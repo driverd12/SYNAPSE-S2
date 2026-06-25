@@ -1,0 +1,21 @@
+[project]
+name = "synapse-s2"
+version = "0.1.0"
+description = "Apple Silicon optimized spiking STDP attention MCP server prototype."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "mlx>=0.25.0",
+    "numpy>=2.0.0",
+    "mlx-snn @ git+https://github.com/D-ST-Sword/mlx-snn.git",
+]
+
+[project.optional-dependencies]
+test = []
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
