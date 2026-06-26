@@ -253,6 +253,7 @@ dd {
 .primary-button,
 .secondary-button,
 .switch-button,
+.guard-button,
 .action-row {
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -269,6 +270,7 @@ dd {
 .icon-button:hover,
 .utility-button:hover,
 .secondary-button:hover,
+.guard-button:hover,
 .action-row:hover {
   border-color: var(--border-strong);
   background: var(--panel-soft);
@@ -279,6 +281,7 @@ dd {
 .primary-button:focus-visible,
 .secondary-button:focus-visible,
 .switch-button:focus-visible,
+.guard-button:focus-visible,
 .action-row:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -579,6 +582,11 @@ textarea {
 
 .switch-button.off .switch-track span {
   transform: translateX(-20px);
+}
+
+.switch-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
 }
 
 .system-list {
@@ -932,6 +940,60 @@ textarea {
   font-size: 12px;
   font-style: normal;
   text-align: center;
+}
+
+.guarded-action {
+  cursor: default;
+}
+
+.guarded-action:hover {
+  border-color: var(--border);
+  background: var(--panel);
+  transform: none;
+}
+
+.guard-controls {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.guard-button {
+  min-height: 32px;
+  border-radius: 6px;
+  padding: 0 9px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 760;
+  white-space: nowrap;
+}
+
+.guard-button.unlock-button {
+  border-color: color-mix(in srgb, var(--teal) 45%, var(--border));
+  color: var(--teal-strong);
+}
+
+.guard-button.unlock-button[aria-pressed="true"] {
+  border-color: var(--green);
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.guard-button.state-toggle {
+  min-width: 70px;
+}
+
+.guard-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.guard-hint {
+  margin: -2px 0 2px 43px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .panel-note {

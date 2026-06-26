@@ -146,7 +146,7 @@
                 <p class="section-label">Runtime Ready</p>
                 <h2 id="runtimeTitle">SYNAPSE-S2 Core</h2>
               </div>
-              <button id="toggleButton" class="switch-button" aria-pressed="true">
+              <button id="toggleButton" class="switch-button" aria-pressed="true" aria-describedby="coreToggleGuardHint" disabled title="Unlock in Maintenance Controls before changing SYNAPSE-S2 Core">
                 <span class="switch-track" aria-hidden="true"><span></span></span>
                 <span id="toggleText">Enabled</span>
               </button>
@@ -243,11 +243,17 @@
               </div>
             </div>
             <div class="action-list">
-              <button class="action-row" type="button" id="toggleActionButton">
+              <div class="action-row guarded-action" role="group" aria-labelledby="coreToggleActionTitle" aria-describedby="coreToggleGuardHint">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
-                <span><strong>Enable / Disable Core</strong><small>Toggle SYNAPSE-S2 runtime</small></span>
-                <em id="toggleActionState">Enabled</em>
-              </button>
+                <span><strong id="coreToggleActionTitle">Enable / Disable Core</strong><small>Unlock required to change state</small></span>
+                <span class="guard-controls">
+                  <button id="coreUnlockButton" class="guard-button unlock-button" type="button" aria-pressed="false">Unlock</button>
+                  <button id="toggleActionButton" class="guard-button state-toggle" type="button" disabled>
+                    <span id="toggleActionState">Enabled</span>
+                  </button>
+                </span>
+              </div>
+              <p id="coreToggleGuardHint" class="guard-hint">Locked. Press Unlock before enabling or disabling SYNAPSE-S2 Core.</p>
               <button class="action-row" type="button" id="refreshActionButton">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
                 <span><strong>Refresh Runtime State</strong><small>Reload metrics and health</small></span>

@@ -5,6 +5,7 @@ const GRAPH_WIDTH = 760;
 const GRAPH_HEIGHT = 420;
 const GRAPH_MIN_SCALE = 0.45;
 const GRAPH_MAX_SCALE = 3.2;
+const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
 
 const state = {
   context: new URLSearchParams(window.location.search).get("context_id")?.trim() || DEFAULT_CONTEXT,
@@ -20,6 +21,10 @@ const state = {
     lockedSection: null,
     lockUntilMs: 0,
   },
+  coreToggle: {
+    unlockedUntilMs: 0,
+    lockTimer: null,
+  },
 };
 
 const elements = collectElements([
@@ -32,6 +37,8 @@ const elements = collectElements([
   "contextApply",
   "contextInput",
   "contextUri",
+  "coreToggleGuardHint",
+  "coreUnlockButton",
   "coreVersion",
   "currentEnvelope",
   "engineState",
@@ -252,6 +259,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   elements.toggleActionState.textContent = enabled ? "Enabled" : "Disabled";
   elements.toggleButton.classList.toggle("off", !enabled);
   elements.toggleButton.setAttribute("aria-pressed", String(enabled));
+  updateCoreToggleGuard();
 
   elements.graphSummary.textContent = graphDeferred
     ? "graph loading"
@@ -1031,13 +1039,67 @@ async function withBusy(button, label, task, options = { refresh: true }) {
 }
 
 async function toggleCore(button) {
+  if (!isCoreToggleUnlocked()) {
+    updateCoreToggleGuard();
+    logOperation("Core toggle locked", "Press Unlock before enabling or disabling SYNAPSE-S2 Core.");
+    return;
+  }
   const enabled = !elements.toggleButton.classList.contains("off");
-  await withBusy(button, "Toggle", () => (
-    requestJson("/api/toggle", {
-      method: "POST",
-      body: { context_id: state.context, enabled: !enabled },
-    })
-  ));
+  try {
+    await withBusy(button, "Toggle", () => (
+      requestJson("/api/toggle", {
+        method: "POST",
+        body: { context_id: state.context, enabled: !enabled },
+      })
+    ));
+  } finally {
+    lockCoreToggleGuard();
+  }
+}
+
+function isCoreToggleUnlocked() {
+  return nowMs() < state.coreToggle.unlockedUntilMs;
+}
+
+function unlockCoreToggleGuard() {
+  state.coreToggle.unlockedUntilMs = nowMs() + CORE_TOGGLE_UNLOCK_WINDOW_MS;
+  if (state.coreToggle.lockTimer) {
+    window.clearTimeout(state.coreToggle.lockTimer);
+  }
+  state.coreToggle.lockTimer = window.setTimeout(lockCoreToggleGuard, CORE_TOGGLE_UNLOCK_WINDOW_MS + 50);
+  updateCoreToggleGuard();
+  logOperation("Core toggle unlocked", "One SYNAPSE-S2 Core state change is available for 10 seconds.");
+}
+
+function lockCoreToggleGuard() {
+  state.coreToggle.unlockedUntilMs = 0;
+  if (state.coreToggle.lockTimer) {
+    window.clearTimeout(state.coreToggle.lockTimer);
+    state.coreToggle.lockTimer = null;
+  }
+  updateCoreToggleGuard();
+}
+
+function updateCoreToggleGuard() {
+  const unlocked = isCoreToggleUnlocked();
+  const enabled = !elements.toggleButton.classList.contains("off");
+  const nextAction = enabled ? "Disable" : "Enable";
+  const lockedHint = "Locked. Press Unlock before enabling or disabling SYNAPSE-S2 Core.";
+  const unlockedHint = `Unlocked for one ${nextAction.toLowerCase()} action. Relocks after use or timeout.`;
+  elements.toggleButton.disabled = !unlocked;
+  elements.toggleActionButton.disabled = !unlocked;
+  elements.coreUnlockButton.disabled = unlocked;
+  elements.coreUnlockButton.textContent = unlocked ? "Unlocked" : "Unlock";
+  elements.coreUnlockButton.setAttribute("aria-pressed", String(unlocked));
+  elements.coreToggleGuardHint.textContent = unlocked ? unlockedHint : lockedHint;
+  elements.toggleButton.title = unlocked
+    ? `${nextAction} SYNAPSE-S2 Core`
+    : "Unlock in Maintenance Controls before changing SYNAPSE-S2 Core";
+  elements.toggleActionButton.title = unlocked
+    ? `${nextAction} SYNAPSE-S2 Core`
+    : "Unlock before changing SYNAPSE-S2 Core";
+  elements.toggleButton.setAttribute("aria-label", `${nextAction} SYNAPSE-S2 Core`);
+  elements.toggleActionButton.setAttribute("aria-label", `${nextAction} SYNAPSE-S2 Core`);
 }
 
 elements.contextApply.addEventListener("click", async () => {
@@ -1086,6 +1148,7 @@ elements.graphZoomIn.addEventListener("click", () => zoomGraphBy(1.18));
 elements.graphFit.addEventListener("click", fitGraphToView);
 elements.graphReset.addEventListener("click", resetGraphLayout);
 
+elements.coreUnlockButton.addEventListener("click", unlockCoreToggleGuard);
 elements.toggleButton.addEventListener("click", () => toggleCore(elements.toggleButton));
 elements.toggleActionButton.addEventListener("click", () => toggleCore(elements.toggleActionButton));
 
