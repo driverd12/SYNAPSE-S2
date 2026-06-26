@@ -1,5 +1,8 @@
+const DEFAULT_CONTEXT = "default";
+const THEME_STORAGE_KEY = "synapse-s2-theme";
+
 const state = {
-  context: new URLSearchParams(window.location.search).get("context_id") || "board-demo",
+  context: new URLSearchParams(window.location.search).get("context_id")?.trim() || DEFAULT_CONTEXT,
   snapshot: null,
 };
 
@@ -7,6 +10,7 @@ const elements = {
   runtimeLine: document.getElementById("runtimeLine"),
   contextInput: document.getElementById("contextInput"),
   contextApply: document.getElementById("contextApply"),
+  themeButton: document.getElementById("themeButton"),
   refreshButton: document.getElementById("refreshButton"),
   toggleButton: document.getElementById("toggleButton"),
   toggleText: document.getElementById("toggleText"),
@@ -35,6 +39,7 @@ const elements = {
 };
 
 elements.contextInput.value = state.context;
+applyTheme(loadTheme());
 
 function apiUrl(path, params = {}) {
   const url = new URL(path, window.location.origin);
@@ -75,6 +80,36 @@ function clamp(value, min, max) {
 function logOperation(label, payload) {
   const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
   elements.operationLog.textContent = `${label}\n${text}`;
+}
+
+function preferredTheme() {
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function loadTheme() {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return stored === "dark" || stored === "light" ? stored : preferredTheme();
+  } catch {
+    return preferredTheme();
+  }
+}
+
+function storeTheme(theme) {
+  try {
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  } catch {
+    // Theme persistence is best-effort; the control remains functional without storage.
+  }
+}
+
+function applyTheme(theme) {
+  const normalized = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = normalized;
+  const dark = normalized === "dark";
+  elements.themeButton.setAttribute("aria-pressed", String(dark));
+  elements.themeButton.setAttribute("aria-label", dark ? "Use light mode" : "Use dark mode");
+  elements.themeButton.setAttribute("title", dark ? "Use light mode" : "Use dark mode");
 }
 
 async function refreshSnapshot() {
@@ -218,9 +253,9 @@ function renderQueryResult(text) {
     .split(" / ")
     .map((item) => item.trim())
     .filter(Boolean);
-  elements.queryResults.innerHTML = parts.length
-    ? parts.map((item) => `<span class="result-chip">${escapeHtml(item)}</span>`).join("")
-    : `<span class="result-chip">No high-salience context</span>`;
+  elements.queryResults.innerHTML = parts
+    .map((item) => `<span class="result-chip">${escapeHtml(item)}</span>`)
+    .join("");
 }
 
 function escapeHtml(value) {
@@ -251,11 +286,18 @@ async function withBusy(button, label, task, options = { refresh: true }) {
 }
 
 elements.contextApply.addEventListener("click", async () => {
-  state.context = elements.contextInput.value.trim() || "board-demo";
+  state.context = elements.contextInput.value.trim() || DEFAULT_CONTEXT;
+  elements.contextInput.value = state.context;
   const url = new URL(window.location.href);
   url.searchParams.set("context_id", state.context);
   history.replaceState(null, "", url);
   await withBusy(elements.contextApply, "Context", refreshSnapshot);
+});
+
+elements.themeButton.addEventListener("click", () => {
+  const nextTheme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(nextTheme);
+  storeTheme(nextTheme);
 });
 
 elements.refreshButton.addEventListener("click", () => {
@@ -285,10 +327,17 @@ elements.toggleButton.addEventListener("click", async () => {
 
 elements.queryForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  const prompt = elements.queryInput.value.trim();
+  if (!prompt) {
+    elements.queryResults.replaceChildren();
+    logOperation("Recall rejected", "prompt is required");
+    elements.queryInput.focus();
+    return;
+  }
   await withBusy(elements.queryForm.querySelector("button"), "Recall", async () => {
     const payload = await requestJson("/api/query", {
       method: "POST",
-      body: { context_id: state.context, prompt: elements.queryInput.value },
+      body: { context_id: state.context, prompt },
     });
     renderQueryResult(payload.result);
     return payload;
@@ -314,9 +363,6 @@ elements.backupButton.addEventListener("click", () => {
 });
 
 refreshSnapshot()
-  .then(() => {
-    elements.queryForm.dispatchEvent(new Event("submit", { cancelable: true }));
-  })
   .catch((error) => {
     logOperation("Initial load failed", error.message);
   });

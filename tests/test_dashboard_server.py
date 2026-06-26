@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 import urllib.error
 import urllib.request
 
-from dashboard_server import DashboardRuntime, SynapseDashboardServer
+from dashboard_server import DEFAULT_CONTEXT, DashboardRuntime, SynapseDashboardServer
 from mlx_backend import SpikingAttentionBackend
 
 
@@ -59,6 +59,16 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["status"]["memory_context_entry_count"], 4)
         self.assertGreaterEqual(payload["graph"]["relationship_count"], 1)
         self.assertIn("estimated_total_mb", payload["profile"])
+
+    def test_snapshot_defaults_to_neutral_context(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            status, payload = self.decode(runtime.handle("GET", "/api/snapshot"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(DEFAULT_CONTEXT, "default")
+        self.assertEqual(payload["context_id"], "default")
 
     def test_toggle_and_query_use_real_backend_state(self):
         with TemporaryDirectory() as tmp:
@@ -125,6 +135,20 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Content-Security-Policy", headers)
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+
+    def test_dashboard_assets_do_not_seed_demo_or_auto_recall(self):
+        root = Path(__file__).resolve().parents[1]
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+        styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("themeButton", index)
+        self.assertIn("dataset.theme", app)
+        self.assertIn("data-theme", styles)
+        self.assertNotIn("board-demo", index)
+        self.assertNotIn("board-demo", app)
+        self.assertNotIn("durable real memory local SQLite substrate", index)
+        self.assertNotIn('dispatchEvent(new Event("submit"', app)
 
     def test_http_handler_rejects_cross_origin_mutations(self):
         with TemporaryDirectory() as tmp:

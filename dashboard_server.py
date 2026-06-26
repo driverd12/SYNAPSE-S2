@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 MAX_JSON_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 64 * 1024
-DEFAULT_CONTEXT = os.getenv("SYNAPSE_S2_DASHBOARD_CONTEXT", "board-demo")
+DEFAULT_CONTEXT = os.getenv("SYNAPSE_S2_DASHBOARD_CONTEXT", "default")
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; "

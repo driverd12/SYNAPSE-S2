@@ -24,7 +24,7 @@ def fetch_text(url: str) -> str:
 
 
 def main() -> int:
-    context = sys.argv[1] if len(sys.argv) > 1 else "board-demo"
+    context = sys.argv[1] if len(sys.argv) > 1 else "default"
     runtime = DashboardRuntime()
     server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

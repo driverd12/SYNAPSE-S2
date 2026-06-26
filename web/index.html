@@ -26,7 +26,7 @@
         <div class="context-block">
           <label for="contextInput">Context</label>
           <div class="context-row">
-            <input id="contextInput" value="board-demo" autocomplete="off" />
+            <input id="contextInput" value="default" autocomplete="off" />
             <button id="contextApply" class="icon-button" title="Apply context" aria-label="Apply context">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
             </button>
@@ -41,6 +41,9 @@
             <h2>Spiking memory control plane</h2>
           </div>
           <div class="top-actions">
+            <button id="themeButton" class="icon-button theme-button" title="Use dark mode" aria-label="Use dark mode" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 7.5A9 9 0 1 1 12 3Z"/></svg>
+            </button>
             <button id="refreshButton" class="icon-button" title="Refresh" aria-label="Refresh">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
             </button>
@@ -118,7 +121,7 @@
               </div>
             </div>
             <form id="queryForm" class="query-form">
-              <textarea id="queryInput" rows="4">durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients</textarea>
+              <textarea id="queryInput" rows="4" placeholder="Enter a live prompt or memory cue"></textarea>
               <button class="primary-button" type="submit">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>
                 Recall
@@ -148,7 +151,7 @@
                 Backup
               </button>
             </div>
-            <pre id="operationLog" class="operation-log">ready</pre>
+            <pre id="operationLog" class="operation-log">idle</pre>
           </article>
         </section>
       </main>

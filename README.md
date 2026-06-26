@@ -141,14 +141,14 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, graph memory inspection, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
-.venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context board-demo
-open "http://127.0.0.1:8765/?context_id=board-demo"
+.venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default
+open "http://127.0.0.1:8765/?context_id=default"
 ```
 
 For non-interactive readiness checks:
 
 ```bash
-.venv/bin/python scripts/smoke_dashboard.py board-demo
+.venv/bin/python scripts/smoke_dashboard.py default
 ```
 
 ## **System Architecture**
