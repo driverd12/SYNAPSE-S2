@@ -140,10 +140,108 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(listing.returncode, 0, listing.stderr)
         self.assertEqual(exported.returncode, 0, exported.stderr)
         self.assertEqual(backup.returncode, 0, backup.stderr)
-        self.assertEqual(json.loads(listing.stdout)["entries"][0]["tag"], "cli-real-memory")
+        listing_payload = json.loads(listing.stdout)
+        self.assertEqual(listing_payload["entries"][0]["tag"], "cli-real-memory")
+        self.assertNotIn("spike_indices", listing_payload["entries"][0])
+        self.assertNotIn("neuron_indices", listing_payload["entries"][0])
         self.assertEqual(json.loads(exported.stdout)["entries"][0]["source_text"], "SYNAPSE-S2 stores full local memory in SQLite.")
         self.assertTrue(export_exists)
         self.assertTrue(backup_exists)
+
+    def test_cli_list_memory_can_include_vector_details_when_requested(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-vector-memory",
+                "--text",
+                "SYNAPSE-S2 can expose vector details explicitly.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            listing = self.run_cli(
+                "list-memory",
+                "--context",
+                "demo",
+                "--limit",
+                "5",
+                "--include-vectors",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        entry = json.loads(listing.stdout)["entries"][0]
+        self.assertIn("spike_indices", entry)
+        self.assertIn("neuron_indices", entry)
+
+    def test_cli_preflight_reports_ready_when_runtime_memory_and_launcher_are_good(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-preflight-memory",
+                "--text",
+                "SYNAPSE-S2 preflight verifies memory recall.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            preflight = self.run_cli(
+                "preflight",
+                "--context",
+                "demo",
+                "--query-text",
+                "SYNAPSE-S2 preflight verifies memory recall.",
+                "--minimum-memory",
+                "1",
+                "--launcher",
+                sys.executable,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        payload = json.loads(preflight.stdout)
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["failed_checks"], [])
+        self.assertTrue(payload["checks"]["launcher_executable"])
+        self.assertTrue(payload["checks"]["memory_minimum_met"])
+        self.assertIn("cli-preflight-memory", payload["query_result"])
+
+    def test_cli_preflight_reports_failed_checks_without_crashing(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            preflight = self.run_cli(
+                "preflight",
+                "--context",
+                "demo",
+                "--minimum-memory",
+                "1",
+                "--launcher",
+                str(Path(tmp) / "missing-launcher"),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        payload = json.loads(preflight.stdout)
+        self.assertFalse(payload["ready"])
+        self.assertIn("launcher_executable", payload["failed_checks"])
+        self.assertIn("memory_minimum_met", payload["failed_checks"])
 
 
 if __name__ == "__main__":

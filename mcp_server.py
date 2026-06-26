@@ -278,13 +278,21 @@ def get_spiking_attention_status(context_id: str = "default") -> str:
         "readOnlyHint": True,
     }
 )
-def list_spiking_memory(context_id: str = "default", limit: int = 50) -> str:
+def list_spiking_memory(
+    context_id: str = "default",
+    limit: int = 50,
+    include_vectors: bool = False,
+) -> str:
     """List persisted local memory entries for a context."""
     context = _sanitize_context_id(context_id)
     try:
         bounded_limit = _validate_limit(limit)
         _, mlx_backend = _load_backend()
-        payload = mlx_backend.list_memory(context_id=context, limit=bounded_limit)
+        payload = mlx_backend.get_backend().list_memory(
+            context_id=context,
+            limit=bounded_limit,
+            include_vectors=bool(include_vectors),
+        )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid memory list request for context_id=%s: %s", context, exc)

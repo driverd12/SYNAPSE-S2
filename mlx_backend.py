@@ -683,6 +683,7 @@ class SpikingAttentionBackend:
         context_id: str = "default",
         limit: int = 50,
         include_global: bool = True,
+        include_vectors: bool = False,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         entries = self.memory_store.list_entries(
@@ -690,11 +691,37 @@ class SpikingAttentionBackend:
             limit=limit,
             include_global=include_global,
         )
+        rendered_entries = [
+            self._render_memory_entry(entry, include_vectors=include_vectors)
+            for entry in entries
+        ]
         return {
             "context_id": context,
             "memory_db_path": str(self.memory_store.db_path),
-            "entry_count": len(entries),
-            "entries": entries,
+            "entry_count": len(rendered_entries),
+            "entries": rendered_entries,
+            "include_vectors": bool(include_vectors),
+        }
+
+    def _render_memory_entry(
+        self,
+        entry: dict[str, Any],
+        *,
+        include_vectors: bool,
+    ) -> dict[str, Any]:
+        if include_vectors:
+            return dict(entry)
+        return {
+            "memory_id": entry["memory_id"],
+            "tag": entry["tag"],
+            "context_id": entry["context_id"],
+            "source_text": entry["source_text"],
+            "metadata": entry["metadata"],
+            "embedding_dimensions": entry["embedding_dimensions"],
+            "spike_count": len(entry.get("spike_indices", [])),
+            "neuron_count": len(entry.get("neuron_indices", [])),
+            "created_at": entry["created_at"],
+            "updated_at": entry["updated_at"],
         }
 
     def export_memory(
@@ -857,8 +884,16 @@ def get_status(context_id: str = "default") -> dict[str, Any]:
     return get_backend().status(context_id=context_id)
 
 
-def list_memory(context_id: str = "default", limit: int = 50) -> dict[str, Any]:
-    return get_backend().list_memory(context_id=context_id, limit=limit)
+def list_memory(
+    context_id: str = "default",
+    limit: int = 50,
+    include_vectors: bool = False,
+) -> dict[str, Any]:
+    return get_backend().list_memory(
+        context_id=context_id,
+        limit=limit,
+        include_vectors=include_vectors,
+    )
 
 
 def export_memory(

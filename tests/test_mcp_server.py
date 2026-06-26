@@ -120,8 +120,30 @@ class McpServerTests(unittest.TestCase):
 
         self.assertEqual(listing["entry_count"], 1)
         self.assertEqual(listing["entries"][0]["tag"], "ops-handoff-memory")
+        self.assertNotIn("spike_indices", listing["entries"][0])
+        self.assertNotIn("neuron_indices", listing["entries"][0])
         self.assertEqual(exported["entries"][0]["source_text"], "Real memory is inspectable through MCP.")
         self.assertTrue(Path(backup["backup_path"]).exists())
+
+    def test_memory_list_tool_can_include_vector_details_when_requested(self):
+        mcp_server.remember_spiking_context(
+            tag="mcp-vector-memory",
+            context_id="demo",
+            text="MCP can include vector details on request.",
+            metadata={"surface": "mcp"},
+        )
+
+        listing = json.loads(
+            mcp_server.list_spiking_memory(
+                context_id="demo",
+                limit=5,
+                include_vectors=True,
+            )
+        )
+
+        self.assertEqual(listing["entries"][0]["tag"], "mcp-vector-memory")
+        self.assertIn("spike_indices", listing["entries"][0])
+        self.assertIn("neuron_indices", listing["entries"][0])
 
     def test_memory_export_tool_rejects_paths_outside_export_root(self):
         result = json.loads(

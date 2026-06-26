@@ -29,6 +29,14 @@ The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists b
 .venv/bin/python synapse_cli.py --json doctor --context board-demo
 ```
 
+For the full morning readiness path, run:
+
+```bash
+scripts/prep_tomorrow.sh
+```
+
+The detailed operator runbook is in `docs/TOMORROW_RUNBOOK.md`.
+
 ### 3. Seed and Query Persistent Memory
 
 ```bash

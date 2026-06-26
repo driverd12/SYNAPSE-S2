@@ -139,7 +139,11 @@ def command_sleep(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_list_memory(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
-    return backend.list_memory(context_id=args.context, limit=args.limit)
+    return backend.list_memory(
+        context_id=args.context,
+        limit=args.limit,
+        include_vectors=args.include_vectors,
+    )
 
 
 def command_export_memory(args: argparse.Namespace) -> dict[str, Any]:
@@ -150,6 +154,63 @@ def command_export_memory(args: argparse.Namespace) -> dict[str, Any]:
 def command_backup_memory(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.backup_memory(path=args.output)
+
+
+def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    status = backend.status(context_id=args.context)
+    dependencies = {
+        "mlx": dependency_status("mlx"),
+        "mlx.core": dependency_status("mlx.core"),
+        "mlxsnn": dependency_status("mlxsnn"),
+        "fastmcp": dependency_status("fastmcp"),
+        "mcp": dependency_status("mcp"),
+    }
+    launcher_path = Path(args.launcher).expanduser()
+    state_path = Path(status["state_path"]).expanduser()
+    memory_db_path = Path(status["memory_db_path"]).expanduser()
+    query_result = ""
+    if args.query_text:
+        query_result = backend.query(
+            backend.embed_text(args.query_text),
+            context_id=args.context,
+        )
+
+    checks = {
+        "dependencies_importable": all(
+            dependencies[name]["importable"]
+            for name in ("mlx.core", "mlxsnn", "fastmcp", "mcp")
+        ),
+        "effective_enabled": bool(status["effective_enabled"]),
+        "memory_db_exists": memory_db_path.exists(),
+        "memory_parent_writable": os.access(memory_db_path.parent, os.W_OK),
+        "state_parent_writable": os.access(state_path.parent, os.W_OK),
+        "memory_minimum_met": int(status["memory_context_entry_count"]) >= int(args.minimum_memory),
+        "launcher_executable": launcher_path.exists() and os.access(launcher_path, os.X_OK),
+    }
+    if args.query_text:
+        checks["query_returned_context"] = bool(query_result) and "No high-salience" not in query_result
+        checks["query_not_disabled"] = "disabled" not in query_result.lower()
+
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    return {
+        "ready": not failed_checks,
+        "failed_checks": failed_checks,
+        "checks": checks,
+        "context_id": mlx_backend.sanitize_context_id(args.context),
+        "launcher_path": str(launcher_path),
+        "state_path": str(state_path),
+        "memory_db_path": str(memory_db_path),
+        "minimum_memory": int(args.minimum_memory),
+        "dependencies": dependencies,
+        "status": status,
+        "memory_preview": backend.list_memory(
+            context_id=args.context,
+            limit=args.preview_limit,
+            include_vectors=False,
+        ),
+        "query_result": query_result,
+    }
 
 
 def command_seed_demo(args: argparse.Namespace) -> dict[str, Any]:
@@ -195,6 +256,7 @@ def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
             "MLX_DEVICE": os.getenv("MLX_DEVICE", ""),
             "SYNAPSE_S2_STATE_PATH": os.getenv("SYNAPSE_S2_STATE_PATH", ""),
             "SYNAPSE_S2_MEMORY_DB": os.getenv("SYNAPSE_S2_MEMORY_DB", ""),
+            "SYNAPSE_S2_EXPORT_DIR": os.getenv("SYNAPSE_S2_EXPORT_DIR", ""),
         },
         "dependencies": {
             "mlx": dependency_status("mlx"),
@@ -275,6 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_memory = subparsers.add_parser("list-memory")
     add_context(list_memory)
     list_memory.add_argument("--limit", type=int, default=50)
+    list_memory.add_argument("--include-vectors", action="store_true")
     list_memory.set_defaults(func=command_list_memory)
 
     export_memory = subparsers.add_parser("export-memory")
@@ -285,6 +348,20 @@ def build_parser() -> argparse.ArgumentParser:
     backup_memory = subparsers.add_parser("backup-memory")
     backup_memory.add_argument("--output", default=None)
     backup_memory.set_defaults(func=command_backup_memory)
+
+    preflight = subparsers.add_parser("preflight")
+    add_context(preflight)
+    preflight.add_argument(
+        "--query-text",
+        default="SYNAPSE-S2 durable local memory Apple Silicon MCP recall",
+    )
+    preflight.add_argument("--minimum-memory", type=int, default=1)
+    preflight.add_argument("--preview-limit", type=int, default=5)
+    preflight.add_argument(
+        "--launcher",
+        default="/Users/dan.driver/.local/bin/synapse-s2-mcp",
+    )
+    preflight.set_defaults(func=command_preflight)
 
     doctor = subparsers.add_parser("doctor")
     add_context(doctor)
