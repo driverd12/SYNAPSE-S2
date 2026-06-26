@@ -320,6 +320,64 @@ class SynapseCliTests(unittest.TestCase):
         self.assertTrue(json.loads(edge_prune.stdout)["result"]["deleted"])
         self.assertTrue(json.loads(memory_prune.stdout)["result"]["deleted"])
 
+    def test_cli_capture_inbox_drop_status_and_process(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            inbox_root = Path(tmp) / "capture-root"
+
+            drop = self.run_cli(
+                "capture-inbox-drop",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-magic",
+                "--speaker",
+                "codex",
+                "--text",
+                "The passive capture inbox should ingest this payload. api_key=sk-test-secret123",
+                "--capture-root",
+                str(inbox_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            status_before = self.run_cli(
+                "capture-inbox-status",
+                "--capture-root",
+                str(inbox_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            processed = self.run_cli(
+                "capture-inbox-process",
+                "--capture-root",
+                str(inbox_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            graph = self.run_cli(
+                "graph",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(drop.returncode, 0, drop.stderr)
+        self.assertEqual(status_before.returncode, 0, status_before.stderr)
+        self.assertEqual(processed.returncode, 0, processed.stderr)
+        self.assertEqual(graph.returncode, 0, graph.stderr)
+        self.assertFalse(Path(json.loads(drop.stdout)["drop_path"]).exists())
+        self.assertEqual(json.loads(status_before.stdout)["pending_file_count"], 1)
+        self.assertEqual(json.loads(processed.stdout)["processed_file_count"], 1)
+        graph_payload = json.loads(graph.stdout)
+        self.assertTrue(
+            any(entry["tag"].startswith("cli-magic-event") for entry in graph_payload["entries"])
+        )
+        self.assertTrue(
+            all("sk-test-secret123" not in entry["source_text"] for entry in graph_payload["entries"])
+        )
+
     def test_cli_publishes_and_acknowledges_context_deployments(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

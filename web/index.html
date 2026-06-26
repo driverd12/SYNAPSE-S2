@@ -274,6 +274,15 @@
                 <span><strong>Evidence Pack</strong><small>Write report plus SQLite backup</small></span>
                 <em>Pack</em>
               </button>
+              <button class="action-row" type="button" id="captureInboxButton">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+                <span><strong>Magic Capture</strong><small>Process local session inbox drops</small></span>
+                <em>Process</em>
+              </button>
+              <div id="captureInboxState" class="capture-inbox-state" aria-live="polite">
+                <strong>Capture inbox pending</strong>
+                <small>Waiting for local clients to drop session payloads.</small>
+              </div>
               <button class="action-row" type="button" id="quickPruneButton">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"/><path d="M6 16h12"/><path d="M8 12h8"/><path d="M10 8h4"/><path d="M12 4v16"/></svg>
                 <span><strong>Quick Prune</strong><small>Reclaim ephemeral nodes</small></span>

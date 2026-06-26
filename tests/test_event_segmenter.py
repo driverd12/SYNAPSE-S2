@@ -73,6 +73,27 @@ class BayesianSurpriseEventSegmenterTests(unittest.TestCase):
             1,
         )
 
+    def test_preserves_local_dot_paths_inside_sentences(self):
+        segmenter = BayesianSurpriseEventSegmenter(
+            surprise_threshold=0.50,
+            min_segment_sentences=1,
+        )
+        text = (
+            "The sidecar watches .synapse_s2/capture_inbox for local payloads. "
+            "It moves processed files into .synapse_s2/capture_processed."
+        )
+
+        segments = segmenter.segment(
+            text,
+            context_id="default",
+            source_tag="path-brief",
+        )
+
+        rendered = " ".join(segment["text"] for segment in segments)
+        self.assertIn(".synapse_s2/capture_inbox", rendered)
+        self.assertIn(".synapse_s2/capture_processed", rendered)
+        self.assertFalse(any(segment["text"] == "The sidecar watches ." for segment in segments))
+
 
 if __name__ == "__main__":
     unittest.main()

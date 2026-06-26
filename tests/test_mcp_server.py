@@ -25,14 +25,23 @@ class McpServerTests(unittest.TestCase):
         )
         self.addCleanup(lambda: setattr(mlx_backend, "_ENGINE_INSTANCE", None))
         self.previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
+        self.previous_capture_root = os.environ.get("SYNAPSE_S2_CAPTURE_ROOT")
         os.environ["SYNAPSE_S2_EXPORT_DIR"] = self.tmpdir.name
+        os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = str(Path(self.tmpdir.name) / "capture-root")
         self.addCleanup(self._restore_export_dir)
+        self.addCleanup(self._restore_capture_root)
 
     def _restore_export_dir(self):
         if self.previous_export_dir is None:
             os.environ.pop("SYNAPSE_S2_EXPORT_DIR", None)
         else:
             os.environ["SYNAPSE_S2_EXPORT_DIR"] = self.previous_export_dir
+
+    def _restore_capture_root(self):
+        if self.previous_capture_root is None:
+            os.environ.pop("SYNAPSE_S2_CAPTURE_ROOT", None)
+        else:
+            os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = self.previous_capture_root
 
     def test_query_rejects_empty_embedding(self):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -240,6 +249,32 @@ class McpServerTests(unittest.TestCase):
         self.assertTrue(capture["agent_deployment"]["published"])
         self.assertTrue(edge_prune["result"]["deleted"])
         self.assertTrue(memory_prune["result"]["deleted"])
+
+    def test_mcp_capture_inbox_tools_drop_process_and_redact(self):
+        drop = json.loads(
+            mcp_server.drop_spiking_capture_inbox(
+                text=(
+                    "MCP wrappers can drop session notes into the magic inbox. "
+                    "The sidecar processes api_key=sk-test-secret123 safely."
+                ),
+                context_id="demo",
+                source_tag="mcp-magic",
+                speaker="codex",
+            )
+        )
+        status_before = json.loads(mcp_server.get_spiking_capture_inbox_status())
+        processed = json.loads(mcp_server.process_spiking_capture_inbox(max_files=10))
+        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+
+        self.assertFalse(Path(drop["drop_path"]).exists())
+        self.assertEqual(status_before["pending_file_count"], 1)
+        self.assertEqual(processed["processed_file_count"], 1)
+        self.assertTrue(
+            any(entry["tag"].startswith("mcp-magic-event") for entry in graph["entries"])
+        )
+        self.assertTrue(
+            all("sk-test-secret123" not in entry["source_text"] for entry in graph["entries"])
+        )
 
     def test_context_deployment_tool_lists_published_thoughts_for_connected_agents(self):
         registration = json.loads(

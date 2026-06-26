@@ -12,6 +12,7 @@ export MLX_DEVICE="${MLX_DEVICE:-gpu}"
 export SYNAPSE_S2_STATE_PATH="${SYNAPSE_S2_STATE_PATH:-$ROOT/.synapse_s2/runtime_state.json}"
 export SYNAPSE_S2_MEMORY_DB="${SYNAPSE_S2_MEMORY_DB:-$ROOT/.synapse_s2/memory.sqlite3}"
 export SYNAPSE_S2_EXPORT_DIR="${SYNAPSE_S2_EXPORT_DIR:-$ROOT/.synapse_s2}"
+export SYNAPSE_S2_CAPTURE_ROOT="${SYNAPSE_S2_CAPTURE_ROOT:-$ROOT/.synapse_s2}"
 
 mkdir -p "$SYNAPSE_S2_EXPORT_DIR"
 
@@ -32,11 +33,14 @@ scripts/install_local_launcher.sh
 echo "=== install client configs ==="
 scripts/install_client_configs.py
 
+echo "=== install capture inbox daemon ==="
+scripts/install_capture_daemon.sh
+
 echo "=== unit tests ==="
 .venv/bin/python -m unittest discover -s tests -v
 
 echo "=== compile check ==="
-.venv/bin/python -m py_compile event_segmenter.py memory_store.py mlx_backend.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
+.venv/bin/python -m py_compile capture_daemon.py event_segmenter.py memory_store.py mlx_backend.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
 
 echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json remember-text \
@@ -53,6 +57,15 @@ echo "=== factual preflight evidence ==="
   --metadata '{"source":"prep_tomorrow","event_graph":true,"factual_preflight":true}'
 .venv/bin/python synapse_cli.py --json graph --context "$CONTEXT" --limit 10
 .venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
+
+echo "=== capture inbox smoke ==="
+.venv/bin/python synapse_cli.py --json capture-inbox-drop \
+  --context "$CONTEXT" \
+  --tag "production-capture-inbox" \
+  --speaker "codex" \
+  --text "SYNAPSE-S2 capture inbox sidecar accepts explicit session payloads, redacts common secret patterns like api_key=sk-preflight-redaction-test123, and ingests cleaned temporal events into the same local graph."
+.venv/bin/python synapse_cli.py --json capture-inbox-process
+.venv/bin/python synapse_cli.py --json capture-inbox-status
 
 echo "=== cli preflight ==="
 .venv/bin/python synapse_cli.py --json preflight \
@@ -107,6 +120,12 @@ PY
 .venv/bin/fastmcp call --command "$LAUNCHER" \
   --target list_spiking_context_cursors \
   --input-json "{\"context_id\":\"$CONTEXT\",\"limit\":5}" \
+  --json --timeout 15
+
+echo "=== mcp capture inbox status smoke ==="
+.venv/bin/fastmcp call --command "$LAUNCHER" \
+  --target get_spiking_capture_inbox_status \
+  --input-json "{}" \
   --json --timeout 15
 
 echo "=== dashboard smoke ==="

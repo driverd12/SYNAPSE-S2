@@ -12,6 +12,17 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertNotIn("seed-demo", script)
         self.assertIn('CONTEXT="${SYNAPSE_S2_PREFLIGHT_CONTEXT:-default}"', script)
         self.assertIn("factual preflight evidence", script)
+        self.assertIn("install_capture_daemon.sh", script)
+        self.assertIn("capture-inbox-drop", script)
+        self.assertIn("get_spiking_capture_inbox_status", script)
+
+    def test_capture_daemon_installer_declares_launch_agent(self):
+        script = (ROOT / "scripts" / "install_capture_daemon.sh").read_text(encoding="utf-8")
+
+        self.assertIn("aero.boom.synapse-s2.capture-daemon", script)
+        self.assertIn("capture_daemon.py", script)
+        self.assertIn("SYNAPSE_S2_CAPTURE_ROOT", script)
+        self.assertIn("launchctl bootstrap", script)
 
 
 if __name__ == "__main__":

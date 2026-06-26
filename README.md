@@ -15,6 +15,7 @@ brew install uv
 uv sync
 scripts/install_local_launcher.sh
 scripts/install_client_configs.py
+scripts/install_capture_daemon.sh
 ```
 
 The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists because this checked-out workspace path contains spaces and a colon, which can break tools that split command strings or PATH entries. The launcher executes the synced virtual environment directly:
@@ -94,6 +95,19 @@ Capture real operator/Codex conversation notes into the event graph:
   --text "User asked for future conversation details to appear in the event relationship graph. Codex added durable session capture plus surgical memory pruning. Operators can remove sensitive, wrong, or partial-truth graph data by node, edge, deployment event, or relationship mode."
 ```
 
+For the always-on "magic" capture lane, run the launchd sidecar and drop session payloads into the local inbox. This is still opt-in and local: clients, hooks, or operators write a payload, then the sidecar redacts common secret shapes and ingests it into the same real graph used by MCP, CLI, and the dashboard.
+
+```bash
+scripts/install_capture_daemon.sh
+.venv/bin/python synapse_cli.py --json capture-inbox-drop \
+  --context default \
+  --tag codex-session \
+  --speaker codex \
+  --text "Capture a concise factual session note here."
+.venv/bin/python synapse_cli.py --json capture-inbox-status
+.venv/bin/python synapse_cli.py --json graph --context default --limit 30
+```
+
 Hand-prune bad or sensitive memory from the same durable store:
 
 ```bash
@@ -138,6 +152,9 @@ The MCP server exposes these tools:
 | `list_spiking_memory` | List persisted SQLite memory entries for a context. |
 | `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
 | `capture_spiking_conversation` | Capture real operator/agent conversation notes as temporal event memories. |
+| `drop_spiking_capture_inbox` | Drop opt-in session text into the local capture inbox sidecar. |
+| `get_spiking_capture_inbox_status` | Show pending, processed, and failed inbox file counts. |
+| `process_spiking_capture_inbox` | Process pending inbox drops into the real memory graph. |
 | `list_spiking_memory_graph` | List compact memory entries and relationship edges for a context. |
 | `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
@@ -193,7 +210,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, durable trace capture, conversation capture, event ingestion, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

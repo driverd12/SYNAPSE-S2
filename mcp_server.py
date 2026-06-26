@@ -157,6 +157,12 @@ def _load_backend():
     return mx, mlx_backend
 
 
+def _load_capture_daemon():
+    import capture_daemon
+
+    return capture_daemon
+
+
 def _publish_tool_deployment(
     mlx_backend_module: Any,
     *,
@@ -423,6 +429,80 @@ def capture_spiking_conversation(
     except Exception as exc:
         LOGGER.exception("conversation capture failed for context_id=%s", context)
         return json.dumps({"error": f"conversation capture failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def drop_spiking_capture_inbox(
+    text: str,
+    context_id: str = "default",
+    source_tag: str = "codex-session",
+    speaker: str = "operator",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Drop opt-in session text into the local capture inbox for sidecar ingestion."""
+    context = _sanitize_context_id(context_id)
+    try:
+        source_text = _validate_text(text)
+        capture_daemon = _load_capture_daemon()
+        drop_path = capture_daemon.write_capture_drop(
+            context_id=context,
+            source_tag=source_tag,
+            speaker=speaker,
+            text=source_text,
+            metadata={
+                **(metadata or {}),
+                "source_surface": "mcp-inbox",
+            },
+        )
+        return json.dumps(
+            {
+                "action": "drop-spiking-capture-inbox",
+                "context_id": context,
+                "drop_path": str(drop_path),
+            },
+            sort_keys=True,
+        )
+    except ValueError as exc:
+        LOGGER.warning("invalid capture inbox drop for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid capture inbox drop: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("capture inbox drop failed for context_id=%s", context)
+        return json.dumps({"error": f"capture inbox drop failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get SYNAPSE-S2 Capture Inbox Status",
+        "readOnlyHint": True,
+    }
+)
+def get_spiking_capture_inbox_status() -> str:
+    """Return pending/processed/error counts for the local capture inbox sidecar."""
+    try:
+        capture_daemon = _load_capture_daemon()
+        return json.dumps(capture_daemon.CaptureInboxDaemon().status(), sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("capture inbox status failed")
+        return json.dumps({"error": f"capture inbox status failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def process_spiking_capture_inbox(max_files: int = 50) -> str:
+    """Process pending local capture inbox files into the real SYNAPSE-S2 graph."""
+    try:
+        bounded_max = min(max(int(max_files), 1), 250)
+        capture_daemon = _load_capture_daemon()
+        return json.dumps(
+            capture_daemon.CaptureInboxDaemon().process_once(max_files=bounded_max),
+            sort_keys=True,
+            default=str,
+        )
+    except ValueError as exc:
+        LOGGER.warning("invalid capture inbox process request: %s", exc)
+        return json.dumps({"error": f"invalid capture inbox process request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("capture inbox process failed")
+        return json.dumps({"error": f"capture inbox process failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool()

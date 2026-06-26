@@ -15,12 +15,13 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 | Bad graph data could not be surgically removed | Sensitive, wrong, or partial-truth memory could keep influencing recall | Add confirmed pruning for memory nodes, event nodes, edges, context deployments, temporal edges, and associative edges | Fixed in `memory_store.py`, backend, MCP, CLI, dashboard, and GUI |
 | README/runbook still taught `board-demo` and `seed-demo` | IT operators could accidentally present synthetic state | Rewrite examples around `default` and real operator captures | Fixed in `README.md` and `docs/TOMORROW_RUNBOOK.md` |
 | Compliance matrix under-described client registration and delivery receipts | Proposal mapping lagged implementation | Add explicit rows for config installer and context cursors | Fixed in `docs/PROPOSAL_COMPLIANCE.md` |
+| Capture required an active user-facing tool call | Useful session notes could be missed if the dashboard or agent forgot the synchronous capture form | Add a launchd-backed local capture inbox with CLI, MCP, dashboard status/process controls, redaction, processed/error queues, and tests | Fixed in `capture_daemon.py`, `synapse_cli.py`, `mcp_server.py`, `dashboard_server.py`, `web/app.js`, and `scripts/install_capture_daemon.sh` |
 
 ## Remaining Explicit Non-Claims
 
 | Gap | Risk | Shorthand solution | Current disposition |
 | :--- | :--- | :--- | :--- |
-| No passive interception of every already-running Codex/Claude chat | Running clients must call the capture tool/CLI for notes to enter memory | Restart clients, pull durable deployment events, and use `capture_spiking_conversation`/`capture-session` at session boundaries | Documented limitation; durable capture plus pull/ack works now |
+| No invisible interception of arbitrary already-running Codex/Claude chats | Running clients must call a capture tool, CLI, or write a local inbox payload for notes to enter memory | Restart clients, pull durable deployment events, and use `capture_spiking_conversation`, `capture-session`, or the capture inbox sidecar at session boundaries | Documented limitation; always-on local inbox plus durable capture and pull/ack works now |
 | Text projection is deterministic lexical hashing, not a semantic embedding model | Recall quality depends on lexical overlap and SNN graph expansion | Add optional local embedding provider while keeping offline fallback | Research extension, not claimed complete |
 | Bayesian surprise is deterministic lexical approximation | Event boundaries are useful but not probabilistic token-stream inference | Add provider-backed or calibrated probabilistic surprise module | Research extension, not claimed complete |
 | Resource envelope is estimated from MLX array topology, not Instruments counters | Hardware-level memory certification is not yet captured | Add Instruments/Metal counter harness across target Apple Silicon SKUs | Research extension, not claimed complete |
@@ -38,4 +39,5 @@ The current bar for calling a local build presentable is:
 5. No-memory recall returns a transparent raw activation summary, never a fake historical tag.
 6. Conversation capture creates visible event nodes in the graph and a durable context-bus deployment.
 7. Confirmed pruning can remove a single node, edge, deployment event, temporal edge set, or associative edge set.
-8. The dashboard at `http://127.0.0.1:8765/?context_id=default` can write, capture conversations, ingest, recall, graph, prune, sleep, back up, and show context-bus receipt state.
+8. The capture inbox sidecar is installed or `capture-inbox-process` proves pending drops become graph events with secret redaction.
+9. The dashboard at `http://127.0.0.1:8765/?context_id=default` can write, capture conversations, process magic capture drops, ingest, recall, graph, prune, sleep, back up, and show context-bus receipt state.

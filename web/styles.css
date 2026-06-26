@@ -1000,6 +1000,40 @@ textarea {
   line-height: 1.35;
 }
 
+.capture-inbox-state {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px 12px;
+}
+
+.capture-inbox-state strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 820;
+}
+
+.capture-inbox-state small {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.capture-inbox-state.ready strong {
+  color: var(--green);
+}
+
+.capture-inbox-state.pending strong {
+  color: var(--amber);
+}
+
+.capture-inbox-state.error strong {
+  color: var(--red);
+}
+
 .panel-note {
   border-top: 1px solid var(--row);
   margin-top: 12px;

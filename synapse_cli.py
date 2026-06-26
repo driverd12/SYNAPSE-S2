@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from capture_daemon import CaptureInboxDaemon, write_capture_drop
 import mlx_backend
 
 
@@ -226,6 +227,39 @@ def command_prune_memory(args: argparse.Namespace) -> dict[str, Any]:
         reason=args.reason,
         source_surface="cli",
     )
+
+
+def command_capture_inbox_drop(args: argparse.Namespace) -> dict[str, Any]:
+    text = _text_from_args(args).strip()
+    if not text:
+        raise ValueError("--text or --text-file must provide content")
+    drop_path = write_capture_drop(
+        root=args.capture_root,
+        context_id=args.context,
+        source_tag=args.tag,
+        speaker=args.speaker,
+        text=text,
+        metadata=parse_metadata(args.metadata),
+    )
+    return {
+        "action": "capture-inbox-drop",
+        "drop_path": str(drop_path),
+        "context_id": mlx_backend.sanitize_context_id(args.context),
+        "source_tag": mlx_backend.sanitize_tag(args.tag).replace(" ", "-"),
+        "speaker": mlx_backend.sanitize_agent_id(args.speaker),
+    }
+
+
+def _capture_daemon_from_args(args: argparse.Namespace) -> CaptureInboxDaemon:
+    return CaptureInboxDaemon(root=args.capture_root, backend=build_backend(args))
+
+
+def command_capture_inbox_status(args: argparse.Namespace) -> dict[str, Any]:
+    return _capture_daemon_from_args(args).status()
+
+
+def command_capture_inbox_process(args: argparse.Namespace) -> dict[str, Any]:
+    return _capture_daemon_from_args(args).process_once(max_files=args.max_files)
 
 
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
@@ -513,6 +547,25 @@ def build_parser() -> argparse.ArgumentParser:
     prune_memory.add_argument("--reason", default="")
     prune_memory.add_argument("--confirm", action="store_true")
     prune_memory.set_defaults(func=command_prune_memory)
+
+    capture_inbox_drop = subparsers.add_parser("capture-inbox-drop")
+    add_context(capture_inbox_drop)
+    capture_inbox_drop.add_argument("--tag", default="codex-session")
+    capture_inbox_drop.add_argument("--speaker", default="operator")
+    capture_inbox_drop.add_argument("--text", default="")
+    capture_inbox_drop.add_argument("--text-file", default=None)
+    capture_inbox_drop.add_argument("--metadata", default=None)
+    capture_inbox_drop.add_argument("--capture-root", default=None)
+    capture_inbox_drop.set_defaults(func=command_capture_inbox_drop)
+
+    capture_inbox_status = subparsers.add_parser("capture-inbox-status")
+    capture_inbox_status.add_argument("--capture-root", default=None)
+    capture_inbox_status.set_defaults(func=command_capture_inbox_status)
+
+    capture_inbox_process = subparsers.add_parser("capture-inbox-process")
+    capture_inbox_process.add_argument("--capture-root", default=None)
+    capture_inbox_process.add_argument("--max-files", type=int, default=50)
+    capture_inbox_process.set_defaults(func=command_capture_inbox_process)
 
     graph = subparsers.add_parser("graph")
     add_context(graph)

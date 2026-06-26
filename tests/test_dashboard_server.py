@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import urllib.error
 import urllib.request
 
+from capture_daemon import write_capture_drop
 from dashboard_server import DEFAULT_CONTEXT, DashboardRuntime, SynapseDashboardServer
 from mlx_backend import SpikingAttentionBackend
 
@@ -248,6 +249,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Remember + publish", index)
         self.assertIn("Ingest + publish", index)
         self.assertIn("Capture conversation", index)
+        self.assertIn("Magic Capture", index)
+        self.assertIn("captureInboxButton", index)
+        self.assertIn("captureInboxState", index)
         self.assertIn("graph-safety-panel", index)
         self.assertIn("pruneForm", index)
         self.assertIn("relationshipLedger", index)
@@ -259,6 +263,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("renderContextEventLedger", app)
         self.assertIn("pruneGraphItem", app)
         self.assertIn("captureForm", app)
+        self.assertIn("renderCaptureInbox", app)
         self.assertIn("logSnapshotResponse", app)
         self.assertIn("unlockCoreToggleGuard", app)
         self.assertIn("lockCoreToggleGuard", app)
@@ -278,6 +283,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/ingest", app)
         self.assertIn("/api/capture-conversation", app)
         self.assertIn("/api/prune-memory", app)
+        self.assertIn("/api/capture-inbox", app)
         self.assertIn("/api/context-events", app)
         self.assertIn("danger-button", styles)
         self.assertNotIn("board-demo", index)
@@ -564,6 +570,51 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(graph_status, 200)
         self.assertEqual(prune_status, 400)
         self.assertIn("confirm", prune_payload["error"])
+
+    def test_capture_inbox_status_and_process_endpoint_ingests_pending_payload(self):
+        with TemporaryDirectory() as tmp:
+            previous_root = os.environ.get("SYNAPSE_S2_CAPTURE_ROOT")
+            os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = tmp
+            try:
+                runtime = self.make_runtime(tmp)
+                write_capture_drop(
+                    root=tmp,
+                    context_id="demo",
+                    source_tag="dashboard-magic",
+                    speaker="codex",
+                    text="Dashboard capture inbox should process this dropped payload.",
+                )
+
+                status_before, payload_before = self.decode(
+                    runtime.handle("GET", "/api/capture-inbox")
+                )
+                process_status, process_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/capture-inbox/process",
+                        json.dumps({"context_id": "demo"}).encode(),
+                    )
+                )
+                graph_status, graph_payload = self.decode(
+                    runtime.handle("GET", "/api/graph?context_id=demo&limit=30")
+                )
+            finally:
+                if previous_root is None:
+                    os.environ.pop("SYNAPSE_S2_CAPTURE_ROOT", None)
+                else:
+                    os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = previous_root
+
+        self.assertEqual(status_before, 200)
+        self.assertEqual(payload_before["pending_file_count"], 1)
+        self.assertEqual(process_status, 200)
+        self.assertEqual(process_payload["processed_file_count"], 1)
+        self.assertEqual(graph_status, 200)
+        self.assertTrue(
+            any(
+                entry["tag"].startswith("dashboard-magic-event")
+                for entry in graph_payload["entries"]
+            )
+        )
 
     def test_context_events_endpoint_lists_published_agent_handoffs(self):
         with TemporaryDirectory() as tmp:

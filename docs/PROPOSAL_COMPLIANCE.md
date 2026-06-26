@@ -32,6 +32,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Bayesian Surprise Event Segmenter for local text streams | Implemented as deterministic local surprise segmentation | `event_segmenter.py`, `ingest_spiking_memory_text`, `synapse_cli.py ingest-text`, `tests/test_event_segmenter.py` |
 | Dual graph memory protocol for episodic-semantic relationships | Implemented | `memory_relationships` table in `memory_store.py`, `list_spiking_memory_graph`, graph-expanded recall, deep-sleep relationship extraction |
 | Agent/operator conversation capture into event memory | Implemented | `capture_spiking_conversation`, `synapse_cli.py capture-session`, `/api/capture-conversation`, GUI capture form |
+| Always-on local session capture sidecar | Implemented as opt-in capture inbox | `capture_daemon.py`, `drop_spiking_capture_inbox`, `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, `/api/capture-inbox`, `scripts/install_capture_daemon.sh` |
 | Operator safety pruning for bad or sensitive graph data | Implemented | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, `/api/prune-memory`, GUI safety prune controls |
 | Shared state across Codex/Claude/direct CLI surfaces | Implemented | `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, launcher, common `.synapse_s2/memory.sqlite3` |
 | Codex, Claude Desktop, and Claude Code client registration | Implemented | `client_config.py`, `scripts/install_client_configs.py`, `tests/test_client_config.py` |
@@ -57,6 +58,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Store real local memory | `remember_spiking_context`, `synapse_cli.py remember-text/remember-vector` |
 | Segment long text into event memory graph | `ingest_spiking_memory_text`, `synapse_cli.py ingest-text` |
 | Capture real session conversation notes | `capture_spiking_conversation`, `synapse_cli.py capture-session`, dashboard Conversation capture |
+| Drop and process sidecar session payloads | `drop_spiking_capture_inbox`, `get_spiking_capture_inbox_status`, `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, dashboard Magic Capture |
 | Query vector or text recall | `query_spiking_attention`, `query_spiking_attention_text`, CLI equivalents |
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
 | List/export/backup persisted memory | MCP and CLI memory commands |
@@ -75,6 +77,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Raw `uv run mcp_server.py` in client config | Configs point to `/Users/dan.driver/.local/bin/synapse-s2-mcp` | The workspace path contains spaces and a colon. The launcher preserves the same synced `uv` environment while avoiding client command-splitting failures. |
 | Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and safe for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
 | "Deploy to all connected agents" language | Deployment is durable local pull with per-agent acknowledgement cursors | Local desktop clients do not expose a reliable push bus. Durable pull plus receipts is auditable and survives client restarts. |
+| "Magic" passive capture | Implemented as a local always-on inbox, not unauthorized scraping of arbitrary app state | Clients, hooks, or operators explicitly write payloads; the sidecar then redacts common secret patterns and ingests into real temporal graph memory. |
 | Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-safe 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
 | VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark | This is the right readiness signal for tomorrow. External Metal counter capture can be added later for hardware certification. |
 
@@ -86,7 +89,7 @@ These items are present in the architecture document as longer-horizon research 
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
 - Probabilistic embedding-calibrated surprise over live token streams; current implementation is deterministic, local, and lexical so it can run offline inside MCP stdio without model calls.
 - External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs.
-- Real-time push into already-running Codex/Claude sessions; clients must restart or reconnect and then pull the durable context-bus events.
+- Invisible capture of arbitrary already-running Codex/Claude chats without client cooperation; clients must restart or reconnect and then use MCP capture tools, CLI capture, or the local capture inbox.
 
 ## Current Verification Command
 

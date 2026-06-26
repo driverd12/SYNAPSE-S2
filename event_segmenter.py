@@ -24,7 +24,8 @@ SENTENCE_RE = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
 PROTECTED_SENTENCE_FRAGMENT_RE = re.compile(
     r"\b(?:https?://|file://|s2://)[^\s]+"
     r"|(?<![\w-])(?:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)"
-    r"(?::[0-9]+)?(?:/[A-Za-z0-9_./:%#?=&+-]+)?(?![\w-])",
+    r"(?::[0-9]+)?(?:/[A-Za-z0-9_./:%#?=&+-]+)?(?![\w-])"
+    r"|(?<![\w-])\.?[A-Za-z0-9_-]+(?:/[A-Za-z0-9_./:%#?=&+-]+)+(?![\w-])",
     re.IGNORECASE,
 )
 SAFE_TAG_RE = re.compile(r"[^A-Za-z0-9_.:-]+")

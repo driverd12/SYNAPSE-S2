@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from capture_daemon import CaptureInboxDaemon
 import mlx_backend
 
 
@@ -69,6 +70,12 @@ class DashboardRuntime:
         if self._backend is None:
             self._backend = mlx_backend.get_backend()
         return self._backend
+
+    def capture_daemon(self) -> CaptureInboxDaemon:
+        return CaptureInboxDaemon(
+            root=os.getenv("SYNAPSE_S2_CAPTURE_ROOT"),
+            backend=self.backend,
+        )
 
     def handle(
         self,
@@ -140,6 +147,8 @@ class DashboardRuntime:
                     limit=limit,
                 )
             )
+        if method == "GET" and path == "/api/capture-inbox":
+            return self._json_response(self.capture_daemon().status())
         if method == "GET" and path == "/api/snapshot":
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
@@ -318,6 +327,15 @@ class DashboardRuntime:
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
             return self._json_response(self.evidence_pack(context_id=context))
+        if method == "POST" and path == "/api/capture-inbox/process":
+            payload = self._parse_json_body(body)
+            try:
+                max_files = int(payload.get("max_files", 50))
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "max_files must be an integer") from exc
+            return self._json_response(
+                self.capture_daemon().process_once(max_files=min(max(max_files, 1), 250))
+            )
 
         raise DashboardError(HTTPStatus.NOT_FOUND, "route not found")
 
@@ -350,6 +368,7 @@ class DashboardRuntime:
             timings["graph"] = 0.0
             graph = self._deferred_graph(context=context, status=status)
         system = timed("system", lambda: self._system_info(context_id=context))
+        capture_inbox = timed("capture_inbox", lambda: self.capture_daemon().status())
         timings["total"] = round((time.perf_counter() - snapshot_started) * 1000.0, 3)
         return {
             "context_id": context,
@@ -357,6 +376,7 @@ class DashboardRuntime:
             "profile": profile,
             "graph": graph,
             "system": system,
+            "capture_inbox": capture_inbox,
             "timings_ms": timings,
             "generated_at": time.time(),
         }

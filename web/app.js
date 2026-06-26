@@ -43,6 +43,8 @@ const elements = collectElements([
   "coreUnlockButton",
   "coreVersion",
   "captureForm",
+  "captureInboxButton",
+  "captureInboxState",
   "captureSpeaker",
   "captureTag",
   "captureText",
@@ -303,6 +305,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderContextEventLedger(snapshot.context_deployments || {});
   renderMemoryLedger(graph);
   renderContextBus(status);
+  renderCaptureInbox(snapshot.capture_inbox || null);
   renderFooter(snapshot, status, profile, contextCount);
   renderHydrationTiming(snapshot, clientElapsedMs);
 }
@@ -330,6 +333,37 @@ function renderContextBus(status, deployment = null) {
   elements.contextBusState.innerHTML = `
     <strong>${escapeHtml(stateText)}</strong>
     <span>${escapeHtml(detailText)}</span>
+  `;
+}
+
+function renderCaptureInbox(captureInbox) {
+  if (!captureInbox) {
+    elements.captureInboxState.className = "capture-inbox-state";
+    elements.captureInboxState.innerHTML = `
+      <strong>Capture inbox unknown</strong>
+      <small>Status has not been loaded yet.</small>
+    `;
+    return;
+  }
+  const pending = Number(captureInbox.pending_file_count ?? 0);
+  const processed = Number(captureInbox.processed_file_count ?? 0);
+  const errors = Number(captureInbox.error_file_count ?? 0);
+  const last = captureInbox.last_result || {};
+  const capturedEvents = Number(last.captured_event_count ?? 0);
+  const capturedPayloads = Number(last.captured_payload_count ?? 0);
+  const mode = errors > 0 ? "error" : pending > 0 ? "pending" : "ready";
+  const headline = errors > 0
+    ? `${formatNumber(errors)} capture error${errors === 1 ? "" : "s"}`
+    : pending > 0
+      ? `${formatNumber(pending)} pending capture file${pending === 1 ? "" : "s"}`
+      : "Capture inbox armed";
+  const detail = pending > 0
+    ? `${formatNumber(processed)} processed. Press Process to ingest pending local session drops.`
+    : `Processed ${formatNumber(processed)} files; last run captured ${formatNumber(capturedEvents)} events from ${formatNumber(capturedPayloads)} payloads.`;
+  elements.captureInboxState.className = `capture-inbox-state ${mode}`;
+  elements.captureInboxState.innerHTML = `
+    <strong>${escapeHtml(headline)}</strong>
+    <small>${escapeHtml(detail)}</small>
   `;
 }
 
@@ -1556,6 +1590,21 @@ elements.evidencePackButton.addEventListener("click", () => {
       body: { context_id: state.context },
     })
   ));
+});
+
+elements.captureInboxButton.addEventListener("click", () => {
+  withBusy(elements.captureInboxButton, "Magic capture", async () => {
+    const payload = await requestJson("/api/capture-inbox/process", {
+      method: "POST",
+      body: { context_id: state.context, max_files: 50 },
+    });
+    renderCaptureInbox({
+      ...(state.snapshot?.capture_inbox || {}),
+      last_result: payload,
+      pending_file_count: 0,
+    });
+    return payload;
+  });
 });
 
 refreshSnapshot()

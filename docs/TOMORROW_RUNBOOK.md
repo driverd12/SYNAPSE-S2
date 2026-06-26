@@ -9,13 +9,14 @@ cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local 
 scripts/prep_tomorrow.sh
 ```
 
-The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
+The script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
 To refresh local client registration directly:
 
 ```bash
 scripts/install_local_launcher.sh
 scripts/install_client_configs.py
+scripts/install_capture_daemon.sh
 ```
 
 Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions.
@@ -106,6 +107,20 @@ Conversation capture:
 
 This creates event nodes in the relationship visualizer and publishes a durable context-bus event for connected clients to pull. Do not capture secrets, credentials, raw tokens, private keys, or speculative claims.
 
+Always-on capture inbox:
+
+```bash
+scripts/install_capture_daemon.sh
+.venv/bin/python synapse_cli.py --json capture-inbox-drop \
+  --context default \
+  --tag codex-session \
+  --speaker codex \
+  --text "Capture a concise factual session boundary note here."
+.venv/bin/python synapse_cli.py --json capture-inbox-status
+```
+
+The sidecar watches `.synapse_s2/capture_inbox`, redacts common secret patterns, ingests pending payloads into real temporal event memories, then moves files to `.synapse_s2/capture_processed`. This is the production-safe "magic" layer: clients and hooks still opt in by writing payloads, but no running dashboard or terminal session has to stay open for ingestion.
+
 Hand pruning:
 
 ```bash
@@ -182,6 +197,9 @@ Useful tool calls:
 | `query_spiking_attention_text` | Recalls local memory from text without external embedding calls. |
 | `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
 | `capture_spiking_conversation` | Captures real operator/agent session notes into event memory. |
+| `drop_spiking_capture_inbox` | Drops opt-in session notes for the always-on local sidecar. |
+| `get_spiking_capture_inbox_status` | Shows pending and processed capture inbox counts. |
+| `process_spiking_capture_inbox` | Manually processes pending capture inbox files. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
 | `prune_spiking_memory` | Removes a node, relationship edge, deployment event, or relationship mode. |
@@ -208,5 +226,8 @@ The matrix maps each proposal requirement to implementation evidence and separat
 | :--- | :--- |
 | `.synapse_s2/memory.sqlite3` | Durable memory store. |
 | `.synapse_s2/runtime_state.json` | Toggle/runtime state. |
+| `.synapse_s2/capture_inbox` | Pending opt-in session payloads for the sidecar. |
+| `.synapse_s2/capture_processed` | Sidecar-processed payloads. |
+| `.synapse_s2/capture-daemon.log` | Capture sidecar stderr/stdout log. |
 | `.synapse_s2/*backup*.sqlite3` | Local backups. |
 | `/Users/dan.driver/.local/bin/synapse-s2-mcp` | Launcher used by Codex, FastMCP, and inspector tools. |
