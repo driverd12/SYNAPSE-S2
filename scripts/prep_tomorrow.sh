@@ -50,12 +50,14 @@ echo "=== seed durable memory ==="
   --min-segment-sentences 1 \
   --metadata '{"source":"prep_tomorrow","event_graph":true}'
 .venv/bin/python synapse_cli.py --json graph --context "$CONTEXT" --limit 10
+.venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
 
 echo "=== cli preflight ==="
 .venv/bin/python synapse_cli.py --json preflight \
   --context "$CONTEXT" \
   --minimum-memory 3 \
   --minimum-relationships 1 \
+  --require-resource-envelope \
   --launcher "$LAUNCHER" \
   --query-text "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients"
 
@@ -72,6 +74,12 @@ echo "=== mcp graph smoke ==="
 .venv/bin/fastmcp call --command "$LAUNCHER" \
   --target list_spiking_memory_graph \
   --input-json "{\"context_id\":\"$CONTEXT\",\"limit\":10}" \
+  --json --timeout 15
+
+echo "=== mcp resource profile smoke ==="
+.venv/bin/fastmcp call --command "$LAUNCHER" \
+  --target profile_spiking_resources \
+  --input-json "{\"benchmark_quick_prune\":true}" \
   --json --timeout 15
 
 echo "=== proposal lifecycle smoke ==="

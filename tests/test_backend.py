@@ -311,6 +311,24 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             ],
         )
 
+    def test_resource_profile_reports_topology_memory_and_pruning_budget(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        profile = backend.resource_profile(benchmark_quick_prune=True)
+
+        self.assertEqual(profile["dimension"], 8)
+        self.assertEqual(profile["num_neurons"], 6)
+        self.assertEqual(profile["arrays"]["W_syn"]["elements"], 48)
+        self.assertEqual(profile["arrays"]["W_lateral"]["elements"], 36)
+        self.assertGreater(profile["estimated_total_mb"], 0.0)
+        self.assertIn("within_target_envelope", profile)
+        self.assertTrue(profile["quick_pruning"]["within_60ms_budget"])
+
     def test_backend_exports_and_backs_up_real_memory_store(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

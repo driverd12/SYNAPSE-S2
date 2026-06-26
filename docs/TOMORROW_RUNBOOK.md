@@ -9,7 +9,7 @@ cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local 
 scripts/prep_tomorrow.sh
 ```
 
-The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, seeds the `board-demo` memory context, runs CLI preflight, exercises the FastMCP launcher, and writes a SQLite backup into `.synapse_s2`.
+The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, seeds the `board-demo` memory context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, and writes a SQLite backup into `.synapse_s2`.
 
 ## Expected ready signal
 
@@ -29,6 +29,8 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | `dependencies_importable` | `mlx.core`, `mlxsnn`, `fastmcp`, or `mcp` is not importable. | Run `uv sync`. |
 | `launcher_executable` | `/Users/dan.driver/.local/bin/synapse-s2-mcp` is missing or not executable. | Run `scripts/install_local_launcher.sh`. |
 | `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Run `synapse_cli.py --json seed-demo --context board-demo`. |
+| `relationship_minimum_met` | The selected context has too few persisted event relationships for the requested gate. | Run the event graph ingestion command below. |
+| `resource_envelope_met` | The default topology is outside the configured 61-138 MB estimated resource envelope. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then adjust `SYNAPSE_S2_NEURONS` or topology CLI args. |
 | `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context board-demo`. |
 | `query_returned_context` | Recall did not return a registered context. | Seed or remember a matching trace, then query again. |
 
@@ -74,6 +76,14 @@ Event graph ingestion:
 
 The graph output should show event tags like `proposal-event-brief-event-001` and at least one `temporal_next` relationship.
 
+Resource envelope:
+
+```bash
+.venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
+```
+
+The default topology should report `within_target_envelope: true` for the proposal's 61-138 MB target and a quick-pruning result with `within_60ms_budget: true`. This is an implementation-level memory estimate from the live MLX arrays, not an external Metal profiler trace.
+
 Backup:
 
 ```bash
@@ -108,6 +118,7 @@ Useful tool calls:
 | `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
+| `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
 | `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |
 

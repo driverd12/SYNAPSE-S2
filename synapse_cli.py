@@ -155,6 +155,15 @@ def command_graph(args: argparse.Namespace) -> dict[str, Any]:
     return backend.list_memory_graph(context_id=args.context, limit=args.limit)
 
 
+def command_profile(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.resource_profile(
+        benchmark_quick_prune=args.benchmark_quick_prune,
+        target_min_mb=args.target_min_mb,
+        target_max_mb=args.target_max_mb,
+    )
+
+
 def command_quick_prune(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.run_quick_pruning()
@@ -192,6 +201,7 @@ def command_backup_memory(args: argparse.Namespace) -> dict[str, Any]:
 def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     status = backend.status(context_id=args.context)
+    resource_profile = backend.resource_profile(benchmark_quick_prune=False)
     dependencies = {
         "mlx": dependency_status("mlx"),
         "mlx.core": dependency_status("mlx.core"),
@@ -223,6 +233,10 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
             status["memory_context_relationship_count"]
         )
         >= int(args.minimum_relationships),
+        "resource_envelope_met": (
+            not bool(args.require_resource_envelope)
+            or bool(resource_profile["within_target_envelope"])
+        ),
         "launcher_executable": launcher_path.exists() and os.access(launcher_path, os.X_OK),
         "consolidation_lifecycle_declared": status["consolidation_phase_names"]
         == [
@@ -256,6 +270,7 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         "minimum_relationships": int(args.minimum_relationships),
         "dependencies": dependencies,
         "status": status,
+        "resource_profile": resource_profile,
         "memory_preview": backend.list_memory(
             context_id=args.context,
             limit=args.preview_limit,
@@ -393,6 +408,12 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--limit", type=int, default=100)
     graph.set_defaults(func=command_graph)
 
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("--benchmark-quick-prune", action="store_true")
+    profile.add_argument("--target-min-mb", type=float, default=61.0)
+    profile.add_argument("--target-max-mb", type=float, default=138.0)
+    profile.set_defaults(func=command_profile)
+
     seed_demo = subparsers.add_parser("seed-demo")
     add_context(seed_demo)
     seed_demo.set_defaults(func=command_seed_demo)
@@ -430,6 +451,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--minimum-memory", type=int, default=1)
     preflight.add_argument("--minimum-relationships", type=int, default=0)
+    preflight.add_argument("--require-resource-envelope", action="store_true")
     preflight.add_argument("--preview-limit", type=int, default=5)
     preflight.add_argument(
         "--launcher",

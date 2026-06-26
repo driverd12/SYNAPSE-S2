@@ -36,6 +36,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Quick-pruning mode every 5 minutes | Implemented and tested | `quick_pruning_interval_seconds=300.0`, auto-prune in `query()` / `register_trace()`, `tests/test_backend.py` |
 | Quick-pruning completes under 60 ms budget as measured locally | Implemented as runtime check | `run_quick_pruning()` returns `within_60ms_budget`; unit test asserts the local path stays under budget |
 | Quick-pruning is non-LLM GPU/array maintenance | Implemented | `run_quick_pruning()` decays MLX arrays and resets transient membrane state |
+| Proposal 61-138 MB resource envelope | Implemented as live topology estimate and readiness gate | `resource_profile()`, `profile_spiking_resources`, `synapse_cli.py profile`, `synapse_cli.py preflight --require-resource-envelope`, `scripts/prep_tomorrow.sh` |
 | Deep-sleep consolidation on idle | Implemented and tested | `run_idle_maintenance()`, `trigger_idle_maintenance()`, `synapse_cli.py idle-maintenance` |
 | Hebbian Distillation into structured semantic hierarchy | Implemented | `run_deep_sleep_consolidation()` builds `semantic_hierarchy` from active traces, durable entries, and persisted relationship edges |
 | Seven-phase consolidation lifecycle | Implemented and tested | `CONSOLIDATION_PHASES`, deep-sleep `phases`, `tests/test_backend.py` |
@@ -53,6 +54,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
 | List/export/backup persisted memory | MCP and CLI memory commands |
 | Inspect event relationships | `list_spiking_memory_graph`, `synapse_cli.py graph` |
+| Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
 | Manual quick prune | `synapse_cli.py quick-prune` |
 | Manual or forced idle deep sleep | `trigger_sleep_consolidation`, `trigger_idle_maintenance`, `synapse_cli.py sleep`, `synapse_cli.py idle-maintenance --force-deep-sleep` |
 
@@ -63,6 +65,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Raw `uv run mcp_server.py` in client config | Configs point to `/Users/dan.driver/.local/bin/synapse-s2-mcp` | The workspace path contains spaces and a colon. The launcher preserves the same synced `uv` environment while avoiding client command-splitting failures. |
 | Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and safe for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
 | Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-safe 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
+| VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark | This is the right readiness signal for tomorrow. External Metal counter capture can be added later for hardware certification. |
 
 ## Research Extensions Not Claimed Complete
 
@@ -71,7 +74,7 @@ These items are present in the architecture document as longer-horizon research 
 - PTsoftmax and Bit Shifting PowerNorm.
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
 - Probabilistic embedding-calibrated surprise over live token streams; current implementation is deterministic, local, and lexical so it can run offline inside MCP stdio without model calls.
-- Measured 61 MB to 138 MB peak VRAM envelope across large topology profiles.
+- External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs.
 - Automatic Claude Desktop config installation through `fastmcp install`; the repo provides the command and working launcher, but does not mutate Claude Desktop config during tests.
 
 ## Current Verification Command
@@ -80,4 +83,4 @@ These items are present in the architecture document as longer-horizon research 
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Current result: 44 tests passing.
+Current result: run `scripts/prep_tomorrow.sh` before the presentation. The readiness script runs the full unit suite, compile check, CLI graph/profile/preflight gates, MCP smoke calls, consolidation lifecycle smoke, and a SQLite backup.

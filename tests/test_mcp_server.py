@@ -55,6 +55,16 @@ class McpServerTests(unittest.TestCase):
 
         self.assertIn("deep-sleep", result)
 
+    def test_resource_profile_tool_reports_memory_estimate(self):
+        profile = json.loads(
+            mcp_server.profile_spiking_resources(benchmark_quick_prune=True)
+        )
+
+        self.assertEqual(profile["dimension"], 6)
+        self.assertEqual(profile["num_neurons"], 10)
+        self.assertIn("estimated_total_mb", profile)
+        self.assertTrue(profile["quick_pruning"]["within_60ms_budget"])
+
     def test_idle_maintenance_tool_can_force_deep_sleep(self):
         result = json.loads(mcp_server.trigger_idle_maintenance(force_deep_sleep=True))
 

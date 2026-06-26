@@ -90,6 +90,23 @@ class SynapseCliTests(unittest.TestCase):
         self.assertIn("dependencies", payload)
         self.assertIn("memory_db_path", payload["status"])
 
+    def test_cli_profile_reports_resource_envelope(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+
+            result = self.run_cli(
+                "profile",
+                "--benchmark-quick-prune",
+                state_path=state_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["dimension"], 32)
+        self.assertEqual(payload["num_neurons"], 24)
+        self.assertIn("estimated_total_mb", payload)
+        self.assertTrue(payload["quick_pruning"]["within_60ms_budget"])
+
     def test_cli_idle_maintenance_can_force_deep_sleep(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

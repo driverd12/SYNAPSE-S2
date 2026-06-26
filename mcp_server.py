@@ -358,6 +358,31 @@ def list_spiking_memory_graph(context_id: str = "default", limit: int = 100) -> 
         return json.dumps({"error": f"memory graph list failed: {exc}"}, sort_keys=True)
 
 
+@mcp.tool(
+    annotations={
+        "title": "Profile SYNAPSE-S2 Runtime Resources",
+        "readOnlyHint": False,
+    }
+)
+def profile_spiking_resources(
+    benchmark_quick_prune: bool = False,
+    target_min_mb: float = 61.0,
+    target_max_mb: float = 138.0,
+) -> str:
+    """Report topology memory estimates and optional quick-pruning timing."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.resource_profile(
+            benchmark_quick_prune=bool(benchmark_quick_prune),
+            target_min_mb=float(target_min_mb),
+            target_max_mb=float(target_max_mb),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("resource profile failed")
+        return json.dumps({"error": f"resource profile failed: {exc}"}, sort_keys=True)
+
+
 @mcp.tool()
 def export_spiking_memory(
     context_id: str = "default",

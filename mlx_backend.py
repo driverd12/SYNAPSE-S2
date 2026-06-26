@@ -1016,6 +1016,63 @@ class SpikingAttentionBackend:
             "relationships": relationships,
         }
 
+    def resource_profile(
+        self,
+        *,
+        benchmark_quick_prune: bool = False,
+        target_min_mb: float = 61.0,
+        target_max_mb: float = 138.0,
+    ) -> dict[str, Any]:
+        arrays = {
+            "W_syn": self._array_profile(self.W_syn),
+            "W_lateral": self._array_profile(self.W_lateral),
+            "mem": self._array_profile(self.state["mem"]),
+            "spk": self._array_profile(self.state["spk"]),
+            "active_traces": self._array_profile(self.active_traces),
+        }
+        estimated_total_bytes = sum(
+            int(profile["estimated_bytes"])
+            for profile in arrays.values()
+        )
+        estimated_total_mb = round(estimated_total_bytes / (1024.0 * 1024.0), 6)
+        quick_profile = (
+            self.run_quick_pruning(trigger="resource-profile")
+            if benchmark_quick_prune
+            else None
+        )
+        return {
+            "dimension": int(self.dimension),
+            "num_neurons": int(self.num_neurons),
+            "default_top_k": int(self.default_top_k),
+            "recall_count": int(self.recall_count),
+            "estimated_total_bytes": int(estimated_total_bytes),
+            "estimated_total_mb": estimated_total_mb,
+            "target_envelope_mb": {
+                "min": float(target_min_mb),
+                "max": float(target_max_mb),
+            },
+            "within_target_envelope": bool(
+                float(target_min_mb) <= estimated_total_mb <= float(target_max_mb)
+            ),
+            "arrays": arrays,
+            "quick_pruning": quick_profile,
+            "mlx_device": os.getenv("MLX_DEVICE", "default"),
+            "mlxsnn_lif_execution_path": self._mlxsnn_lif_layer is not None,
+        }
+
+    def _array_profile(self, array: Any) -> dict[str, Any]:
+        elements = self._array_element_count(array)
+        dtype = str(getattr(array, "dtype", "float32"))
+        dtype_bytes = 8 if "float64" in dtype else 4
+        estimated_bytes = int(elements * dtype_bytes)
+        return {
+            "shape": [int(dimension) for dimension in getattr(array, "shape", ())],
+            "dtype": dtype,
+            "elements": int(elements),
+            "estimated_bytes": estimated_bytes,
+            "estimated_mb": round(estimated_bytes / (1024.0 * 1024.0), 6),
+        }
+
     def _render_memory_entry(
         self,
         entry: dict[str, Any],
@@ -1418,6 +1475,19 @@ def list_memory_graph(
     limit: int = 100,
 ) -> dict[str, Any]:
     return get_backend().list_memory_graph(context_id=context_id, limit=limit)
+
+
+def resource_profile(
+    *,
+    benchmark_quick_prune: bool = False,
+    target_min_mb: float = 61.0,
+    target_max_mb: float = 138.0,
+) -> dict[str, Any]:
+    return get_backend().resource_profile(
+        benchmark_quick_prune=benchmark_quick_prune,
+        target_min_mb=target_min_mb,
+        target_max_mb=target_max_mb,
+    )
 
 
 def export_memory(
