@@ -787,4 +787,6 @@ def trigger_idle_maintenance(force_deep_sleep: bool = False) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    from client_session_bridge import run_with_client_session_bridge
+
+    run_with_client_session_bridge(mcp.run)

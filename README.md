@@ -24,6 +24,8 @@ The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists b
 /Users/dan.driver/.local/bin/synapse-s2-mcp
 ```
 
+The launcher enters through `mcp_client_wrapper.py`, which hydrates SYNAPSE-S2 at MCP process startup and drops a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the client disconnects. `scripts/install_client_configs.py` stamps distinct delivery cursors for Codex, Claude Desktop, Claude Code, and the project `.mcp.json` manifest so one client does not consume another client's context deployments.
+
 ### 2. Verify the Local Engine
 
 ```bash
@@ -76,7 +78,7 @@ Inspect, export, and back up the memory store:
   --output .synapse_s2/default-memory-backup.sqlite3
 ```
 
-Hydrate a restarted agent from the durable context bus:
+Connected MCP clients now hydrate automatically when their SYNAPSE-S2 server process starts. To run the same hydration manually for diagnostics:
 
 ```bash
 .venv/bin/python synapse_cli.py --json agent-brief \
@@ -85,7 +87,7 @@ Hydrate a restarted agent from the durable context bus:
   --prompt "Summarize the current SYNAPSE-S2 work and next implementation gap."
 ```
 
-`agent-brief` composes `pull-context`, text recall, graph summary, and `ack-context` into one agent-ready briefing. Use the lower-level commands when diagnosing delivery state directly:
+`agent-brief` composes `pull-context`, text recall, graph summary, and `ack-context` into one agent-ready briefing. The client wrapper calls the same backend behavior at startup. Use the lower-level commands when diagnosing delivery state directly:
 
 ```bash
 .venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 10
@@ -192,7 +194,7 @@ Project `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, Claude Desktop, and
 scripts/install_client_configs.py
 ```
 
-The installer preserves existing client settings, writes timestamped backups before mutating existing JSON/TOML files, and points every client at `/Users/dan.driver/.local/bin/synapse-s2-mcp` plus the shared `.synapse_s2` state directory. Restart Codex, Claude Desktop, and Claude Code after running it so each client reloads its MCP server registry.
+The installer preserves existing client settings, writes timestamped backups before mutating existing JSON/TOML files, and points every client at `/Users/dan.driver/.local/bin/synapse-s2-mcp` plus the shared `.synapse_s2` state directory. It also assigns per-client `SYNAPSE_S2_CLIENT_AGENT_ID` values: `codex-desktop`, `claude-desktop`, `claude-code`, and `project-mcp`. Restart Codex, Claude Desktop, and Claude Code after running it so each client reloads its MCP server registry and starts using the startup/session-boundary bridge.
 
 ### 6. Maintenance Lifecycle
 

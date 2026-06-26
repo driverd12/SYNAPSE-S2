@@ -15,6 +15,7 @@ class ClientConfigTests(unittest.TestCase):
             server = client_config.build_server_definition(
                 repo_root=repo_root,
                 launcher_path=launcher,
+                client_agent_id="codex-desktop",
             )
             resolved_repo = repo_root.resolve()
 
@@ -26,6 +27,11 @@ class ClientConfigTests(unittest.TestCase):
             server["env"]["SYNAPSE_S2_MEMORY_DB"],
             str(resolved_repo / ".synapse_s2" / "memory.sqlite3"),
         )
+        self.assertEqual(server["env"]["SYNAPSE_S2_CAPTURE_ROOT"], str(resolved_repo / ".synapse_s2"))
+        self.assertEqual(server["env"]["SYNAPSE_S2_CONTEXT_ID"], "default")
+        self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"], "codex-desktop")
+        self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_SESSION_BRIDGE"], "1")
+        self.assertIn("codex-desktop", server["env"]["SYNAPSE_S2_CLIENT_STARTUP_PROMPT"])
 
     def test_install_merges_claude_codex_and_project_configs_without_clobbering(self):
         with TemporaryDirectory() as tmp:
@@ -74,8 +80,16 @@ class ClientConfigTests(unittest.TestCase):
 
         self.assertTrue(desktop["preferences"]["keepAwakeEnabled"])
         self.assertIn("synapse-s2", desktop["mcpServers"])
+        self.assertEqual(
+            desktop["mcpServers"]["synapse-s2"]["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"],
+            "claude-desktop",
+        )
         self.assertIn("master-mold", claude_code["mcpServers"])
         self.assertIn("synapse-s2", claude_code["mcpServers"])
+        self.assertEqual(
+            claude_code["mcpServers"]["synapse-s2"]["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"],
+            "claude-code",
+        )
         self.assertIn(resolved_repo, claude_code["projects"])
         self.assertIn(
             "synapse-s2",
@@ -83,12 +97,49 @@ class ClientConfigTests(unittest.TestCase):
         )
         self.assertIn("[mcp_servers.synapse-s2]", codex_text)
         self.assertIn(str(launcher), codex_text)
+        self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', codex_text)
+        self.assertIn('SYNAPSE_S2_CLIENT_SESSION_BRIDGE = "1"', codex_text)
         self.assertIn("synapse-s2", project_manifest["mcpServers"])
+        self.assertEqual(
+            project_manifest["mcpServers"]["synapse-s2"]["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"],
+            "project-mcp",
+        )
         self.assertTrue(result["restart_required"])
         self.assertEqual(
             sorted(result["clients"]),
             ["claude_code", "claude_desktop", "codex", "project_mcp"],
         )
+
+    def test_codex_config_updates_existing_synapse_server_block(self):
+        with TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "SYNAPSE-S2"
+            launcher = Path(tmp) / "bin" / "synapse-s2-mcp"
+            server = client_config.build_server_definition(
+                repo_root=repo_root,
+                launcher_path=launcher,
+                client_agent_id="codex-desktop",
+            )
+            existing = """model = "gpt-5.5"
+
+[mcp_servers.synapse-s2]
+command = "/old/synapse-s2-mcp"
+args = []
+
+[mcp_servers.synapse-s2.env]
+SYNAPSE_S2_CLIENT_AGENT_ID = "old-agent"
+
+[mcp_servers.other]
+command = "node"
+"""
+
+            merged = client_config.merge_codex_config_text(existing, server=server)
+
+        self.assertIn('model = "gpt-5.5"', merged)
+        self.assertIn("[mcp_servers.other]", merged)
+        self.assertIn(str(launcher), merged)
+        self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', merged)
+        self.assertNotIn("/old/synapse-s2-mcp", merged)
+        self.assertNotIn("old-agent", merged)
 
 
 if __name__ == "__main__":

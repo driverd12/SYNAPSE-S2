@@ -17,12 +17,13 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 | Compliance matrix under-described client registration and delivery receipts | Proposal mapping lagged implementation | Add explicit rows for config installer and context cursors | Fixed in `docs/PROPOSAL_COMPLIANCE.md` |
 | Capture required an active user-facing tool call | Useful session notes could be missed if the dashboard or agent forgot the synchronous capture form | Add a launchd-backed local capture inbox with CLI, MCP, dashboard status/process controls, redaction, processed/error queues, and tests | Fixed in `capture_daemon.py`, `synapse_cli.py`, `mcp_server.py`, `dashboard_server.py`, `web/app.js`, and `scripts/install_capture_daemon.sh` |
 | Restarted agents had to manually compose raw pull, recall, graph, and ack calls | Codex/Claude could miss relevant memory or fail to acknowledge consumed deployments | Add one context-hydration command/tool that returns an agent-ready brief and updates the cursor | Fixed in `mlx_backend.py`, `synapse_cli.py`, `mcp_server.py`, `AGENTS.md`, and tests |
+| Client startup and shutdown had no repeatable SYNAPSE-S2 habit | Clients could reconnect without hydrating or recording a useful session boundary | Wrap the local MCP launcher with startup hydration and sanitized exit capture; install per-client agent ids | Fixed in `client_session_bridge.py`, `mcp_client_wrapper.py`, `client_config.py`, launcher script, and tests |
 
 ## Remaining Explicit Non-Claims
 
 | Gap | Risk | Shorthand solution | Current disposition |
 | :--- | :--- | :--- | :--- |
-| No invisible interception of arbitrary already-running Codex/Claude chats | Running clients must call a capture tool, CLI, or write a local inbox payload for notes to enter memory | Restart clients, pull durable deployment events, and use `capture_spiking_conversation`, `capture-session`, or the capture inbox sidecar at session boundaries | Documented limitation; always-on local inbox plus durable capture and pull/ack works now |
+| No invisible interception of arbitrary already-running Codex/Claude transcript content | Running clients must still call a capture tool, CLI, or write a local inbox payload for full chat text to enter memory | Restart clients so the MCP startup/session-boundary bridge hydrates and records process boundaries; use explicit capture for full transcript notes | Documented limitation; bridge plus always-on inbox plus durable capture and pull/ack works now |
 | Text projection is deterministic lexical hashing, not a semantic embedding model | Recall quality depends on lexical overlap and SNN graph expansion | Add optional local embedding provider while keeping offline fallback | Research extension, not claimed complete |
 | Bayesian surprise is deterministic lexical approximation | Event boundaries are useful but not probabilistic token-stream inference | Add provider-backed or calibrated probabilistic surprise module | Research extension, not claimed complete |
 | Resource envelope is estimated from MLX array topology, not Instruments counters | Hardware-level memory certification is not yet captured | Add Instruments/Metal counter harness across target Apple Silicon SKUs | Research extension, not claimed complete |
@@ -41,4 +42,5 @@ The current bar for calling a local build presentable is:
 6. Conversation capture creates visible event nodes in the graph and a durable context-bus deployment.
 7. Confirmed pruning can remove a single node, edge, deployment event, temporal edge set, or associative edge set.
 8. The capture inbox sidecar is installed or `capture-inbox-process` proves pending drops become graph events with secret redaction.
-9. The dashboard at `http://127.0.0.1:8765/?context_id=default` can write, capture conversations, process magic capture drops, ingest, recall, graph, prune, sleep, back up, and show context-bus receipt state.
+9. The local MCP launcher enters through the startup/session-boundary bridge and client configs declare distinct agent ids.
+10. The dashboard at `http://127.0.0.1:8765/?context_id=default` can write, capture conversations, process magic capture drops, ingest, recall, graph, prune, sleep, back up, and show context-bus receipt state.

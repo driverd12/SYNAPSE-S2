@@ -9,7 +9,7 @@ cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local 
 scripts/prep_tomorrow.sh
 ```
 
-The script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
+The script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
 To refresh local client registration directly:
 
@@ -19,7 +19,7 @@ scripts/install_client_configs.py
 scripts/install_capture_daemon.sh
 ```
 
-Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions.
+Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions. New SYNAPSE-S2 MCP server processes hydrate their own cursor at startup and drop a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the process exits.
 
 ## Expected ready signal
 
@@ -95,7 +95,7 @@ Agent context hydration:
   --prompt "Prepare SYNAPSE-S2 for the next live operator session."
 ```
 
-This returns a compact Markdown briefing plus structured JSON for new deployments, recall hits, graph highlights, and an ack cursor. Use raw receipts when validating the delivery protocol directly:
+This returns a compact Markdown briefing plus structured JSON for new deployments, recall hits, graph highlights, and an ack cursor. The client wrapper runs the same hydration automatically on MCP server startup; this command remains useful for manual diagnostics. Use raw receipts when validating the delivery protocol directly:
 
 ```bash
 .venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 10
@@ -236,7 +236,7 @@ The matrix maps each proposal requirement to implementation evidence and separat
 | :--- | :--- |
 | `.synapse_s2/memory.sqlite3` | Durable memory store. |
 | `.synapse_s2/runtime_state.json` | Toggle/runtime state. |
-| `.synapse_s2/capture_inbox` | Pending opt-in session payloads for the sidecar. |
+| `.synapse_s2/capture_inbox` | Pending opt-in session payloads and client-session boundary notes for the sidecar. |
 | `.synapse_s2/capture_processed` | Sidecar-processed payloads. |
 | `.synapse_s2/capture-daemon.log` | Capture sidecar stderr/stdout log. |
 | `.synapse_s2/*backup*.sqlite3` | Local backups. |

@@ -24,6 +24,13 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertIn("SYNAPSE_S2_CAPTURE_ROOT", script)
         self.assertIn("launchctl bootstrap", script)
 
+    def test_local_launcher_uses_client_session_wrapper(self):
+        script = (ROOT / "scripts" / "install_local_launcher.sh").read_text(encoding="utf-8")
+
+        self.assertIn("mcp_client_wrapper.py", script)
+        self.assertIn("SYNAPSE_S2_CLIENT_SESSION_BRIDGE", script)
+        self.assertNotIn('"$REPO_ROOT/mcp_server.py"', script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Project-root state discovery through client environment | Implemented | `SYNAPSE_S2_*` envs, plus `CLAUDE_PROJECT_DIR` / `CODEX_PROJECT_DIR` fallback in `mlx_backend.py` |
 | Durable context-bus deployment to connected local agents | Implemented as pull-plus-ack protocol | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, CLI `pull-context` / `ack-context`, `agent_context_cursors` table |
 | Agent-ready context hydration after client restart | Implemented | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief`, backend `hydrate_agent_context`, cursor-backed ack plus recall and graph summary |
+| Client-side startup/session-boundary bridge | Implemented | `mcp_client_wrapper.py`, `client_session_bridge.py`, launcher wrapper, per-client `SYNAPSE_S2_CLIENT_AGENT_ID`, sanitized boundary drops into capture inbox |
 | Recall does not fabricate historical tags when memory is empty | Implemented | no-memory queries return transparent raw activation summaries instead of synthetic `context::neuron-*` memory labels |
 | Operator-visible local control surface | Implemented | `dashboard_server.py`, `web/index.html`, `web/app.js`, `web/styles.css`, `scripts/smoke_dashboard.py`, `tests/test_dashboard_server.py` |
 | Quick-pruning mode every 5 minutes | Implemented and tested | `quick_pruning_interval_seconds=300.0`, auto-prune in `query()` / `register_trace()`, `tests/test_backend.py` |
@@ -79,7 +80,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Raw `uv run mcp_server.py` in client config | Configs point to `/Users/dan.driver/.local/bin/synapse-s2-mcp` | The workspace path contains spaces and a colon. The launcher preserves the same synced `uv` environment while avoiding client command-splitting failures. |
 | Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and safe for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
 | "Deploy to all connected agents" language | Deployment is durable local pull with per-agent acknowledgement cursors | Local desktop clients do not expose a reliable push bus. Durable pull plus receipts is auditable and survives client restarts. |
-| "Magic" passive capture | Implemented as a local always-on inbox, not unauthorized scraping of arbitrary app state | Clients, hooks, or operators explicitly write payloads; the sidecar then redacts common secret patterns and ingests into real temporal graph memory. |
+| "Magic" passive capture | Implemented as a local always-on inbox plus MCP startup/session-boundary bridge, not unauthorized scraping of arbitrary app state | MCP clients hydrate automatically on server startup and drop sanitized boundary notes on exit. Full chat capture still requires clients, hooks, or operators to explicitly write payloads. |
 | Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-safe 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
 | VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark | This is the right readiness signal for tomorrow. External Metal counter capture can be added later for hardware certification. |
 
@@ -91,7 +92,7 @@ These items are present in the architecture document as longer-horizon research 
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
 - Probabilistic embedding-calibrated surprise over live token streams; current implementation is deterministic, local, and lexical so it can run offline inside MCP stdio without model calls.
 - External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs.
-- Invisible capture of arbitrary already-running Codex/Claude chats without client cooperation; clients must restart or reconnect and then use MCP capture tools, CLI capture, or the local capture inbox.
+- Invisible capture of arbitrary already-running Codex/Claude chat transcript content without client cooperation; the MCP process boundary is captured, but full chat text still requires explicit client/tool/hook payloads.
 
 ## Current Verification Command
 

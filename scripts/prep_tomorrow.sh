@@ -40,7 +40,7 @@ echo "=== unit tests ==="
 .venv/bin/python -m unittest discover -s tests -v
 
 echo "=== compile check ==="
-.venv/bin/python -m py_compile capture_daemon.py event_segmenter.py memory_store.py mlx_backend.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
+.venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
 
 echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json remember-text \

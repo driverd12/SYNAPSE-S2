@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -17,9 +18,17 @@ def build_server_definition(
     *,
     repo_root: Path = ROOT,
     launcher_path: Path = DEFAULT_LAUNCHER,
+    client_agent_id: str = "local-mcp-client",
+    context_id: str = "default",
+    startup_prompt: str | None = None,
 ) -> dict[str, Any]:
     repo = repo_root.expanduser().resolve()
     launcher = launcher_path.expanduser()
+    agent = _sanitize_agent_id(client_agent_id)
+    context = _sanitize_context_id(context_id)
+    prompt = startup_prompt or (
+        f"Hydrate SYNAPSE-S2 context for {agent} local MCP client startup."
+    )
     return {
         "type": "stdio",
         "command": str(launcher),
@@ -30,6 +39,12 @@ def build_server_definition(
             "SYNAPSE_S2_STATE_PATH": str(repo / ".synapse_s2" / "runtime_state.json"),
             "SYNAPSE_S2_MEMORY_DB": str(repo / ".synapse_s2" / "memory.sqlite3"),
             "SYNAPSE_S2_EXPORT_DIR": str(repo / ".synapse_s2"),
+            "SYNAPSE_S2_CAPTURE_ROOT": str(repo / ".synapse_s2"),
+            "SYNAPSE_S2_CONTEXT_ID": context,
+            "SYNAPSE_S2_CLIENT_AGENT_ID": agent,
+            "SYNAPSE_S2_CLIENT_SESSION_BRIDGE": "1",
+            "SYNAPSE_S2_CLIENT_SESSION_SOURCE_TAG": "client-session-boundary",
+            "SYNAPSE_S2_CLIENT_STARTUP_PROMPT": prompt,
         },
         "timeout": 30000,
     }
@@ -44,7 +59,6 @@ def install_client_configs(
 ) -> dict[str, Any]:
     repo = repo_root.expanduser().resolve()
     home_path = home.expanduser()
-    server = build_server_definition(repo_root=repo, launcher_path=launcher_path)
     result: dict[str, Any] = {
         "server_name": SERVER_NAME,
         "repo_root": str(repo),
@@ -53,27 +67,42 @@ def install_client_configs(
         "clients": {},
     }
 
+    project_server = build_server_definition(
+        repo_root=repo,
+        launcher_path=launcher_path,
+        client_agent_id="project-mcp",
+    )
     project_path = repo / ".mcp.json"
     project_payload = _read_json(project_path, fallback={})
-    _merge_mcp_server(project_payload, server)
+    _merge_mcp_server(project_payload, project_server)
     result["clients"]["project_mcp"] = _write_json_if_changed(
         project_path,
         project_payload,
         dry_run=dry_run,
     )
 
+    desktop_server = build_server_definition(
+        repo_root=repo,
+        launcher_path=launcher_path,
+        client_agent_id="claude-desktop",
+    )
     desktop_path = home_path / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
     desktop_payload = _read_json(desktop_path, fallback={})
-    _merge_mcp_server(desktop_payload, server)
+    _merge_mcp_server(desktop_payload, desktop_server)
     result["clients"]["claude_desktop"] = _write_json_if_changed(
         desktop_path,
         desktop_payload,
         dry_run=dry_run,
     )
 
+    claude_code_server = build_server_definition(
+        repo_root=repo,
+        launcher_path=launcher_path,
+        client_agent_id="claude-code",
+    )
     claude_code_path = home_path / ".claude.json"
     claude_code_payload = _read_json(claude_code_path, fallback={})
-    _merge_mcp_server(claude_code_payload, server)
+    _merge_mcp_server(claude_code_payload, claude_code_server)
     _merge_claude_code_project(claude_code_payload, repo)
     result["clients"]["claude_code"] = _write_json_if_changed(
         claude_code_path,
@@ -81,10 +110,15 @@ def install_client_configs(
         dry_run=dry_run,
     )
 
+    codex_server = build_server_definition(
+        repo_root=repo,
+        launcher_path=launcher_path,
+        client_agent_id="codex-desktop",
+    )
     codex_path = home_path / ".codex" / "config.toml"
     next_codex = merge_codex_config_text(
         _read_text(codex_path),
-        server=server,
+        server=codex_server,
     )
     result["clients"]["codex"] = _write_text_if_changed(
         codex_path,
@@ -100,10 +134,15 @@ def install_client_configs(
 
 
 def merge_codex_config_text(text: str, *, server: dict[str, Any]) -> str:
-    if "[mcp_servers.synapse-s2]" in text:
-        return text
-    separator = "\n" if text.endswith("\n") or not text else "\n\n"
-    return text + separator + _codex_server_block(server)
+    cleaned = _remove_toml_sections(
+        text,
+        {
+            "mcp_servers.synapse-s2",
+            "mcp_servers.synapse-s2.env",
+        },
+    ).rstrip()
+    separator = "\n\n" if cleaned else ""
+    return cleaned + separator + _codex_server_block(server)
 
 
 def _codex_server_block(server: dict[str, Any]) -> str:
@@ -208,6 +247,31 @@ def _write_text_if_changed(path: Path, next_text: str, *, dry_run: bool) -> dict
 
 def _toml_string(value: str) -> str:
     return json.dumps(str(value))
+
+
+def _remove_toml_sections(text: str, section_names: set[str]) -> str:
+    lines: list[str] = []
+    skip = False
+    for line in str(text or "").splitlines():
+        match = re.match(r"\s*\[([^\]]+)\]\s*$", line)
+        if match:
+            section = match.group(1).strip()
+            skip = section in section_names
+            if skip:
+                continue
+        if not skip:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _sanitize_agent_id(agent_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.:@-]+", "_", str(agent_id or "").strip()).strip("._-:@")
+    return (cleaned or "local-mcp-client")[:128]
+
+
+def _sanitize_context_id(context_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(context_id or "").strip()).strip("._-:")
+    return (cleaned or "default")[:128]
 
 
 def build_parser() -> argparse.ArgumentParser:
