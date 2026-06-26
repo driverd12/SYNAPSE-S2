@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SYNAPSE-S2 Control</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Workspace">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">S2</div>
+          <div>
+            <h1>SYNAPSE-S2</h1>
+            <p id="runtimeLine">runtime pending</p>
+          </div>
+        </div>
+        <nav class="nav-list" aria-label="Sections">
+          <a href="#overview" class="nav-item active">Overview</a>
+          <a href="#memory" class="nav-item">Memory</a>
+          <a href="#recall" class="nav-item">Recall</a>
+          <a href="#maintenance" class="nav-item">Maintenance</a>
+        </nav>
+        <div class="context-block">
+          <label for="contextInput">Context</label>
+          <div class="context-row">
+            <input id="contextInput" value="board-demo" autocomplete="off" />
+            <button id="contextApply" class="icon-button" title="Apply context" aria-label="Apply context">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar" id="overview">
+          <div>
+            <p class="section-label">Local MCP workbench</p>
+            <h2>Spiking memory control plane</h2>
+          </div>
+          <div class="top-actions">
+            <button id="refreshButton" class="icon-button" title="Refresh" aria-label="Refresh">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+            </button>
+            <button id="toggleButton" class="toggle-button" aria-pressed="true">
+              <span class="toggle-dot" aria-hidden="true"></span>
+              <span id="toggleText">Enabled</span>
+            </button>
+          </div>
+        </header>
+
+        <section class="status-grid" aria-label="Runtime status">
+          <article class="metric-panel">
+            <span>Runtime</span>
+            <strong id="runtimeState">--</strong>
+            <small id="runtimeDetail">MLX pending</small>
+          </article>
+          <article class="metric-panel">
+            <span>Memory</span>
+            <strong id="memoryCount">--</strong>
+            <small id="relationshipCount">-- relationships</small>
+          </article>
+          <article class="metric-panel">
+            <span>Quick-Prune</span>
+            <strong id="pruneBudget">-- ms</strong>
+            <small id="pruneState">within 60 ms target</small>
+          </article>
+          <article class="metric-panel">
+            <span>Envelope</span>
+            <strong id="resourceMb">-- MB</strong>
+            <small id="envelopeState">61-138 MB target</small>
+          </article>
+        </section>
+
+        <section class="workspace-grid">
+          <article class="panel resource-panel" aria-labelledby="resourceTitle">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Resource Envelope</p>
+                <h3 id="resourceTitle">Topology footprint</h3>
+              </div>
+              <button id="profileButton" class="icon-button" title="Benchmark profile" aria-label="Benchmark profile">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v20"/><path d="M5 12h14"/><path d="m16 8 4 4-4 4"/><path d="m8 8-4 4 4 4"/></svg>
+              </button>
+            </div>
+            <div class="envelope">
+              <div class="envelope-track">
+                <div id="envelopeFill" class="envelope-fill"></div>
+                <div id="envelopeMarker" class="envelope-marker" aria-hidden="true"></div>
+              </div>
+              <div class="envelope-scale">
+                <span>61 MB</span>
+                <span id="currentEnvelope">-- MB</span>
+                <span>138 MB</span>
+              </div>
+            </div>
+            <dl class="array-list" id="arrayList"></dl>
+          </article>
+
+          <article class="panel graph-panel" id="memory" aria-labelledby="graphTitle">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Memory Graph</p>
+                <h3 id="graphTitle">Event relationships</h3>
+              </div>
+              <span id="graphSummary" class="status-chip">-- edges</span>
+            </div>
+            <svg id="graphSvg" viewBox="0 0 760 360" role="img" aria-label="Memory relationship graph"></svg>
+          </article>
+
+          <article class="panel recall-panel" id="recall" aria-labelledby="recallTitle">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Recall Console</p>
+                <h3 id="recallTitle">Associative query</h3>
+              </div>
+            </div>
+            <form id="queryForm" class="query-form">
+              <textarea id="queryInput" rows="4">durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients</textarea>
+              <button class="primary-button" type="submit">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>
+                Recall
+              </button>
+            </form>
+            <div id="queryResults" class="result-list" aria-live="polite"></div>
+          </article>
+
+          <article class="panel maintenance-panel" id="maintenance" aria-labelledby="maintenanceTitle">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Maintenance</p>
+                <h3 id="maintenanceTitle">Lifecycle controls</h3>
+              </div>
+            </div>
+            <div class="action-grid">
+              <button id="quickPruneButton" class="action-button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"/><path d="M6 16h12"/><path d="M8 12h8"/><path d="M10 8h4"/><path d="M12 4v16"/></svg>
+                Quick prune
+              </button>
+              <button id="sleepButton" class="action-button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15.5A8.5 8.5 0 0 1 8.5 3a7 7 0 1 0 12.5 12.5Z"/></svg>
+                Deep sleep
+              </button>
+              <button id="backupButton" class="action-button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
+                Backup
+              </button>
+            </div>
+            <pre id="operationLog" class="operation-log">ready</pre>
+          </article>
+        </section>
+      </main>
+    </div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

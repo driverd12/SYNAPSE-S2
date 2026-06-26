@@ -136,6 +136,21 @@ Idle deep-sleep consolidation is available from MCP and CLI:
 
 Deep sleep returns all seven proposal lifecycle phases: connection weight decay, synaptic clustering, semantic merging, threshold rescoring, trace promotion, relationship extraction, and neurogenesis.
 
+### 7. Local Control Dashboard
+
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, graph memory inspection, recall, quick-pruning, deep-sleep, and backups.
+
+```bash
+.venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context board-demo
+open "http://127.0.0.1:8765/?context_id=board-demo"
+```
+
+For non-interactive readiness checks:
+
+```bash
+.venv/bin/python scripts/smoke_dashboard.py board-demo
+```
+
 ## **System Architecture**
 
 The plugin acts as a middleware daemon communicating with local editor interfaces and LLM desktop wrappers via JSON-RPC 2.0 over standard input/output (stdio) channels.

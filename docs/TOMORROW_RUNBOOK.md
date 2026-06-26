@@ -9,7 +9,7 @@ cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local 
 scripts/prep_tomorrow.sh
 ```
 
-The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, seeds the `board-demo` memory context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, and writes a SQLite backup into `.synapse_s2`.
+The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, seeds the `board-demo` memory context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
 ## Expected ready signal
 
@@ -99,6 +99,21 @@ Proposal lifecycle smoke:
 ```
 
 The deep-sleep response should include `phase_count: 7` and phase names for connection weight decay, synaptic clustering, semantic merging, threshold rescoring, trace promotion, relationship extraction, and neurogenesis.
+
+## Local Dashboard
+
+Launch the loopback dashboard:
+
+```bash
+.venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context board-demo
+open "http://127.0.0.1:8765/?context_id=board-demo"
+```
+
+The dashboard shows runtime status, context enablement, topology resource envelope, memory graph edges, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+
+```bash
+.venv/bin/python scripts/smoke_dashboard.py board-demo
+```
 
 ## MCP Inspector
 
