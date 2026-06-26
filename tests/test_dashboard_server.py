@@ -59,6 +59,10 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["status"]["memory_context_entry_count"], 4)
         self.assertGreaterEqual(payload["graph"]["relationship_count"], 1)
         self.assertIn("estimated_total_mb", payload["profile"])
+        self.assertEqual(payload["system"]["model_uri"], "s2://local/demo")
+        self.assertEqual(payload["system"]["mode"], "LOCAL ONLY")
+        self.assertIn("project_version", payload["system"])
+        self.assertIn("uptime_seconds", payload["system"])
 
     def test_snapshot_defaults_to_neutral_context(self):
         with TemporaryDirectory() as tmp:
@@ -98,6 +102,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertFalse(toggle_payload["effective_enabled"])
         self.assertEqual(query_status, 200)
         self.assertIn("disabled", query_payload["result"].lower())
+        self.assertIn("latency_ms", query_payload)
+        self.assertIn("query_id", query_payload)
+        self.assertEqual(query_payload["results"][0]["kind"], "status")
 
     def test_profile_and_quick_prune_endpoints_report_budget(self):
         with TemporaryDirectory() as tmp:

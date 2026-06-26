@@ -4,8 +4,12 @@ import argparse
 import json
 import logging
 import os
+import platform
+import re
+import subprocess
 import sys
 import time
+import tomllib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -56,6 +60,8 @@ class DashboardRuntime:
 
     def __init__(self, backend: mlx_backend.SpikingAttentionBackend | None = None) -> None:
         self._backend = backend
+        self.started_at = time.time()
+        self._system_info_cache: dict[str, Any] | None = None
 
     @property
     def backend(self) -> mlx_backend.SpikingAttentionBackend:
@@ -123,11 +129,22 @@ class DashboardRuntime:
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
             prompt = self._text_payload(payload, "prompt", max_bytes=MAX_TEXT_BYTES)
+            started = time.perf_counter()
             result = self.backend.query(
                 self.backend.embed_text(prompt),
                 context_id=context,
             )
-            return self._json_response({"context_id": context, "prompt": prompt, "result": result})
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            return self._json_response(
+                {
+                    "context_id": context,
+                    "prompt": prompt,
+                    "result": result,
+                    "results": self._parse_recall_result(result),
+                    "latency_ms": elapsed_ms,
+                    "query_id": self._query_id(context=context),
+                }
+            )
         if method == "POST" and path == "/api/remember":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
@@ -175,13 +192,122 @@ class DashboardRuntime:
         raise DashboardError(HTTPStatus.NOT_FOUND, "route not found")
 
     def snapshot(self, *, context_id: str, limit: int = 50) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
         return {
-            "context_id": mlx_backend.sanitize_context_id(context_id),
-            "status": self.backend.status(context_id=context_id),
+            "context_id": context,
+            "status": self.backend.status(context_id=context),
             "profile": self.backend.resource_profile(benchmark_quick_prune=False),
-            "graph": self.backend.list_memory_graph(context_id=context_id, limit=limit),
+            "graph": self.backend.list_memory_graph(context_id=context, limit=limit),
+            "system": self._system_info(context_id=context),
             "generated_at": time.time(),
         }
+
+    def _system_info(self, *, context_id: str) -> dict[str, Any]:
+        if self._system_info_cache is None:
+            self._system_info_cache = {
+                "project_version": self._project_version(),
+                "platform": platform.system() or "Darwin",
+                "machine": platform.machine(),
+                "macos_version": platform.mac_ver()[0],
+                "chip": self._chip_label(),
+                "pid": os.getpid(),
+            }
+        info = dict(self._system_info_cache)
+        uptime_seconds = max(0.0, time.time() - self.started_at)
+        info.update(
+            {
+                "started_at": self.started_at,
+                "uptime_seconds": round(uptime_seconds, 3),
+                "model_uri": f"s2://local/{mlx_backend.sanitize_context_id(context_id)}",
+                "mode": "LOCAL ONLY",
+            }
+        )
+        return info
+
+    def _project_version(self) -> str:
+        try:
+            with (ROOT / "pyproject.toml").open("rb") as handle:
+                payload = tomllib.load(handle)
+            return str(payload.get("project", {}).get("version", "local"))
+        except Exception:
+            LOGGER.exception("failed to read project version")
+            return "local"
+
+    def _chip_label(self) -> str:
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+            label = result.stdout.strip()
+            if label:
+                return label
+        except Exception:
+            LOGGER.debug("failed to read Apple chip label", exc_info=True)
+        machine = platform.machine()
+        return machine or "unknown"
+
+    def _parse_recall_result(self, result: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for rank, chunk in enumerate(str(result or "").split(" / "), start=1):
+            text = chunk.strip()
+            if not text:
+                continue
+            parsed = self._parse_recall_chunk(text)
+            parsed["rank"] = rank
+            parsed["raw"] = text
+            items.append(parsed)
+        return items
+
+    def _parse_recall_chunk(self, text: str) -> dict[str, Any]:
+        match = re.match(r"^(?P<tag>.+?)\s+\((?P<meta>[^()]*)\)$", text)
+        if not match:
+            return {
+                "kind": "status",
+                "tag": text,
+                "label": text,
+            }
+        metadata = self._parse_key_value_pairs(match.group("meta"))
+        item: dict[str, Any] = {
+            "kind": "linked" if "linked" in metadata else "memory",
+            "tag": match.group("tag"),
+            "label": match.group("tag"),
+            "metadata": metadata,
+        }
+        if "score" in metadata:
+            item["score"] = metadata["score"]
+        if "weight" in metadata:
+            item["weight"] = metadata["weight"]
+        if "context" in metadata:
+            item["context_id"] = metadata["context"]
+        if "id" in metadata:
+            item["memory_id"] = metadata["id"]
+        if "linked" in metadata:
+            item["relation_type"] = metadata["linked"]
+        return item
+
+    def _parse_key_value_pairs(self, text: str) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        for part in text.split(","):
+            key, separator, value = part.partition("=")
+            if not separator:
+                continue
+            clean_key = key.strip()
+            clean_value = value.strip()
+            if clean_key in {"score", "weight"}:
+                try:
+                    metadata[clean_key] = round(float(clean_value), 6)
+                    continue
+                except ValueError:
+                    pass
+            metadata[clean_key] = clean_value
+        return metadata
+
+    def _query_id(self, *, context: str) -> str:
+        return f"q_{time.strftime('%Y%m%d_%H%M%S')}_{context}"
 
     def _serve_static(self, path: str) -> tuple[int, dict[str, str], bytes]:
         if path in ("", "/"):
