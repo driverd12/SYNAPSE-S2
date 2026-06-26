@@ -94,6 +94,38 @@ LATEST_EVENT_ID=$(.venv/bin/python synapse_cli.py --json status --context defaul
 .venv/bin/python synapse_cli.py --json list-context-cursors --context default
 ```
 
+Conversation capture:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-session \
+  --context default \
+  --tag codex-session \
+  --speaker codex \
+  --text "Capture real decisions, corrections, temporal order, validation evidence, and follow-up constraints from the current operator or agent session."
+```
+
+This creates event nodes in the relationship visualizer and publishes a durable context-bus event for connected clients to pull. Do not capture secrets, credentials, raw tokens, private keys, or speculative claims.
+
+Hand pruning:
+
+```bash
+.venv/bin/python synapse_cli.py --json graph --context default --limit 30
+.venv/bin/python synapse_cli.py --json prune-memory \
+  --context default \
+  --target-type event \
+  --memory-id "<memory-id-from-graph>" \
+  --reason "remove sensitive or incorrect event" \
+  --confirm
+.venv/bin/python synapse_cli.py --json prune-memory \
+  --context default \
+  --target-type relationship \
+  --relationship-id "<relationship-id-from-graph>" \
+  --reason "remove bad relationship edge" \
+  --confirm
+```
+
+Supported prune targets are `event`, `memory`, `relationship`, `context_event`, `temporal`, and `associative`. Use single-node or single-edge pruning first; mode-wide `temporal` and `associative` pruning clears all matching relationship edges in the selected context.
+
 Resource envelope:
 
 ```bash
@@ -127,7 +159,7 @@ Launch the loopback dashboard:
 open "http://127.0.0.1:8765/?context_id=default"
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, event ingestion, memory graph edges, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, event ingestion, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default
@@ -149,8 +181,10 @@ Useful tool calls:
 | `remember_spiking_context` | Stores a new local memory trace. |
 | `query_spiking_attention_text` | Recalls local memory from text without external embedding calls. |
 | `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
+| `capture_spiking_conversation` | Captures real operator/agent session notes into event memory. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
+| `prune_spiking_memory` | Removes a node, relationship edge, deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pulls context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Records the last deployment event consumed by a local client. |
 | `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |

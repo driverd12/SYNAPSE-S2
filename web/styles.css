@@ -252,6 +252,7 @@ dd {
 .utility-button,
 .primary-button,
 .secondary-button,
+.danger-button,
 .switch-button,
 .guard-button,
 .action-row {
@@ -270,6 +271,7 @@ dd {
 .icon-button:hover,
 .utility-button:hover,
 .secondary-button:hover,
+.danger-button:hover,
 .guard-button:hover,
 .action-row:hover {
   border-color: var(--border-strong);
@@ -280,6 +282,7 @@ dd {
 .utility-button:focus-visible,
 .primary-button:focus-visible,
 .secondary-button:focus-visible,
+.danger-button:focus-visible,
 .switch-button:focus-visible,
 .guard-button:focus-visible,
 .action-row:focus-visible,
@@ -331,6 +334,7 @@ svg {
 .utility-button svg,
 .primary-button svg,
 .secondary-button svg,
+.danger-button svg,
 .action-row svg,
 .quick-prune-strip svg,
 .nav-item svg {
@@ -1211,9 +1215,11 @@ textarea {
   border-top: 1px solid var(--row);
 }
 
-.memory-ledger-row {
+.memory-ledger-row,
+.relationship-ledger-row,
+.context-event-ledger-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(80px, auto) minmax(112px, auto);
+  grid-template-columns: minmax(0, 1fr) minmax(80px, auto) minmax(112px, auto) minmax(84px, auto);
   align-items: center;
   gap: 12px;
   min-height: 46px;
@@ -1221,14 +1227,18 @@ textarea {
   font-size: 12px;
 }
 
-.memory-ledger-row div {
+.memory-ledger-row div,
+.relationship-ledger-row div,
+.context-event-ledger-row div {
   display: grid;
   gap: 2px;
   min-width: 0;
   padding: 7px 0;
 }
 
-.memory-ledger-row strong {
+.memory-ledger-row strong,
+.relationship-ledger-row strong,
+.context-event-ledger-row strong {
   overflow: hidden;
   color: var(--text);
   font-weight: 780;
@@ -1236,16 +1246,52 @@ textarea {
   white-space: nowrap;
 }
 
-.memory-ledger-row p {
+.memory-ledger-row p,
+.relationship-ledger-row p,
+.context-event-ledger-row p {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .memory-ledger-row span,
-.memory-ledger-row time {
+.memory-ledger-row time,
+.relationship-ledger-row span,
+.relationship-ledger-row time,
+.context-event-ledger-row span,
+.context-event-ledger-row time {
   text-align: right;
   white-space: nowrap;
+}
+
+.relationship-ledger,
+.context-event-ledger {
+  display: grid;
+  margin-top: 10px;
+  border-top: 1px solid var(--row);
+}
+
+.relationship-ledger::before,
+.context-event-ledger::before,
+.memory-ledger::before {
+  padding: 9px 0 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.relationship-ledger::before {
+  content: "Relationship Edges";
+}
+
+.context-event-ledger::before {
+  content: "Context Deployments";
+}
+
+.memory-ledger::before {
+  content: "Memory Nodes";
 }
 
 .memory-ledger-empty,
@@ -1392,7 +1438,7 @@ textarea {
 
 .write-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -1428,6 +1474,61 @@ textarea {
 .field-grid {
   display: grid;
   gap: 8px;
+}
+
+.graph-safety-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 12px;
+}
+
+.graph-safety-panel h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.prune-form {
+  display: grid;
+  grid-template-columns: minmax(120px, .85fr) repeat(5, minmax(0, 1fr)) minmax(116px, auto);
+  gap: 8px;
+}
+
+.mode-prune-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.danger-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0 10px;
+  border-color: color-mix(in srgb, #ef4444 42%, var(--border));
+  background: color-mix(in srgb, #ef4444 8%, var(--panel));
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 820;
+}
+
+.danger-button:hover {
+  border-color: #ef4444;
+  background: color-mix(in srgb, #ef4444 14%, var(--panel));
+}
+
+.danger-button.secondary-danger {
+  min-height: 32px;
+}
+
+.prune-row-button {
+  min-height: 30px;
 }
 
 .field-row {
@@ -1568,6 +1669,14 @@ textarea {
     grid-template-columns: 1fr;
   }
 
+  .write-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .prune-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .bottom-bar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1588,6 +1697,7 @@ textarea {
   .query-form,
   .result-list,
   .write-grid,
+  .prune-form,
   .field-row,
   .bottom-bar {
     grid-template-columns: 1fr;
@@ -1630,14 +1740,20 @@ textarea {
   }
 
   .array-list div,
-  .memory-ledger-row {
+  .memory-ledger-row,
+  .relationship-ledger-row,
+  .context-event-ledger-row {
     grid-template-columns: 1fr;
     gap: 3px;
     padding: 8px 0;
   }
 
   .memory-ledger-row span,
-  .memory-ledger-row time {
+  .memory-ledger-row time,
+  .relationship-ledger-row span,
+  .relationship-ledger-row time,
+  .context-event-ledger-row span,
+  .context-event-ledger-row time {
     text-align: left;
   }
 

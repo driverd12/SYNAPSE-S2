@@ -1085,6 +1085,180 @@ class SpikingAttentionBackend:
             LOGGER.exception("event ingestion failed for context_id=%s source_tag=%s", context, source)
             raise
 
+    def capture_conversation(
+        self,
+        *,
+        text: str,
+        context_id: str = "default",
+        source_tag: str = "codex-session",
+        speaker: str = "operator",
+        surprise_threshold: float = 0.5,
+        min_segment_sentences: int = 1,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        source = sanitize_tag(source_tag).replace(" ", "-")
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            raise ValueError("conversation text must not be empty")
+        clean_speaker = sanitize_agent_id(speaker)
+        capture_metadata = self._json_safe_metadata(
+            {
+                **(metadata or {}),
+                "source": "conversation-capture",
+                "conversation_capture": True,
+                "speaker": clean_speaker,
+                "temporal": True,
+            }
+        )
+        try:
+            ingestion = self.ingest_text_events(
+                text=clean_text,
+                context_id=context,
+                source_tag=source,
+                surprise_threshold=surprise_threshold,
+                min_segment_sentences=min_segment_sentences,
+                metadata=capture_metadata,
+            )
+            ingestion["action"] = "capture-conversation"
+            ingestion["speaker"] = clean_speaker
+            ingestion["agent_deployment"] = self.publish_context_event(
+                context_id=context,
+                source_surface="conversation-capture",
+                event_type="conversation-capture",
+                summary=(
+                    f"{source} captured {ingestion['event_count']} conversation events"
+                ),
+                payload={
+                    "source_tag": ingestion["source_tag"],
+                    "sequence_id": ingestion["sequence_id"],
+                    "speaker": clean_speaker,
+                    "event_count": ingestion["event_count"],
+                    "relationship_count": ingestion["relationship_count"],
+                    "events": ingestion["events"],
+                    "relationships": ingestion["relationships"],
+                },
+            )
+            return ingestion
+        except Exception:
+            LOGGER.exception(
+                "conversation capture failed for context_id=%s source_tag=%s",
+                context,
+                source,
+            )
+            raise
+
+    def prune_memory(
+        self,
+        *,
+        context_id: str = "default",
+        target_type: str,
+        memory_id: str = "",
+        tag: str = "",
+        relationship_id: str = "",
+        event_id: int = 0,
+        reason: str = "",
+        source_surface: str = "operator",
+        publish_audit: bool = True,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        normalized_target = str(target_type or "").strip().lower().replace("-", "_")
+        if normalized_target in {"node", "memory", "trace", "event"}:
+            result = self.memory_store.delete_entry(
+                context_id=context,
+                memory_id=str(memory_id or "").strip() or None,
+                tag=sanitize_tag(tag) if str(tag or "").strip() else None,
+            )
+            self._refresh_registered_traces()
+            self._persist_runtime_state()
+        elif normalized_target in {"relationship", "edge"}:
+            clean_relationship_id = str(relationship_id or "").strip()
+            if not clean_relationship_id:
+                raise ValueError("relationship_id is required for relationship pruning")
+            result = self.memory_store.delete_relationship(
+                context_id=context,
+                relationship_id=clean_relationship_id,
+            )
+        elif normalized_target in {"temporal", "associative"}:
+            result = self.memory_store.delete_relationships_by_mode(
+                context_id=context,
+                mode=normalized_target,
+            )
+        elif normalized_target in {"context_event", "deployment", "context_deployment"}:
+            if int(event_id or 0) <= 0:
+                raise ValueError("event_id is required for context_event pruning")
+            result = self.memory_store.delete_context_event(
+                context_id=context,
+                event_id=int(event_id),
+            )
+            normalized_target = "context_event"
+        else:
+            raise ValueError(
+                "target_type must be memory, node, event, relationship, edge, "
+                "temporal, associative, or context_event"
+            )
+
+        safe_result = self._redact_prune_result(result)
+        payload = {
+            "context_id": context,
+            "target_type": normalized_target,
+            "reason": str(reason or ""),
+            "result": safe_result,
+        }
+        audit_event = None
+        if publish_audit:
+            audit_event = self.publish_context_event(
+                context_id=context,
+                source_surface=str(source_surface or "operator"),
+                event_type="prune-memory",
+                summary=(
+                    f"{normalized_target} prune "
+                    f"{'removed data' if safe_result.get('deleted') else 'found no match'}"
+                ),
+                payload=payload,
+            )
+        self._mark_activity()
+        return {
+            "action": "prune-memory",
+            "context_id": context,
+            "target_type": normalized_target,
+            "reason": str(reason or ""),
+            "result": safe_result,
+            "agent_deployment": audit_event,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def _redact_prune_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        safe = dict(result)
+        entry = safe.get("entry")
+        if isinstance(entry, dict):
+            safe["entry"] = {
+                "memory_id": entry.get("memory_id"),
+                "tag": entry.get("tag"),
+                "context_id": entry.get("context_id"),
+                "source_text_bytes": len(str(entry.get("source_text") or "").encode("utf-8")),
+            }
+        relationship = safe.get("relationship")
+        if isinstance(relationship, dict):
+            safe["relationship"] = {
+                "relationship_id": relationship.get("relationship_id"),
+                "context_id": relationship.get("context_id"),
+                "source_memory_id": relationship.get("source_memory_id"),
+                "target_memory_id": relationship.get("target_memory_id"),
+                "relation_type": relationship.get("relation_type"),
+                "weight": relationship.get("weight"),
+            }
+        event = safe.get("event")
+        if isinstance(event, dict):
+            safe["event"] = {
+                "event_id": event.get("event_id"),
+                "context_id": event.get("context_id"),
+                "event_type": event.get("event_type"),
+                "source_surface": event.get("source_surface"),
+                "summary": event.get("summary"),
+            }
+        return safe
+
     def _link_semantic_event_overlaps(
         self,
         *,
@@ -1693,6 +1867,52 @@ def ingest_text_events(
         surprise_threshold=surprise_threshold,
         min_segment_sentences=min_segment_sentences,
         metadata=metadata,
+    )
+
+
+def capture_conversation(
+    *,
+    text: str,
+    context_id: str = "default",
+    source_tag: str = "codex-session",
+    speaker: str = "operator",
+    surprise_threshold: float = 0.5,
+    min_segment_sentences: int = 1,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return get_backend().capture_conversation(
+        text=text,
+        context_id=context_id,
+        source_tag=source_tag,
+        speaker=speaker,
+        surprise_threshold=surprise_threshold,
+        min_segment_sentences=min_segment_sentences,
+        metadata=metadata,
+    )
+
+
+def prune_memory(
+    *,
+    context_id: str = "default",
+    target_type: str,
+    memory_id: str = "",
+    tag: str = "",
+    relationship_id: str = "",
+    event_id: int = 0,
+    reason: str = "",
+    source_surface: str = "operator",
+    publish_audit: bool = True,
+) -> dict[str, Any]:
+    return get_backend().prune_memory(
+        context_id=context_id,
+        target_type=target_type,
+        memory_id=memory_id,
+        tag=tag,
+        relationship_id=relationship_id,
+        event_id=event_id,
+        reason=reason,
+        source_surface=source_surface,
+        publish_audit=publish_audit,
     )
 
 

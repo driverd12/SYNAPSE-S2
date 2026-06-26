@@ -247,9 +247,18 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Context bus", index)
         self.assertIn("Remember + publish", index)
         self.assertIn("Ingest + publish", index)
+        self.assertIn("Capture conversation", index)
+        self.assertIn("graph-safety-panel", index)
+        self.assertIn("pruneForm", index)
+        self.assertIn("relationshipLedger", index)
+        self.assertIn("contextEventLedger", index)
         self.assertIn("Locked. Press Unlock", index)
         self.assertIn("CORE_TOGGLE_UNLOCK_WINDOW_MS", app)
         self.assertIn("renderContextBus", app)
+        self.assertIn("renderRelationshipLedger", app)
+        self.assertIn("renderContextEventLedger", app)
+        self.assertIn("pruneGraphItem", app)
+        self.assertIn("captureForm", app)
         self.assertIn("logSnapshotResponse", app)
         self.assertIn("unlockCoreToggleGuard", app)
         self.assertIn("lockCoreToggleGuard", app)
@@ -267,7 +276,10 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("data-theme", styles)
         self.assertIn("/api/remember", app)
         self.assertIn("/api/ingest", app)
+        self.assertIn("/api/capture-conversation", app)
+        self.assertIn("/api/prune-memory", app)
         self.assertIn("/api/context-events", app)
+        self.assertIn("danger-button", styles)
         self.assertNotIn("board-demo", index)
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)
@@ -394,6 +406,164 @@ class DashboardRuntimeTests(unittest.TestCase):
                 for entry in snapshot_payload["graph"]["entries"]
             )
         )
+
+    def test_capture_conversation_endpoint_publishes_visible_session_events(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            capture_status, capture_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-conversation",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "source_tag": "codex-session",
+                            "speaker": "codex",
+                            "text": (
+                                "User expects real conversation details in the graph. "
+                                "Codex captures durable session events. "
+                                "The memory graph should show these notes."
+                            ),
+                        }
+                    ).encode(),
+                )
+            )
+            graph_status, graph_payload = self.decode(
+                runtime.handle("GET", "/api/graph?context_id=demo&limit=30")
+            )
+
+        self.assertEqual(capture_status, 200)
+        self.assertGreaterEqual(capture_payload["event_count"], 2)
+        self.assertTrue(capture_payload["agent_deployment"]["published"])
+        self.assertEqual(capture_payload["agent_deployment"]["event_type"], "conversation-capture")
+        self.assertEqual(graph_status, 200)
+        self.assertTrue(
+            any(
+                entry["metadata"].get("conversation_capture") is True
+                for entry in graph_payload["entries"]
+            )
+        )
+
+    def test_prune_memory_endpoint_removes_single_nodes_edges_and_deployments(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            ingest_status, ingest_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-conversation",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "source_tag": "bad-session",
+                            "speaker": "user",
+                            "text": (
+                                "Sensitive event should be pruned. "
+                                "Remaining event can stay available. "
+                                "Shared terms create graph relationships."
+                            ),
+                        }
+                    ).encode(),
+                )
+            )
+            graph_status, graph_payload = self.decode(
+                runtime.handle("GET", "/api/graph?context_id=demo&limit=30")
+            )
+            memory_id = next(
+                entry["memory_id"]
+                for entry in graph_payload["entries"]
+                if entry["tag"].startswith("bad-session-event")
+            )
+            relationship_id = graph_payload["relationships"][0]["relationship_id"]
+            deployment_id = ingest_payload["agent_deployment"]["event_id"]
+
+            edge_status, edge_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/prune-memory",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "target_type": "relationship",
+                            "relationship_id": relationship_id,
+                            "confirm": True,
+                            "reason": "bad edge",
+                        }
+                    ).encode(),
+                )
+            )
+            node_status, node_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/prune-memory",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "target_type": "event",
+                            "memory_id": memory_id,
+                            "confirm": True,
+                            "reason": "bad node",
+                        }
+                    ).encode(),
+                )
+            )
+            deployment_status, deployment_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/prune-memory",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "target_type": "context_event",
+                            "event_id": deployment_id,
+                            "confirm": True,
+                            "reason": "bad deployment",
+                        }
+                    ).encode(),
+                )
+            )
+            final_graph_status, final_graph = self.decode(
+                runtime.handle("GET", "/api/graph?context_id=demo&limit=30")
+            )
+
+        self.assertEqual(ingest_status, 200)
+        self.assertEqual(graph_status, 200)
+        self.assertEqual(edge_status, 200)
+        self.assertEqual(edge_payload["target_type"], "relationship")
+        self.assertTrue(edge_payload["result"]["deleted"])
+        self.assertEqual(node_status, 200)
+        self.assertTrue(node_payload["result"]["deleted"])
+        self.assertEqual(deployment_status, 200)
+        self.assertTrue(deployment_payload["result"]["deleted"])
+        self.assertEqual(final_graph_status, 200)
+        self.assertNotIn(memory_id, [entry["memory_id"] for entry in final_graph["entries"]])
+
+    def test_prune_memory_endpoint_requires_explicit_confirmation(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            graph_status, graph_payload = self.decode(
+                runtime.handle("GET", "/api/graph?context_id=demo&limit=30")
+            )
+            relationship_id = graph_payload["relationships"][0]["relationship_id"]
+
+            prune_status, prune_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/prune-memory",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "target_type": "relationship",
+                            "relationship_id": relationship_id,
+                            "confirm": False,
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(graph_status, 200)
+        self.assertEqual(prune_status, 400)
+        self.assertIn("confirm", prune_payload["error"])
 
     def test_context_events_endpoint_lists_published_agent_handoffs(self):
         with TemporaryDirectory() as tmp:

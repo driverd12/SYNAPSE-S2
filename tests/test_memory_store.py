@@ -149,6 +149,118 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(exported["context_events"][0]["summary"], "operator-note captured and published")
         self.assertEqual(exported["context_cursors"][0]["agent_id"], "codex-desktop")
 
+    def test_delete_entry_cascades_relationships_and_memory_events(self):
+        with TemporaryDirectory() as tmp:
+            store = DurableMemoryStore(Path(tmp) / "synapse-memory.sqlite3")
+            first = store.upsert_entry(
+                tag="sensitive-event-001",
+                context_id="demo",
+                source_text="Sensitive partial truth that must be removed.",
+                metadata={"event_segment": True},
+                embedding_dimensions=8,
+                spike_indices=[1, 2],
+                neuron_indices=[3, 4],
+            )
+            second = store.upsert_entry(
+                tag="safe-event-002",
+                context_id="demo",
+                source_text="Retained context.",
+                metadata={"event_segment": True},
+                embedding_dimensions=8,
+                spike_indices=[5, 6],
+                neuron_indices=[7, 8],
+            )
+            store.upsert_relationship(
+                context_id="demo",
+                source_memory_id=first["memory_id"],
+                target_memory_id=second["memory_id"],
+                relation_type="temporal_next",
+                weight=0.88,
+                evidence={"reason": "sequence"},
+            )
+
+            deletion = store.delete_entry(context_id="demo", memory_id=first["memory_id"])
+            remaining_entries = store.list_entries(context_id="demo")
+            remaining_relationships = store.list_relationships(context_id="demo")
+
+        self.assertTrue(deletion["deleted"])
+        self.assertEqual(deletion["deleted_memory_id"], first["memory_id"])
+        self.assertEqual(deletion["deleted_relationship_count"], 1)
+        self.assertGreaterEqual(deletion["deleted_memory_event_count"], 1)
+        self.assertEqual([entry["tag"] for entry in remaining_entries], ["safe-event-002"])
+        self.assertEqual(remaining_relationships, [])
+
+    def test_delete_relationship_and_relationship_modes_are_precise(self):
+        with TemporaryDirectory() as tmp:
+            store = DurableMemoryStore(Path(tmp) / "synapse-memory.sqlite3")
+            entries = [
+                store.upsert_entry(
+                    tag=f"event-{index}",
+                    context_id="demo",
+                    source_text=f"Event {index}",
+                    metadata={"event_segment": True},
+                    embedding_dimensions=8,
+                    spike_indices=[index],
+                    neuron_indices=[index],
+                )
+                for index in range(1, 4)
+            ]
+            temporal = store.upsert_relationship(
+                context_id="demo",
+                source_memory_id=entries[0]["memory_id"],
+                target_memory_id=entries[1]["memory_id"],
+                relation_type="temporal_next",
+                weight=0.91,
+            )
+            semantic = store.upsert_relationship(
+                context_id="demo",
+                source_memory_id=entries[0]["memory_id"],
+                target_memory_id=entries[2]["memory_id"],
+                relation_type="semantic_overlap",
+                weight=0.51,
+            )
+            removed_edge = store.delete_relationship(
+                context_id="demo",
+                relationship_id=temporal["relationship_id"],
+            )
+            removed_associative = store.delete_relationships_by_mode(
+                context_id="demo",
+                mode="associative",
+            )
+            remaining_relationships = store.list_relationships(context_id="demo")
+
+        self.assertTrue(removed_edge["deleted"])
+        self.assertEqual(removed_edge["relationship_id"], temporal["relationship_id"])
+        self.assertEqual(removed_associative["deleted_relationship_count"], 1)
+        self.assertEqual(removed_associative["deleted_relationship_ids"], [semantic["relationship_id"]])
+        self.assertEqual(remaining_relationships, [])
+
+    def test_delete_context_event_removes_single_deployment_record(self):
+        with TemporaryDirectory() as tmp:
+            store = DurableMemoryStore(Path(tmp) / "synapse-memory.sqlite3")
+            first = store.publish_context_event(
+                context_id="demo",
+                source_surface="test",
+                event_type="conversation-capture",
+                summary="first",
+            )
+            second = store.publish_context_event(
+                context_id="demo",
+                source_surface="test",
+                event_type="prune-memory",
+                summary="second",
+            )
+
+            deletion = store.delete_context_event(
+                context_id="demo",
+                event_id=first["event_id"],
+            )
+            remaining = store.list_context_events(context_id="demo", limit=10)
+
+        self.assertTrue(deletion["deleted"])
+        self.assertEqual(deletion["event_id"], first["event_id"])
+        self.assertEqual([event["event_id"] for event in remaining], [second["event_id"]])
+
 
 if __name__ == "__main__":
     unittest.main()

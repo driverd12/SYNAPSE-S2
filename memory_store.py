@@ -501,6 +501,165 @@ class DurableMemoryStore:
             LOGGER.exception("failed to list memory relationships")
             raise
 
+    def delete_entry(
+        self,
+        *,
+        context_id: str | None = None,
+        memory_id: str | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if memory_id:
+            clauses.append("memory_id = ?")
+            params.append(str(memory_id))
+        if context_id is not None:
+            clauses.append("context_id = ?")
+            params.append(str(context_id))
+        if tag:
+            clauses.append("tag = ?")
+            params.append(str(tag))
+        if not clauses or (not memory_id and not tag):
+            raise ValueError("delete_entry requires memory_id or tag")
+        where_sql = " AND ".join(clauses)
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    f"SELECT * FROM memory_entries WHERE {where_sql} LIMIT 1",
+                    tuple(params),
+                ).fetchone()
+                if row is None:
+                    return {
+                        "deleted": False,
+                        "deleted_memory_id": str(memory_id or ""),
+                        "deleted_relationship_count": 0,
+                        "deleted_memory_event_count": 0,
+                        "entry": None,
+                    }
+                entry = self._row_to_entry(row)
+                entry_id = entry["memory_id"]
+                relationship_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM memory_relationships
+                        WHERE source_memory_id = ? OR target_memory_id = ?
+                        """,
+                        (entry_id, entry_id),
+                    ).fetchone()[0]
+                )
+                memory_event_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM memory_events WHERE memory_id = ?",
+                        (entry_id,),
+                    ).fetchone()[0]
+                )
+                conn.execute("DELETE FROM memory_entries WHERE memory_id = ?", (entry_id,))
+            return {
+                "deleted": True,
+                "deleted_memory_id": entry_id,
+                "deleted_relationship_count": relationship_count,
+                "deleted_memory_event_count": memory_event_count,
+                "entry": entry,
+            }
+        except Exception:
+            LOGGER.exception(
+                "failed to delete memory entry context_id=%s memory_id=%s tag=%s",
+                context_id,
+                memory_id,
+                tag,
+            )
+            raise
+
+    def delete_relationship(
+        self,
+        *,
+        relationship_id: str,
+        context_id: str | None = None,
+    ) -> dict[str, Any]:
+        relationship = self.get_relationship(str(relationship_id))
+        if relationship is None or (
+            context_id is not None and relationship["context_id"] != str(context_id)
+        ):
+            return {
+                "deleted": False,
+                "relationship_id": str(relationship_id),
+                "relationship": None,
+            }
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(
+                    "DELETE FROM memory_relationships WHERE relationship_id = ?",
+                    (str(relationship_id),),
+                )
+            return {
+                "deleted": True,
+                "relationship_id": str(relationship_id),
+                "relationship": relationship,
+            }
+        except Exception:
+            LOGGER.exception(
+                "failed to delete memory relationship context_id=%s relationship_id=%s",
+                context_id,
+                relationship_id,
+            )
+            raise
+
+    def delete_relationships_by_mode(
+        self,
+        *,
+        context_id: str,
+        mode: str,
+        source_memory_id: str | None = None,
+        target_memory_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(mode or "").strip().lower()
+        if normalized not in {"temporal", "associative"}:
+            raise ValueError("mode must be temporal or associative")
+        clauses = ["context_id = ?"]
+        params: list[Any] = [str(context_id)]
+        if normalized == "temporal":
+            clauses.append("relation_type LIKE 'temporal%'")
+        else:
+            clauses.append("(relation_type LIKE 'semantic%' OR relation_type LIKE 'associative%')")
+        if source_memory_id:
+            clauses.append("source_memory_id = ?")
+            params.append(str(source_memory_id))
+        if target_memory_id:
+            clauses.append("target_memory_id = ?")
+            params.append(str(target_memory_id))
+        where_sql = " AND ".join(clauses)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT relationship_id
+                    FROM memory_relationships
+                    WHERE {where_sql}
+                    ORDER BY updated_at DESC
+                    """,
+                    tuple(params),
+                ).fetchall()
+                relationship_ids = [str(row["relationship_id"]) for row in rows]
+                if relationship_ids:
+                    conn.executemany(
+                        "DELETE FROM memory_relationships WHERE relationship_id = ?",
+                        [(relationship_id,) for relationship_id in relationship_ids],
+                    )
+            return {
+                "deleted": bool(relationship_ids),
+                "mode": normalized,
+                "deleted_relationship_count": len(relationship_ids),
+                "deleted_relationship_ids": relationship_ids,
+            }
+        except Exception:
+            LOGGER.exception(
+                "failed to delete %s relationships context_id=%s",
+                normalized,
+                context_id,
+            )
+            raise
+
     def publish_context_event(
         self,
         *,
@@ -599,6 +758,50 @@ class DurableMemoryStore:
             return [self._row_to_context_event(row) for row in rows]
         except Exception:
             LOGGER.exception("failed to list context events")
+            raise
+
+    def delete_context_event(
+        self,
+        *,
+        context_id: str,
+        event_id: int,
+    ) -> dict[str, Any]:
+        bounded_event_id = max(0, int(event_id))
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM agent_context_events
+                    WHERE context_id = ? AND event_id = ?
+                    """,
+                    (str(context_id), bounded_event_id),
+                ).fetchone()
+                if row is None:
+                    return {
+                        "deleted": False,
+                        "event_id": bounded_event_id,
+                        "event": None,
+                    }
+                event = self._row_to_context_event(row)
+                conn.execute(
+                    """
+                    DELETE FROM agent_context_events
+                    WHERE context_id = ? AND event_id = ?
+                    """,
+                    (str(context_id), bounded_event_id),
+                )
+            return {
+                "deleted": True,
+                "event_id": bounded_event_id,
+                "event": event,
+            }
+        except Exception:
+            LOGGER.exception(
+                "failed to delete context event context_id=%s event_id=%s",
+                context_id,
+                event_id,
+            )
             raise
 
     def ack_context_events(

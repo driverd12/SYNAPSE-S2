@@ -332,6 +332,33 @@
               </aside>
               <svg id="graphSvg" viewBox="0 0 760 420" role="img" aria-label="Memory relationship graph"></svg>
             </div>
+            <div class="graph-safety-panel" aria-label="Graph safety pruning controls">
+              <div>
+                <p class="section-label">Safety Prune</p>
+                <h3>Remove bad memory graph data</h3>
+              </div>
+              <form id="pruneForm" class="prune-form">
+                <select id="pruneTargetType" aria-label="Prune target type">
+                  <option value="event">Event/node</option>
+                  <option value="relationship">Relationship edge</option>
+                  <option value="context_event">Deployment event</option>
+                  <option value="temporal">All temporal edges</option>
+                  <option value="associative">All associative edges</option>
+                </select>
+                <input id="pruneMemoryId" autocomplete="off" placeholder="memory-id" />
+                <input id="pruneRelationshipId" autocomplete="off" placeholder="relationship-id" />
+                <input id="pruneEventId" type="number" min="0" step="1" placeholder="event-id" />
+                <input id="pruneTag" autocomplete="off" placeholder="tag fallback" />
+                <input id="pruneReason" autocomplete="off" placeholder="reason" />
+                <button class="danger-button" type="submit">Confirm prune</button>
+              </form>
+              <div class="mode-prune-row">
+                <button id="pruneTemporalButton" class="danger-button secondary-danger" type="button">Clear temporal edges</button>
+                <button id="pruneAssociativeButton" class="danger-button secondary-danger" type="button">Clear associative edges</button>
+              </div>
+            </div>
+            <div id="relationshipLedger" class="relationship-ledger" aria-live="polite"></div>
+            <div id="contextEventLedger" class="context-event-ledger" aria-live="polite"></div>
             <div id="memoryLedger" class="memory-ledger" aria-live="polite"></div>
           </article>
 
@@ -430,6 +457,27 @@
                 <button class="secondary-button" type="submit">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M4 12h10"/><path d="M4 17h7"/><path d="m15 17 2 2 4-5"/></svg>
                   Ingest + publish
+                </button>
+              </form>
+
+              <form id="captureForm" class="write-form conversation-capture-form">
+                <div class="field-row">
+                  <div class="field-grid">
+                    <label for="captureTag">Session tag</label>
+                    <input id="captureTag" autocomplete="off" value="codex-session" />
+                  </div>
+                  <div class="field-grid">
+                    <label for="captureSpeaker">Speaker</label>
+                    <input id="captureSpeaker" autocomplete="off" value="codex" />
+                  </div>
+                </div>
+                <div class="field-grid">
+                  <label for="captureText">Conversation notes</label>
+                  <textarea id="captureText" rows="5" placeholder="Paste real user/Codex decisions, corrections, temporal notes, or session summaries"></textarea>
+                </div>
+                <button class="secondary-button" type="submit">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                  Capture conversation
                 </button>
               </form>
             </div>

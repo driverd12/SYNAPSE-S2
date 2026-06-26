@@ -250,6 +250,76 @@ class SynapseCliTests(unittest.TestCase):
             "temporal_next",
         )
 
+    def test_cli_captures_session_and_prunes_graph_items(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            text = (
+                "User expects later Codex conversations to appear in the graph. "
+                "Codex records a durable session capture. "
+                "Operators can clear sensitive graph items."
+            )
+
+            capture = self.run_cli(
+                "capture-session",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-session",
+                "--speaker",
+                "codex",
+                "--text",
+                text,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            graph = self.run_cli(
+                "graph",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            graph_payload = json.loads(graph.stdout)
+            memory_id = next(
+                entry["memory_id"]
+                for entry in graph_payload["entries"]
+                if entry["tag"].startswith("cli-session-event")
+            )
+            relationship_id = graph_payload["relationships"][0]["relationship_id"]
+            edge_prune = self.run_cli(
+                "prune-memory",
+                "--context",
+                "demo",
+                "--target-type",
+                "relationship",
+                "--relationship-id",
+                relationship_id,
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            memory_prune = self.run_cli(
+                "prune-memory",
+                "--context",
+                "demo",
+                "--target-type",
+                "event",
+                "--memory-id",
+                memory_id,
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(capture.returncode, 0, capture.stderr)
+        self.assertEqual(graph.returncode, 0, graph.stderr)
+        self.assertEqual(edge_prune.returncode, 0, edge_prune.stderr)
+        self.assertEqual(memory_prune.returncode, 0, memory_prune.stderr)
+        self.assertGreaterEqual(json.loads(capture.stdout)["event_count"], 2)
+        self.assertTrue(json.loads(edge_prune.stdout)["result"]["deleted"])
+        self.assertTrue(json.loads(memory_prune.stdout)["result"]["deleted"])
+
     def test_cli_publishes_and_acknowledges_context_deployments(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

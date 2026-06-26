@@ -11,6 +11,8 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 | GUI published context events but did not acknowledge its own pulls | Operator could not tell whether the dashboard consumed the event it displayed | Dashboard calls `/api/context-ack` after pulling deployments | Fixed in `web/app.js`; covered by dashboard route tests |
 | Canned demo-memory path remained available from ops surfaces | Polluted real memory with static content and could undermine trust in recall | Remove production CLI `seed-demo`; default prep to `default` context and factual preflight evidence | Fixed in `synapse_cli.py` and `scripts/prep_tomorrow.sh`; guarded by CLI and operational tests |
 | CLI writes were not published to the context bus | CLI-captured thoughts would not appear in agent deployment pulls | Publish CLI remember/ingest writes and add CLI pull/ack cursor commands | Fixed in `synapse_cli.py`; covered by `tests/test_cli.py` |
+| Agent/operator conversation notes had no first-class capture path | Future sessions would not naturally appear in the event relationship visualizer | Add `capture-session`, `capture_spiking_conversation`, `/api/capture-conversation`, and GUI capture form | Fixed in backend, MCP, CLI, dashboard, and GUI tests |
+| Bad graph data could not be surgically removed | Sensitive, wrong, or partial-truth memory could keep influencing recall | Add confirmed pruning for memory nodes, event nodes, edges, context deployments, temporal edges, and associative edges | Fixed in `memory_store.py`, backend, MCP, CLI, dashboard, and GUI |
 | README/runbook still taught `board-demo` and `seed-demo` | IT operators could accidentally present synthetic state | Rewrite examples around `default` and real operator captures | Fixed in `README.md` and `docs/TOMORROW_RUNBOOK.md` |
 | Compliance matrix under-described client registration and delivery receipts | Proposal mapping lagged implementation | Add explicit rows for config installer and context cursors | Fixed in `docs/PROPOSAL_COMPLIANCE.md` |
 
@@ -18,7 +20,7 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 
 | Gap | Risk | Shorthand solution | Current disposition |
 | :--- | :--- | :--- | :--- |
-| No real-time push into already-running Codex/Claude sessions | Running clients may not see new MCP tools until restart/reconnect | Restart clients, then pull durable deployment events | Documented limitation; durable pull/ack works now |
+| No passive interception of every already-running Codex/Claude chat | Running clients must call the capture tool/CLI for notes to enter memory | Restart clients, pull durable deployment events, and use `capture_spiking_conversation`/`capture-session` at session boundaries | Documented limitation; durable capture plus pull/ack works now |
 | Text projection is deterministic lexical hashing, not a semantic embedding model | Recall quality depends on lexical overlap and SNN graph expansion | Add optional local embedding provider while keeping offline fallback | Research extension, not claimed complete |
 | Bayesian surprise is deterministic lexical approximation | Event boundaries are useful but not probabilistic token-stream inference | Add provider-backed or calibrated probabilistic surprise module | Research extension, not claimed complete |
 | Resource envelope is estimated from MLX array topology, not Instruments counters | Hardware-level memory certification is not yet captured | Add Instruments/Metal counter harness across target Apple Silicon SKUs | Research extension, not claimed complete |
@@ -34,4 +36,6 @@ The current bar for calling a local build presentable is:
 3. `pull_spiking_context_deployments` returns durable write events.
 4. `ack_spiking_context_deployments` records a local client cursor.
 5. No-memory recall returns a transparent raw activation summary, never a fake historical tag.
-6. The dashboard at `http://127.0.0.1:8765/?context_id=default` can write, ingest, recall, graph, prune, sleep, back up, and show context-bus receipt state.
+6. Conversation capture creates visible event nodes in the graph and a durable context-bus deployment.
+7. Confirmed pruning can remove a single node, edge, deployment event, temporal edge set, or associative edge set.
+8. The dashboard at `http://127.0.0.1:8765/?context_id=default` can write, capture conversations, ingest, recall, graph, prune, sleep, back up, and show context-bus receipt state.

@@ -474,6 +474,110 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(cursors["cursors"][0]["agent_id"], "codex-desktop")
         self.assertEqual(status["context_bus_ack_cursor_count"], 1)
 
+    def test_capture_conversation_creates_event_graph_and_context_deployment(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        capture = backend.capture_conversation(
+            text=(
+                "User asked that future Codex conversations appear in the graph. "
+                "Codex added a durable capture path for session notes. "
+                "Operators can prune sensitive or partial information later."
+            ),
+            context_id="demo",
+            source_tag="codex-session",
+            speaker="codex",
+        )
+        graph = backend.list_memory_graph(context_id="demo", limit=20)
+        deployments = backend.list_context_events(context_id="demo", limit=10)
+
+        self.assertGreaterEqual(capture["event_count"], 2)
+        self.assertTrue(capture["agent_deployment"]["published"])
+        self.assertEqual(capture["agent_deployment"]["event_type"], "conversation-capture")
+        self.assertGreaterEqual(graph["relationship_summary"]["temporal"], 1)
+        self.assertTrue(
+            all(
+                entry["metadata"].get("conversation_capture") is True
+                for entry in graph["entries"]
+                if entry["tag"].startswith("codex-session-event")
+            )
+        )
+        self.assertEqual(
+            deployments["events"][-1]["payload"]["source_tag"],
+            "codex-session",
+        )
+
+    def test_prune_memory_removes_nodes_edges_modes_and_context_events(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        capture = backend.capture_conversation(
+            text=(
+                "First event must be removable. "
+                "Second event remains available. "
+                "Shared event terms create associative links."
+            ),
+            context_id="demo",
+            source_tag="prune-session",
+            speaker="user",
+        )
+        graph = backend.list_memory_graph(context_id="demo", limit=20)
+        first_entry = next(
+            entry for entry in graph["entries"] if entry["tag"].startswith("prune-session-event")
+        )
+        first_relationship = graph["relationships"][0]
+
+        edge_deletion = backend.prune_memory(
+            context_id="demo",
+            target_type="relationship",
+            relationship_id=first_relationship["relationship_id"],
+            reason="bad edge",
+        )
+        entry_deletion = backend.prune_memory(
+            context_id="demo",
+            target_type="event",
+            memory_id=first_entry["memory_id"],
+            reason="sensitive event",
+        )
+        mode_deletion = backend.prune_memory(
+            context_id="demo",
+            target_type="temporal",
+            reason="drop temporal links",
+        )
+        event_deletion = backend.prune_memory(
+            context_id="demo",
+            target_type="context_event",
+            event_id=capture["agent_deployment"]["event_id"],
+            reason="remove deployment record",
+        )
+        remaining_graph = backend.list_memory_graph(context_id="demo", limit=20)
+        remaining_deployments = backend.list_context_events(context_id="demo", limit=10)
+
+        self.assertEqual(edge_deletion["action"], "prune-memory")
+        self.assertTrue(edge_deletion["result"]["deleted"])
+        self.assertTrue(entry_deletion["result"]["deleted"])
+        self.assertGreaterEqual(mode_deletion["result"]["deleted_relationship_count"], 0)
+        self.assertTrue(event_deletion["result"]["deleted"])
+        self.assertNotIn(
+            first_entry["memory_id"],
+            [entry["memory_id"] for entry in remaining_graph["entries"]],
+        )
+        self.assertNotIn(
+            capture["agent_deployment"]["event_id"],
+            [event["event_id"] for event in remaining_deployments["events"]],
+        )
+
     def test_quick_pruning_decays_weights_and_resets_membrane(self):
         backend = SpikingAttentionBackend(
             dimension=4,

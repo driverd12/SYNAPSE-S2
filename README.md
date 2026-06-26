@@ -84,6 +84,36 @@ LATEST_EVENT_ID=$(.venv/bin/python synapse_cli.py --json status --context defaul
 .venv/bin/python synapse_cli.py --json list-context-cursors --context default
 ```
 
+Capture real operator/Codex conversation notes into the event graph:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-session \
+  --context default \
+  --tag codex-session \
+  --speaker codex \
+  --text "User asked for future conversation details to appear in the event relationship graph. Codex added durable session capture plus surgical memory pruning. Operators can remove sensitive, wrong, or partial-truth graph data by node, edge, deployment event, or relationship mode."
+```
+
+Hand-prune bad or sensitive memory from the same durable store:
+
+```bash
+.venv/bin/python synapse_cli.py --json graph --context default --limit 30
+.venv/bin/python synapse_cli.py --json prune-memory \
+  --context default \
+  --target-type event \
+  --memory-id "<memory-id-from-graph>" \
+  --reason "remove sensitive or partial-truth event" \
+  --confirm
+.venv/bin/python synapse_cli.py --json prune-memory \
+  --context default \
+  --target-type relationship \
+  --relationship-id "<relationship-id-from-graph>" \
+  --reason "remove bad edge" \
+  --confirm
+```
+
+Supported prune targets are `event`, `memory`, `relationship`, `context_event`, `temporal`, and `associative`. Mode-wide `temporal` and `associative` pruning removes all matching edges in the selected context, so prefer a single node or relationship ID when possible.
+
 ### 4. Toggle Runtime Behavior
 
 ```bash
@@ -107,7 +137,9 @@ The MCP server exposes these tools:
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
 | `list_spiking_memory` | List persisted SQLite memory entries for a context. |
 | `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
+| `capture_spiking_conversation` | Capture real operator/agent conversation notes as temporal event memories. |
 | `list_spiking_memory_graph` | List compact memory entries and relationship edges for a context. |
+| `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Record the last context-bus event consumed by a local agent. |
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
@@ -161,7 +193,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, durable trace capture, event ingestion, graph memory inspection, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, durable trace capture, conversation capture, event ingestion, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

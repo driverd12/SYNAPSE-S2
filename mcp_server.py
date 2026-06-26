@@ -389,6 +389,75 @@ def ingest_spiking_memory_text(
         return json.dumps({"error": f"event ingestion failed: {exc}"}, sort_keys=True)
 
 
+@mcp.tool()
+def capture_spiking_conversation(
+    text: str,
+    context_id: str = "default",
+    source_tag: str = "codex-session",
+    speaker: str = "operator",
+    surprise_threshold: float = 0.5,
+    min_segment_sentences: int = 1,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Capture real operator/agent conversation notes as temporal event memories."""
+    context = _sanitize_context_id(context_id)
+    try:
+        source_text = _validate_text(text)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.capture_conversation(
+            text=source_text,
+            context_id=context,
+            source_tag=source_tag,
+            speaker=speaker,
+            surprise_threshold=float(surprise_threshold),
+            min_segment_sentences=int(min_segment_sentences),
+            metadata={
+                **(metadata or {}),
+                "source_surface": "mcp",
+            },
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid conversation capture for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid conversation capture: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("conversation capture failed for context_id=%s", context)
+        return json.dumps({"error": f"conversation capture failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def prune_spiking_memory(
+    target_type: str,
+    context_id: str = "default",
+    memory_id: str = "",
+    tag: str = "",
+    relationship_id: str = "",
+    event_id: int = 0,
+    reason: str = "",
+) -> str:
+    """Prune one SYNAPSE-S2 memory node, edge, relationship mode, or deployment event."""
+    context = _sanitize_context_id(context_id)
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.prune_memory(
+            context_id=context,
+            target_type=target_type,
+            memory_id=memory_id,
+            tag=tag,
+            relationship_id=relationship_id,
+            event_id=max(0, int(event_id)),
+            reason=reason,
+            source_surface="mcp",
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid memory prune for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid memory prune: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("memory prune failed for context_id=%s", context)
+        return json.dumps({"error": f"memory prune failed: {exc}"}, sort_keys=True)
+
+
 @mcp.tool(
     annotations={
         "title": "List SYNAPSE-S2 Memory Graph",

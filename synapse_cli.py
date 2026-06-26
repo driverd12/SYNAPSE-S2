@@ -196,6 +196,38 @@ def command_ingest_text(args: argparse.Namespace) -> dict[str, Any]:
     return ingestion
 
 
+def command_capture_session(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    text = _text_from_args(args).strip()
+    if not text:
+        raise ValueError("--text or --text-file must provide content")
+    return backend.capture_conversation(
+        text=text,
+        context_id=args.context,
+        source_tag=args.tag,
+        speaker=args.speaker,
+        surprise_threshold=args.surprise_threshold,
+        min_segment_sentences=args.min_segment_sentences,
+        metadata=parse_metadata(args.metadata),
+    )
+
+
+def command_prune_memory(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.confirm:
+        raise ValueError("--confirm is required before pruning memory graph data")
+    backend = build_backend(args)
+    return backend.prune_memory(
+        context_id=args.context,
+        target_type=args.target_type,
+        memory_id=args.memory_id,
+        tag=args.tag,
+        relationship_id=args.relationship_id,
+        event_id=args.event_id,
+        reason=args.reason,
+        source_surface="cli",
+    )
+
+
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.list_memory_graph(context_id=args.context, limit=args.limit)
@@ -459,6 +491,28 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_text.add_argument("--surprise-threshold", type=float, default=0.62)
     ingest_text.add_argument("--min-segment-sentences", type=int, default=2)
     ingest_text.set_defaults(func=command_ingest_text)
+
+    capture_session = subparsers.add_parser("capture-session")
+    add_context(capture_session)
+    capture_session.add_argument("--tag", default="codex-session")
+    capture_session.add_argument("--speaker", default="operator")
+    capture_session.add_argument("--text", default="")
+    capture_session.add_argument("--text-file", default=None)
+    capture_session.add_argument("--metadata", default=None)
+    capture_session.add_argument("--surprise-threshold", type=float, default=0.5)
+    capture_session.add_argument("--min-segment-sentences", type=int, default=1)
+    capture_session.set_defaults(func=command_capture_session)
+
+    prune_memory = subparsers.add_parser("prune-memory")
+    add_context(prune_memory)
+    prune_memory.add_argument("--target-type", required=True)
+    prune_memory.add_argument("--memory-id", default="")
+    prune_memory.add_argument("--tag", default="")
+    prune_memory.add_argument("--relationship-id", default="")
+    prune_memory.add_argument("--event-id", type=int, default=0)
+    prune_memory.add_argument("--reason", default="")
+    prune_memory.add_argument("--confirm", action="store_true")
+    prune_memory.set_defaults(func=command_prune_memory)
 
     graph = subparsers.add_parser("graph")
     add_context(graph)

@@ -36,11 +36,16 @@ const elements = collectElements([
   "clearRecallButton",
   "contextApply",
   "contextBusState",
+  "contextEventLedger",
   "contextInput",
   "contextUri",
   "coreToggleGuardHint",
   "coreUnlockButton",
   "coreVersion",
+  "captureForm",
+  "captureSpeaker",
+  "captureTag",
+  "captureText",
   "currentEnvelope",
   "engineState",
   "endpointLabel",
@@ -85,7 +90,16 @@ const elements = collectElements([
   "platformLabel",
   "profileButton",
   "pruneBudget",
+  "pruneAssociativeButton",
+  "pruneEventId",
+  "pruneForm",
+  "pruneMemoryId",
+  "pruneReason",
+  "pruneRelationshipId",
   "pruneState",
+  "pruneTag",
+  "pruneTargetType",
+  "pruneTemporalButton",
   "queryForm",
   "queryInput",
   "queryResults",
@@ -96,6 +110,7 @@ const elements = collectElements([
   "rememberForm",
   "rememberTag",
   "rememberText",
+  "relationshipLedger",
   "resourceCurrent",
   "resourceMb",
   "resultCount",
@@ -205,7 +220,11 @@ async function refreshSnapshot() {
     const graph = await requestJson("/api/graph", {
       params: { context_id: state.context, limit: SNAPSHOT_LIMIT },
     });
-    state.snapshot = withGraph(shellSnapshot, graph);
+    const contextDeployments = await pullContextDeployments(0, 20);
+    state.snapshot = {
+      ...withGraph(shellSnapshot, graph),
+      context_deployments: contextDeployments,
+    };
     renderSnapshot(state.snapshot, elapsedMs(started));
   } catch (error) {
     logOperation("Graph refresh failed", error.message);
@@ -280,6 +299,8 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderArrays(profile.arrays || {});
   renderMaintenance(status, profile);
   renderGraph(graph, status);
+  renderRelationshipLedger(graph);
+  renderContextEventLedger(snapshot.context_deployments || {});
   renderMemoryLedger(graph);
   renderContextBus(status);
   renderFooter(snapshot, status, profile, contextCount);
@@ -845,12 +866,59 @@ function cssEscape(value) {
   return window.CSS?.escape ? window.CSS.escape(value) : String(value).replaceAll('"', '\\"');
 }
 
+function renderRelationshipLedger(graph) {
+  const relationships = (graph.relationships || []).slice(0, 8);
+  elements.relationshipLedger.innerHTML = relationships.length
+    ? relationships.map((relationship) => `
+        <div class="relationship-ledger-row">
+          <div>
+            <strong>${escapeHtml(relationship.relation_type || "relationship")}</strong>
+            <small>${escapeHtml(relationship.source_tag || compactMemoryId(relationship.source_memory_id))} -> ${escapeHtml(relationship.target_tag || compactMemoryId(relationship.target_memory_id))}</small>
+            <p>${escapeHtml(compactMemoryId(relationship.relationship_id))}</p>
+          </div>
+          <span>${escapeHtml(formatNumber(relationship.weight, 3))}</span>
+          <time>${escapeHtml(formatTimestamp(relationship.updated_at || relationship.created_at))}</time>
+          <button class="danger-button prune-row-button" type="button"
+            data-prune-target="relationship"
+            data-relationship-id="${escapeHtml(relationship.relationship_id)}"
+            data-prune-label="${escapeHtml(relationship.relation_type || "relationship")}">
+            Delete edge
+          </button>
+        </div>
+      `).join("")
+    : '<div class="memory-ledger-empty">No relationship edges</div>';
+}
+
+function renderContextEventLedger(deployments) {
+  const events = (deployments.events || []).slice(-8).reverse();
+  elements.contextEventLedger.innerHTML = events.length
+    ? events.map((event) => `
+        <div class="context-event-ledger-row">
+          <div>
+            <strong>#${escapeHtml(formatNumber(event.event_id))} ${escapeHtml(event.event_type || "context-update")}</strong>
+            <small>${escapeHtml(event.source_surface || "surface")} / ${escapeHtml(event.delivery_mode || deployments.delivery_mode || "durable-mcp-pull")}</small>
+            <p>${escapeHtml(event.summary || "")}</p>
+          </div>
+          <span>${escapeHtml(formatNumber((event.agent_targets || []).length))} targets</span>
+          <time>${escapeHtml(formatTimestamp(event.created_at))}</time>
+          <button class="danger-button prune-row-button" type="button"
+            data-prune-target="context_event"
+            data-event-id="${escapeHtml(event.event_id)}"
+            data-prune-label="#${escapeHtml(formatNumber(event.event_id))}">
+            Delete event
+          </button>
+        </div>
+      `).join("")
+    : '<div class="memory-ledger-empty">No context deployments</div>';
+}
+
 function renderMemoryLedger(graph) {
   const entries = (graph.entries || []).slice(0, 10);
   elements.memoryLedger.innerHTML = entries.length
     ? entries.map((entry) => {
       const source = entry.metadata?.source_tag || entry.metadata?.source || entry.context_id || "--";
       const sourceText = String(entry.source_text || "").trim();
+      const targetType = entry.metadata?.event_segment ? "event" : "memory";
       return `
         <div class="memory-ledger-row">
           <div>
@@ -860,6 +928,13 @@ function renderMemoryLedger(graph) {
           </div>
           <span>${formatNumber(entry.spike_count)} spikes</span>
           <time>${escapeHtml(formatTimestamp(entry.updated_at || entry.created_at))}</time>
+          <button class="danger-button prune-row-button" type="button"
+            data-prune-target="${targetType}"
+            data-memory-id="${escapeHtml(entry.memory_id)}"
+            data-tag="${escapeHtml(entry.tag)}"
+            data-prune-label="${escapeHtml(entry.tag)}">
+            Delete node
+          </button>
         </div>
       `;
     }).join("")
@@ -1097,6 +1172,62 @@ async function ackContextDeployment(lastEventId, agentId = "dashboard-ui") {
   });
 }
 
+async function publishAwareResult(payload) {
+  if (payload.agent_deployment?.event_id) {
+    payload.context_bus = await pullContextDeployments(
+      payload.agent_deployment.event_id - 1,
+      5,
+    );
+    payload.context_ack = await ackContextDeployment(
+      payload.agent_deployment.event_id,
+    );
+  }
+  return payload;
+}
+
+function confirmPrune(label) {
+  return window.confirm(`Permanently prune ${label || "this graph item"} from SYNAPSE-S2 memory?`);
+}
+
+async function pruneGraphItem(payload, button, label = "selected graph data") {
+  if (!confirmPrune(label)) {
+    logOperation("Prune cancelled", label);
+    return null;
+  }
+  return withBusy(button, "Prune memory", async () => (
+    publishAwareResult(await requestJson("/api/prune-memory", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        confirm: true,
+        reason: "operator-dashboard-prune",
+        ...payload,
+      },
+    }))
+  ));
+}
+
+function prunePayloadFromButton(button) {
+  return {
+    target_type: button.dataset.pruneTarget || "",
+    memory_id: button.dataset.memoryId || "",
+    tag: button.dataset.tag || "",
+    relationship_id: button.dataset.relationshipId || "",
+    event_id: Number(button.dataset.eventId || 0),
+  };
+}
+
+function handleLedgerPruneClick(event) {
+  const button = event.target.closest?.("button[data-prune-target]");
+  if (!button) return;
+  event.preventDefault();
+  pruneGraphItem(
+    prunePayloadFromButton(button),
+    button,
+    button.dataset.pruneLabel || button.textContent.trim(),
+  );
+}
+
 async function withBusy(button, label, task, options = { refresh: true }) {
   const originalDisabled = button.disabled;
   button.disabled = true;
@@ -1254,15 +1385,7 @@ elements.rememberForm.addEventListener("submit", async (event) => {
         metadata: { source: "dashboard" },
       },
     });
-    if (payload.agent_deployment?.event_id) {
-      payload.context_bus = await pullContextDeployments(
-        payload.agent_deployment.event_id - 1,
-        5,
-      );
-      payload.context_ack = await ackContextDeployment(
-        payload.agent_deployment.event_id,
-      );
-    }
+    await publishAwareResult(payload);
     elements.rememberText.value = "";
     return payload;
   });
@@ -1290,19 +1413,78 @@ elements.ingestForm.addEventListener("submit", async (event) => {
         min_segment_sentences: Math.max(1, Math.trunc(Number.isFinite(minSentences) ? minSentences : 1)),
       },
     });
-    if (payload.agent_deployment?.event_id) {
-      payload.context_bus = await pullContextDeployments(
-        payload.agent_deployment.event_id - 1,
-        5,
-      );
-      payload.context_ack = await ackContextDeployment(
-        payload.agent_deployment.event_id,
-      );
-    }
+    await publishAwareResult(payload);
     elements.ingestText.value = "";
     return payload;
   });
 });
+
+elements.captureForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const tag = elements.captureTag.value.trim() || "codex-session";
+  const speaker = elements.captureSpeaker.value.trim() || "operator";
+  const text = elements.captureText.value.trim();
+  if (!text) {
+    logOperation("Conversation capture rejected", "conversation notes are required");
+    elements.captureText.focus();
+    return;
+  }
+  await withBusy(elements.captureForm.querySelector("button"), "Capture conversation", async () => {
+    const payload = await requestJson("/api/capture-conversation", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        source_tag: tag,
+        speaker,
+        text,
+        metadata: { source: "dashboard" },
+      },
+    });
+    await publishAwareResult(payload);
+    elements.captureText.value = "";
+    return payload;
+  });
+});
+
+elements.pruneForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = {
+    target_type: elements.pruneTargetType.value,
+    memory_id: elements.pruneMemoryId.value.trim(),
+    tag: elements.pruneTag.value.trim(),
+    relationship_id: elements.pruneRelationshipId.value.trim(),
+    event_id: Number(elements.pruneEventId.value || 0),
+    reason: elements.pruneReason.value.trim() || "operator-dashboard-prune",
+  };
+  const button = elements.pruneForm.querySelector("button");
+  const result = await pruneGraphItem(payload, button, payload.target_type);
+  if (result) {
+    elements.pruneMemoryId.value = "";
+    elements.pruneRelationshipId.value = "";
+    elements.pruneEventId.value = "";
+    elements.pruneTag.value = "";
+  }
+});
+
+elements.pruneTemporalButton.addEventListener("click", () => {
+  pruneGraphItem(
+    { target_type: "temporal", reason: "operator-cleared-temporal-edges" },
+    elements.pruneTemporalButton,
+    "all temporal relationship edges in this context",
+  );
+});
+
+elements.pruneAssociativeButton.addEventListener("click", () => {
+  pruneGraphItem(
+    { target_type: "associative", reason: "operator-cleared-associative-edges" },
+    elements.pruneAssociativeButton,
+    "all associative relationship edges in this context",
+  );
+});
+
+elements.memoryLedger.addEventListener("click", handleLedgerPruneClick);
+elements.relationshipLedger.addEventListener("click", handleLedgerPruneClick);
+elements.contextEventLedger.addEventListener("click", handleLedgerPruneClick);
 
 elements.queryForm.addEventListener("submit", async (event) => {
   event.preventDefault();

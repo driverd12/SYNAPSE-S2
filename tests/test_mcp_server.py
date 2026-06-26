@@ -198,6 +198,49 @@ class McpServerTests(unittest.TestCase):
         self.assertGreaterEqual(graph["relationship_count"], 1)
         self.assertEqual(graph["relationships"][0]["relation_type"], "temporal_next")
 
+    def test_mcp_captures_conversation_and_prunes_memory_graph_items(self):
+        capture = json.loads(
+            mcp_server.capture_spiking_conversation(
+                text=(
+                    "User wants conversation details visible in SYNAPSE-S2. "
+                    "Codex captures a durable session event. "
+                    "Sensitive partial truths can be pruned later."
+                ),
+                context_id="demo",
+                source_tag="mcp-session",
+                speaker="codex",
+            )
+        )
+        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+        memory_id = next(
+            entry["memory_id"]
+            for entry in graph["entries"]
+            if entry["tag"].startswith("mcp-session-event")
+        )
+        relationship_id = graph["relationships"][0]["relationship_id"]
+
+        edge_prune = json.loads(
+            mcp_server.prune_spiking_memory(
+                target_type="relationship",
+                context_id="demo",
+                relationship_id=relationship_id,
+                reason="bad edge",
+            )
+        )
+        memory_prune = json.loads(
+            mcp_server.prune_spiking_memory(
+                target_type="event",
+                context_id="demo",
+                memory_id=memory_id,
+                reason="bad event",
+            )
+        )
+
+        self.assertGreaterEqual(capture["event_count"], 2)
+        self.assertTrue(capture["agent_deployment"]["published"])
+        self.assertTrue(edge_prune["result"]["deleted"])
+        self.assertTrue(memory_prune["result"]["deleted"])
+
     def test_context_deployment_tool_lists_published_thoughts_for_connected_agents(self):
         registration = json.loads(
             mcp_server.remember_spiking_context(

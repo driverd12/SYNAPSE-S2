@@ -31,6 +31,8 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Persistent associative memory substrate | Implemented | `memory_store.py` SQLite store, `remember_spiking_context`, `list_spiking_memory`, export, backup |
 | Bayesian Surprise Event Segmenter for local text streams | Implemented as deterministic local surprise segmentation | `event_segmenter.py`, `ingest_spiking_memory_text`, `synapse_cli.py ingest-text`, `tests/test_event_segmenter.py` |
 | Dual graph memory protocol for episodic-semantic relationships | Implemented | `memory_relationships` table in `memory_store.py`, `list_spiking_memory_graph`, graph-expanded recall, deep-sleep relationship extraction |
+| Agent/operator conversation capture into event memory | Implemented | `capture_spiking_conversation`, `synapse_cli.py capture-session`, `/api/capture-conversation`, GUI capture form |
+| Operator safety pruning for bad or sensitive graph data | Implemented | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, `/api/prune-memory`, GUI safety prune controls |
 | Shared state across Codex/Claude/direct CLI surfaces | Implemented | `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, launcher, common `.synapse_s2/memory.sqlite3` |
 | Codex, Claude Desktop, and Claude Code client registration | Implemented | `client_config.py`, `scripts/install_client_configs.py`, `tests/test_client_config.py` |
 | Project-root state discovery through client environment | Implemented | `SYNAPSE_S2_*` envs, plus `CLAUDE_PROJECT_DIR` / `CODEX_PROJECT_DIR` fallback in `mlx_backend.py` |
@@ -54,10 +56,12 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Enable/disable globally or per context | `set_spiking_attention_enabled`, `synapse_cli.py enable/disable` |
 | Store real local memory | `remember_spiking_context`, `synapse_cli.py remember-text/remember-vector` |
 | Segment long text into event memory graph | `ingest_spiking_memory_text`, `synapse_cli.py ingest-text` |
+| Capture real session conversation notes | `capture_spiking_conversation`, `synapse_cli.py capture-session`, dashboard Conversation capture |
 | Query vector or text recall | `query_spiking_attention`, `query_spiking_attention_text`, CLI equivalents |
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
 | List/export/backup persisted memory | MCP and CLI memory commands |
 | Inspect event relationships | `list_spiking_memory_graph`, `synapse_cli.py graph` |
+| Hand-prune nodes, edges, deployment events, temporal edges, or associative edges | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, dashboard Safety Prune |
 | Pull and acknowledge context deployments | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, `synapse_cli.py pull-context/ack-context/list-context-cursors` |
 | Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
 | Use a local dashboard | `dashboard_server.py`, `scripts/smoke_dashboard.py` |

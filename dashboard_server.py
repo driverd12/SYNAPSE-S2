@@ -239,6 +239,50 @@ class DashboardRuntime:
                 },
             )
             return self._json_response(ingestion)
+        if method == "POST" and path == "/api/capture-conversation":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            tag = mlx_backend.sanitize_tag(str(payload.get("source_tag", payload.get("tag", "codex-session"))).strip())
+            text = self._text_payload(payload, "text", max_bytes=MAX_TEXT_BYTES)
+            speaker = mlx_backend.sanitize_agent_id(str(payload.get("speaker", "operator")))
+            threshold = float(payload.get("surprise_threshold", 0.5))
+            min_sentences = int(payload.get("min_segment_sentences", 1))
+            capture = self.backend.capture_conversation(
+                text=text,
+                context_id=context,
+                source_tag=tag,
+                speaker=speaker,
+                surprise_threshold=threshold,
+                min_segment_sentences=min_sentences,
+                metadata={
+                    **self._metadata_payload(payload),
+                    "source_surface": "dashboard",
+                },
+            )
+            return self._json_response(capture)
+        if method == "POST" and path == "/api/prune-memory":
+            payload = self._parse_json_body(body)
+            if payload.get("confirm") is not True:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "confirm must be true before pruning memory graph data",
+                )
+            context = self._context_from_payload(payload)
+            try:
+                event_id = int(payload.get("event_id", 0) or 0)
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "event_id must be an integer") from exc
+            prune = self.backend.prune_memory(
+                context_id=context,
+                target_type=str(payload.get("target_type", "")),
+                memory_id=str(payload.get("memory_id", "")),
+                tag=str(payload.get("tag", "")),
+                relationship_id=str(payload.get("relationship_id", "")),
+                event_id=event_id,
+                reason=str(payload.get("reason", "")),
+                source_surface="dashboard",
+            )
+            return self._json_response(prune)
         if method == "POST" and path == "/api/context-ack":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
