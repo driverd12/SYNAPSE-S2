@@ -772,17 +772,35 @@ textarea {
   white-space: nowrap;
 }
 
-.array-list {
-  display: grid;
-  margin-top: 12px;
-  border-top: 1px solid var(--row);
-}
-
+.array-list-header,
 .array-list div {
   display: grid;
   grid-template-columns: minmax(96px, 0.65fr) minmax(140px, 1fr) auto;
   align-items: center;
   gap: 12px;
+}
+
+.array-list-header {
+  margin-top: 14px;
+  border-bottom: 1px solid var(--row);
+  padding: 0 0 7px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 820;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.array-list-header span:last-child {
+  text-align: right;
+}
+
+.array-list {
+  display: grid;
+  margin-top: 0;
+}
+
+.array-list div {
   min-height: 34px;
   border-bottom: 1px solid var(--row);
   color: var(--muted);
@@ -792,6 +810,10 @@ textarea {
 .array-list dt {
   color: var(--text);
   font-weight: 820;
+}
+
+.array-list dd:last-child {
+  text-align: right;
 }
 
 .quick-prune-strip {
@@ -1382,6 +1404,10 @@ textarea {
 
   .resource-stats div:first-child {
     border-top: 0;
+  }
+
+  .array-list-header {
+    display: none;
   }
 
   .array-list div,
