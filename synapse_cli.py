@@ -307,6 +307,19 @@ def command_list_context_cursors(args: argparse.Namespace) -> dict[str, Any]:
     return backend.list_context_cursors(context_id=args.context, limit=args.limit)
 
 
+def command_agent_brief(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.hydrate_agent_context(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        prompt=args.prompt,
+        since_event_id=args.since_event_id,
+        event_limit=args.limit,
+        graph_limit=args.graph_limit,
+        acknowledge=not args.no_ack,
+    )
+
+
 def command_profile(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.resource_profile(
@@ -588,6 +601,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(list_context_cursors)
     list_context_cursors.add_argument("--limit", type=int, default=50)
     list_context_cursors.set_defaults(func=command_list_context_cursors)
+
+    agent_brief = subparsers.add_parser("agent-brief")
+    add_context(agent_brief)
+    agent_brief.add_argument("--agent-id", required=True)
+    agent_brief.add_argument("--prompt", default="")
+    agent_brief.add_argument("--since-event-id", type=int, default=None)
+    agent_brief.add_argument("--limit", type=int, default=20)
+    agent_brief.add_argument("--graph-limit", type=int, default=30)
+    agent_brief.add_argument("--no-ack", action="store_true")
+    agent_brief.set_defaults(func=command_agent_brief)
 
     profile = subparsers.add_parser("profile")
     profile.add_argument("--benchmark-quick-prune", action="store_true")

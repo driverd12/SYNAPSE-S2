@@ -429,6 +429,66 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(json.loads(ack.stdout)["agent_id"], "cli-test")
         self.assertEqual(json.loads(cursors.stdout)["cursors"][0]["agent_id"], "cli-test")
 
+    def test_cli_agent_brief_hydrates_context_and_advances_cursor(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-agent-brief-memory",
+                "--text",
+                "Agent brief hydration should recall CLI context deployments.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            event_id = json.loads(remember.stdout)["agent_deployment"]["event_id"]
+            first = self.run_cli(
+                "agent-brief",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                "--prompt",
+                "CLI context deployments",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            second = self.run_cli(
+                "agent-brief",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                "--prompt",
+                "CLI context deployments",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        first_payload = json.loads(first.stdout)
+        second_payload = json.loads(second.stdout)
+        self.assertEqual(first_payload["action"], "agent-context-hydrate")
+        self.assertEqual(first_payload["new_event_count"], 1)
+        self.assertEqual(first_payload["latest_event_id"], event_id)
+        self.assertEqual(first_payload["ack"]["agent_id"], "cli-agent")
+        self.assertIn("cli-agent-brief-memory", first_payload["briefing_markdown"])
+        self.assertIn("cli-agent-brief-memory", first_payload["recall_result"])
+        self.assertIn("payload_summary", first_payload["events"][0])
+        self.assertNotIn(
+            "Agent brief hydration should recall CLI context deployments.",
+            json.dumps(first_payload["events"]),
+        )
+        self.assertIn("source_text_bytes", first_payload["events"][0]["payload_summary"])
+        self.assertEqual(second_payload["new_event_count"], 0)
+        self.assertEqual(second_payload["since_event_id"], event_id)
+
     def test_cli_list_memory_can_include_vector_details_when_requested(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

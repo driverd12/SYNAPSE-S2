@@ -2,7 +2,16 @@
 
 Use SYNAPSE-S2 as the durable local memory substrate for this repository.
 
-At the start of substantive work, inspect the current memory context:
+At the start of substantive work, hydrate the current agent context. This pulls durable context deployments from the agent cursor, runs local recall for the current task prompt, summarizes the memory graph, and acknowledges consumed events:
+
+```bash
+.venv/bin/python synapse_cli.py --json agent-brief \
+  --context default \
+  --agent-id codex-desktop \
+  --prompt "<current task or user request>"
+```
+
+If you need lower-level diagnostics, inspect the raw context bus and graph:
 
 ```bash
 .venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 20

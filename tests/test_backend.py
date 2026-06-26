@@ -474,6 +474,55 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(cursors["cursors"][0]["agent_id"], "codex-desktop")
         self.assertEqual(status["context_bus_ack_cursor_count"], 1)
 
+    def test_agent_context_hydration_briefs_recalls_and_advances_cursor(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        registration = backend.register_trace(
+            tag="agent-brief-memory",
+            embedding=backend.embed_text("agent hydration should recall the sidecar context"),
+            context_id="demo",
+            source_text="agent hydration should recall the sidecar context",
+            metadata={"source": "unit-test"},
+        )
+        event = backend.publish_context_event(
+            context_id="demo",
+            source_surface="unit-test",
+            event_type="remember-trace",
+            summary="agent-brief-memory captured and published",
+            payload={"tag": registration["tag"], "memory_id": registration["memory_id"]},
+        )
+
+        first = backend.hydrate_agent_context(
+            context_id="demo",
+            agent_id="codex-hydrator",
+            prompt="sidecar context recall",
+        )
+        second = backend.hydrate_agent_context(
+            context_id="demo",
+            agent_id="codex-hydrator",
+            prompt="sidecar context recall",
+        )
+
+        self.assertEqual(first["action"], "agent-context-hydrate")
+        self.assertEqual(first["context_id"], "demo")
+        self.assertEqual(first["agent_id"], "codex-hydrator")
+        self.assertEqual(first["new_event_count"], 1)
+        self.assertEqual(first["latest_event_id"], event["event_id"])
+        self.assertEqual(first["ack"]["last_event_id"], event["event_id"])
+        self.assertTrue(first["ack"]["caught_up"])
+        self.assertIn("agent-brief-memory captured and published", first["briefing_markdown"])
+        self.assertIn("agent-brief-memory", first["recall_result"])
+        self.assertEqual(first["graph_summary"]["entry_count"], 1)
+        self.assertEqual(second["new_event_count"], 0)
+        self.assertEqual(second["since_event_id"], event["event_id"])
+        self.assertEqual(second["ack"]["last_event_id"], event["event_id"])
+
     def test_capture_conversation_creates_event_graph_and_context_deployment(self):
         backend = SpikingAttentionBackend(
             dimension=32,

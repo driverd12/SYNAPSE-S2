@@ -645,6 +645,59 @@ def list_spiking_context_cursors(context_id: str = "default", limit: int = 50) -
 
 @mcp.tool(
     annotations={
+        "title": "Hydrate Agent Context From SYNAPSE-S2",
+        "readOnlyHint": False,
+    }
+)
+def hydrate_spiking_agent_context(
+    agent_id: str,
+    context_id: str = "default",
+    prompt: str = "",
+    since_event_id: int = -1,
+    limit: int = 20,
+    graph_limit: int = 30,
+    acknowledge: bool = True,
+) -> str:
+    """Return an agent-ready context brief, recall hits, and optional delivery ack."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        prompt_text = str(prompt or "").strip()
+        if len(prompt_text) > 20_000:
+            raise ValueError("prompt exceeds 20000 characters")
+        bounded_limit = _validate_limit(limit)
+        bounded_graph_limit = _validate_limit(graph_limit)
+        starting_event_id = None if int(since_event_id) < 0 else max(0, int(since_event_id))
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.hydrate_agent_context(
+            context_id=context,
+            agent_id=agent,
+            prompt=prompt_text,
+            since_event_id=starting_event_id,
+            event_limit=bounded_limit,
+            graph_limit=bounded_graph_limit,
+            acknowledge=bool(acknowledge),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid agent context hydration for context_id=%s agent_id=%s: %s",
+            context,
+            agent,
+            exc,
+        )
+        return json.dumps({"error": f"invalid agent context hydration: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception(
+            "agent context hydration failed for context_id=%s agent_id=%s",
+            context,
+            agent,
+        )
+        return json.dumps({"error": f"agent context hydration failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
         "title": "Profile SYNAPSE-S2 Runtime Resources",
         "readOnlyHint": False,
     }

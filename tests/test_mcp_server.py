@@ -330,6 +330,53 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(ack["pending_event_count"], 0)
         self.assertEqual(cursors["cursors"][0]["agent_id"], "codex-desktop")
 
+    def test_agent_context_hydration_tool_briefs_and_acknowledges(self):
+        registration = json.loads(
+            mcp_server.remember_spiking_context(
+                tag="mcp-agent-brief-memory",
+                context_id="demo",
+                text="MCP agent hydration should recall deployment context.",
+                metadata={"surface": "mcp"},
+            )
+        )
+
+        first = json.loads(
+            mcp_server.hydrate_spiking_agent_context(
+                agent_id="mcp-agent",
+                context_id="demo",
+                prompt="deployment context",
+            )
+        )
+        second = json.loads(
+            mcp_server.hydrate_spiking_agent_context(
+                agent_id="mcp-agent",
+                context_id="demo",
+                prompt="deployment context",
+            )
+        )
+
+        self.assertEqual(first["action"], "agent-context-hydrate")
+        self.assertEqual(
+            first["latest_event_id"],
+            registration["agent_deployment"]["event_id"],
+        )
+        self.assertEqual(first["new_event_count"], 1)
+        self.assertEqual(first["ack"]["agent_id"], "mcp-agent")
+        self.assertTrue(first["ack"]["caught_up"])
+        self.assertIn("mcp-agent-brief-memory", first["briefing_markdown"])
+        self.assertIn("mcp-agent-brief-memory", first["recall_result"])
+        self.assertIn("payload_summary", first["events"][0])
+        self.assertNotIn(
+            "MCP agent hydration should recall deployment context.",
+            json.dumps(first["events"]),
+        )
+        self.assertIn("source_text_bytes", first["events"][0]["payload_summary"])
+        self.assertEqual(second["new_event_count"], 0)
+        self.assertEqual(
+            second["since_event_id"],
+            registration["agent_deployment"]["event_id"],
+        )
+
     def test_memory_export_tool_rejects_paths_outside_export_root(self):
         result = json.loads(
             mcp_server.export_spiking_memory(

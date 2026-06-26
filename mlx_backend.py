@@ -993,6 +993,287 @@ class SpikingAttentionBackend:
             "memory_db_path": str(self.memory_store.db_path),
         }
 
+    def hydrate_agent_context(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        prompt: str = "",
+        since_event_id: int | None = None,
+        event_limit: int = 20,
+        graph_limit: int = 30,
+        acknowledge: bool = True,
+    ) -> dict[str, Any]:
+        """Compose the durable S2 context bus into an agent-ready briefing."""
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        bounded_event_limit = min(max(int(event_limit), 1), 100)
+        bounded_graph_limit = min(max(int(graph_limit), 1), 200)
+        start_event_id = (
+            self._agent_cursor_event_id(context=context, agent_id=agent)
+            if since_event_id is None
+            else max(0, int(since_event_id))
+        )
+
+        deployments = self.list_context_events(
+            context_id=context,
+            since_event_id=start_event_id,
+            limit=bounded_event_limit,
+        )
+        raw_events = deployments["events"]
+        events = [
+            self._summarize_agent_context_event(event)
+            for event in raw_events
+        ]
+        latest_event_id = max(
+            [start_event_id] + [int(event["event_id"]) for event in raw_events]
+        )
+        graph = self.list_memory_graph(context_id=context, limit=bounded_graph_limit)
+
+        prompt_text = str(prompt or "").strip()
+        recall_result = ""
+        recall_items: list[str] = []
+        if prompt_text:
+            recall_result = self.query(
+                self.embed_text(prompt_text),
+                context_id=context,
+            )
+            recall_items = self._split_recall_result(recall_result)
+
+        ack_payload = None
+        if acknowledge:
+            ack_payload = self.ack_context_events(
+                context_id=context,
+                agent_id=agent,
+                last_event_id=latest_event_id,
+            )
+
+        graph_entries = [
+            self._summarize_agent_graph_entry(entry)
+            for entry in graph["entries"][: min(10, bounded_graph_limit)]
+        ]
+        graph_relationships = [
+            self._summarize_agent_graph_relationship(relationship)
+            for relationship in graph["relationships"][: min(10, bounded_graph_limit)]
+        ]
+        graph_summary = {
+            "entry_count": int(graph["entry_count"]),
+            "relationship_count": int(graph["relationship_count"]),
+            "relationship_modes": graph["relationship_summary"],
+        }
+        payload = {
+            "action": "agent-context-hydrate",
+            "context_id": context,
+            "agent_id": agent,
+            "since_event_id": start_event_id,
+            "latest_event_id": latest_event_id,
+            "new_event_count": len(events),
+            "events": events,
+            "ack": ack_payload,
+            "acknowledged": bool(ack_payload),
+            "recall_prompt": prompt_text,
+            "recall_result": recall_result,
+            "recall_items": recall_items,
+            "graph_summary": graph_summary,
+            "graph_entries": graph_entries,
+            "graph_relationships": graph_relationships,
+            "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+        payload["briefing_markdown"] = self._render_agent_context_briefing(payload)
+        return payload
+
+    def _agent_cursor_event_id(self, *, context: str, agent_id: str) -> int:
+        cursors = self.memory_store.list_context_cursors(
+            context_id=context,
+            agent_id=agent_id,
+            limit=1,
+        )
+        if not cursors:
+            return 0
+        return max(0, int(cursors[0].get("last_event_id", 0)))
+
+    def _split_recall_result(self, recall_result: str) -> list[str]:
+        if not recall_result:
+            return []
+        if "No registered historical context matched" in recall_result:
+            return []
+        if "disabled" in recall_result.lower():
+            return []
+        return [
+            item.strip()
+            for item in recall_result.split(" / ")
+            if item.strip()
+        ]
+
+    def _summarize_agent_context_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "event_id": event.get("event_id", 0),
+            "context_id": event.get("context_id", ""),
+            "source_surface": event.get("source_surface", ""),
+            "event_type": event.get("event_type", ""),
+            "summary": event.get("summary", ""),
+            "agent_targets": event.get("agent_targets", []),
+            "target_count": event.get("target_count", 0),
+            "delivery_mode": event.get("delivery_mode", CONTEXT_BUS_DELIVERY_MODE),
+            "published": bool(event.get("published", True)),
+            "created_at": event.get("created_at", 0.0),
+            "payload_summary": self._summarize_agent_event_payload(
+                event.get("payload", {})
+            ),
+        }
+
+    def _summarize_agent_event_payload(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"payload_type": type(payload).__name__}
+        summary: dict[str, Any] = {
+            "payload_keys": sorted(str(key) for key in payload.keys()),
+        }
+        scalar_keys = (
+            "tag",
+            "memory_id",
+            "source_tag",
+            "sequence_id",
+            "speaker",
+            "target_type",
+            "reason",
+            "event_count",
+            "relationship_count",
+            "spike_count",
+            "neuron_count",
+        )
+        for key in scalar_keys:
+            if key not in payload:
+                continue
+            value = payload[key]
+            if isinstance(value, str):
+                summary[key] = self._compact_text(value, 180)
+            elif isinstance(value, (int, float, bool)) or value is None:
+                summary[key] = value
+        if isinstance(payload.get("source_text"), str):
+            summary["source_text_bytes"] = len(
+                payload["source_text"].encode("utf-8")
+            )
+        if isinstance(payload.get("text"), str):
+            summary["text_bytes"] = len(payload["text"].encode("utf-8"))
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            summary["metadata_keys"] = sorted(str(key) for key in metadata.keys())
+        nested_events = payload.get("events")
+        if isinstance(nested_events, list):
+            summary["nested_event_count"] = len(nested_events)
+            summary["nested_event_tags"] = [
+                str(item.get("tag", ""))
+                for item in nested_events[:5]
+                if isinstance(item, dict) and item.get("tag")
+            ]
+        nested_relationships = payload.get("relationships")
+        if isinstance(nested_relationships, list):
+            summary["nested_relationship_count"] = len(nested_relationships)
+        result = payload.get("result")
+        if isinstance(result, dict):
+            summary["result"] = {
+                key: result.get(key)
+                for key in (
+                    "deleted",
+                    "deleted_memory_id",
+                    "deleted_relationship_count",
+                    "deleted_memory_event_count",
+                    "deleted_relationship_ids",
+                )
+                if key in result
+            }
+        return summary
+
+    def _summarize_agent_graph_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        source_text = str(entry.get("source_text") or "").strip()
+        excerpt = source_text[:220] + ("..." if len(source_text) > 220 else "")
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        return {
+            "memory_id": entry.get("memory_id", ""),
+            "tag": entry.get("tag", ""),
+            "context_id": entry.get("context_id", ""),
+            "excerpt": excerpt,
+            "metadata_keys": sorted(str(key) for key in metadata.keys()),
+            "updated_at": entry.get("updated_at", 0.0),
+        }
+
+    def _summarize_agent_graph_relationship(
+        self,
+        relationship: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "relationship_id": relationship.get("relationship_id", ""),
+            "relation_type": relationship.get("relation_type", ""),
+            "weight": relationship.get("weight", 0.0),
+            "source_memory_id": relationship.get("source_memory_id", ""),
+            "source_tag": relationship.get("source_tag", ""),
+            "target_memory_id": relationship.get("target_memory_id", ""),
+            "target_tag": relationship.get("target_tag", ""),
+            "updated_at": relationship.get("updated_at", 0.0),
+        }
+
+    def _render_agent_context_briefing(self, payload: dict[str, Any]) -> str:
+        lines = [
+            "# SYNAPSE-S2 Agent Context",
+            (
+                f"- Context: {payload['context_id']} | Agent: {payload['agent_id']} | "
+                f"Events: {payload['new_event_count']} new since "
+                f"{payload['since_event_id']} -> {payload['latest_event_id']}"
+            ),
+            f"- Delivery: {payload['delivery_mode']} | Ack: {'yes' if payload['acknowledged'] else 'no'}",
+        ]
+        events = payload.get("events", [])
+        if events:
+            lines.append("## New Context Deployments")
+            for event in events[:10]:
+                lines.append(
+                    (
+                        f"- #{event['event_id']} {event['event_type']} from "
+                        f"{event['source_surface']}: {self._compact_text(event['summary'], 180)}"
+                    )
+                )
+        else:
+            lines.append("## New Context Deployments")
+            lines.append("- No new context deployments for this agent cursor.")
+
+        recall_prompt = str(payload.get("recall_prompt") or "")
+        if recall_prompt:
+            lines.append("## Prompt Recall")
+            if payload.get("recall_items"):
+                for item in payload["recall_items"][:8]:
+                    lines.append(f"- {self._compact_text(item, 220)}")
+            else:
+                lines.append(f"- {self._compact_text(payload.get('recall_result', ''), 220)}")
+
+        graph_summary = payload.get("graph_summary", {})
+        relationship_modes = graph_summary.get("relationship_modes", {})
+        lines.append("## Memory Graph")
+        lines.append(
+            (
+                f"- Entries: {graph_summary.get('entry_count', 0)} | "
+                f"Relationships: {graph_summary.get('relationship_count', 0)} | "
+                f"Temporal: {relationship_modes.get('temporal', 0)} | "
+                f"Associative: {relationship_modes.get('associative', 0)}"
+            )
+        )
+        for entry in payload.get("graph_entries", [])[:5]:
+            excerpt = entry.get("excerpt") or "no source text"
+            lines.append(
+                f"- {entry.get('tag', '')}: {self._compact_text(str(excerpt), 180)}"
+            )
+        lines.append("## Operator Safety")
+        lines.append(
+            "- Treat this as local working memory. Prune sensitive, wrong, or partial data before it influences future recall."
+        )
+        return "\n".join(lines)
+
+    def _compact_text(self, value: str, limit: int) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
+
     def ingest_text_events(
         self,
         *,
@@ -1848,6 +2129,27 @@ def list_context_cursors(
     return get_backend().list_context_cursors(
         context_id=context_id,
         limit=limit,
+    )
+
+
+def hydrate_agent_context(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    prompt: str = "",
+    since_event_id: int | None = None,
+    event_limit: int = 20,
+    graph_limit: int = 30,
+    acknowledge: bool = True,
+) -> dict[str, Any]:
+    return get_backend().hydrate_agent_context(
+        context_id=context_id,
+        agent_id=agent_id,
+        prompt=prompt,
+        since_event_id=since_event_id,
+        event_limit=event_limit,
+        graph_limit=graph_limit,
+        acknowledge=acknowledge,
     )
 
 

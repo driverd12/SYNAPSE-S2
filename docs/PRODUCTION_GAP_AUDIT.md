@@ -16,6 +16,7 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 | README/runbook still taught `board-demo` and `seed-demo` | IT operators could accidentally present synthetic state | Rewrite examples around `default` and real operator captures | Fixed in `README.md` and `docs/TOMORROW_RUNBOOK.md` |
 | Compliance matrix under-described client registration and delivery receipts | Proposal mapping lagged implementation | Add explicit rows for config installer and context cursors | Fixed in `docs/PROPOSAL_COMPLIANCE.md` |
 | Capture required an active user-facing tool call | Useful session notes could be missed if the dashboard or agent forgot the synchronous capture form | Add a launchd-backed local capture inbox with CLI, MCP, dashboard status/process controls, redaction, processed/error queues, and tests | Fixed in `capture_daemon.py`, `synapse_cli.py`, `mcp_server.py`, `dashboard_server.py`, `web/app.js`, and `scripts/install_capture_daemon.sh` |
+| Restarted agents had to manually compose raw pull, recall, graph, and ack calls | Codex/Claude could miss relevant memory or fail to acknowledge consumed deployments | Add one context-hydration command/tool that returns an agent-ready brief and updates the cursor | Fixed in `mlx_backend.py`, `synapse_cli.py`, `mcp_server.py`, `AGENTS.md`, and tests |
 
 ## Remaining Explicit Non-Claims
 

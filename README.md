@@ -76,7 +76,16 @@ Inspect, export, and back up the memory store:
   --output .synapse_s2/default-memory-backup.sqlite3
 ```
 
-Inspect and acknowledge context-bus deployments from the CLI:
+Hydrate a restarted agent from the durable context bus:
+
+```bash
+.venv/bin/python synapse_cli.py --json agent-brief \
+  --context default \
+  --agent-id codex-desktop \
+  --prompt "Summarize the current SYNAPSE-S2 work and next implementation gap."
+```
+
+`agent-brief` composes `pull-context`, text recall, graph summary, and `ack-context` into one agent-ready briefing. Use the lower-level commands when diagnosing delivery state directly:
 
 ```bash
 .venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 10
@@ -160,6 +169,7 @@ The MCP server exposes these tools:
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Record the last context-bus event consumed by a local agent. |
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
+| `hydrate_spiking_agent_context` | Return an agent-ready briefing with new deployments, prompt recall, graph highlights, and optional ack. |
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
 | `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |

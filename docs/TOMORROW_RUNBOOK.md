@@ -86,7 +86,16 @@ Event graph ingestion:
 
 The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship.
 
-Context-bus receipts:
+Agent context hydration:
+
+```bash
+.venv/bin/python synapse_cli.py --json agent-brief \
+  --context default \
+  --agent-id codex-desktop \
+  --prompt "Prepare SYNAPSE-S2 for the next live operator session."
+```
+
+This returns a compact Markdown briefing plus structured JSON for new deployments, recall hits, graph highlights, and an ack cursor. Use raw receipts when validating the delivery protocol directly:
 
 ```bash
 .venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 10
@@ -206,6 +215,7 @@ Useful tool calls:
 | `pull_spiking_context_deployments` | Pulls context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Records the last deployment event consumed by a local client. |
 | `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |
+| `hydrate_spiking_agent_context` | Hydrates a restarted client with new deployments, prompt recall, graph highlights, and an optional ack cursor update. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
 | `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |

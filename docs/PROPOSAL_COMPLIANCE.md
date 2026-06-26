@@ -38,6 +38,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Codex, Claude Desktop, and Claude Code client registration | Implemented | `client_config.py`, `scripts/install_client_configs.py`, `tests/test_client_config.py` |
 | Project-root state discovery through client environment | Implemented | `SYNAPSE_S2_*` envs, plus `CLAUDE_PROJECT_DIR` / `CODEX_PROJECT_DIR` fallback in `mlx_backend.py` |
 | Durable context-bus deployment to connected local agents | Implemented as pull-plus-ack protocol | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, CLI `pull-context` / `ack-context`, `agent_context_cursors` table |
+| Agent-ready context hydration after client restart | Implemented | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief`, backend `hydrate_agent_context`, cursor-backed ack plus recall and graph summary |
 | Recall does not fabricate historical tags when memory is empty | Implemented | no-memory queries return transparent raw activation summaries instead of synthetic `context::neuron-*` memory labels |
 | Operator-visible local control surface | Implemented | `dashboard_server.py`, `web/index.html`, `web/app.js`, `web/styles.css`, `scripts/smoke_dashboard.py`, `tests/test_dashboard_server.py` |
 | Quick-pruning mode every 5 minutes | Implemented and tested | `quick_pruning_interval_seconds=300.0`, auto-prune in `query()` / `register_trace()`, `tests/test_backend.py` |
@@ -65,6 +66,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Inspect event relationships | `list_spiking_memory_graph`, `synapse_cli.py graph` |
 | Hand-prune nodes, edges, deployment events, temporal edges, or associative edges | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, dashboard Safety Prune |
 | Pull and acknowledge context deployments | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, `synapse_cli.py pull-context/ack-context/list-context-cursors` |
+| Hydrate a restarted agent from memory | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief` |
 | Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
 | Use a local dashboard | `dashboard_server.py`, `scripts/smoke_dashboard.py` |
 | Manual quick prune | `synapse_cli.py quick-prune` |
