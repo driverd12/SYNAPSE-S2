@@ -29,6 +29,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Addition/subtraction STDP update with asymmetric temporal constants | Implemented | `_apply_stdp()` |
 | Contextual focus gating | Implemented | global and per-context enable toggles in `set_enabled()` and MCP/CLI controls |
 | Persistent associative memory substrate | Implemented | `memory_store.py` SQLite store, `remember_spiking_context`, `list_spiking_memory`, export, backup |
+| Local text-to-spike provider provenance | Implemented | `embedding_providers.py`, `metadata.embedding_provider`, CLI `--embedding-provider`, status/provider tests |
 | Bayesian Surprise Event Segmenter for local text streams | Implemented as deterministic local surprise segmentation | `event_segmenter.py`, `ingest_spiking_memory_text`, `synapse_cli.py ingest-text`, `tests/test_event_segmenter.py` |
 | Dual graph memory protocol for episodic-semantic relationships | Implemented | `memory_relationships` table in `memory_store.py`, `list_spiking_memory_graph`, graph-expanded recall, deep-sleep relationship extraction |
 | Agent/operator conversation capture into event memory | Implemented | `capture_spiking_conversation`, `synapse_cli.py capture-session`, `/api/capture-conversation`, GUI capture form |
@@ -46,6 +47,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Quick-pruning completes under 60 ms budget as measured locally | Implemented as runtime check | `run_quick_pruning()` returns `within_60ms_budget`; unit test asserts the local path stays under budget |
 | Quick-pruning is non-LLM GPU/array maintenance | Implemented | `run_quick_pruning()` decays MLX arrays and resets transient membrane state |
 | Proposal 61-138 MB resource envelope | Implemented as live topology estimate and readiness gate | `resource_profile()`, `profile_spiking_resources`, `synapse_cli.py profile`, `synapse_cli.py preflight --require-resource-envelope`, `scripts/prep_tomorrow.sh` |
+| Native MLX/mlxsnn certification evidence | Implemented | `certify_runtime()`, CLI `certify-runtime`, MCP `certify_spiking_runtime`, dashboard `/api/certify-runtime`, strict-native checks |
 | Deep-sleep consolidation on idle | Implemented and tested | `run_idle_maintenance()`, `trigger_idle_maintenance()`, `synapse_cli.py idle-maintenance` |
 | Hebbian Distillation into structured semantic hierarchy | Implemented | `run_deep_sleep_consolidation()` builds `semantic_hierarchy` from active traces, durable entries, and persisted relationship edges |
 | Seven-phase consolidation lifecycle | Implemented and tested | `CONSOLIDATION_PHASES`, deep-sleep `phases`, `tests/test_backend.py` |
@@ -69,6 +71,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Pull and acknowledge context deployments | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, `synapse_cli.py pull-context/ack-context/list-context-cursors` |
 | Hydrate a restarted agent from memory | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief` |
 | Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
+| Certify native runtime execution | `certify_spiking_runtime`, `synapse_cli.py certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope`, dashboard Native Certify |
 | Use a local dashboard | `dashboard_server.py`, `scripts/smoke_dashboard.py` |
 | Manual quick prune | `synapse_cli.py quick-prune` |
 | Manual or forced idle deep sleep | `trigger_sleep_consolidation`, `trigger_idle_maintenance`, `synapse_cli.py sleep`, `synapse_cli.py idle-maintenance --force-deep-sleep` |
@@ -81,8 +84,9 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and safe for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
 | "Deploy to all connected agents" language | Deployment is durable local pull with per-agent acknowledgement cursors | Local desktop clients do not expose a reliable push bus. Durable pull plus receipts is auditable and survives client restarts. |
 | "Magic" passive capture | Implemented as a local always-on inbox plus MCP startup/session-boundary bridge, not unauthorized scraping of arbitrary app state | MCP clients hydrate automatically on server startup and drop sanitized boundary notes on exit. Full chat capture still requires clients, hooks, or operators to explicitly write payloads. |
+| Text embeddings from arbitrary client text | Default provider is `semantic-hash-v1`; local neural encoders plug in through `python:/path.py:function` | Keeps the default offline and deterministic while making semantic/model provenance visible on every text memory. |
 | Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-safe 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
-| VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark | This is the right readiness signal for tomorrow. External Metal counter capture can be added later for hardware certification. |
+| VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark and certification evidence payload | This is the right readiness signal for tomorrow. External Metal/Instruments counter capture can be added later for hardware certification. |
 
 ## Research Extensions Not Claimed Complete
 
@@ -90,8 +94,8 @@ These items are present in the architecture document as longer-horizon research 
 
 - PTsoftmax and Bit Shifting PowerNorm.
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
-- Probabilistic embedding-calibrated surprise over live token streams; current implementation is deterministic, local, and lexical so it can run offline inside MCP stdio without model calls.
-- External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs.
+- Probabilistic embedding-calibrated surprise over live token streams; current implementation is deterministic and local so it can run offline inside MCP stdio without model calls.
+- External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs; current certification evidence is MLX/topology/runtime based.
 - Invisible capture of arbitrary already-running Codex/Claude chat transcript content without client cooperation; the MCP process boundary is captured, but full chat text still requires explicit client/tool/hook payloads.
 
 ## Current Verification Command

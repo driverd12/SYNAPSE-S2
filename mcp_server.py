@@ -721,6 +721,43 @@ def profile_spiking_resources(
         return json.dumps({"error": f"resource profile failed: {exc}"}, sort_keys=True)
 
 
+@mcp.tool(
+    annotations={
+        "title": "Certify SYNAPSE-S2 Native Runtime",
+        "readOnlyHint": False,
+    }
+)
+def certify_spiking_runtime(
+    strict_native: bool = False,
+    require_gpu: bool = False,
+    benchmark_quick_prune: bool = False,
+    require_resource_envelope: bool = False,
+    target_min_mb: float = 61.0,
+    target_max_mb: float = 138.0,
+    output_path: str = "",
+) -> str:
+    """Emit an auditable local native-runtime certification evidence payload."""
+    try:
+        path = _optional_output_path(output_path, allowed_suffixes={".json"})
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.certify_runtime(
+            strict_native=bool(strict_native),
+            require_gpu=bool(require_gpu),
+            benchmark_quick_prune=bool(benchmark_quick_prune),
+            require_resource_envelope=bool(require_resource_envelope),
+            target_min_mb=float(target_min_mb),
+            target_max_mb=float(target_max_mb),
+            output_path=path,
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid runtime certification request: %s", exc)
+        return json.dumps({"error": f"invalid runtime certification request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("runtime certification failed")
+        return json.dumps({"error": f"runtime certification failed: {exc}"}, sort_keys=True)
+
+
 @mcp.tool()
 def export_spiking_memory(
     context_id: str = "default",

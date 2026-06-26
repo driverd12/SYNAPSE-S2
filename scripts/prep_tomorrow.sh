@@ -40,7 +40,7 @@ echo "=== unit tests ==="
 .venv/bin/python -m unittest discover -s tests -v
 
 echo "=== compile check ==="
-.venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
+.venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
 
 echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json remember-text \
@@ -58,6 +58,13 @@ echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json graph --context "$CONTEXT" --limit 10
 .venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
 
+echo "=== native runtime certification ==="
+.venv/bin/python synapse_cli.py --json certify-runtime \
+  --strict-native \
+  --benchmark-quick-prune \
+  --require-resource-envelope \
+  --output "$SYNAPSE_S2_EXPORT_DIR/native-certification-$STAMP.json"
+
 echo "=== capture inbox smoke ==="
 .venv/bin/python synapse_cli.py --json capture-inbox-drop \
   --context "$CONTEXT" \
@@ -73,6 +80,7 @@ echo "=== cli preflight ==="
   --minimum-memory 3 \
   --minimum-relationships 1 \
   --require-resource-envelope \
+  --require-native \
   --launcher "$LAUNCHER" \
   --query-text "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients"
 
@@ -95,6 +103,12 @@ echo "=== mcp resource profile smoke ==="
 .venv/bin/fastmcp call --command "$LAUNCHER" \
   --target profile_spiking_resources \
   --input-json "{\"benchmark_quick_prune\":true}" \
+  --json --timeout 15
+
+echo "=== mcp native certification smoke ==="
+.venv/bin/fastmcp call --command "$LAUNCHER" \
+  --target certify_spiking_runtime \
+  --input-json "{\"strict_native\":true,\"benchmark_quick_prune\":true,\"require_resource_envelope\":true}" \
   --json --timeout 15
 
 echo "=== mcp context deployment smoke ==="

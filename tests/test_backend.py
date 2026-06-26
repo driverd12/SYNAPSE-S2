@@ -5,6 +5,8 @@ import time
 
 import mlx.core as mx
 
+import mlx_backend
+from mlx_backend import BackendUnavailable
 from mlx_backend import SpikingAttentionBackend
 
 
@@ -242,6 +244,154 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertEqual(first.tolist(), second.tolist())
         self.assertNotEqual(first.tolist(), third.tolist())
+
+    def test_text_embedding_provider_status_and_provenance_are_visible(self):
+        backend = SpikingAttentionBackend(
+            dimension=48,
+            num_neurons=24,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+
+        payload = backend.embed_text_payload("Apple Silicon Metal acceleration", dimensions=48)
+        registration = backend.register_text_trace(
+            tag="semantic-provider-memory",
+            text="Apple Silicon Metal acceleration",
+            context_id="demo",
+            metadata={"source": "unit-test"},
+        )
+        memory = backend.list_memory(context_id="demo")
+        status = backend.status(context_id="demo")
+
+        self.assertEqual(payload["provenance"]["provider"], "semantic-hash-v1")
+        self.assertTrue(payload["provenance"]["semantic"])
+        self.assertEqual(status["embedding_provider"]["provider"], "semantic-hash-v1")
+        self.assertTrue(status["embedding_provider"]["semantic"])
+        self.assertEqual(registration["embedding_provider"]["provider"], "semantic-hash-v1")
+        self.assertEqual(
+            memory["entries"][0]["metadata"]["embedding_provider"]["provider"],
+            "semantic-hash-v1",
+        )
+        self.assertEqual(memory["entries"][0]["metadata"]["source"], "unit-test")
+
+    def test_semantic_provider_improves_related_phrase_recall_without_exact_tokens(self):
+        backend = SpikingAttentionBackend(
+            dimension=96,
+            num_neurons=48,
+            default_top_k=8,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        backend.register_text_trace(
+            tag="native-metal-memory",
+            text="Apple Silicon Metal kernels accelerate the local spiking runtime.",
+            context_id="demo",
+        )
+
+        result = backend.query(
+            backend.embed_text("M-series MLX GPU compute path"),
+            context_id="demo",
+        )
+
+        self.assertIn("native-metal-memory", result)
+
+    def test_native_certification_reports_checks_and_writes_evidence(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            evidence_path = Path(tmp) / "certification.json"
+            backend = SpikingAttentionBackend(
+                dimension=8,
+                num_neurons=6,
+                compile_graph=False,
+                state_path=state_path,
+            )
+
+            certification = backend.certify_runtime(
+                strict_native=False,
+                benchmark_quick_prune=True,
+                output_path=evidence_path,
+            )
+            evidence_exists = evidence_path.exists()
+
+        self.assertTrue(evidence_exists)
+        self.assertEqual(certification["action"], "certify-runtime")
+        self.assertIn("checks", certification)
+        self.assertIn("resource_profile", certification)
+        self.assertIn("quick_pruning", certification["resource_profile"])
+        self.assertEqual(certification["evidence_path"], str(evidence_path.resolve()))
+        self.assertEqual(certification["checks"]["mlx_available"]["passed"], True)
+
+    def test_native_certification_retries_cold_quick_prune_sample(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        samples = [
+            {"elapsed_ms": 67.0, "within_60ms_budget": False},
+            {"elapsed_ms": 11.5, "within_60ms_budget": True},
+        ]
+
+        def fake_quick_prune(*, trigger: str = "manual") -> dict:
+            sample = dict(samples.pop(0))
+            sample.update(
+                {
+                    "mode": "quick-pruning",
+                    "trigger": trigger,
+                    "gpu_non_llm": True,
+                    "decay_strategy": "lazy-scalar",
+                    "membrane_reset": True,
+                }
+            )
+            return sample
+
+        backend.run_quick_pruning = fake_quick_prune  # type: ignore[method-assign]
+
+        certification = backend.certify_runtime(benchmark_quick_prune=True)
+        quick_profile = certification["resource_profile"]["quick_pruning"]
+
+        self.assertTrue(certification["checks"]["quick_pruning_budget"]["passed"])
+        self.assertEqual(quick_profile["elapsed_ms"], 11.5)
+        self.assertEqual(quick_profile["sample_count"], 2)
+        self.assertTrue(quick_profile["cold_start_retry_used"])
+        self.assertEqual(
+            [sample["elapsed_ms"] for sample in quick_profile["samples"]],
+            [67.0, 11.5],
+        )
+
+    def test_native_certification_strict_mode_fails_when_lif_downgrades(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend._mlxsnn_lif_layer = None
+
+        certification = backend.certify_runtime(strict_native=True)
+
+        self.assertFalse(certification["ready"])
+        self.assertTrue(certification["strict_native"])
+        self.assertIn("mlxsnn_lif_execution_path", certification["failed_checks"])
+
+    def test_require_native_constructor_raises_when_mlxsnn_is_unavailable(self):
+        original_mlxsnn = mlx_backend.mlxsnn
+        try:
+            mlx_backend.mlxsnn = None
+            with self.assertRaises(BackendUnavailable):
+                SpikingAttentionBackend(
+                    dimension=8,
+                    num_neurons=6,
+                    compile_graph=False,
+                    state_path=self.state_path,
+                    require_native=True,
+                )
+        finally:
+            mlx_backend.mlxsnn = original_mlxsnn
 
     def test_global_toggle_disables_and_reenables_queries(self):
         backend = SpikingAttentionBackend(

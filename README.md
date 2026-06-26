@@ -7,6 +7,7 @@ Unlike traditional vector similarity retrieval methods, SYNAPSE-S2 runs natively
 ## **Operational Quickstart**
 
 This repository now includes a working local MCP server, a SQLite-backed persistent memory store, runtime toggle controls, and a CLI for validation outside an MCP client.
+Text recall is routed through a pluggable local embedding provider. The default `semantic-hash-v1` provider remains offline and deterministic while expanding related concepts beyond exact lexical matches; `lexical-hash-v1` is available for strict legacy behavior, and `python:/path/to/module.py:function` can point SYNAPSE-S2 at an IT-managed local encoder.
 
 ### 1. Install Runtime Dependencies
 
@@ -31,6 +32,10 @@ The launcher enters through `mcp_client_wrapper.py`, which hydrates SYNAPSE-S2 a
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python synapse_cli.py --json doctor --context default
+.venv/bin/python synapse_cli.py --json certify-runtime \
+  --strict-native \
+  --benchmark-quick-prune \
+  --require-resource-envelope
 ```
 
 For the full morning readiness path, run:
@@ -66,6 +71,7 @@ Expected query output returns ranked registered traces such as `production-memor
 Event ingestion additionally creates segmented memories such as `production-preflight-brief-event-001` and relationship edges such as `temporal_next` and `semantic_overlap`.
 
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`. Runtime toggles and client state live in `.synapse_s2/runtime_state.json`. Both `.mcp.json` and `/Users/dan.driver/.codex/config.toml` set `SYNAPSE_S2_MEMORY_DB` so Codex, Claude, and direct CLI runs target the same durable substrate. MCP export and backup paths are constrained to `.synapse_s2` by default through `SYNAPSE_S2_EXPORT_DIR`; the CLI remains available for explicit operator-chosen local paths.
+Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, local-only status, semantic flag, dimensions, concepts, and a vector hash. Set `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 
 Inspect, export, and back up the memory store:
 
@@ -173,6 +179,7 @@ The MCP server exposes these tools:
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
 | `hydrate_spiking_agent_context` | Return an agent-ready briefing with new deployments, prompt recall, graph highlights, and optional ack. |
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
+| `certify_spiking_runtime` | Emit native runtime certification evidence for MLX, mlxsnn, envelope, provider, and quick-prune checks. |
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
 | `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |
 | `trigger_sleep_consolidation` | Run deep-sleep consolidation and semantic hierarchy extraction. |
@@ -209,6 +216,11 @@ Resource profiling reports the MLX topology footprint from the live arrays (`W_s
 ```bash
 .venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
 .venv/bin/python synapse_cli.py --json preflight --require-resource-envelope
+.venv/bin/python synapse_cli.py --json certify-runtime \
+  --strict-native \
+  --benchmark-quick-prune \
+  --require-resource-envelope \
+  --output .synapse_s2/native-certification.json
 ```
 
 Idle deep-sleep consolidation is available from MCP and CLI:
@@ -222,7 +234,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

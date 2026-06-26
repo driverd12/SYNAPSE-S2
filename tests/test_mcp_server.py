@@ -83,6 +83,20 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("estimated_total_mb", profile)
         self.assertTrue(profile["quick_pruning"]["within_60ms_budget"])
 
+    def test_native_certification_tool_reports_evidence_shape(self):
+        certification = json.loads(
+            mcp_server.certify_spiking_runtime(
+                strict_native=False,
+                benchmark_quick_prune=True,
+            )
+        )
+
+        self.assertEqual(certification["action"], "certify-runtime")
+        self.assertIn("checks", certification)
+        self.assertIn("resource_profile", certification)
+        self.assertIn("quick_pruning", certification["resource_profile"])
+        self.assertIn("mlx_available", certification["checks"])
+
     def test_idle_maintenance_tool_can_force_deep_sleep(self):
         result = json.loads(mcp_server.trigger_idle_maintenance(force_deep_sleep=True))
 
@@ -124,6 +138,25 @@ class McpServerTests(unittest.TestCase):
         self.assertTrue(registration["agent_deployment"]["published"])
         self.assertEqual(registration["agent_deployment"]["event_type"], "remember-trace")
         self.assertIn("exec-briefing-memory", result)
+
+    def test_text_remember_tool_records_embedding_provider_provenance(self):
+        registration = json.loads(
+            mcp_server.remember_spiking_context(
+                tag="mcp-semantic-memory",
+                context_id="demo",
+                text="Apple Silicon Metal acceleration",
+                metadata={"surface": "mcp"},
+            )
+        )
+        listing = json.loads(mcp_server.list_spiking_memory(context_id="demo", limit=5))
+        status = json.loads(mcp_server.get_spiking_attention_status(context_id="demo"))
+
+        self.assertEqual(registration["embedding_provider"]["provider"], "semantic-hash-v1")
+        self.assertEqual(
+            listing["entries"][0]["metadata"]["embedding_provider"]["provider"],
+            "semantic-hash-v1",
+        )
+        self.assertEqual(status["embedding_provider"]["provider"], "semantic-hash-v1")
 
     def test_text_query_tool_uses_local_deterministic_embedding(self):
         mcp_server.remember_spiking_context(

@@ -15,6 +15,9 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertIn("install_capture_daemon.sh", script)
         self.assertIn("capture-inbox-drop", script)
         self.assertIn("get_spiking_capture_inbox_status", script)
+        self.assertIn("embedding_providers.py", script)
+        self.assertIn("certify-runtime", script)
+        self.assertIn("certify_spiking_runtime", script)
 
     def test_capture_daemon_installer_declares_launch_agent(self):
         script = (ROOT / "scripts" / "install_capture_daemon.sh").read_text(encoding="utf-8")
@@ -29,6 +32,9 @@ class OperationalScriptTests(unittest.TestCase):
 
         self.assertIn("mcp_client_wrapper.py", script)
         self.assertIn("SYNAPSE_S2_CLIENT_SESSION_BRIDGE", script)
+        self.assertIn("SYNAPSE_S2_EMBEDDING_PROVIDER:=semantic-hash", script)
+        self.assertIn("MLX_DEVICE:=gpu", script)
+        self.assertIn("SYNAPSE_S2_MEMORY_DB", script)
         self.assertNotIn('"$REPO_ROOT/mcp_server.py"', script)
 
 

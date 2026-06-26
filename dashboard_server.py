@@ -192,11 +192,10 @@ class DashboardRuntime:
                 raise DashboardError(HTTPStatus.BAD_REQUEST, "tag is required")
             text = self._text_payload(payload, "text", max_bytes=MAX_TEXT_BYTES)
             metadata = self._metadata_payload(payload)
-            registration = self.backend.register_trace(
+            registration = self.backend.register_text_trace(
                 tag=tag,
-                embedding=self.backend.embed_text(text),
                 context_id=context,
-                source_text=text,
+                text=text,
                 metadata=metadata,
             )
             registration["agent_deployment"] = self._publish_agent_deployment(
@@ -312,6 +311,25 @@ class DashboardRuntime:
             )
         if method == "POST" and path == "/api/quick-prune":
             return self._json_response(self.backend.run_quick_pruning(trigger="dashboard"))
+        if method == "POST" and path == "/api/certify-runtime":
+            payload = self._parse_json_body(body)
+            output_path = ""
+            if payload.get("write_evidence") is True:
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                output_path = str(self._export_root() / f"native-certification-{stamp}.json")
+            return self._json_response(
+                self.backend.certify_runtime(
+                    strict_native=bool(payload.get("strict_native", False)),
+                    require_gpu=bool(payload.get("require_gpu", False)),
+                    benchmark_quick_prune=bool(payload.get("benchmark_quick_prune", False)),
+                    require_resource_envelope=bool(
+                        payload.get("require_resource_envelope", False)
+                    ),
+                    target_min_mb=float(payload.get("target_min_mb", 61.0)),
+                    target_max_mb=float(payload.get("target_max_mb", 138.0)),
+                    output_path=output_path or None,
+                )
+            )
         if method == "POST" and path == "/api/sleep":
             return self._json_response(self.backend.run_deep_sleep_consolidation())
         if method == "POST" and path == "/api/backup":

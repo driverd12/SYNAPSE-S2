@@ -130,6 +130,113 @@ class SynapseCliTests(unittest.TestCase):
         self.assertIn("estimated_total_mb", payload)
         self.assertTrue(payload["quick_pruning"]["within_60ms_budget"])
 
+    def test_cli_status_and_remember_text_report_embedding_provider(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-semantic-memory",
+                "--text",
+                "Apple Silicon Metal acceleration",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            status = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "status",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            listing = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "list-memory",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertEqual(json.loads(remember.stdout)["embedding_provider"]["provider"], "semantic-hash-v1")
+        self.assertEqual(json.loads(status.stdout)["embedding_provider"]["provider"], "semantic-hash-v1")
+        self.assertEqual(
+            json.loads(listing.stdout)["entries"][0]["metadata"]["embedding_provider"]["provider"],
+            "semantic-hash-v1",
+        )
+
+    def test_cli_certify_runtime_writes_evidence_pack(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            evidence_path = Path(tmp) / "native-certification.json"
+
+            result = self.run_cli(
+                "certify-runtime",
+                "--benchmark-quick-prune",
+                "--output",
+                str(evidence_path),
+                state_path=state_path,
+            )
+            evidence_exists = evidence_path.exists()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["action"], "certify-runtime")
+        self.assertEqual(payload["evidence_path"], str(evidence_path.resolve()))
+        self.assertTrue(evidence_exists)
+        self.assertIn("checks", payload)
+        self.assertIn("resource_profile", payload)
+
+    def test_cli_preflight_can_require_native_certification(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "native-preflight-memory",
+                "--text",
+                "SYNAPSE-S2 native certification should run during preflight.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            preflight = self.run_cli(
+                "preflight",
+                "--context",
+                "demo",
+                "--query-text",
+                "native certification preflight",
+                "--minimum-memory",
+                "1",
+                "--launcher",
+                sys.executable,
+                "--require-native",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        payload = json.loads(preflight.stdout)
+        self.assertIn("native_certification", payload)
+        self.assertTrue(payload["checks"]["native_certification_ready"])
+        self.assertEqual(payload["native_certification"]["action"], "certify-runtime")
+
     def test_cli_idle_maintenance_can_force_deep_sleep(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

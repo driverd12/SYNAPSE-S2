@@ -67,6 +67,8 @@ def build_backend(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBacke
         compile_graph=not args.no_compile,
         state_path=args.state,
         memory_path=args.memory_db,
+        embedding_provider_name=args.embedding_provider,
+        require_native=args.require_native_backend,
     )
 
 
@@ -95,12 +97,11 @@ def command_disable(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_remember_text(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
-    registration = backend.register_trace(
+    registration = backend.register_text_trace(
         tag=args.tag,
-        embedding=backend.embed_text(args.text),
         context_id=args.context,
+        text=args.text,
         metadata=parse_metadata(args.metadata),
-        source_text=args.text,
     )
     registration["agent_deployment"] = _publish_cli_deployment(
         backend,
@@ -143,9 +144,11 @@ def command_remember_vector(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_query_text(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
+    embedding = backend.embed_text_payload(args.text)
     return {
         "context_id": mlx_backend.sanitize_context_id(args.context),
-        "result": backend.query(backend.embed_text(args.text), context_id=args.context),
+        "embedding_provider": embedding["provenance"],
+        "result": backend.query(embedding["embedding"], context_id=args.context),
     }
 
 
@@ -329,6 +332,19 @@ def command_profile(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_certify_runtime(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.certify_runtime(
+        strict_native=args.strict_native,
+        require_gpu=args.require_gpu,
+        benchmark_quick_prune=args.benchmark_quick_prune,
+        require_resource_envelope=args.require_resource_envelope,
+        target_min_mb=args.target_min_mb,
+        target_max_mb=args.target_max_mb,
+        output_path=args.output,
+    )
+
+
 def command_quick_prune(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.run_quick_pruning()
@@ -367,6 +383,16 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     status = backend.status(context_id=args.context)
     resource_profile = backend.resource_profile(benchmark_quick_prune=False)
+    native_certification = (
+        backend.certify_runtime(
+            strict_native=args.require_native,
+            require_gpu=args.require_gpu,
+            benchmark_quick_prune=False,
+            require_resource_envelope=args.require_resource_envelope,
+        )
+        if args.require_native or args.require_gpu
+        else None
+    )
     dependencies = {
         "mlx": dependency_status("mlx"),
         "mlx.core": dependency_status("mlx.core"),
@@ -418,6 +444,8 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         )
         == 300.0,
     }
+    if native_certification is not None:
+        checks["native_certification_ready"] = bool(native_certification["ready"])
     if args.query_text:
         checks["query_returned_context"] = (
             bool(query_result)
@@ -440,6 +468,7 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         "dependencies": dependencies,
         "status": status,
         "resource_profile": resource_profile,
+        "native_certification": native_certification,
         "memory_preview": backend.list_memory(
             context_id=args.context,
             limit=args.preview_limit,
@@ -486,6 +515,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--idle-deep-sleep-seconds", type=float, default=1800.0)
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--memory-db", default=None, help="Durable SQLite memory path.")
+    parser.add_argument(
+        "--embedding-provider",
+        default=None,
+        help="Text embedding provider: auto, semantic-hash, lexical-hash, or python:/path.py:function.",
+    )
+    parser.add_argument(
+        "--require-native-backend",
+        action="store_true",
+        help="Fail backend startup if native MLX/mlxsnn execution is not available.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -618,6 +657,16 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--target-max-mb", type=float, default=138.0)
     profile.set_defaults(func=command_profile)
 
+    certify_runtime = subparsers.add_parser("certify-runtime")
+    certify_runtime.add_argument("--strict-native", action="store_true")
+    certify_runtime.add_argument("--require-gpu", action="store_true")
+    certify_runtime.add_argument("--benchmark-quick-prune", action="store_true")
+    certify_runtime.add_argument("--require-resource-envelope", action="store_true")
+    certify_runtime.add_argument("--target-min-mb", type=float, default=61.0)
+    certify_runtime.add_argument("--target-max-mb", type=float, default=138.0)
+    certify_runtime.add_argument("--output", default=None)
+    certify_runtime.set_defaults(func=command_certify_runtime)
+
     quick_prune = subparsers.add_parser("quick-prune")
     quick_prune.set_defaults(func=command_quick_prune)
 
@@ -652,6 +701,8 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--minimum-memory", type=int, default=1)
     preflight.add_argument("--minimum-relationships", type=int, default=0)
     preflight.add_argument("--require-resource-envelope", action="store_true")
+    preflight.add_argument("--require-native", action="store_true")
+    preflight.add_argument("--require-gpu", action="store_true")
     preflight.add_argument("--preview-limit", type=int, default=5)
     preflight.add_argument(
         "--launcher",

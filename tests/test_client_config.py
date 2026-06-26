@@ -23,6 +23,7 @@ class ClientConfigTests(unittest.TestCase):
         self.assertEqual(server["command"], str(launcher))
         self.assertEqual(server["env"]["PYTHONPATH"], str(resolved_repo))
         self.assertEqual(server["env"]["MLX_DEVICE"], "gpu")
+        self.assertEqual(server["env"]["SYNAPSE_S2_EMBEDDING_PROVIDER"], "semantic-hash")
         self.assertEqual(
             server["env"]["SYNAPSE_S2_MEMORY_DB"],
             str(resolved_repo / ".synapse_s2" / "memory.sqlite3"),
@@ -99,6 +100,7 @@ class ClientConfigTests(unittest.TestCase):
         self.assertIn(str(launcher), codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_SESSION_BRIDGE = "1"', codex_text)
+        self.assertIn('SYNAPSE_S2_EMBEDDING_PROVIDER = "semantic-hash"', codex_text)
         self.assertIn("synapse-s2", project_manifest["mcpServers"])
         self.assertEqual(
             project_manifest["mcpServers"]["synapse-s2"]["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"],
@@ -138,6 +140,7 @@ command = "node"
         self.assertIn("[mcp_servers.other]", merged)
         self.assertIn(str(launcher), merged)
         self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', merged)
+        self.assertIn('SYNAPSE_S2_EMBEDDING_PROVIDER = "semantic-hash"', merged)
         self.assertNotIn("/old/synapse-s2-mcp", merged)
         self.assertNotIn("old-agent", merged)
 

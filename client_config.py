@@ -36,6 +36,7 @@ def build_server_definition(
         "env": {
             "PYTHONPATH": str(repo),
             "MLX_DEVICE": "gpu",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
             "SYNAPSE_S2_STATE_PATH": str(repo / ".synapse_s2" / "runtime_state.json"),
             "SYNAPSE_S2_MEMORY_DB": str(repo / ".synapse_s2" / "memory.sqlite3"),
             "SYNAPSE_S2_EXPORT_DIR": str(repo / ".synapse_s2"),

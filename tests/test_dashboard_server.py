@@ -149,6 +149,29 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(prune_status, 200)
         self.assertEqual(prune_payload["mode"], "quick-pruning")
 
+    def test_certify_runtime_endpoint_reports_native_evidence(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            certify_status, certify_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/certify-runtime",
+                    json.dumps(
+                        {
+                            "strict_native": False,
+                            "benchmark_quick_prune": True,
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(certify_status, 200)
+        self.assertEqual(certify_payload["action"], "certify-runtime")
+        self.assertIn("checks", certify_payload)
+        self.assertIn("resource_profile", certify_payload)
+        self.assertIn("quick_pruning", certify_payload["resource_profile"])
+
     def test_readiness_audit_endpoint_reports_actionable_checks(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -355,6 +378,7 @@ class DashboardRuntimeTests(unittest.TestCase):
 
         self.assertEqual(remember_status, 200)
         self.assertEqual(remember_payload["tag"], "operator-note")
+        self.assertEqual(remember_payload["embedding_provider"]["provider"], "semantic-hash-v1")
         self.assertTrue(remember_payload["agent_deployment"]["published"])
         self.assertEqual(remember_payload["agent_deployment"]["event_type"], "remember-trace")
         self.assertEqual(remember_payload["agent_deployment"]["delivery_mode"], "durable-mcp-pull")

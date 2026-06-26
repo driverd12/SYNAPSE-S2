@@ -87,6 +87,7 @@ const elements = collectElements([
   "memoryLedger",
   "memoryState",
   "modeLabel",
+  "nativeCertifyButton",
   "modelUri",
   "operationLog",
   "platformLabel",
@@ -1389,6 +1390,20 @@ elements.profileButton.addEventListener("click", async () => {
     renderSnapshot(state.snapshot);
     return profile;
   }, { refresh: false });
+});
+
+elements.nativeCertifyButton.addEventListener("click", () => {
+  withBusy(elements.nativeCertifyButton, "Native certification", () => (
+    requestJson("/api/certify-runtime", {
+      method: "POST",
+      body: {
+        strict_native: true,
+        benchmark_quick_prune: true,
+        require_resource_envelope: true,
+        write_evidence: true,
+      },
+    })
+  ));
 });
 
 elements.graphZoomOut.addEventListener("click", () => zoomGraphBy(1 / 1.18));

@@ -9,7 +9,7 @@ cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local 
 scripts/prep_tomorrow.sh
 ```
 
-The script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
+The script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, writes a native certification evidence payload, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
 To refresh local client registration directly:
 
@@ -41,6 +41,7 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Capture a real trace with `synapse_cli.py --json remember-text --context default --tag <tag> --text <text>`. |
 | `relationship_minimum_met` | The selected context has too few persisted event relationships for the requested gate. | Run the event graph ingestion command below. |
 | `resource_envelope_met` | The default topology is outside the configured 61-138 MB estimated resource envelope. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then adjust `SYNAPSE_S2_NEURONS` or topology CLI args. |
+| `native_certification_ready` | Strict MLX/mlxsnn certification failed. | Run `synapse_cli.py --json certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope` and inspect `failed_checks`. |
 | `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context default`. |
 | `query_returned_context` | Recall did not return a registered context. | Seed or remember a matching trace, then query again. |
 
@@ -156,7 +157,30 @@ Resource envelope:
 .venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
 ```
 
-The default topology should report `within_target_envelope: true` for the proposal's 61-138 MB target and a quick-pruning result with `within_60ms_budget: true`. This is an implementation-level memory estimate from the live MLX arrays, not an external Metal profiler trace.
+Native certification:
+
+```bash
+.venv/bin/python synapse_cli.py --json certify-runtime \
+  --strict-native \
+  --benchmark-quick-prune \
+  --require-resource-envelope \
+  --output .synapse_s2/native-certification.json
+```
+
+The default topology should report `within_target_envelope: true` for the proposal's 61-138 MB target and a quick-pruning result with `within_60ms_budget: true`. Certification additionally checks MLX availability, `mx.compile`, `mlxsnn`, active `mlxsnn.Leaky` execution path, local embedding provider provenance, and any requested GPU/envelope gates. This is implementation-level runtime evidence from the live MLX arrays, not an external Apple Instruments profiler trace.
+
+Embedding provider provenance:
+
+```bash
+.venv/bin/python synapse_cli.py --json remember-text \
+  --embedding-provider semantic-hash \
+  --context default \
+  --tag provider-check \
+  --text "Apple Silicon Metal acceleration should recall M-series MLX GPU compute context."
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 1
+```
+
+The memory entry metadata should include `embedding_provider.provider: semantic-hash-v1`. For an IT-managed local model, set `--embedding-provider python:/absolute/path/encoder.py:embed` or `SYNAPSE_S2_EMBEDDING_PROVIDER` to the same value.
 
 Backup:
 
@@ -217,6 +241,7 @@ Useful tool calls:
 | `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |
 | `hydrate_spiking_agent_context` | Hydrates a restarted client with new deployments, prompt recall, graph highlights, and an optional ack cursor update. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
+| `certify_spiking_runtime` | Emits native MLX/mlxsnn/provider/envelope certification evidence. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
 | `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |
 
