@@ -42,12 +42,20 @@ The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 
 ```bash
 .venv/bin/python synapse_cli.py --json seed-demo --context board-demo
+.venv/bin/python synapse_cli.py --json ingest-text \
+  --context board-demo \
+  --tag proposal-event-brief \
+  --text "Apple Silicon MLX compiles spiking neural kernels into Metal for local recall. Sparse top-k spike populations reduce context pressure and keep associative traces on-device. Procurement reviews supplier budget exposure, renewal timing, and contract risk. Operators need graph relationships that connect technical runtime evidence to tomorrow morning approval actions." \
+  --surprise-threshold 0.58 \
+  --min-segment-sentences 1
 .venv/bin/python synapse_cli.py --json query-text \
   --context board-demo \
   --text "Apple Silicon local spiking memory can reduce context pressure for Codex and Claude"
+.venv/bin/python synapse_cli.py --json graph --context board-demo --limit 10
 ```
 
 Expected query output returns ranked registered traces such as `ops-toggle`, `metal-runtime`, and `executive-briefing`.
+Event ingestion additionally creates segmented memories such as `proposal-event-brief-event-001` and relationship edges such as `temporal_next`.
 
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`. Runtime toggles and client state live in `.synapse_s2/runtime_state.json`. Both `.mcp.json` and `/Users/dan.driver/.codex/config.toml` set `SYNAPSE_S2_MEMORY_DB` so Codex, Claude, and direct CLI runs target the same durable substrate. MCP export and backup paths are constrained to `.synapse_s2` by default through `SYNAPSE_S2_EXPORT_DIR`; the CLI remains available for explicit operator-chosen local paths.
 
@@ -84,6 +92,8 @@ The MCP server exposes these tools:
 | `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
 | `list_spiking_memory` | List persisted SQLite memory entries for a context. |
+| `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
+| `list_spiking_memory_graph` | List compact memory entries and relationship edges for a context. |
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
 | `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |
 | `trigger_sleep_consolidation` | Run deep-sleep consolidation and semantic hierarchy extraction. |

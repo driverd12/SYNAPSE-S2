@@ -121,6 +121,72 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(memory["entries"][0]["metadata"], {"ticket": "S2"})
         self.assertEqual(memory["memory_db_path"], str(memory_path))
 
+    def test_ingest_text_events_segments_persists_and_links_memory_graph(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        text = (
+            "Apple Silicon MLX compiles spiking neural kernels into Metal. "
+            "The local SNN tracks sparse top-k spike populations for recall. "
+            "Procurement then reviews supplier budget exposure and contract risk. "
+            "Finance needs renewal timing, approval owners, and payment status."
+        )
+
+        ingestion = backend.ingest_text_events(
+            text=text,
+            context_id="board-demo",
+            source_tag="morning-brief",
+            surprise_threshold=0.58,
+            min_segment_sentences=1,
+        )
+        graph = backend.list_memory_graph(context_id="board-demo")
+        recall = backend.query(
+            backend.embed_text("supplier budget contract risk"),
+            context_id="board-demo",
+        )
+
+        self.assertGreaterEqual(ingestion["event_count"], 2)
+        self.assertGreaterEqual(ingestion["relationship_count"], 1)
+        self.assertEqual(ingestion["events"][0]["tag"], "morning-brief-event-001")
+        self.assertTrue(graph["relationships"])
+        self.assertEqual(graph["relationships"][0]["relation_type"], "temporal_next")
+        self.assertIn("morning-brief-event", recall)
+
+    def test_query_expands_recall_with_related_event_graph_neighbors(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=1,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        text = (
+            "Apple Silicon MLX compiles spiking neural kernels into Metal. "
+            "The local SNN tracks sparse top-k spike populations for recall. "
+            "Procurement reviews supplier budget exposure and contract risk."
+        )
+        backend.ingest_text_events(
+            text=text,
+            context_id="board-demo",
+            source_tag="graph-brief",
+            surprise_threshold=0.58,
+            min_segment_sentences=1,
+        )
+
+        recall = backend.query(
+            backend.embed_text("Apple Silicon MLX compiles spiking neural kernels into Metal."),
+            context_id="board-demo",
+        )
+
+        self.assertIn("graph-brief-event-001", recall)
+        self.assertIn("graph-brief-event-002", recall)
+
     def test_text_embedding_is_deterministic_for_cli_and_mcp_demo_use(self):
         backend = SpikingAttentionBackend(
             dimension=32,
@@ -393,6 +459,35 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
         self.assertEqual(status["phases"][4]["promoted_trace_count"], 1)
         self.assertEqual(status["phases"][5]["contexts"], ["proposal"])
+
+    def test_deep_sleep_consolidation_includes_relationship_graph(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend.ingest_text_events(
+            text=(
+                "Apple Silicon MLX compiles spiking kernels into Metal. "
+                "Sparse spike populations recall local context. "
+                "Procurement reviews supplier budget exposure and contract risk."
+            ),
+            context_id="board-demo",
+            source_tag="sleep-brief",
+            surprise_threshold=0.58,
+            min_segment_sentences=1,
+        )
+
+        status = backend.run_deep_sleep_consolidation()
+
+        self.assertEqual(status["mode"], "deep-sleep")
+        self.assertIn("relationships", backend.semantic_hierarchy["board-demo"])
+        self.assertGreaterEqual(
+            backend.semantic_hierarchy["board-demo"]["relationship_count"],
+            1,
+        )
 
     def test_idle_maintenance_runs_deep_sleep_after_idle_threshold(self):
         backend = SpikingAttentionBackend(

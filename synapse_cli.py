@@ -129,6 +129,32 @@ def command_query_vector(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _text_from_args(args: argparse.Namespace) -> str:
+    if getattr(args, "text_file", None):
+        return Path(args.text_file).expanduser().read_text(encoding="utf-8")
+    return str(getattr(args, "text", "") or "")
+
+
+def command_ingest_text(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    text = _text_from_args(args).strip()
+    if not text:
+        raise ValueError("--text or --text-file must provide content")
+    return backend.ingest_text_events(
+        text=text,
+        context_id=args.context,
+        source_tag=args.tag,
+        surprise_threshold=args.surprise_threshold,
+        min_segment_sentences=args.min_segment_sentences,
+        metadata=parse_metadata(args.metadata),
+    )
+
+
+def command_graph(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_memory_graph(context_id=args.context, limit=args.limit)
+
+
 def command_quick_prune(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.run_quick_pruning()
@@ -193,6 +219,10 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         "memory_parent_writable": os.access(memory_db_path.parent, os.W_OK),
         "state_parent_writable": os.access(state_path.parent, os.W_OK),
         "memory_minimum_met": int(status["memory_context_entry_count"]) >= int(args.minimum_memory),
+        "relationship_minimum_met": int(
+            status["memory_context_relationship_count"]
+        )
+        >= int(args.minimum_relationships),
         "launcher_executable": launcher_path.exists() and os.access(launcher_path, os.X_OK),
         "consolidation_lifecycle_declared": status["consolidation_phase_names"]
         == [
@@ -223,6 +253,7 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         "state_path": str(state_path),
         "memory_db_path": str(memory_db_path),
         "minimum_memory": int(args.minimum_memory),
+        "minimum_relationships": int(args.minimum_relationships),
         "dependencies": dependencies,
         "status": status,
         "memory_preview": backend.list_memory(
@@ -347,6 +378,21 @@ def build_parser() -> argparse.ArgumentParser:
     query_vector.add_argument("--vector", required=True)
     query_vector.set_defaults(func=command_query_vector)
 
+    ingest_text = subparsers.add_parser("ingest-text")
+    add_context(ingest_text)
+    ingest_text.add_argument("--tag", required=True)
+    ingest_text.add_argument("--text", default="")
+    ingest_text.add_argument("--text-file", default=None)
+    ingest_text.add_argument("--metadata", default=None)
+    ingest_text.add_argument("--surprise-threshold", type=float, default=0.62)
+    ingest_text.add_argument("--min-segment-sentences", type=int, default=2)
+    ingest_text.set_defaults(func=command_ingest_text)
+
+    graph = subparsers.add_parser("graph")
+    add_context(graph)
+    graph.add_argument("--limit", type=int, default=100)
+    graph.set_defaults(func=command_graph)
+
     seed_demo = subparsers.add_parser("seed-demo")
     add_context(seed_demo)
     seed_demo.set_defaults(func=command_seed_demo)
@@ -383,6 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="SYNAPSE-S2 durable local memory Apple Silicon MCP recall",
     )
     preflight.add_argument("--minimum-memory", type=int, default=1)
+    preflight.add_argument("--minimum-relationships", type=int, default=0)
     preflight.add_argument("--preview-limit", type=int, default=5)
     preflight.add_argument(
         "--launcher",

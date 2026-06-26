@@ -153,6 +153,29 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("spike_indices", listing["entries"][0])
         self.assertIn("neuron_indices", listing["entries"][0])
 
+    def test_mcp_ingests_text_events_and_lists_memory_graph(self):
+        text = (
+            "Apple Silicon MLX compiles spiking kernels into Metal. "
+            "Sparse spike populations recall local context. "
+            "Procurement reviews supplier budget exposure and contract risk. "
+            "Finance tracks renewal owners and approval status."
+        )
+
+        ingestion = json.loads(
+            mcp_server.ingest_spiking_memory_text(
+                tag="mcp-brief",
+                text=text,
+                context_id="demo",
+                surprise_threshold=0.58,
+                min_segment_sentences=1,
+            )
+        )
+        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+
+        self.assertGreaterEqual(ingestion["event_count"], 2)
+        self.assertGreaterEqual(graph["relationship_count"], 1)
+        self.assertEqual(graph["relationships"][0]["relation_type"], "temporal_next")
+
     def test_memory_export_tool_rejects_paths_outside_export_root(self):
         result = json.loads(
             mcp_server.export_spiking_memory(

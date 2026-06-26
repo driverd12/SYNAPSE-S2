@@ -60,6 +60,20 @@ Recall smoke:
   --text "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients"
 ```
 
+Event graph ingestion:
+
+```bash
+.venv/bin/python synapse_cli.py --json ingest-text \
+  --context board-demo \
+  --tag proposal-event-brief \
+  --text "Apple Silicon MLX compiles spiking neural kernels into Metal for local recall. Sparse top-k spike populations reduce context pressure and keep associative traces on-device. Procurement reviews supplier budget exposure, renewal timing, and contract risk. Operators need graph relationships that connect technical runtime evidence to tomorrow morning approval actions." \
+  --surprise-threshold 0.58 \
+  --min-segment-sentences 1
+.venv/bin/python synapse_cli.py --json graph --context board-demo --limit 10
+```
+
+The graph output should show event tags like `proposal-event-brief-event-001` and at least one `temporal_next` relationship.
+
 Backup:
 
 ```bash
@@ -91,7 +105,9 @@ Useful tool calls:
 | `get_spiking_attention_status` | Proves the runtime is enabled and shows memory counts. |
 | `remember_spiking_context` | Stores a new local memory trace. |
 | `query_spiking_attention_text` | Recalls local memory from text without external embedding calls. |
+| `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
+| `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
 | `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |
 

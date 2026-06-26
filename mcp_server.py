@@ -303,6 +303,62 @@ def list_spiking_memory(
 
 
 @mcp.tool()
+def ingest_spiking_memory_text(
+    tag: str,
+    text: str,
+    context_id: str = "default",
+    surprise_threshold: float = 0.62,
+    min_segment_sentences: int = 2,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Segment long text into event memories and persist graph relationships."""
+    context = _sanitize_context_id(context_id)
+    try:
+        source_text = _validate_text(text)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.ingest_text_events(
+            text=source_text,
+            context_id=context,
+            source_tag=tag,
+            surprise_threshold=float(surprise_threshold),
+            min_segment_sentences=int(min_segment_sentences),
+            metadata=metadata or {},
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid event ingestion request for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid event ingestion request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("event ingestion failed for context_id=%s", context)
+        return json.dumps({"error": f"event ingestion failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "List SYNAPSE-S2 Memory Graph",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_memory_graph(context_id: str = "default", limit: int = 100) -> str:
+    """List compact memory entries and their persisted relationship graph."""
+    context = _sanitize_context_id(context_id)
+    try:
+        bounded_limit = _validate_limit(limit)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.list_memory_graph(
+            context_id=context,
+            limit=bounded_limit,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid graph list request for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid graph list request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("memory graph list failed for context_id=%s", context)
+        return json.dumps({"error": f"memory graph list failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
 def export_spiking_memory(
     context_id: str = "default",
     output_path: str = "",

@@ -55,6 +55,35 @@ CREATE TABLE IF NOT EXISTS memory_events (
 
 CREATE INDEX IF NOT EXISTS ix_memory_events_memory_created
 ON memory_events(memory_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS memory_relationships (
+    relationship_id TEXT PRIMARY KEY,
+    context_id TEXT NOT NULL,
+    source_memory_id TEXT NOT NULL,
+    target_memory_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    weight REAL NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(source_memory_id)
+        REFERENCES memory_entries(memory_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY(target_memory_id)
+        REFERENCES memory_entries(memory_id)
+        ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_relationships_edge
+ON memory_relationships(
+    context_id,
+    source_memory_id,
+    target_memory_id,
+    relation_type
+);
+
+CREATE INDEX IF NOT EXISTS ix_memory_relationships_context_weight
+ON memory_relationships(context_id, weight DESC, updated_at DESC);
 """
 
 
@@ -119,6 +148,20 @@ class DurableMemoryStore:
     def stable_memory_id(self, *, context_id: str, tag: str) -> str:
         key = f"{context_id}\x1f{tag}".encode("utf-8")
         return "s2_" + hashlib.sha256(key).hexdigest()[:32]
+
+    def stable_relationship_id(
+        self,
+        *,
+        context_id: str,
+        source_memory_id: str,
+        target_memory_id: str,
+        relation_type: str,
+    ) -> str:
+        key = (
+            f"{context_id}\x1f{source_memory_id}\x1f"
+            f"{target_memory_id}\x1f{relation_type}"
+        ).encode("utf-8")
+        return "s2r_" + hashlib.sha256(key).hexdigest()[:32]
 
     def upsert_entry(
         self,
@@ -306,6 +349,133 @@ class DurableMemoryStore:
         )
         return candidates[: min(max(int(limit), 1), 1000)]
 
+    def upsert_relationship(
+        self,
+        *,
+        context_id: str,
+        source_memory_id: str,
+        target_memory_id: str,
+        relation_type: str,
+        weight: float,
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        relationship_id = self.stable_relationship_id(
+            context_id=context_id,
+            source_memory_id=source_memory_id,
+            target_memory_id=target_memory_id,
+            relation_type=relation_type,
+        )
+        now = time.time()
+        bounded_weight = min(max(float(weight), 0.0), 1.0)
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO memory_relationships (
+                        relationship_id,
+                        context_id,
+                        source_memory_id,
+                        target_memory_id,
+                        relation_type,
+                        weight,
+                        evidence_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(relationship_id) DO UPDATE SET
+                        weight = excluded.weight,
+                        evidence_json = excluded.evidence_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        relationship_id,
+                        str(context_id),
+                        str(source_memory_id),
+                        str(target_memory_id),
+                        str(relation_type),
+                        bounded_weight,
+                        _json_dumps(evidence or {}),
+                        now,
+                        now,
+                    ),
+                )
+            relationship = self.get_relationship(relationship_id)
+            if relationship is None:
+                raise RuntimeError(
+                    f"relationship {relationship_id} was not readable after upsert"
+                )
+            return relationship
+        except Exception:
+            LOGGER.exception(
+                "failed to upsert relationship context_id=%s source=%s target=%s",
+                context_id,
+                source_memory_id,
+                target_memory_id,
+            )
+            raise
+
+    def get_relationship(self, relationship_id: str) -> dict[str, Any] | None:
+        relationships = self.list_relationships(
+            relationship_id=relationship_id,
+            limit=1,
+        )
+        return relationships[0] if relationships else None
+
+    def list_relationships(
+        self,
+        *,
+        context_id: str | None = None,
+        relationship_id: str | None = None,
+        source_memory_id: str | None = None,
+        target_memory_id: str | None = None,
+        relation_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            clauses.append("r.context_id = ?")
+            params.append(str(context_id))
+        if relationship_id is not None:
+            clauses.append("r.relationship_id = ?")
+            params.append(str(relationship_id))
+        if source_memory_id is not None:
+            clauses.append("r.source_memory_id = ?")
+            params.append(str(source_memory_id))
+        if target_memory_id is not None:
+            clauses.append("r.target_memory_id = ?")
+            params.append(str(target_memory_id))
+        if relation_type is not None:
+            clauses.append("r.relation_type = ?")
+            params.append(str(relation_type))
+        where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        params.append(bounded_limit)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        r.*,
+                        source.tag AS source_tag,
+                        target.tag AS target_tag
+                    FROM memory_relationships AS r
+                    JOIN memory_entries AS source
+                        ON source.memory_id = r.source_memory_id
+                    JOIN memory_entries AS target
+                        ON target.memory_id = r.target_memory_id
+                    {where_sql}
+                    ORDER BY r.weight DESC, r.updated_at DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+            return [self._row_to_relationship(row) for row in rows]
+        except Exception:
+            LOGGER.exception("failed to list memory relationships")
+            raise
+
     def stats(self, *, context_id: str | None = None) -> dict[str, Any]:
         try:
             with closing(self._connect()) as conn:
@@ -313,9 +483,16 @@ class DurableMemoryStore:
                     entry_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_entries"
                     ).fetchone()[0]
+                    relationship_count = conn.execute(
+                        "SELECT COUNT(*) FROM memory_relationships"
+                    ).fetchone()[0]
                 else:
                     entry_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_entries WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
+                    relationship_count = conn.execute(
+                        "SELECT COUNT(*) FROM memory_relationships WHERE context_id = ?",
                         (context_id,),
                     ).fetchone()[0]
                 event_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
@@ -331,6 +508,7 @@ class DurableMemoryStore:
                 "memory_db_path": str(self.db_path),
                 "entry_count": int(entry_count),
                 "event_count": int(event_count),
+                "relationship_count": int(relationship_count),
                 "contexts": {str(row["context_id"]): int(row["count"]) for row in context_rows},
             }
         except Exception:
@@ -351,6 +529,10 @@ class DurableMemoryStore:
             "context_id": context_id,
             "stats": self.stats(context_id=context_id),
             "entries": self.list_entries(context_id=context_id, limit=limit),
+            "relationships": self.list_relationships(
+                context_id=context_id,
+                limit=limit,
+            ),
         }
         if path is not None:
             output_path = Path(path).expanduser()
@@ -403,6 +585,21 @@ class DurableMemoryStore:
                 int(value)
                 for value in _decode_json(str(row["neuron_indices_json"]), [])
             ],
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def _row_to_relationship(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "relationship_id": str(row["relationship_id"]),
+            "context_id": str(row["context_id"]),
+            "source_memory_id": str(row["source_memory_id"]),
+            "target_memory_id": str(row["target_memory_id"]),
+            "source_tag": str(row["source_tag"]),
+            "target_tag": str(row["target_tag"]),
+            "relation_type": str(row["relation_type"]),
+            "weight": round(float(row["weight"]), 6),
+            "evidence": _decode_json(str(row["evidence_json"]), {}),
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
         }

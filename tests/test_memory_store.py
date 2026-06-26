@@ -52,6 +52,49 @@ class DurableMemoryStoreTests(unittest.TestCase):
 
             self.assertEqual(row_count, 1)
 
+    def test_relationships_are_upserted_listed_and_exported(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            export_path = Path(tmp) / "memory-export.json"
+            store = DurableMemoryStore(db_path)
+            first = store.upsert_entry(
+                tag="brief-event-001",
+                context_id="demo",
+                source_text="Apple Silicon MLX spiking runtime.",
+                metadata={"event_segment": True},
+                embedding_dimensions=8,
+                spike_indices=[1, 2],
+                neuron_indices=[4, 5],
+            )
+            second = store.upsert_entry(
+                tag="brief-event-002",
+                context_id="demo",
+                source_text="Procurement budget and contract risk.",
+                metadata={"event_segment": True},
+                embedding_dimensions=8,
+                spike_indices=[5, 6],
+                neuron_indices=[7, 8],
+            )
+
+            relationship = store.upsert_relationship(
+                context_id="demo",
+                source_memory_id=first["memory_id"],
+                target_memory_id=second["memory_id"],
+                relation_type="temporal_next",
+                weight=0.87,
+                evidence={"surprise_score": 0.71},
+            )
+            relationships = store.list_relationships(context_id="demo", limit=10)
+            stats = store.stats(context_id="demo")
+            exported = store.export_json(export_path, context_id="demo")
+
+        self.assertEqual(relationship["relation_type"], "temporal_next")
+        self.assertEqual(relationships[0]["source_tag"], "brief-event-001")
+        self.assertEqual(relationships[0]["target_tag"], "brief-event-002")
+        self.assertEqual(relationships[0]["evidence"]["surprise_score"], 0.71)
+        self.assertEqual(stats["relationship_count"], 1)
+        self.assertEqual(exported["relationships"][0]["weight"], 0.87)
+
 
 if __name__ == "__main__":
     unittest.main()

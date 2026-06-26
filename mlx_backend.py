@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from event_segmenter import BayesianSurpriseEventSegmenter
 from memory_store import DurableMemoryStore
 
 try:
@@ -684,7 +685,7 @@ class SpikingAttentionBackend:
             firing_values=firing_values,
             limit=self.recall_count,
         )
-        return [
+        rendered = [
             (
                 f"{candidate['tag']} "
                 f"(score={float(candidate['score']):.3f}, "
@@ -693,6 +694,62 @@ class SpikingAttentionBackend:
             )
             for candidate in candidates
         ]
+        rendered.extend(
+            self._related_trace_contexts(
+                context=context,
+                candidates=candidates,
+            )
+        )
+        return rendered
+
+    def _related_trace_contexts(
+        self,
+        *,
+        context: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[str]:
+        seen_ids = {str(candidate["memory_id"]) for candidate in candidates}
+        related: list[str] = []
+        for candidate in candidates:
+            memory_id = str(candidate["memory_id"])
+            relationships = (
+                self.memory_store.list_relationships(
+                    context_id=context,
+                    source_memory_id=memory_id,
+                    limit=max(1, self.recall_count),
+                )
+                + self.memory_store.list_relationships(
+                    context_id=context,
+                    target_memory_id=memory_id,
+                    limit=max(1, self.recall_count),
+                )
+            )
+            relationships.sort(
+                key=lambda item: (float(item["weight"]), float(item["updated_at"])),
+                reverse=True,
+            )
+            for relationship in relationships[: max(1, self.recall_count)]:
+                neighbor_id = (
+                    relationship["target_memory_id"]
+                    if relationship["source_memory_id"] == memory_id
+                    else relationship["source_memory_id"]
+                )
+                if neighbor_id in seen_ids:
+                    continue
+                entry = self.memory_store.get_entry(str(neighbor_id))
+                if entry is None:
+                    continue
+                seen_ids.add(neighbor_id)
+                related.append(
+                    (
+                        f"{entry['tag']} "
+                        f"(linked={relationship['relation_type']}, "
+                        f"weight={float(relationship['weight']):.3f}, "
+                        f"context={entry['context_id']}, "
+                        f"id={entry['memory_id']})"
+                    )
+                )
+        return related
 
     def _recall_indices(self, firing_signature: Any, sensory_spikes: Any) -> list[int]:
         native_mx = self._mx
@@ -759,6 +816,8 @@ class SpikingAttentionBackend:
             "memory_entry_count": int(total_stats["entry_count"]),
             "memory_context_entry_count": int(context_stats["entry_count"]),
             "memory_event_count": int(total_stats["event_count"]),
+            "memory_relationship_count": int(total_stats["relationship_count"]),
+            "memory_context_relationship_count": int(context_stats["relationship_count"]),
             "memory_contexts": total_stats["contexts"],
             "semantic_group_count": len(self.semantic_hierarchy),
             "mlx_available": mx is not None,
@@ -804,6 +863,157 @@ class SpikingAttentionBackend:
             "entry_count": len(rendered_entries),
             "entries": rendered_entries,
             "include_vectors": bool(include_vectors),
+        }
+
+    def ingest_text_events(
+        self,
+        *,
+        text: str,
+        context_id: str = "default",
+        source_tag: str = "memory",
+        surprise_threshold: float = 0.62,
+        min_segment_sentences: int = 2,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        source = sanitize_tag(source_tag).replace(" ", "-")
+        segmenter = BayesianSurpriseEventSegmenter(
+            surprise_threshold=surprise_threshold,
+            min_segment_sentences=min_segment_sentences,
+        )
+        segments = segmenter.segment(text, context_id=context, source_tag=source)
+        registrations: list[dict[str, Any]] = []
+        relationships: list[dict[str, Any]] = []
+        try:
+            for segment in segments:
+                event_metadata = self._json_safe_metadata(
+                    {
+                        **(metadata or {}),
+                        "event_segment": True,
+                        "segment_id": segment["segment_id"],
+                        "sequence_id": segment["sequence_id"],
+                        "segment_index": segment["segment_index"],
+                        "sentence_count": segment["sentence_count"],
+                        "surprise_score": segment["surprise_score"],
+                        "keywords": segment["keywords"],
+                        "source_tag": segment["source_tag"],
+                    }
+                )
+                registration = self.register_trace(
+                    tag=segment["tag"],
+                    embedding=self.embed_text(segment["text"]),
+                    context_id=context,
+                    metadata=event_metadata,
+                    source_text=segment["text"],
+                )
+                registration["segment"] = segment
+                registrations.append(registration)
+
+            for index in range(1, len(registrations)):
+                previous = registrations[index - 1]
+                current = registrations[index]
+                current_segment = current["segment"]
+                relationships.append(
+                    self.memory_store.upsert_relationship(
+                        context_id=context,
+                        source_memory_id=previous["memory_id"],
+                        target_memory_id=current["memory_id"],
+                        relation_type="temporal_next",
+                        weight=max(0.5, float(current_segment["surprise_score"])),
+                        evidence={
+                            "sequence_id": current_segment["sequence_id"],
+                            "source_tag": source,
+                            "surprise_score": current_segment["surprise_score"],
+                        },
+                    )
+                )
+
+            relationships.extend(
+                self._link_semantic_event_overlaps(
+                    context=context,
+                    registrations=registrations,
+                    source_tag=source,
+                )
+            )
+            self._refresh_registered_traces()
+            return {
+                "context_id": context,
+                "source_tag": source,
+                "sequence_id": segments[0]["sequence_id"] if segments else "",
+                "event_count": len(registrations),
+                "relationship_count": len(relationships),
+                "events": [
+                    {
+                        "tag": item["tag"],
+                        "memory_id": item["memory_id"],
+                        "segment": item["segment"],
+                    }
+                    for item in registrations
+                ],
+                "relationships": relationships,
+                "memory_db_path": str(self.memory_store.db_path),
+            }
+        except Exception:
+            LOGGER.exception("event ingestion failed for context_id=%s source_tag=%s", context, source)
+            raise
+
+    def _link_semantic_event_overlaps(
+        self,
+        *,
+        context: str,
+        registrations: list[dict[str, Any]],
+        source_tag: str,
+    ) -> list[dict[str, Any]]:
+        relationships: list[dict[str, Any]] = []
+        for left_index, left in enumerate(registrations):
+            left_keywords = set(left["segment"]["keywords"])
+            if not left_keywords:
+                continue
+            for right in registrations[left_index + 1 :]:
+                right_keywords = set(right["segment"]["keywords"])
+                if not right_keywords:
+                    continue
+                overlap = left_keywords & right_keywords
+                if not overlap:
+                    continue
+                union = left_keywords | right_keywords
+                weight = len(overlap) / max(1, len(union))
+                if weight < 0.12:
+                    continue
+                relationships.append(
+                    self.memory_store.upsert_relationship(
+                        context_id=context,
+                        source_memory_id=left["memory_id"],
+                        target_memory_id=right["memory_id"],
+                        relation_type="semantic_overlap",
+                        weight=weight,
+                        evidence={
+                            "source_tag": source_tag,
+                            "keywords": sorted(overlap),
+                        },
+                    )
+                )
+        return relationships
+
+    def list_memory_graph(
+        self,
+        *,
+        context_id: str = "default",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        entries = self.list_memory(context_id=context, limit=limit)["entries"]
+        relationships = self.memory_store.list_relationships(
+            context_id=context,
+            limit=limit,
+        )
+        return {
+            "context_id": context,
+            "memory_db_path": str(self.memory_store.db_path),
+            "entry_count": len(entries),
+            "relationship_count": len(relationships),
+            "entries": entries,
+            "relationships": relationships,
         }
 
     def _render_memory_entry(
@@ -969,10 +1179,21 @@ class SpikingAttentionBackend:
 
             threshold_before = self.threshold
             self._rescore_threshold(active_rank_count=len(ranked))
+            relationships_by_context = {
+                context: self.memory_store.list_relationships(
+                    context_id=context,
+                    limit=1_000,
+                )
+                for context in grouped
+            }
             self.semantic_hierarchy = {
                 context: {
                     "members": members,
                     "member_count": len(members),
+                    "relationships": relationships_by_context.get(context, []),
+                    "relationship_count": len(
+                        relationships_by_context.get(context, [])
+                    ),
                     "distillation": "hebbian-memory-store",
                 }
                 for context, members in grouped.items()
@@ -985,6 +1206,10 @@ class SpikingAttentionBackend:
                 ranked=ranked,
                 quick_status=quick_status,
                 threshold_before=threshold_before,
+                relationship_count=sum(
+                    len(relationships)
+                    for relationships in relationships_by_context.values()
+                ),
             )
             self.consolidation_phase_history = phases
             self.deep_sleep_count += 1
@@ -1022,6 +1247,7 @@ class SpikingAttentionBackend:
         ranked: list[int],
         quick_status: dict[str, Any],
         threshold_before: float,
+        relationship_count: int = 0,
     ) -> list[dict[str, Any]]:
         semantic_member_count = sum(len(members) for members in grouped.values())
         inactive_pool = max(0, self.num_neurons - len(set(ranked)))
@@ -1064,6 +1290,7 @@ class SpikingAttentionBackend:
                 "name": "relationship-extraction",
                 "operation": "Hebbian Distillation semantic graph build",
                 "contexts": sorted(grouped),
+                "relationship_count": int(relationship_count),
             },
             {
                 "phase": 7,
@@ -1165,6 +1392,32 @@ def list_memory(
         limit=limit,
         include_vectors=include_vectors,
     )
+
+
+def ingest_text_events(
+    *,
+    text: str,
+    context_id: str = "default",
+    source_tag: str = "memory",
+    surprise_threshold: float = 0.62,
+    min_segment_sentences: int = 2,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return get_backend().ingest_text_events(
+        text=text,
+        context_id=context_id,
+        source_tag=source_tag,
+        surprise_threshold=surprise_threshold,
+        min_segment_sentences=min_segment_sentences,
+        metadata=metadata,
+    )
+
+
+def list_memory_graph(
+    context_id: str = "default",
+    limit: int = 100,
+) -> dict[str, Any]:
+    return get_backend().list_memory_graph(context_id=context_id, limit=limit)
 
 
 def export_memory(

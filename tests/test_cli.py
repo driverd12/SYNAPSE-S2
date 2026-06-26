@@ -165,6 +165,51 @@ class SynapseCliTests(unittest.TestCase):
         self.assertTrue(export_exists)
         self.assertTrue(backup_exists)
 
+    def test_cli_ingests_text_events_and_lists_memory_graph(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            text = (
+                "Apple Silicon MLX compiles spiking kernels into Metal. "
+                "Sparse spike populations recall local context. "
+                "Procurement reviews supplier budget exposure and contract risk. "
+                "Finance tracks renewal owners and approval status."
+            )
+
+            ingestion = self.run_cli(
+                "ingest-text",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-brief",
+                "--text",
+                text,
+                "--surprise-threshold",
+                "0.58",
+                "--min-segment-sentences",
+                "1",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            graph = self.run_cli(
+                "graph",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(ingestion.returncode, 0, ingestion.stderr)
+        self.assertEqual(graph.returncode, 0, graph.stderr)
+        ingestion_payload = json.loads(ingestion.stdout)
+        graph_payload = json.loads(graph.stdout)
+        self.assertGreaterEqual(ingestion_payload["event_count"], 2)
+        self.assertGreaterEqual(graph_payload["relationship_count"], 1)
+        self.assertEqual(
+            graph_payload["relationships"][0]["relation_type"],
+            "temporal_next",
+        )
+
     def test_cli_list_memory_can_include_vector_details_when_requested(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
@@ -236,6 +281,50 @@ class SynapseCliTests(unittest.TestCase):
         self.assertTrue(payload["checks"]["launcher_executable"])
         self.assertTrue(payload["checks"]["memory_minimum_met"])
         self.assertIn("cli-preflight-memory", payload["query_result"])
+
+    def test_cli_preflight_can_require_memory_graph_relationships(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            ingestion = self.run_cli(
+                "ingest-text",
+                "--context",
+                "demo",
+                "--tag",
+                "preflight-graph",
+                "--text",
+                (
+                    "Apple Silicon MLX compiles spiking kernels into Metal. "
+                    "Sparse spike populations recall local context. "
+                    "Procurement reviews supplier budget exposure and contract risk."
+                ),
+                "--surprise-threshold",
+                "0.58",
+                "--min-segment-sentences",
+                "1",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            preflight = self.run_cli(
+                "preflight",
+                "--context",
+                "demo",
+                "--minimum-memory",
+                "2",
+                "--minimum-relationships",
+                "1",
+                "--launcher",
+                sys.executable,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(ingestion.returncode, 0, ingestion.stderr)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        payload = json.loads(preflight.stdout)
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["checks"]["relationship_minimum_met"])
 
     def test_cli_preflight_reports_failed_checks_without_crashing(self):
         with TemporaryDirectory() as tmp:
