@@ -90,6 +90,23 @@ class SynapseCliTests(unittest.TestCase):
         self.assertIn("dependencies", payload)
         self.assertIn("memory_db_path", payload["status"])
 
+    def test_cli_idle_maintenance_can_force_deep_sleep(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+
+            result = self.run_cli(
+                "idle-maintenance",
+                "--force-deep-sleep",
+                state_path=state_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["mode"], "deep-sleep")
+        self.assertEqual(payload["trigger"], "idle-force")
+        self.assertTrue(payload["maintenance_run"])
+        self.assertEqual(payload["phase_count"], 7)
+
     def test_cli_lists_exports_and_backs_up_real_memory(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

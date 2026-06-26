@@ -44,6 +44,15 @@ LOGGER.propagate = False
 MAX_EMBEDDING_DIMS = 32_768
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 TAG_RE = re.compile(r"[^A-Za-z0-9_.: /#-]+")
+CONSOLIDATION_PHASES = (
+    "connection-weight-decay",
+    "synaptic-clustering",
+    "semantic-merging",
+    "threshold-rescoring",
+    "trace-promotion",
+    "relationship-extraction",
+    "neurogenesis",
+)
 
 
 class BackendUnavailable(RuntimeError):
@@ -110,6 +119,9 @@ class SpikingAttentionBackend:
         stdp_tau_minus: float = 24.0,
         stdp_clip: float = 0.05,
         stdp_active_limit: int = 512,
+        quick_pruning_interval_seconds: float = 300.0,
+        idle_deep_sleep_seconds: float = 1800.0,
+        quick_pruning_eager_decay_elements: int = 4_000_000,
         compile_graph: bool = True,
         state_path: str | os.PathLike[str] | None = None,
         memory_path: str | os.PathLike[str] | None = None,
@@ -123,6 +135,10 @@ class SpikingAttentionBackend:
             raise ValueError("beta must be in the open interval (0, 1)")
         if threshold <= 0.0:
             raise ValueError("threshold must be positive")
+        if quick_pruning_interval_seconds < 0.0:
+            raise ValueError("quick_pruning_interval_seconds must be non-negative")
+        if idle_deep_sleep_seconds < 0.0:
+            raise ValueError("idle_deep_sleep_seconds must be non-negative")
 
         self.dimension = int(dimension)
         self.num_neurons = int(num_neurons)
@@ -139,11 +155,23 @@ class SpikingAttentionBackend:
         self.stdp_tau_minus = float(stdp_tau_minus)
         self.stdp_clip = float(stdp_clip)
         self.stdp_active_limit = int(max(0, stdp_active_limit))
+        self.quick_pruning_interval_seconds = float(quick_pruning_interval_seconds)
+        self.idle_deep_sleep_seconds = float(idle_deep_sleep_seconds)
+        self.quick_pruning_eager_decay_elements = int(
+            max(0, quick_pruning_eager_decay_elements)
+        )
+        self.W_syn_decay_multiplier = 1.0
+        self.W_lateral_decay_multiplier = 1.0
         self._mx = native_mx
         self._lif_step = self._build_lif_step(compile_graph)
         self._mlxsnn_available = mlxsnn is not None
+        self._mlxsnn_lif_layer = self._build_mlxsnn_lif_layer()
         self.state_path = self._resolve_state_path(state_path)
-        self.memory_store = DurableMemoryStore(self._resolve_memory_path(memory_path))
+        if memory_path is None and state_path is not None:
+            resolved_memory_path = self.state_path.parent / "memory.sqlite3"
+        else:
+            resolved_memory_path = self._resolve_memory_path(memory_path)
+        self.memory_store = DurableMemoryStore(resolved_memory_path)
         self.global_enabled = True
         self.context_overrides: dict[str, bool] = {}
         self.registered_traces: list[dict[str, Any]] = []
@@ -166,6 +194,11 @@ class SpikingAttentionBackend:
         self.memory_mapping: dict[int, str] = {}
         self.semantic_hierarchy: dict[str, dict[str, Any]] = {}
         self.last_pruning_monotonic = time.monotonic()
+        self.last_activity_monotonic = time.monotonic()
+        self.quick_pruning_count = 0
+        self.deep_sleep_count = 0
+        self.last_maintenance: dict[str, Any] = {}
+        self.consolidation_phase_history: list[dict[str, Any]] = []
         self._load_runtime_state()
         self._refresh_registered_traces()
 
@@ -181,6 +214,9 @@ class SpikingAttentionBackend:
         configured = os.getenv("SYNAPSE_S2_STATE_PATH")
         if configured:
             return Path(configured)
+        project_dir = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("CODEX_PROJECT_DIR")
+        if project_dir:
+            return Path(project_dir).expanduser() / ".synapse_s2" / "runtime_state.json"
         return Path.cwd() / ".synapse_s2" / "runtime_state.json"
 
     def _resolve_memory_path(self, memory_path: str | os.PathLike[str] | None) -> Path:
@@ -189,6 +225,9 @@ class SpikingAttentionBackend:
         configured = os.getenv("SYNAPSE_S2_MEMORY_DB")
         if configured:
             return Path(configured)
+        project_dir = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("CODEX_PROJECT_DIR")
+        if project_dir:
+            return Path(project_dir).expanduser() / ".synapse_s2" / "memory.sqlite3"
         return self.state_path.parent / "memory.sqlite3"
 
     def _load_runtime_state(self) -> None:
@@ -320,6 +359,43 @@ class SpikingAttentionBackend:
                 LOGGER.warning("mx.compile unavailable for LIF step: %s", exc)
         return lif_step
 
+    def _build_mlxsnn_lif_layer(self) -> Any | None:
+        if mlxsnn is None:
+            return None
+        try:
+            return mlxsnn.Leaky(
+                beta=self.beta,
+                threshold=self.threshold,
+                reset_mechanism="subtract",
+            )
+        except Exception as exc:  # pragma: no cover - dependency implementation varies
+            LOGGER.warning("failed to initialize mlxsnn.Leaky layer: %s", exc)
+            return None
+
+    def _eval_if_available(self, *arrays: Any) -> None:
+        if not hasattr(self._mx, "eval"):
+            return
+        try:
+            self._mx.eval(*arrays)
+        except Exception as exc:  # pragma: no cover - host/runtime dependent
+            LOGGER.warning("mx.eval failed: %s", exc)
+
+    def _lif_update(self, mem: Any, input_current: Any) -> tuple[Any, Any]:
+        if self._mlxsnn_lif_layer is None:
+            return self._lif_step(mem, input_current, self.beta, self.threshold)
+        try:
+            batched_input = input_current.reshape((1, self.num_neurons))
+            batched_state = {"mem": mem.reshape((1, self.num_neurons))}
+            batched_spikes, next_state = self._mlxsnn_lif_layer(
+                batched_input,
+                batched_state,
+            )
+            return batched_spikes[0], next_state["mem"][0]
+        except Exception as exc:  # pragma: no cover - fallback protects MCP runtime
+            LOGGER.warning("mlxsnn.Leaky execution failed; falling back to explicit LIF math: %s", exc)
+            self._mlxsnn_lif_layer = None
+            return self._lif_step(mem, input_current, self.beta, self.threshold)
+
     def _balanced_matrix(
         self,
         shape: tuple[int, int],
@@ -378,6 +454,7 @@ class SpikingAttentionBackend:
             scale=0.01,
             excitatory_ratio=0.8,
         )
+        self.W_syn_decay_multiplier = 1.0
         LOGGER.info("resized sensory projection to %s dimensions", self.dimension)
 
     def encode_to_spikes_top_k(self, embedding: Any, k: int | None = None):
@@ -436,16 +513,19 @@ class SpikingAttentionBackend:
         spikes_in = self._coerce_embedding(sensory_spikes)
         self._ensure_projection_shape(int(spikes_in.shape[0]))
 
-        input_current = native_mx.matmul(spikes_in, self.W_syn)
+        input_current = native_mx.matmul(spikes_in, self.W_syn) * self.W_syn_decay_multiplier
         mem = self.state["mem"]
         prev_spikes = self.state["spk"]
         accumulated = native_mx.zeros((self.num_neurons,))
         W_lateral = self.W_lateral
 
         for _ in range(max(1, int(steps))):
-            lateral_current = native_mx.matmul(prev_spikes, W_lateral)
+            lateral_current = (
+                native_mx.matmul(prev_spikes, W_lateral)
+                * self.W_lateral_decay_multiplier
+            )
             total_current = input_current + lateral_current
-            spk, mem = self._lif_step(mem, total_current, self.beta, self.threshold)
+            spk, mem = self._lif_update(mem, total_current)
             accumulated = accumulated + spk
             W_lateral = self._apply_stdp(W_lateral, prev_spikes, spk)
             prev_spikes = spk
@@ -456,6 +536,7 @@ class SpikingAttentionBackend:
             "spk": prev_spikes,
         }
         self.active_traces = self.trace_decay * self.active_traces + accumulated
+        self._eval_if_available(accumulated, self.state["mem"], self.state["spk"], self.active_traces)
         return accumulated
 
     def _apply_stdp(self, W_lateral: Any, previous_spikes: Any, current_spikes: Any):
@@ -493,55 +574,63 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         clean_tag = sanitize_tag(tag)
-        arr = self._coerce_embedding(embedding)
-        self._ensure_projection_shape(int(arr.shape[0]))
-        sensory_spikes = self.encode_to_spikes_top_k(arr)
-        spike_indices = self._active_indices_from_spikes(sensory_spikes)
-        neuron_indices = self._project_sensory_indices(spike_indices)
-        registered_at = time.time()
-        trace = {
-            "tag": clean_tag,
-            "context_id": context,
-            "embedding_dimensions": int(arr.shape[0]),
-            "spike_indices": spike_indices,
-            "neuron_indices": neuron_indices,
-            "metadata": self._json_safe_metadata(metadata),
-            "registered_at": registered_at,
-            "source_text": str(source_text or ""),
-        }
+        try:
+            self._auto_quick_prune_if_due(trigger="register-trace")
+            arr = self._coerce_embedding(embedding)
+            self._ensure_projection_shape(int(arr.shape[0]))
+            sensory_spikes = self.encode_to_spikes_top_k(arr)
+            spike_indices = self._active_indices_from_spikes(sensory_spikes)
+            neuron_indices = self._project_sensory_indices(spike_indices)
+            registered_at = time.time()
+            trace = {
+                "tag": clean_tag,
+                "context_id": context,
+                "embedding_dimensions": int(arr.shape[0]),
+                "spike_indices": spike_indices,
+                "neuron_indices": neuron_indices,
+                "metadata": self._json_safe_metadata(metadata),
+                "registered_at": registered_at,
+                "source_text": str(source_text or ""),
+            }
 
-        persisted = self.memory_store.upsert_entry(
-            tag=trace["tag"],
-            context_id=trace["context_id"],
-            source_text=trace["source_text"],
-            metadata=trace["metadata"],
-            embedding_dimensions=trace["embedding_dimensions"],
-            spike_indices=trace["spike_indices"],
-            neuron_indices=trace["neuron_indices"],
-            registered_at=registered_at,
-        )
-        self._refresh_registered_traces()
-        self._persist_runtime_state()
-        return {
-            "tag": clean_tag,
-            "context_id": context,
-            "memory_id": persisted["memory_id"],
-            "spike_count": len(spike_indices),
-            "neuron_count": len(neuron_indices),
-            "registered_trace_count": len(self.registered_traces),
-            "state_path": str(self.state_path),
-            "memory_db_path": str(self.memory_store.db_path),
-            "persisted": True,
-        }
+            persisted = self.memory_store.upsert_entry(
+                tag=trace["tag"],
+                context_id=trace["context_id"],
+                source_text=trace["source_text"],
+                metadata=trace["metadata"],
+                embedding_dimensions=trace["embedding_dimensions"],
+                spike_indices=trace["spike_indices"],
+                neuron_indices=trace["neuron_indices"],
+                registered_at=registered_at,
+            )
+            self._refresh_registered_traces()
+            self._persist_runtime_state()
+            self._mark_activity()
+            return {
+                "tag": clean_tag,
+                "context_id": context,
+                "memory_id": persisted["memory_id"],
+                "spike_count": len(spike_indices),
+                "neuron_count": len(neuron_indices),
+                "registered_trace_count": len(self.registered_traces),
+                "state_path": str(self.state_path),
+                "memory_db_path": str(self.memory_store.db_path),
+                "persisted": True,
+            }
+        except Exception:
+            LOGGER.exception("trace registration failed for context_id=%s tag=%s", context, clean_tag)
+            raise
 
     def query(self, embedding: Any, *, context_id: str = "default", steps: int = 12) -> str:
         context = sanitize_context_id(context_id)
         if not self.is_enabled(context):
+            self._mark_activity()
             return (
                 f"SYNAPSE-S2 disabled for context {context}. "
                 "Toggle it with set_spiking_attention_enabled(true)."
             )
         try:
+            self._auto_quick_prune_if_due(trigger="query")
             sensory_spikes = self.encode_to_spikes_top_k(embedding)
             firing_signature = self.run_snn_cycle(sensory_spikes, steps=steps)
             registered = self._recall_registered_traces(
@@ -559,6 +648,8 @@ class SpikingAttentionBackend:
         except Exception:
             LOGGER.exception("query failed for context_id=%s", context)
             raise
+        finally:
+            self._mark_activity()
 
     def _active_indices_from_spikes(self, spikes: Any) -> list[int]:
         return [
@@ -672,9 +763,21 @@ class SpikingAttentionBackend:
             "semantic_group_count": len(self.semantic_hierarchy),
             "mlx_available": mx is not None,
             "mlxsnn_available": self._mlxsnn_available,
+            "mlxsnn_lif_execution_path": self._mlxsnn_lif_layer is not None,
             "mlx_device": os.getenv("MLX_DEVICE", "default"),
             "state_path": str(self.state_path),
             "memory_db_path": str(self.memory_store.db_path),
+            "quick_pruning_interval_seconds": self.quick_pruning_interval_seconds,
+            "idle_deep_sleep_seconds": self.idle_deep_sleep_seconds,
+            "last_pruning_age_seconds": round(time.monotonic() - self.last_pruning_monotonic, 3),
+            "last_activity_age_seconds": round(time.monotonic() - self.last_activity_monotonic, 3),
+            "quick_pruning_count": self.quick_pruning_count,
+            "deep_sleep_count": self.deep_sleep_count,
+            "W_syn_decay_multiplier": round(float(self.W_syn_decay_multiplier), 9),
+            "W_lateral_decay_multiplier": round(float(self.W_lateral_decay_multiplier), 9),
+            "quick_pruning_eager_decay_elements": self.quick_pruning_eager_decay_elements,
+            "last_maintenance": self.last_maintenance,
+            "consolidation_phase_names": list(CONSOLIDATION_PHASES),
         }
 
     def list_memory(
@@ -740,7 +843,16 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         return self.memory_store.backup(path)
 
-    def run_quick_pruning(self) -> dict[str, Any]:
+    def _mark_activity(self) -> None:
+        self.last_activity_monotonic = time.monotonic()
+
+    def _auto_quick_prune_if_due(self, *, trigger: str) -> dict[str, Any] | None:
+        elapsed = time.monotonic() - self.last_pruning_monotonic
+        if elapsed < self.quick_pruning_interval_seconds:
+            return None
+        return self.run_quick_pruning(trigger=f"auto:{trigger}")
+
+    def run_quick_pruning(self, *, trigger: str = "manual") -> dict[str, Any]:
         """Run non-LLM synaptic decay and transient membrane flushing."""
         native_mx = self._mx
         timing = ConsolidationTiming(time.perf_counter())
@@ -748,30 +860,97 @@ class SpikingAttentionBackend:
             elapsed_min = max(1.0, (time.monotonic() - self.last_pruning_monotonic) / 60.0)
             syn_decay = self.quick_decay_syn**elapsed_min
             lateral_decay = self.quick_decay_lateral**elapsed_min
-            self.W_syn = self.W_syn * syn_decay
-            self.W_lateral = self.W_lateral * lateral_decay
+            decay_strategy = self._apply_weight_decay(
+                syn_decay=syn_decay,
+                lateral_decay=lateral_decay,
+            )
             self.active_traces = self.active_traces * self.trace_decay
             self.state = {
                 "mem": native_mx.zeros_like(self.state["mem"]),
                 "spk": native_mx.zeros_like(self.state["spk"]),
             }
+            self._eval_if_available(
+                self.active_traces,
+                self.state["mem"],
+                self.state["spk"],
+            )
             self.last_pruning_monotonic = time.monotonic()
-            return {
+            self.quick_pruning_count += 1
+            elapsed_ms = timing.elapsed_ms()
+            status = {
                 "mode": "quick-pruning",
-                "elapsed_ms": timing.elapsed_ms(),
+                "trigger": str(trigger),
+                "elapsed_ms": elapsed_ms,
+                "target_interval_seconds": self.quick_pruning_interval_seconds,
+                "within_60ms_budget": elapsed_ms <= 60.0,
+                "gpu_non_llm": True,
+                "decay_strategy": decay_strategy,
                 "syn_decay": round(float(syn_decay), 6),
                 "lateral_decay": round(float(lateral_decay), 6),
+                "W_syn_decay_multiplier": round(float(self.W_syn_decay_multiplier), 9),
+                "W_lateral_decay_multiplier": round(float(self.W_lateral_decay_multiplier), 9),
                 "membrane_reset": True,
+                "quick_pruning_count": self.quick_pruning_count,
             }
+            self.last_maintenance = status
+            return status
         except Exception:
             LOGGER.exception("quick pruning failed")
             raise
 
-    def run_deep_sleep_consolidation(self) -> dict[str, Any]:
+    def _apply_weight_decay(self, *, syn_decay: float, lateral_decay: float) -> str:
+        total_elements = self._array_element_count(self.W_syn) + self._array_element_count(
+            self.W_lateral
+        )
+        if total_elements <= self.quick_pruning_eager_decay_elements:
+            self.W_syn = self.W_syn * syn_decay
+            self.W_lateral = self.W_lateral * lateral_decay
+            self.W_syn_decay_multiplier = 1.0
+            self.W_lateral_decay_multiplier = 1.0
+            self._eval_if_available(self.W_syn, self.W_lateral)
+            return "eager-matrix"
+
+        self.W_syn_decay_multiplier *= float(syn_decay)
+        self.W_lateral_decay_multiplier *= float(lateral_decay)
+        return "lazy-scalar"
+
+    def _array_element_count(self, array: Any) -> int:
+        count = 1
+        for dimension in getattr(array, "shape", ()):
+            count *= int(dimension)
+        return int(count)
+
+    def run_idle_maintenance(self, *, force_deep_sleep: bool = False) -> dict[str, Any]:
+        """Run maintenance appropriate for the current idle window."""
+        try:
+            idle_seconds = time.monotonic() - self.last_activity_monotonic
+            if force_deep_sleep or idle_seconds >= self.idle_deep_sleep_seconds:
+                status = self.run_deep_sleep_consolidation(
+                    trigger="idle-force" if force_deep_sleep else "idle-threshold"
+                )
+                status["idle_seconds"] = round(idle_seconds, 3)
+                status["deep_sleep_threshold_seconds"] = self.idle_deep_sleep_seconds
+                status["maintenance_run"] = True
+                self.last_maintenance = status
+                return status
+
+            quick_status = self._auto_quick_prune_if_due(trigger="idle-maintenance")
+            return {
+                "mode": "idle-maintenance",
+                "maintenance_run": quick_status is not None,
+                "idle_seconds": round(idle_seconds, 3),
+                "deep_sleep_threshold_seconds": self.idle_deep_sleep_seconds,
+                "quick_pruning": quick_status,
+            }
+        except Exception:
+            LOGGER.exception("idle maintenance failed")
+            raise
+
+    def run_deep_sleep_consolidation(self, *, trigger: str = "manual") -> dict[str, Any]:
         """Distill active traces into context-keyed semantic hierarchy groups."""
         timing = ConsolidationTiming(time.perf_counter())
         try:
-            self.run_quick_pruning()
+            quick_status = self.run_quick_pruning(trigger=f"{trigger}:deep-sleep-prepass")
             ranked = self._rank_active_trace_indices(limit=max(self.recall_count, 32))
             grouped: dict[str, list[str]] = {}
             for idx in ranked:
@@ -788,6 +967,8 @@ class SpikingAttentionBackend:
                 if tag not in members:
                     members.append(tag)
 
+            threshold_before = self.threshold
+            self._rescore_threshold(active_rank_count=len(ranked))
             self.semantic_hierarchy = {
                 context: {
                     "members": members,
@@ -797,16 +978,100 @@ class SpikingAttentionBackend:
                 for context, members in grouped.items()
             }
             self.active_traces = self.active_traces * 0.5
-            return {
+            self._eval_if_available(self.active_traces)
+            phases = self._build_consolidation_phases(
+                grouped=grouped,
+                memory_entries=memory_entries,
+                ranked=ranked,
+                quick_status=quick_status,
+                threshold_before=threshold_before,
+            )
+            self.consolidation_phase_history = phases
+            self.deep_sleep_count += 1
+            elapsed_ms = timing.elapsed_ms()
+            status = {
                 "mode": "deep-sleep",
-                "elapsed_ms": timing.elapsed_ms(),
+                "trigger": str(trigger),
+                "elapsed_ms": elapsed_ms,
                 "contexts": sorted(self.semantic_hierarchy),
                 "semantic_groups": len(self.semantic_hierarchy),
                 "memory_entry_count": len(memory_entries),
+                "phase_count": len(phases),
+                "phases": phases,
+                "quick_pruning": quick_status,
+                "deep_sleep_count": self.deep_sleep_count,
             }
+            self.last_maintenance = status
+            return status
         except Exception:
             LOGGER.exception("deep sleep consolidation failed")
             raise
+
+    def _rescore_threshold(self, *, active_rank_count: int) -> None:
+        active_fraction = active_rank_count / max(1, self.num_neurons)
+        if active_fraction > 0.08:
+            self.threshold = min(self.threshold * 1.02, 10.0)
+        elif active_fraction < 0.005:
+            self.threshold = max(self.threshold * 0.99, 0.05)
+
+    def _build_consolidation_phases(
+        self,
+        *,
+        grouped: dict[str, list[str]],
+        memory_entries: list[dict[str, Any]],
+        ranked: list[int],
+        quick_status: dict[str, Any],
+        threshold_before: float,
+    ) -> list[dict[str, Any]]:
+        semantic_member_count = sum(len(members) for members in grouped.values())
+        inactive_pool = max(0, self.num_neurons - len(set(ranked)))
+        return [
+            {
+                "phase": 1,
+                "name": "connection-weight-decay",
+                "operation": "exponential GPU weight decay",
+                "syn_decay": quick_status["syn_decay"],
+                "lateral_decay": quick_status["lateral_decay"],
+            },
+            {
+                "phase": 2,
+                "name": "synaptic-clustering",
+                "operation": "active trace density grouping",
+                "active_trace_count": len(ranked),
+            },
+            {
+                "phase": 3,
+                "name": "semantic-merging",
+                "operation": "context-keyed node pooling",
+                "semantic_groups": len(grouped),
+                "semantic_member_count": semantic_member_count,
+            },
+            {
+                "phase": 4,
+                "name": "threshold-rescoring",
+                "operation": "bounded adaptive V_thr rescore",
+                "threshold_before": round(float(threshold_before), 6),
+                "threshold_after": round(float(self.threshold), 6),
+            },
+            {
+                "phase": 5,
+                "name": "trace-promotion",
+                "operation": "durable SQLite memory substrate retention",
+                "promoted_trace_count": len(memory_entries),
+            },
+            {
+                "phase": 6,
+                "name": "relationship-extraction",
+                "operation": "Hebbian Distillation semantic graph build",
+                "contexts": sorted(grouped),
+            },
+            {
+                "phase": 7,
+                "name": "neurogenesis",
+                "operation": "inactive transient state reset for reuse",
+                "available_neuron_pool": inactive_pool,
+            },
+        ]
 
     def _rank_active_trace_indices(self, *, limit: int) -> list[int]:
         scored = [
@@ -829,6 +1094,12 @@ def get_backend() -> SpikingAttentionBackend:
             num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", "5000")),
             default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "150")),
             recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "5")),
+            quick_pruning_interval_seconds=float(
+                os.getenv("SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS", "300")
+            ),
+            idle_deep_sleep_seconds=float(
+                os.getenv("SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS", "1800")
+            ),
         )
     return _ENGINE_INSTANCE
 
@@ -909,6 +1180,10 @@ def backup_memory(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
 
 def run_quick_pruning() -> dict[str, Any]:
     return get_backend().run_quick_pruning()
+
+
+def run_idle_maintenance(*, force_deep_sleep: bool = False) -> dict[str, Any]:
+    return get_backend().run_idle_maintenance(force_deep_sleep=force_deep_sleep)
 
 
 def run_offline_consolidation() -> dict[str, Any]:

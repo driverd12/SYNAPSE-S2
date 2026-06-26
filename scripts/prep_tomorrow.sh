@@ -59,6 +59,10 @@ echo "=== mcp recall smoke ==="
   --input-json "{\"context_id\":\"$CONTEXT\",\"prompt\":\"durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients\"}" \
   --json --timeout 15
 
+echo "=== proposal lifecycle smoke ==="
+.venv/bin/python synapse_cli.py --json quick-prune
+.venv/bin/python synapse_cli.py --json idle-maintenance --force-deep-sleep
+
 echo "=== backup durable memory ==="
 .venv/bin/python synapse_cli.py --json backup-memory \
   --output "$SYNAPSE_S2_EXPORT_DIR/preflight-memory-$STAMP.sqlite3"

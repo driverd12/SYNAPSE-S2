@@ -36,6 +36,7 @@ scripts/prep_tomorrow.sh
 ```
 
 The detailed operator runbook is in `docs/TOMORROW_RUNBOOK.md`.
+The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 
 ### 3. Seed and Query Persistent Memory
 
@@ -86,6 +87,7 @@ The MCP server exposes these tools:
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
 | `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |
 | `trigger_sleep_consolidation` | Run deep-sleep consolidation and semantic hierarchy extraction. |
+| `trigger_idle_maintenance` | Run due maintenance or force idle deep-sleep consolidation. |
 
 FastMCP smoke check:
 
@@ -98,6 +100,23 @@ FastMCP smoke check:
 ```
 
 Project `.mcp.json` and `/Users/dan.driver/.codex/config.toml` are configured to use the launcher directly.
+
+### 6. Maintenance Lifecycle
+
+Quick-pruning is configured for the proposal's five-minute interval (`300` seconds) and automatically runs from the live query/register path when due. It is also available as an explicit operator command:
+
+```bash
+.venv/bin/python synapse_cli.py --json quick-prune
+```
+
+Idle deep-sleep consolidation is available from MCP and CLI:
+
+```bash
+.venv/bin/python synapse_cli.py --json idle-maintenance --force-deep-sleep
+.venv/bin/python synapse_cli.py --json sleep
+```
+
+Deep sleep returns all seven proposal lifecycle phases: connection weight decay, synaptic clustering, semantic merging, threshold rescoring, trace promotion, relationship extraction, and neurogenesis.
 
 ## **System Architecture**
 

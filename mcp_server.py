@@ -353,5 +353,19 @@ def trigger_sleep_consolidation() -> str:
         return f"sleep consolidation failed: {exc}"
 
 
+@mcp.tool()
+def trigger_idle_maintenance(force_deep_sleep: bool = False) -> str:
+    """Run due maintenance, or force idle deep-sleep consolidation."""
+    try:
+        _, mlx_backend = _load_backend()
+        status = mlx_backend.run_idle_maintenance(
+            force_deep_sleep=bool(force_deep_sleep)
+        )
+        return json.dumps(status, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("idle maintenance failed")
+        return json.dumps({"error": f"idle maintenance failed: {exc}"}, sort_keys=True)
+
+
 if __name__ == "__main__":
     mcp.run()

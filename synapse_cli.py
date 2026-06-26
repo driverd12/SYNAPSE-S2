@@ -61,6 +61,8 @@ def build_backend(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBacke
         num_neurons=args.neurons,
         default_top_k=args.top_k,
         recall_count=args.recall_count,
+        quick_pruning_interval_seconds=args.quick_pruning_interval,
+        idle_deep_sleep_seconds=args.idle_deep_sleep_seconds,
         compile_graph=not args.no_compile,
         state_path=args.state,
         memory_path=args.memory_db,
@@ -132,6 +134,11 @@ def command_quick_prune(args: argparse.Namespace) -> dict[str, Any]:
     return backend.run_quick_pruning()
 
 
+def command_idle_maintenance(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.run_idle_maintenance(force_deep_sleep=args.force_deep_sleep)
+
+
 def command_sleep(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.run_deep_sleep_consolidation()
@@ -187,6 +194,20 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         "state_parent_writable": os.access(state_path.parent, os.W_OK),
         "memory_minimum_met": int(status["memory_context_entry_count"]) >= int(args.minimum_memory),
         "launcher_executable": launcher_path.exists() and os.access(launcher_path, os.X_OK),
+        "consolidation_lifecycle_declared": status["consolidation_phase_names"]
+        == [
+            "connection-weight-decay",
+            "synaptic-clustering",
+            "semantic-merging",
+            "threshold-rescoring",
+            "trace-promotion",
+            "relationship-extraction",
+            "neurogenesis",
+        ],
+        "quick_pruning_interval_configured": float(
+            status["quick_pruning_interval_seconds"]
+        )
+        == 300.0,
     }
     if args.query_text:
         checks["query_returned_context"] = bool(query_result) and "No high-salience" not in query_result
@@ -279,6 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neurons", type=int, default=5000)
     parser.add_argument("--top-k", type=int, default=150)
     parser.add_argument("--recall-count", type=int, default=5)
+    parser.add_argument("--quick-pruning-interval", type=float, default=300.0)
+    parser.add_argument("--idle-deep-sleep-seconds", type=float, default=1800.0)
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--memory-db", default=None, help="Durable SQLite memory path.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
@@ -330,6 +353,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     quick_prune = subparsers.add_parser("quick-prune")
     quick_prune.set_defaults(func=command_quick_prune)
+
+    idle_maintenance = subparsers.add_parser("idle-maintenance")
+    idle_maintenance.add_argument("--force-deep-sleep", action="store_true")
+    idle_maintenance.set_defaults(func=command_idle_maintenance)
 
     sleep = subparsers.add_parser("sleep")
     sleep.set_defaults(func=command_sleep)

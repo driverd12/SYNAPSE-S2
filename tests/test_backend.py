@@ -1,6 +1,7 @@
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
+import time
 
 import mlx.core as mx
 
@@ -229,6 +230,20 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertIn("memory_db_path", status)
         self.assertIn("memory_entry_count", status)
         self.assertIn("memory_event_count", status)
+        self.assertEqual(status["quick_pruning_interval_seconds"], 300.0)
+        self.assertEqual(status["idle_deep_sleep_seconds"], 1800.0)
+        self.assertEqual(
+            status["consolidation_phase_names"],
+            [
+                "connection-weight-decay",
+                "synaptic-clustering",
+                "semantic-merging",
+                "threshold-rescoring",
+                "trace-promotion",
+                "relationship-extraction",
+                "neurogenesis",
+            ],
+        )
 
     def test_backend_exports_and_backs_up_real_memory_store(self):
         with TemporaryDirectory() as tmp:
@@ -281,8 +296,47 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         status = backend.run_quick_pruning()
 
         self.assertEqual(status["mode"], "quick-pruning")
+        self.assertEqual(status["trigger"], "manual")
+        self.assertTrue(status["gpu_non_llm"])
+        self.assertTrue(status["within_60ms_budget"])
         self.assertLessEqual(abs(float(backend.W_syn[0, 0])), abs(before_weight) + 1e-6)
         self.assertEqual(backend.state["mem"].tolist(), [0.0] * 6)
+
+    def test_quick_pruning_uses_lazy_scalar_decay_for_large_substrates(self):
+        backend = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+            quick_pruning_eager_decay_elements=1,
+        )
+        before_weight = float(backend.W_syn[0, 0])
+
+        status = backend.run_quick_pruning()
+
+        self.assertEqual(status["decay_strategy"], "lazy-scalar")
+        self.assertEqual(float(backend.W_syn[0, 0]), before_weight)
+        self.assertLess(status["W_syn_decay_multiplier"], 1.0)
+        self.assertLess(status["W_lateral_decay_multiplier"], 1.0)
+        self.assertTrue(status["within_60ms_budget"])
+
+    def test_query_auto_runs_quick_pruning_after_configured_interval(self):
+        backend = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            default_top_k=2,
+            compile_graph=False,
+            state_path=self.state_path,
+            quick_pruning_interval_seconds=300.0,
+        )
+        backend.last_pruning_monotonic = time.monotonic() - 301.0
+
+        result = backend.query(mx.array([0.0, 2.0, 7.0, -1.0]), context_id="demo")
+
+        self.assertIn("demo::neuron-", result)
+        self.assertEqual(backend.quick_pruning_count, 1)
+        self.assertEqual(backend.last_maintenance["mode"], "quick-pruning")
+        self.assertEqual(backend.last_maintenance["trigger"], "auto:query")
 
     def test_deep_sleep_consolidation_builds_semantic_hierarchy(self):
         backend = SpikingAttentionBackend(
@@ -305,6 +359,63 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             backend.semantic_hierarchy["demo"]["members"],
             ["demo::neuron-000001", "demo::neuron-000002"],
         )
+
+    def test_deep_sleep_reports_all_proposal_consolidation_phases(self):
+        backend = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend.register_trace(
+            tag="proposal-memory",
+            embedding=mx.array([0.0, 1.0, 9.0, 2.0]),
+            context_id="proposal",
+            metadata={"source": "unit-test"},
+            source_text="Proposal lifecycle coverage.",
+        )
+
+        status = backend.run_deep_sleep_consolidation()
+        phase_names = [phase["name"] for phase in status["phases"]]
+
+        self.assertEqual(status["phase_count"], 7)
+        self.assertEqual(
+            phase_names,
+            [
+                "connection-weight-decay",
+                "synaptic-clustering",
+                "semantic-merging",
+                "threshold-rescoring",
+                "trace-promotion",
+                "relationship-extraction",
+                "neurogenesis",
+            ],
+        )
+        self.assertEqual(status["phases"][4]["promoted_trace_count"], 1)
+        self.assertEqual(status["phases"][5]["contexts"], ["proposal"])
+
+    def test_idle_maintenance_runs_deep_sleep_after_idle_threshold(self):
+        backend = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+            idle_deep_sleep_seconds=1.0,
+        )
+        backend.memory_mapping = {
+            1: "idle::neuron-000001",
+            2: "idle::neuron-000002",
+        }
+        backend.active_traces = mx.array([0.0, 2.0, 1.5, 0.0, 0.0, 0.0])
+        backend.last_activity_monotonic = time.monotonic() - 2.0
+
+        status = backend.run_idle_maintenance()
+
+        self.assertEqual(status["mode"], "deep-sleep")
+        self.assertEqual(status["trigger"], "idle-threshold")
+        self.assertTrue(status["maintenance_run"])
+        self.assertEqual(status["phase_count"], 7)
+        self.assertEqual(backend.deep_sleep_count, 1)
 
 
 if __name__ == "__main__":

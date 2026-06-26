@@ -55,6 +55,14 @@ class McpServerTests(unittest.TestCase):
 
         self.assertIn("deep-sleep", result)
 
+    def test_idle_maintenance_tool_can_force_deep_sleep(self):
+        result = json.loads(mcp_server.trigger_idle_maintenance(force_deep_sleep=True))
+
+        self.assertEqual(result["mode"], "deep-sleep")
+        self.assertEqual(result["trigger"], "idle-force")
+        self.assertTrue(result["maintenance_run"])
+        self.assertEqual(result["phase_count"], 7)
+
     def test_toggle_tool_disables_query_and_status_reports_state(self):
         disabled = json.loads(mcp_server.set_spiking_attention_enabled(False))
         status = json.loads(mcp_server.get_spiking_attention_status(context_id="demo"))

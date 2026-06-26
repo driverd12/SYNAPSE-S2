@@ -67,6 +67,15 @@ Backup:
   --output .synapse_s2/manual-memory-backup.sqlite3
 ```
 
+Proposal lifecycle smoke:
+
+```bash
+.venv/bin/python synapse_cli.py --json quick-prune
+.venv/bin/python synapse_cli.py --json idle-maintenance --force-deep-sleep
+```
+
+The deep-sleep response should include `phase_count: 7` and phase names for connection weight decay, synaptic clustering, semantic merging, threshold rescoring, trace promotion, relationship extraction, and neurogenesis.
+
 ## MCP Inspector
 
 Use the launcher directly:
@@ -84,6 +93,17 @@ Useful tool calls:
 | `query_spiking_attention_text` | Recalls local memory from text without external embedding calls. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
+| `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |
+
+## Proposal compliance
+
+Before calling the build ready, inspect:
+
+```bash
+open docs/PROPOSAL_COMPLIANCE.md
+```
+
+The matrix maps each proposal requirement to implementation evidence and separates verified prototype gates from longer-horizon research extensions.
 
 ## Local state
 
