@@ -1,7 +1,7 @@
 [project]
 name = "synapse-s2"
 version = "0.1.0"
-description = "Apple Silicon optimized spiking STDP attention MCP server prototype."
+description = "Apple Silicon optimized spiking STDP attention MCP server."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

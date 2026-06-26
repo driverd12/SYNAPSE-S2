@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from memory_store import DurableMemoryStore
+
 try:
     import mlx.core as mx
 except Exception as exc:  # pragma: no cover - exercised only on non-MLX hosts
@@ -110,6 +112,7 @@ class SpikingAttentionBackend:
         stdp_active_limit: int = 512,
         compile_graph: bool = True,
         state_path: str | os.PathLike[str] | None = None,
+        memory_path: str | os.PathLike[str] | None = None,
     ) -> None:
         native_mx = _require_mx()
         if dimension <= 0:
@@ -140,6 +143,7 @@ class SpikingAttentionBackend:
         self._lif_step = self._build_lif_step(compile_graph)
         self._mlxsnn_available = mlxsnn is not None
         self.state_path = self._resolve_state_path(state_path)
+        self.memory_store = DurableMemoryStore(self._resolve_memory_path(memory_path))
         self.global_enabled = True
         self.context_overrides: dict[str, bool] = {}
         self.registered_traces: list[dict[str, Any]] = []
@@ -163,6 +167,7 @@ class SpikingAttentionBackend:
         self.semantic_hierarchy: dict[str, dict[str, Any]] = {}
         self.last_pruning_monotonic = time.monotonic()
         self._load_runtime_state()
+        self._refresh_registered_traces()
 
         if not self._mlxsnn_available:
             LOGGER.warning(
@@ -178,10 +183,19 @@ class SpikingAttentionBackend:
             return Path(configured)
         return Path.cwd() / ".synapse_s2" / "runtime_state.json"
 
+    def _resolve_memory_path(self, memory_path: str | os.PathLike[str] | None) -> Path:
+        if memory_path is not None:
+            return Path(memory_path)
+        configured = os.getenv("SYNAPSE_S2_MEMORY_DB")
+        if configured:
+            return Path(configured)
+        return self.state_path.parent / "memory.sqlite3"
+
     def _load_runtime_state(self) -> None:
         if not self.state_path.exists():
             return
         try:
+            migrated_trace_count = 0
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("runtime state root must be an object")
@@ -194,14 +208,27 @@ class SpikingAttentionBackend:
                 }
             traces = payload.get("registered_traces", [])
             if isinstance(traces, list):
-                self.registered_traces = [
-                    self._normalize_trace_payload(trace)
-                    for trace in traces
-                    if isinstance(trace, dict)
-                ]
-            for trace in self.registered_traces:
-                for neuron_idx in trace["neuron_indices"]:
-                    self.memory_mapping.setdefault(int(neuron_idx), trace["tag"])
+                for raw_trace in traces:
+                    if not isinstance(raw_trace, dict):
+                        continue
+                    trace = self._normalize_trace_payload(raw_trace)
+                    self.memory_store.upsert_entry(
+                        tag=trace["tag"],
+                        context_id=trace["context_id"],
+                        source_text=trace["source_text"],
+                        metadata=trace["metadata"],
+                        embedding_dimensions=trace["embedding_dimensions"],
+                        spike_indices=trace["spike_indices"],
+                        neuron_indices=trace["neuron_indices"],
+                        registered_at=trace["registered_at"],
+                    )
+                    migrated_trace_count += 1
+            if migrated_trace_count:
+                LOGGER.info(
+                    "migrated %s legacy runtime traces into SQLite memory store",
+                    migrated_trace_count,
+                )
+                self._persist_runtime_state()
         except Exception as exc:
             LOGGER.error("failed to load runtime state from %s: %s", self.state_path, exc)
 
@@ -209,10 +236,10 @@ class SpikingAttentionBackend:
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "version": 1,
+                "version": 2,
                 "global_enabled": self.global_enabled,
                 "context_overrides": self.context_overrides,
-                "registered_traces": self.registered_traces,
+                "memory_db_path": str(self.memory_store.db_path),
                 "updated_at": time.time(),
             }
             temp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
@@ -224,6 +251,35 @@ class SpikingAttentionBackend:
         except Exception:
             LOGGER.exception("failed to persist runtime state to %s", self.state_path)
             raise
+
+    def _refresh_registered_traces(self) -> None:
+        try:
+            entries = self.memory_store.list_entries(limit=10_000)
+            self.registered_traces = [
+                self._trace_from_memory_entry(entry)
+                for entry in entries
+            ]
+            self.memory_mapping = {}
+            for trace in self.registered_traces:
+                for neuron_idx in trace["neuron_indices"]:
+                    self.memory_mapping.setdefault(int(neuron_idx), trace["tag"])
+        except Exception:
+            LOGGER.exception("failed to refresh registered traces from %s", self.memory_store.db_path)
+            raise
+
+    def _trace_from_memory_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "memory_id": str(entry["memory_id"]),
+            "tag": sanitize_tag(str(entry["tag"])),
+            "context_id": sanitize_context_id(str(entry["context_id"])),
+            "embedding_dimensions": int(entry["embedding_dimensions"]),
+            "spike_indices": [int(idx) for idx in entry.get("spike_indices", [])],
+            "neuron_indices": [int(idx) for idx in entry.get("neuron_indices", [])],
+            "metadata": self._json_safe_metadata(entry.get("metadata", {})),
+            "registered_at": float(entry.get("created_at", time.time())),
+            "updated_at": float(entry.get("updated_at", time.time())),
+            "source_text": str(entry.get("source_text", "")),
+        }
 
     def _normalize_trace_payload(self, trace: dict[str, Any]) -> dict[str, Any]:
         metadata = trace.get("metadata", {})
@@ -237,7 +293,7 @@ class SpikingAttentionBackend:
             "neuron_indices": [int(idx) for idx in trace.get("neuron_indices", [])],
             "metadata": self._json_safe_metadata(metadata),
             "registered_at": float(trace.get("registered_at", time.time())),
-            "source_text": str(trace.get("source_text", ""))[:1000],
+            "source_text": str(trace.get("source_text", "")),
         }
 
     def _json_safe_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -334,8 +390,17 @@ class SpikingAttentionBackend:
         variance = native_mx.mean((arr - mean) * (arr - mean))
         std = native_mx.sqrt(variance + 1e-6)
         z_scores = (arr - mean) / std
-        threshold_value = native_mx.sort(z_scores)[-top_k]
-        return native_mx.where(z_scores >= threshold_value, 1.0, 0.0)
+        selected_indices = native_mx.argsort(z_scores)[-top_k:]
+        coordinate_indices = native_mx.arange(int(arr.shape[0]))
+        selected_mask = native_mx.sum(
+            native_mx.where(
+                coordinate_indices[:, None] == selected_indices[None, :],
+                1.0,
+                0.0,
+            ),
+            axis=1,
+        )
+        return native_mx.where(selected_mask > 0.0, 1.0, 0.0)
 
     def embed_text(self, text: str, *, dimensions: int | None = None):
         """Map text to a deterministic local embedding for offline MCP use.
@@ -433,6 +498,7 @@ class SpikingAttentionBackend:
         sensory_spikes = self.encode_to_spikes_top_k(arr)
         spike_indices = self._active_indices_from_spikes(sensory_spikes)
         neuron_indices = self._project_sensory_indices(spike_indices)
+        registered_at = time.time()
         trace = {
             "tag": clean_tag,
             "context_id": context,
@@ -440,29 +506,32 @@ class SpikingAttentionBackend:
             "spike_indices": spike_indices,
             "neuron_indices": neuron_indices,
             "metadata": self._json_safe_metadata(metadata),
-            "registered_at": time.time(),
-            "source_text": str(source_text or "")[:1000],
+            "registered_at": registered_at,
+            "source_text": str(source_text or ""),
         }
 
-        self.registered_traces = [
-            existing
-            for existing in self.registered_traces
-            if not (
-                existing["tag"] == clean_tag
-                and existing["context_id"] == context
-            )
-        ]
-        self.registered_traces.append(trace)
-        for neuron_idx in neuron_indices:
-            self.memory_mapping[int(neuron_idx)] = clean_tag
+        persisted = self.memory_store.upsert_entry(
+            tag=trace["tag"],
+            context_id=trace["context_id"],
+            source_text=trace["source_text"],
+            metadata=trace["metadata"],
+            embedding_dimensions=trace["embedding_dimensions"],
+            spike_indices=trace["spike_indices"],
+            neuron_indices=trace["neuron_indices"],
+            registered_at=registered_at,
+        )
+        self._refresh_registered_traces()
         self._persist_runtime_state()
         return {
             "tag": clean_tag,
             "context_id": context,
+            "memory_id": persisted["memory_id"],
             "spike_count": len(spike_indices),
             "neuron_count": len(neuron_indices),
             "registered_trace_count": len(self.registered_traces),
             "state_path": str(self.state_path),
+            "memory_db_path": str(self.memory_store.db_path),
+            "persisted": True,
         }
 
     def query(self, embedding: Any, *, context_id: str = "default", steps: int = 12) -> str:
@@ -518,29 +587,20 @@ class SpikingAttentionBackend:
         if not query_spikes:
             return []
         firing_values = firing_signature.tolist()
-        candidates: list[tuple[float, dict[str, Any]]] = []
-        for trace in self.registered_traces:
-            trace_context = trace["context_id"]
-            if trace_context not in {context, "global"}:
-                continue
-            trace_spikes = set(int(idx) for idx in trace["spike_indices"])
-            if not trace_spikes:
-                continue
-            overlap = len(query_spikes & trace_spikes)
-            union = len(query_spikes | trace_spikes)
-            jaccard = overlap / max(1, union)
-            neuron_activity = 0.0
-            for neuron_idx in trace["neuron_indices"]:
-                if 0 <= int(neuron_idx) < len(firing_values):
-                    neuron_activity += float(firing_values[int(neuron_idx)])
-            activity_bonus = min(neuron_activity / max(1, len(trace["neuron_indices"])), 1.0)
-            score = jaccard + 0.05 * activity_bonus
-            if score > 0.0:
-                candidates.append((score, trace))
-        candidates.sort(key=lambda item: (item[0], item[1]["registered_at"]), reverse=True)
+        candidates = self.memory_store.recall_candidates(
+            context_id=context,
+            query_spikes=query_spikes,
+            firing_values=firing_values,
+            limit=self.recall_count,
+        )
         return [
-            f"{trace['tag']} (score={score:.3f}, context={trace['context_id']})"
-            for score, trace in candidates[: self.recall_count]
+            (
+                f"{candidate['tag']} "
+                f"(score={float(candidate['score']):.3f}, "
+                f"context={candidate['context_id']}, "
+                f"id={candidate['memory_id']})"
+            )
+            for candidate in candidates
         ]
 
     def _recall_indices(self, firing_signature: Any, sensory_spikes: Any) -> list[int]:
@@ -590,6 +650,8 @@ class SpikingAttentionBackend:
 
     def status(self, *, context_id: str = "default") -> dict[str, Any]:
         context = sanitize_context_id(context_id)
+        total_stats = self.memory_store.stats()
+        context_stats = self.memory_store.stats(context_id=context)
         return {
             "runtime": "ready" if self.is_enabled(context) else "disabled",
             "context_id": context,
@@ -600,14 +662,56 @@ class SpikingAttentionBackend:
             "num_neurons": int(self.num_neurons),
             "default_top_k": int(self.default_top_k),
             "recall_count": int(self.recall_count),
-            "registered_trace_count": len(self.registered_traces),
+            "registered_trace_count": int(total_stats["entry_count"]),
+            "registered_trace_cache_count": len(self.registered_traces),
             "memory_mapping_count": len(self.memory_mapping),
+            "memory_entry_count": int(total_stats["entry_count"]),
+            "memory_context_entry_count": int(context_stats["entry_count"]),
+            "memory_event_count": int(total_stats["event_count"]),
+            "memory_contexts": total_stats["contexts"],
             "semantic_group_count": len(self.semantic_hierarchy),
             "mlx_available": mx is not None,
             "mlxsnn_available": self._mlxsnn_available,
             "mlx_device": os.getenv("MLX_DEVICE", "default"),
             "state_path": str(self.state_path),
+            "memory_db_path": str(self.memory_store.db_path),
         }
+
+    def list_memory(
+        self,
+        *,
+        context_id: str = "default",
+        limit: int = 50,
+        include_global: bool = True,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        entries = self.memory_store.list_entries(
+            context_id=context,
+            limit=limit,
+            include_global=include_global,
+        )
+        return {
+            "context_id": context,
+            "memory_db_path": str(self.memory_store.db_path),
+            "entry_count": len(entries),
+            "entries": entries,
+        }
+
+    def export_memory(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        context_id: str | None = None,
+        limit: int = 10_000,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id) if context_id is not None else None
+        return self.memory_store.export_json(path, context_id=context, limit=limit)
+
+    def backup_memory(
+        self,
+        path: str | os.PathLike[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.memory_store.backup(path)
 
     def run_quick_pruning(self) -> dict[str, Any]:
         """Run non-LLM synaptic decay and transient membrane flushing."""
@@ -649,12 +753,19 @@ class SpikingAttentionBackend:
                     continue
                 context = tag.split("::", 1)[0]
                 grouped.setdefault(context, []).append(tag)
+            memory_entries = self.memory_store.list_entries(limit=10_000)
+            for entry in memory_entries:
+                context = sanitize_context_id(str(entry["context_id"]))
+                tag = sanitize_tag(str(entry["tag"]))
+                members = grouped.setdefault(context, [])
+                if tag not in members:
+                    members.append(tag)
 
             self.semantic_hierarchy = {
                 context: {
                     "members": members,
                     "member_count": len(members),
-                    "distillation": "hebbian-active-trace",
+                    "distillation": "hebbian-memory-store",
                 }
                 for context, members in grouped.items()
             }
@@ -664,6 +775,7 @@ class SpikingAttentionBackend:
                 "elapsed_ms": timing.elapsed_ms(),
                 "contexts": sorted(self.semantic_hierarchy),
                 "semantic_groups": len(self.semantic_hierarchy),
+                "memory_entry_count": len(memory_entries),
             }
         except Exception:
             LOGGER.exception("deep sleep consolidation failed")
@@ -743,6 +855,21 @@ def set_enabled(enabled: bool, context_id: str | None = None) -> dict[str, Any]:
 
 def get_status(context_id: str = "default") -> dict[str, Any]:
     return get_backend().status(context_id=context_id)
+
+
+def list_memory(context_id: str = "default", limit: int = 50) -> dict[str, Any]:
+    return get_backend().list_memory(context_id=context_id, limit=limit)
+
+
+def export_memory(
+    path: str | os.PathLike[str] | None = None,
+    context_id: str | None = None,
+) -> dict[str, Any]:
+    return get_backend().export_memory(path=path, context_id=context_id)
+
+
+def backup_memory(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    return get_backend().backup_memory(path=path)
 
 
 def run_quick_pruning() -> dict[str, Any]:

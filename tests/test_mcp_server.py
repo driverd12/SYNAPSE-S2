@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -20,8 +21,18 @@ class McpServerTests(unittest.TestCase):
             recall_count=3,
             compile_graph=False,
             state_path=Path(self.tmpdir.name) / "state.json",
+            memory_path=Path(self.tmpdir.name) / "memory.sqlite3",
         )
         self.addCleanup(lambda: setattr(mlx_backend, "_ENGINE_INSTANCE", None))
+        self.previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
+        os.environ["SYNAPSE_S2_EXPORT_DIR"] = self.tmpdir.name
+        self.addCleanup(self._restore_export_dir)
+
+    def _restore_export_dir(self):
+        if self.previous_export_dir is None:
+            os.environ.pop("SYNAPSE_S2_EXPORT_DIR", None)
+        else:
+            os.environ["SYNAPSE_S2_EXPORT_DIR"] = self.previous_export_dir
 
     def test_query_rejects_empty_embedding(self):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -90,6 +101,38 @@ class McpServerTests(unittest.TestCase):
         )
 
         self.assertIn("local-demo-memory", result)
+
+    def test_memory_list_export_and_backup_tools_are_json_safe(self):
+        mcp_server.remember_spiking_context(
+            tag="ops-handoff-memory",
+            context_id="demo",
+            text="Real memory is inspectable through MCP.",
+            metadata={"surface": "mcp"},
+        )
+
+        listing = json.loads(mcp_server.list_spiking_memory(context_id="demo", limit=5))
+        exported = json.loads(mcp_server.export_spiking_memory(context_id="demo"))
+        backup = json.loads(
+            mcp_server.backup_spiking_memory(
+                output_path=str(Path(self.tmpdir.name) / "backup.sqlite3")
+            )
+        )
+
+        self.assertEqual(listing["entry_count"], 1)
+        self.assertEqual(listing["entries"][0]["tag"], "ops-handoff-memory")
+        self.assertEqual(exported["entries"][0]["source_text"], "Real memory is inspectable through MCP.")
+        self.assertTrue(Path(backup["backup_path"]).exists())
+
+    def test_memory_export_tool_rejects_paths_outside_export_root(self):
+        result = json.loads(
+            mcp_server.export_spiking_memory(
+                context_id="demo",
+                output_path="/tmp/synapse-s2-outside-export.json",
+            )
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("export root", result["error"])
 
 
 if __name__ == "__main__":

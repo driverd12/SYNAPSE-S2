@@ -6,7 +6,7 @@ Unlike traditional vector similarity retrieval methods, SYNAPSE-S2 runs natively
 
 ## **Operational Quickstart**
 
-This repository now includes a working local MCP server, persistent memory store, runtime toggle controls, and a CLI for validation outside an MCP client.
+This repository now includes a working local MCP server, a SQLite-backed persistent memory store, runtime toggle controls, and a CLI for validation outside an MCP client.
 
 ### 1. Install Runtime Dependencies
 
@@ -40,6 +40,19 @@ The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists b
 
 Expected query output returns ranked registered traces such as `ops-toggle`, `metal-runtime`, and `executive-briefing`.
 
+Real memory is stored locally in `.synapse_s2/memory.sqlite3`. Runtime toggles and client state live in `.synapse_s2/runtime_state.json`. Both `.mcp.json` and `/Users/dan.driver/.codex/config.toml` set `SYNAPSE_S2_MEMORY_DB` so Codex, Claude, and direct CLI runs target the same durable substrate. MCP export and backup paths are constrained to `.synapse_s2` by default through `SYNAPSE_S2_EXPORT_DIR`; the CLI remains available for explicit operator-chosen local paths.
+
+Inspect, export, and back up the memory store:
+
+```bash
+.venv/bin/python synapse_cli.py --json list-memory --context board-demo --limit 20
+.venv/bin/python synapse_cli.py --json export-memory \
+  --context board-demo \
+  --output .synapse_s2/board-demo-memory-export.json
+.venv/bin/python synapse_cli.py --json backup-memory \
+  --output .synapse_s2/board-demo-memory-backup.sqlite3
+```
+
 ### 4. Toggle Runtime Behavior
 
 ```bash
@@ -61,6 +74,9 @@ The MCP server exposes these tools:
 | `remember_spiking_context` | Persist a named context trace from text and/or an embedding. |
 | `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
+| `list_spiking_memory` | List persisted SQLite memory entries for a context. |
+| `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
+| `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |
 | `trigger_sleep_consolidation` | Run deep-sleep consolidation and semantic hierarchy extraction. |
 
 FastMCP smoke check:

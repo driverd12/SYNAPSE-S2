@@ -26,6 +26,19 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertEqual(spikes.tolist(), [0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
 
+    def test_encode_to_spikes_top_k_keeps_tied_sparse_vectors_bounded(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=8,
+            default_top_k=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        spikes = backend.encode_to_spikes_top_k(mx.array([0.0] * 8))
+
+        self.assertEqual(sum(spikes.tolist()), 3.0)
+
     def test_query_returns_context_tags_and_tracks_state(self):
         backend = SpikingAttentionBackend(
             dimension=6,
@@ -69,6 +82,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
     def test_registered_trace_persists_to_state_file(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "synapse-state.json"
+            memory_path = Path(tmp) / "synapse-memory.sqlite3"
             backend = SpikingAttentionBackend(
                 dimension=6,
                 num_neurons=10,
@@ -76,12 +90,14 @@ class SpikingAttentionBackendTests(unittest.TestCase):
                 recall_count=3,
                 compile_graph=False,
                 state_path=state_path,
+                memory_path=memory_path,
             )
             backend.register_trace(
                 tag="procurement-memory",
                 embedding=mx.array([0.0, 1.0, 9.0, 2.0, 7.0, -4.0]),
                 context_id="ops",
                 metadata={"ticket": "S2"},
+                source_text="Procurement memory should survive backend restarts.",
             )
 
             restored = SpikingAttentionBackend(
@@ -91,13 +107,18 @@ class SpikingAttentionBackendTests(unittest.TestCase):
                 recall_count=3,
                 compile_graph=False,
                 state_path=state_path,
+                memory_path=memory_path,
             )
             result = restored.query(
                 mx.array([0.0, 1.0, 8.8, 2.0, 6.9, -4.1]),
                 context_id="ops",
             )
+            memory = restored.list_memory(context_id="ops")
 
         self.assertIn("procurement-memory", result)
+        self.assertEqual(memory["entries"][0]["source_text"], "Procurement memory should survive backend restarts.")
+        self.assertEqual(memory["entries"][0]["metadata"], {"ticket": "S2"})
+        self.assertEqual(memory["memory_db_path"], str(memory_path))
 
     def test_text_embedding_is_deterministic_for_cli_and_mcp_demo_use(self):
         backend = SpikingAttentionBackend(
@@ -205,6 +226,44 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(status["num_neurons"], 6)
         self.assertIn("mlx_available", status)
         self.assertIn("mlxsnn_available", status)
+        self.assertIn("memory_db_path", status)
+        self.assertIn("memory_entry_count", status)
+        self.assertIn("memory_event_count", status)
+
+    def test_backend_exports_and_backs_up_real_memory_store(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            export_path = Path(tmp) / "memory-export.json"
+            backup_path = Path(tmp) / "memory-backup.sqlite3"
+            backend = SpikingAttentionBackend(
+                dimension=6,
+                num_neurons=10,
+                default_top_k=2,
+                recall_count=3,
+                compile_graph=False,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            backend.register_trace(
+                tag="ops-memory",
+                embedding=mx.array([0.0, 1.0, 9.0, 2.0, 7.0, -4.0]),
+                context_id="ops",
+                metadata={"owner": "it"},
+                source_text="Operators can inspect and export this memory.",
+            )
+
+            listing = backend.list_memory(context_id="ops")
+            exported = backend.export_memory(path=export_path, context_id="ops")
+            backup = backend.backup_memory(backup_path)
+            export_exists = export_path.exists()
+            backup_exists = backup_path.exists()
+
+        self.assertEqual(listing["entry_count"], 1)
+        self.assertEqual(exported["entries"][0]["tag"], "ops-memory")
+        self.assertTrue(export_exists)
+        self.assertEqual(backup["entry_count"], 1)
+        self.assertTrue(backup_exists)
 
     def test_quick_pruning_decays_weights_and_resets_membrane(self):
         backend = SpikingAttentionBackend(

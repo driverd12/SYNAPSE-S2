@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 try:
@@ -101,6 +102,45 @@ def _validate_text(text: str, *, field_name: str = "text") -> str:
     if len(value) > 20_000:
         raise ValueError(f"{field_name} exceeds 20000 characters")
     return value
+
+
+def _validate_limit(limit: int) -> int:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    return min(max(value, 1), 500)
+
+
+def _optional_output_path(
+    output_path: str | None,
+    *,
+    allowed_suffixes: set[str],
+) -> str | None:
+    value = str(output_path or "").strip()
+    if not value:
+        return None
+    if len(value) > 4096:
+        raise ValueError("output_path exceeds 4096 characters")
+    export_root = Path(os.getenv("SYNAPSE_S2_EXPORT_DIR", ".synapse_s2")).expanduser()
+    if not export_root.is_absolute():
+        export_root = Path.cwd() / export_root
+    resolved_root = export_root.resolve()
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    resolved_candidate = candidate.resolve()
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"output_path must stay within export root {resolved_root}"
+        ) from exc
+    suffix = resolved_candidate.suffix.lower()
+    if suffix not in allowed_suffixes:
+        allowed = ", ".join(sorted(allowed_suffixes))
+        raise ValueError(f"output_path suffix must be one of: {allowed}")
+    return str(resolved_candidate)
 
 
 def _load_backend():
@@ -230,6 +270,67 @@ def get_spiking_attention_status(context_id: str = "default") -> str:
     except Exception as exc:
         LOGGER.exception("status check failed for context_id=%s", context)
         return json.dumps({"error": f"status failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "List Persisted SYNAPSE-S2 Memory",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_memory(context_id: str = "default", limit: int = 50) -> str:
+    """List persisted local memory entries for a context."""
+    context = _sanitize_context_id(context_id)
+    try:
+        bounded_limit = _validate_limit(limit)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.list_memory(context_id=context, limit=bounded_limit)
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid memory list request for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid memory list request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("memory list failed for context_id=%s", context)
+        return json.dumps({"error": f"memory list failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def export_spiking_memory(
+    context_id: str = "default",
+    output_path: str = "",
+) -> str:
+    """Export persisted memory as JSON, optionally writing to output_path."""
+    context = _sanitize_context_id(context_id)
+    try:
+        path = _optional_output_path(output_path, allowed_suffixes={".json"})
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.export_memory(path=path, context_id=context)
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid memory export request for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid memory export request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("memory export failed for context_id=%s", context)
+        return json.dumps({"error": f"memory export failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def backup_spiking_memory(output_path: str = "") -> str:
+    """Create a SQLite backup of the durable SYNAPSE-S2 memory store."""
+    try:
+        path = _optional_output_path(
+            output_path,
+            allowed_suffixes={".db", ".sqlite", ".sqlite3"},
+        )
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.backup_memory(path=path)
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid memory backup request: %s", exc)
+        return json.dumps({"error": f"invalid memory backup request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("memory backup failed")
+        return json.dumps({"error": f"memory backup failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool()

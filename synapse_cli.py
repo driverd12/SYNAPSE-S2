@@ -63,6 +63,7 @@ def build_backend(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBacke
         recall_count=args.recall_count,
         compile_graph=not args.no_compile,
         state_path=args.state,
+        memory_path=args.memory_db,
     )
 
 
@@ -136,6 +137,21 @@ def command_sleep(args: argparse.Namespace) -> dict[str, Any]:
     return backend.run_deep_sleep_consolidation()
 
 
+def command_list_memory(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_memory(context_id=args.context, limit=args.limit)
+
+
+def command_export_memory(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.export_memory(path=args.output, context_id=args.context)
+
+
+def command_backup_memory(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.backup_memory(path=args.output)
+
+
 def command_seed_demo(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     samples = [
@@ -178,6 +194,7 @@ def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
         "environment": {
             "MLX_DEVICE": os.getenv("MLX_DEVICE", ""),
             "SYNAPSE_S2_STATE_PATH": os.getenv("SYNAPSE_S2_STATE_PATH", ""),
+            "SYNAPSE_S2_MEMORY_DB": os.getenv("SYNAPSE_S2_MEMORY_DB", ""),
         },
         "dependencies": {
             "mlx": dependency_status("mlx"),
@@ -201,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=150)
     parser.add_argument("--recall-count", type=int, default=5)
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--memory-db", default=None, help="Durable SQLite memory path.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -253,6 +271,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     sleep = subparsers.add_parser("sleep")
     sleep.set_defaults(func=command_sleep)
+
+    list_memory = subparsers.add_parser("list-memory")
+    add_context(list_memory)
+    list_memory.add_argument("--limit", type=int, default=50)
+    list_memory.set_defaults(func=command_list_memory)
+
+    export_memory = subparsers.add_parser("export-memory")
+    add_context(export_memory)
+    export_memory.add_argument("--output", default=None)
+    export_memory.set_defaults(func=command_export_memory)
+
+    backup_memory = subparsers.add_parser("backup-memory")
+    backup_memory.add_argument("--output", default=None)
+    backup_memory.set_defaults(func=command_backup_memory)
 
     doctor = subparsers.add_parser("doctor")
     add_context(doctor)
