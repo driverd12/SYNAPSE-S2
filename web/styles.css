@@ -1202,6 +1202,35 @@ textarea {
   gap: 10px;
 }
 
+.recall-guide {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 2px 0 12px;
+}
+
+.recall-guide div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.recall-guide strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 820;
+}
+
+.recall-guide span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .k-control {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -1450,6 +1479,7 @@ textarea {
 
   .top-readouts,
   .nav-list,
+  .recall-guide,
   .resource-stats,
   .graph-shell,
   .graph-toolbar,

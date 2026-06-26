@@ -337,8 +337,22 @@
               </div>
               <button id="clearRecallButton" class="utility-button small" type="button">Clear</button>
             </div>
+            <div id="recallGuide" class="recall-guide" aria-label="Recall console guidance">
+              <div>
+                <strong>What this does</strong>
+                <span>Embeds your text locally, gates the spiking memory graph, and returns matching traces from this context.</span>
+              </div>
+              <div>
+                <strong>Where it goes</strong>
+                <span title="MCP tool: query_spiking_attention_text">Local recall only here; MCP-connected clients pull the same context through the MCP recall tool.</span>
+              </div>
+              <div>
+                <strong>Good prompts</strong>
+                <span>Ask for prior decisions, incidents, people, project state, or temporal context you have already captured.</span>
+              </div>
+            </div>
             <form id="queryForm" class="query-form">
-              <input id="queryInput" autocomplete="off" placeholder="Ask SYNAPSE-S2..." />
+              <input id="queryInput" autocomplete="off" placeholder="Ask local memory: decision, incident, project state..." aria-describedby="recallGuide" />
               <label class="k-control">
                 <span>K=</span>
                 <select id="recallLimit" aria-label="Displayed recall result count">
