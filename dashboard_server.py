@@ -116,7 +116,10 @@ class DashboardRuntime:
         if method == "GET" and path == "/api/snapshot":
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
-            return self._json_response(self.snapshot(context_id=context, limit=limit))
+            include_graph = self._bool_param(params, "include_graph", True)
+            return self._json_response(
+                self.snapshot(context_id=context, limit=limit, include_graph=include_graph)
+            )
 
         if method == "POST" and path == "/api/toggle":
             payload = self._parse_json_body(body)
@@ -191,15 +194,62 @@ class DashboardRuntime:
 
         raise DashboardError(HTTPStatus.NOT_FOUND, "route not found")
 
-    def snapshot(self, *, context_id: str, limit: int = 50) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        context_id: str,
+        limit: int = 50,
+        include_graph: bool = True,
+    ) -> dict[str, Any]:
         context = mlx_backend.sanitize_context_id(context_id)
+        timings: dict[str, float] = {}
+        snapshot_started = time.perf_counter()
+
+        def timed(stage: str, callback: Any) -> Any:
+            started = time.perf_counter()
+            try:
+                return callback()
+            finally:
+                timings[stage] = round((time.perf_counter() - started) * 1000.0, 3)
+
+        status = timed("status", lambda: self.backend.status(context_id=context))
+        profile = timed(
+            "profile",
+            lambda: self.backend.resource_profile(benchmark_quick_prune=False),
+        )
+        if include_graph:
+            graph = timed("graph", lambda: self.backend.list_memory_graph(context_id=context, limit=limit))
+        else:
+            timings["graph"] = 0.0
+            graph = self._deferred_graph(context=context, status=status)
+        system = timed("system", lambda: self._system_info(context_id=context))
+        timings["total"] = round((time.perf_counter() - snapshot_started) * 1000.0, 3)
         return {
             "context_id": context,
-            "status": self.backend.status(context_id=context),
-            "profile": self.backend.resource_profile(benchmark_quick_prune=False),
-            "graph": self.backend.list_memory_graph(context_id=context, limit=limit),
-            "system": self._system_info(context_id=context),
+            "status": status,
+            "profile": profile,
+            "graph": graph,
+            "system": system,
+            "timings_ms": timings,
             "generated_at": time.time(),
+        }
+
+    def _deferred_graph(self, *, context: str, status: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "context_id": context,
+            "deferred": True,
+            "entries": [],
+            "relationships": [],
+            "entry_count": int(status.get("memory_context_entry_count") or 0),
+            "relationship_count": int(status.get("memory_context_relationship_count") or 0),
+            "relationship_summary": {
+                "total": int(status.get("memory_context_relationship_count") or 0),
+                "temporal": None,
+                "associative": None,
+                "other": None,
+                "by_type": {},
+            },
+            "memory_db_path": status.get("memory_db_path"),
         }
 
     def _system_info(self, *, context_id: str) -> dict[str, Any]:

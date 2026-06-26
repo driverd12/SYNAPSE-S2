@@ -55,6 +55,7 @@ const elements = collectElements([
   "headroomMb",
   "headroomState",
   "headerRuntime",
+  "hydrateLabel",
   "ingestForm",
   "ingestMinSentences",
   "ingestTag",
@@ -165,16 +166,27 @@ function applyTheme(theme) {
 }
 
 async function refreshSnapshot() {
+  const started = nowMs();
   elements.headerRuntime.textContent = "REFRESHING";
-  const snapshot = await requestJson("/api/snapshot", {
-    params: { context_id: state.context, limit: SNAPSHOT_LIMIT },
+  const shellSnapshot = await requestJson("/api/snapshot", {
+    params: { context_id: state.context, limit: SNAPSHOT_LIMIT, include_graph: "false" },
   });
-  state.snapshot = snapshot;
-  renderSnapshot(snapshot);
-  return snapshot;
+  state.snapshot = withGraph(shellSnapshot, shellSnapshot.graph);
+  renderSnapshot(state.snapshot, elapsedMs(started));
+
+  try {
+    const graph = await requestJson("/api/graph", {
+      params: { context_id: state.context, limit: SNAPSHOT_LIMIT },
+    });
+    state.snapshot = withGraph(shellSnapshot, graph);
+    renderSnapshot(state.snapshot, elapsedMs(started));
+  } catch (error) {
+    logOperation("Graph refresh failed", error.message);
+  }
+  return state.snapshot;
 }
 
-function renderSnapshot(snapshot) {
+function renderSnapshot(snapshot, clientElapsedMs = null) {
   const status = snapshot.status || {};
   const profile = snapshot.profile || {};
   const graph = snapshot.graph || {};
@@ -185,8 +197,9 @@ function renderSnapshot(snapshot) {
   const entryTotal = Number(status.memory_context_entry_count ?? graph.entry_count ?? 0);
   const relationshipTotal = Number(status.memory_context_relationship_count ?? graph.relationship_count ?? 0);
   const relationshipSummary = graph.relationship_summary || {};
-  const temporalRelationships = Number(relationshipSummary.temporal ?? 0);
-  const associativeRelationships = Number(relationshipSummary.associative ?? 0);
+  const graphDeferred = Boolean(graph.deferred);
+  const temporalRelationships = graphDeferred ? null : Number(relationshipSummary.temporal ?? 0);
+  const associativeRelationships = graphDeferred ? null : Number(relationshipSummary.associative ?? 0);
   const contexts = status.memory_contexts || {};
   const contextCount = Object.keys(contexts).length;
 
@@ -217,7 +230,9 @@ function renderSnapshot(snapshot) {
   elements.toggleButton.classList.toggle("off", !enabled);
   elements.toggleButton.setAttribute("aria-pressed", String(enabled));
 
-  elements.graphSummary.textContent = `${formatNumber(temporalRelationships)} temporal / ${formatNumber(associativeRelationships)} associative`;
+  elements.graphSummary.textContent = graphDeferred
+    ? "graph loading"
+    : `${formatNumber(temporalRelationships)} temporal / ${formatNumber(associativeRelationships)} associative`;
   elements.graphNodeCount.textContent = formatNumber(entryTotal);
   elements.graphEdgeCount.textContent = formatNumber(relationshipTotal);
   elements.graphTemporalCount.textContent = formatNumber(temporalRelationships);
@@ -231,6 +246,23 @@ function renderSnapshot(snapshot) {
   renderGraph(graph, status);
   renderMemoryLedger(graph);
   renderFooter(snapshot, status, profile, contextCount);
+  renderHydrationTiming(snapshot, clientElapsedMs);
+}
+
+function withGraph(snapshot, graph) {
+  return {
+    ...snapshot,
+    graph,
+  };
+}
+
+function renderHydrationTiming(snapshot, clientElapsedMs) {
+  const timings = snapshot.timings_ms || {};
+  const serverMs = Number(timings.total);
+  const clientMs = Number(clientElapsedMs);
+  const serverText = Number.isFinite(serverMs) ? `${formatNumber(serverMs, 1)} ms api` : "-- ms api";
+  const clientText = Number.isFinite(clientMs) ? `${formatNumber(clientMs, 0)} ms ui` : "-- ms ui";
+  elements.hydrateLabel.textContent = `Hydrate: ${serverText} / ${clientText}`;
 }
 
 function renderEnvelope(profile, status) {
@@ -290,6 +322,16 @@ function renderGraph(graph, status) {
   const relationships = graph.relationships || [];
   const svg = elements.graphSvg;
   svg.replaceChildren();
+
+  if (graph.deferred) {
+    appendSvg(svg, "text", {
+      x: 380,
+      y: 208,
+      "text-anchor": "middle",
+      class: "graph-empty",
+    }, "Loading memory graph");
+    return;
+  }
 
   if (!entries.length) {
     state.graph.visibleIds = new Set();
@@ -718,6 +760,7 @@ function countEventEntries(entries) {
 }
 
 function formatNumber(value, digits = 0) {
+  if (value === null || value === undefined) return "--";
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "--";
   return numeric.toLocaleString(undefined, {
@@ -773,6 +816,17 @@ function formatClock(value) {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function nowMs() {
+  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function elapsedMs(started) {
+  return Math.max(0, nowMs() - Number(started || nowMs()));
 }
 
 function compactPath(path) {

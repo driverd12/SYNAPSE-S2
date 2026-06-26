@@ -63,6 +63,29 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["system"]["mode"], "LOCAL ONLY")
         self.assertIn("project_version", payload["system"])
         self.assertIn("uptime_seconds", payload["system"])
+        self.assertIn("timings_ms", payload)
+        self.assertGreaterEqual(payload["timings_ms"]["total"], 0)
+        for stage in ("status", "profile", "graph", "system"):
+            self.assertIn(stage, payload["timings_ms"])
+
+    def test_snapshot_can_defer_graph_for_fast_hydration(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            status, payload = self.decode(
+                runtime.handle("GET", "/api/snapshot?context_id=demo&limit=10&include_graph=false")
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["context_id"], "demo")
+        self.assertTrue(payload["graph"]["deferred"])
+        self.assertEqual(payload["graph"]["entries"], [])
+        self.assertEqual(payload["graph"]["relationships"], [])
+        self.assertEqual(payload["graph"]["entry_count"], 4)
+        self.assertGreaterEqual(payload["graph"]["relationship_count"], 1)
+        self.assertEqual(payload["timings_ms"]["graph"], 0)
+        self.assertIn("estimated_total_mb", payload["profile"])
+        self.assertEqual(payload["system"]["model_uri"], "s2://local/demo")
 
     def test_snapshot_defaults_to_neutral_context(self):
         with TemporaryDirectory() as tmp:
@@ -150,9 +173,13 @@ class DashboardRuntimeTests(unittest.TestCase):
         styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("themeButton", index)
+        self.assertIn("hydrateLabel", index)
         self.assertIn("rememberForm", index)
         self.assertIn("ingestForm", index)
         self.assertIn("dataset.theme", app)
+        self.assertIn('include_graph: "false"', app)
+        self.assertIn('"/api/graph"', app)
+        self.assertIn("graph.deferred", app)
         self.assertIn("data-theme", styles)
         self.assertIn("/api/remember", app)
         self.assertIn("/api/ingest", app)
