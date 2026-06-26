@@ -42,11 +42,20 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("invalid prompt_embedding", result)
 
     def test_query_sanitizes_context_id(self):
+        registration = json.loads(
+            mcp_server.remember_spiking_context(
+                tag="sanitized-memory",
+                context_id="../demo with spaces",
+                prompt_embedding=[0.0, 1.0, 9.0, 2.0, 7.0, -4.0],
+            )
+        )
         result = mcp_server.query_spiking_attention(
             [0.0, 1.0, 9.0, 2.0, 7.0, -4.0],
             context_id="../demo with spaces",
         )
 
+        self.assertEqual(registration["context_id"], "demo_with_spaces")
+        self.assertIn("sanitized-memory", result)
         self.assertIn("demo_with_spaces", result)
         self.assertNotIn("..", result)
 
@@ -217,6 +226,31 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(deployments["delivery_mode"], "durable-mcp-pull")
         self.assertEqual(deployments["events"][0]["payload"]["tag"], "agent-visible-memory")
         self.assertEqual(after_registration["events"], [])
+
+    def test_context_deployment_ack_tool_records_agent_cursor(self):
+        registration = json.loads(
+            mcp_server.remember_spiking_context(
+                tag="ack-visible-memory",
+                context_id="demo",
+                text="Connected agents should acknowledge this context update.",
+                metadata={"surface": "mcp"},
+            )
+        )
+
+        ack = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                last_event_id=registration["agent_deployment"]["event_id"],
+            )
+        )
+        cursors = json.loads(
+            mcp_server.list_spiking_context_cursors(context_id="demo")
+        )
+
+        self.assertEqual(ack["agent_id"], "codex-desktop")
+        self.assertEqual(ack["pending_event_count"], 0)
+        self.assertEqual(cursors["cursors"][0]["agent_id"], "codex-desktop")
 
     def test_memory_export_tool_rejects_paths_outside_export_root(self):
         result = json.loads(

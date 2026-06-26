@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture"
 LAUNCHER="/Users/dan.driver/.local/bin/synapse-s2-mcp"
-CONTEXT="${SYNAPSE_S2_PREFLIGHT_CONTEXT:-board-demo}"
+CONTEXT="${SYNAPSE_S2_PREFLIGHT_CONTEXT:-default}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 cd "$ROOT"
@@ -38,20 +38,19 @@ echo "=== unit tests ==="
 echo "=== compile check ==="
 .venv/bin/python -m py_compile event_segmenter.py memory_store.py mlx_backend.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
 
-echo "=== seed durable memory ==="
-.venv/bin/python synapse_cli.py --json seed-demo --context "$CONTEXT"
+echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json remember-text \
   --context "$CONTEXT" \
   --tag "production-memory-contract" \
-  --text "SYNAPSE-S2 stores durable real memory in a local SQLite substrate with MCP tools to list, export, backup, toggle, remember, and recall context across local clients." \
+  --text "SYNAPSE-S2 stores durable local memory in the shared .synapse_s2 SQLite substrate. Codex, Claude Desktop, Claude Code, the CLI, the dashboard, and direct FastMCP launches use the same local launcher and memory database." \
   --metadata '{"source":"prep_tomorrow","operator_ready":true}'
 .venv/bin/python synapse_cli.py --json ingest-text \
   --context "$CONTEXT" \
-  --tag "proposal-event-brief" \
-  --text "Apple Silicon MLX compiles spiking neural kernels into Metal for local recall. Sparse top-k spike populations reduce context pressure and keep associative traces on-device. Procurement reviews supplier budget exposure, renewal timing, and contract risk. Operators need graph relationships that connect technical runtime evidence to tomorrow morning approval actions." \
+  --tag "production-preflight-brief" \
+  --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients can pull and acknowledge with delivery cursors." \
   --surprise-threshold 0.58 \
   --min-segment-sentences 1 \
-  --metadata '{"source":"prep_tomorrow","event_graph":true}'
+  --metadata '{"source":"prep_tomorrow","event_graph":true,"factual_preflight":true}'
 .venv/bin/python synapse_cli.py --json graph --context "$CONTEXT" --limit 10
 .venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
 
@@ -89,6 +88,25 @@ echo "=== mcp context deployment smoke ==="
 .venv/bin/fastmcp call --command "$LAUNCHER" \
   --target pull_spiking_context_deployments \
   --input-json "{\"context_id\":\"$CONTEXT\",\"since_event_id\":0,\"limit\":5}" \
+  --json --timeout 15
+
+echo "=== mcp context deployment ack smoke ==="
+LATEST_EVENT_ID="$(
+  CONTEXT="$CONTEXT" \
+  .venv/bin/python - <<'PY'
+import os
+import mlx_backend
+context = os.environ.get("CONTEXT", "default")
+print(mlx_backend.get_status(context_id=context).get("context_bus_latest_event_id", 0))
+PY
+)"
+.venv/bin/fastmcp call --command "$LAUNCHER" \
+  --target ack_spiking_context_deployments \
+  --input-json "{\"context_id\":\"$CONTEXT\",\"agent_id\":\"prep-tomorrow\",\"last_event_id\":$LATEST_EVENT_ID}" \
+  --json --timeout 15
+.venv/bin/fastmcp call --command "$LAUNCHER" \
+  --target list_spiking_context_cursors \
+  --input-json "{\"context_id\":\"$CONTEXT\",\"limit\":5}" \
   --json --timeout 15
 
 echo "=== dashboard smoke ==="

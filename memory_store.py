@@ -70,6 +70,17 @@ CREATE TABLE IF NOT EXISTS agent_context_events (
 CREATE INDEX IF NOT EXISTS ix_agent_context_events_context_event
 ON agent_context_events(context_id, event_id);
 
+CREATE TABLE IF NOT EXISTS agent_context_cursors (
+    context_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (context_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_agent_context_cursors_context
+ON agent_context_cursors(context_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS memory_relationships (
     relationship_id TEXT PRIMARY KEY,
     context_id TEXT NOT NULL,
@@ -590,6 +601,131 @@ class DurableMemoryStore:
             LOGGER.exception("failed to list context events")
             raise
 
+    def ack_context_events(
+        self,
+        *,
+        context_id: str,
+        agent_id: str,
+        last_event_id: int,
+    ) -> dict[str, Any]:
+        context = str(context_id)
+        agent = str(agent_id or "").strip() or "unknown-agent"
+        requested_event_id = max(0, int(last_event_id))
+        try:
+            with closing(self._connect()) as conn:
+                latest_event_id = int(
+                    conn.execute(
+                        """
+                        SELECT COALESCE(MAX(event_id), 0)
+                        FROM agent_context_events
+                        WHERE context_id = ?
+                        """,
+                        (context,),
+                    ).fetchone()[0]
+                    or 0
+                )
+                bounded_event_id = min(requested_event_id, latest_event_id)
+                now = time.time()
+                conn.execute(
+                    """
+                    INSERT INTO agent_context_cursors (
+                        context_id,
+                        agent_id,
+                        last_event_id,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(context_id, agent_id) DO UPDATE SET
+                        last_event_id = MAX(
+                            agent_context_cursors.last_event_id,
+                            excluded.last_event_id
+                        ),
+                        updated_at = excluded.updated_at
+                    """,
+                    (context, agent, bounded_event_id, now),
+                )
+            cursors = self.list_context_cursors(
+                context_id=context,
+                agent_id=agent,
+                limit=1,
+            )
+            if not cursors:
+                raise RuntimeError(f"context cursor for {agent} was not readable after ack")
+            return cursors[0]
+        except Exception:
+            LOGGER.exception(
+                "failed to acknowledge context events context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
+            )
+            raise
+
+    def list_context_cursors(
+        self,
+        *,
+        context_id: str | None = None,
+        agent_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            clauses.append("context_id = ?")
+            params.append(str(context_id))
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(str(agent_id))
+        where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+        bounded_limit = min(max(int(limit), 1), 1000)
+        params.append(bounded_limit)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM agent_context_cursors
+                    {where_sql}
+                    ORDER BY updated_at DESC, context_id ASC, agent_id ASC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+                cursors = []
+                for row in rows:
+                    context = str(row["context_id"])
+                    latest_event_id = int(
+                        conn.execute(
+                            """
+                            SELECT COALESCE(MAX(event_id), 0)
+                            FROM agent_context_events
+                            WHERE context_id = ?
+                            """,
+                            (context,),
+                        ).fetchone()[0]
+                        or 0
+                    )
+                    pending_event_count = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM agent_context_events
+                            WHERE context_id = ? AND event_id > ?
+                            """,
+                            (context, int(row["last_event_id"])),
+                        ).fetchone()[0]
+                    )
+                    cursors.append(
+                        self._row_to_context_cursor(
+                            row,
+                            latest_event_id=latest_event_id,
+                            pending_event_count=pending_event_count,
+                        )
+                    )
+            return cursors
+        except Exception:
+            LOGGER.exception("failed to list context cursors")
+            raise
+
     def stats(self, *, context_id: str | None = None) -> dict[str, Any]:
         try:
             with closing(self._connect()) as conn:
@@ -606,6 +742,9 @@ class DurableMemoryStore:
                     latest_context_event_row = conn.execute(
                         "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
                     ).fetchone()
+                    context_bus_ack_cursor_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_cursors"
+                    ).fetchone()[0]
                 else:
                     entry_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_entries WHERE context_id = ?",
@@ -623,6 +762,10 @@ class DurableMemoryStore:
                         "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events WHERE context_id = ?",
                         (context_id,),
                     ).fetchone()
+                    context_bus_ack_cursor_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_cursors WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
                 event_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
                 context_rows = conn.execute(
                     """
@@ -639,6 +782,7 @@ class DurableMemoryStore:
                 "relationship_count": int(relationship_count),
                 "context_bus_event_count": int(context_bus_event_count),
                 "context_bus_latest_event_id": int(latest_context_event_row[0] or 0),
+                "context_bus_ack_cursor_count": int(context_bus_ack_cursor_count),
                 "contexts": {str(row["context_id"]): int(row["count"]) for row in context_rows},
             }
         except Exception:
@@ -664,6 +808,10 @@ class DurableMemoryStore:
                 limit=limit,
             ),
             "context_events": self.list_context_events(
+                context_id=context_id,
+                limit=limit,
+            ),
+            "context_cursors": self.list_context_cursors(
                 context_id=context_id,
                 limit=limit,
             ),
@@ -751,4 +899,22 @@ class DurableMemoryStore:
                 for value in _decode_json(str(row["agent_targets_json"]), [])
             ],
             "created_at": float(row["created_at"]),
+        }
+
+    def _row_to_context_cursor(
+        self,
+        row: sqlite3.Row,
+        *,
+        latest_event_id: int,
+        pending_event_count: int,
+    ) -> dict[str, Any]:
+        last_event_id = int(row["last_event_id"])
+        return {
+            "context_id": str(row["context_id"]),
+            "agent_id": str(row["agent_id"]),
+            "last_event_id": last_event_id,
+            "latest_event_id": int(latest_event_id),
+            "pending_event_count": int(pending_event_count),
+            "caught_up": int(pending_event_count) == 0,
+            "updated_at": float(row["updated_at"]),
         }

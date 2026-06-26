@@ -9,7 +9,7 @@ cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local 
 scripts/prep_tomorrow.sh
 ```
 
-The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, seeds the `board-demo` memory context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
+The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
 To refresh local client registration directly:
 
@@ -37,10 +37,10 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | :--- | :--- | :--- |
 | `dependencies_importable` | `mlx.core`, `mlxsnn`, `fastmcp`, or `mcp` is not importable. | Run `uv sync`. |
 | `launcher_executable` | `/Users/dan.driver/.local/bin/synapse-s2-mcp` is missing or not executable. | Run `scripts/install_local_launcher.sh`. |
-| `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Run `synapse_cli.py --json seed-demo --context board-demo`. |
+| `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Capture a real trace with `synapse_cli.py --json remember-text --context default --tag <tag> --text <text>`. |
 | `relationship_minimum_met` | The selected context has too few persisted event relationships for the requested gate. | Run the event graph ingestion command below. |
 | `resource_envelope_met` | The default topology is outside the configured 61-138 MB estimated resource envelope. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then adjust `SYNAPSE_S2_NEURONS` or topology CLI args. |
-| `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context board-demo`. |
+| `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context default`. |
 | `query_returned_context` | Recall did not return a registered context. | Seed or remember a matching trace, then query again. |
 
 ## Operator commands
@@ -48,26 +48,26 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 Status:
 
 ```bash
-.venv/bin/python synapse_cli.py --json status --context board-demo
+.venv/bin/python synapse_cli.py --json status --context default
 ```
 
 Compact memory list:
 
 ```bash
-.venv/bin/python synapse_cli.py --json list-memory --context board-demo --limit 10
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 10
 ```
 
 Full vector details, only when needed:
 
 ```bash
-.venv/bin/python synapse_cli.py --json list-memory --context board-demo --limit 2 --include-vectors
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 2 --include-vectors
 ```
 
 Recall smoke:
 
 ```bash
 .venv/bin/python synapse_cli.py --json query-text \
-  --context board-demo \
+  --context default \
   --text "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients"
 ```
 
@@ -75,15 +75,24 @@ Event graph ingestion:
 
 ```bash
 .venv/bin/python synapse_cli.py --json ingest-text \
-  --context board-demo \
-  --tag proposal-event-brief \
-  --text "Apple Silicon MLX compiles spiking neural kernels into Metal for local recall. Sparse top-k spike populations reduce context pressure and keep associative traces on-device. Procurement reviews supplier budget exposure, renewal timing, and contract risk. Operators need graph relationships that connect technical runtime evidence to tomorrow morning approval actions." \
+  --context default \
+  --tag production-preflight-brief \
+  --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients can pull and acknowledge with delivery cursors." \
   --surprise-threshold 0.58 \
   --min-segment-sentences 1
-.venv/bin/python synapse_cli.py --json graph --context board-demo --limit 10
+.venv/bin/python synapse_cli.py --json graph --context default --limit 10
 ```
 
-The graph output should show event tags like `proposal-event-brief-event-001` and at least one `temporal_next` relationship.
+The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship.
+
+Context-bus receipts:
+
+```bash
+.venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 10
+LATEST_EVENT_ID=$(.venv/bin/python synapse_cli.py --json status --context default | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["context_bus_latest_event_id"])')
+.venv/bin/python synapse_cli.py --json ack-context --context default --agent-id cli-operator --last-event-id "$LATEST_EVENT_ID"
+.venv/bin/python synapse_cli.py --json list-context-cursors --context default
+```
 
 Resource envelope:
 
@@ -143,6 +152,8 @@ Useful tool calls:
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
 | `pull_spiking_context_deployments` | Pulls context-bus events published by GUI and MCP write actions. |
+| `ack_spiking_context_deployments` | Records the last deployment event consumed by a local client. |
+| `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
 | `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |

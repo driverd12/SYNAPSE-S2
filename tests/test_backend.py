@@ -40,7 +40,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertEqual(sum(spikes.tolist()), 3.0)
 
-    def test_query_returns_context_tags_and_tracks_state(self):
+    def test_query_without_registered_memory_reports_raw_activation_not_fake_tags(self):
         backend = SpikingAttentionBackend(
             dimension=6,
             num_neurons=10,
@@ -52,8 +52,10 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         result = backend.query(mx.array([0.0, 1.0, 9.0, 2.0, 7.0, -4.0]), context_id="demo")
 
-        self.assertIn("demo::neuron-", result)
-        self.assertGreater(len(backend.memory_mapping), 0)
+        self.assertIn("No registered historical context matched", result)
+        self.assertIn("raw_activation_top_neurons=", result)
+        self.assertNotIn("demo::neuron-", result)
+        self.assertEqual(len(backend.memory_mapping), 0)
 
     def test_register_trace_returns_named_tag_from_query(self):
         backend = SpikingAttentionBackend(
@@ -265,7 +267,8 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertFalse(disabled["global_enabled"])
         self.assertIn("disabled", disabled_query.lower())
         self.assertTrue(enabled["global_enabled"])
-        self.assertIn("demo::neuron-", enabled_query)
+        self.assertIn("No registered historical context matched", enabled_query)
+        self.assertNotIn("demo::neuron-", enabled_query)
 
     def test_context_toggle_overrides_global_state(self):
         backend = SpikingAttentionBackend(
@@ -290,7 +293,8 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
 
         self.assertIn("disabled", quiet_query.lower())
-        self.assertIn("active-demo::neuron-", active_query)
+        self.assertIn("No registered historical context matched", active_query)
+        self.assertNotIn("active-demo::neuron-", active_query)
 
     def test_toggle_state_persists_to_state_file(self):
         with TemporaryDirectory() as tmp:
@@ -430,6 +434,46 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(status["context_bus_context_event_count"], 1)
         self.assertEqual(status["context_bus_latest_event_id"], event["event_id"])
 
+    def test_backend_tracks_context_event_delivery_receipts_by_agent(self):
+        backend = SpikingAttentionBackend(
+            dimension=6,
+            num_neurons=10,
+            default_top_k=2,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        first = backend.publish_context_event(
+            context_id="demo",
+            source_surface="unit-test",
+            event_type="remember-trace",
+            summary="first deployed",
+            payload={"tag": "first"},
+        )
+        second = backend.publish_context_event(
+            context_id="demo",
+            source_surface="unit-test",
+            event_type="ingest-events",
+            summary="second deployed",
+            payload={"tag": "second"},
+        )
+
+        ack = backend.ack_context_events(
+            context_id="demo",
+            agent_id="codex-desktop",
+            last_event_id=first["event_id"],
+        )
+        cursors = backend.list_context_cursors(context_id="demo")
+        status = backend.status(context_id="demo")
+
+        self.assertEqual(ack["agent_id"], "codex-desktop")
+        self.assertEqual(ack["last_event_id"], first["event_id"])
+        self.assertEqual(ack["latest_event_id"], second["event_id"])
+        self.assertEqual(ack["pending_event_count"], 1)
+        self.assertEqual(cursors["cursor_count"], 1)
+        self.assertEqual(cursors["cursors"][0]["agent_id"], "codex-desktop")
+        self.assertEqual(status["context_bus_ack_cursor_count"], 1)
+
     def test_quick_pruning_decays_weights_and_resets_membrane(self):
         backend = SpikingAttentionBackend(
             dimension=4,
@@ -483,7 +527,8 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         result = backend.query(mx.array([0.0, 2.0, 7.0, -1.0]), context_id="demo")
 
-        self.assertIn("demo::neuron-", result)
+        self.assertIn("No registered historical context matched", result)
+        self.assertNotIn("demo::neuron-", result)
         self.assertEqual(backend.quick_pruning_count, 1)
         self.assertEqual(backend.last_maintenance["mode"], "quick-pruning")
         self.assertEqual(backend.last_maintenance["trigger"], "auto:query")

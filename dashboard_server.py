@@ -131,6 +131,15 @@ class DashboardRuntime:
                     limit=limit,
                 )
             )
+        if method == "GET" and path == "/api/context-cursors":
+            context = self._context_from_params(params)
+            limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
+            return self._json_response(
+                self.backend.list_context_cursors(
+                    context_id=context,
+                    limit=limit,
+                )
+            )
         if method == "GET" and path == "/api/snapshot":
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
@@ -230,6 +239,24 @@ class DashboardRuntime:
                 },
             )
             return self._json_response(ingestion)
+        if method == "POST" and path == "/api/context-ack":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            agent_id = mlx_backend.sanitize_agent_id(str(payload.get("agent_id", "")))
+            try:
+                last_event_id = int(payload.get("last_event_id", 0))
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "last_event_id must be an integer",
+                ) from exc
+            return self._json_response(
+                self.backend.ack_context_events(
+                    context_id=context,
+                    agent_id=agent_id,
+                    last_event_id=max(0, last_event_id),
+                )
+            )
         if method == "POST" and path == "/api/quick-prune":
             return self._json_response(self.backend.run_quick_pruning(trigger="dashboard"))
         if method == "POST" and path == "/api/sleep":

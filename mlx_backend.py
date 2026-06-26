@@ -45,6 +45,7 @@ LOGGER.propagate = False
 MAX_EMBEDDING_DIMS = 32_768
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 TAG_RE = re.compile(r"[^A-Za-z0-9_.: /#-]+")
+AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
 CONSOLIDATION_PHASES = (
     "connection-weight-decay",
     "synaptic-clustering",
@@ -86,6 +87,12 @@ def sanitize_tag(tag: str) -> str:
     raw = str(tag or "").strip()
     cleaned = TAG_RE.sub("_", raw).strip()
     return (cleaned or "untagged-trace")[:200]
+
+
+def sanitize_agent_id(agent_id: str) -> str:
+    raw = str(agent_id or "").strip()
+    cleaned = AGENT_ID_RE.sub("_", raw).strip("._-:@")
+    return (cleaned or "unknown-agent")[:128]
 
 
 def _array_to_int_list(array: Any) -> list[int]:
@@ -646,7 +653,7 @@ class SpikingAttentionBackend:
             active_indices = self._recall_indices(firing_signature, sensory_spikes)
             tags = self._tags_for_indices(active_indices, context)
             if not tags:
-                return "No high-salience spiking patterns registered. Fallback context active."
+                return self._raw_activation_summary(active_indices)
             return " / ".join(tags)
         except Exception:
             LOGGER.exception("query failed for context_id=%s", context)
@@ -773,11 +780,18 @@ class SpikingAttentionBackend:
         tags: list[str] = []
         for idx in active_indices[: self.recall_count]:
             tag = self.memory_mapping.get(idx)
-            if tag is None:
-                tag = f"{context}::neuron-{idx:06d}"
-                self.memory_mapping[idx] = tag
-            tags.append(tag)
+            if tag is not None:
+                tags.append(tag)
         return tags
+
+    def _raw_activation_summary(self, active_indices: list[int]) -> str:
+        if not active_indices:
+            return "No registered historical context matched. raw_activation_top_neurons=[]"
+        raw = ",".join(f"{idx:06d}" for idx in active_indices[: self.recall_count])
+        return (
+            "No registered historical context matched. "
+            f"raw_activation_top_neurons=[{raw}]"
+        )
 
     def is_enabled(self, context_id: str = "default") -> bool:
         context = sanitize_context_id(context_id)
@@ -824,6 +838,9 @@ class SpikingAttentionBackend:
             "context_bus_event_count": int(total_stats["context_bus_event_count"]),
             "context_bus_context_event_count": int(context_stats["context_bus_event_count"]),
             "context_bus_latest_event_id": int(context_stats["context_bus_latest_event_id"]),
+            "context_bus_ack_cursor_count": int(
+                context_stats["context_bus_ack_cursor_count"]
+            ),
             "context_bus_delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
             "context_bus_agent_targets": list(DEFAULT_AGENT_TARGETS),
             "semantic_group_count": len(self.semantic_hierarchy),
@@ -924,6 +941,55 @@ class SpikingAttentionBackend:
             "since_event_id": max(0, int(since_event_id)),
             "event_count": len(events),
             "events": [self._decorate_context_event(event) for event in events],
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def ack_context_events(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        last_event_id: int = 0,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        try:
+            cursor = self.memory_store.ack_context_events(
+                context_id=context,
+                agent_id=agent,
+                last_event_id=max(0, int(last_event_id)),
+            )
+            self._mark_activity()
+            return self._decorate_context_cursor(cursor)
+        except Exception:
+            LOGGER.exception(
+                "context event ack failed for context_id=%s agent_id=%s",
+                context,
+                agent,
+            )
+            raise
+
+    def list_context_cursors(
+        self,
+        *,
+        context_id: str = "default",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        bounded_limit = min(max(int(limit), 1), 500)
+        cursors = self.memory_store.list_context_cursors(
+            context_id=context,
+            limit=bounded_limit,
+        )
+        latest_event_id = int(self.memory_store.stats(context_id=context)[
+            "context_bus_latest_event_id"
+        ])
+        return {
+            "context_id": context,
+            "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "latest_event_id": latest_event_id,
+            "cursor_count": len(cursors),
+            "cursors": [self._decorate_context_cursor(cursor) for cursor in cursors],
             "memory_db_path": str(self.memory_store.db_path),
         }
 
@@ -1192,6 +1258,13 @@ class SpikingAttentionBackend:
             "target_count": len(targets),
             "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
             "published": True,
+        }
+
+    def _decorate_context_cursor(self, cursor: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **cursor,
+            "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "acknowledged": True,
         }
 
     def export_memory(
@@ -1578,6 +1651,28 @@ def list_context_events(
     return get_backend().list_context_events(
         context_id=context_id,
         since_event_id=since_event_id,
+        limit=limit,
+    )
+
+
+def ack_context_events(
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    last_event_id: int = 0,
+) -> dict[str, Any]:
+    return get_backend().ack_context_events(
+        context_id=context_id,
+        agent_id=agent_id,
+        last_event_id=last_event_id,
+    )
+
+
+def list_context_cursors(
+    context_id: str = "default",
+    limit: int = 100,
+) -> dict[str, Any]:
+    return get_backend().list_context_cursors(
+        context_id=context_id,
         limit=limit,
     )
 

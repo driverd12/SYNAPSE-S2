@@ -289,18 +289,23 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
 function renderContextBus(status, deployment = null) {
   const eventCount = Number(status.context_bus_context_event_count ?? status.context_bus_event_count ?? 0);
   const latestEventId = Number(deployment?.event_id ?? status.context_bus_latest_event_id ?? 0);
+  const receiptCount = Number(status.context_bus_ack_cursor_count ?? 0);
   const targets = Array.isArray(deployment?.agent_targets)
     ? deployment.agent_targets
     : Array.isArray(status.context_bus_agent_targets)
       ? status.context_bus_agent_targets
       : ["mcp-clients"];
   const targetText = targets.length ? targets.join(", ") : "mcp-clients";
+  const ack = deployment?.ack;
+  const receiptText = ack
+    ? `${ack.agent_id || "agent"} acknowledged #${formatNumber(ack.last_event_id)}`
+    : `${formatNumber(receiptCount)} delivery receipts`;
   const stateText = deployment
     ? `Published event #${formatNumber(latestEventId)}`
     : `${formatNumber(eventCount)} published context updates`;
   const detailText = deployment
-    ? `${deployment.event_type || "context-update"} via ${deployment.delivery_mode || "durable-mcp-pull"} to ${targetText}`
-    : `Ready for Remember/Ingest handoffs via ${status.context_bus_delivery_mode || "durable-mcp-pull"}`;
+    ? `${deployment.event_type || "context-update"} via ${deployment.delivery_mode || "durable-mcp-pull"} to ${targetText}; ${receiptText}`
+    : `Ready for Remember/Ingest handoffs via ${status.context_bus_delivery_mode || "durable-mcp-pull"}; ${receiptText}`;
   elements.contextBusState.innerHTML = `
     <strong>${escapeHtml(stateText)}</strong>
     <span>${escapeHtml(detailText)}</span>
@@ -1081,6 +1086,17 @@ async function pullContextDeployments(sinceEventId = 0, limit = 10) {
   });
 }
 
+async function ackContextDeployment(lastEventId, agentId = "dashboard-ui") {
+  return requestJson("/api/context-ack", {
+    method: "POST",
+    body: {
+      context_id: state.context,
+      agent_id: agentId,
+      last_event_id: Math.max(0, Math.trunc(Number(lastEventId) || 0)),
+    },
+  });
+}
+
 async function withBusy(button, label, task, options = { refresh: true }) {
   const originalDisabled = button.disabled;
   button.disabled = true;
@@ -1088,7 +1104,10 @@ async function withBusy(button, label, task, options = { refresh: true }) {
     const payload = await task();
     logOperation(label, payload);
     if (payload?.agent_deployment) {
-      renderContextBus(state.snapshot?.status || {}, payload.agent_deployment);
+      renderContextBus(state.snapshot?.status || {}, {
+        ...payload.agent_deployment,
+        ack: payload.context_ack || null,
+      });
     }
     if (options.refresh) {
       await refreshSnapshot();
@@ -1240,6 +1259,9 @@ elements.rememberForm.addEventListener("submit", async (event) => {
         payload.agent_deployment.event_id - 1,
         5,
       );
+      payload.context_ack = await ackContextDeployment(
+        payload.agent_deployment.event_id,
+      );
     }
     elements.rememberText.value = "";
     return payload;
@@ -1272,6 +1294,9 @@ elements.ingestForm.addEventListener("submit", async (event) => {
       payload.context_bus = await pullContextDeployments(
         payload.agent_deployment.event_id - 1,
         5,
+      );
+      payload.context_ack = await ackContextDeployment(
+        payload.agent_deployment.event_id,
       );
     }
     elements.ingestText.value = "";

@@ -36,6 +36,29 @@ class SynapseCliTests(unittest.TestCase):
             check=False,
         )
 
+    def test_cli_does_not_expose_seed_demo_command(self):
+        help_result = subprocess.run(
+            [sys.executable, str(ROOT / "synapse_cli.py"), "--help"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        invalid_result = subprocess.run(
+            [sys.executable, str(ROOT / "synapse_cli.py"), "seed-demo"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertNotIn("seed-demo", help_result.stdout)
+        self.assertNotEqual(invalid_result.returncode, 0)
+        self.assertIn("invalid choice", invalid_result.stderr)
+
     def test_cli_remembers_queries_and_toggles_text_context(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
@@ -226,6 +249,57 @@ class SynapseCliTests(unittest.TestCase):
             graph_payload["relationships"][0]["relation_type"],
             "temporal_next",
         )
+
+    def test_cli_publishes_and_acknowledges_context_deployments(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+
+            remember = self.run_cli(
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-published-memory",
+                "--text",
+                "CLI writes should publish durable context deployments.",
+                state_path=state_path,
+            )
+            event_id = json.loads(remember.stdout)["agent_deployment"]["event_id"]
+            pull = self.run_cli(
+                "pull-context",
+                "--context",
+                "demo",
+                "--since-event-id",
+                "0",
+                state_path=state_path,
+            )
+            ack = self.run_cli(
+                "ack-context",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-test",
+                "--last-event-id",
+                str(event_id),
+                state_path=state_path,
+            )
+            cursors = self.run_cli(
+                "list-context-cursors",
+                "--context",
+                "demo",
+                state_path=state_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(pull.returncode, 0, pull.stderr)
+        self.assertEqual(ack.returncode, 0, ack.stderr)
+        self.assertEqual(cursors.returncode, 0, cursors.stderr)
+        self.assertEqual(
+            json.loads(pull.stdout)["events"][0]["payload"]["tag"],
+            "cli-published-memory",
+        )
+        self.assertEqual(json.loads(ack.stdout)["agent_id"], "cli-test")
+        self.assertEqual(json.loads(cursors.stdout)["cursors"][0]["agent_id"], "cli-test")
 
     def test_cli_list_memory_can_include_vector_details_when_requested(self):
         with TemporaryDirectory() as tmp:

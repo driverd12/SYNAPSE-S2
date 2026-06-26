@@ -94,23 +94,50 @@ def command_disable(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_remember_text(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
-    return backend.register_trace(
+    registration = backend.register_trace(
         tag=args.tag,
         embedding=backend.embed_text(args.text),
         context_id=args.context,
         metadata=parse_metadata(args.metadata),
         source_text=args.text,
     )
+    registration["agent_deployment"] = _publish_cli_deployment(
+        backend,
+        context_id=args.context,
+        event_type="remember-trace",
+        summary=f"{registration['tag']} captured and published",
+        payload={
+            "tag": registration["tag"],
+            "memory_id": registration["memory_id"],
+            "source_text": args.text,
+            "spike_count": registration["spike_count"],
+            "neuron_count": registration["neuron_count"],
+        },
+    )
+    return registration
 
 
 def command_remember_vector(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
-    return backend.register_trace(
+    registration = backend.register_trace(
         tag=args.tag,
         embedding=parse_vector(args.vector),
         context_id=args.context,
         metadata=parse_metadata(args.metadata),
     )
+    registration["agent_deployment"] = _publish_cli_deployment(
+        backend,
+        context_id=args.context,
+        event_type="remember-trace",
+        summary=f"{registration['tag']} captured and published",
+        payload={
+            "tag": registration["tag"],
+            "memory_id": registration["memory_id"],
+            "spike_count": registration["spike_count"],
+            "neuron_count": registration["neuron_count"],
+        },
+    )
+    return registration
 
 
 def command_query_text(args: argparse.Namespace) -> dict[str, Any]:
@@ -140,7 +167,7 @@ def command_ingest_text(args: argparse.Namespace) -> dict[str, Any]:
     text = _text_from_args(args).strip()
     if not text:
         raise ValueError("--text or --text-file must provide content")
-    return backend.ingest_text_events(
+    ingestion = backend.ingest_text_events(
         text=text,
         context_id=args.context,
         source_tag=args.tag,
@@ -148,11 +175,70 @@ def command_ingest_text(args: argparse.Namespace) -> dict[str, Any]:
         min_segment_sentences=args.min_segment_sentences,
         metadata=parse_metadata(args.metadata),
     )
+    ingestion["agent_deployment"] = _publish_cli_deployment(
+        backend,
+        context_id=args.context,
+        event_type="ingest-events",
+        summary=(
+            f"{ingestion['source_tag']} published "
+            f"{ingestion['event_count']} event traces"
+        ),
+        payload={
+            "source_tag": ingestion["source_tag"],
+            "sequence_id": ingestion["sequence_id"],
+            "source_text": text,
+            "event_count": ingestion["event_count"],
+            "relationship_count": ingestion["relationship_count"],
+            "events": ingestion["events"],
+            "relationships": ingestion["relationships"],
+        },
+    )
+    return ingestion
 
 
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.list_memory_graph(context_id=args.context, limit=args.limit)
+
+
+def _publish_cli_deployment(
+    backend: mlx_backend.SpikingAttentionBackend,
+    *,
+    context_id: str,
+    event_type: str,
+    summary: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return backend.publish_context_event(
+        context_id=context_id,
+        source_surface="cli",
+        event_type=event_type,
+        summary=summary,
+        payload=payload,
+    )
+
+
+def command_pull_context(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_context_events(
+        context_id=args.context,
+        since_event_id=args.since_event_id,
+        limit=args.limit,
+    )
+
+
+def command_ack_context(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.ack_context_events(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        last_event_id=args.last_event_id,
+    )
+
+
+def command_list_context_cursors(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_context_cursors(context_id=args.context, limit=args.limit)
 
 
 def command_profile(args: argparse.Namespace) -> dict[str, Any]:
@@ -254,7 +340,11 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         == 300.0,
     }
     if args.query_text:
-        checks["query_returned_context"] = bool(query_result) and "No high-salience" not in query_result
+        checks["query_returned_context"] = (
+            bool(query_result)
+            and "No high-salience" not in query_result
+            and "No registered historical context matched" not in query_result
+        )
         checks["query_not_disabled"] = "disabled" not in query_result.lower()
 
     failed_checks = [name for name, passed in checks.items() if not passed]
@@ -277,39 +367,6 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
             include_vectors=False,
         ),
         "query_result": query_result,
-    }
-
-
-def command_seed_demo(args: argparse.Namespace) -> dict[str, Any]:
-    backend = build_backend(args)
-    samples = [
-        (
-            "executive-briefing",
-            "SYNAPSE-S2 reduces context pressure with local spiking associative recall",
-        ),
-        (
-            "metal-runtime",
-            "Apple Silicon MLX executes immutable leaky integrate and fire state updates",
-        ),
-        (
-            "ops-toggle",
-            "Operators can enable disable inspect and prune the local MCP memory substrate",
-        ),
-    ]
-    registrations = [
-        backend.register_trace(
-            tag=tag,
-            embedding=backend.embed_text(text),
-            context_id=args.context,
-            metadata={"seed": "demo"},
-            source_text=text,
-        )
-        for tag, text in samples
-    ]
-    return {
-        "context_id": mlx_backend.sanitize_context_id(args.context),
-        "registered": registrations,
-        "status": backend.status(context_id=args.context),
     }
 
 
@@ -408,15 +465,28 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--limit", type=int, default=100)
     graph.set_defaults(func=command_graph)
 
+    pull_context = subparsers.add_parser("pull-context")
+    add_context(pull_context)
+    pull_context.add_argument("--since-event-id", type=int, default=0)
+    pull_context.add_argument("--limit", type=int, default=50)
+    pull_context.set_defaults(func=command_pull_context)
+
+    ack_context = subparsers.add_parser("ack-context")
+    add_context(ack_context)
+    ack_context.add_argument("--agent-id", required=True)
+    ack_context.add_argument("--last-event-id", type=int, required=True)
+    ack_context.set_defaults(func=command_ack_context)
+
+    list_context_cursors = subparsers.add_parser("list-context-cursors")
+    add_context(list_context_cursors)
+    list_context_cursors.add_argument("--limit", type=int, default=50)
+    list_context_cursors.set_defaults(func=command_list_context_cursors)
+
     profile = subparsers.add_parser("profile")
     profile.add_argument("--benchmark-quick-prune", action="store_true")
     profile.add_argument("--target-min-mb", type=float, default=61.0)
     profile.add_argument("--target-max-mb", type=float, default=138.0)
     profile.set_defaults(func=command_profile)
-
-    seed_demo = subparsers.add_parser("seed-demo")
-    add_context(seed_demo)
-    seed_demo.set_defaults(func=command_seed_demo)
 
     quick_prune = subparsers.add_parser("quick-prune")
     quick_prune.set_defaults(func=command_quick_prune)

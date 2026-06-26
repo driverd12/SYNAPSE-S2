@@ -27,7 +27,7 @@ The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists b
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python synapse_cli.py --json doctor --context board-demo
+.venv/bin/python synapse_cli.py --json doctor --context default
 ```
 
 For the full morning readiness path, run:
@@ -38,45 +38,58 @@ scripts/prep_tomorrow.sh
 
 The detailed operator runbook is in `docs/TOMORROW_RUNBOOK.md`.
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
+The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
 
-### 3. Seed and Query Persistent Memory
+### 3. Write and Query Persistent Memory
 
 ```bash
-.venv/bin/python synapse_cli.py --json seed-demo --context board-demo
+.venv/bin/python synapse_cli.py --json remember-text \
+  --context default \
+  --tag production-memory-contract \
+  --text "SYNAPSE-S2 stores durable local memory in the shared .synapse_s2 SQLite substrate. Codex, Claude Desktop, Claude Code, the CLI, the dashboard, and direct FastMCP launches use the same local launcher and memory database."
 .venv/bin/python synapse_cli.py --json ingest-text \
-  --context board-demo \
-  --tag proposal-event-brief \
-  --text "Apple Silicon MLX compiles spiking neural kernels into Metal for local recall. Sparse top-k spike populations reduce context pressure and keep associative traces on-device. Procurement reviews supplier budget exposure, renewal timing, and contract risk. Operators need graph relationships that connect technical runtime evidence to tomorrow morning approval actions." \
+  --context default \
+  --tag production-preflight-brief \
+  --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients can pull and acknowledge with delivery cursors." \
   --surprise-threshold 0.58 \
   --min-segment-sentences 1
 .venv/bin/python synapse_cli.py --json query-text \
-  --context board-demo \
-  --text "Apple Silicon local spiking memory can reduce context pressure for Codex and Claude"
-.venv/bin/python synapse_cli.py --json graph --context board-demo --limit 10
+  --context default \
+  --text "Which clients share the SYNAPSE-S2 memory database and launcher?"
+.venv/bin/python synapse_cli.py --json graph --context default --limit 10
 ```
 
-Expected query output returns ranked registered traces such as `ops-toggle`, `metal-runtime`, and `executive-briefing`.
-Event ingestion additionally creates segmented memories such as `proposal-event-brief-event-001` and relationship edges such as `temporal_next`.
+Expected query output returns ranked registered traces such as `production-memory-contract` and linked event traces from `production-preflight-brief`.
+Event ingestion additionally creates segmented memories such as `production-preflight-brief-event-001` and relationship edges such as `temporal_next` and `semantic_overlap`.
 
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`. Runtime toggles and client state live in `.synapse_s2/runtime_state.json`. Both `.mcp.json` and `/Users/dan.driver/.codex/config.toml` set `SYNAPSE_S2_MEMORY_DB` so Codex, Claude, and direct CLI runs target the same durable substrate. MCP export and backup paths are constrained to `.synapse_s2` by default through `SYNAPSE_S2_EXPORT_DIR`; the CLI remains available for explicit operator-chosen local paths.
 
 Inspect, export, and back up the memory store:
 
 ```bash
-.venv/bin/python synapse_cli.py --json list-memory --context board-demo --limit 20
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 20
 .venv/bin/python synapse_cli.py --json export-memory \
-  --context board-demo \
-  --output .synapse_s2/board-demo-memory-export.json
+  --context default \
+  --output .synapse_s2/default-memory-export.json
 .venv/bin/python synapse_cli.py --json backup-memory \
-  --output .synapse_s2/board-demo-memory-backup.sqlite3
+  --output .synapse_s2/default-memory-backup.sqlite3
+```
+
+Inspect and acknowledge context-bus deployments from the CLI:
+
+```bash
+.venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 10
+LATEST_EVENT_ID=$(.venv/bin/python synapse_cli.py --json status --context default | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["context_bus_latest_event_id"])')
+.venv/bin/python synapse_cli.py --json ack-context --context default --agent-id cli-operator --last-event-id "$LATEST_EVENT_ID"
+.venv/bin/python synapse_cli.py --json list-context-cursors --context default
 ```
 
 ### 4. Toggle Runtime Behavior
 
 ```bash
-.venv/bin/python synapse_cli.py --json disable --context board-demo
-.venv/bin/python synapse_cli.py --json query-text --context board-demo --text "anything"
-.venv/bin/python synapse_cli.py --json enable --context board-demo
+.venv/bin/python synapse_cli.py --json disable --context default
+.venv/bin/python synapse_cli.py --json query-text --context default --text "anything"
+.venv/bin/python synapse_cli.py --json enable --context default
 ```
 
 When disabled, queries return a disabled status instead of mutating or recalling memory.
@@ -96,6 +109,8 @@ The MCP server exposes these tools:
 | `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
 | `list_spiking_memory_graph` | List compact memory entries and relationship edges for a context. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
+| `ack_spiking_context_deployments` | Record the last context-bus event consumed by a local agent. |
+| `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
 | `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |
@@ -108,7 +123,7 @@ FastMCP smoke check:
 .venv/bin/fastmcp list --command /Users/dan.driver/.local/bin/synapse-s2-mcp --json --timeout 15
 .venv/bin/fastmcp call --command /Users/dan.driver/.local/bin/synapse-s2-mcp \
   --target get_spiking_attention_status \
-  --input-json '{"context_id":"board-demo"}' \
+  --input-json '{"context_id":"default"}' \
   --json --timeout 15
 ```
 

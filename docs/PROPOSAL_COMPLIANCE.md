@@ -32,7 +32,10 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Bayesian Surprise Event Segmenter for local text streams | Implemented as deterministic local surprise segmentation | `event_segmenter.py`, `ingest_spiking_memory_text`, `synapse_cli.py ingest-text`, `tests/test_event_segmenter.py` |
 | Dual graph memory protocol for episodic-semantic relationships | Implemented | `memory_relationships` table in `memory_store.py`, `list_spiking_memory_graph`, graph-expanded recall, deep-sleep relationship extraction |
 | Shared state across Codex/Claude/direct CLI surfaces | Implemented | `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, launcher, common `.synapse_s2/memory.sqlite3` |
+| Codex, Claude Desktop, and Claude Code client registration | Implemented | `client_config.py`, `scripts/install_client_configs.py`, `tests/test_client_config.py` |
 | Project-root state discovery through client environment | Implemented | `SYNAPSE_S2_*` envs, plus `CLAUDE_PROJECT_DIR` / `CODEX_PROJECT_DIR` fallback in `mlx_backend.py` |
+| Durable context-bus deployment to connected local agents | Implemented as pull-plus-ack protocol | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, CLI `pull-context` / `ack-context`, `agent_context_cursors` table |
+| Recall does not fabricate historical tags when memory is empty | Implemented | no-memory queries return transparent raw activation summaries instead of synthetic `context::neuron-*` memory labels |
 | Operator-visible local control surface | Implemented | `dashboard_server.py`, `web/index.html`, `web/app.js`, `web/styles.css`, `scripts/smoke_dashboard.py`, `tests/test_dashboard_server.py` |
 | Quick-pruning mode every 5 minutes | Implemented and tested | `quick_pruning_interval_seconds=300.0`, auto-prune in `query()` / `register_trace()`, `tests/test_backend.py` |
 | Quick-pruning completes under 60 ms budget as measured locally | Implemented as runtime check | `run_quick_pruning()` returns `within_60ms_budget`; unit test asserts the local path stays under budget |
@@ -55,6 +58,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
 | List/export/backup persisted memory | MCP and CLI memory commands |
 | Inspect event relationships | `list_spiking_memory_graph`, `synapse_cli.py graph` |
+| Pull and acknowledge context deployments | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, `synapse_cli.py pull-context/ack-context/list-context-cursors` |
 | Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
 | Use a local dashboard | `dashboard_server.py`, `scripts/smoke_dashboard.py` |
 | Manual quick prune | `synapse_cli.py quick-prune` |
@@ -66,6 +70,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | :--- | :--- | :--- |
 | Raw `uv run mcp_server.py` in client config | Configs point to `/Users/dan.driver/.local/bin/synapse-s2-mcp` | The workspace path contains spaces and a colon. The launcher preserves the same synced `uv` environment while avoiding client command-splitting failures. |
 | Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and safe for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
+| "Deploy to all connected agents" language | Deployment is durable local pull with per-agent acknowledgement cursors | Local desktop clients do not expose a reliable push bus. Durable pull plus receipts is auditable and survives client restarts. |
 | Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-safe 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
 | VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark | This is the right readiness signal for tomorrow. External Metal counter capture can be added later for hardware certification. |
 
@@ -77,7 +82,7 @@ These items are present in the architecture document as longer-horizon research 
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
 - Probabilistic embedding-calibrated surprise over live token streams; current implementation is deterministic, local, and lexical so it can run offline inside MCP stdio without model calls.
 - External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs.
-- Automatic Claude Desktop config installation through `fastmcp install`; the repo provides the command and working launcher, but does not mutate Claude Desktop config during tests.
+- Real-time push into already-running Codex/Claude sessions; clients must restart or reconnect and then pull the durable context-bus events.
 
 ## Current Verification Command
 

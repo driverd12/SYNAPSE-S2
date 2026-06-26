@@ -124,6 +124,12 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 since_event_id=first["event_id"],
                 limit=10,
             )
+            ack = restored.ack_context_events(
+                context_id="demo",
+                agent_id="codex-desktop",
+                last_event_id=second["event_id"],
+            )
+            cursors = restored.list_context_cursors(context_id="demo")
             stats = restored.stats(context_id="demo")
             exported = restored.export_json(export_path, context_id="demo")
 
@@ -133,9 +139,15 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertIn("codex-desktop", first["agent_targets"])
         self.assertEqual([event["event_id"] for event in events], [first["event_id"], second["event_id"]])
         self.assertEqual([event["event_id"] for event in since_first], [second["event_id"]])
+        self.assertEqual(ack["agent_id"], "codex-desktop")
+        self.assertEqual(ack["last_event_id"], second["event_id"])
+        self.assertEqual(ack["pending_event_count"], 0)
+        self.assertEqual(cursors[0]["agent_id"], "codex-desktop")
         self.assertEqual(stats["context_bus_event_count"], 2)
         self.assertEqual(stats["context_bus_latest_event_id"], second["event_id"])
+        self.assertEqual(stats["context_bus_ack_cursor_count"], 1)
         self.assertEqual(exported["context_events"][0]["summary"], "operator-note captured and published")
+        self.assertEqual(exported["context_cursors"][0]["agent_id"], "codex-desktop")
 
 
 if __name__ == "__main__":

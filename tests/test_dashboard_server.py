@@ -422,6 +422,22 @@ class DashboardRuntimeTests(unittest.TestCase):
                     f"/api/context-events?context_id=demo&since_event_id={event_id}&limit=5",
                 )
             )
+            ack_status, ack_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/context-ack",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-ui",
+                            "last_event_id": event_id,
+                        }
+                    ).encode(),
+                )
+            )
+            cursor_status, cursor_payload = self.decode(
+                runtime.handle("GET", "/api/context-cursors?context_id=demo")
+            )
 
         self.assertEqual(remember_status, 200)
         self.assertEqual(list_status, 200)
@@ -429,6 +445,11 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(list_payload["events"][-1]["payload"]["tag"], "operator-note")
         self.assertEqual(since_status, 200)
         self.assertEqual(since_payload["events"], [])
+        self.assertEqual(ack_status, 200)
+        self.assertEqual(ack_payload["agent_id"], "dashboard-ui")
+        self.assertEqual(ack_payload["pending_event_count"], 0)
+        self.assertEqual(cursor_status, 200)
+        self.assertEqual(cursor_payload["cursors"][0]["agent_id"], "dashboard-ui")
 
 
 if __name__ == "__main__":

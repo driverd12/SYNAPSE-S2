@@ -34,6 +34,7 @@ logging.basicConfig(
 
 MAX_TOOL_EMBEDDING_DIMS = 32_768
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
+AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
 
 
 class _UnavailableMCP:
@@ -67,6 +68,12 @@ def _sanitize_context_id(context_id: str) -> str:
     raw = str(context_id or "default").strip()
     cleaned = CONTEXT_ID_RE.sub("_", raw).strip("._-:")
     return (cleaned or "default")[:128]
+
+
+def _sanitize_agent_id(agent_id: str) -> str:
+    raw = str(agent_id or "").strip()
+    cleaned = AGENT_ID_RE.sub("_", raw).strip("._-:@")
+    return (cleaned or "unknown-agent")[:128]
 
 
 def _validate_embedding(prompt_embedding: list[float]) -> list[float]:
@@ -435,6 +442,56 @@ def pull_spiking_context_deployments(
     except Exception as exc:
         LOGGER.exception("context deployment pull failed for context_id=%s", context)
         return json.dumps({"error": f"context deployment pull failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def ack_spiking_context_deployments(
+    agent_id: str,
+    context_id: str = "default",
+    last_event_id: int = 0,
+) -> str:
+    """Record that a local agent consumed context-bus events through last_event_id."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.ack_context_events(
+            context_id=context,
+            agent_id=agent,
+            last_event_id=max(0, int(last_event_id)),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid context deployment ack for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid context deployment ack: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("context deployment ack failed for context_id=%s", context)
+        return json.dumps({"error": f"context deployment ack failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "List SYNAPSE-S2 Context Deployment Cursors",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_context_cursors(context_id: str = "default", limit: int = 50) -> str:
+    """List durable per-agent context-bus delivery cursors."""
+    context = _sanitize_context_id(context_id)
+    try:
+        bounded_limit = _validate_limit(limit)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.list_context_cursors(
+            context_id=context,
+            limit=bounded_limit,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid context cursor list for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid context cursor list: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("context cursor list failed for context_id=%s", context)
+        return json.dumps({"error": f"context cursor list failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool(
