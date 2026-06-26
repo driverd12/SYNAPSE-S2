@@ -14,6 +14,7 @@ This repository now includes a working local MCP server, a SQLite-backed persist
 brew install uv
 uv sync
 scripts/install_local_launcher.sh
+scripts/install_client_configs.py
 ```
 
 The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists because this checked-out workspace path contains spaces and a colon, which can break tools that split command strings or PATH entries. The launcher executes the synced virtual environment directly:
@@ -94,6 +95,7 @@ The MCP server exposes these tools:
 | `list_spiking_memory` | List persisted SQLite memory entries for a context. |
 | `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
 | `list_spiking_memory_graph` | List compact memory entries and relationship edges for a context. |
+| `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
 | `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |
@@ -110,7 +112,13 @@ FastMCP smoke check:
   --json --timeout 15
 ```
 
-Project `.mcp.json` and `/Users/dan.driver/.codex/config.toml` are configured to use the launcher directly.
+Project `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, Claude Desktop, and Claude Code can be refreshed with:
+
+```bash
+scripts/install_client_configs.py
+```
+
+The installer preserves existing client settings, writes timestamped backups before mutating existing JSON/TOML files, and points every client at `/Users/dan.driver/.local/bin/synapse-s2-mcp` plus the shared `.synapse_s2` state directory. Restart Codex, Claude Desktop, and Claude Code after running it so each client reloads its MCP server registry.
 
 ### 6. Maintenance Lifecycle
 

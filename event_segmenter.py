@@ -21,6 +21,12 @@ LOGGER.propagate = False
 
 TOKEN_RE = re.compile(r"[a-z0-9_.:/#-]+")
 SENTENCE_RE = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
+PROTECTED_SENTENCE_FRAGMENT_RE = re.compile(
+    r"\b(?:https?://|file://|s2://)[^\s]+"
+    r"|(?<![\w-])(?:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)"
+    r"(?::[0-9]+)?(?:/[A-Za-z0-9_./:%#?=&+-]+)?(?![\w-])",
+    re.IGNORECASE,
+)
 SAFE_TAG_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 STOPWORDS = {
     "a",
@@ -138,8 +144,37 @@ class BayesianSurpriseEventSegmenter:
         normalized = str(text or "").strip()
         if not normalized:
             return []
-        matches = [match.group(0).strip() for match in SENTENCE_RE.finditer(normalized)]
+        protected, replacements = self._protect_sentence_fragments(normalized)
+        matches = [
+            self._restore_sentence_fragments(match.group(0).strip(), replacements)
+            for match in SENTENCE_RE.finditer(protected)
+        ]
         return [sentence for sentence in matches if sentence]
+
+    def _protect_sentence_fragments(self, text: str) -> tuple[str, dict[str, str]]:
+        replacements: dict[str, str] = {}
+
+        def replace(match: re.Match[str]) -> str:
+            value = match.group(0)
+            suffix = ""
+            while value.endswith((".", "!")):
+                suffix = value[-1] + suffix
+                value = value[:-1]
+            if not value:
+                return match.group(0)
+            token = f"__S2_PROTECTED_{len(replacements)}__"
+            replacements[token] = value
+            return f"{token}{suffix}"
+
+        return PROTECTED_SENTENCE_FRAGMENT_RE.sub(replace, text), replacements
+
+    def _restore_sentence_fragments(
+        self, text: str, replacements: dict[str, str]
+    ) -> str:
+        restored = text
+        for token, value in replacements.items():
+            restored = restored.replace(token, value)
+        return restored
 
     def _tokens(self, text: str) -> list[str]:
         tokens: list[str] = []

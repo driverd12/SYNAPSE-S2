@@ -29,11 +29,14 @@ fi
 echo "=== install launcher ==="
 scripts/install_local_launcher.sh
 
+echo "=== install client configs ==="
+scripts/install_client_configs.py
+
 echo "=== unit tests ==="
 .venv/bin/python -m unittest discover -s tests -v
 
 echo "=== compile check ==="
-.venv/bin/python -m py_compile event_segmenter.py memory_store.py mlx_backend.py mcp_server.py synapse_cli.py dashboard_server.py scripts/smoke_dashboard.py
+.venv/bin/python -m py_compile event_segmenter.py memory_store.py mlx_backend.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
 
 echo "=== seed durable memory ==="
 .venv/bin/python synapse_cli.py --json seed-demo --context "$CONTEXT"
@@ -80,6 +83,12 @@ echo "=== mcp resource profile smoke ==="
 .venv/bin/fastmcp call --command "$LAUNCHER" \
   --target profile_spiking_resources \
   --input-json "{\"benchmark_quick_prune\":true}" \
+  --json --timeout 15
+
+echo "=== mcp context deployment smoke ==="
+.venv/bin/fastmcp call --command "$LAUNCHER" \
+  --target pull_spiking_context_deployments \
+  --input-json "{\"context_id\":\"$CONTEXT\",\"since_event_id\":0,\"limit\":5}" \
   --json --timeout 15
 
 echo "=== dashboard smoke ==="

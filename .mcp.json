@@ -1,17 +1,17 @@
 {
   "mcpServers": {
     "synapse-s2": {
-      "type": "stdio",
-      "command": "/Users/dan.driver/.local/bin/synapse-s2-mcp",
       "args": [],
+      "command": "/Users/dan.driver/.local/bin/synapse-s2-mcp",
       "env": {
-        "PYTHONPATH": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture",
         "MLX_DEVICE": "gpu",
-        "SYNAPSE_S2_STATE_PATH": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture/.synapse_s2/runtime_state.json",
+        "PYTHONPATH": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture",
+        "SYNAPSE_S2_EXPORT_DIR": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture/.synapse_s2",
         "SYNAPSE_S2_MEMORY_DB": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture/.synapse_s2/memory.sqlite3",
-        "SYNAPSE_S2_EXPORT_DIR": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture/.synapse_s2"
+        "SYNAPSE_S2_STATE_PATH": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture/.synapse_s2/runtime_state.json"
       },
-      "timeout": 30000
+      "timeout": 30000,
+      "type": "stdio"
     }
   }
 }

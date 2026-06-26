@@ -11,6 +11,15 @@ scripts/prep_tomorrow.sh
 
 The script installs or refreshes the local launcher, runs the unit suite, checks bytecode compilation, seeds the `board-demo` memory context, verifies graph ingestion, profiles the runtime resource envelope, runs CLI preflight, exercises the FastMCP launcher, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
+To refresh local client registration directly:
+
+```bash
+scripts/install_local_launcher.sh
+scripts/install_client_configs.py
+```
+
+Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions.
+
 ## Expected ready signal
 
 The CLI preflight JSON should include:
@@ -133,6 +142,7 @@ Useful tool calls:
 | `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
+| `pull_spiking_context_deployments` | Pulls context-bus events published by GUI and MCP write actions. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
 | `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |

@@ -48,6 +48,31 @@ class BayesianSurpriseEventSegmenterTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_preserves_urls_ips_and_versions_inside_sentences(self):
+        segmenter = BayesianSurpriseEventSegmenter(
+            surprise_threshold=0.50,
+            min_segment_sentences=1,
+        )
+        text = (
+            "The dashboard runs at http://127.0.0.1:8765 and uses S2 Core v2.3.1. "
+            "Restart Codex and Claude clients after MCP config updates."
+        )
+
+        segments = segmenter.segment(
+            text,
+            context_id="default",
+            source_tag="endpoint-brief",
+        )
+
+        rendered = " ".join(segment["text"] for segment in segments)
+        self.assertIn("http://127.0.0.1:8765", rendered)
+        self.assertIn("v2.3.1", rendered)
+        self.assertFalse(any(segment["text"] == "0. 0." for segment in segments))
+        self.assertEqual(
+            sum("http://127.0.0.1:8765" in segment["text"] for segment in segments),
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
