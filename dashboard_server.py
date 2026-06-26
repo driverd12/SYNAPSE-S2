@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -191,6 +192,14 @@ class DashboardRuntime:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             backup_path = export_root / f"dashboard-memory-{stamp}.sqlite3"
             return self._json_response(self.backend.backup_memory(path=backup_path))
+        if method == "POST" and path == "/api/readiness-audit":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            return self._json_response(self.readiness_audit(context_id=context))
+        if method == "POST" and path == "/api/evidence-pack":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            return self._json_response(self.evidence_pack(context_id=context))
 
         raise DashboardError(HTTPStatus.NOT_FOUND, "route not found")
 
@@ -251,6 +260,102 @@ class DashboardRuntime:
             },
             "memory_db_path": status.get("memory_db_path"),
         }
+
+    def readiness_audit(self, *, context_id: str) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        started = time.perf_counter()
+        status = self.backend.status(context_id=context)
+        profile = self.backend.resource_profile(benchmark_quick_prune=False)
+        graph = self.backend.list_memory_graph(context_id=context, limit=20)
+        prompt = self._audit_prompt(graph)
+        query_result = ""
+        if prompt:
+            query_result = self.backend.query(
+                self.backend.embed_text(prompt),
+                context_id=context,
+            )
+        target_max = float(profile.get("target_envelope_mb", {}).get("max", 138.0))
+        estimated_mb = float(profile.get("estimated_total_mb") or 0.0)
+        checks = {
+            "runtime_ready": bool(status.get("effective_enabled"))
+            and str(status.get("runtime", "")).lower() == "ready",
+            "mlx_ready": bool(status.get("mlx_available")),
+            "mlxsnn_ready": bool(status.get("mlxsnn_available")),
+            "memory_ready": int(status.get("memory_context_entry_count") or 0) > 0,
+            "graph_ready": int(graph.get("relationship_count") or 0) > 0,
+            "resource_ceiling_ok": estimated_mb <= target_max,
+            "query_ready": bool(query_result) and "disabled" not in query_result.lower(),
+        }
+        failed_checks = [name for name, passed in checks.items() if not passed]
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+        return {
+            "action": "readiness-audit",
+            "audit_id": f"audit_{time.strftime('%Y%m%d_%H%M%S')}_{context}",
+            "context_id": context,
+            "ready": not failed_checks,
+            "checks": checks,
+            "failed_checks": failed_checks,
+            "elapsed_ms": elapsed_ms,
+            "query_prompt": prompt,
+            "query_result": query_result,
+            "graph_summary": graph.get("relationship_summary", {}),
+            "status_summary": {
+                "runtime": status.get("runtime"),
+                "effective_enabled": status.get("effective_enabled"),
+                "memory_context_entry_count": status.get("memory_context_entry_count"),
+                "memory_context_relationship_count": status.get(
+                    "memory_context_relationship_count"
+                ),
+                "quick_pruning_interval_seconds": status.get(
+                    "quick_pruning_interval_seconds"
+                ),
+            },
+            "resource_summary": {
+                "estimated_total_mb": profile.get("estimated_total_mb"),
+                "target_envelope_mb": profile.get("target_envelope_mb"),
+                "mlx_device": profile.get("mlx_device"),
+                "mlxsnn_lif_execution_path": profile.get("mlxsnn_lif_execution_path"),
+            },
+        }
+
+    def evidence_pack(self, *, context_id: str) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        export_root = self._export_root()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        report_path = export_root / f"evidence-pack-{context}-{stamp}.json"
+        backup_path = export_root / f"evidence-memory-{context}-{stamp}.sqlite3"
+        snapshot = self.snapshot(context_id=context, limit=250, include_graph=True)
+        audit = self.readiness_audit(context_id=context)
+        backup = self.backend.backup_memory(path=backup_path)
+        payload: dict[str, Any] = {
+            "action": "evidence-pack",
+            "context_id": context,
+            "created_at": time.time(),
+            "report_path": str(report_path),
+            "snapshot": snapshot,
+            "readiness_audit": audit,
+            "backup": backup,
+        }
+        digest_body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload["sha256"] = hashlib.sha256(digest_body).hexdigest()
+        report_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        return payload
+
+    def _audit_prompt(self, graph: dict[str, Any]) -> str:
+        entries = graph.get("entries", [])
+        for entry in entries:
+            if not entry.get("metadata", {}).get("event_segment"):
+                text = str(entry.get("source_text") or entry.get("tag") or "").strip()
+                if text:
+                    return text
+        for entry in entries:
+            text = str(entry.get("source_text") or entry.get("tag") or "").strip()
+            if text:
+                return text
+        return "SYNAPSE-S2 local memory readiness"
 
     def _system_info(self, *, context_id: str) -> dict[str, Any]:
         if self._system_info_cache is None:

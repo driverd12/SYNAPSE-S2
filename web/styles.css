@@ -119,6 +119,7 @@ dd {
   display: grid;
   grid-template-columns: 186px minmax(0, 1fr);
   grid-template-rows: 76px minmax(0, 1fr) 54px;
+  height: 100vh;
   min-height: 100vh;
 }
 
@@ -624,6 +625,48 @@ textarea {
 
 .good {
   color: var(--green);
+}
+
+.runtime-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.runtime-health-grid div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.runtime-health-grid span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 820;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.runtime-health-grid strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 820;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-health-grid small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .runtime-footer {
@@ -1292,7 +1335,7 @@ textarea {
 .bottom-bar {
   display: grid;
   grid-column: 1 / -1;
-  grid-template-columns: 145px 1fr 1fr 1fr 190px;
+  grid-template-columns: minmax(480px, 2.3fr) 145px 1fr 1fr 1fr 190px;
   align-items: center;
   border-top: 1px solid var(--border);
   background: var(--shell);
@@ -1328,6 +1371,33 @@ textarea {
   white-space: nowrap;
 }
 
+.operator-guide {
+  align-items: center;
+  gap: 12px;
+}
+
+.operator-guide small {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.operator-guide small span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  padding: 0 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
 @media (max-width: 1280px) {
   body {
     overflow: auto;
@@ -1336,6 +1406,7 @@ textarea {
   .app-shell {
     grid-template-columns: 1fr;
     grid-template-rows: auto auto auto auto;
+    height: auto;
   }
 
   .app-topbar {
@@ -1414,6 +1485,10 @@ textarea {
     border-top: 1px solid var(--row);
   }
 
+  .runtime-health-grid {
+    grid-template-columns: 1fr;
+  }
+
   .resource-stats div:first-child {
     border-top: 0;
   }
@@ -1442,5 +1517,16 @@ textarea {
     min-height: 44px;
     border-left: 0;
     border-top: 1px solid var(--border);
+  }
+
+  .operator-guide {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+    padding-block: 10px;
+  }
+
+  .operator-guide small {
+    flex-wrap: wrap;
   }
 }

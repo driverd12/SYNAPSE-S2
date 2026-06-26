@@ -16,6 +16,10 @@ const state = {
     visibleIds: new Set(),
     interaction: null,
   },
+  nav: {
+    lockedSection: null,
+    lockUntilMs: 0,
+  },
 };
 
 const elements = collectElements([
@@ -35,6 +39,7 @@ const elements = collectElements([
   "envelopeFill",
   "envelopeMarker",
   "envelopeState",
+  "evidencePackButton",
   "footerContexts",
   "footerGpu",
   "footerHealth",
@@ -87,7 +92,16 @@ const elements = collectElements([
   "resourceMb",
   "resultCount",
   "routerState",
+  "readinessAuditButton",
+  "runtimeContextGraph",
+  "runtimeContextMemory",
   "runtimeDetail",
+  "runtimeDevice",
+  "runtimeDeviceDetail",
+  "runtimeGraphDetail",
+  "runtimeGraphMode",
+  "runtimeMaintenance",
+  "runtimeMaintenanceDetail",
   "sidebarStatus",
   "sleepButton",
   "themeButton",
@@ -103,6 +117,7 @@ elements.contextInput.value = state.context;
 elements.endpointLabel.textContent = window.location.host || "127.0.0.1:8765";
 applyTheme(loadTheme());
 initializeGraphInteractions();
+initializeSectionNavigation();
 
 function collectElements(ids) {
   return Object.fromEntries(ids.map((id) => [id, requiredElement(id)]));
@@ -224,6 +239,14 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   elements.apiState.className = "good";
   elements.runtimeDetail.textContent = `MLX ${status.mlx_available ? "ready" : "missing"} / mlxsnn ${status.mlxsnn_available ? "ready" : "missing"} / ${profile.mlxsnn_lif_execution_path ? "native LIF" : "fallback LIF"}`;
   elements.lastTick.textContent = `Last tick: ${formatGeneratedAt(snapshot.generated_at)}`;
+  renderRuntimeHealth(status, profile, graph, {
+    contextCount,
+    entryTotal,
+    relationshipTotal,
+    temporalRelationships,
+    associativeRelationships,
+    graphDeferred,
+  });
 
   elements.toggleText.textContent = enabled ? "Enabled" : "Disabled";
   elements.toggleActionState.textContent = enabled ? "Enabled" : "Disabled";
@@ -247,6 +270,26 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderMemoryLedger(graph);
   renderFooter(snapshot, status, profile, contextCount);
   renderHydrationTiming(snapshot, clientElapsedMs);
+}
+
+function renderRuntimeHealth(status, profile, graph, counts) {
+  const device = status.mlx_device || profile.mlx_device || "default";
+  elements.runtimeDevice.textContent = `MLX ${device}`;
+  elements.runtimeDeviceDetail.textContent = `${formatNumber(status.default_top_k)} top-k / ${formatNumber(status.num_neurons)} neurons`;
+
+  elements.runtimeContextMemory.textContent = `${formatNumber(counts.entryTotal)} traces`;
+  elements.runtimeContextGraph.textContent = `${formatNumber(counts.relationshipTotal)} relationships / ${formatNumber(counts.contextCount)} contexts`;
+
+  elements.runtimeGraphMode.textContent = counts.graphDeferred
+    ? "hydrating"
+    : `${formatNumber(counts.temporalRelationships)} temporal / ${formatNumber(counts.associativeRelationships)} associative`;
+  elements.runtimeGraphDetail.textContent = `${formatNumber(countEventEntries(graph.entries || []))} event traces visible`;
+
+  const lastMode = status.last_maintenance?.mode
+    ? compactTag(String(status.last_maintenance.mode), 20)
+    : "standby";
+  elements.runtimeMaintenance.textContent = lastMode;
+  elements.runtimeMaintenanceDetail.textContent = `${formatAge(status.last_pruning_age_seconds)} / ${formatNumber(status.quick_pruning_interval_seconds, 0)}s interval`;
 }
 
 function withGraph(snapshot, graph) {
@@ -656,6 +699,108 @@ function initializeGraphInteractions() {
   });
 }
 
+function initializeSectionNavigation() {
+  const navItems = Array.from(document.querySelectorAll(".nav-item[data-section-target]"));
+  if (!navItems.length) return;
+
+  for (const item of navItems) {
+    item.addEventListener("click", (event) => {
+      event.preventDefault();
+      const sectionId = item.getAttribute("data-section-target") || "";
+      state.nav.lockedSection = sectionId;
+      state.nav.lockUntilMs = nowMs() + 1400;
+      scrollSectionIntoView(sectionId);
+      setActiveNavItem(sectionId);
+      history.replaceState(null, "", `#${sectionId}`);
+    });
+  }
+
+  const updateActiveSection = () => setActiveNavItem(currentSectionId(navItems));
+  const main = document.querySelector(".main");
+  main?.addEventListener("scroll", updateActiveSection, { passive: true });
+  window.addEventListener("scroll", updateActiveSection, { passive: true });
+
+  if (window.location.hash) {
+    const initial = window.location.hash.slice(1);
+    requestAnimationFrame(() => {
+      scrollSectionIntoView(initial);
+      setActiveNavItem(initial);
+    });
+  } else {
+    setActiveNavItem("overview");
+  }
+}
+
+function scrollSectionIntoView(sectionId) {
+  const scrollTarget = dashboardScrollTarget();
+  if (!sectionId || sectionId === "overview") {
+    scrollTarget.container.scrollTo({ top: 0, behavior: "smooth" });
+    return;
+  }
+  const target = document.getElementById(sectionId);
+  if (!target) return;
+  const mainRect = scrollTarget.rect();
+  const targetRect = target.getBoundingClientRect();
+  const targetTop = scrollTarget.scrollTop() + targetRect.top - mainRect.top - 12;
+  scrollTarget.container.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
+}
+
+function setActiveNavItem(sectionId) {
+  const normalized = sectionId || "overview";
+  for (const item of document.querySelectorAll(".nav-item[data-section-target]")) {
+    const active = item.getAttribute("data-section-target") === normalized;
+    item.classList.toggle("active", active);
+    if (active) {
+      item.setAttribute("aria-current", "page");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+}
+
+function currentSectionId(navItems) {
+  const scrollTarget = dashboardScrollTarget();
+  if (state.nav.lockedSection && nowMs() < state.nav.lockUntilMs) {
+    return state.nav.lockedSection;
+  }
+  state.nav.lockedSection = null;
+  if (scrollTarget.scrollTop() < 24) return "overview";
+  let current = "runtime";
+  const threshold = scrollTarget.rect().top + 90;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const item of navItems) {
+    const sectionId = item.getAttribute("data-section-target") || "";
+    if (sectionId === "overview") continue;
+    const target = document.getElementById(sectionId);
+    if (!target) continue;
+    const rect = target.getBoundingClientRect();
+    if (rect.bottom < scrollTarget.rect().top || rect.top > window.innerHeight) continue;
+    const distance = Math.abs(rect.top - threshold);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      current = sectionId;
+    }
+  }
+  return current;
+}
+
+function dashboardScrollTarget() {
+  const main = document.querySelector(".main");
+  if (main && main.scrollHeight > main.clientHeight + 1) {
+    return {
+      container: main,
+      rect: () => main.getBoundingClientRect(),
+      scrollTop: () => main.scrollTop,
+    };
+  }
+  const root = document.scrollingElement || document.documentElement;
+  return {
+    container: root,
+    rect: () => ({ top: 0 }),
+    scrollTop: () => root.scrollTop,
+  };
+}
+
 function cssEscape(value) {
   return window.CSS?.escape ? window.CSS.escape(value) : String(value).replaceAll('"', '\\"');
 }
@@ -1046,6 +1191,24 @@ elements.sleepButton.addEventListener("click", () => {
 elements.backupButton.addEventListener("click", () => {
   withBusy(elements.backupButton, "Backup", () => (
     requestJson("/api/backup", { method: "POST", body: {} })
+  ));
+});
+
+elements.readinessAuditButton.addEventListener("click", () => {
+  withBusy(elements.readinessAuditButton, "Readiness audit", () => (
+    requestJson("/api/readiness-audit", {
+      method: "POST",
+      body: { context_id: state.context },
+    })
+  ));
+});
+
+elements.evidencePackButton.addEventListener("click", () => {
+  withBusy(elements.evidencePackButton, "Evidence pack", () => (
+    requestJson("/api/evidence-pack", {
+      method: "POST",
+      body: { context_id: state.context },
+    })
   ));
 });
 

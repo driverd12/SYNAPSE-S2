@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import unittest
 from pathlib import Path
@@ -145,6 +146,63 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(prune_status, 200)
         self.assertEqual(prune_payload["mode"], "quick-pruning")
 
+    def test_readiness_audit_endpoint_reports_actionable_checks(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            audit_status, audit_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/readiness-audit",
+                    json.dumps({"context_id": "demo"}).encode(),
+                )
+            )
+
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_payload["context_id"], "demo")
+        self.assertTrue(audit_payload["ready"])
+        self.assertEqual(audit_payload["action"], "readiness-audit")
+        self.assertIn("audit_id", audit_payload)
+        self.assertGreaterEqual(audit_payload["elapsed_ms"], 0)
+        self.assertTrue(audit_payload["checks"]["runtime_ready"])
+        self.assertTrue(audit_payload["checks"]["mlx_ready"])
+        self.assertTrue(audit_payload["checks"]["memory_ready"])
+        self.assertTrue(audit_payload["checks"]["graph_ready"])
+        self.assertIn("dashboard-memory", audit_payload["query_result"])
+
+    def test_evidence_pack_endpoint_writes_local_report_and_backup(self):
+        with TemporaryDirectory() as tmp:
+            previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
+            os.environ["SYNAPSE_S2_EXPORT_DIR"] = tmp
+            try:
+                runtime = self.make_runtime(tmp)
+
+                pack_status, pack_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/evidence-pack",
+                        json.dumps({"context_id": "demo"}).encode(),
+                    )
+                )
+            finally:
+                if previous_export_dir is None:
+                    os.environ.pop("SYNAPSE_S2_EXPORT_DIR", None)
+                else:
+                    os.environ["SYNAPSE_S2_EXPORT_DIR"] = previous_export_dir
+
+            report_path = Path(pack_payload["report_path"])
+            backup_path = Path(pack_payload["backup"]["backup_path"])
+
+            self.assertEqual(pack_status, 200)
+            self.assertEqual(pack_payload["context_id"], "demo")
+            self.assertEqual(pack_payload["action"], "evidence-pack")
+            self.assertTrue(report_path.exists())
+            self.assertTrue(backup_path.exists())
+            self.assertEqual(report_path.parent, Path(tmp).resolve())
+            self.assertIn("sha256", pack_payload)
+            self.assertGreaterEqual(pack_payload["snapshot"]["graph"]["relationship_count"], 1)
+            self.assertEqual(pack_payload["snapshot"]["status"]["runtime"], "ready")
+
     def test_static_paths_cannot_escape_web_root(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -174,9 +232,18 @@ class DashboardRuntimeTests(unittest.TestCase):
 
         self.assertIn("themeButton", index)
         self.assertIn("hydrateLabel", index)
+        self.assertIn("runtimeHealthGrid", index)
+        self.assertIn("operatorGuide", index)
+        self.assertIn("readinessAuditButton", index)
+        self.assertIn("evidencePackButton", index)
+        self.assertIn("data-section-target", index)
         self.assertIn("rememberForm", index)
         self.assertIn("ingestForm", index)
         self.assertIn("dataset.theme", app)
+        self.assertIn("initializeSectionNavigation", app)
+        self.assertIn("scrollSectionIntoView", app)
+        self.assertIn("/api/readiness-audit", app)
+        self.assertIn("/api/evidence-pack", app)
         self.assertIn('include_graph: "false"', app)
         self.assertIn('"/api/graph"', app)
         self.assertIn("graph.deferred", app)
