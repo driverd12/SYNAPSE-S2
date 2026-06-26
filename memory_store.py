@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS memory_events (
 CREATE INDEX IF NOT EXISTS ix_memory_events_memory_created
 ON memory_events(memory_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS agent_context_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    context_id TEXT NOT NULL,
+    source_surface TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    agent_targets_json TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_agent_context_events_context_event
+ON agent_context_events(context_id, event_id);
+
 CREATE TABLE IF NOT EXISTS memory_relationships (
     relationship_id TEXT PRIMARY KEY,
     context_id TEXT NOT NULL,
@@ -476,6 +490,106 @@ class DurableMemoryStore:
             LOGGER.exception("failed to list memory relationships")
             raise
 
+    def publish_context_event(
+        self,
+        *,
+        context_id: str,
+        source_surface: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+        agent_targets: Iterable[str] | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        targets = [
+            str(target).strip()
+            for target in (agent_targets or [])
+            if str(target).strip()
+        ]
+        if not targets:
+            targets = ["mcp-clients"]
+        now = float(created_at or time.time())
+        try:
+            with closing(self._connect()) as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO agent_context_events (
+                        context_id,
+                        source_surface,
+                        event_type,
+                        summary,
+                        payload_json,
+                        agent_targets_json,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(context_id),
+                        str(source_surface or "unknown"),
+                        str(event_type or "context-update"),
+                        str(summary or ""),
+                        _json_dumps(payload or {}),
+                        _json_dumps(targets),
+                        now,
+                    ),
+                )
+                event_id = int(cursor.lastrowid)
+            events = self.list_context_events(event_id=event_id, limit=1)
+            if not events:
+                raise RuntimeError(f"context event {event_id} was not readable after publish")
+            return events[0]
+        except Exception:
+            LOGGER.exception(
+                "failed to publish context event context_id=%s event_type=%s",
+                context_id,
+                event_type,
+            )
+            raise
+
+    def list_context_events(
+        self,
+        *,
+        context_id: str | None = None,
+        event_id: int | None = None,
+        since_event_id: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            clauses.append("context_id = ?")
+            params.append(str(context_id))
+        if event_id is not None:
+            clauses.append("event_id = ?")
+            params.append(int(event_id))
+        else:
+            clauses.append("event_id > ?")
+            params.append(max(0, int(since_event_id)))
+        where_sql = "WHERE " + " AND ".join(clauses)
+        bounded_limit = min(max(int(limit), 1), 1000)
+        params.append(bounded_limit)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM (
+                        SELECT *
+                        FROM agent_context_events
+                        {where_sql}
+                        ORDER BY event_id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY event_id ASC
+                    """,
+                    tuple(params),
+                ).fetchall()
+            return [self._row_to_context_event(row) for row in rows]
+        except Exception:
+            LOGGER.exception("failed to list context events")
+            raise
+
     def stats(self, *, context_id: str | None = None) -> dict[str, Any]:
         try:
             with closing(self._connect()) as conn:
@@ -486,6 +600,12 @@ class DurableMemoryStore:
                     relationship_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_relationships"
                     ).fetchone()[0]
+                    context_bus_event_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_events"
+                    ).fetchone()[0]
+                    latest_context_event_row = conn.execute(
+                        "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
+                    ).fetchone()
                 else:
                     entry_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_entries WHERE context_id = ?",
@@ -495,6 +615,14 @@ class DurableMemoryStore:
                         "SELECT COUNT(*) FROM memory_relationships WHERE context_id = ?",
                         (context_id,),
                     ).fetchone()[0]
+                    context_bus_event_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_events WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
+                    latest_context_event_row = conn.execute(
+                        "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()
                 event_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
                 context_rows = conn.execute(
                     """
@@ -509,6 +637,8 @@ class DurableMemoryStore:
                 "entry_count": int(entry_count),
                 "event_count": int(event_count),
                 "relationship_count": int(relationship_count),
+                "context_bus_event_count": int(context_bus_event_count),
+                "context_bus_latest_event_id": int(latest_context_event_row[0] or 0),
                 "contexts": {str(row["context_id"]): int(row["count"]) for row in context_rows},
             }
         except Exception:
@@ -530,6 +660,10 @@ class DurableMemoryStore:
             "stats": self.stats(context_id=context_id),
             "entries": self.list_entries(context_id=context_id, limit=limit),
             "relationships": self.list_relationships(
+                context_id=context_id,
+                limit=limit,
+            ),
+            "context_events": self.list_context_events(
                 context_id=context_id,
                 limit=limit,
             ),
@@ -602,4 +736,19 @@ class DurableMemoryStore:
             "evidence": _decode_json(str(row["evidence_json"]), {}),
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
+        }
+
+    def _row_to_context_event(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "event_id": int(row["event_id"]),
+            "context_id": str(row["context_id"]),
+            "source_surface": str(row["source_surface"]),
+            "event_type": str(row["event_type"]),
+            "summary": str(row["summary"]),
+            "payload": _decode_json(str(row["payload_json"]), {}),
+            "agent_targets": [
+                str(value)
+                for value in _decode_json(str(row["agent_targets_json"]), [])
+            ],
+            "created_at": float(row["created_at"]),
         }

@@ -403,6 +403,33 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(backup["entry_count"], 1)
         self.assertTrue(backup_exists)
 
+    def test_backend_publishes_context_events_for_connected_agents(self):
+        backend = SpikingAttentionBackend(
+            dimension=6,
+            num_neurons=10,
+            default_top_k=2,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        event = backend.publish_context_event(
+            context_id="demo",
+            source_surface="unit-test",
+            event_type="remember-trace",
+            summary="operator-note deployed",
+            payload={"tag": "operator-note", "memory_id": "s2_demo"},
+        )
+        listing = backend.list_context_events(context_id="demo", limit=5)
+        status = backend.status(context_id="demo")
+
+        self.assertTrue(event["published"])
+        self.assertEqual(event["delivery_mode"], "durable-mcp-pull")
+        self.assertEqual(event["agent_targets"], ["mcp-clients", "codex-desktop", "local-ide-adapters"])
+        self.assertEqual(listing["events"][0]["summary"], "operator-note deployed")
+        self.assertEqual(status["context_bus_context_event_count"], 1)
+        self.assertEqual(status["context_bus_latest_event_id"], event["event_id"])
+
     def test_quick_pruning_decays_weights_and_resets_membrane(self):
         backend = SpikingAttentionBackend(
             dimension=4,

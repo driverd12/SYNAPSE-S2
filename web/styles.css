@@ -1396,6 +1396,34 @@ textarea {
   gap: 12px;
 }
 
+.context-bus-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px 12px;
+}
+
+.context-bus-state strong {
+  color: var(--teal-strong);
+  font-size: 13px;
+  font-weight: 820;
+  white-space: nowrap;
+}
+
+.context-bus-state span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: right;
+}
+
 .write-form,
 .field-grid {
   display: grid;
@@ -1426,7 +1454,13 @@ textarea {
 .bottom-bar {
   display: grid;
   grid-column: 1 / -1;
-  grid-template-columns: minmax(480px, 2.3fr) 145px 1fr 1fr 1fr 190px;
+  grid-template-columns:
+    minmax(520px, 2fr)
+    minmax(190px, 0.72fr)
+    minmax(210px, 0.82fr)
+    minmax(190px, 0.72fr)
+    minmax(170px, 0.62fr)
+    minmax(190px, 0.72fr);
   align-items: center;
   border-top: 1px solid var(--border);
   background: var(--shell);
@@ -1460,6 +1494,12 @@ textarea {
   font-size: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.footer-health-cell small {
+  min-width: 58px;
+  overflow: visible;
+  text-overflow: clip;
 }
 
 .operator-guide {
@@ -1620,5 +1660,14 @@ textarea {
 
   .operator-guide small {
     flex-wrap: wrap;
+  }
+
+  .context-bus-state {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .context-bus-state span {
+    text-align: left;
   }
 }

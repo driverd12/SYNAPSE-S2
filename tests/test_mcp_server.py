@@ -103,6 +103,8 @@ class McpServerTests(unittest.TestCase):
         )
 
         self.assertEqual(registration["tag"], "exec-briefing-memory")
+        self.assertTrue(registration["agent_deployment"]["published"])
+        self.assertEqual(registration["agent_deployment"]["event_type"], "remember-trace")
         self.assertIn("exec-briefing-memory", result)
 
     def test_text_query_tool_uses_local_deterministic_embedding(self):
@@ -183,8 +185,38 @@ class McpServerTests(unittest.TestCase):
         graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
 
         self.assertGreaterEqual(ingestion["event_count"], 2)
+        self.assertTrue(ingestion["agent_deployment"]["published"])
         self.assertGreaterEqual(graph["relationship_count"], 1)
         self.assertEqual(graph["relationships"][0]["relation_type"], "temporal_next")
+
+    def test_context_deployment_tool_lists_published_thoughts_for_connected_agents(self):
+        registration = json.loads(
+            mcp_server.remember_spiking_context(
+                tag="agent-visible-memory",
+                context_id="demo",
+                text="Connected agents should pull this context update.",
+                metadata={"surface": "mcp"},
+            )
+        )
+
+        deployments = json.loads(
+            mcp_server.pull_spiking_context_deployments(
+                context_id="demo",
+                since_event_id=0,
+                limit=10,
+            )
+        )
+        after_registration = json.loads(
+            mcp_server.pull_spiking_context_deployments(
+                context_id="demo",
+                since_event_id=registration["agent_deployment"]["event_id"],
+                limit=10,
+            )
+        )
+
+        self.assertEqual(deployments["delivery_mode"], "durable-mcp-pull")
+        self.assertEqual(deployments["events"][0]["payload"]["tag"], "agent-visible-memory")
+        self.assertEqual(after_registration["events"], [])
 
     def test_memory_export_tool_rejects_paths_outside_export_root(self):
         result = json.loads(

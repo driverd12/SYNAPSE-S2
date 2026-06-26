@@ -150,6 +150,23 @@ def _load_backend():
     return mx, mlx_backend
 
 
+def _publish_tool_deployment(
+    mlx_backend_module: Any,
+    *,
+    context_id: str,
+    event_type: str,
+    summary: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return mlx_backend_module.publish_context_event(
+        context_id=context_id,
+        source_surface="mcp-tool",
+        event_type=event_type,
+        summary=summary,
+        payload=payload,
+    )
+
+
 @mcp.tool(
     annotations={
         "title": "Query Spiking Associative Memory",
@@ -232,6 +249,20 @@ def remember_spiking_context(
                 metadata=metadata or {},
                 source_text=source_text,
             )
+        registration["agent_deployment"] = _publish_tool_deployment(
+            mlx_backend,
+            context_id=context,
+            event_type="remember-trace",
+            summary=f"{registration['tag']} captured and published",
+            payload={
+                "tag": registration["tag"],
+                "memory_id": registration["memory_id"],
+                "source_text": source_text,
+                "metadata": metadata or {},
+                "spike_count": registration["spike_count"],
+                "neuron_count": registration["neuron_count"],
+            },
+        )
         return json.dumps(registration, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid trace registration for context_id=%s: %s", context, exc)
@@ -324,6 +355,24 @@ def ingest_spiking_memory_text(
             min_segment_sentences=int(min_segment_sentences),
             metadata=metadata or {},
         )
+        payload["agent_deployment"] = _publish_tool_deployment(
+            mlx_backend,
+            context_id=context,
+            event_type="ingest-events",
+            summary=(
+                f"{payload['source_tag']} published "
+                f"{payload['event_count']} event traces"
+            ),
+            payload={
+                "source_tag": payload["source_tag"],
+                "sequence_id": payload["sequence_id"],
+                "source_text": source_text,
+                "event_count": payload["event_count"],
+                "relationship_count": payload["relationship_count"],
+                "events": payload["events"],
+                "relationships": payload["relationships"],
+            },
+        )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid event ingestion request for context_id=%s: %s", context, exc)
@@ -356,6 +405,36 @@ def list_spiking_memory_graph(context_id: str = "default", limit: int = 100) -> 
     except Exception as exc:
         LOGGER.exception("memory graph list failed for context_id=%s", context)
         return json.dumps({"error": f"memory graph list failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Pull SYNAPSE-S2 Context Deployments",
+        "readOnlyHint": True,
+    }
+)
+def pull_spiking_context_deployments(
+    context_id: str = "default",
+    since_event_id: int = 0,
+    limit: int = 50,
+) -> str:
+    """Pull durable context-bus events published for connected local agents."""
+    context = _sanitize_context_id(context_id)
+    try:
+        bounded_limit = _validate_limit(limit)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.list_context_events(
+            context_id=context,
+            since_event_id=max(0, int(since_event_id)),
+            limit=bounded_limit,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid context deployment pull for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid context deployment pull: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("context deployment pull failed for context_id=%s", context)
+        return json.dumps({"error": f"context deployment pull failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool(

@@ -54,6 +54,8 @@ CONSOLIDATION_PHASES = (
     "relationship-extraction",
     "neurogenesis",
 )
+DEFAULT_AGENT_TARGETS = ("mcp-clients", "codex-desktop", "local-ide-adapters")
+CONTEXT_BUS_DELIVERY_MODE = "durable-mcp-pull"
 
 
 class BackendUnavailable(RuntimeError):
@@ -819,6 +821,11 @@ class SpikingAttentionBackend:
             "memory_relationship_count": int(total_stats["relationship_count"]),
             "memory_context_relationship_count": int(context_stats["relationship_count"]),
             "memory_contexts": total_stats["contexts"],
+            "context_bus_event_count": int(total_stats["context_bus_event_count"]),
+            "context_bus_context_event_count": int(context_stats["context_bus_event_count"]),
+            "context_bus_latest_event_id": int(context_stats["context_bus_latest_event_id"]),
+            "context_bus_delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "context_bus_agent_targets": list(DEFAULT_AGENT_TARGETS),
             "semantic_group_count": len(self.semantic_hierarchy),
             "mlx_available": mx is not None,
             "mlxsnn_available": self._mlxsnn_available,
@@ -863,6 +870,61 @@ class SpikingAttentionBackend:
             "entry_count": len(rendered_entries),
             "entries": rendered_entries,
             "include_vectors": bool(include_vectors),
+        }
+
+    def publish_context_event(
+        self,
+        *,
+        context_id: str = "default",
+        source_surface: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+        agent_targets: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        targets = list(agent_targets or DEFAULT_AGENT_TARGETS)
+        try:
+            event = self.memory_store.publish_context_event(
+                context_id=context,
+                source_surface=str(source_surface or "unknown"),
+                event_type=str(event_type or "context-update"),
+                summary=str(summary or ""),
+                payload=self._json_safe_metadata(payload or {}),
+                agent_targets=targets,
+            )
+            self._mark_activity()
+            return self._decorate_context_event(event)
+        except Exception:
+            LOGGER.exception(
+                "context event publish failed for context_id=%s event_type=%s",
+                context,
+                event_type,
+            )
+            raise
+
+    def list_context_events(
+        self,
+        *,
+        context_id: str = "default",
+        since_event_id: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        bounded_limit = min(max(int(limit), 1), 500)
+        events = self.memory_store.list_context_events(
+            context_id=context,
+            since_event_id=max(0, int(since_event_id)),
+            limit=bounded_limit,
+        )
+        return {
+            "context_id": context,
+            "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "agent_targets": list(DEFAULT_AGENT_TARGETS),
+            "since_event_id": max(0, int(since_event_id)),
+            "event_count": len(events),
+            "events": [self._decorate_context_event(event) for event in events],
+            "memory_db_path": str(self.memory_store.db_path),
         }
 
     def ingest_text_events(
@@ -1116,6 +1178,20 @@ class SpikingAttentionBackend:
             "neuron_count": len(entry.get("neuron_indices", [])),
             "created_at": entry["created_at"],
             "updated_at": entry["updated_at"],
+        }
+
+    def _decorate_context_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        targets = [
+            str(target)
+            for target in event.get("agent_targets", [])
+            if str(target).strip()
+        ] or list(DEFAULT_AGENT_TARGETS)
+        return {
+            **event,
+            "agent_targets": targets,
+            "target_count": len(targets),
+            "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "published": True,
         }
 
     def export_memory(
@@ -1472,6 +1548,37 @@ def list_memory(
         context_id=context_id,
         limit=limit,
         include_vectors=include_vectors,
+    )
+
+
+def publish_context_event(
+    *,
+    context_id: str = "default",
+    source_surface: str,
+    event_type: str,
+    summary: str,
+    payload: dict[str, Any] | None = None,
+    agent_targets: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    return get_backend().publish_context_event(
+        context_id=context_id,
+        source_surface=source_surface,
+        event_type=event_type,
+        summary=summary,
+        payload=payload,
+        agent_targets=agent_targets,
+    )
+
+
+def list_context_events(
+    context_id: str = "default",
+    since_event_id: int = 0,
+    limit: int = 100,
+) -> dict[str, Any]:
+    return get_backend().list_context_events(
+        context_id=context_id,
+        since_event_id=since_event_id,
+        limit=limit,
     )
 
 

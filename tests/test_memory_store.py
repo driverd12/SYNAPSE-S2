@@ -95,6 +95,48 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(stats["relationship_count"], 1)
         self.assertEqual(exported["relationships"][0]["weight"], 0.87)
 
+    def test_context_bus_events_are_persisted_listed_and_exported(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            export_path = Path(tmp) / "memory-export.json"
+            store = DurableMemoryStore(db_path)
+
+            first = store.publish_context_event(
+                context_id="demo",
+                source_surface="dashboard",
+                event_type="remember-trace",
+                summary="operator-note captured and published",
+                payload={"tag": "operator-note", "memory_id": "s2_demo"},
+                agent_targets=["mcp-clients", "codex-desktop", "local-ide-adapters"],
+            )
+            second = store.publish_context_event(
+                context_id="demo",
+                source_surface="dashboard",
+                event_type="ingest-events",
+                summary="ops-brief segmented and published",
+                payload={"source_tag": "ops-brief", "event_count": 3},
+                agent_targets=["mcp-clients"],
+            )
+            restored = DurableMemoryStore(db_path)
+            events = restored.list_context_events(context_id="demo", limit=10)
+            since_first = restored.list_context_events(
+                context_id="demo",
+                since_event_id=first["event_id"],
+                limit=10,
+            )
+            stats = restored.stats(context_id="demo")
+            exported = restored.export_json(export_path, context_id="demo")
+
+        self.assertEqual(first["context_id"], "demo")
+        self.assertEqual(first["event_type"], "remember-trace")
+        self.assertEqual(first["payload"]["tag"], "operator-note")
+        self.assertIn("codex-desktop", first["agent_targets"])
+        self.assertEqual([event["event_id"] for event in events], [first["event_id"], second["event_id"]])
+        self.assertEqual([event["event_id"] for event in since_first], [second["event_id"]])
+        self.assertEqual(stats["context_bus_event_count"], 2)
+        self.assertEqual(stats["context_bus_latest_event_id"], second["event_id"])
+        self.assertEqual(exported["context_events"][0]["summary"], "operator-note captured and published")
+
 
 if __name__ == "__main__":
     unittest.main()

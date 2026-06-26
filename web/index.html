@@ -36,7 +36,7 @@
             <strong><i class="status-dot" aria-hidden="true"></i><span id="headerRuntime">PENDING</span></strong>
           </div>
           <div class="top-readout">
-            <span>Model</span>
+            <span>Memory URI</span>
             <strong id="modelUri">s2://local/default</strong>
           </div>
           <div class="top-readout">
@@ -116,7 +116,7 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
             </button>
           </div>
-          <small id="contextHelp">Current model URI: <span id="contextUri">s2://local/default</span></small>
+          <small id="contextHelp">Current memory URI: <span id="contextUri">s2://local/default</span></small>
         </div>
 
         <div class="sidebar-status">
@@ -388,6 +388,10 @@
                 <h2 id="writeTitle">Durable trace capture</h2>
               </div>
             </div>
+            <div id="contextBusState" class="context-bus-state" aria-live="polite">
+              <strong>Context bus ready</strong>
+              <span>Remember/Ingest stores local memory and publishes a durable update for MCP clients and IDE adapters to pull.</span>
+            </div>
             <div class="write-grid">
               <form id="rememberForm" class="write-form">
                 <div class="field-grid">
@@ -400,7 +404,7 @@
                 </div>
                 <button class="primary-button" type="submit">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
-                  Remember trace
+                  Remember + publish
                 </button>
               </form>
 
@@ -425,7 +429,7 @@
                 </div>
                 <button class="secondary-button" type="submit">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M4 12h10"/><path d="M4 17h7"/><path d="m15 17 2 2 4-5"/></svg>
-                  Ingest events
+                  Ingest + publish
                 </button>
               </form>
             </div>
@@ -435,7 +439,7 @@
             <div class="panel-header">
               <div>
                 <p class="section-label">Operation Log</p>
-                <h2 id="logTitle">Last backend response</h2>
+                <h2 id="logTitle">Backend response stream</h2>
               </div>
             </div>
             <pre id="operationLog" class="operation-log">idle</pre>
@@ -453,7 +457,7 @@
             <span>4 Audit + pack</span>
           </small>
         </div>
-        <div><span class="status-dot" aria-hidden="true"></span><strong>Health</strong><small id="footerHealth">GOOD</small></div>
+        <div class="footer-health-cell"><span class="status-dot" aria-hidden="true"></span><strong>Health</strong><small id="footerHealth">GOOD</small></div>
         <div><strong>Memory</strong><small id="footerMemory">-- / 138 MB</small></div>
         <div><strong>Compute</strong><small id="footerGpu">MLX --</small></div>
         <div><strong>Contexts</strong><small id="footerContexts">--</small></div>

@@ -114,6 +114,23 @@ class DashboardRuntime:
             return self._json_response(
                 self.backend.list_memory_graph(context_id=context, limit=limit)
             )
+        if method == "GET" and path == "/api/context-events":
+            context = self._context_from_params(params)
+            limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
+            since_event_id = self._int_param(
+                params,
+                "since_event_id",
+                0,
+                minimum=0,
+                maximum=9_999_999_999,
+            )
+            return self._json_response(
+                self.backend.list_context_events(
+                    context_id=context,
+                    since_event_id=since_event_id,
+                    limit=limit,
+                )
+            )
         if method == "GET" and path == "/api/snapshot":
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
@@ -157,15 +174,28 @@ class DashboardRuntime:
                 raise DashboardError(HTTPStatus.BAD_REQUEST, "tag is required")
             text = self._text_payload(payload, "text", max_bytes=MAX_TEXT_BYTES)
             metadata = self._metadata_payload(payload)
-            return self._json_response(
-                self.backend.register_trace(
-                    tag=tag,
-                    embedding=self.backend.embed_text(text),
-                    context_id=context,
-                    source_text=text,
-                    metadata=metadata,
-                )
+            registration = self.backend.register_trace(
+                tag=tag,
+                embedding=self.backend.embed_text(text),
+                context_id=context,
+                source_text=text,
+                metadata=metadata,
             )
+            registration["agent_deployment"] = self._publish_agent_deployment(
+                context_id=context,
+                source_surface="dashboard",
+                event_type="remember-trace",
+                summary=f"{registration['tag']} captured and published",
+                payload={
+                    "tag": registration["tag"],
+                    "memory_id": registration["memory_id"],
+                    "source_text": text,
+                    "metadata": metadata,
+                    "spike_count": registration["spike_count"],
+                    "neuron_count": registration["neuron_count"],
+                },
+            )
+            return self._json_response(registration)
         if method == "POST" and path == "/api/ingest":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
@@ -173,16 +203,33 @@ class DashboardRuntime:
             text = self._text_payload(payload, "text", max_bytes=MAX_TEXT_BYTES)
             threshold = float(payload.get("surprise_threshold", 0.58))
             min_sentences = int(payload.get("min_segment_sentences", 1))
-            return self._json_response(
-                self.backend.ingest_text_events(
-                    text=text,
-                    context_id=context,
-                    source_tag=tag,
-                    surprise_threshold=threshold,
-                    min_segment_sentences=min_sentences,
-                    metadata={"source": "dashboard"},
-                )
+            ingestion = self.backend.ingest_text_events(
+                text=text,
+                context_id=context,
+                source_tag=tag,
+                surprise_threshold=threshold,
+                min_segment_sentences=min_sentences,
+                metadata={"source": "dashboard"},
             )
+            ingestion["agent_deployment"] = self._publish_agent_deployment(
+                context_id=context,
+                source_surface="dashboard",
+                event_type="ingest-events",
+                summary=(
+                    f"{ingestion['source_tag']} published "
+                    f"{ingestion['event_count']} event traces"
+                ),
+                payload={
+                    "source_tag": ingestion["source_tag"],
+                    "sequence_id": ingestion["sequence_id"],
+                    "source_text": text,
+                    "event_count": ingestion["event_count"],
+                    "relationship_count": ingestion["relationship_count"],
+                    "events": ingestion["events"],
+                    "relationships": ingestion["relationships"],
+                },
+            )
+            return self._json_response(ingestion)
         if method == "POST" and path == "/api/quick-prune":
             return self._json_response(self.backend.run_quick_pruning(trigger="dashboard"))
         if method == "POST" and path == "/api/sleep":
@@ -242,6 +289,23 @@ class DashboardRuntime:
             "timings_ms": timings,
             "generated_at": time.time(),
         }
+
+    def _publish_agent_deployment(
+        self,
+        *,
+        context_id: str,
+        source_surface: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.backend.publish_context_event(
+            context_id=context_id,
+            source_surface=source_surface,
+            event_type=event_type,
+            summary=summary,
+            payload=payload,
+        )
 
     def _deferred_graph(self, *, context: str, status: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -369,11 +433,14 @@ class DashboardRuntime:
             }
         info = dict(self._system_info_cache)
         uptime_seconds = max(0.0, time.time() - self.started_at)
+        memory_uri = f"s2://local/{mlx_backend.sanitize_context_id(context_id)}"
         info.update(
             {
                 "started_at": self.started_at,
                 "uptime_seconds": round(uptime_seconds, 3),
-                "model_uri": f"s2://local/{mlx_backend.sanitize_context_id(context_id)}",
+                "memory_uri": memory_uri,
+                "model_uri": memory_uri,
+                "substrate_label": "SNN Memory Context",
                 "mode": "LOCAL ONLY",
             }
         )

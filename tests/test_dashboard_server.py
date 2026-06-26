@@ -60,7 +60,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["status"]["memory_context_entry_count"], 4)
         self.assertGreaterEqual(payload["graph"]["relationship_count"], 1)
         self.assertIn("estimated_total_mb", payload["profile"])
+        self.assertEqual(payload["system"]["memory_uri"], "s2://local/demo")
         self.assertEqual(payload["system"]["model_uri"], "s2://local/demo")
+        self.assertEqual(payload["system"]["substrate_label"], "SNN Memory Context")
         self.assertEqual(payload["system"]["mode"], "LOCAL ONLY")
         self.assertIn("project_version", payload["system"])
         self.assertIn("uptime_seconds", payload["system"])
@@ -86,7 +88,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(payload["graph"]["relationship_count"], 1)
         self.assertEqual(payload["timings_ms"]["graph"], 0)
         self.assertIn("estimated_total_mb", payload["profile"])
-        self.assertEqual(payload["system"]["model_uri"], "s2://local/demo")
+        self.assertEqual(payload["system"]["memory_uri"], "s2://local/demo")
 
     def test_snapshot_defaults_to_neutral_context(self):
         with TemporaryDirectory() as tmp:
@@ -241,8 +243,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("evidencePackButton", index)
         self.assertIn("coreUnlockButton", index)
         self.assertIn("coreToggleGuardHint", index)
+        self.assertIn("Memory URI", index)
+        self.assertIn("Context bus", index)
+        self.assertIn("Remember + publish", index)
+        self.assertIn("Ingest + publish", index)
         self.assertIn("Locked. Press Unlock", index)
         self.assertIn("CORE_TOGGLE_UNLOCK_WINDOW_MS", app)
+        self.assertIn("renderContextBus", app)
+        self.assertIn("logSnapshotResponse", app)
         self.assertIn("unlockCoreToggleGuard", app)
         self.assertIn("lockCoreToggleGuard", app)
         self.assertIn("data-section-target", index)
@@ -259,6 +267,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("data-theme", styles)
         self.assertIn("/api/remember", app)
         self.assertIn("/api/ingest", app)
+        self.assertIn("/api/context-events", app)
         self.assertNotIn("board-demo", index)
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)
@@ -328,6 +337,9 @@ class DashboardRuntimeTests(unittest.TestCase):
 
         self.assertEqual(remember_status, 200)
         self.assertEqual(remember_payload["tag"], "operator-note")
+        self.assertTrue(remember_payload["agent_deployment"]["published"])
+        self.assertEqual(remember_payload["agent_deployment"]["event_type"], "remember-trace")
+        self.assertEqual(remember_payload["agent_deployment"]["delivery_mode"], "durable-mcp-pull")
         self.assertIn("operator-note", recall)
 
     def test_ingest_endpoint_persists_events_and_relationships(self):
@@ -360,8 +372,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(ingest_status, 200)
         self.assertGreaterEqual(ingest_payload["event_count"], 2)
         self.assertGreaterEqual(ingest_payload["relationship_count"], 1)
+        self.assertTrue(ingest_payload["agent_deployment"]["published"])
+        self.assertEqual(ingest_payload["agent_deployment"]["event_type"], "ingest-events")
         self.assertEqual(snapshot_status, 200)
         self.assertGreaterEqual(snapshot_payload["graph"]["relationship_count"], 1)
+        self.assertGreaterEqual(
+            snapshot_payload["status"]["context_bus_context_event_count"],
+            1,
+        )
         self.assertEqual(
             snapshot_payload["graph"]["relationship_summary"]["total"],
             snapshot_payload["graph"]["relationship_count"],
@@ -376,6 +394,41 @@ class DashboardRuntimeTests(unittest.TestCase):
                 for entry in snapshot_payload["graph"]["entries"]
             )
         )
+
+    def test_context_events_endpoint_lists_published_agent_handoffs(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            remember_status, remember_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/remember",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "tag": "operator-note",
+                            "text": "Publish this context for connected MCP clients.",
+                        }
+                    ).encode(),
+                )
+            )
+            event_id = remember_payload["agent_deployment"]["event_id"]
+
+            list_status, list_payload = self.decode(
+                runtime.handle("GET", "/api/context-events?context_id=demo&limit=5")
+            )
+            since_status, since_payload = self.decode(
+                runtime.handle(
+                    f"GET",
+                    f"/api/context-events?context_id=demo&since_event_id={event_id}&limit=5",
+                )
+            )
+
+        self.assertEqual(remember_status, 200)
+        self.assertEqual(list_status, 200)
+        self.assertEqual(list_payload["events"][-1]["event_id"], event_id)
+        self.assertEqual(list_payload["events"][-1]["payload"]["tag"], "operator-note")
+        self.assertEqual(since_status, 200)
+        self.assertEqual(since_payload["events"], [])
 
 
 if __name__ == "__main__":

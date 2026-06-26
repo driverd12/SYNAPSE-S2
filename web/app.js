@@ -35,6 +35,7 @@ const elements = collectElements([
   "chipLabel",
   "clearRecallButton",
   "contextApply",
+  "contextBusState",
   "contextInput",
   "contextUri",
   "coreToggleGuardHint",
@@ -194,7 +195,11 @@ async function refreshSnapshot() {
     params: { context_id: state.context, limit: SNAPSHOT_LIMIT, include_graph: "false" },
   });
   state.snapshot = withGraph(shellSnapshot, shellSnapshot.graph);
-  renderSnapshot(state.snapshot, elapsedMs(started));
+  const shellElapsedMs = elapsedMs(started);
+  renderSnapshot(state.snapshot, shellElapsedMs);
+  if (operationLogIsIdle()) {
+    logSnapshotResponse(state.snapshot, shellElapsedMs);
+  }
 
   try {
     const graph = await requestJson("/api/graph", {
@@ -215,7 +220,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   const system = snapshot.system || {};
   const enabled = Boolean(status.effective_enabled);
   const runtimeReady = enabled && String(status.runtime || "").toLowerCase() === "ready";
-  const modelUri = system.model_uri || `s2://local/${snapshot.context_id || state.context}`;
+  const memoryUri = system.memory_uri || system.model_uri || `s2://local/${snapshot.context_id || state.context}`;
   const entryTotal = Number(status.memory_context_entry_count ?? graph.entry_count ?? 0);
   const relationshipTotal = Number(status.memory_context_relationship_count ?? graph.relationship_count ?? 0);
   const relationshipSummary = graph.relationship_summary || {};
@@ -225,8 +230,8 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   const contexts = status.memory_contexts || {};
   const contextCount = Object.keys(contexts).length;
 
-  elements.contextUri.textContent = modelUri;
-  elements.modelUri.textContent = modelUri;
+  elements.contextUri.textContent = memoryUri;
+  elements.modelUri.textContent = memoryUri;
   elements.headerRuntime.textContent = runtimeReady ? "READY" : String(status.runtime || "PENDING").toUpperCase();
   elements.modeLabel.textContent = system.mode || "LOCAL ONLY";
   elements.platformLabel.textContent = platformLabel(system);
@@ -276,8 +281,30 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderMaintenance(status, profile);
   renderGraph(graph, status);
   renderMemoryLedger(graph);
+  renderContextBus(status);
   renderFooter(snapshot, status, profile, contextCount);
   renderHydrationTiming(snapshot, clientElapsedMs);
+}
+
+function renderContextBus(status, deployment = null) {
+  const eventCount = Number(status.context_bus_context_event_count ?? status.context_bus_event_count ?? 0);
+  const latestEventId = Number(deployment?.event_id ?? status.context_bus_latest_event_id ?? 0);
+  const targets = Array.isArray(deployment?.agent_targets)
+    ? deployment.agent_targets
+    : Array.isArray(status.context_bus_agent_targets)
+      ? status.context_bus_agent_targets
+      : ["mcp-clients"];
+  const targetText = targets.length ? targets.join(", ") : "mcp-clients";
+  const stateText = deployment
+    ? `Published event #${formatNumber(latestEventId)}`
+    : `${formatNumber(eventCount)} published context updates`;
+  const detailText = deployment
+    ? `${deployment.event_type || "context-update"} via ${deployment.delivery_mode || "durable-mcp-pull"} to ${targetText}`
+    : `Ready for Remember/Ingest handoffs via ${status.context_bus_delivery_mode || "durable-mcp-pull"}`;
+  elements.contextBusState.innerHTML = `
+    <strong>${escapeHtml(stateText)}</strong>
+    <span>${escapeHtml(detailText)}</span>
+  `;
 }
 
 function renderRuntimeHealth(status, profile, graph, counts) {
@@ -1020,12 +1047,49 @@ function logOperation(label, payload) {
   elements.operationLog.textContent = `${label}\n${text}`;
 }
 
+function operationLogIsIdle() {
+  return elements.operationLog.textContent.trim() === "idle";
+}
+
+function logSnapshotResponse(snapshot, clientElapsedMs) {
+  const status = snapshot.status || {};
+  const profile = snapshot.profile || {};
+  const timings = snapshot.timings_ms || {};
+  logOperation("Backend snapshot", {
+    context_id: snapshot.context_id,
+    runtime: status.runtime,
+    effective_enabled: status.effective_enabled,
+    memory_entries: status.memory_context_entry_count,
+    relationships: status.memory_context_relationship_count,
+    context_bus_events: status.context_bus_context_event_count,
+    memory_mb: profile.estimated_total_mb,
+    server_total_ms: timings.total,
+    client_hydrate_ms: Number.isFinite(Number(clientElapsedMs))
+      ? Number(clientElapsedMs.toFixed(1))
+      : null,
+    generated_at: snapshot.generated_at,
+  });
+}
+
+async function pullContextDeployments(sinceEventId = 0, limit = 10) {
+  return requestJson("/api/context-events", {
+    params: {
+      context_id: state.context,
+      since_event_id: Math.max(0, Math.trunc(Number(sinceEventId) || 0)),
+      limit,
+    },
+  });
+}
+
 async function withBusy(button, label, task, options = { refresh: true }) {
   const originalDisabled = button.disabled;
   button.disabled = true;
   try {
     const payload = await task();
     logOperation(label, payload);
+    if (payload?.agent_deployment) {
+      renderContextBus(state.snapshot?.status || {}, payload.agent_deployment);
+    }
     if (options.refresh) {
       await refreshSnapshot();
     }
@@ -1161,7 +1225,7 @@ elements.rememberForm.addEventListener("submit", async (event) => {
     (!tag ? elements.rememberTag : elements.rememberText).focus();
     return;
   }
-  await withBusy(elements.rememberForm.querySelector("button"), "Remember trace", async () => {
+  await withBusy(elements.rememberForm.querySelector("button"), "Remember + publish", async () => {
     const payload = await requestJson("/api/remember", {
       method: "POST",
       body: {
@@ -1171,6 +1235,12 @@ elements.rememberForm.addEventListener("submit", async (event) => {
         metadata: { source: "dashboard" },
       },
     });
+    if (payload.agent_deployment?.event_id) {
+      payload.context_bus = await pullContextDeployments(
+        payload.agent_deployment.event_id - 1,
+        5,
+      );
+    }
     elements.rememberText.value = "";
     return payload;
   });
@@ -1187,7 +1257,7 @@ elements.ingestForm.addEventListener("submit", async (event) => {
     (!tag ? elements.ingestTag : elements.ingestText).focus();
     return;
   }
-  await withBusy(elements.ingestForm.querySelector("button"), "Ingest events", async () => {
+  await withBusy(elements.ingestForm.querySelector("button"), "Ingest + publish", async () => {
     const payload = await requestJson("/api/ingest", {
       method: "POST",
       body: {
@@ -1198,6 +1268,12 @@ elements.ingestForm.addEventListener("submit", async (event) => {
         min_segment_sentences: Math.max(1, Math.trunc(Number.isFinite(minSentences) ? minSentences : 1)),
       },
     });
+    if (payload.agent_deployment?.event_id) {
+      payload.context_bus = await pullContextDeployments(
+        payload.agent_deployment.event_id - 1,
+        5,
+      );
+    }
     elements.ingestText.value = "";
     return payload;
   });
