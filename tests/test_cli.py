@@ -177,6 +177,31 @@ class SynapseCliTests(unittest.TestCase):
             "semantic-hash-v1",
         )
 
+    def test_cli_provider_benchmark_reports_latency_and_provenance(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+
+            result = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "provider-benchmark",
+                "--text",
+                "SYNAPSE-S2 neural provider benchmark",
+                "--runs",
+                "2",
+                state_path=state_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["action"], "provider-benchmark")
+        self.assertEqual(payload["embedding_provider"]["provider"], "semantic-hash-v1")
+        self.assertEqual(payload["dimensions"], 32)
+        self.assertEqual(payload["runs"], 2)
+        self.assertEqual(len(payload["sample_latencies_ms"]), 2)
+        self.assertGreaterEqual(payload["elapsed_ms"], 0.0)
+        self.assertGreaterEqual(payload["average_latency_ms"], 0.0)
+
     def test_cli_certify_runtime_writes_evidence_pack(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

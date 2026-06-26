@@ -83,6 +83,25 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("estimated_total_mb", profile)
         self.assertTrue(profile["quick_pruning"]["within_60ms_budget"])
 
+    def test_embedding_provider_benchmark_tool_reports_provenance(self):
+        self.assertTrue(
+            hasattr(mcp_server, "benchmark_spiking_embedding_provider"),
+            "MCP server must expose benchmark_spiking_embedding_provider",
+        )
+        benchmark = json.loads(
+            mcp_server.benchmark_spiking_embedding_provider(
+                text="MCP provider benchmark",
+                runs=2,
+                dimensions=6,
+            )
+        )
+
+        self.assertEqual(benchmark["action"], "provider-benchmark")
+        self.assertEqual(benchmark["runs"], 2)
+        self.assertEqual(benchmark["dimensions"], 6)
+        self.assertEqual(len(benchmark["sample_latencies_ms"]), 2)
+        self.assertEqual(benchmark["embedding_provider"]["provider"], "semantic-hash-v1")
+
     def test_native_certification_tool_reports_evidence_shape(self):
         certification = json.loads(
             mcp_server.certify_spiking_runtime(

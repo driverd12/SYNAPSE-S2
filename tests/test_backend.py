@@ -323,6 +323,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertIn("quick_pruning", certification["resource_profile"])
         self.assertEqual(certification["evidence_path"], str(evidence_path.resolve()))
         self.assertEqual(certification["checks"]["mlx_available"]["passed"], True)
+        self.assertIn("embedding_provider_native_mlx", certification["checks"])
 
     def test_native_certification_retries_cold_quick_prune_sample(self):
         backend = SpikingAttentionBackend(

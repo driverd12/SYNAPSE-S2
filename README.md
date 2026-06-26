@@ -7,7 +7,7 @@ Unlike traditional vector similarity retrieval methods, SYNAPSE-S2 runs natively
 ## **Operational Quickstart**
 
 This repository now includes a working local MCP server, a SQLite-backed persistent memory store, runtime toggle controls, and a CLI for validation outside an MCP client.
-Text recall is routed through a pluggable local embedding provider. The default `semantic-hash-v1` provider remains offline and deterministic while expanding related concepts beyond exact lexical matches; `lexical-hash-v1` is available for strict legacy behavior, and `python:/path/to/module.py:function` can point SYNAPSE-S2 at an IT-managed local encoder.
+Text recall is routed through a pluggable local embedding provider. The default client/launcher path is `mlx-neural-v1`, backed by the local MLX model `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`; it runs on Apple Silicon through `mlx-lm`, stores weights under `.synapse_s2/models`, and emits provider provenance on every text memory. `semantic-hash-v1` remains available as the deterministic offline fallback, `lexical-hash-v1` is available for strict legacy behavior, and `python:/path/to/module.py:function` can point SYNAPSE-S2 at an IT-managed local encoder.
 
 ### 1. Install Runtime Dependencies
 
@@ -32,6 +32,11 @@ The launcher enters through `mcp_client_wrapper.py`, which hydrates SYNAPSE-S2 a
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python synapse_cli.py --json doctor --context default
+.venv/bin/python synapse_cli.py --json \
+  --embedding-provider mlx-neural \
+  provider-benchmark \
+  --text "SYNAPSE-S2 neural embedding benchmark" \
+  --runs 3
 .venv/bin/python synapse_cli.py --json certify-runtime \
   --strict-native \
   --benchmark-quick-prune \
@@ -71,7 +76,7 @@ Expected query output returns ranked registered traces such as `production-memor
 Event ingestion additionally creates segmented memories such as `production-preflight-brief-event-001` and relationship edges such as `temporal_next` and `semantic_overlap`.
 
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`. Runtime toggles and client state live in `.synapse_s2/runtime_state.json`. Both `.mcp.json` and `/Users/dan.driver/.codex/config.toml` set `SYNAPSE_S2_MEMORY_DB` so Codex, Claude, and direct CLI runs target the same durable substrate. MCP export and backup paths are constrained to `.synapse_s2` by default through `SYNAPSE_S2_EXPORT_DIR`; the CLI remains available for explicit operator-chosen local paths.
-Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, local-only status, semantic flag, dimensions, concepts, and a vector hash. Set `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
+Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 
 Inspect, export, and back up the memory store:
 
@@ -162,7 +167,7 @@ The MCP server exposes these tools:
 | Tool | Purpose |
 | :--- | :--- |
 | `query_spiking_attention` | Query with a dense embedding vector. |
-| `query_spiking_attention_text` | Query with local deterministic text projection when no embedding model is available. |
+| `query_spiking_attention_text` | Query text through the configured local embedding provider, defaulting to MLX neural embeddings in installed clients. |
 | `remember_spiking_context` | Persist a named context trace from text and/or an embedding. |
 | `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
@@ -178,6 +183,7 @@ The MCP server exposes these tools:
 | `ack_spiking_context_deployments` | Record the last context-bus event consumed by a local agent. |
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
 | `hydrate_spiking_agent_context` | Return an agent-ready briefing with new deployments, prompt recall, graph highlights, and optional ack. |
+| `benchmark_spiking_embedding_provider` | Benchmark the configured local embedding provider and return latency plus provenance. |
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
 | `certify_spiking_runtime` | Emit native runtime certification evidence for MLX, mlxsnn, envelope, provider, and quick-prune checks. |
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |

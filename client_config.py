@@ -12,6 +12,8 @@ from typing import Any
 SERVER_NAME = "synapse-s2"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_LAUNCHER = Path.home() / ".local" / "bin" / "synapse-s2-mcp"
+DEFAULT_EMBEDDING_PROVIDER = "mlx-neural"
+DEFAULT_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
 
 
 def build_server_definition(
@@ -36,7 +38,9 @@ def build_server_definition(
         "env": {
             "PYTHONPATH": str(repo),
             "MLX_DEVICE": "gpu",
-            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": DEFAULT_EMBEDDING_PROVIDER,
+            "SYNAPSE_S2_NEURAL_MODEL": DEFAULT_NEURAL_MODEL,
+            "SYNAPSE_S2_NEURAL_CACHE_DIR": str(repo / ".synapse_s2" / "models"),
             "SYNAPSE_S2_STATE_PATH": str(repo / ".synapse_s2" / "runtime_state.json"),
             "SYNAPSE_S2_MEMORY_DB": str(repo / ".synapse_s2" / "memory.sqlite3"),
             "SYNAPSE_S2_EXPORT_DIR": str(repo / ".synapse_s2"),

@@ -84,7 +84,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and safe for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
 | "Deploy to all connected agents" language | Deployment is durable local pull with per-agent acknowledgement cursors | Local desktop clients do not expose a reliable push bus. Durable pull plus receipts is auditable and survives client restarts. |
 | "Magic" passive capture | Implemented as a local always-on inbox plus MCP startup/session-boundary bridge, not unauthorized scraping of arbitrary app state | MCP clients hydrate automatically on server startup and drop sanitized boundary notes on exit. Full chat capture still requires clients, hooks, or operators to explicitly write payloads. |
-| Text embeddings from arbitrary client text | Default provider is `semantic-hash-v1`; local neural encoders plug in through `python:/path.py:function` | Keeps the default offline and deterministic while making semantic/model provenance visible on every text memory. |
+| Text embeddings from arbitrary client text | Default installed client provider is `mlx-neural-v1` using `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`; deterministic `semantic-hash-v1` and `python:/path.py:function` remain available | Real local neural embeddings now back text capture/recall while preserving an offline no-model fallback and explicit provenance on every text memory. |
 | Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-safe 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
 | VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark and certification evidence payload | This is the right readiness signal for tomorrow. External Metal/Instruments counter capture can be added later for hardware certification. |
 
@@ -94,7 +94,7 @@ These items are present in the architecture document as longer-horizon research 
 
 - PTsoftmax and Bit Shifting PowerNorm.
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
-- Probabilistic embedding-calibrated surprise over live token streams; current implementation is deterministic and local so it can run offline inside MCP stdio without model calls.
+- Probabilistic embedding-calibrated surprise over live token streams; embeddings can now be neural, but event segmentation thresholds remain deterministic and local for predictable MCP stdio behavior.
 - External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs; current certification evidence is MLX/topology/runtime based.
 - Invisible capture of arbitrary already-running Codex/Claude chat transcript content without client cooperation; the MCP process boundary is captured, but full chat text still requires explicit client/tool/hook payloads.
 

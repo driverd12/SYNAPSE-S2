@@ -17,7 +17,9 @@ else
   PYTHONPATH="\$REPO_ROOT"
 fi
 : "\${MLX_DEVICE:=gpu}"
-: "\${SYNAPSE_S2_EMBEDDING_PROVIDER:=semantic-hash}"
+: "\${SYNAPSE_S2_EMBEDDING_PROVIDER:=mlx-neural}"
+: "\${SYNAPSE_S2_NEURAL_MODEL:=mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ}"
+: "\${SYNAPSE_S2_NEURAL_CACHE_DIR:=\$REPO_ROOT/.synapse_s2/models}"
 : "\${SYNAPSE_S2_STATE_PATH:=\$REPO_ROOT/.synapse_s2/runtime_state.json}"
 : "\${SYNAPSE_S2_MEMORY_DB:=\$REPO_ROOT/.synapse_s2/memory.sqlite3}"
 : "\${SYNAPSE_S2_EXPORT_DIR:=\$REPO_ROOT/.synapse_s2}"
@@ -26,6 +28,8 @@ fi
 export PYTHONPATH
 export MLX_DEVICE
 export SYNAPSE_S2_EMBEDDING_PROVIDER
+export SYNAPSE_S2_NEURAL_MODEL
+export SYNAPSE_S2_NEURAL_CACHE_DIR
 export SYNAPSE_S2_STATE_PATH
 export SYNAPSE_S2_MEMORY_DB
 export SYNAPSE_S2_EXPORT_DIR

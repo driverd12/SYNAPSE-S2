@@ -50,6 +50,7 @@ const elements = collectElements([
   "captureText",
   "currentEnvelope",
   "engineState",
+  "embeddingModelLabel",
   "endpointLabel",
   "envelopeFill",
   "envelopeMarker",
@@ -254,6 +255,8 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
 
   elements.contextUri.textContent = memoryUri;
   elements.modelUri.textContent = memoryUri;
+  elements.embeddingModelLabel.textContent = formatEmbeddingProvider(status.embedding_provider || {});
+  elements.embeddingModelLabel.title = embeddingProviderTitle(status.embedding_provider || {});
   elements.headerRuntime.textContent = runtimeReady ? "READY" : String(status.runtime || "PENDING").toUpperCase();
   elements.modeLabel.textContent = system.mode || "LOCAL ONLY";
   elements.platformLabel.textContent = platformLabel(system);
@@ -1048,6 +1051,38 @@ function platformLabel(system) {
     return "Apple Silicon";
   }
   return [system.platform, machine].filter(Boolean).join(" ") || "local";
+}
+
+function formatEmbeddingProvider(provider) {
+  const providerId = String(provider.provider || "unknown");
+  const modelId = String(provider.model_id || providerId);
+  if (provider.provider_type === "mlx-neural") {
+    return `MLX neural / ${compactModelId(modelId)}`;
+  }
+  if (provider.provider_type === "semantic-hash") {
+    return "semantic hash";
+  }
+  if (provider.provider_type === "lexical-hash") {
+    return "lexical hash";
+  }
+  return compactModelId(modelId);
+}
+
+function embeddingProviderTitle(provider) {
+  const fields = [
+    `provider=${provider.provider || "unknown"}`,
+    `model=${provider.model_id || provider.provider || "unknown"}`,
+    `local_only=${provider.local_only !== false}`,
+  ];
+  if (provider.native_mlx !== undefined) fields.push(`native_mlx=${Boolean(provider.native_mlx)}`);
+  if (provider.loaded !== undefined) fields.push(`loaded=${Boolean(provider.loaded)}`);
+  return fields.join(" / ");
+}
+
+function compactModelId(modelId) {
+  const text = String(modelId || "unknown");
+  const parts = text.split("/");
+  return parts[parts.length - 1] || text;
 }
 
 function countEventEntries(entries) {

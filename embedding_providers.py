@@ -15,6 +15,9 @@ from typing import Any, Callable
 
 MAX_PROVIDER_DIMS = 32_768
 TOKEN_RE = re.compile(r"[a-z0-9_.:/#-]+")
+DEFAULT_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+DEFAULT_NEURAL_POOLING = "mean"
+DEFAULT_NEURAL_MAX_TOKENS = 512
 
 CONCEPT_GROUPS: dict[str, set[str]] = {
     "local_compute": {
@@ -133,6 +136,21 @@ class EmbeddingProvider:
     def embed(self, text: str, *, dimensions: int) -> EmbeddingResult:
         raise NotImplementedError
 
+    def info(self, *, dimensions: int) -> dict[str, Any]:
+        sample = self.embed("synapse-s2 provider check", dimensions=dimensions)
+        return sample.provenance
+
+
+@dataclass(frozen=True)
+class MLXNeuralEmbeddingConfig:
+    model_id: str
+    cache_dir: str | None
+    revision: str | None
+    pooling: str
+    max_tokens: int
+    normalize: bool
+    local_files_only: bool
+
 
 def resolve_embedding_provider(name: str | None = None) -> EmbeddingProvider:
     requested = (name or os.getenv("SYNAPSE_S2_EMBEDDING_PROVIDER") or "auto").strip()
@@ -145,9 +163,17 @@ def resolve_embedding_provider(name: str | None = None) -> EmbeddingProvider:
         return LexicalHashEmbeddingProvider()
     if normalized.startswith("python:"):
         return PythonCallableEmbeddingProvider(requested)
+    if normalized in {"neural", "mlx", "mlx-neural", "mlx-neural-v1"}:
+        return MLXNeuralEmbeddingProvider()
+    if normalized.startswith("neural:"):
+        _, model_id = requested.split(":", 1)
+        return MLXNeuralEmbeddingProvider(model_id=model_id.strip() or None)
+    if normalized.startswith("mlx-neural:"):
+        _, model_id = requested.split(":", 1)
+        return MLXNeuralEmbeddingProvider(model_id=model_id.strip() or None)
     raise EmbeddingProviderError(
         "unknown embedding provider; expected auto, semantic-hash, lexical-hash, "
-        "or python:/path/to/module.py:function"
+        "mlx-neural[:model-id], or python:/path/to/module.py:function"
     )
 
 
@@ -289,6 +315,264 @@ class PythonCallableEmbeddingProvider(EmbeddingProvider):
         )
 
 
+class MLXNeuralEmbeddingProvider(EmbeddingProvider):
+    provider_id = "mlx-neural-v1"
+
+    def __init__(
+        self,
+        model_id: str | None = None,
+        *,
+        runtime_factory: Callable[[MLXNeuralEmbeddingConfig], Any] | None = None,
+        pooling: str | None = None,
+        max_tokens: int | None = None,
+        cache_dir: str | os.PathLike[str] | None = None,
+        revision: str | None = None,
+        normalize: bool | None = None,
+        local_files_only: bool | None = None,
+    ) -> None:
+        self.model_id = (
+            model_id
+            or os.getenv("SYNAPSE_S2_NEURAL_MODEL")
+            or DEFAULT_NEURAL_MODEL
+        ).strip()
+        if not self.model_id:
+            raise EmbeddingProviderError("MLX neural provider requires a model id")
+        self.pooling = _validate_pooling(
+            pooling or os.getenv("SYNAPSE_S2_NEURAL_POOLING") or DEFAULT_NEURAL_POOLING
+        )
+        self.max_tokens = _positive_int(
+            max_tokens
+            if max_tokens is not None
+            else os.getenv("SYNAPSE_S2_NEURAL_MAX_TOKENS"),
+            default=DEFAULT_NEURAL_MAX_TOKENS,
+            name="SYNAPSE_S2_NEURAL_MAX_TOKENS",
+        )
+        self.cache_dir = _optional_path_str(
+            cache_dir
+            if cache_dir is not None
+            else os.getenv("SYNAPSE_S2_NEURAL_CACHE_DIR")
+        )
+        self.revision = (
+            revision
+            if revision is not None
+            else os.getenv("SYNAPSE_S2_NEURAL_REVISION")
+        )
+        self.normalize = _env_bool(
+            "SYNAPSE_S2_NEURAL_NORMALIZE",
+            default=True if normalize is None else bool(normalize),
+        )
+        self.local_files_only = _env_bool(
+            "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY",
+            default=False if local_files_only is None else bool(local_files_only),
+        )
+        self._runtime_factory = runtime_factory or MLXNeuralEmbeddingRuntime
+        self._runtime = None
+
+    def embed(self, text: str, *, dimensions: int) -> EmbeddingResult:
+        dims = _validate_dimensions(dimensions)
+        runtime = self._get_runtime()
+        try:
+            raw_vector = runtime.embed_text(
+                str(text or ""),
+                pooling=self.pooling,
+                max_tokens=self.max_tokens,
+            )
+        except EmbeddingProviderError:
+            raise
+        except Exception as exc:
+            raise EmbeddingProviderError(
+                f"MLX neural model {self.model_id} failed to embed text: {exc}"
+            ) from exc
+
+        source_vector = _validate_float_list(raw_vector)
+        vector = _project_vector(source_vector, dimensions=dims)
+        if self.normalize:
+            vector = _normalize_vector(vector)
+        runtime_model_id = str(getattr(runtime, "model_id", self.model_id))
+        provenance = _provenance(
+            provider=self.provider_id,
+            provider_type="mlx-neural",
+            dimensions=dims,
+            semantic=True,
+            local_only=True,
+            tokens=_tokens(str(text or "").lower()),
+            concepts=[],
+            vector=vector,
+            feature_count=None,
+            model_id=runtime_model_id,
+            details={
+                "cache_dir": self.cache_dir or "",
+                "revision": self.revision or "",
+                "max_tokens": self.max_tokens,
+                "projection": "signed-hash-projection-v1",
+                "runtime_source": str(getattr(runtime, "source", "")),
+            },
+        )
+        provenance.update(
+            {
+                "native_mlx": bool(getattr(runtime, "native_mlx", False)),
+                "pooling": self.pooling,
+                "source_dimensions": len(source_vector),
+                "normalized": bool(self.normalize),
+            }
+        )
+        return EmbeddingResult(vector=vector, provenance=provenance)
+
+    def info(self, *, dimensions: int) -> dict[str, Any]:
+        dims = _validate_dimensions(dimensions)
+        return {
+            "provider": self.provider_id,
+            "provider_type": "mlx-neural",
+            "model_id": self.model_id,
+            "dimensions": dims,
+            "semantic": True,
+            "local_only": True,
+            "native_mlx": True,
+            "pooling": self.pooling,
+            "max_tokens": self.max_tokens,
+            "normalized": bool(self.normalize),
+            "loaded": self._runtime is not None,
+            "cache_dir": self.cache_dir or "",
+            "revision": self.revision or "",
+        }
+
+    def _get_runtime(self):
+        if self._runtime is not None:
+            return self._runtime
+        config = MLXNeuralEmbeddingConfig(
+            model_id=self.model_id,
+            cache_dir=self.cache_dir,
+            revision=self.revision,
+            pooling=self.pooling,
+            max_tokens=self.max_tokens,
+            normalize=self.normalize,
+            local_files_only=self.local_files_only,
+        )
+        try:
+            self._runtime = self._runtime_factory(config)
+        except EmbeddingProviderError:
+            raise
+        except ImportError as exc:
+            raise EmbeddingProviderError(
+                "MLX neural embeddings require mlx-lm, huggingface-hub, "
+                "tokenizers, and safetensors. Install with `uv add mlx-lm "
+                "huggingface-hub tokenizers safetensors`, then set "
+                "SYNAPSE_S2_NEURAL_MODEL to an MLX embedding model such as "
+                f"{DEFAULT_NEURAL_MODEL}."
+            ) from exc
+        except Exception as exc:
+            raise EmbeddingProviderError(
+                f"failed to load MLX neural embedding model {self.model_id}; "
+                "verify SYNAPSE_S2_NEURAL_MODEL, SYNAPSE_S2_NEURAL_CACHE_DIR, "
+                f"and network/cache access: {exc}"
+            ) from exc
+        return self._runtime
+
+
+class MLXNeuralEmbeddingRuntime:
+    native_mlx = True
+
+    def __init__(self, config: MLXNeuralEmbeddingConfig) -> None:
+        self.config = config
+        self.model_id = config.model_id
+        self.source = config.model_id
+        self.model_config: dict[str, Any] = {}
+        self.model, self.tokenizer = self._load_model(config)
+
+    def _load_model(self, config: MLXNeuralEmbeddingConfig):
+        from mlx_lm import load
+
+        model_ref = self._resolve_model_ref(config)
+        loaded = load(
+            model_ref,
+            lazy=False,
+            return_config=True,
+            revision=None if Path(str(model_ref)).expanduser().exists() else config.revision,
+        )
+        model, tokenizer, model_config = loaded
+        self.model_config = _json_safe(model_config)
+        return model, tokenizer
+
+    def _resolve_model_ref(self, config: MLXNeuralEmbeddingConfig) -> str:
+        local_path = Path(config.model_id).expanduser()
+        if local_path.exists():
+            self.source = str(local_path)
+            return str(local_path)
+        if not config.cache_dir:
+            return config.model_id
+
+        from huggingface_hub import snapshot_download
+
+        cache_root = Path(config.cache_dir).expanduser()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        model_path = snapshot_download(
+            repo_id=config.model_id,
+            cache_dir=str(cache_root),
+            revision=config.revision,
+            local_files_only=config.local_files_only,
+            allow_patterns=[
+                "*.json",
+                "*.model",
+                "*.txt",
+                "*.py",
+                "*.safetensors",
+                "tokenizer*",
+                "special_tokens_map.json",
+                "generation_config.json",
+            ],
+        )
+        self.source = model_path
+        return model_path
+
+    def embed_text(self, text: str, *, pooling: str, max_tokens: int) -> list[float]:
+        import mlx.core as mx
+
+        tokens = self._encode(text, max_tokens=max_tokens)
+        token_array = mx.array([tokens], dtype=mx.int32)
+        hidden = self._hidden_states(token_array)
+        pooled = self._pool(hidden, pooling=pooling)
+        denom = mx.sqrt(mx.sum(pooled * pooled))
+        pooled = pooled / mx.maximum(denom, mx.array(1e-12))
+        mx.eval(pooled)
+        return [float(value) for value in pooled.tolist()]
+
+    def _encode(self, text: str, *, max_tokens: int) -> list[int]:
+        try:
+            tokens = self.tokenizer.encode(str(text or ""), add_special_tokens=True)
+        except TypeError:
+            tokens = self.tokenizer.encode(str(text or ""))
+        if not tokens:
+            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+            tokens = [int(eos_token_id)] if eos_token_id is not None else [0]
+        return [int(token) for token in tokens[:max_tokens]]
+
+    def _hidden_states(self, token_array):
+        core_model = getattr(self.model, "model", None)
+        if callable(core_model):
+            output = core_model(token_array)
+        else:
+            output = self.model(token_array)
+        return _extract_array_output(output)
+
+    def _pool(self, hidden, *, pooling: str):
+        import mlx.core as mx
+
+        if len(hidden.shape) == 3:
+            sequence = hidden[0]
+        elif len(hidden.shape) == 2:
+            sequence = hidden
+        elif len(hidden.shape) == 1:
+            return hidden
+        else:
+            sequence = mx.reshape(hidden, (-1, hidden.shape[-1]))
+
+        if pooling == "last":
+            return sequence[-1]
+        if pooling == "first":
+            return sequence[0]
+        return mx.mean(sequence, axis=0)
+
+
 def _tokens(text: str) -> list[str]:
     tokens = TOKEN_RE.findall(text)
     return tokens or ["empty"]
@@ -362,6 +646,102 @@ def _validate_vector(vector: Any, *, dimensions: int) -> list[float]:
             raise EmbeddingProviderError("provider returned non-finite vector value")
         safe.append(number)
     return safe
+
+
+def _validate_float_list(vector: Any) -> list[float]:
+    if not isinstance(vector, (list, tuple)):
+        raise EmbeddingProviderError("neural runtime returned vector must be a list")
+    if not vector:
+        raise EmbeddingProviderError("neural runtime returned an empty vector")
+    safe: list[float] = []
+    for value in vector:
+        number = float(value)
+        if not math.isfinite(number):
+            raise EmbeddingProviderError("neural runtime returned non-finite vector value")
+        safe.append(number)
+    return safe
+
+
+def _project_vector(vector: list[float], *, dimensions: int) -> list[float]:
+    dims = _validate_dimensions(dimensions)
+    if len(vector) == dims:
+        return list(vector)
+    projected = [0.0] * dims
+    for index, value in enumerate(vector):
+        digest = hashlib.blake2b(
+            f"mlx-neural-v1:{len(vector)}:{index}".encode("utf-8"),
+            digest_size=12,
+        ).digest()
+        target = int.from_bytes(digest[:4], "big") % dims
+        sign = 1.0 if digest[4] % 2 == 0 else -1.0
+        projected[target] += sign * float(value)
+    return projected
+
+
+def _normalize_vector(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(float(value) * float(value) for value in vector))
+    if norm <= 1e-12:
+        normalized = [0.0] * len(vector)
+        if normalized:
+            normalized[0] = 1.0
+        return normalized
+    return [float(value) / norm for value in vector]
+
+
+def _validate_pooling(pooling: str) -> str:
+    normalized = str(pooling or DEFAULT_NEURAL_POOLING).strip().lower()
+    if normalized in {"mean", "avg", "average"}:
+        return "mean"
+    if normalized in {"last", "eos"}:
+        return "last"
+    if normalized in {"first", "cls"}:
+        return "first"
+    raise EmbeddingProviderError("SYNAPSE_S2_NEURAL_POOLING must be mean, last, or first")
+
+
+def _positive_int(value: Any, *, default: int, name: str) -> int:
+    if value is None or value == "":
+        return int(default)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise EmbeddingProviderError(f"{name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise EmbeddingProviderError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _optional_path_str(value: str | os.PathLike[str] | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return str(Path(text).expanduser())
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _extract_array_output(output: Any):
+    if isinstance(output, dict):
+        for key in ("last_hidden_state", "hidden_states", "embeddings", "logits"):
+            if key in output:
+                return _extract_array_output(output[key])
+    if isinstance(output, (list, tuple)):
+        if not output:
+            raise EmbeddingProviderError("MLX neural model returned no hidden state")
+        return _extract_array_output(output[0])
+    shape = getattr(output, "shape", None)
+    if shape is None:
+        raise EmbeddingProviderError(
+            f"MLX neural model returned unsupported output type {type(output).__name__}"
+        )
+    return output
 
 
 def _provenance(

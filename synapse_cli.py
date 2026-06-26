@@ -332,6 +332,15 @@ def command_profile(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_provider_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.benchmark_embedding_provider(
+        text=args.text,
+        runs=args.runs,
+        dimensions=args.embedding_dimensions or args.dimension,
+    )
+
+
 def command_certify_runtime(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.certify_runtime(
@@ -518,7 +527,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--embedding-provider",
         default=None,
-        help="Text embedding provider: auto, semantic-hash, lexical-hash, or python:/path.py:function.",
+        help=(
+            "Text embedding provider: auto, mlx-neural[:model], semantic-hash, "
+            "lexical-hash, or python:/path.py:function."
+        ),
     )
     parser.add_argument(
         "--require-native-backend",
@@ -656,6 +668,12 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--target-min-mb", type=float, default=61.0)
     profile.add_argument("--target-max-mb", type=float, default=138.0)
     profile.set_defaults(func=command_profile)
+
+    provider_benchmark = subparsers.add_parser("provider-benchmark")
+    provider_benchmark.add_argument("--text", required=True)
+    provider_benchmark.add_argument("--runs", type=int, default=1)
+    provider_benchmark.add_argument("--embedding-dimensions", type=int, default=None)
+    provider_benchmark.set_defaults(func=command_provider_benchmark)
 
     certify_runtime = subparsers.add_parser("certify-runtime")
     certify_runtime.add_argument("--strict-native", action="store_true")

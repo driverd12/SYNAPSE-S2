@@ -215,7 +215,7 @@ def query_spiking_attention(
     }
 )
 def query_spiking_attention_text(prompt: str, context_id: str = "default") -> str:
-    """Return activated context tags using local deterministic text projection."""
+    """Return activated context tags using the configured local text embedding provider."""
     context = _sanitize_context_id(context_id)
     try:
         prompt_text = _validate_text(prompt, field_name="prompt")
@@ -719,6 +719,41 @@ def profile_spiking_resources(
     except Exception as exc:
         LOGGER.exception("resource profile failed")
         return json.dumps({"error": f"resource profile failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Benchmark SYNAPSE-S2 Embedding Provider",
+        "readOnlyHint": False,
+    }
+)
+def benchmark_spiking_embedding_provider(
+    text: str,
+    runs: int = 1,
+    dimensions: int = 0,
+) -> str:
+    """Embed text with the configured local provider and report latency/provenance."""
+    try:
+        prompt = str(text or "").strip()
+        if not prompt:
+            raise ValueError("text must not be empty")
+        if len(prompt) > 20_000:
+            raise ValueError("text exceeds 20000 characters")
+        bounded_runs = max(1, min(int(runs), 25))
+        requested_dimensions = None if int(dimensions) <= 0 else int(dimensions)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.benchmark_embedding_provider(
+            text=prompt,
+            runs=bounded_runs,
+            dimensions=requested_dimensions,
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid embedding provider benchmark request: %s", exc)
+        return json.dumps({"error": f"invalid embedding provider benchmark: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("embedding provider benchmark failed")
+        return json.dumps({"error": f"embedding provider benchmark failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool(

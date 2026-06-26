@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import json
 import math
@@ -532,8 +533,9 @@ class SpikingAttentionBackend:
 
     def embedding_provider_info(self) -> dict[str, Any]:
         try:
-            sample = self.embedding_provider.embed("synapse-s2 provider check", dimensions=8)
-            return self._json_safe_metadata(sample.provenance)
+            return self._json_safe_metadata(
+                self.embedding_provider.info(dimensions=min(8, self.dimension))
+            )
         except Exception as exc:
             return {
                 "provider": str(self.embedding_provider_name),
@@ -542,6 +544,48 @@ class SpikingAttentionBackend:
                 "local_only": True,
                 "error": str(exc),
             }
+
+    def benchmark_embedding_provider(
+        self,
+        *,
+        text: str,
+        runs: int = 1,
+        dimensions: int | None = None,
+    ) -> dict[str, Any]:
+        bounded_runs = max(1, min(int(runs), 25))
+        dims = int(dimensions or self.dimension)
+        if dims <= 0 or dims > MAX_EMBEDDING_DIMS:
+            raise ValueError(f"dimensions must be between 1 and {MAX_EMBEDDING_DIMS}")
+        prompt = str(text or "")
+        sample_latencies: list[float] = []
+        payload: dict[str, Any] | None = None
+        started = time.perf_counter()
+        for _ in range(bounded_runs):
+            sample_started = time.perf_counter()
+            payload = self.embed_text_payload(prompt, dimensions=dims)
+            sample_latencies.append(
+                round((time.perf_counter() - sample_started) * 1000, 3)
+            )
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        embedding = payload["embedding"] if payload else []
+        try:
+            vector = [float(value) for value in embedding.tolist()]
+        except AttributeError:
+            vector = [float(value) for value in embedding]
+        return {
+            "action": "provider-benchmark",
+            "input_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "input_chars": len(prompt),
+            "dimensions": dims,
+            "runs": bounded_runs,
+            "elapsed_ms": elapsed_ms,
+            "average_latency_ms": round(sum(sample_latencies) / len(sample_latencies), 3),
+            "sample_latencies_ms": sample_latencies,
+            "vector_nonzero_count": sum(
+                1 for value in vector if abs(float(value)) > 1e-12
+            ),
+            "embedding_provider": payload["provenance"] if payload else {},
+        }
 
     def register_text_trace(
         self,
@@ -1738,6 +1782,8 @@ class SpikingAttentionBackend:
         )
         status = self.status(context_id="default")
         mlx_device = str(status.get("mlx_device") or "default").lower()
+        provider_status = status["embedding_provider"]
+        provider_type = str(provider_status.get("provider_type", ""))
         checks = {
             "mlx_available": self._cert_check(
                 passed=mx is not None,
@@ -1785,9 +1831,20 @@ class SpikingAttentionBackend:
                 ),
             ),
             "embedding_provider_local": self._cert_check(
-                passed=bool(status["embedding_provider"].get("local_only", True)),
+                passed=bool(provider_status.get("local_only", True)),
                 required=True,
-                detail=str(status["embedding_provider"].get("provider", "")),
+                detail=str(provider_status.get("provider", "")),
+            ),
+            "embedding_provider_native_mlx": self._cert_check(
+                passed=(
+                    provider_type != "mlx-neural"
+                    or bool(provider_status.get("native_mlx", False))
+                ),
+                required=provider_type == "mlx-neural",
+                detail=(
+                    f"{provider_status.get('provider', '')} "
+                    f"native_mlx={provider_status.get('native_mlx', False)}"
+                ),
             ),
         }
         failed_checks = [
@@ -2485,6 +2542,19 @@ def resource_profile(
         benchmark_quick_prune=benchmark_quick_prune,
         target_min_mb=target_min_mb,
         target_max_mb=target_max_mb,
+    )
+
+
+def benchmark_embedding_provider(
+    *,
+    text: str,
+    runs: int = 1,
+    dimensions: int | None = None,
+) -> dict[str, Any]:
+    return get_backend().benchmark_embedding_provider(
+        text=text,
+        runs=runs,
+        dimensions=dimensions,
     )
 
 

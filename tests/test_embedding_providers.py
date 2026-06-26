@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from embedding_providers import resolve_embedding_provider
+import embedding_providers
+from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
 
 
 def cosine(left, right):
@@ -16,6 +17,13 @@ def cosine(left, right):
 
 
 class EmbeddingProviderTests(unittest.TestCase):
+    def _neural_provider_class(self):
+        self.assertTrue(
+            hasattr(embedding_providers, "MLXNeuralEmbeddingProvider"),
+            "MLXNeuralEmbeddingProvider must be implemented",
+        )
+        return embedding_providers.MLXNeuralEmbeddingProvider
+
     def test_semantic_hash_provider_expands_related_local_compute_terms(self):
         provider = resolve_embedding_provider("semantic-hash")
 
@@ -69,6 +77,92 @@ class EmbeddingProviderTests(unittest.TestCase):
         self.assertEqual(result.provenance["provider"], "semantic-hash-v1")
         self.assertEqual(len(result.vector), 32)
         self.assertTrue(result.provenance["local_only"])
+
+    def test_mlx_neural_provider_resolves_without_eager_model_load(self):
+        try:
+            provider = resolve_embedding_provider("mlx-neural:unit-neural-model")
+        except EmbeddingProviderError as exc:
+            self.fail(
+                "resolver must support mlx-neural providers without eager model load: "
+                f"{exc}"
+            )
+
+        self.assertEqual(provider.provider_id, "mlx-neural-v1")
+        self.assertEqual(getattr(provider, "model_id", None), "unit-neural-model")
+        self.assertIsNone(getattr(provider, "_runtime", None))
+
+    def test_mlx_neural_provider_info_does_not_eager_load_model(self):
+        Provider = self._neural_provider_class()
+        loaded = []
+        provider = Provider(
+            model_id="unit-neural-model",
+            runtime_factory=lambda config: loaded.append(config),
+        )
+
+        self.assertTrue(hasattr(provider, "info"), "provider must expose lazy info()")
+        info = provider.info(dimensions=32)
+
+        self.assertEqual(loaded, [])
+        self.assertEqual(info["provider"], "mlx-neural-v1")
+        self.assertEqual(info["provider_type"], "mlx-neural")
+        self.assertEqual(info["model_id"], "unit-neural-model")
+        self.assertEqual(info["dimensions"], 32)
+        self.assertTrue(info["semantic"])
+        self.assertTrue(info["local_only"])
+
+    def test_mlx_neural_provider_projects_runtime_embedding_with_provenance(self):
+        Provider = self._neural_provider_class()
+        loaded = []
+
+        class FakeRuntime:
+            model_id = "unit-neural-model"
+            native_mlx = True
+
+            def embed_text(self, text, *, pooling, max_tokens):
+                loaded.append((text, pooling, max_tokens))
+                return [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+        provider = Provider(
+            model_id="unit-neural-model",
+            runtime_factory=lambda config: FakeRuntime(),
+            pooling="mean",
+            max_tokens=128,
+        )
+
+        result = provider.embed("neural semantic recall", dimensions=10)
+
+        self.assertEqual(loaded, [("neural semantic recall", "mean", 128)])
+        self.assertEqual(len(result.vector), 10)
+        self.assertAlmostEqual(
+            math.sqrt(sum(value * value for value in result.vector)),
+            1.0,
+            places=6,
+        )
+        self.assertEqual(result.provenance["provider"], "mlx-neural-v1")
+        self.assertEqual(result.provenance["provider_type"], "mlx-neural")
+        self.assertEqual(result.provenance["model_id"], "unit-neural-model")
+        self.assertTrue(result.provenance["semantic"])
+        self.assertTrue(result.provenance["local_only"])
+        self.assertTrue(result.provenance["native_mlx"])
+        self.assertEqual(result.provenance["pooling"], "mean")
+        self.assertEqual(result.provenance["source_dimensions"], 6)
+
+    def test_mlx_neural_provider_wraps_dependency_failure_with_actionable_message(self):
+        Provider = self._neural_provider_class()
+
+        def broken_runtime(_config):
+            raise ImportError("No module named 'mlx_lm'")
+
+        provider = Provider(
+            model_id="unit-neural-model",
+            runtime_factory=broken_runtime,
+        )
+
+        with self.assertRaisesRegex(
+            EmbeddingProviderError,
+            "mlx-lm.*SYNAPSE_S2_NEURAL_MODEL",
+        ):
+            provider.embed("dependency failure path", dimensions=8)
 
 
 if __name__ == "__main__":

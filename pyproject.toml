@@ -9,6 +9,10 @@ dependencies = [
     "mlx>=0.25.0",
     "numpy>=2.0.0",
     "mlx-snn @ git+https://github.com/D-ST-Sword/mlx-snn.git",
+    "mlx-lm>=0.31.3",
+    "huggingface-hub>=1.21.0",
+    "tokenizers>=0.22.2",
+    "safetensors>=0.8.0",
 ]
 
 [project.optional-dependencies]

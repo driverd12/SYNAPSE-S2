@@ -172,15 +172,20 @@ The default topology should report `within_target_envelope: true` for the propos
 Embedding provider provenance:
 
 ```bash
+.venv/bin/python synapse_cli.py --json \
+  --embedding-provider mlx-neural \
+  provider-benchmark \
+  --text "Apple Silicon Metal acceleration should recall M-series MLX GPU compute context." \
+  --runs 3
 .venv/bin/python synapse_cli.py --json remember-text \
-  --embedding-provider semantic-hash \
+  --embedding-provider mlx-neural \
   --context default \
-  --tag provider-check \
+  --tag neural-provider-check \
   --text "Apple Silicon Metal acceleration should recall M-series MLX GPU compute context."
 .venv/bin/python synapse_cli.py --json list-memory --context default --limit 1
 ```
 
-The memory entry metadata should include `embedding_provider.provider: semantic-hash-v1`. For an IT-managed local model, set `--embedding-provider python:/absolute/path/encoder.py:embed` or `SYNAPSE_S2_EMBEDDING_PROVIDER` to the same value.
+The benchmark should report `embedding_provider.provider: mlx-neural-v1`, `model_id: mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`, and `native_mlx: true`. First run may include model download or cache load cost; warm in-process runs should show the steady-state embedding latency. The memory entry metadata should carry the same neural provider provenance. For deterministic no-model fallback, set `--embedding-provider semantic-hash`; for an IT-managed local encoder, set `--embedding-provider python:/absolute/path/encoder.py:embed` or `SYNAPSE_S2_EMBEDDING_PROVIDER` to the same value.
 
 Backup:
 
@@ -227,7 +232,7 @@ Useful tool calls:
 | :--- | :--- |
 | `get_spiking_attention_status` | Proves the runtime is enabled and shows memory counts. |
 | `remember_spiking_context` | Stores a new local memory trace. |
-| `query_spiking_attention_text` | Recalls local memory from text without external embedding calls. |
+| `query_spiking_attention_text` | Recalls local memory from text using the configured local provider; installed clients default to MLX neural embeddings without external inference calls. |
 | `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
 | `capture_spiking_conversation` | Captures real operator/agent session notes into event memory. |
 | `drop_spiking_capture_inbox` | Drops opt-in session notes for the always-on local sidecar. |
