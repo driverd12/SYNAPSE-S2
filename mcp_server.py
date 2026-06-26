@@ -88,6 +88,21 @@ def _validate_embedding(prompt_embedding: list[float]) -> list[float]:
     return values
 
 
+def _validate_optional_embedding(prompt_embedding: list[float] | None) -> list[float] | None:
+    if prompt_embedding is None:
+        return None
+    return _validate_embedding(prompt_embedding)
+
+
+def _validate_text(text: str, *, field_name: str = "text") -> str:
+    value = str(text or "").strip()
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if len(value) > 20_000:
+        raise ValueError(f"{field_name} exceeds 20000 characters")
+    return value
+
+
 def _load_backend():
     import mlx.core as mx
     import mlx_backend
@@ -121,6 +136,100 @@ def query_spiking_attention(
     except Exception as exc:
         LOGGER.exception("spiking attention query failed for context_id=%s", context)
         return f"spiking attention unavailable: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Query Spiking Associative Memory From Text",
+        "readOnlyHint": True,
+    }
+)
+def query_spiking_attention_text(prompt: str, context_id: str = "default") -> str:
+    """Return activated context tags using local deterministic text projection."""
+    context = _sanitize_context_id(context_id)
+    try:
+        prompt_text = _validate_text(prompt, field_name="prompt")
+        _, mlx_backend = _load_backend()
+        return mlx_backend.simulate_spiking_text_retrieval(
+            prompt=prompt_text,
+            context_id=context,
+        )
+    except ValueError as exc:
+        LOGGER.warning("invalid prompt text for context_id=%s: %s", context, exc)
+        return f"invalid prompt: {exc}"
+    except Exception as exc:
+        LOGGER.exception("text spiking attention query failed for context_id=%s", context)
+        return f"spiking attention unavailable: {exc}"
+
+
+@mcp.tool()
+def remember_spiking_context(
+    tag: str,
+    context_id: str = "default",
+    prompt_embedding: list[float] | None = None,
+    text: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Persist a named context trace for future spiking associative recall."""
+    context = _sanitize_context_id(context_id)
+    try:
+        mx, mlx_backend = _load_backend()
+        values = _validate_optional_embedding(prompt_embedding)
+        source_text = str(text or "").strip()
+        if values is None:
+            source_text = _validate_text(source_text)
+            registration = mlx_backend.register_text_trace(
+                tag=tag,
+                text=source_text,
+                context_id=context,
+                metadata=metadata or {},
+            )
+        else:
+            registration = mlx_backend.register_trace(
+                tag=tag,
+                embedding=mx.array(values, dtype=mx.float32),
+                context_id=context,
+                metadata=metadata or {},
+                source_text=source_text,
+            )
+        return json.dumps(registration, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid trace registration for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid trace: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("trace registration failed for context_id=%s", context)
+        return json.dumps({"error": f"trace registration failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def set_spiking_attention_enabled(enabled: bool, context_id: str = "global") -> str:
+    """Enable or disable SYNAPSE-S2 globally or for one context id."""
+    context = _sanitize_context_id(context_id)
+    try:
+        _, mlx_backend = _load_backend()
+        status = mlx_backend.set_enabled(bool(enabled), context_id=context)
+        return json.dumps(status, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("toggle failed for context_id=%s", context)
+        return json.dumps({"error": f"toggle failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get SYNAPSE-S2 Status",
+        "readOnlyHint": True,
+    }
+)
+def get_spiking_attention_status(context_id: str = "default") -> str:
+    """Return runtime health, toggle state, and memory-store status."""
+    context = _sanitize_context_id(context_id)
+    try:
+        _, mlx_backend = _load_backend()
+        status = mlx_backend.get_status(context_id=context)
+        return json.dumps(status, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("status check failed for context_id=%s", context)
+        return json.dumps({"error": f"status failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool()

@@ -4,6 +4,77 @@ SYNAPSE-S2 (Synaptic Plasticity & Spiking Encoding via $S^2$) is an Apple Silico
 
 Unlike traditional vector similarity retrieval methods, SYNAPSE-S2 runs natively on M-series GPUs, completely eliminating the $O(N^2)$ memory wall of traditional self-attention by implementing the Spiking STDP Transformer ($S^2TDPT$) mathematical framework. It operates as a multiplication-free, addition-only system that embeds query-key correlations directly in synaptic weights using Spike-Timing-Dependent Plasticity (STDP).
 
+## **Operational Quickstart**
+
+This repository now includes a working local MCP server, persistent memory store, runtime toggle controls, and a CLI for validation outside an MCP client.
+
+### 1. Install Runtime Dependencies
+
+```bash
+brew install uv
+uv sync
+scripts/install_local_launcher.sh
+```
+
+The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists because this checked-out workspace path contains spaces and a colon, which can break tools that split command strings or PATH entries. The launcher executes the synced virtual environment directly:
+
+```bash
+/Users/dan.driver/.local/bin/synapse-s2-mcp
+```
+
+### 2. Verify the Local Engine
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python synapse_cli.py --json doctor --context board-demo
+```
+
+### 3. Seed and Query Persistent Memory
+
+```bash
+.venv/bin/python synapse_cli.py --json seed-demo --context board-demo
+.venv/bin/python synapse_cli.py --json query-text \
+  --context board-demo \
+  --text "Apple Silicon local spiking memory can reduce context pressure for Codex and Claude"
+```
+
+Expected query output returns ranked registered traces such as `ops-toggle`, `metal-runtime`, and `executive-briefing`.
+
+### 4. Toggle Runtime Behavior
+
+```bash
+.venv/bin/python synapse_cli.py --json disable --context board-demo
+.venv/bin/python synapse_cli.py --json query-text --context board-demo --text "anything"
+.venv/bin/python synapse_cli.py --json enable --context board-demo
+```
+
+When disabled, queries return a disabled status instead of mutating or recalling memory.
+
+### 5. MCP Tool Surface
+
+The MCP server exposes these tools:
+
+| Tool | Purpose |
+| :--- | :--- |
+| `query_spiking_attention` | Query with a dense embedding vector. |
+| `query_spiking_attention_text` | Query with local deterministic text projection when no embedding model is available. |
+| `remember_spiking_context` | Persist a named context trace from text and/or an embedding. |
+| `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
+| `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
+| `trigger_sleep_consolidation` | Run deep-sleep consolidation and semantic hierarchy extraction. |
+
+FastMCP smoke check:
+
+```bash
+.venv/bin/fastmcp list --command /Users/dan.driver/.local/bin/synapse-s2-mcp --json --timeout 15
+.venv/bin/fastmcp call --command /Users/dan.driver/.local/bin/synapse-s2-mcp \
+  --target get_spiking_attention_status \
+  --input-json '{"context_id":"board-demo"}' \
+  --json --timeout 15
+```
+
+Project `.mcp.json` and `/Users/dan.driver/.codex/config.toml` are configured to use the launcher directly.
+
 ## **System Architecture**
 
 The plugin acts as a middleware daemon communicating with local editor interfaces and LLM desktop wrappers via JSON-RPC 2.0 over standard input/output (stdio) channels.
@@ -25,7 +96,7 @@ The plugin acts as a middleware daemon communicating with local editor interface
                               | to sparse sensory spikes
                               v
 +-----------------------------------------------------------+
-|              SYNAPSE-S2 SPICKING SUBSTRATE                |
+|              SYNAPSE-S2 SPIKING SUBSTRATE                 |
 |        (Metal-Accelerated Recurrent mlx-snn Model)        |
 +-----------------------------------------------------------+
 ```
@@ -116,13 +187,10 @@ By executing directly inside Apple's Unified Memory Architecture via mlx-snn, SY
 
 ## **Verification and Diagnostics**
 
-To verify the transport layer, launch the interactive MCP Inspector interface :
-
-Bash
+To verify the transport layer, launch the interactive MCP Inspector interface with the launcher:
 
 ```
-npx @anthropic-ai/mcp-inspector uv run mcp_server.py
+npx @anthropic-ai/mcp-inspector /Users/dan.driver/.local/bin/synapse-s2-mcp
 ```
 
 This verifies the stdio JSON-RPC endpoints and ensures structural tool definitions are fully accessible before registering the server to your primary client environments.
-
