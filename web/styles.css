@@ -295,6 +295,11 @@ textarea:focus-visible {
   padding: 0;
 }
 
+.icon-button.compact {
+  width: 30px;
+  height: 30px;
+}
+
 .utility-button {
   display: inline-flex;
   align-items: center;
@@ -880,6 +885,12 @@ textarea {
   margin-bottom: 8px;
 }
 
+.graph-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
 .graph-shell {
   display: grid;
   grid-template-columns: 152px minmax(0, 1fr);
@@ -969,11 +980,26 @@ textarea {
     linear-gradient(90deg, var(--graph-grid) 1px, transparent 1px),
     var(--graph-bg);
   background-size: 28px 28px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+#graphSvg.is-panning,
+#graphSvg.is-dragging-node {
+  cursor: grabbing;
+}
+
+.graph-viewport {
+  transform-box: fill-box;
 }
 
 .graph-edge {
   stroke: color-mix(in srgb, var(--teal) 45%, var(--muted));
   stroke-linecap: round;
+  transition:
+    stroke-width 120ms ease,
+    opacity 120ms ease;
 }
 
 .graph-edge.weak,
@@ -989,6 +1015,20 @@ textarea {
   fill: var(--panel);
   stroke: var(--teal);
   stroke-width: 2;
+}
+
+.graph-node-group {
+  cursor: grab;
+}
+
+.graph-node-group:focus-visible .graph-node,
+.graph-node-group:hover .graph-node {
+  filter: drop-shadow(0 7px 12px rgba(4, 121, 134, 0.22));
+  stroke-width: 2.8;
+}
+
+#graphSvg.is-dragging-node .graph-node-group {
+  cursor: grabbing;
 }
 
 .context-node {
@@ -1307,6 +1347,7 @@ textarea {
   .nav-list,
   .resource-stats,
   .graph-shell,
+  .graph-toolbar,
   .query-form,
   .result-list,
   .write-grid,
@@ -1323,6 +1364,11 @@ textarea {
 
   .top-actions {
     justify-content: start;
+  }
+
+  .graph-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .panel {

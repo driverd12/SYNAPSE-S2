@@ -1,11 +1,21 @@
 const DEFAULT_CONTEXT = "default";
-const THEME_STORAGE_KEY = "synapse-s2-control-theme-v2";
+const THEME_STORAGE_KEY = "synapse-s2-control-theme-v3";
 const SNAPSHOT_LIMIT = 80;
+const GRAPH_WIDTH = 760;
+const GRAPH_HEIGHT = 420;
+const GRAPH_MIN_SCALE = 0.45;
+const GRAPH_MAX_SCALE = 3.2;
 
 const state = {
   context: new URLSearchParams(window.location.search).get("context_id")?.trim() || DEFAULT_CONTEXT,
   snapshot: null,
   lastQueryPayload: null,
+  graph: {
+    nodePositions: new Map(),
+    transform: { x: 0, y: 0, scale: 1 },
+    visibleIds: new Set(),
+    interaction: null,
+  },
 };
 
 const elements = collectElements([
@@ -34,8 +44,12 @@ const elements = collectElements([
   "graphEdgeCount",
   "graphLastPrune",
   "graphNodeCount",
+  "graphFit",
+  "graphReset",
   "graphSummary",
   "graphSvg",
+  "graphZoomIn",
+  "graphZoomOut",
   "headroomMb",
   "headroomState",
   "headerRuntime",
@@ -85,6 +99,7 @@ const elements = collectElements([
 elements.contextInput.value = state.context;
 elements.endpointLabel.textContent = window.location.host || "127.0.0.1:8765";
 applyTheme(loadTheme());
+initializeGraphInteractions();
 
 function collectElements(ids) {
   return Object.fromEntries(ids.map((id) => [id, requiredElement(id)]));
@@ -270,6 +285,7 @@ function renderGraph(graph, status) {
   svg.replaceChildren();
 
   if (!entries.length) {
+    state.graph.visibleIds = new Set();
     appendSvg(svg, "text", {
       x: 380,
       y: 208,
@@ -279,17 +295,37 @@ function renderGraph(graph, status) {
     return;
   }
 
-  const width = 760;
-  const height = 420;
   const visible = entries.slice(0, 14);
-  const positions = layoutGraph(visible, width, height);
+  const visibleIds = new Set(visible.map((entry) => String(entry.memory_id)));
+  state.graph.visibleIds = visibleIds;
+  for (const memoryId of Array.from(state.graph.nodePositions.keys())) {
+    if (!visibleIds.has(memoryId)) {
+      state.graph.nodePositions.delete(memoryId);
+    }
+  }
+  const layoutPositions = layoutGraph(visible, GRAPH_WIDTH, GRAPH_HEIGHT);
+  for (const [memoryId, position] of layoutPositions) {
+    if (!state.graph.nodePositions.has(memoryId)) {
+      state.graph.nodePositions.set(memoryId, { x: position.x, y: position.y });
+    }
+  }
+
+  const viewport = appendSvg(svg, "g", {
+    id: "graphViewport",
+    class: "graph-viewport",
+    transform: graphTransformAttribute(),
+  });
+  const edgeLayer = appendSvg(viewport, "g", { id: "graphEdges", class: "graph-edge-layer" });
+  const nodeLayer = appendSvg(viewport, "g", { id: "graphNodes", class: "graph-node-layer" });
 
   for (const relationship of relationships) {
-    const source = positions.get(relationship.source_memory_id);
-    const target = positions.get(relationship.target_memory_id);
+    const source = state.graph.nodePositions.get(String(relationship.source_memory_id));
+    const target = state.graph.nodePositions.get(String(relationship.target_memory_id));
     if (!source || !target) continue;
     const weight = Number(relationship.weight ?? 0.5);
-    appendSvg(svg, "line", {
+    appendSvg(edgeLayer, "line", {
+      "data-source-id": relationship.source_memory_id,
+      "data-target-id": relationship.target_memory_id,
       x1: source.x,
       y1: source.y,
       x2: target.x,
@@ -300,42 +336,52 @@ function renderGraph(graph, status) {
   }
 
   const contextLabel = status.context_id || graph.context_id || state.context;
-  appendSvg(svg, "circle", {
-    cx: width / 2,
-    cy: height / 2,
+  const contextGroup = appendSvg(nodeLayer, "g", {
+    class: "graph-node-group context-node-group",
+    transform: `translate(${GRAPH_WIDTH / 2} ${GRAPH_HEIGHT / 2})`,
+  });
+  appendSvg(contextGroup, "circle", {
     r: 28,
     class: "graph-node context-node",
   });
-  appendSvg(svg, "text", {
-    x: width / 2,
-    y: height / 2 + 4,
+  appendSvg(contextGroup, "text", {
+    y: 4,
     "text-anchor": "middle",
     class: "graph-label context-label",
   }, compactTag(contextLabel, 18));
 
-  for (const node of positions.values()) {
-    appendSvg(svg, "circle", {
-      cx: node.x,
-      cy: node.y,
-      r: node.entry.metadata?.event_segment ? 20 : 18,
-      class: nodeClass(node.entry),
+  for (const entry of visible) {
+    const position = state.graph.nodePositions.get(String(entry.memory_id));
+    if (!position) continue;
+    const group = appendSvg(nodeLayer, "g", {
+      class: "graph-node-group",
+      "data-node-id": entry.memory_id,
+      transform: `translate(${position.x} ${position.y})`,
+      tabindex: "0",
+      role: "button",
+      "aria-label": `Move ${entry.tag}`,
     });
-    appendSvg(svg, "text", {
-      x: node.x,
-      y: node.y + 34,
+    appendSvg(group, "title", {}, `${entry.tag}\n${entry.source_text || ""}`.trim());
+    appendSvg(group, "circle", {
+      r: entry.metadata?.event_segment ? 20 : 18,
+      class: nodeClass(entry),
+    });
+    appendSvg(group, "text", {
+      y: 34,
       "text-anchor": "middle",
       class: "graph-label",
-    }, compactTag(node.entry.tag, 22));
-    const score = node.entry.spike_count ? `${formatNumber(node.entry.spike_count)} spikes` : "";
+    }, compactTag(entry.tag, 22));
+    const score = entry.spike_count ? `${formatNumber(entry.spike_count)} spikes` : "";
     if (score) {
-      appendSvg(svg, "text", {
-        x: node.x,
-        y: node.y + 49,
+      appendSvg(group, "text", {
+        y: 49,
         "text-anchor": "middle",
         class: "graph-sub-label",
       }, score);
     }
   }
+
+  applyGraphTransform();
 }
 
 function layoutGraph(entries, width, height) {
@@ -364,6 +410,202 @@ function nodeClass(entry) {
   if (entry.metadata?.event_segment) return "graph-node event-node";
   if (entry.metadata?.source_tag || entry.metadata?.source) return "graph-node concept-node";
   return "graph-node";
+}
+
+function graphTransformAttribute() {
+  const transform = state.graph.transform;
+  return `matrix(${transform.scale} 0 0 ${transform.scale} ${transform.x} ${transform.y})`;
+}
+
+function applyGraphTransform() {
+  const viewport = document.getElementById("graphViewport");
+  if (viewport) {
+    viewport.setAttribute("transform", graphTransformAttribute());
+  }
+}
+
+function svgLocalPoint(event) {
+  const svg = elements.graphSvg;
+  const point = svg.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return { x: 0, y: 0 };
+  const local = point.matrixTransform(matrix.inverse());
+  return { x: local.x, y: local.y };
+}
+
+function graphPointFromSvgPoint(point) {
+  const transform = state.graph.transform;
+  return {
+    x: (point.x - transform.x) / transform.scale,
+    y: (point.y - transform.y) / transform.scale,
+  };
+}
+
+function setGraphScale(nextScale, anchor = { x: GRAPH_WIDTH / 2, y: GRAPH_HEIGHT / 2 }) {
+  const transform = state.graph.transform;
+  const scale = clamp(nextScale, GRAPH_MIN_SCALE, GRAPH_MAX_SCALE);
+  const graphAnchor = graphPointFromSvgPoint(anchor);
+  state.graph.transform = {
+    scale,
+    x: anchor.x - graphAnchor.x * scale,
+    y: anchor.y - graphAnchor.y * scale,
+  };
+  applyGraphTransform();
+}
+
+function zoomGraphBy(factor, anchor = { x: GRAPH_WIDTH / 2, y: GRAPH_HEIGHT / 2 }) {
+  setGraphScale(state.graph.transform.scale * factor, anchor);
+}
+
+function resetGraphView() {
+  state.graph.transform = { x: 0, y: 0, scale: 1 };
+  applyGraphTransform();
+}
+
+function resetGraphLayout() {
+  state.graph.nodePositions.clear();
+  resetGraphView();
+  if (state.snapshot?.graph) {
+    renderGraph(state.snapshot.graph, state.snapshot.status || {});
+  }
+}
+
+function fitGraphToView() {
+  const points = Array.from(state.graph.nodePositions.values());
+  if (!points.length) {
+    resetGraphView();
+    return;
+  }
+  points.push({ x: GRAPH_WIDTH / 2, y: GRAPH_HEIGHT / 2 });
+  const bounds = points.reduce((acc, point) => ({
+    minX: Math.min(acc.minX, point.x),
+    maxX: Math.max(acc.maxX, point.x),
+    minY: Math.min(acc.minY, point.y),
+    maxY: Math.max(acc.maxY, point.y),
+  }), {
+    minX: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY,
+  });
+  const padding = 88;
+  const width = Math.max(1, bounds.maxX - bounds.minX);
+  const height = Math.max(1, bounds.maxY - bounds.minY);
+  const scale = clamp(
+    Math.min((GRAPH_WIDTH - padding) / width, (GRAPH_HEIGHT - padding) / height),
+    GRAPH_MIN_SCALE,
+    Math.min(1.65, GRAPH_MAX_SCALE),
+  );
+  const centerX = bounds.minX + width / 2;
+  const centerY = bounds.minY + height / 2;
+  state.graph.transform = {
+    scale,
+    x: GRAPH_WIDTH / 2 - centerX * scale,
+    y: GRAPH_HEIGHT / 2 - centerY * scale,
+  };
+  applyGraphTransform();
+}
+
+function moveGraphNode(memoryId, position) {
+  state.graph.nodePositions.set(String(memoryId), position);
+  const group = elements.graphSvg.querySelector(`[data-node-id="${cssEscape(String(memoryId))}"]`);
+  if (group) {
+    group.setAttribute("transform", `translate(${position.x} ${position.y})`);
+  }
+  updateGraphEdgesForNode(String(memoryId));
+}
+
+function updateGraphEdgesForNode(memoryId) {
+  const edges = elements.graphSvg.querySelectorAll(
+    `[data-source-id="${cssEscape(memoryId)}"], [data-target-id="${cssEscape(memoryId)}"]`,
+  );
+  for (const edge of edges) {
+    const source = state.graph.nodePositions.get(String(edge.getAttribute("data-source-id")));
+    const target = state.graph.nodePositions.get(String(edge.getAttribute("data-target-id")));
+    if (!source || !target) continue;
+    edge.setAttribute("x1", String(source.x));
+    edge.setAttribute("y1", String(source.y));
+    edge.setAttribute("x2", String(target.x));
+    edge.setAttribute("y2", String(target.y));
+  }
+}
+
+function initializeGraphInteractions() {
+  const svg = elements.graphSvg;
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const local = svgLocalPoint(event);
+    zoomGraphBy(event.deltaY < 0 ? 1.12 : 1 / 1.12, local);
+  }, { passive: false });
+
+  svg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const nodeGroup = event.target.closest?.(".graph-node-group[data-node-id]");
+    const local = svgLocalPoint(event);
+    if (nodeGroup) {
+      const nodeId = nodeGroup.getAttribute("data-node-id");
+      const position = state.graph.nodePositions.get(String(nodeId));
+      if (!nodeId || !position) return;
+      state.graph.interaction = {
+        type: "node",
+        pointerId: event.pointerId,
+        nodeId,
+        startGraph: graphPointFromSvgPoint(local),
+        startPosition: { ...position },
+      };
+      svg.classList.add("is-dragging-node");
+    } else {
+      state.graph.interaction = {
+        type: "pan",
+        pointerId: event.pointerId,
+        startLocal: local,
+        startTransform: { ...state.graph.transform },
+      };
+      svg.classList.add("is-panning");
+    }
+    svg.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+
+  svg.addEventListener("pointermove", (event) => {
+    const interaction = state.graph.interaction;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    const local = svgLocalPoint(event);
+    if (interaction.type === "node") {
+      const graphPoint = graphPointFromSvgPoint(local);
+      moveGraphNode(interaction.nodeId, {
+        x: interaction.startPosition.x + graphPoint.x - interaction.startGraph.x,
+        y: interaction.startPosition.y + graphPoint.y - interaction.startGraph.y,
+      });
+    } else {
+      state.graph.transform = {
+        ...interaction.startTransform,
+        x: interaction.startTransform.x + local.x - interaction.startLocal.x,
+        y: interaction.startTransform.y + local.y - interaction.startLocal.y,
+      };
+      applyGraphTransform();
+    }
+  });
+
+  const endInteraction = (event) => {
+    const interaction = state.graph.interaction;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    state.graph.interaction = null;
+    svg.classList.remove("is-panning", "is-dragging-node");
+    svg.releasePointerCapture?.(event.pointerId);
+  };
+  svg.addEventListener("pointerup", endInteraction);
+  svg.addEventListener("pointercancel", endInteraction);
+  svg.addEventListener("lostpointercapture", () => {
+    state.graph.interaction = null;
+    svg.classList.remove("is-panning", "is-dragging-node");
+  });
+}
+
+function cssEscape(value) {
+  return window.CSS?.escape ? window.CSS.escape(value) : String(value).replaceAll('"', '\\"');
 }
 
 function renderMemoryLedger(graph) {
@@ -629,6 +871,11 @@ elements.profileButton.addEventListener("click", async () => {
     return profile;
   }, { refresh: false });
 });
+
+elements.graphZoomOut.addEventListener("click", () => zoomGraphBy(1 / 1.18));
+elements.graphZoomIn.addEventListener("click", () => zoomGraphBy(1.18));
+elements.graphFit.addEventListener("click", fitGraphToView);
+elements.graphReset.addEventListener("click", resetGraphLayout);
 
 elements.toggleButton.addEventListener("click", () => toggleCore(elements.toggleButton));
 elements.toggleActionButton.addEventListener("click", () => toggleCore(elements.toggleActionButton));
