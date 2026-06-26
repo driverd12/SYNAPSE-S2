@@ -48,6 +48,8 @@ const elements = collectElements([
   "graphReset",
   "graphSummary",
   "graphSvg",
+  "graphAssociativeCount",
+  "graphTemporalCount",
   "graphZoomIn",
   "graphZoomOut",
   "headroomMb",
@@ -182,6 +184,9 @@ function renderSnapshot(snapshot) {
   const modelUri = system.model_uri || `s2://local/${snapshot.context_id || state.context}`;
   const entryTotal = Number(status.memory_context_entry_count ?? graph.entry_count ?? 0);
   const relationshipTotal = Number(status.memory_context_relationship_count ?? graph.relationship_count ?? 0);
+  const relationshipSummary = graph.relationship_summary || {};
+  const temporalRelationships = Number(relationshipSummary.temporal ?? 0);
+  const associativeRelationships = Number(relationshipSummary.associative ?? 0);
   const contexts = status.memory_contexts || {};
   const contextCount = Object.keys(contexts).length;
 
@@ -212,9 +217,11 @@ function renderSnapshot(snapshot) {
   elements.toggleButton.classList.toggle("off", !enabled);
   elements.toggleButton.setAttribute("aria-pressed", String(enabled));
 
-  elements.graphSummary.textContent = `${formatNumber(relationshipTotal)} edges`;
+  elements.graphSummary.textContent = `${formatNumber(temporalRelationships)} temporal / ${formatNumber(associativeRelationships)} associative`;
   elements.graphNodeCount.textContent = formatNumber(entryTotal);
   elements.graphEdgeCount.textContent = formatNumber(relationshipTotal);
+  elements.graphTemporalCount.textContent = formatNumber(temporalRelationships);
+  elements.graphAssociativeCount.textContent = formatNumber(associativeRelationships);
   elements.graphActiveCount.textContent = formatNumber(countEventEntries(graph.entries || []));
   elements.graphLastPrune.textContent = formatAge(status.last_pruning_age_seconds);
 
@@ -403,6 +410,9 @@ function layoutGraph(entries, width, height) {
 function edgeClass(relationship, weight) {
   const relation = String(relationship.relation_type || "");
   if (relation.includes("temporal")) return "graph-edge temporal";
+  if (relation.includes("semantic") || relation.includes("associative")) {
+    return weight >= 0.5 ? "graph-edge associative strong" : "graph-edge associative weak";
+  }
   return weight >= 0.5 ? "graph-edge strong" : "graph-edge weak";
 }
 

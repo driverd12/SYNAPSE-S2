@@ -987,8 +987,13 @@ textarea {
   border-top: 2px solid var(--muted);
 }
 
-.legend-line.weak {
+.legend-line.temporal {
   border-style: dashed;
+  border-color: var(--orange);
+}
+
+.legend-line.associative {
+  border-color: var(--teal);
 }
 
 #graphSvg {
@@ -1024,13 +1029,20 @@ textarea {
     opacity 120ms ease;
 }
 
-.graph-edge.weak,
 .graph-edge.temporal {
   stroke-dasharray: 7 6;
 }
 
+.graph-edge.weak {
+  opacity: 0.72;
+}
+
 .graph-edge.temporal {
   stroke: var(--orange);
+}
+
+.graph-edge.associative {
+  stroke: color-mix(in srgb, var(--teal) 72%, var(--blue));
 }
 
 .graph-node {

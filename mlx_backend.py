@@ -1012,8 +1012,32 @@ class SpikingAttentionBackend:
             "memory_db_path": str(self.memory_store.db_path),
             "entry_count": len(entries),
             "relationship_count": len(relationships),
+            "relationship_summary": self._summarize_relationship_modes(relationships),
             "entries": entries,
             "relationships": relationships,
+        }
+
+    def _summarize_relationship_modes(
+        self,
+        relationships: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        by_type: dict[str, int] = {}
+        temporal = 0
+        associative = 0
+        for relationship in relationships:
+            relation_type = str(relationship.get("relation_type") or "unknown")
+            by_type[relation_type] = by_type.get(relation_type, 0) + 1
+            if relation_type.startswith("temporal"):
+                temporal += 1
+            elif relation_type.startswith("semantic") or relation_type.startswith("associative"):
+                associative += 1
+        total = len(relationships)
+        return {
+            "total": total,
+            "temporal": temporal,
+            "associative": associative,
+            "other": max(0, total - temporal - associative),
+            "by_type": dict(sorted(by_type.items())),
         }
 
     def resource_profile(

@@ -259,6 +259,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(ingest_payload["relationship_count"], 1)
         self.assertEqual(snapshot_status, 200)
         self.assertGreaterEqual(snapshot_payload["graph"]["relationship_count"], 1)
+        self.assertEqual(
+            snapshot_payload["graph"]["relationship_summary"]["total"],
+            snapshot_payload["graph"]["relationship_count"],
+        )
+        self.assertGreaterEqual(
+            snapshot_payload["graph"]["relationship_summary"]["temporal"],
+            1,
+        )
         self.assertTrue(
             any(
                 entry["tag"].startswith("ops-brief-event")

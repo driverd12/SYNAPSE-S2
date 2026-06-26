@@ -157,6 +157,45 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(graph["relationships"][0]["relation_type"], "temporal_next")
         self.assertIn("morning-brief-event", recall)
 
+    def test_memory_graph_summarizes_temporal_and_associative_relationship_modes(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        text = (
+            "Supplier contract renewal risk needs local recall. "
+            "Apple Silicon kernels compile spiking attention locally. "
+            "Supplier contract payment ownership needs associative follow-up."
+        )
+
+        backend.ingest_text_events(
+            text=text,
+            context_id="board-demo",
+            source_tag="mode-brief",
+            surprise_threshold=0.58,
+            min_segment_sentences=1,
+        )
+        graph = backend.list_memory_graph(context_id="board-demo")
+
+        self.assertEqual(
+            graph["relationship_summary"]["total"],
+            graph["relationship_count"],
+        )
+        self.assertGreaterEqual(graph["relationship_summary"]["temporal"], 2)
+        self.assertGreaterEqual(graph["relationship_summary"]["associative"], 1)
+        self.assertEqual(
+            graph["relationship_summary"]["by_type"]["temporal_next"],
+            graph["relationship_summary"]["temporal"],
+        )
+        self.assertEqual(
+            graph["relationship_summary"]["by_type"]["semantic_overlap"],
+            graph["relationship_summary"]["associative"],
+        )
+
     def test_query_expands_recall_with_related_event_graph_neighbors(self):
         backend = SpikingAttentionBackend(
             dimension=64,
