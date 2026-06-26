@@ -28,7 +28,16 @@ const elements = {
   arrayList: document.getElementById("arrayList"),
   graphSvg: document.getElementById("graphSvg"),
   graphSummary: document.getElementById("graphSummary"),
+  memoryLedger: document.getElementById("memoryLedger"),
   profileButton: document.getElementById("profileButton"),
+  rememberForm: document.getElementById("rememberForm"),
+  rememberTag: document.getElementById("rememberTag"),
+  rememberText: document.getElementById("rememberText"),
+  ingestForm: document.getElementById("ingestForm"),
+  ingestTag: document.getElementById("ingestTag"),
+  ingestThreshold: document.getElementById("ingestThreshold"),
+  ingestMinSentences: document.getElementById("ingestMinSentences"),
+  ingestText: document.getElementById("ingestText"),
   queryForm: document.getElementById("queryForm"),
   queryInput: document.getElementById("queryInput"),
   queryResults: document.getElementById("queryResults"),
@@ -148,6 +157,7 @@ function renderSnapshot(snapshot) {
   renderEnvelope(profile);
   renderArrays(profile.arrays || {});
   renderGraph(graph);
+  renderMemoryLedger(graph);
 }
 
 function renderEnvelope(profile) {
@@ -232,6 +242,25 @@ function renderGraph(graph) {
   }
 }
 
+function renderMemoryLedger(graph) {
+  const entries = (graph.entries || []).slice(0, 8);
+  elements.memoryLedger.innerHTML = entries.length
+    ? entries.map((entry) => {
+      const source = entry.metadata?.source_tag || entry.metadata?.source || entry.context_id || "--";
+      return `
+        <div class="memory-ledger-row">
+          <div>
+            <strong>${escapeHtml(entry.tag)}</strong>
+            <small>${escapeHtml(source)} / ${escapeHtml(compactMemoryId(entry.memory_id))}</small>
+          </div>
+          <span>${formatNumber(entry.spike_count)}</span>
+          <time>${escapeHtml(formatTimestamp(entry.updated_at || entry.created_at))}</time>
+        </div>
+      `;
+    }).join("")
+    : `<div class="memory-ledger-empty">No persisted traces</div>`;
+}
+
 function appendSvg(parent, tag, attrs, text = "") {
   const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
   for (const [key, value] of Object.entries(attrs)) {
@@ -246,6 +275,22 @@ function compactTag(tag) {
   const text = String(tag || "");
   if (text.length <= 24) return text;
   return `${text.slice(0, 10)}…${text.slice(-10)}`;
+}
+
+function compactMemoryId(memoryId) {
+  const text = String(memoryId || "");
+  return text.length > 12 ? `...${text.slice(-8)}` : text;
+}
+
+function formatTimestamp(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "--";
+  return new Date(numeric * 1000).toLocaleString(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function renderQueryResult(text) {
@@ -323,6 +368,57 @@ elements.toggleButton.addEventListener("click", async () => {
       body: { context_id: state.context, enabled: !enabled },
     })
   ));
+});
+
+elements.rememberForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const tag = elements.rememberTag.value.trim();
+  const text = elements.rememberText.value.trim();
+  if (!tag || !text) {
+    logOperation("Remember rejected", "tag and text are required");
+    (!tag ? elements.rememberTag : elements.rememberText).focus();
+    return;
+  }
+  await withBusy(elements.rememberForm.querySelector("button"), "Remember trace", async () => {
+    const payload = await requestJson("/api/remember", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        tag,
+        text,
+        metadata: { source: "dashboard" },
+      },
+    });
+    elements.rememberText.value = "";
+    return payload;
+  });
+});
+
+elements.ingestForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const tag = elements.ingestTag.value.trim();
+  const text = elements.ingestText.value.trim();
+  const threshold = Number(elements.ingestThreshold.value || 0.58);
+  const minSentences = Number(elements.ingestMinSentences.value || 1);
+  if (!tag || !text) {
+    logOperation("Ingest rejected", "source tag and text are required");
+    (!tag ? elements.ingestTag : elements.ingestText).focus();
+    return;
+  }
+  await withBusy(elements.ingestForm.querySelector("button"), "Ingest events", async () => {
+    const payload = await requestJson("/api/ingest", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        tag,
+        text,
+        surprise_threshold: clamp(Number.isFinite(threshold) ? threshold : 0.58, 0.1, 1),
+        min_segment_sentences: Math.max(1, Math.trunc(Number.isFinite(minSentences) ? minSentences : 1)),
+      },
+    });
+    elements.ingestText.value = "";
+    return payload;
+  });
 });
 
 elements.queryForm.addEventListener("submit", async (event) => {

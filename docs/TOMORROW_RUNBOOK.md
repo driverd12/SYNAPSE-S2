@@ -109,7 +109,7 @@ Launch the loopback dashboard:
 open "http://127.0.0.1:8765/?context_id=default"
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, memory graph edges, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, event ingestion, memory graph edges, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default

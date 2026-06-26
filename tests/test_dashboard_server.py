@@ -143,8 +143,12 @@ class DashboardRuntimeTests(unittest.TestCase):
         styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("themeButton", index)
+        self.assertIn("rememberForm", index)
+        self.assertIn("ingestForm", index)
         self.assertIn("dataset.theme", app)
         self.assertIn("data-theme", styles)
+        self.assertIn("/api/remember", app)
+        self.assertIn("/api/ingest", app)
         self.assertNotIn("board-demo", index)
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)
@@ -215,6 +219,45 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(remember_status, 200)
         self.assertEqual(remember_payload["tag"], "operator-note")
         self.assertIn("operator-note", recall)
+
+    def test_ingest_endpoint_persists_events_and_relationships(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            ingest_status, ingest_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/ingest",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "tag": "ops-brief",
+                            "text": (
+                                "Battery telemetry exceeded limits during taxi. "
+                                "Maintenance isolated the affected power channel. "
+                                "The morning review needs traceable graph evidence."
+                            ),
+                            "surprise_threshold": 0.58,
+                            "min_segment_sentences": 1,
+                        }
+                    ).encode(),
+                )
+            )
+            snapshot_status, snapshot_payload = self.decode(
+                runtime.handle("GET", "/api/snapshot?context_id=demo&limit=20")
+            )
+
+        self.assertEqual(ingest_status, 200)
+        self.assertGreaterEqual(ingest_payload["event_count"], 2)
+        self.assertGreaterEqual(ingest_payload["relationship_count"], 1)
+        self.assertEqual(snapshot_status, 200)
+        self.assertGreaterEqual(snapshot_payload["graph"]["relationship_count"], 1)
+        self.assertTrue(
+            any(
+                entry["tag"].startswith("ops-brief-event")
+                for entry in snapshot_payload["graph"]["entries"]
+            )
+        )
 
 
 if __name__ == "__main__":
