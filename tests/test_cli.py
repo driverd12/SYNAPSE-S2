@@ -387,8 +387,8 @@ class SynapseCliTests(unittest.TestCase):
             state_path = Path(tmp) / "state.json"
             memory_path = Path(tmp) / "memory.sqlite3"
             text = (
-                "User expects later Codex conversations to appear in the graph. "
-                "Codex records a durable session capture. "
+                "Apple Silicon Metal kernels accelerate local MLX compute. "
+                "Finance owners review supplier renewal approval risk. "
                 "Operators can clear sensitive graph items."
             )
 

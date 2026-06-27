@@ -162,6 +162,47 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(graph["relationships"][0]["relation_type"], "temporal_next")
         self.assertIn("morning-brief-event", recall)
 
+    def test_ingest_text_events_records_embedding_surprise_metadata(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+
+        ingestion = backend.ingest_text_events(
+            text=(
+                "Metal compiles local kernels for M-series acceleration. "
+                "On-chip GPU execution keeps native compute efficient. "
+                "Finance approval owners track contract renewal risk."
+            ),
+            context_id="default",
+            source_tag="semantic-surprise",
+            surprise_threshold=0.40,
+            min_segment_sentences=1,
+        )
+        memory = backend.list_memory(context_id="default", limit=10)
+        first_event = next(
+            entry
+            for entry in memory["entries"]
+            if entry["tag"] == "semantic-surprise-event-001"
+        )
+
+        self.assertEqual(
+            ingestion["events"][0]["segment"]["surprise_mode"],
+            "embedding",
+        )
+        self.assertEqual(first_event["metadata"]["surprise_mode"], "embedding")
+        self.assertIn("semantic_surprise_score", first_event["metadata"])
+        self.assertEqual(
+            first_event["metadata"]["surprise_model"]["embedding_provider"],
+            "semantic-hash-v1",
+        )
+        self.assertTrue(ingestion["surprise_model"]["semantic"])
+
     def test_memory_graph_summarizes_temporal_and_associative_relationship_modes(self):
         backend = SpikingAttentionBackend(
             dimension=64,

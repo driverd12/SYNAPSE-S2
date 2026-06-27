@@ -85,7 +85,7 @@ Event graph ingestion:
 .venv/bin/python synapse_cli.py --json graph --context default --limit 10
 ```
 
-The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship.
+The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship. Event memory metadata should also include `surprise_model`, `surprise_mode`, `semantic_surprise_score`, and `lexical_surprise_score`. `surprise_mode: embedding` means the boundary was cut from the configured local provider's cosine-distance signal; `surprise_mode: lexical` means SYNAPSE-S2 safely fell back to token-overlap surprise.
 
 Agent context hydration:
 

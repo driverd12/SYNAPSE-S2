@@ -2465,9 +2465,11 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         source = sanitize_tag(source_tag).replace(" ", "-")
+        surprise_model = self._surprise_model_info()
         segmenter = BayesianSurpriseEventSegmenter(
             surprise_threshold=surprise_threshold,
             min_segment_sentences=min_segment_sentences,
+            embedding_fn=self._embed_sentence_for_surprise,
         )
         segments = segmenter.segment(text, context_id=context, source_tag=source)
         registrations: list[dict[str, Any]] = []
@@ -2483,6 +2485,16 @@ class SpikingAttentionBackend:
                         "segment_index": segment["segment_index"],
                         "sentence_count": segment["sentence_count"],
                         "surprise_score": segment["surprise_score"],
+                        "surprise_mode": segment.get("surprise_mode", "lexical"),
+                        "lexical_surprise_score": segment.get(
+                            "lexical_surprise_score",
+                            segment["surprise_score"],
+                        ),
+                        "semantic_surprise_score": segment.get(
+                            "semantic_surprise_score",
+                            0.0,
+                        ),
+                        "surprise_model": surprise_model,
                         "keywords": segment["keywords"],
                         "source_tag": segment["source_tag"],
                     }
@@ -2511,6 +2523,19 @@ class SpikingAttentionBackend:
                             "sequence_id": current_segment["sequence_id"],
                             "source_tag": source,
                             "surprise_score": current_segment["surprise_score"],
+                            "surprise_mode": current_segment.get(
+                                "surprise_mode",
+                                "lexical",
+                            ),
+                            "lexical_surprise_score": current_segment.get(
+                                "lexical_surprise_score",
+                                current_segment["surprise_score"],
+                            ),
+                            "semantic_surprise_score": current_segment.get(
+                                "semantic_surprise_score",
+                                0.0,
+                            ),
+                            "surprise_model": surprise_model,
                         },
                     )
                 )
@@ -2529,6 +2554,7 @@ class SpikingAttentionBackend:
                 "sequence_id": segments[0]["sequence_id"] if segments else "",
                 "event_count": len(registrations),
                 "relationship_count": len(relationships),
+                "surprise_model": surprise_model,
                 "events": [
                     {
                         "tag": item["tag"],
@@ -2543,6 +2569,34 @@ class SpikingAttentionBackend:
         except Exception:
             LOGGER.exception("event ingestion failed for context_id=%s source_tag=%s", context, source)
             raise
+
+    def _embed_sentence_for_surprise(self, sentence: str) -> list[float]:
+        payload = self.embed_text_payload(str(sentence or ""), dimensions=self.dimension)
+        embedding = payload["embedding"]
+        try:
+            return [float(value) for value in embedding.tolist()]
+        except AttributeError:
+            return [float(value) for value in embedding]
+
+    def _surprise_model_info(self) -> dict[str, Any]:
+        provider_info = self.embedding_provider_info()
+        provider_id = str(
+            provider_info.get("provider")
+            or getattr(self.embedding_provider, "provider_id", "")
+            or self.embedding_provider_name
+            or "unknown"
+        )
+        return self._json_safe_metadata(
+            {
+                "mode": "embedding-cosine",
+                "fallback": "lexical-jaccard",
+                "embedding_provider": provider_id,
+                "provider_type": provider_info.get("provider_type", "unknown"),
+                "semantic": bool(provider_info.get("semantic", False)),
+                "local_only": bool(provider_info.get("local_only", True)),
+                "dimensions": int(self.dimension),
+            }
+        )
 
     def capture_conversation(
         self,

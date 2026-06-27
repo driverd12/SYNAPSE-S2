@@ -4,6 +4,38 @@ from event_segmenter import BayesianSurpriseEventSegmenter
 
 
 class BayesianSurpriseEventSegmenterTests(unittest.TestCase):
+    def test_embedding_surprise_keeps_semantic_paraphrases_together(self):
+        def fake_embedder(sentence: str) -> list[float]:
+            lowered = sentence.lower()
+            if any(token in lowered for token in ("metal", "m-series", "gpu", "compute")):
+                return [1.0, 0.0, 0.0]
+            if any(token in lowered for token in ("contract", "renewal", "approval")):
+                return [0.0, 1.0, 0.0]
+            return [0.0, 0.0, 1.0]
+
+        segmenter = BayesianSurpriseEventSegmenter(
+            surprise_threshold=0.40,
+            min_segment_sentences=1,
+            embedding_fn=fake_embedder,
+        )
+        text = (
+            "Metal compiles local kernels for M-series acceleration. "
+            "On-chip GPU execution keeps native compute efficient. "
+            "Contract renewal approvals need finance owner review."
+        )
+
+        segments = segmenter.segment(
+            text,
+            context_id="default",
+            source_tag="semantic-brief",
+        )
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["sentence_count"], 2)
+        self.assertEqual(segments[0]["surprise_mode"], "embedding")
+        self.assertLess(segments[0]["semantic_surprise_score"], 0.05)
+        self.assertGreaterEqual(segments[1]["semantic_surprise_score"], 0.9)
+
     def test_segments_text_when_topic_surprise_crosses_threshold(self):
         segmenter = BayesianSurpriseEventSegmenter(
             surprise_threshold=0.58,

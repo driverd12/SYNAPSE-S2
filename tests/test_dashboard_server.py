@@ -33,8 +33,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         backend.ingest_text_events(
             text=(
                 "Apple Silicon MLX compiles kernels into Metal. "
-                "Sparse spiking recall reduces context pressure. "
-                "Operators review graph relationships before approval."
+                "Procurement reviews supplier contract exposure before approval. "
+                "Operators prune sensitive graph relationships."
             ),
             context_id="demo",
             source_tag="dashboard-brief",

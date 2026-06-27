@@ -30,7 +30,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Contextual focus gating | Implemented | global and per-context enable toggles in `set_enabled()` and MCP/CLI controls |
 | Persistent associative memory substrate | Implemented | `memory_store.py` SQLite store, `remember_spiking_context`, `list_spiking_memory`, export, backup |
 | Local text-to-spike provider provenance | Implemented | `embedding_providers.py`, `metadata.embedding_provider`, CLI `--embedding-provider`, status/provider tests |
-| Bayesian Surprise Event Segmenter for local text streams | Implemented as deterministic local surprise segmentation | `event_segmenter.py`, `ingest_spiking_memory_text`, `synapse_cli.py ingest-text`, `tests/test_event_segmenter.py` |
+| Bayesian Surprise Event Segmenter for local text streams | Implemented as deterministic provider-backed semantic surprise with lexical fallback | `event_segmenter.py`, `ingest_spiking_memory_text`, `synapse_cli.py ingest-text`, `mlx_backend.py`, `tests/test_event_segmenter.py`, `tests/test_backend.py` |
 | Dual graph memory protocol for episodic-semantic relationships | Implemented | `memory_relationships` table in `memory_store.py`, `list_spiking_memory_graph`, graph-expanded recall, deep-sleep relationship extraction |
 | Agent/operator conversation capture into event memory | Implemented | `capture_spiking_conversation`, `synapse_cli.py capture-session`, `/api/capture-conversation`, GUI capture form |
 | Always-on local session capture sidecar | Implemented as opt-in capture inbox | `capture_daemon.py`, `drop_spiking_capture_inbox`, `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, `/api/capture-inbox`, `scripts/install_capture_daemon.sh` |
@@ -96,7 +96,7 @@ These items are present in the architecture document as longer-horizon research 
 
 - PTsoftmax and Bit Shifting PowerNorm.
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
-- Probabilistic embedding-calibrated surprise over live token streams; embeddings can now be neural, but event segmentation thresholds remain deterministic and local for predictable MCP stdio behavior.
+- Online probabilistic Bayesian surprise over live token streams; current event segmentation is deterministic over configured local embedding-provider cosine distance, persists semantic and lexical boundary scores, and keeps lexical fallback for predictable MCP stdio behavior.
 - External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs; current certification evidence is MLX/topology/runtime based.
 - Invisible capture of arbitrary already-running Codex/Claude chat transcript content without client cooperation; the MCP process boundary is captured, but full chat text still requires explicit client/tool/hook payloads.
 
