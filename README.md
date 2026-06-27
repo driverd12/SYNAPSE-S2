@@ -341,7 +341,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, tokenized App Connect local app attachment/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, tokenized App Connect local app attachment/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

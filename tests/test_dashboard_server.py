@@ -572,6 +572,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
             server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            self.assertTrue(server.daemon_threads)
+            self.assertGreaterEqual(server.request_queue_size, 32)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:

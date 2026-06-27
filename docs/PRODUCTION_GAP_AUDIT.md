@@ -37,6 +37,7 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 | Spike-overlap recall scanned every memory row | Query latency could scale linearly as durable memory grew | Add a durable `memory_spikes` inverted index, migrate existing rows, update it atomically on upsert, and query overlap through indexed SQLite joins | Fixed in `memory_store.py`; covered by memory-store and backend recall tests |
 | Surface-text recall rebuilt a large Python index after memory changes | First recall after capture could pull and tokenize thousands of full memory rows | Add durable `memory_surface_terms` token/facet index, migrate/backfill existing rows, update it atomically on upsert, and query prompt terms through indexed SQLite joins | Fixed in `memory_store.py` and `mlx_backend.py`; covered by memory-store/backend tests |
 | Graph serialization decorated relationship endpoints one row at a time | The relationship visualizer could show edge rows whose endpoints were not present in the drawn node set and could perform N+1 entry reads | Batch-load relationship endpoints and prioritize them before recent noise in `list_memory_graph` | Fixed in `memory_store.py` and `mlx_backend.py`; covered by backend graph tests |
+| Dashboard used a single request worker | A slow local graph, certification, or evidence-pack request could make health/status/static requests feel stuck | Serve the loopback dashboard with daemon request threads and a larger local queue | Fixed in `dashboard_server.py`; covered by dashboard server tests |
 
 ## Remaining Explicit Non-Claims
 
@@ -72,3 +73,4 @@ The current bar for calling a local build presentable is:
 17. App Connect can list local apps, attach a confirmed app, capture selected text or a redacted app snapshot, and persist those captures as real temporal graph memory.
 18. The dashboard at `http://127.0.0.1:8765/?context_id=default` can write, capture conversations, attach and snapshot local apps, process magic capture drops, ingest, enter/tick/commit Cortex Governor sessions with scoped intended files/tools, promote/demote/prune governed traces with confirmation for deletion, recall, graph, prune, certify native runtime, sleep, back up, and show context-bus receipt state.
 19. Store stats show populated durable spike and surface-term recall indexes, and graph responses prioritize relationship endpoints before recent unrelated nodes.
+20. Dashboard HTTP serving uses threaded local request handling so heavy operator actions do not monopolize the loopback UI.
