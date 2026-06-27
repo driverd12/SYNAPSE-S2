@@ -77,6 +77,36 @@ echo "=== capture inbox smoke ==="
 .venv/bin/python synapse_cli.py --json capture-inbox-process
 .venv/bin/python synapse_cli.py --json capture-inbox-status
 
+echo "=== cortex governor smoke ==="
+CORTEX_SESSION_ID="$(
+  .venv/bin/python synapse_cli.py --json enter-cortex \
+    --context "$CONTEXT" \
+    --agent-id "prep-tomorrow" \
+    --task "Validate SYNAPSE-S2 Cortex Governor before tomorrow's operator review." \
+    --mode strict | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["session_id"])'
+)"
+echo "cortex session: $CORTEX_SESSION_ID"
+.venv/bin/python synapse_cli.py --json cortex-tick \
+  --context "$CONTEXT" \
+  --agent-id "prep-tomorrow" \
+  --session-id "$CORTEX_SESSION_ID" \
+  --observation "Prep script is about to continue mutating runtime evidence and readiness artifacts." \
+  --proposed-action "Proceed only after smoke validations and commit a factual validation trace." \
+  --mutation-intent \
+  --confidence 0.82
+.venv/bin/python synapse_cli.py --json commit-cortex \
+  --context "$CONTEXT" \
+  --agent-id "prep-tomorrow" \
+  --session-id "$CORTEX_SESSION_ID" \
+  --type validation \
+  --truth-posture test-validated \
+  --text "Prep script verified the Cortex Governor enter, tick, commit, and state path." \
+  --evidence '{"source":"prep_tomorrow","surface":"cli"}'
+.venv/bin/python synapse_cli.py --json cortex-state \
+  --context "$CONTEXT" \
+  --agent-id "prep-tomorrow" \
+  --limit 10
+
 echo "=== cli preflight ==="
 .venv/bin/python synapse_cli.py --json preflight \
   --context "$CONTEXT" \

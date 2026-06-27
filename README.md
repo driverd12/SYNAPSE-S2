@@ -107,6 +107,35 @@ LATEST_EVENT_ID=$(.venv/bin/python synapse_cli.py --json status --context defaul
 .venv/bin/python synapse_cli.py --json list-context-cursors --context default
 ```
 
+Run a governed agent session when you want SYNAPSE-S2 to act as a live cognitive control plane instead of passive recall only:
+
+```bash
+SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
+  --context default \
+  --agent-id codex-desktop \
+  --task "Implement the next SYNAPSE-S2 change with verification before mutation." \
+  --mode strict | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
+.venv/bin/python synapse_cli.py --json cortex-tick \
+  --context default \
+  --agent-id codex-desktop \
+  --session-id "$SESSION_ID" \
+  --observation "About to edit backend and dashboard files." \
+  --proposed-action "Patch code, run focused tests, then run full validation." \
+  --mutation-intent \
+  --confidence 0.62
+.venv/bin/python synapse_cli.py --json commit-cortex \
+  --context default \
+  --agent-id codex-desktop \
+  --session-id "$SESSION_ID" \
+  --type validation \
+  --truth-posture test-validated \
+  --text "Focused and full validation passed for the governed change." \
+  --evidence '{"tests":["unittest discover"],"surface":"cli"}'
+.venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
+```
+
+The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id.
+
 Capture real operator/Codex conversation notes into the event graph:
 
 ```bash
@@ -183,6 +212,10 @@ The MCP server exposes these tools:
 | `ack_spiking_context_deployments` | Record the last context-bus event consumed by a local agent. |
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
 | `hydrate_spiking_agent_context` | Return an agent-ready briefing with new deployments, prompt recall, graph highlights, and optional ack. |
+| `enter_spiking_cortex` | Start a governed agent session with policy, recall, and a context-bus deployment. |
+| `tick_spiking_cortex` | Evaluate the current observation and proposed action against governed memory before proceeding. |
+| `commit_spiking_cortical_trace` | Persist a typed governed trace with truth posture, confidence, and evidence. |
+| `get_spiking_cortex_state` | Inspect active governed sessions and typed cortical memory for a context. |
 | `benchmark_spiking_embedding_provider` | Benchmark the configured local embedding provider and return latency plus provenance. |
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
 | `certify_spiking_runtime` | Emit native runtime certification evidence for MLX, mlxsnn, envelope, provider, and quick-prune checks. |
@@ -240,7 +273,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

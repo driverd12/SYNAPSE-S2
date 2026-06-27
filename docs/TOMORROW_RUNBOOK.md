@@ -212,10 +212,37 @@ Launch the loopback dashboard:
 open "http://127.0.0.1:8765/?context_id=default"
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, event ingestion, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, event ingestion, Cortex Governor enter/tick/commit controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default
+```
+
+Governed agent session smoke:
+
+```bash
+SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
+  --context default \
+  --agent-id codex-desktop \
+  --task "Use SYNAPSE-S2 as a live governor before making a code mutation." \
+  --mode strict | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
+.venv/bin/python synapse_cli.py --json cortex-tick \
+  --context default \
+  --agent-id codex-desktop \
+  --session-id "$SESSION_ID" \
+  --observation "The agent is preparing a mutation." \
+  --proposed-action "Edit files and run validation before claiming completion." \
+  --mutation-intent \
+  --confidence 0.65
+.venv/bin/python synapse_cli.py --json commit-cortex \
+  --context default \
+  --agent-id codex-desktop \
+  --session-id "$SESSION_ID" \
+  --type validation \
+  --truth-posture test-validated \
+  --text "The governed session path entered, ticked, and committed a typed validation trace." \
+  --evidence '{"surface":"runbook"}'
+.venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
 ```
 
 ## MCP Inspector
@@ -245,6 +272,10 @@ Useful tool calls:
 | `ack_spiking_context_deployments` | Records the last deployment event consumed by a local client. |
 | `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |
 | `hydrate_spiking_agent_context` | Hydrates a restarted client with new deployments, prompt recall, graph highlights, and an optional ack cursor update. |
+| `enter_spiking_cortex` | Starts a governed agent session with recall and policy. |
+| `tick_spiking_cortex` | Checks the current observation and proposed action for mutation, confidence, and sensitive-data warnings. |
+| `commit_spiking_cortical_trace` | Persists typed validation, decision, constraint, risk, or implementation memory with evidence. |
+| `get_spiking_cortex_state` | Shows active governed sessions and typed cortical memory. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `certify_spiking_runtime` | Emits native MLX/mlxsnn/provider/envelope certification evidence. |
 | `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |

@@ -149,12 +149,93 @@ class DashboardRuntime:
             )
         if method == "GET" and path == "/api/capture-inbox":
             return self._json_response(self.capture_daemon().status())
+        if method == "GET" and path == "/api/cortex/state":
+            context = self._context_from_params(params)
+            agent_raw = str(params.get("agent_id", [""])[0] or "").strip()
+            agent_id = mlx_backend.sanitize_agent_id(agent_raw) if agent_raw else ""
+            limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
+            return self._json_response(
+                self.backend.get_cortex_state(
+                    context_id=context,
+                    agent_id=agent_id,
+                    limit=limit,
+                )
+            )
         if method == "GET" and path == "/api/snapshot":
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
             include_graph = self._bool_param(params, "include_graph", True)
             return self._json_response(
                 self.snapshot(context_id=context, limit=limit, include_graph=include_graph)
+            )
+
+        if method == "POST" and path == "/api/cortex/enter":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            agent_id = mlx_backend.sanitize_agent_id(str(payload.get("agent_id", "dashboard-ui")))
+            task = self._text_payload(payload, "task", max_bytes=MAX_TEXT_BYTES)
+            return self._json_response(
+                self.backend.enter_spiking_cortex(
+                    context_id=context,
+                    agent_id=agent_id,
+                    task=task,
+                    mode=str(payload.get("mode", "strict")),
+                )
+            )
+        if method == "POST" and path == "/api/cortex/tick":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            agent_id = mlx_backend.sanitize_agent_id(str(payload.get("agent_id", "dashboard-ui")))
+            session_id = self._text_payload(payload, "session_id", max_bytes=512)
+            observation = str(payload.get("observation", "") or "").strip()
+            proposed_action = str(payload.get("proposed_action", "") or "").strip()
+            if len(observation.encode("utf-8")) > MAX_TEXT_BYTES:
+                raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "observation is too large")
+            if len(proposed_action.encode("utf-8")) > MAX_TEXT_BYTES:
+                raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "proposed_action is too large")
+            try:
+                confidence = float(payload.get("confidence", 0.5))
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "confidence must be numeric") from exc
+            return self._json_response(
+                self.backend.cortex_tick(
+                    context_id=context,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    observation=observation,
+                    proposed_action=proposed_action,
+                    mutation_intent=bool(payload.get("mutation_intent", False)),
+                    confidence=confidence,
+                )
+            )
+        if method == "POST" and path == "/api/cortex/commit":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            agent_id = mlx_backend.sanitize_agent_id(str(payload.get("agent_id", "dashboard-ui")))
+            text = self._text_payload(payload, "text", max_bytes=MAX_TEXT_BYTES)
+            evidence = payload.get("evidence", {})
+            if evidence is None:
+                evidence = {}
+            if not isinstance(evidence, dict):
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "evidence must be an object")
+            confidence_raw = payload.get("confidence", None)
+            confidence: float | None = None
+            if confidence_raw is not None and confidence_raw != "":
+                try:
+                    confidence = float(confidence_raw)
+                except (TypeError, ValueError) as exc:
+                    raise DashboardError(HTTPStatus.BAD_REQUEST, "confidence must be numeric") from exc
+            return self._json_response(
+                self.backend.commit_cortical_trace(
+                    context_id=context,
+                    agent_id=agent_id,
+                    session_id=str(payload.get("session_id", "") or ""),
+                    trace_type=str(payload.get("trace_type", "") or ""),
+                    truth_posture=str(payload.get("truth_posture", "observed") or "observed"),
+                    text=text,
+                    evidence=evidence,
+                    confidence=confidence,
+                )
             )
 
         if method == "POST" and path == "/api/toggle":
@@ -387,6 +468,10 @@ class DashboardRuntime:
             graph = self._deferred_graph(context=context, status=status)
         system = timed("system", lambda: self._system_info(context_id=context))
         capture_inbox = timed("capture_inbox", lambda: self.capture_daemon().status())
+        cortex_state = timed(
+            "cortex_state",
+            lambda: self.backend.get_cortex_state(context_id=context, limit=limit),
+        )
         timings["total"] = round((time.perf_counter() - snapshot_started) * 1000.0, 3)
         return {
             "context_id": context,
@@ -395,6 +480,7 @@ class DashboardRuntime:
             "graph": graph,
             "system": system,
             "capture_inbox": capture_inbox,
+            "cortex_state": cortex_state,
             "timings_ms": timings,
             "generated_at": time.time(),
         }

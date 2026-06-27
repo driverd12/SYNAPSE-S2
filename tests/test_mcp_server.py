@@ -429,6 +429,55 @@ class McpServerTests(unittest.TestCase):
             registration["agent_deployment"]["event_id"],
         )
 
+    def test_cortex_governor_tools_enter_tick_commit_and_state(self):
+        self.assertTrue(hasattr(mcp_server, "enter_spiking_cortex"))
+        self.assertTrue(hasattr(mcp_server, "tick_spiking_cortex"))
+        self.assertTrue(hasattr(mcp_server, "commit_spiking_cortical_trace"))
+        self.assertTrue(hasattr(mcp_server, "get_spiking_cortex_state"))
+
+        entered = json.loads(
+            mcp_server.enter_spiking_cortex(
+                agent_id="mcp-agent",
+                context_id="demo",
+                task="Govern MCP agent work.",
+                mode="strict",
+            )
+        )
+        tick = json.loads(
+            mcp_server.tick_spiking_cortex(
+                agent_id="mcp-agent",
+                context_id="demo",
+                session_id=entered["session_id"],
+                observation="Preparing a mutation.",
+                proposed_action="Edit code and run tests.",
+                mutation_intent=True,
+                confidence=0.4,
+            )
+        )
+        committed = json.loads(
+            mcp_server.commit_spiking_cortical_trace(
+                agent_id="mcp-agent",
+                context_id="demo",
+                session_id=entered["session_id"],
+                trace_type="validation",
+                truth_posture="test-validated",
+                text="MCP cortex tools returned structured governance state.",
+                evidence_json='{"tests":["tests.test_mcp_server"]}',
+            )
+        )
+        state = json.loads(
+            mcp_server.get_spiking_cortex_state(
+                agent_id="mcp-agent",
+                context_id="demo",
+            )
+        )
+
+        self.assertEqual(entered["action"], "enter-spiking-cortex")
+        self.assertEqual(tick["decision"], "verify-first")
+        self.assertEqual(committed["trace_type"], "validation")
+        self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
+        self.assertIn("cognitive_governance", state["policy"])
+
     def test_memory_export_tool_rejects_paths_outside_export_root(self):
         result = json.loads(
             mcp_server.export_spiking_memory(

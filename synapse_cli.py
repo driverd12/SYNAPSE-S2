@@ -323,6 +323,55 @@ def command_agent_brief(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_enter_cortex(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.enter_spiking_cortex(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        task=args.task,
+        mode=args.mode,
+    )
+
+
+def command_cortex_tick(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.cortex_tick(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        session_id=args.session_id,
+        observation=args.observation,
+        proposed_action=args.proposed_action,
+        mutation_intent=args.mutation_intent,
+        confidence=args.confidence,
+    )
+
+
+def command_commit_cortex(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    text = _text_from_args(args).strip()
+    if not text:
+        raise ValueError("--text or --text-file must provide content")
+    return backend.commit_cortical_trace(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        session_id=args.session_id,
+        trace_type=args.trace_type,
+        truth_posture=args.truth_posture,
+        text=text,
+        evidence=parse_metadata(args.evidence),
+        confidence=args.confidence,
+    )
+
+
+def command_cortex_state(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.get_cortex_state(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        limit=args.limit,
+    )
+
+
 def command_profile(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.resource_profile(
@@ -662,6 +711,45 @@ def build_parser() -> argparse.ArgumentParser:
     agent_brief.add_argument("--graph-limit", type=int, default=30)
     agent_brief.add_argument("--no-ack", action="store_true")
     agent_brief.set_defaults(func=command_agent_brief)
+
+    enter_cortex = subparsers.add_parser("enter-cortex")
+    add_context(enter_cortex)
+    enter_cortex.add_argument("--agent-id", required=True)
+    enter_cortex.add_argument("--task", required=True)
+    enter_cortex.add_argument(
+        "--mode",
+        default="strict",
+        choices=["strict", "creative", "operator", "security", "demo"],
+    )
+    enter_cortex.set_defaults(func=command_enter_cortex)
+
+    cortex_tick = subparsers.add_parser("cortex-tick")
+    add_context(cortex_tick)
+    cortex_tick.add_argument("--agent-id", required=True)
+    cortex_tick.add_argument("--session-id", required=True)
+    cortex_tick.add_argument("--observation", default="")
+    cortex_tick.add_argument("--proposed-action", default="")
+    cortex_tick.add_argument("--mutation-intent", action="store_true")
+    cortex_tick.add_argument("--confidence", type=float, default=0.5)
+    cortex_tick.set_defaults(func=command_cortex_tick)
+
+    commit_cortex = subparsers.add_parser("commit-cortex")
+    add_context(commit_cortex)
+    commit_cortex.add_argument("--agent-id", required=True)
+    commit_cortex.add_argument("--session-id", default="")
+    commit_cortex.add_argument("--type", dest="trace_type", default="")
+    commit_cortex.add_argument("--truth-posture", default="observed")
+    commit_cortex.add_argument("--text", default="")
+    commit_cortex.add_argument("--text-file", default=None)
+    commit_cortex.add_argument("--evidence", default=None)
+    commit_cortex.add_argument("--confidence", type=float, default=None)
+    commit_cortex.set_defaults(func=command_commit_cortex)
+
+    cortex_state = subparsers.add_parser("cortex-state")
+    add_context(cortex_state)
+    cortex_state.add_argument("--agent-id", default="")
+    cortex_state.add_argument("--limit", type=int, default=50)
+    cortex_state.set_defaults(func=command_cortex_state)
 
     profile = subparsers.add_parser("profile")
     profile.add_argument("--benchmark-quick-prune", action="store_true")

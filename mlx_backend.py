@@ -59,6 +59,27 @@ CONSOLIDATION_PHASES = (
 )
 DEFAULT_AGENT_TARGETS = ("mcp-clients", "codex-desktop", "local-ide-adapters")
 CONTEXT_BUS_DELIVERY_MODE = "durable-mcp-pull"
+CORTEX_TRACE_TYPES = {
+    "goal",
+    "decision",
+    "constraint",
+    "evidence",
+    "blocker",
+    "implementation",
+    "validation",
+    "risk",
+    "correction",
+    "follow_up",
+    "assumption",
+}
+CORTEX_TRUTH_POSTURES = {
+    "observed",
+    "inferred",
+    "operator-confirmed",
+    "test-validated",
+    "stale",
+}
+CORTEX_MODES = {"strict", "creative", "operator", "security", "demo"}
 
 
 class BackendUnavailable(RuntimeError):
@@ -193,6 +214,7 @@ class SpikingAttentionBackend:
         self.memory_store = DurableMemoryStore(resolved_memory_path)
         self.global_enabled = True
         self.context_overrides: dict[str, bool] = {}
+        self.cortex_sessions: dict[str, dict[str, Any]] = {}
         self.registered_traces: list[dict[str, Any]] = []
 
         self.W_syn = self._balanced_matrix(
@@ -271,6 +293,13 @@ class SpikingAttentionBackend:
                     sanitize_context_id(key): bool(value)
                     for key, value in overrides.items()
                 }
+            cortex_sessions = payload.get("cortex_sessions", {})
+            if isinstance(cortex_sessions, dict):
+                self.cortex_sessions = {
+                    str(session_id): self._normalize_cortex_session(raw_session)
+                    for session_id, raw_session in cortex_sessions.items()
+                    if isinstance(raw_session, dict)
+                }
             traces = payload.get("registered_traces", [])
             if isinstance(traces, list):
                 for raw_trace in traces:
@@ -304,6 +333,7 @@ class SpikingAttentionBackend:
                 "version": 2,
                 "global_enabled": self.global_enabled,
                 "context_overrides": self.context_overrides,
+                "cortex_sessions": self.cortex_sessions,
                 "memory_db_path": str(self.memory_store.db_path),
                 "updated_at": time.time(),
             }
@@ -368,6 +398,37 @@ class SpikingAttentionBackend:
             return json.loads(json.dumps(metadata, default=str))
         except Exception:
             return {str(key): str(value) for key, value in metadata.items()}
+
+    def _normalize_cortex_session(self, session: dict[str, Any]) -> dict[str, Any]:
+        now = time.time()
+        session_id = str(session.get("session_id") or "").strip()
+        if not session_id:
+            seed = json.dumps(session, sort_keys=True, default=str).encode("utf-8")
+            session_id = "ctx_" + hashlib.sha256(seed).hexdigest()[:16]
+        mode = str(session.get("mode") or "strict").strip().lower()
+        if mode not in CORTEX_MODES:
+            mode = "strict"
+        status = str(session.get("status") or "active").strip().lower()
+        if status not in {"active", "closed"}:
+            status = "active"
+        return {
+            "session_id": session_id,
+            "context_id": sanitize_context_id(str(session.get("context_id", "default"))),
+            "agent_id": sanitize_agent_id(str(session.get("agent_id", "unknown-agent"))),
+            "task": str(session.get("task", "")).strip()[:2000],
+            "mode": mode,
+            "status": status,
+            "started_at": float(session.get("started_at", now) or now),
+            "updated_at": float(session.get("updated_at", now) or now),
+            "tick_count": int(max(0, int(session.get("tick_count", 0) or 0))),
+            "last_decision": str(session.get("last_decision", "enter")),
+            "last_confidence": float(session.get("last_confidence", 0.0) or 0.0),
+            "last_observation": str(session.get("last_observation", ""))[:2000],
+            "last_proposed_action": str(session.get("last_proposed_action", ""))[:2000],
+            "last_warnings": self._json_safe_metadata(
+                {"items": session.get("last_warnings", [])}
+            ).get("items", []),
+        }
 
     def _build_lif_step(self, compile_graph: bool):
         native_mx = self._mx
@@ -934,6 +995,15 @@ class SpikingAttentionBackend:
             "memory_relationship_count": int(total_stats["relationship_count"]),
             "memory_context_relationship_count": int(context_stats["relationship_count"]),
             "memory_contexts": total_stats["contexts"],
+            "active_cortex_session_count": len(
+                [
+                    session
+                    for session in self.cortex_sessions.values()
+                    if session.get("status") == "active"
+                    and session.get("context_id") == context
+                ]
+            ),
+            "cortex_policy": self._cortex_policy("strict"),
             "context_bus_event_count": int(total_stats["context_bus_event_count"]),
             "context_bus_context_event_count": int(context_stats["context_bus_event_count"]),
             "context_bus_latest_event_id": int(context_stats["context_bus_latest_event_id"]),
@@ -1093,6 +1163,522 @@ class SpikingAttentionBackend:
             "memory_db_path": str(self.memory_store.db_path),
         }
 
+    def enter_spiking_cortex(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        task: str,
+        mode: str = "strict",
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        task_text = str(task or "").strip()
+        if not task_text:
+            raise ValueError("task must not be empty")
+        clean_mode = str(mode or "strict").strip().lower()
+        if clean_mode not in CORTEX_MODES:
+            clean_mode = "strict"
+        now = time.time()
+        seed = f"{context}\x1f{agent}\x1f{task_text}\x1f{now:.6f}".encode("utf-8")
+        session_id = "ctx_" + hashlib.sha256(seed).hexdigest()[:18]
+        session = self._normalize_cortex_session(
+            {
+                "session_id": session_id,
+                "context_id": context,
+                "agent_id": agent,
+                "task": task_text,
+                "mode": clean_mode,
+                "status": "active",
+                "started_at": now,
+                "updated_at": now,
+                "tick_count": 0,
+                "last_decision": "entered",
+            }
+        )
+        self.cortex_sessions[session_id] = session
+        self._persist_runtime_state()
+        recall_result = self.query(self.embed_text(task_text), context_id=context)
+        recall_items = self._split_recall_result(recall_result)
+        policy = self._cortex_policy(clean_mode)
+        state = self.get_cortex_state(context_id=context, agent_id=agent)
+        deployment = self.publish_context_event(
+            context_id=context,
+            source_surface="cortex-governor",
+            event_type="cortex-entered",
+            summary=f"{agent} entered Cortex Governor for {self._compact_text(task_text, 120)}",
+            payload={
+                "session_id": session_id,
+                "agent_id": agent,
+                "task": task_text,
+                "mode": clean_mode,
+                "governance_contract": policy["contract"],
+                "recall_items": recall_items[:8],
+            },
+        )
+        return {
+            "action": "enter-spiking-cortex",
+            "context_id": context,
+            "agent_id": agent,
+            "session_id": session_id,
+            "task": task_text,
+            "mode": clean_mode,
+            "governance_contract": policy["contract"],
+            "policy": policy,
+            "recall_result": recall_result,
+            "recall_items": recall_items,
+            "cortex_state": state,
+            "agent_deployment": deployment,
+        }
+
+    def cortex_tick(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        session_id: str,
+        observation: str = "",
+        proposed_action: str = "",
+        mutation_intent: bool = False,
+        confidence: float = 0.5,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        clean_session_id = str(session_id or "").strip()
+        session = self._active_cortex_session(
+            context=context,
+            agent_id=agent,
+            session_id=clean_session_id,
+        )
+        observation_text = str(observation or "").strip()
+        proposed_text = str(proposed_action or "").strip()
+        bounded_confidence = min(max(float(confidence), 0.0), 1.0)
+        state = self.get_cortex_state(context_id=context, agent_id=agent)
+        recall_prompt = " ".join(part for part in (observation_text, proposed_text) if part)
+        recall_result = (
+            self.query(self.embed_text(recall_prompt), context_id=context)
+            if recall_prompt
+            else ""
+        )
+        warnings = self._cortex_warnings(
+            mutation_intent=bool(mutation_intent),
+            confidence=bounded_confidence,
+            observation=observation_text,
+            proposed_action=proposed_text,
+            cortex_state=state,
+        )
+        decision = self._cortex_decision(warnings=warnings, confidence=bounded_confidence)
+        now = time.time()
+        session.update(
+            {
+                "updated_at": now,
+                "tick_count": int(session.get("tick_count", 0)) + 1,
+                "last_decision": decision,
+                "last_confidence": bounded_confidence,
+                "last_observation": observation_text[:2000],
+                "last_proposed_action": proposed_text[:2000],
+                "last_warnings": warnings,
+            }
+        )
+        self.cortex_sessions[clean_session_id] = session
+        self._persist_runtime_state()
+        deployment = self.publish_context_event(
+            context_id=context,
+            source_surface="cortex-governor",
+            event_type="cortex-tick",
+            summary=f"{agent} cortex tick: {decision}",
+            payload={
+                "session_id": clean_session_id,
+                "agent_id": agent,
+                "decision": decision,
+                "confidence": bounded_confidence,
+                "mutation_intent": bool(mutation_intent),
+                "warning_codes": [warning["code"] for warning in warnings],
+            },
+        )
+        return {
+            "action": "cortex-tick",
+            "context_id": context,
+            "agent_id": agent,
+            "session_id": clean_session_id,
+            "decision": decision,
+            "confidence": bounded_confidence,
+            "warnings": warnings,
+            "recalled_constraints": state["constraints"][:8],
+            "recalled_risks": state["risks"][:8],
+            "recall_result": recall_result,
+            "recall_items": self._split_recall_result(recall_result),
+            "capture_recommendation": self._cortex_capture_recommendation(
+                observation_text,
+                proposed_text,
+                decision,
+            ),
+            "cortex_state": self.get_cortex_state(context_id=context, agent_id=agent),
+            "agent_deployment": deployment,
+        }
+
+    def commit_cortical_trace(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        session_id: str = "",
+        trace_type: str = "",
+        truth_posture: str = "observed",
+        text: str,
+        evidence: dict[str, Any] | None = None,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            raise ValueError("text must not be empty")
+        clean_session_id = str(session_id or "").strip() or "direct-cortex-commit"
+        clean_trace_type = self._normalize_cortex_trace_type(trace_type, clean_text)
+        clean_truth_posture = self._normalize_truth_posture(truth_posture)
+        safe_evidence = self._json_safe_metadata(evidence or {})
+        scored_confidence = self._score_cortex_confidence(
+            trace_type=clean_trace_type,
+            truth_posture=clean_truth_posture,
+            evidence=safe_evidence,
+            confidence=confidence,
+            text=clean_text,
+        )
+        session = self.cortex_sessions.get(clean_session_id, {})
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        digest = hashlib.sha256(
+            f"{context}\x1f{agent}\x1f{clean_session_id}\x1f{clean_trace_type}\x1f{clean_text}".encode("utf-8")
+        ).hexdigest()[:8]
+        tag = sanitize_tag(f"cortex-{agent}-{clean_trace_type}-{stamp}-{digest}")
+        metadata = self._json_safe_metadata(
+            {
+                "source": "cortex-governor",
+                "cortex_governor": True,
+                "cortex_session_id": clean_session_id,
+                "agent_id": agent,
+                "trace_type": clean_trace_type,
+                "truth_posture": clean_truth_posture,
+                "confidence": scored_confidence,
+                "evidence": safe_evidence,
+                "governance_mode": session.get("mode", "direct"),
+                "task": session.get("task", ""),
+            }
+        )
+        registration = self.register_text_trace(
+            tag=tag,
+            context_id=context,
+            text=clean_text,
+            metadata=metadata,
+        )
+        deployment = self.publish_context_event(
+            context_id=context,
+            source_surface="cortex-governor",
+            event_type="cortex-trace-committed",
+            summary=f"{agent} committed {clean_trace_type} trace at {scored_confidence:.2f} confidence",
+            payload={
+                "session_id": clean_session_id,
+                "agent_id": agent,
+                "trace_type": clean_trace_type,
+                "truth_posture": clean_truth_posture,
+                "confidence": scored_confidence,
+                "memory_id": registration["memory_id"],
+                "tag": registration["tag"],
+                "evidence": safe_evidence,
+            },
+        )
+        return {
+            "action": "commit-cortical-trace",
+            "context_id": context,
+            "agent_id": agent,
+            "session_id": clean_session_id,
+            "trace_type": clean_trace_type,
+            "truth_posture": clean_truth_posture,
+            "confidence": scored_confidence,
+            "memory_id": registration["memory_id"],
+            "tag": registration["tag"],
+            "metadata": metadata,
+            "agent_deployment": deployment,
+        }
+
+    def get_cortex_state(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id) if agent_id else ""
+        active_sessions = [
+            dict(session)
+            for session in self.cortex_sessions.values()
+            if session.get("context_id") == context
+            and session.get("status") == "active"
+            and (not agent or session.get("agent_id") == agent)
+        ]
+        active_sessions.sort(key=lambda item: float(item.get("updated_at", 0.0)), reverse=True)
+        entries = self.memory_store.list_entries(
+            context_id=context,
+            include_global=True,
+            limit=max(1, min(int(limit), 500)),
+        )
+        cortical_entries = [
+            self._summarize_cortex_memory(entry)
+            for entry in entries
+            if isinstance(entry.get("metadata"), dict)
+            and entry["metadata"].get("cortex_governor") is True
+        ]
+        typed_counts: dict[str, int] = {}
+        for entry in cortical_entries:
+            trace_type = str(entry.get("trace_type") or "unknown")
+            typed_counts[trace_type] = typed_counts.get(trace_type, 0) + 1
+        high_confidence = [
+            entry for entry in cortical_entries if float(entry.get("confidence", 0.0)) >= 0.8
+        ][:10]
+        constraints = [
+            entry for entry in cortical_entries if entry.get("trace_type") == "constraint"
+        ][:10]
+        risks = [
+            entry for entry in cortical_entries if entry.get("trace_type") in {"risk", "blocker", "assumption"}
+        ][:10]
+        decisions = [
+            entry for entry in cortical_entries if entry.get("trace_type") == "decision"
+        ][:10]
+        return {
+            "action": "cortex-state",
+            "context_id": context,
+            "agent_id": agent,
+            "active_session_count": len(active_sessions),
+            "active_sessions": active_sessions[:10],
+            "typed_memory_counts": dict(sorted(typed_counts.items())),
+            "high_confidence_truths": high_confidence,
+            "constraints": constraints,
+            "risks": risks,
+            "decisions": decisions,
+            "working_memory": cortical_entries[:10],
+            "policy": self._cortex_policy(
+                str(active_sessions[0].get("mode", "strict")) if active_sessions else "strict"
+            ),
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def _active_cortex_session(
+        self,
+        *,
+        context: str,
+        agent_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        if not session_id:
+            raise ValueError("session_id is required")
+        session = self.cortex_sessions.get(session_id)
+        if not session:
+            raise ValueError(f"cortex session not found: {session_id}")
+        if session.get("context_id") != context:
+            raise ValueError("cortex session context mismatch")
+        if session.get("agent_id") != agent_id:
+            raise ValueError("cortex session agent mismatch")
+        if session.get("status") != "active":
+            raise ValueError("cortex session is not active")
+        return dict(session)
+
+    def _cortex_policy(self, mode: str) -> dict[str, Any]:
+        clean_mode = str(mode or "strict").strip().lower()
+        if clean_mode not in CORTEX_MODES:
+            clean_mode = "strict"
+        base_contract = [
+            "hydrate-before-action",
+            "verify-before-mutation",
+            "capture-validated-traces",
+            "surface-conflicts",
+            "prune-sensitive-or-wrong-memory",
+        ]
+        if clean_mode == "creative":
+            base_contract.append("allow-low-confidence-exploration")
+        elif clean_mode == "security":
+            base_contract.extend(["fail-closed-on-secret-risk", "require-provenance"])
+        elif clean_mode == "demo":
+            base_contract.append("prefer-readable-evidence")
+        return {
+            "policy_id": f"cognitive_governance:{clean_mode}",
+            "cognitive_governance": True,
+            "mode": clean_mode,
+            "contract": base_contract,
+            "decision_thresholds": {
+                "verify_first_below_confidence": 0.7,
+                "high_confidence_truth": 0.8,
+                "mutation_requires_warning": True,
+            },
+            "memory_rules": [
+                "user corrections outrank generated inference",
+                "test-validated traces outrank unverified summaries",
+                "stale or sensitive traces should be pruned before reuse",
+            ],
+        }
+
+    def _normalize_cortex_trace_type(self, trace_type: str, text: str) -> str:
+        requested = str(trace_type or "").strip().lower().replace("-", "_")
+        if requested in CORTEX_TRACE_TYPES:
+            return requested
+        lowered = str(text or "").lower()
+        keyword_map = {
+            "validation": ("test", "passed", "verified", "validated", "certified"),
+            "decision": ("decided", "decision", "choose", "selected", "approved"),
+            "constraint": ("must", "requires", "do not", "never", "constraint"),
+            "risk": ("risk", "danger", "sensitive", "unsafe", "warning"),
+            "blocker": ("blocked", "blocker", "cannot", "missing"),
+            "correction": ("correction", "actually", "wrong", "fix"),
+            "implementation": ("implemented", "changed", "added", "patched"),
+            "goal": ("goal", "objective", "target"),
+            "follow_up": ("follow up", "next", "todo"),
+        }
+        for candidate, keywords in keyword_map.items():
+            if any(keyword in lowered for keyword in keywords):
+                return candidate
+        return "evidence"
+
+    def _normalize_truth_posture(self, truth_posture: str) -> str:
+        posture = str(truth_posture or "observed").strip().lower().replace("_", "-")
+        return posture if posture in CORTEX_TRUTH_POSTURES else "observed"
+
+    def _score_cortex_confidence(
+        self,
+        *,
+        trace_type: str,
+        truth_posture: str,
+        evidence: dict[str, Any],
+        confidence: float | None,
+        text: str,
+    ) -> float:
+        if confidence is not None:
+            return round(min(max(float(confidence), 0.0), 1.0), 3)
+        base_by_posture = {
+            "test-validated": 0.88,
+            "operator-confirmed": 0.86,
+            "observed": 0.74,
+            "inferred": 0.58,
+            "stale": 0.3,
+        }
+        score = base_by_posture.get(truth_posture, 0.7)
+        if evidence:
+            score += 0.05
+        if trace_type in {"validation", "constraint", "decision"}:
+            score += 0.03
+        lowered = str(text or "").lower()
+        if any(token in lowered for token in ("passed", "verified", "confirmed")):
+            score += 0.03
+        if any(token in lowered for token in ("maybe", "might", "assume", "guess")):
+            score -= 0.12
+        return round(min(max(score, 0.05), 0.99), 3)
+
+    def _summarize_cortex_memory(self, entry: dict[str, Any]) -> dict[str, Any]:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        source_text = str(entry.get("source_text") or "")
+        return {
+            "memory_id": entry.get("memory_id", ""),
+            "tag": entry.get("tag", ""),
+            "context_id": entry.get("context_id", ""),
+            "trace_type": str(metadata.get("trace_type", "evidence")),
+            "truth_posture": str(metadata.get("truth_posture", "observed")),
+            "confidence": round(float(metadata.get("confidence", 0.0) or 0.0), 3),
+            "agent_id": str(metadata.get("agent_id", "")),
+            "session_id": str(metadata.get("cortex_session_id", "")),
+            "excerpt": self._compact_text(source_text, 180),
+            "evidence": metadata.get("evidence", {}),
+            "updated_at": float(entry.get("updated_at", 0.0) or 0.0),
+        }
+
+    def _cortex_warnings(
+        self,
+        *,
+        mutation_intent: bool,
+        confidence: float,
+        observation: str,
+        proposed_action: str,
+        cortex_state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        if mutation_intent:
+            warnings.append(
+                {
+                    "code": "mutation-verification-required",
+                    "severity": "high" if confidence < 0.7 else "medium",
+                    "message": "Mutation intent requires verification evidence before completion.",
+                }
+            )
+        if confidence < 0.5:
+            warnings.append(
+                {
+                    "code": "low-confidence-action",
+                    "severity": "medium",
+                    "message": "Agent confidence is below the Cortex Governor verification threshold.",
+                }
+            )
+        combined = f"{observation} {proposed_action}".lower()
+        if any(token in combined for token in ("secret", "token", "password", "private key", "credential")):
+            warnings.append(
+                {
+                    "code": "sensitive-data-risk",
+                    "severity": "critical",
+                    "message": "Potential sensitive data path detected; avoid capture and verify redaction.",
+                }
+            )
+        if any(token in combined for token in ("assume", "maybe", "might", "uncertain")):
+            warnings.append(
+                {
+                    "code": "unverified-assumption",
+                    "severity": "medium",
+                    "message": "Observation or proposed action contains uncertainty language.",
+                }
+            )
+        if cortex_state.get("risks"):
+            warnings.append(
+                {
+                    "code": "related-risk-memory",
+                    "severity": "medium",
+                    "message": "Related risk or blocker memories are active in this context.",
+                }
+            )
+        return warnings
+
+    def _cortex_decision(
+        self,
+        *,
+        warnings: list[dict[str, Any]],
+        confidence: float,
+    ) -> str:
+        warning_codes = {str(warning.get("code", "")) for warning in warnings}
+        if "sensitive-data-risk" in warning_codes:
+            return "stop-and-sanitize"
+        if "mutation-verification-required" in warning_codes and confidence < 0.7:
+            return "verify-first"
+        if warnings:
+            return "proceed-with-verification"
+        return "proceed"
+
+    def _cortex_capture_recommendation(
+        self,
+        observation: str,
+        proposed_action: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        combined = f"{observation} {proposed_action}".lower()
+        if "test" in combined or "verify" in combined:
+            trace_type = "validation"
+        elif "decid" in combined or "choose" in combined:
+            trace_type = "decision"
+        elif "risk" in combined or "secret" in combined:
+            trace_type = "risk"
+        else:
+            trace_type = "evidence"
+        return {
+            "recommended": decision in {"verify-first", "proceed-with-verification"},
+            "trace_type": trace_type,
+            "truth_posture": "observed",
+            "reason": "Capture the outcome after verification, not before.",
+        }
+
     def hydrate_agent_context(
         self,
         *,
@@ -1161,6 +1747,11 @@ class SpikingAttentionBackend:
             "relationship_count": int(graph["relationship_count"]),
             "relationship_modes": graph["relationship_summary"],
         }
+        cortex_state = self.get_cortex_state(
+            context_id=context,
+            agent_id=agent,
+            limit=bounded_graph_limit,
+        )
         payload = {
             "action": "agent-context-hydrate",
             "context_id": context,
@@ -1177,6 +1768,7 @@ class SpikingAttentionBackend:
             "graph_summary": graph_summary,
             "graph_entries": graph_entries,
             "graph_relationships": graph_relationships,
+            "cortex_state": cortex_state,
             "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
             "memory_db_path": str(self.memory_store.db_path),
         }
@@ -1362,6 +1954,31 @@ class SpikingAttentionBackend:
             lines.append(
                 f"- {entry.get('tag', '')}: {self._compact_text(str(excerpt), 180)}"
             )
+        cortex_state = payload.get("cortex_state", {})
+        if cortex_state:
+            policy = cortex_state.get("policy", {})
+            lines.append("## Cortex Governor")
+            lines.append(
+                (
+                    f"- Active Sessions: {cortex_state.get('active_session_count', 0)} | "
+                    f"Policy: {policy.get('policy_id', 'cognitive_governance:strict')}"
+                )
+            )
+            typed_counts = cortex_state.get("typed_memory_counts", {})
+            if typed_counts:
+                counts_text = ", ".join(
+                    f"{key}={value}" for key, value in sorted(typed_counts.items())
+                )
+                lines.append(f"- Typed Memory: {counts_text}")
+            for item in cortex_state.get("high_confidence_truths", [])[:3]:
+                lines.append(
+                    (
+                        f"- {item.get('trace_type', 'evidence')} "
+                        f"({item.get('truth_posture', 'observed')}, "
+                        f"{item.get('confidence', 0.0)}): "
+                        f"{self._compact_text(str(item.get('excerpt', '')), 150)}"
+                    )
+                )
         lines.append("## Operator Safety")
         lines.append(
             "- Treat this as local working memory. Prune sensitive, wrong, or partial data before it influences future recall."
@@ -2463,6 +3080,78 @@ def hydrate_agent_context(
         event_limit=event_limit,
         graph_limit=graph_limit,
         acknowledge=acknowledge,
+    )
+
+
+def enter_spiking_cortex(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    task: str,
+    mode: str = "strict",
+) -> dict[str, Any]:
+    return get_backend().enter_spiking_cortex(
+        context_id=context_id,
+        agent_id=agent_id,
+        task=task,
+        mode=mode,
+    )
+
+
+def cortex_tick(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    session_id: str,
+    observation: str = "",
+    proposed_action: str = "",
+    mutation_intent: bool = False,
+    confidence: float = 0.5,
+) -> dict[str, Any]:
+    return get_backend().cortex_tick(
+        context_id=context_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        observation=observation,
+        proposed_action=proposed_action,
+        mutation_intent=mutation_intent,
+        confidence=confidence,
+    )
+
+
+def commit_cortical_trace(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    session_id: str = "",
+    trace_type: str = "",
+    truth_posture: str = "observed",
+    text: str,
+    evidence: dict[str, Any] | None = None,
+    confidence: float | None = None,
+) -> dict[str, Any]:
+    return get_backend().commit_cortical_trace(
+        context_id=context_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        trace_type=trace_type,
+        truth_posture=truth_posture,
+        text=text,
+        evidence=evidence,
+        confidence=confidence,
+    )
+
+
+def get_cortex_state(
+    *,
+    context_id: str = "default",
+    agent_id: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    return get_backend().get_cortex_state(
+        context_id=context_id,
+        agent_id=agent_id,
+        limit=limit,
     )
 
 

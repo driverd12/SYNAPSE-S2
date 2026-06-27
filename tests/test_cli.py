@@ -621,6 +621,81 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(second_payload["new_event_count"], 0)
         self.assertEqual(second_payload["since_event_id"], event_id)
 
+    def test_cli_cortex_governor_enters_ticks_commits_and_reports_state(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            entered = self.run_cli(
+                "enter-cortex",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                "--task",
+                "Ship a governed cortex loop.",
+                "--mode",
+                "strict",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            session_id = json.loads(entered.stdout)["session_id"]
+            tick = self.run_cli(
+                "cortex-tick",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                "--session-id",
+                session_id,
+                "--observation",
+                "Preparing to mutate files.",
+                "--proposed-action",
+                "Edit backend and run tests.",
+                "--mutation-intent",
+                "--confidence",
+                "0.41",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            committed = self.run_cli(
+                "commit-cortex",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                "--session-id",
+                session_id,
+                "--type",
+                "decision",
+                "--truth-posture",
+                "operator-confirmed",
+                "--text",
+                "Cortex Governor exposes typed state through CLI.",
+                "--evidence",
+                '{"source":"unit-test"}',
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            state = self.run_cli(
+                "cortex-state",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(entered.returncode, 0, entered.stderr)
+        self.assertEqual(tick.returncode, 0, tick.stderr)
+        self.assertEqual(committed.returncode, 0, committed.stderr)
+        self.assertEqual(state.returncode, 0, state.stderr)
+        self.assertEqual(json.loads(entered.stdout)["action"], "enter-spiking-cortex")
+        self.assertEqual(json.loads(tick.stdout)["decision"], "verify-first")
+        self.assertEqual(json.loads(committed.stdout)["trace_type"], "decision")
+        self.assertGreaterEqual(json.loads(state.stdout)["typed_memory_counts"]["decision"], 1)
+
     def test_cli_list_memory_can_include_vector_details_when_requested(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

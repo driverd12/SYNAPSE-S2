@@ -196,6 +196,80 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertTrue(audit_payload["checks"]["graph_ready"])
         self.assertIn("dashboard-memory", audit_payload["query_result"])
 
+    def test_cortex_governor_endpoints_and_snapshot_state(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            enter_status, enter_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/enter",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-agent",
+                            "task": "Govern dashboard operator work.",
+                            "mode": "strict",
+                        }
+                    ).encode(),
+                )
+            )
+            tick_status, tick_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/tick",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-agent",
+                            "session_id": enter_payload["session_id"],
+                            "observation": "Preparing a dashboard mutation.",
+                            "proposed_action": "Edit UI and run tests.",
+                            "mutation_intent": True,
+                            "confidence": 0.39,
+                        }
+                    ).encode(),
+                )
+            )
+            commit_status, commit_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/commit",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-agent",
+                            "session_id": enter_payload["session_id"],
+                            "trace_type": "decision",
+                            "truth_posture": "operator-confirmed",
+                            "text": "Dashboard exposes Cortex Governor state.",
+                            "evidence": {"source": "unit-test"},
+                        }
+                    ).encode(),
+                )
+            )
+            state_status, state_payload = self.decode(
+                runtime.handle("GET", "/api/cortex/state?context_id=demo&agent_id=dashboard-agent")
+            )
+            snapshot_status, snapshot_payload = self.decode(
+                runtime.handle("GET", "/api/snapshot?context_id=demo&limit=10")
+            )
+
+        self.assertEqual(enter_status, 200)
+        self.assertEqual(tick_status, 200)
+        self.assertEqual(commit_status, 200)
+        self.assertEqual(state_status, 200)
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(enter_payload["action"], "enter-spiking-cortex")
+        self.assertEqual(tick_payload["decision"], "verify-first")
+        self.assertEqual(commit_payload["trace_type"], "decision")
+        self.assertGreaterEqual(state_payload["typed_memory_counts"]["decision"], 1)
+        self.assertIn("cortex_state", snapshot_payload)
+        self.assertGreaterEqual(
+            snapshot_payload["cortex_state"]["typed_memory_counts"]["decision"],
+            1,
+        )
+
     def test_evidence_pack_endpoint_writes_local_report_and_backup(self):
         with TemporaryDirectory() as tmp:
             previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
@@ -281,6 +355,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("contextEventLedger", index)
         self.assertIn("neuralInspectorToggle", index)
         self.assertIn("neuralMathPanel", index)
+        self.assertIn("cortexPanel", index)
+        self.assertIn("Cortex Governor", index)
         self.assertIn("Sparse spike code", index)
         self.assertIn("Active neuron sample", index)
         self.assertIn("LIF update", index)
@@ -290,6 +366,10 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("renderContextBus", app)
         self.assertIn("renderRelationshipLedger", app)
         self.assertIn("renderNeuralInspector", app)
+        self.assertIn("renderCortexState", app)
+        self.assertIn("/api/cortex/enter", app)
+        self.assertIn("/api/cortex/tick", app)
+        self.assertIn("/api/cortex/commit", app)
         self.assertIn("formatSpikeSubLabel", app)
         self.assertIn("active coordinates", app)
         self.assertIn("projected neurons", app)
@@ -321,6 +401,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("danger-button", styles)
         self.assertIn("neural-math-panel", styles)
         self.assertIn("neural-inspector-toggle", styles)
+        self.assertIn("cortex-panel", styles)
         self.assertNotIn("board-demo", index)
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)

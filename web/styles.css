@@ -517,6 +517,206 @@ textarea {
   margin-top: 12px;
 }
 
+.cortex-grid {
+  margin-top: 12px;
+}
+
+.cortex-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.cortex-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.cortex-status-grid div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border-left: 1px solid var(--row);
+  background: var(--panel-soft);
+  padding: 10px 12px;
+}
+
+.cortex-status-grid div:first-child {
+  border-left: 0;
+}
+
+.cortex-status-grid span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 820;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.cortex-status-grid strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 820;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cortex-status-grid strong.good,
+.good {
+  color: var(--green);
+}
+
+.cortex-status-grid strong.warn,
+.warn {
+  color: var(--amber);
+}
+
+.cortex-status-grid strong.bad,
+.bad {
+  color: var(--red);
+}
+
+.cortex-status-grid small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cortex-workbench {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.cortex-form {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 12px;
+}
+
+.cortex-form h3,
+.cortex-memory-lists h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.cortex-form textarea {
+  min-height: 86px;
+}
+
+.cortex-inline-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 124px;
+  gap: 10px;
+  align-items: end;
+}
+
+.check-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 720;
+}
+
+.check-control input {
+  width: 18px;
+  height: 18px;
+}
+
+.compact-field {
+  gap: 5px;
+}
+
+.compact-field span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 820;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.cortex-memory-lists {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.cortex-memory-lists > div {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 12px;
+}
+
+.cortex-memory-list {
+  display: grid;
+  gap: 7px;
+}
+
+.cortex-memory-row {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.62fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  background: var(--panel);
+  padding: 8px 10px;
+}
+
+.cortex-memory-row div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cortex-memory-row strong,
+.cortex-memory-row small,
+.cortex-memory-row p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cortex-memory-row strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 820;
+}
+
+.cortex-memory-row small,
+.cortex-memory-row p,
+.cortex-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.cortex-empty {
+  display: grid;
+  min-height: 38px;
+  place-items: center;
+  font-weight: 720;
+}
+
 .panel {
   min-width: 0;
   border: 1px solid var(--border);
@@ -1808,6 +2008,15 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .cortex-workbench {
+    grid-template-columns: 1fr;
+  }
+
+  .cortex-status-grid,
+  .cortex-memory-lists {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .prune-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1830,6 +2039,9 @@ textarea {
   .top-readouts,
   .nav-list,
   .recall-guide,
+  .cortex-status-grid,
+  .cortex-memory-lists,
+  .cortex-inline-controls,
   .resource-stats,
   .graph-shell,
   .graph-toolbar,
@@ -1872,6 +2084,19 @@ textarea {
   .resource-stats div {
     border-left: 0;
     border-top: 1px solid var(--row);
+  }
+
+  .cortex-status-grid div {
+    border-left: 0;
+    border-top: 1px solid var(--row);
+  }
+
+  .cortex-status-grid div:first-child {
+    border-top: 0;
+  }
+
+  .cortex-memory-row {
+    grid-template-columns: 1fr;
   }
 
   .runtime-health-grid {

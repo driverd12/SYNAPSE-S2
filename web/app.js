@@ -26,6 +26,9 @@ const state = {
     unlockedUntilMs: 0,
     lockTimer: null,
   },
+  cortex: {
+    sessionId: "",
+  },
 };
 
 const elements = collectElements([
@@ -43,6 +46,27 @@ const elements = collectElements([
   "coreToggleGuardHint",
   "coreUnlockButton",
   "coreVersion",
+  "cortexAgentId",
+  "cortexCommitForm",
+  "cortexConfidence",
+  "cortexDecision",
+  "cortexEnterForm",
+  "cortexHighConfidence",
+  "cortexMode",
+  "cortexMutationIntent",
+  "cortexObservation",
+  "cortexPolicy",
+  "cortexProposedAction",
+  "cortexSessionCount",
+  "cortexSessionId",
+  "cortexTask",
+  "cortexTickForm",
+  "cortexTraceText",
+  "cortexTraceType",
+  "cortexTruthPosture",
+  "cortexTypedCounts",
+  "cortexWarnings",
+  "cortexWorkingMemory",
   "captureForm",
   "captureInboxButton",
   "captureInboxState",
@@ -314,6 +338,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderMemoryLedger(graph);
   renderContextBus(status);
   renderCaptureInbox(snapshot.capture_inbox || null);
+  renderCortexState(snapshot.cortex_state || {});
   renderFooter(snapshot, status, profile, contextCount);
   renderHydrationTiming(snapshot, clientElapsedMs);
 }
@@ -373,6 +398,93 @@ function renderCaptureInbox(captureInbox) {
     <strong>${escapeHtml(headline)}</strong>
     <small>${escapeHtml(detail)}</small>
   `;
+}
+
+function renderCortexState(cortex) {
+  const activeSessions = Array.isArray(cortex.active_sessions) ? cortex.active_sessions : [];
+  const activeSession = activeSessions[0] || null;
+  const policy = cortex.policy || {};
+  const policyId = String(policy.policy_id || "cognitive_governance:strict");
+  const typedCounts = cortex.typed_memory_counts || {};
+  const highConfidence = Array.isArray(cortex.high_confidence_truths)
+    ? cortex.high_confidence_truths
+    : [];
+  const workingMemory = Array.isArray(cortex.working_memory) ? cortex.working_memory : [];
+  const warnings = Array.isArray(activeSession?.last_warnings) ? activeSession.last_warnings : [];
+
+  if (!state.cortex.sessionId && activeSession?.session_id) {
+    state.cortex.sessionId = String(activeSession.session_id);
+  }
+
+  const currentSessionId = state.cortex.sessionId || String(activeSession?.session_id || "");
+  const lastDecision = String(activeSession?.last_decision || "standby");
+
+  elements.cortexPolicy.textContent = policyId;
+  elements.cortexPolicy.title = Array.isArray(policy.contract)
+    ? policy.contract.join(" / ")
+    : policyId;
+  elements.cortexSessionCount.textContent = formatNumber(cortex.active_session_count ?? activeSessions.length);
+  elements.cortexSessionId.textContent = currentSessionId
+    ? compactTag(currentSessionId, 34)
+    : "no active session";
+  elements.cortexSessionId.title = currentSessionId || "";
+  elements.cortexDecision.textContent = lastDecision;
+  elements.cortexDecision.className = decisionClass(lastDecision);
+
+  const typedSummary = Object.entries(typedCounts)
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+    .map(([type, count]) => `${type}:${formatNumber(count)}`)
+    .join(" / ");
+  elements.cortexTypedCounts.textContent = typedSummary || "none";
+  elements.cortexTypedCounts.title = typedSummary || "";
+
+  elements.cortexWarnings.textContent = warnings.length
+    ? warnings.map((warning) => warning.code || "warning").join(" / ")
+    : "clear";
+  elements.cortexWarnings.className = warnings.some((warning) => warning.severity === "critical")
+    ? "bad"
+    : warnings.length
+      ? "warn"
+      : "good";
+
+  elements.cortexHighConfidence.innerHTML = renderCortexMemoryList(
+    highConfidence,
+    "No high-confidence governed truths yet",
+  );
+  elements.cortexWorkingMemory.innerHTML = renderCortexMemoryList(
+    workingMemory,
+    "No cortical traces yet",
+  );
+}
+
+function renderCortexMemoryList(items, emptyLabel) {
+  if (!items.length) {
+    return `<div class="cortex-empty">${escapeHtml(emptyLabel)}</div>`;
+  }
+  return items.slice(0, 8).map((item) => {
+    const confidence = Number(item.confidence ?? 0);
+    const meta = [
+      item.trace_type || "evidence",
+      item.truth_posture || "observed",
+      Number.isFinite(confidence) ? `${formatNumber(confidence, 2)} confidence` : "",
+    ].filter(Boolean).join(" / ");
+    return `
+      <article class="cortex-memory-row">
+        <div>
+          <strong>${escapeHtml(item.tag || item.memory_id || "cortex-trace")}</strong>
+          <small>${escapeHtml(meta)}</small>
+        </div>
+        <p>${escapeHtml(item.excerpt || "")}</p>
+      </article>
+    `;
+  }).join("");
+}
+
+function decisionClass(decision) {
+  if (decision === "stop-and-sanitize") return "bad";
+  if (decision === "verify-first" || decision === "proceed-with-verification") return "warn";
+  if (decision === "proceed") return "good";
+  return "";
 }
 
 function renderRuntimeHealth(status, profile, graph, counts) {
@@ -1345,6 +1457,103 @@ async function publishAwareResult(payload) {
   return payload;
 }
 
+function currentCortexAgentId() {
+  return elements.cortexAgentId.value.trim() || "dashboard-ui";
+}
+
+function currentCortexSessionId() {
+  return state.cortex.sessionId || elements.cortexSessionId.title || "";
+}
+
+function setCortexSessionId(sessionId) {
+  state.cortex.sessionId = String(sessionId || "");
+  elements.cortexSessionId.textContent = state.cortex.sessionId
+    ? compactTag(state.cortex.sessionId, 34)
+    : "no active session";
+  elements.cortexSessionId.title = state.cortex.sessionId;
+}
+
+async function enterCortexSession(button) {
+  const task = elements.cortexTask.value.trim();
+  if (!task) {
+    logOperation("Cortex enter rejected", "current task is required");
+    elements.cortexTask.focus();
+    return null;
+  }
+  return withBusy(button, "Enter cortex", async () => {
+    const payload = await requestJson("/api/cortex/enter", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        agent_id: currentCortexAgentId(),
+        task,
+        mode: elements.cortexMode.value,
+      },
+    });
+    await publishAwareResult(payload);
+    setCortexSessionId(payload.session_id);
+    if (payload.cortex_state) renderCortexState(payload.cortex_state);
+    return payload;
+  });
+}
+
+async function tickCortexGovernor(button) {
+  const sessionId = currentCortexSessionId();
+  if (!sessionId) {
+    logOperation("Cortex tick rejected", "enter a Cortex Governor session first");
+    elements.cortexTask.focus();
+    return null;
+  }
+  const confidence = clamp(Number(elements.cortexConfidence.value || 0.5), 0, 1);
+  return withBusy(button, "Cortex tick", async () => {
+    const payload = await requestJson("/api/cortex/tick", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        agent_id: currentCortexAgentId(),
+        session_id: sessionId,
+        observation: elements.cortexObservation.value.trim(),
+        proposed_action: elements.cortexProposedAction.value.trim(),
+        mutation_intent: elements.cortexMutationIntent.checked,
+        confidence,
+      },
+    });
+    await publishAwareResult(payload);
+    if (payload.cortex_state) renderCortexState(payload.cortex_state);
+    return payload;
+  });
+}
+
+async function commitCorticalTrace(button) {
+  const text = elements.cortexTraceText.value.trim();
+  if (!text) {
+    logOperation("Cortical trace rejected", "trace text is required");
+    elements.cortexTraceText.focus();
+    return null;
+  }
+  return withBusy(button, "Commit cortical trace", async () => {
+    const payload = await requestJson("/api/cortex/commit", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        agent_id: currentCortexAgentId(),
+        session_id: currentCortexSessionId(),
+        trace_type: elements.cortexTraceType.value,
+        truth_posture: elements.cortexTruthPosture.value,
+        text,
+        evidence: {
+          source: "dashboard",
+          session_id: currentCortexSessionId(),
+          recorded_at: new Date().toISOString(),
+        },
+      },
+    });
+    await publishAwareResult(payload);
+    elements.cortexTraceText.value = "";
+    return payload;
+  });
+}
+
 function confirmPrune(label) {
   return window.confirm(`Permanently prune ${label || "this graph item"} from SYNAPSE-S2 memory?`);
 }
@@ -1550,6 +1759,21 @@ elements.neuralInspectorToggle.addEventListener("click", () => {
 elements.coreUnlockButton.addEventListener("click", unlockCoreToggleGuard);
 elements.toggleButton.addEventListener("click", () => toggleCore(elements.toggleButton));
 elements.toggleActionButton.addEventListener("click", () => toggleCore(elements.toggleActionButton));
+
+elements.cortexEnterForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await enterCortexSession(elements.cortexEnterForm.querySelector("button"));
+});
+
+elements.cortexTickForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await tickCortexGovernor(elements.cortexTickForm.querySelector("button"));
+});
+
+elements.cortexCommitForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await commitCorticalTrace(elements.cortexCommitForm.querySelector("button"));
+});
 
 elements.rememberForm.addEventListener("submit", async (event) => {
   event.preventDefault();

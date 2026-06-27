@@ -42,6 +42,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Agent-ready context hydration after client restart | Implemented | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief`, backend `hydrate_agent_context`, cursor-backed ack plus recall and graph summary |
 | Client-side startup/session-boundary bridge | Implemented | `mcp_client_wrapper.py`, `client_session_bridge.py`, launcher wrapper, per-client `SYNAPSE_S2_CLIENT_AGENT_ID`, sanitized boundary drops into capture inbox |
 | Recall does not fabricate historical tags when memory is empty | Implemented | no-memory queries return transparent raw activation summaries instead of synthetic `context::neuron-*` memory labels |
+| Real-time agent cognitive governance loop | Implemented | Cortex Governor backend, CLI `enter-cortex` / `cortex-tick` / `commit-cortex` / `cortex-state`, MCP tools, dashboard panel, hydration state, and tests |
 | Operator-visible local control surface | Implemented | `dashboard_server.py`, `web/index.html`, `web/app.js`, `web/styles.css`, `scripts/smoke_dashboard.py`, `tests/test_dashboard_server.py` |
 | Quick-pruning mode every 5 minutes | Implemented and tested | `quick_pruning_interval_seconds=300.0`, auto-prune in `query()` / `register_trace()`, `tests/test_backend.py` |
 | Quick-pruning completes under 60 ms budget as measured locally | Implemented as runtime check | `run_quick_pruning()` returns `within_60ms_budget`; unit test asserts the local path stays under budget |
@@ -70,6 +71,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Hand-prune nodes, edges, deployment events, temporal edges, or associative edges | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, dashboard Safety Prune |
 | Pull and acknowledge context deployments | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, `synapse_cli.py pull-context/ack-context/list-context-cursors` |
 | Hydrate a restarted agent from memory | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief` |
+| Run governed agent work sessions | `enter_spiking_cortex`, `tick_spiking_cortex`, `commit_spiking_cortical_trace`, `get_spiking_cortex_state`, CLI `enter-cortex` / `cortex-tick` / `commit-cortex` / `cortex-state`, dashboard Cortex Governor |
 | Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
 | Certify native runtime execution | `certify_spiking_runtime`, `synapse_cli.py certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope`, dashboard Native Certify |
 | Use a local dashboard | `dashboard_server.py`, `scripts/smoke_dashboard.py` |

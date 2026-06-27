@@ -119,6 +119,19 @@ def _validate_limit(limit: int) -> int:
     return min(max(value, 1), 500)
 
 
+def _parse_json_object(raw: str, *, field_name: str) -> dict[str, Any]:
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must be a JSON object")
+    return parsed
+
+
 def _optional_output_path(
     output_path: str | None,
     *,
@@ -694,6 +707,190 @@ def hydrate_spiking_agent_context(
             agent,
         )
         return json.dumps({"error": f"agent context hydration failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Enter SYNAPSE-S2 Cortex Governor",
+        "readOnlyHint": False,
+    }
+)
+def enter_spiking_cortex(
+    agent_id: str,
+    context_id: str = "default",
+    task: str = "",
+    mode: str = "strict",
+) -> str:
+    """Start a governed agent work session with recall, policy, and context-bus deployment."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        task_text = _validate_text(task, field_name="task")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.enter_spiking_cortex(
+            context_id=context,
+            agent_id=agent,
+            task=task_text,
+            mode=str(mode or "strict"),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid cortex enter for context_id=%s agent_id=%s: %s",
+            context,
+            agent,
+            exc,
+        )
+        return json.dumps({"error": f"invalid cortex enter: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("cortex enter failed for context_id=%s agent_id=%s", context, agent)
+        return json.dumps({"error": f"cortex enter failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Tick SYNAPSE-S2 Cortex Governor",
+        "readOnlyHint": False,
+    }
+)
+def tick_spiking_cortex(
+    agent_id: str,
+    session_id: str,
+    context_id: str = "default",
+    observation: str = "",
+    proposed_action: str = "",
+    mutation_intent: bool = False,
+    confidence: float = 0.5,
+) -> str:
+    """Evaluate the current observation/action against governed memory before proceeding."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            raise ValueError("session_id must not be empty")
+        observation_text = str(observation or "").strip()
+        proposed_text = str(proposed_action or "").strip()
+        if len(observation_text) > 20_000:
+            raise ValueError("observation exceeds 20000 characters")
+        if len(proposed_text) > 20_000:
+            raise ValueError("proposed_action exceeds 20000 characters")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.cortex_tick(
+            context_id=context,
+            agent_id=agent,
+            session_id=clean_session_id,
+            observation=observation_text,
+            proposed_action=proposed_text,
+            mutation_intent=bool(mutation_intent),
+            confidence=float(confidence),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid cortex tick for context_id=%s agent_id=%s: %s",
+            context,
+            agent,
+            exc,
+        )
+        return json.dumps({"error": f"invalid cortex tick: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("cortex tick failed for context_id=%s agent_id=%s", context, agent)
+        return json.dumps({"error": f"cortex tick failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Commit SYNAPSE-S2 Cortical Trace",
+        "readOnlyHint": False,
+    }
+)
+def commit_spiking_cortical_trace(
+    agent_id: str,
+    text: str,
+    context_id: str = "default",
+    session_id: str = "",
+    trace_type: str = "",
+    truth_posture: str = "observed",
+    evidence_json: str = "",
+    confidence: float = -1.0,
+) -> str:
+    """Persist a typed governed memory trace with truth posture and optional evidence."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        text_value = _validate_text(text, field_name="text")
+        evidence = _parse_json_object(evidence_json, field_name="evidence_json")
+        confidence_value: float | None = None
+        if float(confidence) >= 0.0:
+            confidence_value = float(confidence)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.commit_cortical_trace(
+            context_id=context,
+            agent_id=agent,
+            session_id=str(session_id or ""),
+            trace_type=str(trace_type or ""),
+            truth_posture=str(truth_posture or "observed"),
+            text=text_value,
+            evidence=evidence,
+            confidence=confidence_value,
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid cortical trace commit for context_id=%s agent_id=%s: %s",
+            context,
+            agent,
+            exc,
+        )
+        return json.dumps({"error": f"invalid cortical trace commit: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception(
+            "cortical trace commit failed for context_id=%s agent_id=%s",
+            context,
+            agent,
+        )
+        return json.dumps({"error": f"cortical trace commit failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get SYNAPSE-S2 Cortex State",
+        "readOnlyHint": True,
+    }
+)
+def get_spiking_cortex_state(
+    agent_id: str = "",
+    context_id: str = "default",
+    limit: int = 50,
+) -> str:
+    """Inspect active governed sessions and typed cortical memory for a context."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id) if str(agent_id or "").strip() else ""
+    try:
+        bounded_limit = _validate_limit(limit)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_cortex_state(
+            context_id=context,
+            agent_id=agent,
+            limit=bounded_limit,
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid cortex state request for context_id=%s agent_id=%s: %s",
+            context,
+            agent or "<all>",
+            exc,
+        )
+        return json.dumps({"error": f"invalid cortex state request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception(
+            "cortex state request failed for context_id=%s agent_id=%s",
+            context,
+            agent or "<all>",
+        )
+        return json.dumps({"error": f"cortex state request failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool(

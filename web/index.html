@@ -101,6 +101,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
             Recall Console
           </a>
+          <a href="#cortex" class="nav-item" data-section-target="cortex">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 0-4 4v1H7a4 4 0 0 0 0 8h1v1a4 4 0 0 0 8 0v-1h1a4 4 0 0 0 0-8h-1V7a4 4 0 0 0-4-4Z"/><path d="M8 8h8"/><path d="M8 16h8"/><path d="M12 3v18"/></svg>
+            Cortex Governor
+          </a>
           <a href="#maintenance" class="nav-item" data-section-target="maintenance">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 0 5.4-5.4"/></svg>
             Maintenance
@@ -304,6 +308,154 @@
               </button>
             </div>
             <p class="panel-note">All actions are local and reversible except persisted memory writes.</p>
+          </article>
+        </section>
+
+        <section class="cortex-grid" id="cortex" aria-label="Cortex Governor control plane">
+          <article class="panel cortex-panel" id="cortexPanel" aria-labelledby="cortexTitle">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Agent Governance</p>
+                <h2 id="cortexTitle">Cortex Governor</h2>
+              </div>
+              <span id="cortexPolicy" class="status-chip">cognitive_governance:strict</span>
+            </div>
+
+            <div class="cortex-status-grid" aria-label="Cortex Governor live state">
+              <div>
+                <span>Active Sessions</span>
+                <strong id="cortexSessionCount">0</strong>
+                <small id="cortexSessionId">no active session</small>
+              </div>
+              <div>
+                <span>Last Decision</span>
+                <strong id="cortexDecision">standby</strong>
+                <small>tick before risky actions</small>
+              </div>
+              <div>
+                <span>Typed Memory</span>
+                <strong id="cortexTypedCounts">none</strong>
+                <small>goal / decision / validation / risk</small>
+              </div>
+              <div>
+                <span>Guardrails</span>
+                <strong id="cortexWarnings">clear</strong>
+                <small>mutation and sensitive-data warnings</small>
+              </div>
+            </div>
+
+            <div class="cortex-workbench">
+              <form id="cortexEnterForm" class="cortex-form">
+                <div>
+                  <p class="section-label">Enter Cortex</p>
+                  <h3>Put the agent under governed memory</h3>
+                </div>
+                <div class="field-row">
+                  <div class="field-grid">
+                    <label for="cortexAgentId">Agent</label>
+                    <input id="cortexAgentId" autocomplete="off" value="dashboard-ui" />
+                  </div>
+                  <div class="field-grid">
+                    <label for="cortexMode">Mode</label>
+                    <select id="cortexMode">
+                      <option value="strict" selected>strict</option>
+                      <option value="operator">operator</option>
+                      <option value="security">security</option>
+                      <option value="creative">creative</option>
+                      <option value="demo">demo</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="field-grid">
+                  <label for="cortexTask">Current task</label>
+                  <textarea id="cortexTask" rows="4" placeholder="Describe the work this agent is about to perform"></textarea>
+                </div>
+                <button class="primary-button" type="submit">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18"/><path d="M5 12h14"/><path d="m14 7 5 5-5 5"/></svg>
+                  Enter + hydrate
+                </button>
+              </form>
+
+              <form id="cortexTickForm" class="cortex-form">
+                <div>
+                  <p class="section-label">Governor Tick</p>
+                  <h3>Check the next move against memory</h3>
+                </div>
+                <div class="field-grid">
+                  <label for="cortexObservation">Observation</label>
+                  <textarea id="cortexObservation" rows="3" placeholder="What did the agent observe?"></textarea>
+                </div>
+                <div class="field-grid">
+                  <label for="cortexProposedAction">Proposed action</label>
+                  <textarea id="cortexProposedAction" rows="3" placeholder="What is the agent about to do?"></textarea>
+                </div>
+                <div class="cortex-inline-controls">
+                  <label class="check-control">
+                    <input id="cortexMutationIntent" type="checkbox" checked />
+                    <span>Mutation intent</span>
+                  </label>
+                  <label class="field-grid compact-field" for="cortexConfidence">
+                    <span>Confidence</span>
+                    <input id="cortexConfidence" type="number" min="0" max="1" step="0.01" value="0.62" />
+                  </label>
+                </div>
+                <button class="secondary-button" type="submit">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 2-8 12h7l-1 8 8-12h-7l1-8Z"/></svg>
+                  Tick governor
+                </button>
+              </form>
+
+              <form id="cortexCommitForm" class="cortex-form">
+                <div>
+                  <p class="section-label">Commit Cortical Trace</p>
+                  <h3>Store verified thoughts as typed memory</h3>
+                </div>
+                <div class="field-row">
+                  <div class="field-grid">
+                    <label for="cortexTraceType">Type</label>
+                    <select id="cortexTraceType">
+                      <option value="validation">validation</option>
+                      <option value="decision">decision</option>
+                      <option value="constraint">constraint</option>
+                      <option value="implementation">implementation</option>
+                      <option value="risk">risk</option>
+                      <option value="evidence">evidence</option>
+                      <option value="correction">correction</option>
+                      <option value="follow_up">follow_up</option>
+                    </select>
+                  </div>
+                  <div class="field-grid">
+                    <label for="cortexTruthPosture">Truth posture</label>
+                    <select id="cortexTruthPosture">
+                      <option value="observed">observed</option>
+                      <option value="test-validated" selected>test-validated</option>
+                      <option value="operator-confirmed">operator-confirmed</option>
+                      <option value="inferred">inferred</option>
+                      <option value="stale">stale</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="field-grid">
+                  <label for="cortexTraceText">Trace text</label>
+                  <textarea id="cortexTraceText" rows="4" placeholder="Verified decision, constraint, validation result, or risk to preserve"></textarea>
+                </div>
+                <button class="secondary-button" type="submit">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
+                  Commit trace
+                </button>
+              </form>
+            </div>
+
+            <div class="cortex-memory-lists">
+              <div>
+                <h3>High-confidence truths</h3>
+                <div id="cortexHighConfidence" class="cortex-memory-list">No governed truths yet</div>
+              </div>
+              <div>
+                <h3>Working memory</h3>
+                <div id="cortexWorkingMemory" class="cortex-memory-list">No cortical traces yet</div>
+              </div>
+            </div>
           </article>
         </section>
 
@@ -545,9 +697,10 @@
           <strong>Operator Flow</strong>
           <small>
             <span>1 Capture trace</span>
-            <span>2 Recall context</span>
-            <span>3 Inspect graph</span>
-            <span>4 Audit + pack</span>
+            <span>2 Enter cortex</span>
+            <span>3 Recall context</span>
+            <span>4 Inspect graph</span>
+            <span>5 Audit + pack</span>
           </small>
         </div>
         <div class="footer-health-cell"><span class="status-dot" aria-hidden="true"></span><strong>Health</strong><small id="footerHealth">GOOD</small></div>

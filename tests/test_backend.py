@@ -708,6 +708,110 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(second["since_event_id"], event["event_id"])
         self.assertEqual(second["ack"]["last_event_id"], event["event_id"])
 
+    def test_cortex_governor_enters_ticks_and_commits_typed_trace(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="operator",
+            session_id="seed-session",
+            trace_type="constraint",
+            truth_posture="operator-confirmed",
+            text="Operator requires tests before claiming Cortex Governor is complete.",
+            evidence={"source": "unit-test"},
+        )
+
+        entry = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Implement the Cortex Governor release with tests.",
+            mode="strict",
+        )
+        tick = backend.cortex_tick(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entry["session_id"],
+            observation="About to edit backend and MCP files.",
+            proposed_action="Modify mlx_backend.py and mcp_server.py, then run tests.",
+            mutation_intent=True,
+            confidence=0.42,
+        )
+        commit = backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entry["session_id"],
+            trace_type="validation",
+            truth_posture="test-validated",
+            text="Cortex Governor tests passed for backend, CLI, MCP, and dashboard surfaces.",
+            evidence={"tests": ["tests.test_backend"], "commit": "pending"},
+        )
+        state = backend.get_cortex_state(context_id="demo", agent_id="codex")
+
+        self.assertEqual(entry["action"], "enter-spiking-cortex")
+        self.assertEqual(entry["mode"], "strict")
+        self.assertIn("verify-before-mutation", entry["governance_contract"])
+        self.assertEqual(entry["agent_deployment"]["event_type"], "cortex-entered")
+        self.assertEqual(tick["action"], "cortex-tick")
+        self.assertEqual(tick["session_id"], entry["session_id"])
+        self.assertEqual(tick["decision"], "verify-first")
+        self.assertTrue(
+            any(item["code"] == "mutation-verification-required" for item in tick["warnings"])
+        )
+        self.assertGreaterEqual(len(tick["recalled_constraints"]), 1)
+        self.assertEqual(commit["action"], "commit-cortical-trace")
+        self.assertEqual(commit["trace_type"], "validation")
+        self.assertEqual(commit["truth_posture"], "test-validated")
+        self.assertGreaterEqual(commit["confidence"], 0.85)
+        self.assertEqual(commit["agent_deployment"]["event_type"], "cortex-trace-committed")
+        self.assertEqual(state["action"], "cortex-state")
+        self.assertEqual(state["active_sessions"][0]["session_id"], entry["session_id"])
+        self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
+        self.assertTrue(
+            any(item["trace_type"] == "validation" for item in state["high_confidence_truths"])
+        )
+
+    def test_agent_context_hydration_includes_cortex_state(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        session = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Hydrate with governed memory.",
+            mode="strict",
+        )
+        backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id=session["session_id"],
+            trace_type="decision",
+            truth_posture="operator-confirmed",
+            text="Cortex hydration must expose active goals, decisions, and risks.",
+            evidence={"source": "unit-test"},
+        )
+
+        hydrated = backend.hydrate_agent_context(
+            context_id="demo",
+            agent_id="codex",
+            prompt="governed memory",
+        )
+
+        self.assertIn("cortex_state", hydrated)
+        self.assertGreaterEqual(hydrated["cortex_state"]["typed_memory_counts"]["decision"], 1)
+        self.assertIn("## Cortex Governor", hydrated["briefing_markdown"])
+        self.assertIn("Active Sessions", hydrated["briefing_markdown"])
+
     def test_capture_conversation_creates_event_graph_and_context_deployment(self):
         backend = SpikingAttentionBackend(
             dimension=32,
