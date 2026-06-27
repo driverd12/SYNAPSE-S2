@@ -833,6 +833,64 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(json.loads(moderated.stdout)["moderation_action"], "promote")
         self.assertGreaterEqual(json.loads(state.stdout)["typed_memory_counts"]["decision"], 1)
 
+    def test_cli_moderate_cortex_prune_requires_confirm(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            committed = self.run_cli(
+                "commit-cortex",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                "--session-id",
+                "moderation-session",
+                "--type",
+                "assumption",
+                "--truth-posture",
+                "inferred",
+                "--text",
+                "CLI Cortex prune should require explicit confirmation.",
+                "--confidence",
+                "0.42",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            memory_id = json.loads(committed.stdout)["memory_id"]
+            rejected = self.run_cli(
+                "moderate-cortex",
+                "--context",
+                "demo",
+                "--memory-id",
+                memory_id,
+                "--action",
+                "prune",
+                "--reason",
+                "missing confirmation",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            accepted = self.run_cli(
+                "moderate-cortex",
+                "--context",
+                "demo",
+                "--memory-id",
+                memory_id,
+                "--action",
+                "prune",
+                "--reason",
+                "confirmed removal",
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(committed.returncode, 0, committed.stderr)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("confirm", json.loads(rejected.stdout)["error"])
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertTrue(json.loads(accepted.stdout)["prune"]["result"]["deleted"])
+
     def test_cli_list_memory_can_include_vector_details_when_requested(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

@@ -337,6 +337,63 @@ class DashboardRuntimeTests(unittest.TestCase):
             1,
         )
 
+    def test_cortex_prune_endpoint_requires_explicit_confirmation(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            commit_status, commit_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/commit",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-agent",
+                            "session_id": "moderation-session",
+                            "trace_type": "assumption",
+                            "truth_posture": "inferred",
+                            "text": "Dashboard Cortex prune should require explicit confirmation.",
+                            "confidence": 0.42,
+                        }
+                    ).encode(),
+                )
+            )
+            rejected_status, rejected_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/moderate",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "memory_id": commit_payload["memory_id"],
+                            "action": "prune",
+                            "reason": "missing confirmation",
+                            "confirm": False,
+                        }
+                    ).encode(),
+                )
+            )
+            accepted_status, accepted_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/moderate",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "memory_id": commit_payload["memory_id"],
+                            "action": "prune",
+                            "reason": "confirmed removal",
+                            "confirm": True,
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(commit_status, 200)
+        self.assertEqual(rejected_status, 400)
+        self.assertIn("confirm", rejected_payload["error"])
+        self.assertEqual(accepted_status, 200)
+        self.assertTrue(accepted_payload["prune"]["result"]["deleted"])
+
     def test_evidence_pack_endpoint_writes_local_report_and_backup(self):
         with TemporaryDirectory() as tmp:
             previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
@@ -433,6 +490,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("cortexIntendedTools", index)
         self.assertIn("cortexNextMove", index)
         self.assertIn("cortexCaptureQueue", index)
+        self.assertIn('<option value="evidence">evidence</option>', index)
+        self.assertIn('<option value="observed" selected>observed</option>', index)
+        self.assertNotIn('<option value="test-validated" selected>', index)
         self.assertIn("Sparse spike code", index)
         self.assertIn("Active neuron sample", index)
         self.assertIn("LIF update", index)
@@ -454,6 +514,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/cortex/moderate", app)
         self.assertIn("data-cortex-action", app)
         self.assertIn("moderateCortexTrace", app)
+        self.assertIn('confirm: action === "prune"', app)
         self.assertIn("formatSpikeSubLabel", app)
         self.assertIn("contextMemoryType", app)
         self.assertIn("active coordinates", app)

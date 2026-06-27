@@ -595,6 +595,49 @@ class McpServerTests(unittest.TestCase):
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
         self.assertIn("cognitive_governance", state["policy"])
 
+    def test_mcp_cortex_prune_requires_explicit_confirmation(self):
+        entered = json.loads(
+            mcp_server.enter_spiking_cortex(
+                agent_id="mcp-agent",
+                context_id="demo",
+                task="Confirm Cortex prune safety.",
+                mode="strict",
+            )
+        )
+        committed = json.loads(
+            mcp_server.commit_spiking_cortical_trace(
+                agent_id="mcp-agent",
+                context_id="demo",
+                session_id=entered["session_id"],
+                trace_type="assumption",
+                truth_posture="inferred",
+                text="MCP Cortex prune should require explicit confirmation.",
+                confidence=0.42,
+            )
+        )
+
+        rejected = json.loads(
+            mcp_server.moderate_spiking_cortical_trace(
+                context_id="demo",
+                memory_id=committed["memory_id"],
+                action="prune",
+                reason="missing confirmation",
+            )
+        )
+        accepted = json.loads(
+            mcp_server.moderate_spiking_cortical_trace(
+                context_id="demo",
+                memory_id=committed["memory_id"],
+                action="prune",
+                reason="confirmed removal",
+                confirm=True,
+            )
+        )
+
+        self.assertIn("confirm", rejected["error"])
+        self.assertEqual(accepted["moderation_action"], "prune")
+        self.assertTrue(accepted["prune"]["result"]["deleted"])
+
     def test_memory_export_tool_rejects_paths_outside_export_root(self):
         result = json.loads(
             mcp_server.export_spiking_memory(

@@ -59,7 +59,7 @@ else
 fi
 
 echo "=== unit tests ==="
-.venv/bin/python -m unittest discover -s tests -v
+SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash .venv/bin/python -m unittest discover -s tests -v
 
 echo "=== compile check ==="
 .venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
@@ -136,7 +136,7 @@ echo "cortex session: $CORTEX_SESSION_ID"
   --type validation \
   --truth-posture test-validated \
   --text "Prep script verified the Cortex Governor enter, tick, commit, and state path." \
-  --evidence '{"source":"prep_tomorrow","surface":"cli"}'
+  --evidence '{"source":"prep_tomorrow","tests":["cortex enter tick commit state"],"test_command":"scripts/prep_tomorrow.sh cortex validation path"}'
 .venv/bin/python synapse_cli.py --json cortex-state \
   --context "$CONTEXT" \
   --agent-id "prep-tomorrow" \

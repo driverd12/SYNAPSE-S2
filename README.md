@@ -65,7 +65,9 @@ The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
 - Capture inbox drops are redacted before they are written to disk; inbox, processed, error, backup, export, and SQLite files are kept private to the local user where the filesystem permits it.
 - Capture processing rejects symlink payloads and over-large payloads instead of following arbitrary files.
 - Direct conversation capture, context-bus deployments, graph metadata, and returned API/MCP payloads use the same redaction path, so sanitized storage does not mask a raw response leak.
-- MCP memory pruning requires explicit `confirm=true`; CLI pruning requires `--confirm`; the dashboard requires a confirmation control before destructive graph operations.
+- MCP memory and Cortex pruning require explicit `confirm=true`; CLI memory and Cortex pruning require `--confirm`; the dashboard requires a confirmation control before destructive graph operations and governed-trace deletion.
+- `test-validated` Cortex traces require concrete validation evidence such as a test command, test list, output summary, artifact path, commit, or verification report. Dashboard typed-memory defaults stay at `observed` evidence.
+- Spike recall and surface-text recall both use durable SQLite indexes (`memory_spikes` and `memory_surface_terms`) maintained on every memory write, so recall does not need to scan the full memory table as the graph grows.
 - Client config installation refuses malformed existing JSON instead of silently overwriting it.
 
 ### 3. Write and Query Persistent Memory
@@ -93,6 +95,7 @@ Event ingestion additionally creates segmented memories such as `production-pref
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`. Runtime toggles and client state live in `.synapse_s2/runtime_state.json`. Both `.mcp.json` and `/Users/dan.driver/.codex/config.toml` set `SYNAPSE_S2_MEMORY_DB` so Codex, Claude, and direct CLI runs target the same durable substrate. MCP export and backup paths are constrained to `.synapse_s2` by default through `SYNAPSE_S2_EXPORT_DIR`; the CLI remains available for explicit operator-chosen local paths.
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode`, `metadata.semantic_surprise_score`, and `metadata.lexical_surprise_score`, so operators can tell whether a boundary was cut by semantic embedding distance or by lexical fallback.
+SQLite maintains a durable sparse spike index and a durable surface-term index for prompt recall. The surface index is built from tags, display labels, display summaries, semantic facets, detail badges, keywords, and bounded source text, and existing memory databases are backfilled automatically on startup.
 
 Inspect, export, and back up the memory store:
 

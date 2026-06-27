@@ -1133,6 +1133,7 @@ def moderate_spiking_cortical_trace(
     action: str,
     context_id: str = "default",
     reason: str = "",
+    confirm: bool = False,
 ) -> str:
     """Promote, demote, or prune a Cortex Governor trace by memory id."""
     context = _sanitize_context_id(context_id)
@@ -1147,6 +1148,7 @@ def moderate_spiking_cortical_trace(
             action=str(action or ""),
             reason=str(reason or ""),
             source_surface="mcp-cortex",
+            confirm=bool(confirm),
         )
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:

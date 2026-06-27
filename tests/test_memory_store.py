@@ -53,6 +53,51 @@ class DurableMemoryStoreTests(unittest.TestCase):
 
             self.assertEqual(row_count, 1)
 
+    def test_list_entries_by_ids_preserves_requested_order_and_context(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            first = store.upsert_entry(
+                tag="first-node",
+                context_id="demo",
+                source_text="First ordered graph node.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[1],
+                neuron_indices=[1],
+            )
+            other_context = store.upsert_entry(
+                tag="other-context-node",
+                context_id="other",
+                source_text="Filtered graph node.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[2],
+                neuron_indices=[2],
+            )
+            second = store.upsert_entry(
+                tag="second-node",
+                context_id="demo",
+                source_text="Second ordered graph node.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[3],
+                neuron_indices=[3],
+            )
+
+            entries = store.list_entries_by_ids(
+                [
+                    second["memory_id"],
+                    other_context["memory_id"],
+                    first["memory_id"],
+                    second["memory_id"],
+                    "missing-node",
+                ],
+                context_id="demo",
+            )
+
+        self.assertEqual([entry["tag"] for entry in entries], ["second-node", "first-node"])
+
     def test_recall_uses_durable_spike_index_and_updates_on_upsert(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "synapse-memory.sqlite3"
@@ -161,6 +206,96 @@ class DurableMemoryStoreTests(unittest.TestCase):
                     )
                 ],
                 ["indexed-recall", "other-recall"],
+            )
+
+    def test_surface_recall_uses_durable_term_index_and_updates_on_upsert(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+
+            entry = store.upsert_entry(
+                tag="surface-recall-node",
+                context_id="demo",
+                source_text="Cortex graph hardening improves operator recall.",
+                metadata={
+                    "display_label": "Cortex graph hardening",
+                    "semantic_facets": ["operator safety", "graph endpoints"],
+                },
+                embedding_dimensions=8,
+                spike_indices=[1, 2],
+                neuron_indices=[1, 2],
+            )
+            store.upsert_entry(
+                tag="unrelated-node",
+                context_id="demo",
+                source_text="Procurement budget note.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[5, 6],
+                neuron_indices=[5, 6],
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                indexed_terms = [
+                    row[0]
+                    for row in conn.execute(
+                        """
+                        SELECT term
+                        FROM memory_surface_terms
+                        WHERE memory_id = ?
+                        ORDER BY term
+                        """,
+                        (entry["memory_id"],),
+                    ).fetchall()
+                ]
+                query_plan = " ".join(
+                    str(row)
+                    for row in conn.execute(
+                        """
+                        EXPLAIN QUERY PLAN
+                        SELECT memory_id
+                        FROM memory_surface_terms
+                        WHERE context_id IN (?, 'global')
+                            AND term IN (?, ?)
+                        GROUP BY memory_id
+                        """,
+                        ("demo", "cortex", "graph"),
+                    ).fetchall()
+                )
+
+            self.assertIn("cortex", indexed_terms)
+            self.assertIn("operator", indexed_terms)
+            self.assertIn("ix_memory_surface_terms_context_term", query_plan)
+            self.assertGreater(store.stats(context_id="demo")["surface_term_count"], 0)
+            self.assertEqual(
+                [
+                    item["tag"]
+                    for item in store.surface_recall_candidates(
+                        context_id="demo",
+                        query_terms=["cortex", "graph"],
+                        limit=10,
+                    )
+                ],
+                ["surface-recall-node"],
+            )
+
+            store.upsert_entry(
+                tag="surface-recall-node",
+                context_id="demo",
+                source_text="Updated node moved away from cortex graph vocabulary.",
+                metadata={"display_label": "renewal budget"},
+                embedding_dimensions=8,
+                spike_indices=[7],
+                neuron_indices=[7],
+            )
+
+            self.assertEqual(
+                store.surface_recall_candidates(
+                    context_id="demo",
+                    query_terms=["operator", "safety"],
+                    limit=10,
+                ),
+                [],
             )
 
     def test_relationships_are_upserted_listed_and_exported(self):

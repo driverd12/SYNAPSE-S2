@@ -243,6 +243,55 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             graph["relationship_summary"]["associative"],
         )
 
+    def test_memory_graph_prioritizes_relationship_endpoints_over_recent_noise(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=16,
+            default_top_k=3,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        source = backend.register_trace(
+            tag="old-critical-source",
+            embedding=[0.1, 0.9, 0.2, 0.8, 0.0, -0.1, 0.4, 0.7],
+            context_id="demo",
+            metadata={"display_label": "old critical source"},
+            source_text="Older critical source node.",
+        )
+        target = backend.register_trace(
+            tag="old-critical-target",
+            embedding=[0.0, 0.7, 0.3, 0.9, 0.1, -0.2, 0.5, 0.6],
+            context_id="demo",
+            metadata={"display_label": "old critical target"},
+            source_text="Older critical target node.",
+        )
+        backend.memory_store.upsert_relationship(
+            context_id="demo",
+            source_memory_id=source["memory_id"],
+            target_memory_id=target["memory_id"],
+            relation_type="semantic_overlap",
+            weight=0.93,
+            evidence={"keywords": ["critical", "edge"]},
+        )
+        for index in range(6):
+            backend.register_trace(
+                tag=f"new-noise-{index}",
+                embedding=[float(index), 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+                context_id="demo",
+                source_text=f"New unrelated dashboard note {index}.",
+            )
+
+        graph = backend.list_memory_graph(context_id="demo", limit=3)
+        graph_ids = {entry["memory_id"] for entry in graph["entries"]}
+
+        self.assertEqual(graph["graph_entry_strategy"], "relationship_endpoints_first")
+        self.assertEqual(graph["relationship_endpoint_count"], 2)
+        self.assertIn(source["memory_id"], graph_ids)
+        self.assertIn(target["memory_id"], graph_ids)
+        self.assertEqual(graph["relationships"][0]["source_label"], "old critical source")
+        self.assertEqual(graph["relationships"][0]["target_label"], "old critical target")
+
     def test_memory_graph_entries_include_bounded_neural_inspector_samples(self):
         backend = SpikingAttentionBackend(
             dimension=8,
@@ -914,7 +963,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             trace_type="validation",
             truth_posture="test-validated",
             text="Cortex typed counts must survive newer non-cortex graph entries.",
-            evidence={"source": "unit-test"},
+            evidence={"source": "unit-test", "tests": ["tests.test_backend"]},
         )
         for index in range(8):
             backend.register_text_trace(
@@ -1009,6 +1058,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             memory_id=committed["memory_id"],
             action="prune",
             reason="operator removed trace",
+            confirm=True,
         )
         state = backend.get_cortex_state(context_id="demo", agent_id="codex")
 
@@ -1021,6 +1071,70 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(demoted["trace"]["truth_posture"], "stale")
         self.assertTrue(pruned["prune"]["result"]["deleted"])
         self.assertNotIn("assumption", state["typed_memory_counts"])
+
+    def test_cortex_prune_requires_explicit_confirmation(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        committed = backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id="moderation-session",
+            trace_type="assumption",
+            truth_posture="inferred",
+            text="This trace should require explicit confirmation before prune.",
+            confidence=0.42,
+        )
+
+        with self.assertRaisesRegex(ValueError, "confirm"):
+            backend.moderate_cortex_trace(
+                context_id="demo",
+                memory_id=committed["memory_id"],
+                action="prune",
+                reason="missing confirmation",
+            )
+
+        still_present = backend.memory_store.get_entry(committed["memory_id"])
+        self.assertIsNotNone(still_present)
+
+    def test_test_validated_cortex_commit_requires_concrete_evidence(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        with self.assertRaisesRegex(ValueError, "concrete validation evidence"):
+            backend.commit_cortical_trace(
+                context_id="demo",
+                agent_id="codex",
+                session_id="validation-session",
+                trace_type="validation",
+                truth_posture="test-validated",
+                text="This claim lacks a concrete validation artifact.",
+                evidence={"source": "unit-test"},
+            )
+
+        committed = backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id="validation-session",
+            trace_type="validation",
+            truth_posture="test-validated",
+            text="This claim includes a concrete validation artifact.",
+            evidence={"tests": ["tests.test_backend"], "command": "python -m unittest"},
+        )
+
+        self.assertEqual(committed["truth_posture"], "test-validated")
+        self.assertGreaterEqual(committed["confidence"], 0.85)
 
     def test_capture_conversation_creates_event_graph_and_context_deployment(self):
         backend = SpikingAttentionBackend(

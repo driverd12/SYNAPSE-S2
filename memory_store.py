@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -57,6 +58,23 @@ ON memory_spikes(context_id, spike_index, memory_id);
 
 CREATE INDEX IF NOT EXISTS ix_memory_spikes_context_memory
 ON memory_spikes(context_id, memory_id);
+
+CREATE TABLE IF NOT EXISTS memory_surface_terms (
+    memory_id TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    term TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY(memory_id, term),
+    FOREIGN KEY(memory_id)
+        REFERENCES memory_entries(memory_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_memory_surface_terms_context_term
+ON memory_surface_terms(context_id, term, memory_id);
+
+CREATE INDEX IF NOT EXISTS ix_memory_surface_terms_context_memory
+ON memory_surface_terms(context_id, memory_id);
 
 CREATE TABLE IF NOT EXISTS memory_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +156,9 @@ CREATE TABLE IF NOT EXISTS store_migrations (
 );
 """
 
+SURFACE_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]{1,63}")
+MAX_SURFACE_INDEX_SOURCE_CHARS = 4096
+
 
 def _json_safe(value: Any, fallback: Any) -> Any:
     try:
@@ -194,54 +215,93 @@ class DurableMemoryStore:
         return conn
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
-        if conn.execute(
+        if not conn.execute(
             "SELECT 1 FROM store_migrations WHERE key = ?",
             ("memory_spikes_v1",),
         ).fetchone():
-            return
-        rows = conn.execute(
-            """
-            SELECT memory_id, context_id, spike_indices_json
-            FROM memory_entries
-            """
-        ).fetchall()
-        with conn:
-            for row in rows:
-                spike_rows = [
-                    (
-                        str(row["memory_id"]),
-                        str(row["context_id"]),
-                        int(spike_index),
-                    )
-                    for spike_index in sorted(
-                        {
-                            int(value)
-                            for value in _decode_json(
-                                str(row["spike_indices_json"]),
-                                [],
-                            )
-                        }
-                    )
-                ]
-                if spike_rows:
-                    conn.executemany(
-                        """
-                        INSERT OR IGNORE INTO memory_spikes (
-                            memory_id,
-                            context_id,
-                            spike_index
-                        )
-                        VALUES (?, ?, ?)
-                        """,
-                        spike_rows,
-                    )
-            conn.execute(
+            rows = conn.execute(
                 """
-                INSERT OR REPLACE INTO store_migrations (key, applied_at)
-                VALUES (?, ?)
-                """,
-                ("memory_spikes_v1", time.time()),
-            )
+                SELECT memory_id, context_id, spike_indices_json
+                FROM memory_entries
+                """
+            ).fetchall()
+            with conn:
+                for row in rows:
+                    spike_rows = [
+                        (
+                            str(row["memory_id"]),
+                            str(row["context_id"]),
+                            int(spike_index),
+                        )
+                        for spike_index in sorted(
+                            {
+                                int(value)
+                                for value in _decode_json(
+                                    str(row["spike_indices_json"]),
+                                    [],
+                                )
+                            }
+                        )
+                    ]
+                    if spike_rows:
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO memory_spikes (
+                                memory_id,
+                                context_id,
+                                spike_index
+                            )
+                            VALUES (?, ?, ?)
+                            """,
+                            spike_rows,
+                        )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("memory_spikes_v1", time.time()),
+                )
+
+        if not conn.execute(
+            "SELECT 1 FROM store_migrations WHERE key = ?",
+            ("memory_surface_terms_v1",),
+        ).fetchone():
+            rows = conn.execute(
+                """
+                SELECT memory_id, context_id, tag, source_text, metadata_json
+                FROM memory_entries
+                """
+            ).fetchall()
+            with conn:
+                for row in rows:
+                    surface_rows = self._surface_term_rows(
+                        memory_id=str(row["memory_id"]),
+                        context_id=str(row["context_id"]),
+                        tag=str(row["tag"]),
+                        source_text=str(row["source_text"]),
+                        metadata=_decode_json(str(row["metadata_json"]), {}),
+                    )
+                    if surface_rows:
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO memory_surface_terms (
+                                memory_id,
+                                context_id,
+                                term,
+                                weight
+                            )
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            surface_rows,
+                        )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("memory_surface_terms_v1", time.time()),
+                )
 
     def _protect_path(self, path: Path, *, directory: bool) -> None:
         try:
@@ -356,6 +416,30 @@ class DurableMemoryStore:
                             ],
                         )
                     conn.execute(
+                        "DELETE FROM memory_surface_terms WHERE memory_id = ?",
+                        (memory_id,),
+                    )
+                    surface_rows = self._surface_term_rows(
+                        memory_id=memory_id,
+                        context_id=context_id,
+                        tag=tag,
+                        source_text=str(source_text or ""),
+                        metadata=metadata or {},
+                    )
+                    if surface_rows:
+                        conn.executemany(
+                            """
+                            INSERT INTO memory_surface_terms (
+                                memory_id,
+                                context_id,
+                                term,
+                                weight
+                            )
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            surface_rows,
+                        )
+                    conn.execute(
                         """
                         INSERT INTO memory_events (
                             memory_id,
@@ -443,6 +527,58 @@ class DurableMemoryStore:
             LOGGER.exception("failed to list memory entries for context_id=%s", context_id)
             raise
 
+    def list_entries_by_ids(
+        self,
+        memory_ids: Iterable[str],
+        *,
+        context_id: str | None = None,
+        limit: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        """Batch-load entries by primary key while preserving caller order."""
+        ordered_ids: list[str] = []
+        seen: set[str] = set()
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        for raw_memory_id in memory_ids:
+            memory_id = str(raw_memory_id or "").strip()
+            if not memory_id or memory_id in seen:
+                continue
+            seen.add(memory_id)
+            ordered_ids.append(memory_id)
+            if len(ordered_ids) >= bounded_limit:
+                break
+        if not ordered_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in ordered_ids)
+        clauses = [f"memory_id IN ({placeholders})"]
+        params: list[Any] = list(ordered_ids)
+        if context_id is not None:
+            clauses.append("context_id = ?")
+            params.append(str(context_id))
+        where_sql = " AND ".join(clauses)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM memory_entries
+                    WHERE {where_sql}
+                    """,
+                    tuple(params),
+                ).fetchall()
+            entries_by_id = {
+                str(row["memory_id"]): self._row_to_entry(row)
+                for row in rows
+            }
+            return [
+                entries_by_id[memory_id]
+                for memory_id in ordered_ids
+                if memory_id in entries_by_id
+            ]
+        except Exception:
+            LOGGER.exception("failed to batch-list memory entries")
+            raise
+
     def entries_revision(
         self,
         *,
@@ -504,7 +640,9 @@ class DurableMemoryStore:
             return []
         clean_query_spikes = sorted({int(value) for value in query_spikes})
         placeholders = ",".join("?" for _ in clean_query_spikes)
-        params: list[Any] = [str(context_id), *clean_query_spikes, 10_000]
+        bounded_limit = min(max(int(limit), 1), 1000)
+        candidate_limit = min(max(bounded_limit * 16, 128), 10_000)
+        params: list[Any] = [str(context_id), *clean_query_spikes, candidate_limit]
         candidates: list[dict[str, Any]] = []
         try:
             with closing(self._connect()) as conn:
@@ -512,7 +650,7 @@ class DurableMemoryStore:
                     f"""
                     SELECT
                         e.*,
-                        COUNT(DISTINCT s.spike_index) AS overlap_count
+                        COUNT(*) AS overlap_count
                     FROM memory_spikes AS s
                     JOIN memory_entries AS e
                         ON e.memory_id = s.memory_id
@@ -555,7 +693,121 @@ class DurableMemoryStore:
             key=lambda item: (float(item["score"]), float(item["updated_at"])),
             reverse=True,
         )
-        return candidates[: min(max(int(limit), 1), 1000)]
+        return candidates[:bounded_limit]
+
+    def surface_recall_candidates(
+        self,
+        *,
+        context_id: str,
+        query_terms: Iterable[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clean_terms: list[str] = []
+        seen_terms: set[str] = set()
+        for raw_term in query_terms:
+            for term in self._surface_terms(str(raw_term or "")):
+                if term in seen_terms:
+                    continue
+                seen_terms.add(term)
+                clean_terms.append(term)
+        if not clean_terms:
+            return []
+        bounded_limit = min(max(int(limit), 1), 1000)
+        placeholders = ",".join("?" for _ in clean_terms)
+        params: list[Any] = [str(context_id), *clean_terms, bounded_limit]
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    WITH matched AS (
+                        SELECT
+                            memory_id,
+                            COUNT(*) AS overlap_count,
+                            SUM(weight) AS term_weight
+                        FROM memory_surface_terms
+                        WHERE
+                            context_id IN (?, 'global')
+                            AND term IN ({placeholders})
+                        GROUP BY memory_id
+                        ORDER BY overlap_count DESC, term_weight DESC
+                        LIMIT ?
+                    )
+                    SELECT
+                        e.*,
+                        matched.overlap_count,
+                        matched.term_weight
+                    FROM matched
+                    JOIN memory_entries AS e
+                        ON e.memory_id = matched.memory_id
+                    ORDER BY
+                        matched.overlap_count DESC,
+                        matched.term_weight DESC,
+                        e.updated_at DESC
+                    """,
+                    tuple(params),
+                ).fetchall()
+            candidates: list[dict[str, Any]] = []
+            for row in rows:
+                entry = self._row_to_entry(row)
+                entry["surface_overlap_count"] = int(row["overlap_count"] or 0)
+                entry["surface_term_weight"] = round(float(row["term_weight"] or 0.0), 6)
+                candidates.append(entry)
+            return candidates
+        except Exception:
+            LOGGER.exception("failed to query surface recall candidates")
+            raise
+
+    def _surface_term_rows(
+        self,
+        *,
+        memory_id: str,
+        context_id: str,
+        tag: str,
+        source_text: str,
+        metadata: dict[str, Any] | None,
+    ) -> list[tuple[str, str, str, float]]:
+        weighted_terms: dict[str, float] = {}
+
+        def add_terms(value: Any, weight: float) -> None:
+            for term in self._surface_terms(str(value or "")):
+                weighted_terms[term] = max(weighted_terms.get(term, 0.0), float(weight))
+
+        safe_metadata = metadata if isinstance(metadata, dict) else {}
+        add_terms(tag, 2.0)
+        add_terms(safe_metadata.get("display_label", ""), 4.0)
+        add_terms(safe_metadata.get("display_summary", ""), 3.0)
+        for key, weight in (
+            ("semantic_facets", 3.5),
+            ("detail_badges", 2.5),
+            ("keywords", 2.5),
+        ):
+            values = safe_metadata.get(key)
+            if isinstance(values, (list, tuple, set)):
+                for value in list(values)[:32]:
+                    add_terms(value, weight)
+            else:
+                add_terms(values, weight)
+        add_terms(str(source_text or "")[:MAX_SURFACE_INDEX_SOURCE_CHARS], 1.0)
+
+        rows = [
+            (str(memory_id), str(context_id), term, round(weight, 6))
+            for term, weight in sorted(
+                weighted_terms.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:512]
+        ]
+        return rows
+
+    def _surface_terms(self, value: str) -> list[str]:
+        terms: list[str] = []
+        seen: set[str] = set()
+        for match in SURFACE_TERM_RE.finditer(str(value or "").lower()):
+            term = match.group(0).strip("._/:-")
+            if len(term) < 2 or term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+        return terms
 
     def upsert_relationship(
         self,
@@ -1122,6 +1374,12 @@ class DurableMemoryStore:
                     relationship_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_relationships"
                     ).fetchone()[0]
+                    spike_index_count = conn.execute(
+                        "SELECT COUNT(*) FROM memory_spikes"
+                    ).fetchone()[0]
+                    surface_term_count = conn.execute(
+                        "SELECT COUNT(*) FROM memory_surface_terms"
+                    ).fetchone()[0]
                     context_bus_event_count = conn.execute(
                         "SELECT COUNT(*) FROM agent_context_events"
                     ).fetchone()[0]
@@ -1138,6 +1396,14 @@ class DurableMemoryStore:
                     ).fetchone()[0]
                     relationship_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_relationships WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
+                    spike_index_count = conn.execute(
+                        "SELECT COUNT(*) FROM memory_spikes WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
+                    surface_term_count = conn.execute(
+                        "SELECT COUNT(*) FROM memory_surface_terms WHERE context_id = ?",
                         (context_id,),
                     ).fetchone()[0]
                     context_bus_event_count = conn.execute(
@@ -1166,6 +1432,8 @@ class DurableMemoryStore:
                 "entry_count": int(entry_count),
                 "event_count": int(event_count),
                 "relationship_count": int(relationship_count),
+                "spike_index_count": int(spike_index_count),
+                "surface_term_count": int(surface_term_count),
                 "context_bus_event_count": int(context_bus_event_count),
                 "context_bus_latest_event_id": int(latest_context_event_row[0] or 0),
                 "context_bus_ack_cursor_count": int(context_bus_ack_cursor_count),

@@ -1864,6 +1864,7 @@ async function moderateCortexTrace(button) {
         memory_id: memoryId,
         action,
         reason: `dashboard ${action} from Cortex Governor panel`,
+        confirm: action === "prune",
       },
     });
     await publishAwareResult(payload);

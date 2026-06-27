@@ -35,7 +35,9 @@ Restart Codex, Claude Desktop, and Claude Code after the client-config installer
 - Capture inbox payloads are redacted before the pending file is written. Pending, processed, error, export, backup, runtime, and SQLite paths are created private to the local user where the filesystem permits it.
 - Capture processing refuses symlinks and oversized payloads. It does not follow arbitrary filesystem targets from the inbox.
 - Direct `capture-session`, MCP `capture_spiking_conversation`, context-bus deployments, graph metadata, and returned API payloads all share the same redaction layer.
-- Destructive pruning is confirmation-gated: CLI requires `--confirm`, MCP requires `confirm=true`, and the dashboard requires an explicit confirmation action.
+- Destructive memory and Cortex pruning are confirmation-gated: CLI requires `--confirm`, MCP requires `confirm=true`, and the dashboard requires an explicit confirmation action before deleting graph data or governed traces.
+- `test-validated` Cortex memory requires concrete validation evidence such as a test command, test list, output summary, artifact path, commit, or verification report. Use `observed` or `operator-confirmed` for ordinary notes.
+- Recall is backed by durable SQLite indexes for sparse spikes and surface terms. Existing databases are backfilled automatically, and `memory_store.stats()` exposes the populated index counts.
 - Client config installation refuses malformed existing JSON instead of silently replacing it.
 
 ## Expected ready signal
@@ -295,7 +297,7 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --type validation \
   --truth-posture test-validated \
   --text "The governed session path entered, ticked, and committed a typed validation trace." \
-  --evidence '{"surface":"runbook"}'
+  --evidence '{"tests":["runbook cortex path"],"test_command":"synapse_cli.py enter-cortex && cortex-tick && commit-cortex"}'
 .venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
 ```
 

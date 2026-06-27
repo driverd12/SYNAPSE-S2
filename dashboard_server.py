@@ -101,6 +101,8 @@ class DashboardRuntime:
             return self._serve_static(parsed.path)
         except DashboardError as exc:
             return self._json_response({"error": exc.message}, status=exc.status)
+        except ValueError as exc:
+            return self._json_response({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             error_id = f"dash_{uuid.uuid4().hex[:12]}"
             LOGGER.exception("dashboard request failed for %s %s", method, raw_path)
@@ -263,6 +265,9 @@ class DashboardRuntime:
             reason = str(payload.get("reason", "") or "").strip()
             if len(reason.encode("utf-8")) > MAX_TEXT_BYTES:
                 raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "reason is too large")
+            confirm = False
+            if action.strip().lower().replace("-", "_") == "prune":
+                confirm = self._required_bool(payload, "confirm")
             return self._json_response(
                 self.backend.moderate_cortex_trace(
                     context_id=context,
@@ -270,6 +275,7 @@ class DashboardRuntime:
                     action=action,
                     reason=reason,
                     source_surface="dashboard-cortex",
+                    confirm=confirm,
                 )
             )
 

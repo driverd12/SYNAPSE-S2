@@ -106,7 +106,6 @@ SURFACE_DETAIL_STOP_WORDS = {
     "with",
     "would",
 }
-MAX_SURFACE_RECALL_ENTRIES = 10_000
 MAX_SURFACE_RECALL_SOURCE_CHARS = 4096
 
 
@@ -1105,24 +1104,56 @@ class SpikingAttentionBackend:
         query_terms = set(self._surface_words(prompt_text))
         if not query_terms:
             return []
+        revision = self.memory_store.entries_revision(
+            context_id=context,
+            include_global=True,
+        )
+        query_hash = hashlib.sha256(
+            "\x1f".join(sorted(query_terms)).encode("utf-8")
+        ).hexdigest()[:16]
+        cache_key = f"{context}|surface-query|{query_hash}"
+        cached = self._surface_recall_cache.get(cache_key)
+        if cached and cached.get("revision") == revision["revision"]:
+            return [dict(candidate) for candidate in cached.get("candidates", [])]
+
         prompt_lower = " ".join(str(prompt_text or "").lower().split())
         candidates: list[dict[str, Any]] = []
-        for indexed in self._surface_recall_index(context=context):
-            entry = indexed["entry"]
+        indexed_entries = self.memory_store.surface_recall_candidates(
+            context_id=context,
+            query_terms=query_terms,
+            limit=max(self.recall_count * 8, 64),
+        )
+        for entry in indexed_entries:
             metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
-            facets = indexed["facets"]
-            corpus_terms = indexed["terms"]
+            facets = self._surface_facets_for_entry(entry)
+            corpus = " ".join(
+                [
+                    self._surface_label_for_entry(entry),
+                    self._surface_summary_for_entry(entry),
+                    str(entry.get("tag") or ""),
+                    str(entry.get("source_text") or "")[:MAX_SURFACE_RECALL_SOURCE_CHARS],
+                    " ".join(facets),
+                ]
+            )
+            corpus_terms = set(self._surface_words(corpus))
             overlap = query_terms & corpus_terms
             phrase_hits = 0
-            for facet_text in indexed["facet_phrases"]:
+            facet_phrases = tuple(
+                " ".join(str(facet or "").lower().split())
+                for facet in facets
+                if str(facet or "").strip()
+            )
+            for facet_text in facet_phrases:
                 if facet_text and (facet_text in prompt_lower or prompt_lower in facet_text):
                     phrase_hits += 1
             if len(overlap) < 2 and phrase_hits == 0:
                 continue
+            term_weight = float(entry.get("surface_term_weight", 0.0) or 0.0)
             score = min(
                 0.99,
                 0.35
                 + (0.5 * len(overlap) / max(1, len(query_terms)))
+                + min(0.08, term_weight / 80.0)
                 + min(0.14, 0.07 * phrase_hits),
             )
             candidate = dict(entry)
@@ -1136,62 +1167,20 @@ class SpikingAttentionBackend:
             key=lambda item: (float(item["score"]), float(item["updated_at"])),
             reverse=True,
         )
-        return candidates[: max(self.recall_count * 3, 12)]
-
-    def _surface_recall_index(self, *, context: str) -> list[dict[str, Any]]:
-        revision = self.memory_store.entries_revision(
-            context_id=context,
-            include_global=True,
-        )
-        cache_key = f"{context}|global"
-        cached = self._surface_recall_cache.get(cache_key)
-        if cached and cached.get("revision") == revision["revision"]:
-            return list(cached.get("items", []))
-
-        items: list[dict[str, Any]] = []
-        entries = self.memory_store.list_entries(
-            context_id=context,
-            include_global=True,
-            limit=MAX_SURFACE_RECALL_ENTRIES,
-        )
-        for entry in entries:
-            facets = self._surface_facets_for_entry(entry)
-            corpus = " ".join(
-                [
-                    self._surface_label_for_entry(entry),
-                    self._surface_summary_for_entry(entry),
-                    str(entry.get("tag") or ""),
-                    str(entry.get("source_text") or "")[:MAX_SURFACE_RECALL_SOURCE_CHARS],
-                    " ".join(facets),
-                ]
-            )
-            facet_phrases = tuple(
-                " ".join(str(facet or "").lower().split())
-                for facet in facets
-                if str(facet or "").strip()
-            )
-            items.append(
-                {
-                    "entry": entry,
-                    "terms": frozenset(self._surface_words(corpus)),
-                    "facets": tuple(facets),
-                    "facet_phrases": facet_phrases,
-                }
-            )
-
+        bounded = candidates[: max(self.recall_count * 3, 12)]
         self._surface_recall_cache[cache_key] = {
             "revision": revision["revision"],
             "revision_info": revision,
-            "items": items,
+            "candidates": [dict(candidate) for candidate in bounded],
             "built_at": time.time(),
         }
-        if len(self._surface_recall_cache) > 16:
+        if len(self._surface_recall_cache) > 32:
             oldest_key = min(
                 self._surface_recall_cache,
                 key=lambda key: float(self._surface_recall_cache[key].get("built_at", 0.0)),
             )
             self._surface_recall_cache.pop(oldest_key, None)
-        return items
+        return bounded
 
     def _recall_indices(self, firing_signature: Any, sensory_spikes: Any) -> list[int]:
         native_mx = self._mx
@@ -1644,6 +1633,13 @@ class SpikingAttentionBackend:
         clean_trace_type = self._normalize_cortex_trace_type(trace_type, clean_text)
         clean_truth_posture = self._normalize_truth_posture(truth_posture)
         safe_evidence = self._json_safe_metadata(evidence or {})
+        if (
+            clean_truth_posture == "test-validated"
+            and not self._has_concrete_validation_evidence(safe_evidence)
+        ):
+            raise ValueError(
+                "test-validated truth posture requires concrete validation evidence"
+            )
         scored_confidence = self._score_cortex_confidence(
             trace_type=clean_trace_type,
             truth_posture=clean_truth_posture,
@@ -1848,6 +1844,7 @@ class SpikingAttentionBackend:
         action: str,
         reason: str = "",
         source_surface: str = "operator",
+        confirm: bool = False,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         clean_memory_id = str(memory_id or "").strip()
@@ -1864,6 +1861,8 @@ class SpikingAttentionBackend:
             raise ValueError("memory_id is not a Cortex Governor trace")
 
         if clean_action == "prune":
+            if confirm is not True:
+                raise ValueError("confirm must be true before pruning a Cortex trace")
             prune = self.prune_memory(
                 context_id=context,
                 target_type="memory",
@@ -2102,6 +2101,40 @@ class SpikingAttentionBackend:
         if any(token in lowered for token in ("maybe", "might", "assume", "guess")):
             score -= 0.12
         return round(min(max(score, 0.05), 0.99), 3)
+
+    def _has_concrete_validation_evidence(self, evidence: dict[str, Any]) -> bool:
+        if not evidence:
+            return False
+        concrete_keys = {
+            "artifact",
+            "artifact_path",
+            "artifacts",
+            "check",
+            "checks",
+            "command",
+            "commands",
+            "commit",
+            "output",
+            "output_summary",
+            "proof",
+            "report",
+            "test_command",
+            "test_output",
+            "tests",
+            "validated_by",
+            "validation",
+            "verification",
+        }
+        for key, value in evidence.items():
+            normalized_key = str(key or "").strip().lower().replace("-", "_")
+            if normalized_key not in concrete_keys:
+                continue
+            if isinstance(value, (list, tuple, set, dict)):
+                if len(value) > 0:
+                    return True
+            elif str(value or "").strip():
+                return True
+        return False
 
     def _summarize_cortex_memory(self, entry: dict[str, Any]) -> dict[str, Any]:
         metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
@@ -2982,11 +3015,12 @@ class SpikingAttentionBackend:
 
     def _surface_words(self, value: str) -> list[str]:
         words: list[str] = []
+        seen: set[str] = set()
         for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", str(value or "").lower()):
-            if word in SURFACE_DETAIL_STOP_WORDS:
+            if word in SURFACE_DETAIL_STOP_WORDS or word in seen:
                 continue
-            if word not in words:
-                words.append(word)
+            seen.add(word)
+            words.append(word)
         return words
 
     def _surface_detail_badges(self, metadata: dict[str, Any]) -> list[str]:
@@ -3524,11 +3558,48 @@ class SpikingAttentionBackend:
         limit: int = 100,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
-        entries = self.list_memory(context_id=context, limit=limit)["entries"]
+        bounded_limit = min(max(int(limit), 1), 500)
         relationships = self.memory_store.list_relationships(
             context_id=context,
-            limit=limit,
+            limit=bounded_limit,
         )
+        endpoint_ids: list[str] = []
+        for relationship in relationships:
+            endpoint_ids.append(str(relationship.get("source_memory_id") or ""))
+            endpoint_ids.append(str(relationship.get("target_memory_id") or ""))
+        max_graph_entries = min(max(bounded_limit * 2, bounded_limit), 1000)
+        endpoint_entries = self.memory_store.list_entries_by_ids(
+            endpoint_ids,
+            context_id=context,
+            limit=max_graph_entries,
+        )
+        recent_entries = self.memory_store.list_entries(
+            context_id=context,
+            include_global=True,
+            limit=bounded_limit,
+        )
+        ordered_raw_entries: list[dict[str, Any]] = []
+        seen_entry_ids: set[str] = set()
+        endpoint_entry_ids: set[str] = set()
+        for entry in endpoint_entries:
+            memory_id = str(entry.get("memory_id") or "")
+            if not memory_id or memory_id in seen_entry_ids:
+                continue
+            ordered_raw_entries.append(entry)
+            seen_entry_ids.add(memory_id)
+            endpoint_entry_ids.add(memory_id)
+        for entry in recent_entries:
+            if len(ordered_raw_entries) >= max_graph_entries:
+                break
+            memory_id = str(entry.get("memory_id") or "")
+            if not memory_id or memory_id in seen_entry_ids:
+                continue
+            ordered_raw_entries.append(entry)
+            seen_entry_ids.add(memory_id)
+        entries = [
+            self._render_memory_entry(entry, include_vectors=False)
+            for entry in ordered_raw_entries
+        ]
         relationship_entries = {str(entry["memory_id"]): entry for entry in entries}
         enriched_relationships = [
             self._decorate_memory_relationship(relationship, relationship_entries)
@@ -3538,6 +3609,9 @@ class SpikingAttentionBackend:
             "context_id": context,
             "memory_db_path": str(self.memory_store.db_path),
             "entry_count": len(entries),
+            "recent_entry_count": len(recent_entries),
+            "relationship_endpoint_count": len(endpoint_entry_ids),
+            "graph_entry_strategy": "relationship_endpoints_first",
             "relationship_count": len(enriched_relationships),
             "relationship_summary": self._summarize_relationship_modes(enriched_relationships),
             "entries": entries,
@@ -4462,6 +4536,7 @@ def moderate_cortex_trace(
     action: str,
     reason: str = "",
     source_surface: str = "operator",
+    confirm: bool = False,
 ) -> dict[str, Any]:
     return get_backend().moderate_cortex_trace(
         context_id=context_id,
@@ -4469,6 +4544,7 @@ def moderate_cortex_trace(
         action=action,
         reason=reason,
         source_surface=source_surface,
+        confirm=confirm,
     )
 
 

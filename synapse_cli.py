@@ -478,6 +478,7 @@ def command_moderate_cortex(args: argparse.Namespace) -> dict[str, Any]:
         action=args.action,
         reason=args.reason,
         source_surface="cli-cortex",
+        confirm=args.confirm,
     )
 
 
@@ -941,6 +942,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     moderate_cortex.add_argument("--reason", default="")
+    moderate_cortex.add_argument("--confirm", action="store_true")
     moderate_cortex.set_defaults(func=command_moderate_cortex)
 
     profile = subparsers.add_parser("profile")
