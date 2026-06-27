@@ -11,6 +11,14 @@ scripts/prep_tomorrow.sh
 
 The script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, writes a native certification evidence payload, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
+For an audit pass that avoids installs, memory writes, inbox processing, MCP wrapper launches, dashboard smoke, maintenance, and backup writes:
+
+```bash
+scripts/prep_tomorrow.sh --verify-only
+```
+
+Use the full command after verify-only passes and before the presentation, because the full path proves the mutating capture, context-bus, dashboard, maintenance, and backup lifecycle.
+
 To refresh local client registration directly:
 
 ```bash
@@ -20,6 +28,15 @@ scripts/install_capture_daemon.sh
 ```
 
 Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions. New SYNAPSE-S2 MCP server processes hydrate their own cursor at startup, enter a strict Cortex Governor session, and drop a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the process exits. The exit path also commits a typed `follow_up` cortical trace so the lifecycle is visible in Cortex state.
+
+## Hardened local contract
+
+- Dashboard HTTP binds to `127.0.0.1` by default. Binding to `0.0.0.0` or another non-loopback interface fails unless `SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD=true` is set intentionally for a controlled LAN demo.
+- Capture inbox payloads are redacted before the pending file is written. Pending, processed, error, export, backup, runtime, and SQLite paths are created private to the local user where the filesystem permits it.
+- Capture processing refuses symlinks and oversized payloads. It does not follow arbitrary filesystem targets from the inbox.
+- Direct `capture-session`, MCP `capture_spiking_conversation`, context-bus deployments, graph metadata, and returned API payloads all share the same redaction layer.
+- Destructive pruning is confirmation-gated: CLI requires `--confirm`, MCP requires `confirm=true`, and the dashboard requires an explicit confirmation action.
+- Client config installation refuses malformed existing JSON instead of silently replacing it.
 
 ## Expected ready signal
 

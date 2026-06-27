@@ -18,6 +18,9 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertIn("embedding_providers.py", script)
         self.assertIn("certify-runtime", script)
         self.assertIn("certify_spiking_runtime", script)
+        self.assertIn("--verify-only", script)
+        self.assertIn("SYNAPSE_S2_PREFLIGHT_VERIFY_ONLY", script)
+        self.assertIn("Skipping launcher/client/LaunchAgent installs", script)
 
     def test_capture_daemon_installer_declares_launch_agent(self):
         script = (ROOT / "scripts" / "install_capture_daemon.sh").read_text(encoding="utf-8")

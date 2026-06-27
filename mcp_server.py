@@ -787,10 +787,13 @@ def prune_spiking_memory(
     relationship_id: str = "",
     event_id: int = 0,
     reason: str = "",
+    confirm: bool = False,
 ) -> str:
     """Prune one SYNAPSE-S2 memory node, edge, relationship mode, or deployment event."""
     context = _sanitize_context_id(context_id)
     try:
+        if confirm is not True:
+            raise ValueError("confirm must be true before pruning memory graph data")
         _, mlx_backend = _load_backend()
         payload = mlx_backend.prune_memory(
             context_id=context,

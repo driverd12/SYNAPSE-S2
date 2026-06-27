@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 
 from capture_daemon import write_capture_drop
-from dashboard_server import DEFAULT_CONTEXT, DashboardRuntime, SynapseDashboardServer
+from dashboard_server import DEFAULT_CONTEXT, DashboardRuntime, SynapseDashboardServer, main
 from mlx_backend import SpikingAttentionBackend
 
 
@@ -62,7 +62,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(payload["graph"]["relationship_count"], 1)
         self.assertIn("estimated_total_mb", payload["profile"])
         self.assertEqual(payload["system"]["memory_uri"], "s2://local/demo")
-        self.assertEqual(payload["system"]["model_uri"], "s2://local/demo")
+        self.assertTrue(payload["system"]["model_uri"].startswith("embedding://"))
+        self.assertIn("embedding_model_id", payload["system"])
         self.assertEqual(payload["system"]["substrate_label"], "SNN Memory Context")
         self.assertEqual(payload["system"]["mode"], "LOCAL ONLY")
         self.assertIn("project_version", payload["system"])
@@ -131,7 +132,48 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("disabled", query_payload["result"].lower())
         self.assertIn("latency_ms", query_payload)
         self.assertIn("query_id", query_payload)
+        self.assertEqual(query_payload["diagnostics"]["runtime"], "disabled")
+        self.assertIn("memory_entry_revision", query_payload["diagnostics"])
         self.assertEqual(query_payload["results"][0]["kind"], "status")
+
+    def test_api_errors_hide_internal_details_by_default(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            def fail_query(*args, **kwargs):
+                raise RuntimeError("internal path /tmp/secret should stay in logs only")
+
+            runtime.backend.query_text = fail_query  # type: ignore[method-assign]
+            status, payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/query",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "prompt": "trigger failure",
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"], "dashboard request failed")
+        self.assertIn("error_id", payload)
+        self.assertNotIn("detail", payload)
+
+    def test_main_refuses_non_loopback_dashboard_bind_without_override(self):
+        previous = os.environ.get("SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD")
+        os.environ.pop("SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD", None)
+        try:
+            status = main(["--host", "0.0.0.0", "--port", "0"])
+        finally:
+            if previous is None:
+                os.environ.pop("SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD", None)
+            else:
+                os.environ["SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD"] = previous
+
+        self.assertEqual(status, 2)
 
     def test_profile_and_quick_prune_endpoints_report_budget(self):
         with TemporaryDirectory() as tmp:

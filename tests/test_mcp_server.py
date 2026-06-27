@@ -288,12 +288,24 @@ class McpServerTests(unittest.TestCase):
                 reason="bad edge",
             )
         )
+        self.assertIn("confirm", edge_prune["error"])
+
+        edge_prune = json.loads(
+            mcp_server.prune_spiking_memory(
+                target_type="relationship",
+                context_id="demo",
+                relationship_id=relationship_id,
+                reason="bad edge",
+                confirm=True,
+            )
+        )
         memory_prune = json.loads(
             mcp_server.prune_spiking_memory(
                 target_type="event",
                 context_id="demo",
                 memory_id=memory_id,
                 reason="bad event",
+                confirm=True,
             )
         )
 
@@ -303,6 +315,29 @@ class McpServerTests(unittest.TestCase):
         self.assertTrue(capture["agent_deployment"]["published"])
         self.assertTrue(edge_prune["result"]["deleted"])
         self.assertTrue(memory_prune["result"]["deleted"])
+
+    def test_mcp_capture_conversation_redacts_secret_payloads(self):
+        capture = json.loads(
+            mcp_server.capture_spiking_conversation(
+                text=(
+                    "Thread: MCP redaction. "
+                    "Event: api_key=sk-mcp-secret123 should not persist."
+                ),
+                context_id="demo",
+                source_tag="mcp-redaction",
+                speaker="codex",
+            )
+        )
+        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+        deployments = json.loads(mcp_server.pull_spiking_context_deployments(context_id="demo"))
+        combined = json.dumps(
+            {"capture": capture, "graph": graph, "deployments": deployments},
+            sort_keys=True,
+            default=str,
+        )
+
+        self.assertNotIn("sk-mcp-secret123", combined)
+        self.assertIn("[REDACTED_SECRET]", combined)
 
     def test_mcp_capture_inbox_tools_drop_process_and_redact(self):
         drop = json.loads(

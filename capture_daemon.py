@@ -5,13 +5,14 @@ import hashlib
 import json
 import logging
 import os
-import re
+import stat
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import mlx_backend
+from redaction import redact_capture_text, redact_sensitive_value
 
 
 LOGGER = logging.getLogger("synapse_s2.capture_daemon")
@@ -27,26 +28,6 @@ LOGGER.propagate = False
 CAPTURE_SUFFIXES = {".json", ".jsonl", ".txt"}
 MAX_CAPTURE_BYTES = 256_000
 
-SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(
-            r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)\s*[:=]\s*([^\s,;]+)"
-        ),
-        r"\1=[REDACTED_SECRET]",
-    ),
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"), "[REDACTED_SECRET]"),
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"), "[REDACTED_SECRET]"),
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{16,}\b"), "[REDACTED_SECRET]"),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_SECRET]"),
-    (
-        re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-            re.DOTALL,
-        ),
-        "[REDACTED_PRIVATE_KEY]",
-    ),
-)
-
 
 def resolve_capture_root(root: str | os.PathLike[str] | None = None) -> Path:
     if root is not None:
@@ -55,15 +36,6 @@ def resolve_capture_root(root: str | os.PathLike[str] | None = None) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.cwd() / ".synapse_s2").resolve()
-
-
-def redact_capture_text(text: str) -> tuple[str, int]:
-    redacted = str(text or "")
-    total = 0
-    for pattern, replacement in SECRET_PATTERNS:
-        redacted, count = pattern.subn(replacement, redacted)
-        total += int(count)
-    return redacted, total
 
 
 def _json_safe(value: Any, fallback: Any) -> Any:
@@ -75,6 +47,31 @@ def _json_safe(value: Any, fallback: Any) -> Any:
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except PermissionError:
+        LOGGER.warning("could not chmod private capture directory %s", path)
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    _ensure_private_dir(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(text)
+        try:
+            path.chmod(0o600)
+        except PermissionError:
+            LOGGER.warning("could not chmod private capture file %s", path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def write_capture_drop(
@@ -91,24 +88,37 @@ def write_capture_drop(
         raise ValueError("capture drop text must not be empty")
     capture_root = resolve_capture_root(root)
     inbox_dir = capture_root / "capture_inbox"
-    inbox_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(capture_root)
+    _ensure_private_dir(inbox_dir)
     context = mlx_backend.sanitize_context_id(context_id)
     tag = mlx_backend.sanitize_tag(source_tag).replace(" ", "-")
+    redacted_text, redaction_count = redact_capture_text(clean_text)
+    safe_metadata, metadata_redactions = redact_sensitive_value(metadata or {})
     payload = {
         "version": 1,
         "created_at": time.time(),
         "context_id": context,
         "source_tag": tag,
         "speaker": mlx_backend.sanitize_agent_id(speaker),
-        "text": clean_text,
-        "metadata": _json_safe(metadata or {}, {}),
+        "text": redacted_text,
+        "metadata": _json_safe(safe_metadata, {}),
+        "redaction_count": int(redaction_count + metadata_redactions),
+        "input_sha256": _sha256_text(clean_text),
+        "raw_text_stored": False,
     }
     digest = _sha256_text(json.dumps(payload, sort_keys=True))[:12]
     filename = f"{time.strftime('%Y%m%d-%H%M%S')}-{tag[:80]}-{digest}.json"
     output_path = inbox_dir / filename
     temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    _write_private_text(
+        temp_path,
+        json.dumps(payload, indent=2, sort_keys=True),
+    )
     temp_path.replace(output_path)
+    try:
+        output_path.chmod(0o600)
+    except PermissionError:
+        LOGGER.warning("could not chmod capture drop %s", output_path)
     return output_path
 
 
@@ -136,7 +146,7 @@ class CaptureInboxDaemon:
     def status(self) -> dict[str, Any]:
         paths = self.paths()
         for key in ("inbox_dir", "processed_dir", "error_dir"):
-            paths[key].mkdir(parents=True, exist_ok=True)
+            _ensure_private_dir(paths[key])
         pending = self._capture_files(paths["inbox_dir"])
         processed = self._capture_files(paths["processed_dir"])
         errors = self._capture_files(paths["error_dir"])
@@ -158,7 +168,7 @@ class CaptureInboxDaemon:
     def process_once(self, *, max_files: int = 50) -> dict[str, Any]:
         paths = self.paths()
         for key in ("inbox_dir", "processed_dir", "error_dir"):
-            paths[key].mkdir(parents=True, exist_ok=True)
+            _ensure_private_dir(paths[key])
         files = self._capture_files(paths["inbox_dir"])[: max(1, int(max_files))]
         captures: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -192,9 +202,9 @@ class CaptureInboxDaemon:
                     "failed_at": time.time(),
                 }
                 errors.append(error_payload)
-                (paths["error_dir"] / f"{path.name}.error.json").write_text(
+                _write_private_text(
+                    paths["error_dir"] / f"{path.name}.error.json",
                     json.dumps(error_payload, indent=2, sort_keys=True),
-                    encoding="utf-8",
                 )
                 self._move_file(path, paths["error_dir"])
                 error_file_count += 1
@@ -214,9 +224,9 @@ class CaptureInboxDaemon:
             "captures": captures,
             "errors": errors,
         }
-        paths["state_path"].write_text(
+        _write_private_text(
+            paths["state_path"],
             json.dumps(result, indent=2, sort_keys=True, default=str),
-            encoding="utf-8",
         )
         return result
 
@@ -236,17 +246,16 @@ class CaptureInboxDaemon:
         files = [
             path
             for path in directory.iterdir()
-            if path.is_file()
+            if not path.is_symlink()
+            and path.is_file()
             and path.suffix.lower() in CAPTURE_SUFFIXES
             and not path.name.startswith(".")
             and not path.name.endswith(".tmp")
         ]
-        return sorted(files, key=lambda path: (path.stat().st_mtime, path.name))
+        return sorted(files, key=lambda path: (path.lstat().st_mtime, path.name))
 
     def _load_payloads(self, path: Path) -> list[dict[str, Any]]:
-        if path.stat().st_size > MAX_CAPTURE_BYTES:
-            raise ValueError(f"capture file exceeds {MAX_CAPTURE_BYTES} bytes")
-        raw = path.read_text(encoding="utf-8")
+        raw = self._read_capture_text(path)
         suffix = path.suffix.lower()
         if suffix == ".txt":
             return [{"source_tag": path.stem, "text": raw}]
@@ -269,13 +278,41 @@ class CaptureInboxDaemon:
             raise ValueError("capture JSON must be an object or list of objects")
         return [parsed]
 
+    def _read_capture_text(self, path: Path) -> str:
+        if path.is_symlink():
+            raise ValueError("capture inbox refuses symlink payloads")
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError(f"capture file disappeared before processing: {path.name}") from exc
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise ValueError("capture inbox payload must be a regular file")
+        if path_stat.st_size > MAX_CAPTURE_BYTES:
+            raise ValueError(f"capture file exceeds {MAX_CAPTURE_BYTES} bytes")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            opened_stat = os.fstat(fd)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise ValueError("capture inbox payload must be a regular file")
+            if opened_stat.st_size > MAX_CAPTURE_BYTES:
+                raise ValueError(f"capture file exceeds {MAX_CAPTURE_BYTES} bytes")
+            raw_bytes = os.read(fd, opened_stat.st_size)
+        finally:
+            os.close(fd)
+        return raw_bytes.decode("utf-8", errors="replace")
+
     def _capture_payload(self, *, path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         text = str(payload.get("text", "")).strip()
         if not text:
             raise ValueError(f"{path.name} capture payload text must not be empty")
         redacted_text, redaction_count = redact_capture_text(text)
+        inherited_redactions = int(payload.get("redaction_count", 0) or 0)
         raw_metadata = payload.get("metadata", {})
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        safe_metadata, metadata_redactions = redact_sensitive_value(metadata)
         source_tag = mlx_backend.sanitize_tag(
             str(payload.get("source_tag") or payload.get("tag") or path.stem)
         ).replace(" ", "-")
@@ -289,11 +326,14 @@ class CaptureInboxDaemon:
             surprise_threshold=float(payload.get("surprise_threshold", 0.5)),
             min_segment_sentences=int(payload.get("min_segment_sentences", 1)),
             metadata={
-                **_json_safe(metadata, {}),
+                **_json_safe(safe_metadata, {}),
                 "capture_daemon": True,
                 "capture_file": path.name,
-                "redaction_count": int(redaction_count),
-                "input_sha256": _sha256_text(text),
+                "redaction_count": int(
+                    redaction_count + inherited_redactions + metadata_redactions
+                ),
+                "input_sha256": str(payload.get("input_sha256") or _sha256_text(text)),
+                "raw_text_stored": False,
             },
         )
         return {
@@ -303,15 +343,19 @@ class CaptureInboxDaemon:
             "event_count": capture["event_count"],
             "relationship_count": capture["relationship_count"],
             "agent_deployment": capture.get("agent_deployment"),
-            "redaction_count": int(redaction_count),
+            "redaction_count": int(redaction_count + inherited_redactions + metadata_redactions),
         }
 
     def _move_file(self, path: Path, destination_dir: Path) -> Path:
-        destination_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(destination_dir)
         destination = destination_dir / path.name
         if destination.exists():
             destination = destination_dir / f"{path.stem}-{int(time.time() * 1000)}{path.suffix}"
         path.replace(destination)
+        try:
+            destination.chmod(0o600)
+        except PermissionError:
+            LOGGER.warning("could not chmod moved capture file %s", destination)
         return destination
 
 

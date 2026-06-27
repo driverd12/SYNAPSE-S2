@@ -205,20 +205,24 @@ def _merge_claude_code_project(payload: dict[str, Any], repo_root: Path) -> None
 
 
 def _read_json(path: Path, *, fallback: dict[str, Any]) -> dict[str, Any]:
-    try:
-        if not path.exists():
-            return dict(fallback)
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else dict(fallback)
-    except Exception:
+    if not path.exists():
         return dict(fallback)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"refusing to overwrite unreadable JSON client config: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"refusing to overwrite non-object JSON client config: {path}")
+    return payload
 
 
 def _read_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8") if path.exists() else ""
-    except Exception:
+    if not path.exists():
         return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ValueError(f"refusing to overwrite unreadable client config: {path}") from exc
 
 
 def _write_json_if_changed(

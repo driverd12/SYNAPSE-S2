@@ -1,3 +1,4 @@
+import json
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -157,7 +158,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertGreaterEqual(ingestion["event_count"], 2)
         self.assertGreaterEqual(ingestion["relationship_count"], 1)
-        self.assertEqual(ingestion["events"][0]["tag"], "morning-brief-event-001")
+        self.assertTrue(ingestion["events"][0]["tag"].startswith("morning-brief-event-001-"))
         self.assertTrue(graph["relationships"])
         self.assertEqual(graph["relationships"][0]["relation_type"], "temporal_next")
         self.assertIn("morning-brief-event", recall)
@@ -188,7 +189,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         first_event = next(
             entry
             for entry in memory["entries"]
-            if entry["tag"] == "semantic-surprise-event-001"
+            if entry["tag"].startswith("semantic-surprise-event-001-")
         )
 
         self.assertEqual(
@@ -1218,6 +1219,114 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertIn("facets=", recall)
         self.assertIn("semantic", recall.lower())
 
+    def test_repeated_conversation_captures_keep_distinct_event_nodes(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+
+        first = backend.capture_conversation(
+            text="Thread: Repeated captures. Event: first retained memory must remain.",
+            context_id="demo",
+            source_tag="codex-session",
+            speaker="codex",
+        )
+        second = backend.capture_conversation(
+            text="Thread: Repeated captures. Event: second retained memory must be additive.",
+            context_id="demo",
+            source_tag="codex-session",
+            speaker="codex",
+        )
+        graph = backend.list_memory_graph(context_id="demo", limit=80)
+        event_entries = [
+            entry
+            for entry in graph["entries"]
+            if entry["tag"].startswith("codex-session-event")
+        ]
+        event_text = " ".join(entry["source_text"] for entry in event_entries)
+
+        self.assertNotEqual(
+            first["events"][0]["memory_id"],
+            second["events"][0]["memory_id"],
+        )
+        self.assertGreaterEqual(len(event_entries), 2)
+        self.assertIn("first retained memory", event_text)
+        self.assertIn("second retained memory", event_text)
+
+    def test_direct_capture_redacts_memory_and_context_bus_payloads(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+
+        capture = backend.capture_conversation(
+            text=(
+                "Thread: Secret redaction. "
+                "Event: direct capture includes api_key=sk-direct-secret123 and "
+                '{"client_secret": "plain-direct-secret"}.'
+            ),
+            context_id="demo",
+            source_tag="direct-secret",
+            speaker="codex",
+        )
+        graph = backend.list_memory_graph(context_id="demo", limit=30)
+        deployments = backend.list_context_events(context_id="demo", limit=10)
+        combined_graph_text = json.dumps(graph, sort_keys=True, default=str)
+        combined_deployment_text = json.dumps(deployments, sort_keys=True, default=str)
+        combined_response_text = json.dumps(capture, sort_keys=True, default=str)
+
+        self.assertNotIn("sk-direct-secret123", combined_graph_text)
+        self.assertNotIn("plain-direct-secret", combined_graph_text)
+        self.assertNotIn("sk-direct-secret123", combined_deployment_text)
+        self.assertNotIn("plain-direct-secret", combined_deployment_text)
+        self.assertNotIn("sk-direct-secret123", combined_response_text)
+        self.assertNotIn("plain-direct-secret", combined_response_text)
+        self.assertIn("[REDACTED_SECRET]", combined_graph_text)
+
+    def test_surface_recall_cache_invalidates_when_memory_changes(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=6,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        backend.capture_conversation(
+            text=(
+                "Thread: Surface recall cache. "
+                "Goal: cache normalized graph surfaces without stale query results."
+            ),
+            context_id="demo",
+            source_tag="surface-cache",
+            speaker="codex",
+        )
+
+        first = backend.query_text("surface recall cache stale query", context_id="demo")
+        self.assertIn("Surface recall cache", first)
+        self.assertTrue(backend._surface_recall_cache)
+
+        backend.register_text_trace(
+            tag="cache-hardening-follow-up",
+            text="Surface recall cache invalidation should expose new hardening follow-up nodes immediately.",
+            context_id="demo",
+            metadata={"source": "unit-test"},
+        )
+        second = backend.query_text("surface recall cache hardening follow-up", context_id="demo")
+
+        self.assertIn("cache-hardening-follow-up", second)
+
     def test_prune_memory_removes_nodes_edges_modes_and_context_events(self):
         backend = SpikingAttentionBackend(
             dimension=32,
@@ -1281,6 +1390,43 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertNotIn(
             capture["agent_deployment"]["event_id"],
             [event["event_id"] for event in remaining_deployments["events"]],
+        )
+
+    def test_temporal_prune_removes_typed_context_sequence_edges(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend.capture_conversation(
+            text=(
+                "Thread: Temporal cleanup. "
+                "Goal: remove wrong order. "
+                "Objective: typed sequence edges should prune with temporal links. "
+                "Event: operator requested cleanup."
+            ),
+            context_id="demo",
+            source_tag="temporal-cleanup",
+            speaker="codex",
+        )
+        graph = backend.list_memory_graph(context_id="demo", limit=80)
+
+        deletion = backend.prune_memory(
+            context_id="demo",
+            target_type="temporal",
+            reason="drop all temporal ordering",
+        )
+        remaining_graph = backend.list_memory_graph(context_id="demo", limit=80)
+
+        self.assertGreaterEqual(graph["relationship_summary"]["by_type"]["typed_context_sequence"], 1)
+        self.assertGreaterEqual(graph["relationship_summary"]["temporal"], 1)
+        self.assertTrue(deletion["result"]["deleted"])
+        self.assertNotIn(
+            "typed_context_sequence",
+            remaining_graph["relationship_summary"]["by_type"],
         )
 
     def test_quick_pruning_decays_weights_and_resets_membrane(self):

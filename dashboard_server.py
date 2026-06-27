@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -49,6 +50,7 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
 }
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 class DashboardError(Exception):
@@ -100,11 +102,12 @@ class DashboardRuntime:
         except DashboardError as exc:
             return self._json_response({"error": exc.message}, status=exc.status)
         except Exception as exc:
+            error_id = f"dash_{uuid.uuid4().hex[:12]}"
             LOGGER.exception("dashboard request failed for %s %s", method, raw_path)
-            return self._json_response(
-                {"error": "dashboard request failed", "detail": str(exc)},
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
+            payload = {"error": "dashboard request failed", "error_id": error_id}
+            if self._debug_error_details_enabled():
+                payload["detail"] = str(exc)
+            return self._json_response(payload, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _handle_api(
         self,
@@ -284,13 +287,23 @@ class DashboardRuntime:
             started = time.perf_counter()
             result = self.backend.query_text(prompt, context_id=context)
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            results = self._parse_recall_result(result)
             return self._json_response(
                 {
                     "context_id": context,
                     "prompt": prompt,
                     "result": result,
-                    "results": self._parse_recall_result(result),
+                    "results": results,
                     "latency_ms": elapsed_ms,
+                    "diagnostics": {
+                        "result_count": len(results),
+                        "runtime": "ready" if self.backend.is_enabled(context) else "disabled",
+                        "embedding_provider": self.backend.embedding_provider_info(),
+                        "memory_entry_revision": self.backend.memory_store.entries_revision(
+                            context_id=context,
+                            include_global=True,
+                        ),
+                    },
                     "query_id": self._query_id(context=context),
                 }
             )
@@ -693,12 +706,16 @@ class DashboardRuntime:
         info = dict(self._system_info_cache)
         uptime_seconds = max(0.0, time.time() - self.started_at)
         memory_uri = f"s2://local/{mlx_backend.sanitize_context_id(context_id)}"
+        provider = self.backend.embedding_provider_info()
+        provider_id = str(provider.get("provider") or "embedding-provider")
+        model_id = str(provider.get("model_id") or provider_id)
         info.update(
             {
                 "started_at": self.started_at,
                 "uptime_seconds": round(uptime_seconds, 3),
                 "memory_uri": memory_uri,
-                "model_uri": memory_uri,
+                "model_uri": f"embedding://{provider_id}/{model_id}",
+                "embedding_model_id": model_id,
                 "substrate_label": "SNN Memory Context",
                 "mode": "LOCAL ONLY",
             }
@@ -851,6 +868,14 @@ class DashboardRuntime:
             raise DashboardError(HTTPStatus.BAD_REQUEST, "JSON body must be an object")
         return payload
 
+    def _debug_error_details_enabled(self) -> bool:
+        return os.getenv("SYNAPSE_S2_DASHBOARD_DEBUG_ERRORS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     def _context_from_params(self, params: dict[str, list[str]]) -> str:
         value = params.get("context_id", [DEFAULT_CONTEXT])[0]
         return mlx_backend.sanitize_context_id(value)
@@ -954,6 +979,9 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(int(HTTPStatus.NO_CONTENT))
         self.send_header("Allow", "GET, POST, OPTIONS")
+        for key, value in SECURITY_HEADERS.items():
+            self.send_header(key, value)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -989,7 +1017,7 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(origin)
         if parsed.scheme not in {"http", "https"}:
             return False
-        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        if parsed.hostname not in LOOPBACK_HOSTS:
             return False
         origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
         return int(origin_port) == int(self.server.server_port)
@@ -1028,6 +1056,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.host not in LOOPBACK_HOSTS and os.getenv(
+        "SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD", ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        LOGGER.error(
+            "refusing to bind dashboard to non-loopback host %s; set "
+            "SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD=true only for a controlled LAN demo",
+            args.host,
+        )
+        return 2
     runtime = DashboardRuntime()
     server = SynapseDashboardServer((args.host, args.port), runtime)
     url = f"http://{args.host}:{server.server_port}/?context_id={mlx_backend.sanitize_context_id(args.context)}"

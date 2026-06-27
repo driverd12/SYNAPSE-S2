@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import unittest
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -47,10 +48,120 @@ class DurableMemoryStoreTests(unittest.TestCase):
             self.assertEqual(backup["backup_path"], str(backup_path))
             self.assertTrue(backup_path.exists())
 
-            with sqlite3.connect(backup_path) as conn:
+            with closing(sqlite3.connect(backup_path)) as conn:
                 row_count = conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0]
 
             self.assertEqual(row_count, 1)
+
+    def test_recall_uses_durable_spike_index_and_updates_on_upsert(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+
+            first = store.upsert_entry(
+                tag="indexed-recall",
+                context_id="demo",
+                source_text="First indexed recall text.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[1, 2, 2, 4],
+                neuron_indices=[1, 4],
+            )
+            store.upsert_entry(
+                tag="other-recall",
+                context_id="demo",
+                source_text="Other indexed recall text.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[6, 7],
+                neuron_indices=[6, 7],
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                indexed_rows = conn.execute(
+                    """
+                    SELECT spike_index
+                    FROM memory_spikes
+                    WHERE memory_id = ?
+                    ORDER BY spike_index
+                    """,
+                    (first["memory_id"],),
+                ).fetchall()
+                query_plan = " ".join(
+                    str(row)
+                    for row in conn.execute(
+                        """
+                        EXPLAIN QUERY PLAN
+                        SELECT e.memory_id
+                        FROM memory_spikes AS s
+                        JOIN memory_entries AS e
+                            ON e.memory_id = s.memory_id
+                        WHERE s.context_id IN (?, 'global')
+                            AND s.spike_index IN (?, ?)
+                        GROUP BY e.memory_id
+                        """,
+                        ("demo", 1, 4),
+                    ).fetchall()
+                )
+
+            self.assertEqual([row[0] for row in indexed_rows], [1, 2, 4])
+            self.assertIn("ix_memory_spikes_context_spike", query_plan)
+            self.assertEqual(
+                [
+                    item["tag"]
+                    for item in store.recall_candidates(
+                        context_id="demo",
+                        query_spikes={1, 4},
+                        firing_values=[0.0] * 9,
+                        limit=10,
+                    )
+                ],
+                ["indexed-recall"],
+            )
+
+            store.upsert_entry(
+                tag="indexed-recall",
+                context_id="demo",
+                source_text="Updated indexed recall text.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[6],
+                neuron_indices=[6],
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                updated_rows = conn.execute(
+                    """
+                    SELECT spike_index
+                    FROM memory_spikes
+                    WHERE memory_id = ?
+                    ORDER BY spike_index
+                    """,
+                    (first["memory_id"],),
+                ).fetchall()
+
+            self.assertEqual([row[0] for row in updated_rows], [6])
+            self.assertEqual(
+                store.recall_candidates(
+                    context_id="demo",
+                    query_spikes={1, 4},
+                    firing_values=[0.0] * 9,
+                    limit=10,
+                ),
+                [],
+            )
+            self.assertEqual(
+                [
+                    item["tag"]
+                    for item in store.recall_candidates(
+                        context_id="demo",
+                        query_spikes={6},
+                        firing_values=[0.0] * 9,
+                        limit=10,
+                    )
+                ],
+                ["indexed-recall", "other-recall"],
+            )
 
     def test_relationships_are_upserted_listed_and_exported(self):
         with TemporaryDirectory() as tmp:

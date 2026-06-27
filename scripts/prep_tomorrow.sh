@@ -5,6 +5,20 @@ ROOT="/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Loca
 LAUNCHER="/Users/dan.driver/.local/bin/synapse-s2-mcp"
 CONTEXT="${SYNAPSE_S2_PREFLIGHT_CONTEXT:-default}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
+VERIFY_ONLY="${SYNAPSE_S2_PREFLIGHT_VERIFY_ONLY:-0}"
+
+case "${1:-}" in
+  --verify-only|--check-only|--dry-run)
+    VERIFY_ONLY=1
+    shift
+    ;;
+  "")
+    ;;
+  *)
+    echo "usage: scripts/prep_tomorrow.sh [--verify-only]" >&2
+    exit 2
+    ;;
+esac
 
 cd "$ROOT"
 
@@ -30,20 +44,41 @@ if [ ! -x ".venv/bin/python" ]; then
   fi
 fi
 
-echo "=== install launcher ==="
-scripts/install_local_launcher.sh
+if [ "$VERIFY_ONLY" = "1" ]; then
+  echo "=== verify-only mode ==="
+  echo "Skipping launcher/client/LaunchAgent installs, memory writes, inbox processing, MCP wrapper launches, dashboard smoke, maintenance, and backup."
+else
+  echo "=== install launcher ==="
+  scripts/install_local_launcher.sh
 
-echo "=== install client configs ==="
-scripts/install_client_configs.py
+  echo "=== install client configs ==="
+  scripts/install_client_configs.py
 
-echo "=== install capture inbox daemon ==="
-scripts/install_capture_daemon.sh
+  echo "=== install capture inbox daemon ==="
+  scripts/install_capture_daemon.sh
+fi
 
 echo "=== unit tests ==="
 .venv/bin/python -m unittest discover -s tests -v
 
 echo "=== compile check ==="
 .venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
+
+if [ "$VERIFY_ONLY" = "1" ]; then
+  echo "=== verify-only read-only-ish checks ==="
+  .venv/bin/python synapse_cli.py --json status --context "$CONTEXT"
+  .venv/bin/python synapse_cli.py --json profile
+  .venv/bin/python synapse_cli.py --json certify-runtime \
+    --strict-native \
+    --require-resource-envelope
+  .venv/bin/python synapse_cli.py --json preflight \
+    --context "$CONTEXT" \
+    --require-resource-envelope \
+    --require-native \
+    --launcher "$LAUNCHER"
+  echo "=== verify-only ready ==="
+  exit 0
+fi
 
 echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json remember-text \

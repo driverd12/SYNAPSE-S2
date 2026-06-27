@@ -16,6 +16,7 @@ from typing import Any
 from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
 from event_segmenter import BayesianSurpriseEventSegmenter
 from memory_store import DurableMemoryStore
+from redaction import redact_capture_text, redact_sensitive_value
 
 try:
     import mlx.core as mx
@@ -105,6 +106,8 @@ SURFACE_DETAIL_STOP_WORDS = {
     "with",
     "would",
 }
+MAX_SURFACE_RECALL_ENTRIES = 10_000
+MAX_SURFACE_RECALL_SOURCE_CHARS = 4096
 
 
 class BackendUnavailable(RuntimeError):
@@ -241,6 +244,7 @@ class SpikingAttentionBackend:
         self.context_overrides: dict[str, bool] = {}
         self.cortex_sessions: dict[str, dict[str, Any]] = {}
         self.registered_traces: list[dict[str, Any]] = []
+        self._surface_recall_cache: dict[str, dict[str, Any]] = {}
 
         self.W_syn = self._balanced_matrix(
             (self.dimension, self.num_neurons),
@@ -714,14 +718,34 @@ class SpikingAttentionBackend:
         context_id: str = "default",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = self.embed_text_payload(text)
+        raw_text = str(text or "")
+        redacted_text, redaction_count = redact_capture_text(raw_text)
+        safe_metadata, metadata_redactions = redact_sensitive_value(metadata or {})
+        if redaction_count or metadata_redactions:
+            safe_metadata = {
+                **(safe_metadata if isinstance(safe_metadata, dict) else {}),
+                "redaction_count": int(
+                    redaction_count
+                    + metadata_redactions
+                    + int(
+                        (safe_metadata if isinstance(safe_metadata, dict) else {}).get(
+                            "redaction_count",
+                            0,
+                        )
+                        or 0
+                    )
+                ),
+                "input_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+                "raw_text_stored": False,
+            }
+        payload = self.embed_text_payload(redacted_text)
         base_metadata = {
-            **(metadata or {}),
+            **(safe_metadata if isinstance(safe_metadata, dict) else {}),
             "embedding_provider": payload["provenance"],
         }
         surface_details = self._surface_node_details(
             tag=tag,
-            text=text,
+            text=redacted_text,
             metadata=base_metadata,
         )
         merged_metadata = self._json_safe_metadata(
@@ -735,7 +759,7 @@ class SpikingAttentionBackend:
             embedding=payload["embedding"],
             context_id=context_id,
             metadata=merged_metadata,
-            source_text=text,
+            source_text=redacted_text,
         )
         registration["embedding_provider"] = payload["provenance"]
         return registration
@@ -837,6 +861,7 @@ class SpikingAttentionBackend:
                 registered_at=registered_at,
             )
             self._refresh_registered_traces()
+            self._surface_recall_cache.clear()
             self._persist_runtime_state()
             self._mark_activity()
             embedding_provider = trace["metadata"].get("embedding_provider")
@@ -1082,27 +1107,14 @@ class SpikingAttentionBackend:
             return []
         prompt_lower = " ".join(str(prompt_text or "").lower().split())
         candidates: list[dict[str, Any]] = []
-        for entry in self.memory_store.list_entries(
-            context_id=context,
-            include_global=True,
-            limit=10_000,
-        ):
+        for indexed in self._surface_recall_index(context=context):
+            entry = indexed["entry"]
             metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
-            facets = self._surface_facets_for_entry(entry)
-            corpus = " ".join(
-                [
-                    self._surface_label_for_entry(entry),
-                    self._surface_summary_for_entry(entry),
-                    str(entry.get("tag") or ""),
-                    str(entry.get("source_text") or ""),
-                    " ".join(facets),
-                ]
-            )
-            corpus_terms = set(self._surface_words(corpus))
+            facets = indexed["facets"]
+            corpus_terms = indexed["terms"]
             overlap = query_terms & corpus_terms
             phrase_hits = 0
-            for facet in facets:
-                facet_text = " ".join(str(facet or "").lower().split())
+            for facet_text in indexed["facet_phrases"]:
                 if facet_text and (facet_text in prompt_lower or prompt_lower in facet_text):
                     phrase_hits += 1
             if len(overlap) < 2 and phrase_hits == 0:
@@ -1125,6 +1137,61 @@ class SpikingAttentionBackend:
             reverse=True,
         )
         return candidates[: max(self.recall_count * 3, 12)]
+
+    def _surface_recall_index(self, *, context: str) -> list[dict[str, Any]]:
+        revision = self.memory_store.entries_revision(
+            context_id=context,
+            include_global=True,
+        )
+        cache_key = f"{context}|global"
+        cached = self._surface_recall_cache.get(cache_key)
+        if cached and cached.get("revision") == revision["revision"]:
+            return list(cached.get("items", []))
+
+        items: list[dict[str, Any]] = []
+        entries = self.memory_store.list_entries(
+            context_id=context,
+            include_global=True,
+            limit=MAX_SURFACE_RECALL_ENTRIES,
+        )
+        for entry in entries:
+            facets = self._surface_facets_for_entry(entry)
+            corpus = " ".join(
+                [
+                    self._surface_label_for_entry(entry),
+                    self._surface_summary_for_entry(entry),
+                    str(entry.get("tag") or ""),
+                    str(entry.get("source_text") or "")[:MAX_SURFACE_RECALL_SOURCE_CHARS],
+                    " ".join(facets),
+                ]
+            )
+            facet_phrases = tuple(
+                " ".join(str(facet or "").lower().split())
+                for facet in facets
+                if str(facet or "").strip()
+            )
+            items.append(
+                {
+                    "entry": entry,
+                    "terms": frozenset(self._surface_words(corpus)),
+                    "facets": tuple(facets),
+                    "facet_phrases": facet_phrases,
+                }
+            )
+
+        self._surface_recall_cache[cache_key] = {
+            "revision": revision["revision"],
+            "revision_info": revision,
+            "items": items,
+            "built_at": time.time(),
+        }
+        if len(self._surface_recall_cache) > 16:
+            oldest_key = min(
+                self._surface_recall_cache,
+                key=lambda key: float(self._surface_recall_cache[key].get("built_at", 0.0)),
+            )
+            self._surface_recall_cache.pop(oldest_key, None)
+        return items
 
     def _recall_indices(self, firing_signature: Any, sensory_spikes: Any) -> list[int]:
         native_mx = self._mx
@@ -1279,13 +1346,25 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         targets = list(agent_targets or DEFAULT_AGENT_TARGETS)
+        safe_summary, _summary_redactions = redact_capture_text(str(summary or ""))
+        safe_payload, payload_redactions = redact_sensitive_value(payload or {})
+        if payload_redactions:
+            if isinstance(safe_payload, dict):
+                safe_payload = {
+                    **safe_payload,
+                    "context_bus_redaction_count": int(
+                        payload_redactions
+                        + int(safe_payload.get("context_bus_redaction_count", 0) or 0)
+                    ),
+                    "raw_payload_stored": False,
+                }
         try:
             event = self.memory_store.publish_context_event(
                 context_id=context,
                 source_surface=str(source_surface or "unknown"),
                 event_type=str(event_type or "context-update"),
-                summary=str(summary or ""),
-                payload=self._json_safe_metadata(payload or {}),
+                summary=safe_summary,
+                payload=self._json_safe_metadata(safe_payload if isinstance(safe_payload, dict) else {}),
                 agent_targets=targets,
             )
             self._mark_activity()
@@ -2653,36 +2732,45 @@ class SpikingAttentionBackend:
         relationships: list[dict[str, Any]] = []
         try:
             for segment in segments:
+                safe_segment = dict(segment)
+                safe_segment_text, segment_redactions = redact_capture_text(
+                    str(segment.get("text") or "")
+                )
+                safe_segment["text"] = safe_segment_text
+                safe_segment["keywords"] = self._surface_words(safe_segment_text)[:10]
+                if segment_redactions:
+                    safe_segment["redaction_count"] = int(segment_redactions)
+                    safe_segment["raw_text_stored"] = False
                 event_metadata = self._json_safe_metadata(
                     {
                         **(metadata or {}),
                         "event_segment": True,
-                        "segment_id": segment["segment_id"],
-                        "sequence_id": segment["sequence_id"],
-                        "segment_index": segment["segment_index"],
-                        "sentence_count": segment["sentence_count"],
-                        "surprise_score": segment["surprise_score"],
-                        "surprise_mode": segment.get("surprise_mode", "lexical"),
+                        "segment_id": safe_segment["segment_id"],
+                        "sequence_id": safe_segment["sequence_id"],
+                        "segment_index": safe_segment["segment_index"],
+                        "sentence_count": safe_segment["sentence_count"],
+                        "surprise_score": safe_segment["surprise_score"],
+                        "surprise_mode": safe_segment.get("surprise_mode", "lexical"),
                         "lexical_surprise_score": segment.get(
                             "lexical_surprise_score",
-                            segment["surprise_score"],
+                            safe_segment["surprise_score"],
                         ),
                         "semantic_surprise_score": segment.get(
                             "semantic_surprise_score",
                             0.0,
                         ),
                         "surprise_model": surprise_model,
-                        "keywords": segment["keywords"],
-                        "source_tag": segment["source_tag"],
+                        "keywords": safe_segment["keywords"],
+                        "source_tag": safe_segment["source_tag"],
                     }
                 )
                 registration = self.register_text_trace(
-                    tag=segment["tag"],
+                    tag=self._event_memory_tag(segment=safe_segment),
                     context_id=context,
                     metadata=event_metadata,
-                    text=segment["text"],
+                    text=safe_segment_text,
                 )
-                registration["segment"] = segment
+                registration["segment"] = safe_segment
                 registrations.append(registration)
 
             for index in range(1, len(registrations)):
@@ -2754,6 +2842,12 @@ class SpikingAttentionBackend:
             return [float(value) for value in embedding.tolist()]
         except AttributeError:
             return [float(value) for value in embedding]
+
+    def _event_memory_tag(self, *, segment: dict[str, Any]) -> str:
+        base_tag = sanitize_tag(str(segment.get("tag") or "event")).replace(" ", "-")
+        sequence_id = str(segment.get("sequence_id") or "")
+        digest = hashlib.sha256(sequence_id.encode("utf-8")).hexdigest()[:8]
+        return sanitize_tag(f"{base_tag}-{digest}").replace(" ", "-")
 
     def _surprise_model_info(self) -> dict[str, Any]:
         provider_info = self.embedding_provider_info()
@@ -3040,7 +3134,9 @@ class SpikingAttentionBackend:
         ingestion: dict[str, Any],
     ) -> dict[str, Any]:
         namespace_id = str(namespace_profile.get("namespace_id") or "default")
-        namespace_title = str(namespace_profile.get("namespace_title") or namespace_id)
+        namespace_title, _namespace_redactions = redact_capture_text(
+            str(namespace_profile.get("namespace_title") or namespace_id)
+        )
         sequence_id = str(ingestion.get("sequence_id") or "")
         base_metadata = {
             "source": "context-namespace-automation",
@@ -3065,12 +3161,16 @@ class SpikingAttentionBackend:
                 "context_memory_type": "namespace",
             },
         )
+        namespace_entry = self.memory_store.get_entry(str(namespace_node["memory_id"]))
         nodes.append(
             {
                 "memory_id": namespace_node["memory_id"],
                 "tag": namespace_node["tag"],
                 "context_memory_type": "namespace",
-                "text": f"Namespace: {namespace_title}",
+                "text": str(
+                    (namespace_entry or {}).get("source_text")
+                    or f"Namespace: {namespace_title}"
+                ),
             }
         )
 
@@ -3082,6 +3182,8 @@ class SpikingAttentionBackend:
                 continue
             for index, label in enumerate(values, start=1):
                 clean_label = self._clean_context_label(str(label or ""))
+                clean_label, _label_redactions = redact_capture_text(clean_label)
+                clean_label = self._clean_context_label(clean_label)
                 if not clean_label:
                     continue
                 digest = hashlib.sha256(
@@ -3102,11 +3204,12 @@ class SpikingAttentionBackend:
                         "context_label_index": index,
                     },
                 )
+                stored_entry = self.memory_store.get_entry(str(node["memory_id"]))
                 typed_node = {
                     "memory_id": node["memory_id"],
                     "tag": node["tag"],
                     "context_memory_type": memory_type,
-                    "text": text,
+                    "text": str((stored_entry or {}).get("source_text") or text),
                 }
                 typed_nodes.append(typed_node)
                 nodes.append(typed_node)
@@ -3365,12 +3468,14 @@ class SpikingAttentionBackend:
             }
         event = safe.get("event")
         if isinstance(event, dict):
+            safe_summary, summary_redactions = redact_capture_text(str(event.get("summary") or ""))
             safe["event"] = {
                 "event_id": event.get("event_id"),
                 "context_id": event.get("context_id"),
                 "event_type": event.get("event_type"),
                 "source_surface": event.get("source_surface"),
-                "summary": event.get("summary"),
+                "summary": safe_summary,
+                "summary_redaction_count": int(summary_redactions),
             }
         return safe
 
@@ -3518,7 +3623,7 @@ class SpikingAttentionBackend:
         for relationship in relationships:
             relation_type = str(relationship.get("relation_type") or "unknown")
             by_type[relation_type] = by_type.get(relation_type, 0) + 1
-            if relation_type.startswith("temporal"):
+            if relation_type.startswith("temporal") or relation_type == "typed_context_sequence":
                 temporal += 1
             elif relation_type.startswith("semantic") or relation_type.startswith("associative"):
                 associative += 1

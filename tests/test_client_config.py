@@ -164,6 +164,26 @@ command = "node"
         self.assertNotIn("/old/synapse-s2-mcp", merged)
         self.assertNotIn("old-agent", merged)
 
+    def test_install_refuses_to_overwrite_malformed_existing_json(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            repo_root = Path(tmp) / "SYNAPSE-S2"
+            repo_root.mkdir()
+            launcher = home / ".local" / "bin" / "synapse-s2-mcp"
+            desktop_config = home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+            desktop_config.parent.mkdir(parents=True)
+            desktop_config.write_text("{not valid json", encoding="utf-8")
+
+            with self.assertRaises(ValueError) as raised:
+                client_config.install_client_configs(
+                    home=home,
+                    repo_root=repo_root,
+                    launcher_path=launcher,
+                )
+
+            self.assertIn("refusing to overwrite", str(raised.exception))
+            self.assertEqual(desktop_config.read_text(encoding="utf-8"), "{not valid json")
+
 
 if __name__ == "__main__":
     unittest.main()

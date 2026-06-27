@@ -49,9 +49,24 @@ For the full morning readiness path, run:
 scripts/prep_tomorrow.sh
 ```
 
+For a no-install/no-ingest audit pass first:
+
+```bash
+scripts/prep_tomorrow.sh --verify-only
+```
+
 The detailed operator runbook is in `docs/TOMORROW_RUNBOOK.md`.
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
+
+### Hardened Local Operating Contract
+
+- Dashboard HTTP binds to loopback only by default. Non-loopback demos must set `SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD=true` explicitly.
+- Capture inbox drops are redacted before they are written to disk; inbox, processed, error, backup, export, and SQLite files are kept private to the local user where the filesystem permits it.
+- Capture processing rejects symlink payloads and over-large payloads instead of following arbitrary files.
+- Direct conversation capture, context-bus deployments, graph metadata, and returned API/MCP payloads use the same redaction path, so sanitized storage does not mask a raw response leak.
+- MCP memory pruning requires explicit `confirm=true`; CLI pruning requires `--confirm`; the dashboard requires a confirmation control before destructive graph operations.
+- Client config installation refuses malformed existing JSON instead of silently overwriting it.
 
 ### 3. Write and Query Persistent Memory
 

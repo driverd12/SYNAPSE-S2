@@ -42,6 +42,22 @@ ON memory_entries(context_id, tag);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_context_updated
 ON memory_entries(context_id, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS memory_spikes (
+    memory_id TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    spike_index INTEGER NOT NULL,
+    PRIMARY KEY(memory_id, spike_index),
+    FOREIGN KEY(memory_id)
+        REFERENCES memory_entries(memory_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_memory_spikes_context_spike
+ON memory_spikes(context_id, spike_index, memory_id);
+
+CREATE INDEX IF NOT EXISTS ix_memory_spikes_context_memory
+ON memory_spikes(context_id, memory_id);
+
 CREATE TABLE IF NOT EXISTS memory_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     memory_id TEXT NOT NULL,
@@ -109,6 +125,17 @@ ON memory_relationships(
 
 CREATE INDEX IF NOT EXISTS ix_memory_relationships_context_weight
 ON memory_relationships(context_id, weight DESC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_memory_relationships_context_source_weight
+ON memory_relationships(context_id, source_memory_id, weight DESC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_memory_relationships_context_target_weight
+ON memory_relationships(context_id, target_memory_id, weight DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS store_migrations (
+    key TEXT PRIMARY KEY,
+    applied_at REAL NOT NULL
+);
 """
 
 
@@ -141,6 +168,7 @@ class DurableMemoryStore:
     def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
         self.db_path = self._resolve_db_path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._protect_path(self.db_path.parent, directory=True)
         self._initialize()
 
     def _resolve_db_path(self, db_path: str | os.PathLike[str] | None) -> Path:
@@ -153,6 +181,7 @@ class DurableMemoryStore:
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._protect_path(self.db_path.parent, directory=True)
         conn = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 10000")
@@ -160,7 +189,66 @@ class DurableMemoryStore:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA_SQL)
+        self._run_migrations(conn)
+        self._protect_path(self.db_path, directory=False)
         return conn
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        if conn.execute(
+            "SELECT 1 FROM store_migrations WHERE key = ?",
+            ("memory_spikes_v1",),
+        ).fetchone():
+            return
+        rows = conn.execute(
+            """
+            SELECT memory_id, context_id, spike_indices_json
+            FROM memory_entries
+            """
+        ).fetchall()
+        with conn:
+            for row in rows:
+                spike_rows = [
+                    (
+                        str(row["memory_id"]),
+                        str(row["context_id"]),
+                        int(spike_index),
+                    )
+                    for spike_index in sorted(
+                        {
+                            int(value)
+                            for value in _decode_json(
+                                str(row["spike_indices_json"]),
+                                [],
+                            )
+                        }
+                    )
+                ]
+                if spike_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO memory_spikes (
+                            memory_id,
+                            context_id,
+                            spike_index
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        spike_rows,
+                    )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO store_migrations (key, applied_at)
+                VALUES (?, ?)
+                """,
+                ("memory_spikes_v1", time.time()),
+            )
+
+    def _protect_path(self, path: Path, *, directory: bool) -> None:
+        try:
+            if path.exists():
+                path.chmod(0o700 if directory else 0o600)
+        except PermissionError:
+            LOGGER.warning("could not chmod private memory-store path %s", path)
 
     def _initialize(self) -> None:
         try:
@@ -203,71 +291,94 @@ class DurableMemoryStore:
         memory_id = self.stable_memory_id(context_id=context_id, tag=tag)
         now = float(registered_at or time.time())
         metadata_json = _json_dumps(metadata or {})
-        spike_json = _json_list(spike_indices)
-        neuron_json = _json_list(neuron_indices)
+        clean_spike_indices = sorted({int(value) for value in spike_indices})
+        clean_neuron_indices = [int(value) for value in neuron_indices]
+        spike_json = _json_list(clean_spike_indices)
+        neuron_json = _json_list(clean_neuron_indices)
         try:
             with closing(self._connect()) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO memory_entries (
-                        memory_id,
-                        tag,
-                        context_id,
-                        source_text,
-                        metadata_json,
-                        embedding_dimensions,
-                        spike_indices_json,
-                        neuron_indices_json,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(memory_id) DO UPDATE SET
-                        tag = excluded.tag,
-                        context_id = excluded.context_id,
-                        source_text = excluded.source_text,
-                        metadata_json = excluded.metadata_json,
-                        embedding_dimensions = excluded.embedding_dimensions,
-                        spike_indices_json = excluded.spike_indices_json,
-                        neuron_indices_json = excluded.neuron_indices_json,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        memory_id,
-                        tag,
-                        context_id,
-                        str(source_text or ""),
-                        metadata_json,
-                        int(embedding_dimensions),
-                        spike_json,
-                        neuron_json,
-                        now,
-                        time.time(),
-                    ),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO memory_events (
-                        memory_id,
-                        event_type,
-                        payload_json,
-                        created_at
-                    )
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        memory_id,
-                        "upsert",
-                        _json_dumps(
-                            {
-                                "tag": tag,
-                                "context_id": context_id,
-                                "embedding_dimensions": int(embedding_dimensions),
-                            }
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO memory_entries (
+                            memory_id,
+                            tag,
+                            context_id,
+                            source_text,
+                            metadata_json,
+                            embedding_dimensions,
+                            spike_indices_json,
+                            neuron_indices_json,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(memory_id) DO UPDATE SET
+                            tag = excluded.tag,
+                            context_id = excluded.context_id,
+                            source_text = excluded.source_text,
+                            metadata_json = excluded.metadata_json,
+                            embedding_dimensions = excluded.embedding_dimensions,
+                            spike_indices_json = excluded.spike_indices_json,
+                            neuron_indices_json = excluded.neuron_indices_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            memory_id,
+                            tag,
+                            context_id,
+                            str(source_text or ""),
+                            metadata_json,
+                            int(embedding_dimensions),
+                            spike_json,
+                            neuron_json,
+                            now,
+                            time.time(),
                         ),
-                        time.time(),
-                    ),
-                )
+                    )
+                    conn.execute(
+                        "DELETE FROM memory_spikes WHERE memory_id = ?",
+                        (memory_id,),
+                    )
+                    if clean_spike_indices:
+                        conn.executemany(
+                            """
+                            INSERT INTO memory_spikes (
+                                memory_id,
+                                context_id,
+                                spike_index
+                            )
+                            VALUES (?, ?, ?)
+                            """,
+                            [
+                                (memory_id, context_id, spike_index)
+                                for spike_index in clean_spike_indices
+                            ],
+                        )
+                    conn.execute(
+                        """
+                        INSERT INTO memory_events (
+                            memory_id,
+                            event_type,
+                            payload_json,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            memory_id,
+                            "upsert",
+                            _json_dumps(
+                                {
+                                    "tag": tag,
+                                    "context_id": context_id,
+                                    "embedding_dimensions": int(embedding_dimensions),
+                                    "spike_count": len(clean_spike_indices),
+                                }
+                            ),
+                            time.time(),
+                        ),
+                    )
             entry = self.get_entry(memory_id)
             if entry is None:
                 raise RuntimeError(f"memory entry {memory_id} was not readable after upsert")
@@ -332,6 +443,55 @@ class DurableMemoryStore:
             LOGGER.exception("failed to list memory entries for context_id=%s", context_id)
             raise
 
+    def entries_revision(
+        self,
+        *,
+        context_id: str | None = None,
+        include_global: bool = False,
+    ) -> dict[str, Any]:
+        """Return a cheap revision fingerprint for entry-list caches."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            if include_global and context_id != "global":
+                clauses.append("context_id IN (?, 'global')")
+                params.append(str(context_id))
+            else:
+                clauses.append("context_id = ?")
+                params.append(str(context_id))
+        where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS entry_count,
+                        COALESCE(MAX(updated_at), 0.0) AS max_updated_at,
+                        COALESCE(MAX(created_at), 0.0) AS max_created_at
+                    FROM memory_entries
+                    {where_sql}
+                    """,
+                    tuple(params),
+                ).fetchone()
+            entry_count = int(row["entry_count"] if row is not None else 0)
+            max_updated_at = float(row["max_updated_at"] if row is not None else 0.0)
+            max_created_at = float(row["max_created_at"] if row is not None else 0.0)
+            revision_seed = (
+                f"{context_id or '*'}\x1f{include_global}\x1f"
+                f"{entry_count}\x1f{max_updated_at:.9f}\x1f{max_created_at:.9f}"
+            )
+            return {
+                "context_id": str(context_id or ""),
+                "include_global": bool(include_global),
+                "entry_count": entry_count,
+                "max_updated_at": max_updated_at,
+                "max_created_at": max_created_at,
+                "revision": hashlib.sha256(revision_seed.encode("utf-8")).hexdigest()[:16],
+            }
+        except Exception:
+            LOGGER.exception("failed to compute memory entry revision")
+            raise
+
     def recall_candidates(
         self,
         *,
@@ -342,17 +502,40 @@ class DurableMemoryStore:
     ) -> list[dict[str, Any]]:
         if not query_spikes:
             return []
+        clean_query_spikes = sorted({int(value) for value in query_spikes})
+        placeholders = ",".join("?" for _ in clean_query_spikes)
+        params: list[Any] = [str(context_id), *clean_query_spikes, 10_000]
         candidates: list[dict[str, Any]] = []
-        for entry in self.list_entries(
-            context_id=context_id,
-            include_global=True,
-            limit=10_000,
-        ):
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        e.*,
+                        COUNT(DISTINCT s.spike_index) AS overlap_count
+                    FROM memory_spikes AS s
+                    JOIN memory_entries AS e
+                        ON e.memory_id = s.memory_id
+                    WHERE
+                        s.context_id IN (?, 'global')
+                        AND s.spike_index IN ({placeholders})
+                    GROUP BY e.memory_id
+                    ORDER BY overlap_count DESC, e.updated_at DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+        except Exception:
+            LOGGER.exception("failed to query indexed recall candidates")
+            raise
+        query_spike_set = set(clean_query_spikes)
+        for row in rows:
+            entry = self._row_to_entry(row)
             trace_spikes = set(int(idx) for idx in entry["spike_indices"])
             if not trace_spikes:
                 continue
-            overlap = len(query_spikes & trace_spikes)
-            union = len(query_spikes | trace_spikes)
+            overlap = int(row["overlap_count"])
+            union = len(query_spike_set | trace_spikes)
             jaccard = overlap / max(1, union)
             if jaccard <= 0.0:
                 continue
@@ -619,7 +802,7 @@ class DurableMemoryStore:
         clauses = ["context_id = ?"]
         params: list[Any] = [str(context_id)]
         if normalized == "temporal":
-            clauses.append("relation_type LIKE 'temporal%'")
+            clauses.append("(relation_type LIKE 'temporal%' OR relation_type = 'typed_context_sequence')")
         else:
             clauses.append("(relation_type LIKE 'semantic%' OR relation_type LIKE 'associative%')")
         if source_memory_id:
@@ -1022,12 +1205,18 @@ class DurableMemoryStore:
         if path is not None:
             output_path = Path(path).expanduser()
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._protect_path(output_path.parent, directory=True)
             temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-            temp_path.write_text(
-                json.dumps(payload, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(json.dumps(payload, indent=2, sort_keys=True))
+            finally:
+                if fd >= 0:
+                    os.close(fd)
             temp_path.replace(output_path)
+            self._protect_path(output_path, directory=False)
             payload["export_path"] = str(output_path)
         return payload
 
@@ -1038,10 +1227,12 @@ class DurableMemoryStore:
         else:
             output_path = Path(path).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._protect_path(output_path.parent, directory=True)
         try:
             with closing(self._connect()) as source:
                 with closing(sqlite3.connect(output_path)) as destination:
                     source.backup(destination)
+            self._protect_path(output_path, directory=False)
             stats = self.stats()
             return {
                 "backup_path": str(output_path),
