@@ -121,6 +121,9 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --session-id "$SESSION_ID" \
   --observation "About to edit backend and dashboard files." \
   --proposed-action "Patch code, run focused tests, then run full validation." \
+  --intended-file mlx_backend.py \
+  --intended-file web/app.js \
+  --intended-tool "python -m unittest discover -s tests -v" \
   --mutation-intent \
   --confidence 0.62
 .venv/bin/python synapse_cli.py --json commit-cortex \
@@ -134,7 +137,7 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
 .venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
 ```
 
-The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id.
+The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goal, assumptions, contradictions, suggested next move, and capture queue in Cortex state.
 
 Capture real operator/Codex conversation notes into the event graph:
 
@@ -213,7 +216,7 @@ The MCP server exposes these tools:
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
 | `hydrate_spiking_agent_context` | Return an agent-ready briefing with new deployments, prompt recall, graph highlights, and optional ack. |
 | `enter_spiking_cortex` | Start a governed agent session with policy, recall, and a context-bus deployment. |
-| `tick_spiking_cortex` | Evaluate the current observation and proposed action against governed memory before proceeding. |
+| `tick_spiking_cortex` | Evaluate the current observation, proposed action, intended files, and intended tools against governed memory before proceeding. |
 | `commit_spiking_cortical_trace` | Persist a typed governed trace with truth posture, confidence, and evidence. |
 | `moderate_spiking_cortical_trace` | Promote, demote, or prune a governed trace from MCP clients by memory id. |
 | `get_spiking_cortex_state` | Inspect active governed sessions and typed cortical memory for a context. |

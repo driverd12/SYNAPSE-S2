@@ -52,8 +52,13 @@ const elements = collectElements([
   "cortexDecision",
   "cortexEnterForm",
   "cortexHighConfidence",
+  "cortexAssumptions",
+  "cortexCaptureQueue",
   "cortexMode",
+  "cortexIntendedFiles",
+  "cortexIntendedTools",
   "cortexMutationIntent",
+  "cortexNextMove",
   "cortexObservation",
   "cortexPolicy",
   "cortexProposedAction",
@@ -409,6 +414,11 @@ function renderCortexState(cortex) {
   const highConfidence = Array.isArray(cortex.high_confidence_truths)
     ? cortex.high_confidence_truths
     : [];
+  const assumptions = [
+    ...(Array.isArray(cortex.unverified_assumptions) ? cortex.unverified_assumptions : []),
+    ...(Array.isArray(cortex.contradictions) ? cortex.contradictions : []),
+  ];
+  const captureQueue = Array.isArray(cortex.capture_queue) ? cortex.capture_queue : [];
   const workingMemory = Array.isArray(cortex.working_memory) ? cortex.working_memory : [];
   const warnings = Array.isArray(activeSession?.last_warnings) ? activeSession.last_warnings : [];
 
@@ -446,10 +456,21 @@ function renderCortexState(cortex) {
     : warnings.length
       ? "warn"
       : "good";
+  const nextMove = String(cortex.suggested_next_move || "Enter Cortex Governor before substantial work.");
+  elements.cortexNextMove.textContent = compactTag(nextMove, 44);
+  elements.cortexNextMove.title = nextMove;
 
   elements.cortexHighConfidence.innerHTML = renderCortexMemoryList(
     highConfidence,
     "No high-confidence governed truths yet",
+  );
+  elements.cortexAssumptions.innerHTML = renderCortexMemoryList(
+    assumptions,
+    "No unresolved assumptions or conflicts",
+  );
+  elements.cortexCaptureQueue.innerHTML = renderCortexCaptureQueue(
+    captureQueue,
+    "No pending capture recommendations",
   );
   elements.cortexWorkingMemory.innerHTML = renderCortexMemoryList(
     workingMemory,
@@ -485,6 +506,30 @@ function renderCortexMemoryList(items, emptyLabel) {
         </div>
         <p>${escapeHtml(item.excerpt || "")}</p>
         ${actions}
+      </article>
+    `;
+  }).join("");
+}
+
+function renderCortexCaptureQueue(items, emptyLabel) {
+  if (!items.length) {
+    return `<div class="cortex-empty">${escapeHtml(emptyLabel)}</div>`;
+  }
+  return items.slice(0, 8).map((item) => {
+    const files = Array.isArray(item.intended_files) ? item.intended_files : [];
+    const tools = Array.isArray(item.intended_tools) ? item.intended_tools : [];
+    const scope = [
+      files.length ? `files: ${files.slice(0, 3).join(", ")}` : "",
+      tools.length ? `tools: ${tools.slice(0, 3).join(", ")}` : "",
+    ].filter(Boolean).join(" / ");
+    return `
+      <article class="cortex-memory-row">
+        <div>
+          <strong>${escapeHtml(item.trace_type || "evidence")}</strong>
+          <small>${escapeHtml(item.decision || "capture recommended")}</small>
+        </div>
+        <p>${escapeHtml(item.reason || "Capture the verified outcome after the action completes.")}</p>
+        ${scope ? `<p>${escapeHtml(scope)}</p>` : ""}
       </article>
     `;
   }).join("");
@@ -1391,6 +1436,14 @@ function compactMemoryId(memoryId) {
   return text.length > 12 ? `...${text.slice(-8)}` : text;
 }
 
+function splitIntentList(value) {
+  return String(value || "")
+    .split(/\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 24);
+}
+
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
@@ -1524,6 +1577,8 @@ async function tickCortexGovernor(button) {
         session_id: sessionId,
         observation: elements.cortexObservation.value.trim(),
         proposed_action: elements.cortexProposedAction.value.trim(),
+        intended_files: splitIntentList(elements.cortexIntendedFiles.value),
+        intended_tools: splitIntentList(elements.cortexIntendedTools.value),
         mutation_intent: elements.cortexMutationIntent.checked,
         confidence,
       },

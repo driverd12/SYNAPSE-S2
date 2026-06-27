@@ -132,6 +132,24 @@ def _parse_json_object(raw: str, *, field_name: str) -> dict[str, Any]:
     return parsed
 
 
+def _validate_string_list(values: list[str] | None, *, field_name: str) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+    cleaned: list[str] = []
+    for index, item in enumerate(values):
+        text = " ".join(str(item or "").split())
+        if not text:
+            continue
+        if len(text) > 260:
+            raise ValueError(f"{field_name}[{index}] exceeds 260 characters")
+        cleaned.append(text)
+        if len(cleaned) > 24:
+            raise ValueError(f"{field_name} exceeds 24 entries")
+    return cleaned
+
+
 def _optional_output_path(
     output_path: str | None,
     *,
@@ -759,6 +777,8 @@ def tick_spiking_cortex(
     context_id: str = "default",
     observation: str = "",
     proposed_action: str = "",
+    intended_files: list[str] | None = None,
+    intended_tools: list[str] | None = None,
     mutation_intent: bool = False,
     confidence: float = 0.5,
 ) -> str:
@@ -775,6 +795,8 @@ def tick_spiking_cortex(
             raise ValueError("observation exceeds 20000 characters")
         if len(proposed_text) > 20_000:
             raise ValueError("proposed_action exceeds 20000 characters")
+        scoped_files = _validate_string_list(intended_files, field_name="intended_files")
+        scoped_tools = _validate_string_list(intended_tools, field_name="intended_tools")
         _, mlx_backend = _load_backend()
         payload = mlx_backend.cortex_tick(
             context_id=context,
@@ -782,6 +804,8 @@ def tick_spiking_cortex(
             session_id=clean_session_id,
             observation=observation_text,
             proposed_action=proposed_text,
+            intended_files=scoped_files,
+            intended_tools=scoped_tools,
             mutation_intent=bool(mutation_intent),
             confidence=float(confidence),
         )

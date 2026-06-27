@@ -727,6 +727,25 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             text="Operator requires tests before claiming Cortex Governor is complete.",
             evidence={"source": "unit-test"},
         )
+        backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id="seed-session",
+            trace_type="assumption",
+            truth_posture="inferred",
+            text="Maybe the dashboard already carries intended file scope.",
+            evidence={"source": "unit-test"},
+            confidence=0.42,
+        )
+        backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id="seed-session",
+            trace_type="correction",
+            truth_posture="operator-confirmed",
+            text="Correction: Cortex ticks must declare intended files and tools before mutation.",
+            evidence={"source": "unit-test"},
+        )
 
         entry = backend.enter_spiking_cortex(
             context_id="demo",
@@ -740,6 +759,8 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             session_id=entry["session_id"],
             observation="About to edit backend and MCP files.",
             proposed_action="Modify mlx_backend.py and mcp_server.py, then run tests.",
+            intended_files=["mlx_backend.py", "mcp_server.py"],
+            intended_tools=["apply_patch", "python -m unittest tests.test_backend"],
             mutation_intent=True,
             confidence=0.42,
         )
@@ -761,17 +782,33 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(tick["action"], "cortex-tick")
         self.assertEqual(tick["session_id"], entry["session_id"])
         self.assertEqual(tick["decision"], "verify-first")
+        self.assertEqual(tick["intended_files"], ["mlx_backend.py", "mcp_server.py"])
+        self.assertEqual(
+            tick["intended_tools"],
+            ["apply_patch", "python -m unittest tests.test_backend"],
+        )
         self.assertTrue(
             any(item["code"] == "mutation-verification-required" for item in tick["warnings"])
         )
+        self.assertFalse(
+            any(item["code"] == "missing-intent-scope" for item in tick["warnings"])
+        )
         self.assertGreaterEqual(len(tick["recalled_constraints"]), 1)
+        self.assertTrue(tick["capture_recommendation"]["recommended"])
+        self.assertGreaterEqual(len(tick["cortex_state"]["capture_queue"]), 1)
         self.assertEqual(commit["action"], "commit-cortical-trace")
         self.assertEqual(commit["trace_type"], "validation")
         self.assertEqual(commit["truth_posture"], "test-validated")
         self.assertGreaterEqual(commit["confidence"], 0.85)
         self.assertEqual(commit["agent_deployment"]["event_type"], "cortex-trace-committed")
         self.assertEqual(state["action"], "cortex-state")
+        self.assertEqual(state["active_goal"], "Implement the Cortex Governor release with tests.")
         self.assertEqual(state["active_sessions"][0]["session_id"], entry["session_id"])
+        self.assertEqual(state["active_sessions"][0]["last_intended_files"], ["mlx_backend.py", "mcp_server.py"])
+        self.assertIn("Resolve the surfaced correction", state["suggested_next_move"])
+        self.assertEqual(len(state["capture_queue"]), 0)
+        self.assertGreaterEqual(len(state["unverified_assumptions"]), 1)
+        self.assertGreaterEqual(len(state["contradictions"]), 1)
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
         self.assertTrue(
             any(item["trace_type"] == "validation" for item in state["high_confidence_truths"])

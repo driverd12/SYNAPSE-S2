@@ -225,6 +225,8 @@ class DashboardRuntimeTests(unittest.TestCase):
                             "session_id": enter_payload["session_id"],
                             "observation": "Preparing a dashboard mutation.",
                             "proposed_action": "Edit UI and run tests.",
+                            "intended_files": ["web/app.js", "dashboard_server.py"],
+                            "intended_tools": ["node --check web/app.js"],
                             "mutation_intent": True,
                             "confidence": 0.39,
                         }
@@ -277,10 +279,16 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(snapshot_status, 200)
         self.assertEqual(enter_payload["action"], "enter-spiking-cortex")
         self.assertEqual(tick_payload["decision"], "verify-first")
+        self.assertEqual(tick_payload["intended_files"], ["web/app.js", "dashboard_server.py"])
+        self.assertEqual(tick_payload["intended_tools"], ["node --check web/app.js"])
+        self.assertGreaterEqual(len(tick_payload["cortex_state"]["capture_queue"]), 1)
         self.assertEqual(commit_payload["trace_type"], "decision")
         self.assertEqual(promote_payload["moderation_action"], "promote")
         self.assertGreaterEqual(promote_payload["trace"]["confidence"], 0.9)
         self.assertGreaterEqual(state_payload["typed_memory_counts"]["decision"], 1)
+        self.assertIn("suggested_next_move", state_payload)
+        self.assertIn("capture_queue", state_payload)
+        self.assertEqual(len(state_payload["capture_queue"]), 0)
         self.assertIn("cortex_state", snapshot_payload)
         self.assertGreaterEqual(
             snapshot_payload["cortex_state"]["typed_memory_counts"]["decision"],
@@ -374,6 +382,10 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("neuralMathPanel", index)
         self.assertIn("cortexPanel", index)
         self.assertIn("Cortex Governor", index)
+        self.assertIn("cortexIntendedFiles", index)
+        self.assertIn("cortexIntendedTools", index)
+        self.assertIn("cortexNextMove", index)
+        self.assertIn("cortexCaptureQueue", index)
         self.assertIn("Sparse spike code", index)
         self.assertIn("Active neuron sample", index)
         self.assertIn("LIF update", index)
@@ -384,6 +396,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("renderRelationshipLedger", app)
         self.assertIn("renderNeuralInspector", app)
         self.assertIn("renderCortexState", app)
+        self.assertIn("splitIntentList", app)
+        self.assertIn("renderCortexCaptureQueue", app)
         self.assertIn("/api/cortex/enter", app)
         self.assertIn("/api/cortex/tick", app)
         self.assertIn("/api/cortex/commit", app)

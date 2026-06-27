@@ -652,6 +652,10 @@ class SynapseCliTests(unittest.TestCase):
                 "Preparing to mutate files.",
                 "--proposed-action",
                 "Edit backend and run tests.",
+                "--intended-file",
+                "mlx_backend.py",
+                "--intended-tool",
+                "python -m unittest tests.test_cli",
                 "--mutation-intent",
                 "--confidence",
                 "0.41",
@@ -708,6 +712,11 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(state.returncode, 0, state.stderr)
         self.assertEqual(json.loads(entered.stdout)["action"], "enter-spiking-cortex")
         self.assertEqual(json.loads(tick.stdout)["decision"], "verify-first")
+        self.assertEqual(json.loads(tick.stdout)["intended_files"], ["mlx_backend.py"])
+        self.assertEqual(
+            json.loads(tick.stdout)["intended_tools"],
+            ["python -m unittest tests.test_cli"],
+        )
         self.assertEqual(json.loads(committed.stdout)["trace_type"], "decision")
         self.assertEqual(json.loads(moderated.stdout)["moderation_action"], "promote")
         self.assertGreaterEqual(json.loads(state.stdout)["typed_memory_counts"]["decision"], 1)

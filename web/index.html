@@ -342,6 +342,11 @@
                 <strong id="cortexWarnings">clear</strong>
                 <small>mutation and sensitive-data warnings</small>
               </div>
+              <div>
+                <span>Next Move</span>
+                <strong id="cortexNextMove">enter cortex</strong>
+                <small>governed recommendation</small>
+              </div>
             </div>
 
             <div class="cortex-workbench">
@@ -388,6 +393,16 @@
                 <div class="field-grid">
                   <label for="cortexProposedAction">Proposed action</label>
                   <textarea id="cortexProposedAction" rows="3" placeholder="What is the agent about to do?"></textarea>
+                </div>
+                <div class="field-row">
+                  <div class="field-grid">
+                    <label for="cortexIntendedFiles">Intended files</label>
+                    <textarea id="cortexIntendedFiles" rows="3" placeholder="One path or glob per line"></textarea>
+                  </div>
+                  <div class="field-grid">
+                    <label for="cortexIntendedTools">Intended tools</label>
+                    <textarea id="cortexIntendedTools" rows="3" placeholder="One command or tool per line"></textarea>
+                  </div>
                 </div>
                 <div class="cortex-inline-controls">
                   <label class="check-control">
@@ -450,6 +465,14 @@
               <div>
                 <h3>High-confidence truths</h3>
                 <div id="cortexHighConfidence" class="cortex-memory-list">No governed truths yet</div>
+              </div>
+              <div>
+                <h3>Assumptions and conflicts</h3>
+                <div id="cortexAssumptions" class="cortex-memory-list">No unresolved assumptions</div>
+              </div>
+              <div>
+                <h3>Capture queue</h3>
+                <div id="cortexCaptureQueue" class="cortex-memory-list">No pending capture recommendations</div>
               </div>
               <div>
                 <h3>Working memory</h3>

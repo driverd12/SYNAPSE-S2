@@ -232,6 +232,9 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --session-id "$SESSION_ID" \
   --observation "The agent is preparing a mutation." \
   --proposed-action "Edit files and run validation before claiming completion." \
+  --intended-file mlx_backend.py \
+  --intended-file web/app.js \
+  --intended-tool "python -m unittest discover -s tests -v" \
   --mutation-intent \
   --confidence 0.65
 .venv/bin/python synapse_cli.py --json commit-cortex \
@@ -273,7 +276,7 @@ Useful tool calls:
 | `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |
 | `hydrate_spiking_agent_context` | Hydrates a restarted client with new deployments, prompt recall, graph highlights, and an optional ack cursor update. |
 | `enter_spiking_cortex` | Starts a governed agent session with recall and policy. |
-| `tick_spiking_cortex` | Checks the current observation and proposed action for mutation, confidence, and sensitive-data warnings. |
+| `tick_spiking_cortex` | Checks the current observation, proposed action, intended files, intended tools, mutation, confidence, and sensitive-data scope before acting. |
 | `commit_spiking_cortical_trace` | Persists typed validation, decision, constraint, risk, or implementation memory with evidence. |
 | `moderate_spiking_cortical_trace` | Promotes, demotes, or prunes a governed trace by memory id. |
 | `get_spiking_cortex_state` | Shows active governed sessions and typed cortical memory. |

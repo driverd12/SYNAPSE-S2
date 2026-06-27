@@ -428,6 +428,18 @@ class SpikingAttentionBackend:
             "last_warnings": self._json_safe_metadata(
                 {"items": session.get("last_warnings", [])}
             ).get("items", []),
+            "last_intended_files": self._json_safe_metadata(
+                {"items": session.get("last_intended_files", [])}
+            ).get("items", []),
+            "last_intended_tools": self._json_safe_metadata(
+                {"items": session.get("last_intended_tools", [])}
+            ).get("items", []),
+            "last_recall_items": self._json_safe_metadata(
+                {"items": session.get("last_recall_items", [])}
+            ).get("items", []),
+            "last_capture_recommendation": self._json_safe_metadata(
+                {"value": session.get("last_capture_recommendation", {})}
+            ).get("value", {}),
         }
         for key in (
             "client_bridge_session_id",
@@ -1260,6 +1272,8 @@ class SpikingAttentionBackend:
         session_id: str,
         observation: str = "",
         proposed_action: str = "",
+        intended_files: Any = None,
+        intended_tools: Any = None,
         mutation_intent: bool = False,
         confidence: float = 0.5,
     ) -> dict[str, Any]:
@@ -1273,6 +1287,8 @@ class SpikingAttentionBackend:
         )
         observation_text = str(observation or "").strip()
         proposed_text = str(proposed_action or "").strip()
+        scoped_files = self._normalize_cortex_intent_list(intended_files)
+        scoped_tools = self._normalize_cortex_intent_list(intended_tools)
         bounded_confidence = min(max(float(confidence), 0.0), 1.0)
         state = self.get_cortex_state(context_id=context, agent_id=agent)
         recall_prompt = " ".join(part for part in (observation_text, proposed_text) if part)
@@ -1281,14 +1297,24 @@ class SpikingAttentionBackend:
             if recall_prompt
             else ""
         )
+        recall_items = self._split_recall_result(recall_result)
         warnings = self._cortex_warnings(
             mutation_intent=bool(mutation_intent),
             confidence=bounded_confidence,
             observation=observation_text,
             proposed_action=proposed_text,
+            intended_files=scoped_files,
+            intended_tools=scoped_tools,
             cortex_state=state,
         )
         decision = self._cortex_decision(warnings=warnings, confidence=bounded_confidence)
+        capture_recommendation = self._cortex_capture_recommendation(
+            observation_text,
+            proposed_text,
+            decision,
+            intended_files=scoped_files,
+            intended_tools=scoped_tools,
+        )
         now = time.time()
         session.update(
             {
@@ -1299,8 +1325,13 @@ class SpikingAttentionBackend:
                 "last_observation": observation_text[:2000],
                 "last_proposed_action": proposed_text[:2000],
                 "last_warnings": warnings,
+                "last_intended_files": scoped_files,
+                "last_intended_tools": scoped_tools,
+                "last_recall_items": recall_items[:12],
+                "last_capture_recommendation": capture_recommendation,
             }
         )
+        session = self._normalize_cortex_session(session)
         self.cortex_sessions[clean_session_id] = session
         self._persist_runtime_state()
         deployment = self.publish_context_event(
@@ -1314,6 +1345,8 @@ class SpikingAttentionBackend:
                 "decision": decision,
                 "confidence": bounded_confidence,
                 "mutation_intent": bool(mutation_intent),
+                "intended_files": scoped_files,
+                "intended_tools": scoped_tools,
                 "warning_codes": [warning["code"] for warning in warnings],
             },
         )
@@ -1324,16 +1357,14 @@ class SpikingAttentionBackend:
             "session_id": clean_session_id,
             "decision": decision,
             "confidence": bounded_confidence,
+            "intended_files": scoped_files,
+            "intended_tools": scoped_tools,
             "warnings": warnings,
             "recalled_constraints": state["constraints"][:8],
             "recalled_risks": state["risks"][:8],
             "recall_result": recall_result,
-            "recall_items": self._split_recall_result(recall_result),
-            "capture_recommendation": self._cortex_capture_recommendation(
-                observation_text,
-                proposed_text,
-                decision,
-            ),
+            "recall_items": recall_items,
+            "capture_recommendation": capture_recommendation,
             "cortex_state": self.get_cortex_state(context_id=context, agent_id=agent),
             "agent_deployment": deployment,
         }
@@ -1392,6 +1423,25 @@ class SpikingAttentionBackend:
             text=clean_text,
             metadata=metadata,
         )
+        if clean_session_id in self.cortex_sessions:
+            updated_session = dict(self.cortex_sessions[clean_session_id])
+            updated_session.update(
+                {
+                    "updated_at": time.time(),
+                    "last_capture_recommendation": {
+                        "recommended": False,
+                        "trace_type": clean_trace_type,
+                        "truth_posture": clean_truth_posture,
+                        "reason": "Committed cortical trace resolved the pending capture recommendation.",
+                        "memory_id": registration["memory_id"],
+                        "tag": registration["tag"],
+                    },
+                }
+            )
+            self.cortex_sessions[clean_session_id] = self._normalize_cortex_session(
+                updated_session
+            )
+            self._persist_runtime_state()
         deployment = self.publish_context_event(
             context_id=context,
             source_surface="cortex-governor",
@@ -1470,17 +1520,65 @@ class SpikingAttentionBackend:
         decisions = [
             entry for entry in cortical_entries if entry.get("trace_type") == "decision"
         ][:10]
+        assumptions = [
+            entry
+            for entry in cortical_entries
+            if entry.get("trace_type") == "assumption"
+            or entry.get("truth_posture") == "inferred"
+            or float(entry.get("confidence", 0.0) or 0.0) < 0.6
+        ][:10]
+        stale_or_uncertain = [
+            entry
+            for entry in cortical_entries
+            if entry.get("truth_posture") == "stale"
+            or entry.get("trace_type") in {"assumption", "blocker"}
+            or any(
+                token in str(entry.get("excerpt", "")).lower()
+                for token in ("assume", "maybe", "might", "uncertain")
+            )
+        ][:10]
+        active_goal = (
+            str(active_sessions[0].get("task", ""))
+            if active_sessions
+            else next(
+                (
+                    str(entry.get("excerpt", ""))
+                    for entry in cortical_entries
+                    if entry.get("trace_type") == "goal"
+                ),
+                "",
+            )
+        )
+        contradictions = self._cortex_contradictions(cortical_entries)[:10]
+        capture_queue = self._cortex_capture_queue(active_sessions)[:10]
+        suggested_next_move = self._cortex_suggested_next_move(
+            active_sessions=active_sessions,
+            assumptions=assumptions,
+            stale_or_uncertain=stale_or_uncertain,
+            contradictions=contradictions,
+            risks=risks,
+            capture_queue=capture_queue,
+        )
         return {
             "action": "cortex-state",
             "context_id": context,
             "agent_id": agent,
+            "active_goal": active_goal,
+            "current_goal": active_goal,
             "active_session_count": len(active_sessions),
             "active_sessions": active_sessions[:10],
             "typed_memory_counts": dict(sorted(typed_counts.items())),
             "high_confidence_truths": high_confidence,
             "constraints": constraints,
+            "governing_constraints": constraints,
             "risks": risks,
             "decisions": decisions,
+            "recent_decisions": decisions,
+            "unverified_assumptions": assumptions,
+            "stale_or_uncertain_memories": stale_or_uncertain,
+            "contradictions": contradictions,
+            "suggested_next_move": suggested_next_move,
+            "capture_queue": capture_queue,
             "working_memory": cortical_entries[:visible_limit],
             "policy": self._cortex_policy(
                 str(active_sessions[0].get("mode", "strict")) if active_sessions else "strict"
@@ -1768,6 +1866,133 @@ class SpikingAttentionBackend:
             "updated_at": float(entry.get("updated_at", 0.0) or 0.0),
         }
 
+    def _normalize_cortex_intent_list(self, values: Any) -> list[str]:
+        if values is None:
+            return []
+        raw_items: list[Any]
+        if isinstance(values, str):
+            stripped = values.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+                raw_items = parsed if isinstance(parsed, list) else [stripped]
+            else:
+                raw_items = re.split(r"[\n,]", stripped)
+        elif isinstance(values, (list, tuple, set)):
+            raw_items = list(values)
+        else:
+            raw_items = [values]
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            text = " ".join(str(item or "").split())
+            if not text:
+                continue
+            text = text[:260]
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(text)
+            if len(normalized) >= 24:
+                break
+        return normalized
+
+    def _cortex_contradictions(self, cortical_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        contradictions: list[dict[str, Any]] = []
+        for entry in cortical_entries:
+            excerpt = str(entry.get("excerpt", ""))
+            lowered = excerpt.lower()
+            if entry.get("trace_type") == "correction" or any(
+                token in lowered
+                for token in (
+                    "correction",
+                    "actually",
+                    "wrong",
+                    "not true",
+                    "contradicts earlier",
+                    "conflicts with",
+                    "supersede",
+                )
+            ):
+                item = dict(entry)
+                item["conflict_reason"] = (
+                    "Correction or contradiction trace should override older inferred memory."
+                )
+                contradictions.append(item)
+        return contradictions
+
+    def _cortex_capture_queue(
+        self,
+        active_sessions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        queue: list[dict[str, Any]] = []
+        for session in active_sessions:
+            recommendation = session.get("last_capture_recommendation")
+            if not isinstance(recommendation, dict) or not recommendation:
+                continue
+            if not bool(recommendation.get("recommended", False)):
+                continue
+            queue.append(
+                {
+                    "session_id": session.get("session_id", ""),
+                    "agent_id": session.get("agent_id", ""),
+                    "trace_type": recommendation.get("trace_type", "evidence"),
+                    "truth_posture": recommendation.get("truth_posture", "observed"),
+                    "reason": recommendation.get("reason", ""),
+                    "observation": self._compact_text(
+                        str(session.get("last_observation", "")),
+                        180,
+                    ),
+                    "proposed_action": self._compact_text(
+                        str(session.get("last_proposed_action", "")),
+                        180,
+                    ),
+                    "intended_files": session.get("last_intended_files", []),
+                    "intended_tools": session.get("last_intended_tools", []),
+                    "decision": session.get("last_decision", ""),
+                }
+            )
+        return queue
+
+    def _cortex_suggested_next_move(
+        self,
+        *,
+        active_sessions: list[dict[str, Any]],
+        assumptions: list[dict[str, Any]],
+        stale_or_uncertain: list[dict[str, Any]],
+        contradictions: list[dict[str, Any]],
+        risks: list[dict[str, Any]],
+        capture_queue: list[dict[str, Any]],
+    ) -> str:
+        if not active_sessions:
+            return "Enter Cortex Governor before substantial work so recall, constraints, and validation capture are tied to a session."
+        active = active_sessions[0]
+        warning_codes = {
+            str(warning.get("code", ""))
+            for warning in active.get("last_warnings", [])
+            if isinstance(warning, dict)
+        }
+        decision = str(active.get("last_decision", "entered"))
+        if "sensitive-data-risk" in warning_codes or "sensitive-intent-scope" in warning_codes:
+            return "Stop, sanitize the scoped data, and prune any sensitive trace before continuing."
+        if contradictions:
+            return "Resolve the surfaced correction or contradiction before relying on older memory."
+        if decision in {"verify-first", "proceed-with-verification"}:
+            return "Run the missing verification, then commit a validation trace with evidence."
+        if capture_queue:
+            return "Complete the proposed action, then commit the queued cortical trace with concrete evidence."
+        if stale_or_uncertain or assumptions:
+            return "Verify or demote stale assumptions before using them as working facts."
+        if risks:
+            return "Review active risk traces and keep mutation scope explicit before acting."
+        return "Proceed, keep file/tool scope declared on each tick, and capture only validated outcomes."
+
     def _cortex_warnings(
         self,
         *,
@@ -1775,6 +2000,8 @@ class SpikingAttentionBackend:
         confidence: float,
         observation: str,
         proposed_action: str,
+        intended_files: list[str],
+        intended_tools: list[str],
         cortex_state: dict[str, Any],
     ) -> list[dict[str, Any]]:
         warnings: list[dict[str, Any]] = []
@@ -1786,6 +2013,14 @@ class SpikingAttentionBackend:
                     "message": "Mutation intent requires verification evidence before completion.",
                 }
             )
+            if not intended_files and not intended_tools:
+                warnings.append(
+                    {
+                        "code": "missing-intent-scope",
+                        "severity": "medium",
+                        "message": "Mutation intent should declare intended files or tools before acting.",
+                    }
+                )
         if confidence < 0.5:
             warnings.append(
                 {
@@ -1801,6 +2036,49 @@ class SpikingAttentionBackend:
                     "code": "sensitive-data-risk",
                     "severity": "critical",
                     "message": "Potential sensitive data path detected; avoid capture and verify redaction.",
+                }
+            )
+        scoped_text = " ".join([*intended_files, *intended_tools]).lower()
+        if any(
+            token in scoped_text
+            for token in (
+                ".env",
+                ".ssh",
+                "id_rsa",
+                "private key",
+                "secret",
+                "token",
+                "credential",
+                "password",
+            )
+        ):
+            warnings.append(
+                {
+                    "code": "sensitive-intent-scope",
+                    "severity": "critical",
+                    "message": "Declared file/tool scope appears to include sensitive material; sanitize before capture.",
+                }
+            )
+        if any(
+            token in scoped_text
+            for token in (
+                "git push",
+                "deploy",
+                "launchctl",
+                "sudo",
+                "rm ",
+                "rm -",
+                "chmod",
+                "chown",
+                "prune",
+                "delete",
+            )
+        ):
+            warnings.append(
+                {
+                    "code": "high-impact-tool-scope",
+                    "severity": "medium",
+                    "message": "Declared tools include a high-impact operation; verify target and rollback path.",
                 }
             )
         if any(token in combined for token in ("assume", "maybe", "might", "uncertain")):
@@ -1828,7 +2106,7 @@ class SpikingAttentionBackend:
         confidence: float,
     ) -> str:
         warning_codes = {str(warning.get("code", "")) for warning in warnings}
-        if "sensitive-data-risk" in warning_codes:
+        if "sensitive-data-risk" in warning_codes or "sensitive-intent-scope" in warning_codes:
             return "stop-and-sanitize"
         if "mutation-verification-required" in warning_codes and confidence < 0.7:
             return "verify-first"
@@ -1841,6 +2119,9 @@ class SpikingAttentionBackend:
         observation: str,
         proposed_action: str,
         decision: str,
+        *,
+        intended_files: list[str] | None = None,
+        intended_tools: list[str] | None = None,
     ) -> dict[str, Any]:
         combined = f"{observation} {proposed_action}".lower()
         if "test" in combined or "verify" in combined:
@@ -1856,6 +2137,8 @@ class SpikingAttentionBackend:
             "trace_type": trace_type,
             "truth_posture": "observed",
             "reason": "Capture the outcome after verification, not before.",
+            "intended_files": list(intended_files or []),
+            "intended_tools": list(intended_tools or []),
         }
 
     def hydrate_agent_context(
@@ -3284,6 +3567,8 @@ def cortex_tick(
     session_id: str,
     observation: str = "",
     proposed_action: str = "",
+    intended_files: Any = None,
+    intended_tools: Any = None,
     mutation_intent: bool = False,
     confidence: float = 0.5,
 ) -> dict[str, Any]:
@@ -3293,6 +3578,8 @@ def cortex_tick(
         session_id=session_id,
         observation=observation,
         proposed_action=proposed_action,
+        intended_files=intended_files,
+        intended_tools=intended_tools,
         mutation_intent=mutation_intent,
         confidence=confidence,
     )

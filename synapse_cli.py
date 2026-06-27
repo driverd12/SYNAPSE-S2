@@ -56,6 +56,23 @@ def parse_metadata(raw: str | None) -> dict[str, Any]:
     return parsed
 
 
+def parse_string_list(raw: str | None, *, field_name: str) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"{field_name} must be a JSON list") from exc
+    if not isinstance(parsed, list):
+        raise argparse.ArgumentTypeError(f"{field_name} must be a JSON list")
+    values: list[str] = []
+    for item in parsed:
+        text = " ".join(str(item or "").split())
+        if text:
+            values.append(text)
+    return values
+
+
 def build_backend(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBackend:
     return mlx_backend.SpikingAttentionBackend(
         dimension=args.dimension,
@@ -335,12 +352,22 @@ def command_enter_cortex(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_cortex_tick(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
+    intended_files = [
+        *parse_string_list(args.intended_files_json, field_name="--intended-files-json"),
+        *(args.intended_file or []),
+    ]
+    intended_tools = [
+        *parse_string_list(args.intended_tools_json, field_name="--intended-tools-json"),
+        *(args.intended_tool or []),
+    ]
     return backend.cortex_tick(
         context_id=args.context,
         agent_id=args.agent_id,
         session_id=args.session_id,
         observation=args.observation,
         proposed_action=args.proposed_action,
+        intended_files=intended_files,
+        intended_tools=intended_tools,
         mutation_intent=args.mutation_intent,
         confidence=args.confidence,
     )
@@ -740,6 +767,20 @@ def build_parser() -> argparse.ArgumentParser:
     cortex_tick.add_argument("--session-id", required=True)
     cortex_tick.add_argument("--observation", default="")
     cortex_tick.add_argument("--proposed-action", default="")
+    cortex_tick.add_argument(
+        "--intended-file",
+        action="append",
+        default=[],
+        help="File, path, or glob the agent intends to touch; repeatable.",
+    )
+    cortex_tick.add_argument(
+        "--intended-tool",
+        action="append",
+        default=[],
+        help="Tool or command the agent intends to use; repeatable.",
+    )
+    cortex_tick.add_argument("--intended-files-json", default=None)
+    cortex_tick.add_argument("--intended-tools-json", default=None)
     cortex_tick.add_argument("--mutation-intent", action="store_true")
     cortex_tick.add_argument("--confidence", type=float, default=0.5)
     cortex_tick.set_defaults(func=command_cortex_tick)

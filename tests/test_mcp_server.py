@@ -451,6 +451,8 @@ class McpServerTests(unittest.TestCase):
                 session_id=entered["session_id"],
                 observation="Preparing a mutation.",
                 proposed_action="Edit code and run tests.",
+                intended_files=["mlx_backend.py", "mcp_server.py"],
+                intended_tools=["pytest tests/test_mcp_server.py"],
                 mutation_intent=True,
                 confidence=0.4,
             )
@@ -483,6 +485,8 @@ class McpServerTests(unittest.TestCase):
 
         self.assertEqual(entered["action"], "enter-spiking-cortex")
         self.assertEqual(tick["decision"], "verify-first")
+        self.assertEqual(tick["intended_files"], ["mlx_backend.py", "mcp_server.py"])
+        self.assertEqual(tick["intended_tools"], ["pytest tests/test_mcp_server.py"])
         self.assertEqual(committed["trace_type"], "validation")
         self.assertEqual(moderated["moderation_action"], "promote")
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)

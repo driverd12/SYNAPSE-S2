@@ -193,6 +193,8 @@ class DashboardRuntime:
                 raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "observation is too large")
             if len(proposed_action.encode("utf-8")) > MAX_TEXT_BYTES:
                 raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "proposed_action is too large")
+            intended_files = self._string_list_payload(payload, "intended_files")
+            intended_tools = self._string_list_payload(payload, "intended_tools")
             try:
                 confidence = float(payload.get("confidence", 0.5))
             except (TypeError, ValueError) as exc:
@@ -204,6 +206,8 @@ class DashboardRuntime:
                     session_id=session_id,
                     observation=observation,
                     proposed_action=proposed_action,
+                    intended_files=intended_files,
+                    intended_tools=intended_tools,
                     mutation_intent=bool(payload.get("mutation_intent", False)),
                     confidence=confidence,
                 )
@@ -853,6 +857,29 @@ class DashboardRuntime:
         if not isinstance(metadata, dict):
             raise DashboardError(HTTPStatus.BAD_REQUEST, "metadata must be an object")
         return metadata
+
+    def _string_list_payload(self, payload: dict[str, Any], key: str) -> list[str]:
+        value = payload.get(key, [])
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [item.strip() for item in value.splitlines() if item.strip()]
+        if not isinstance(value, list):
+            raise DashboardError(HTTPStatus.BAD_REQUEST, f"{key} must be a list")
+        cleaned: list[str] = []
+        for index, item in enumerate(value):
+            text = " ".join(str(item or "").split())
+            if not text:
+                continue
+            if len(text) > 260:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"{key}[{index}] exceeds 260 characters",
+                )
+            cleaned.append(text)
+            if len(cleaned) > 24:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, f"{key} exceeds 24 entries")
+        return cleaned
 
     def _export_root(self) -> Path:
         export_root = Path(os.getenv("SYNAPSE_S2_EXPORT_DIR", ROOT / ".synapse_s2")).expanduser()
