@@ -372,6 +372,17 @@ def command_cortex_state(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_moderate_cortex(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.moderate_cortex_trace(
+        context_id=args.context,
+        memory_id=args.memory_id,
+        action=args.action,
+        reason=args.reason,
+        source_surface="cli-cortex",
+    )
+
+
 def command_profile(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.resource_profile(
@@ -750,6 +761,17 @@ def build_parser() -> argparse.ArgumentParser:
     cortex_state.add_argument("--agent-id", default="")
     cortex_state.add_argument("--limit", type=int, default=50)
     cortex_state.set_defaults(func=command_cortex_state)
+
+    moderate_cortex = subparsers.add_parser("moderate-cortex")
+    add_context(moderate_cortex)
+    moderate_cortex.add_argument("--memory-id", required=True)
+    moderate_cortex.add_argument(
+        "--action",
+        choices=("promote", "demote", "prune"),
+        required=True,
+    )
+    moderate_cortex.add_argument("--reason", default="")
+    moderate_cortex.set_defaults(func=command_moderate_cortex)
 
     profile = subparsers.add_parser("profile")
     profile.add_argument("--benchmark-quick-prune", action="store_true")

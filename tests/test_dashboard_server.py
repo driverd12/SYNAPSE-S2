@@ -248,6 +248,20 @@ class DashboardRuntimeTests(unittest.TestCase):
                     ).encode(),
                 )
             )
+            promote_status, promote_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/moderate",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "memory_id": commit_payload["memory_id"],
+                            "action": "promote",
+                            "reason": "dashboard operator verified",
+                        }
+                    ).encode(),
+                )
+            )
             state_status, state_payload = self.decode(
                 runtime.handle("GET", "/api/cortex/state?context_id=demo&agent_id=dashboard-agent")
             )
@@ -258,11 +272,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(enter_status, 200)
         self.assertEqual(tick_status, 200)
         self.assertEqual(commit_status, 200)
+        self.assertEqual(promote_status, 200)
         self.assertEqual(state_status, 200)
         self.assertEqual(snapshot_status, 200)
         self.assertEqual(enter_payload["action"], "enter-spiking-cortex")
         self.assertEqual(tick_payload["decision"], "verify-first")
         self.assertEqual(commit_payload["trace_type"], "decision")
+        self.assertEqual(promote_payload["moderation_action"], "promote")
+        self.assertGreaterEqual(promote_payload["trace"]["confidence"], 0.9)
         self.assertGreaterEqual(state_payload["typed_memory_counts"]["decision"], 1)
         self.assertIn("cortex_state", snapshot_payload)
         self.assertGreaterEqual(
@@ -370,6 +387,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/cortex/enter", app)
         self.assertIn("/api/cortex/tick", app)
         self.assertIn("/api/cortex/commit", app)
+        self.assertIn("/api/cortex/moderate", app)
+        self.assertIn("data-cortex-action", app)
+        self.assertIn("moderateCortexTrace", app)
         self.assertIn("formatSpikeSubLabel", app)
         self.assertIn("active coordinates", app)
         self.assertIn("projected neurons", app)
@@ -402,6 +422,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("neural-math-panel", styles)
         self.assertIn("neural-inspector-toggle", styles)
         self.assertIn("cortex-panel", styles)
+        self.assertIn("cortex-memory-actions", styles)
         self.assertNotIn("board-demo", index)
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)

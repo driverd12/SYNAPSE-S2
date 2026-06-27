@@ -2,6 +2,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 import time
+import subprocess
 
 import mlx.core as mx
 
@@ -848,6 +849,99 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
         self.assertLessEqual(len(state["working_memory"]), 2)
+
+    def test_cortex_state_reaps_dead_client_bridge_sessions(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        session = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Represent a wrapped MCP client process.",
+            mode="strict",
+        )
+        child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        child.wait(timeout=5)
+        raw_session = dict(backend.cortex_sessions[session["session_id"]])
+        raw_session.update(
+            {
+                "lease_kind": "mcp-client",
+                "owner_pid": child.pid,
+                "client_bridge_session_id": "unit-test-bridge",
+            }
+        )
+        backend.cortex_sessions[session["session_id"]] = backend._normalize_cortex_session(
+            raw_session
+        )
+        backend._persist_runtime_state()
+
+        state = backend.get_cortex_state(context_id="demo", agent_id="codex")
+
+        self.assertEqual(state["active_session_count"], 0)
+        self.assertEqual(
+            backend.cortex_sessions[session["session_id"]]["status"],
+            "orphaned",
+        )
+
+    def test_moderate_cortex_trace_promotes_demotes_and_prunes(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        session = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Moderate a cortical trace.",
+            mode="strict",
+        )
+        committed = backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id=session["session_id"],
+            trace_type="assumption",
+            truth_posture="inferred",
+            text="This assumption needs operator moderation.",
+            confidence=0.42,
+        )
+
+        promoted = backend.moderate_cortex_trace(
+            context_id="demo",
+            memory_id=committed["memory_id"],
+            action="promote",
+            reason="operator verified",
+        )
+        demoted = backend.moderate_cortex_trace(
+            context_id="demo",
+            memory_id=committed["memory_id"],
+            action="demote",
+            reason="operator marked stale",
+        )
+        pruned = backend.moderate_cortex_trace(
+            context_id="demo",
+            memory_id=committed["memory_id"],
+            action="prune",
+            reason="operator removed trace",
+        )
+        state = backend.get_cortex_state(context_id="demo", agent_id="codex")
+
+        self.assertEqual(promoted["action"], "moderate-cortex-trace")
+        self.assertEqual(promoted["moderation_action"], "promote")
+        self.assertGreaterEqual(promoted["trace"]["confidence"], 0.9)
+        self.assertEqual(promoted["trace"]["truth_posture"], "operator-confirmed")
+        self.assertEqual(demoted["moderation_action"], "demote")
+        self.assertLessEqual(demoted["trace"]["confidence"], 0.35)
+        self.assertEqual(demoted["trace"]["truth_posture"], "stale")
+        self.assertTrue(pruned["prune"]["result"]["deleted"])
+        self.assertNotIn("assumption", state["typed_memory_counts"])
 
     def test_capture_conversation_creates_event_graph_and_context_deployment(self):
         backend = SpikingAttentionBackend(

@@ -677,6 +677,20 @@ class SynapseCliTests(unittest.TestCase):
                 state_path=state_path,
                 memory_path=memory_path,
             )
+            memory_id = json.loads(committed.stdout)["memory_id"]
+            moderated = self.run_cli(
+                "moderate-cortex",
+                "--context",
+                "demo",
+                "--memory-id",
+                memory_id,
+                "--action",
+                "promote",
+                "--reason",
+                "CLI operator verified",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
             state = self.run_cli(
                 "cortex-state",
                 "--context",
@@ -690,10 +704,12 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(entered.returncode, 0, entered.stderr)
         self.assertEqual(tick.returncode, 0, tick.stderr)
         self.assertEqual(committed.returncode, 0, committed.stderr)
+        self.assertEqual(moderated.returncode, 0, moderated.stderr)
         self.assertEqual(state.returncode, 0, state.stderr)
         self.assertEqual(json.loads(entered.stdout)["action"], "enter-spiking-cortex")
         self.assertEqual(json.loads(tick.stdout)["decision"], "verify-first")
         self.assertEqual(json.loads(committed.stdout)["trace_type"], "decision")
+        self.assertEqual(json.loads(moderated.stdout)["moderation_action"], "promote")
         self.assertGreaterEqual(json.loads(state.stdout)["typed_memory_counts"]["decision"], 1)
 
     def test_cli_list_memory_can_include_vector_details_when_requested(self):

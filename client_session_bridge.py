@@ -32,12 +32,14 @@ class ClientSessionBridgeConfig:
     capture_root: Path | None = None
     source_tag: str = "client-session-boundary"
     enabled: bool = True
+    cortex_enabled: bool = True
+    cortex_mode: str = "strict"
     event_limit: int = 20
     graph_limit: int = 30
 
 
 class ClientSessionBridge:
-    """Hydrate a local MCP client on start and capture a boundary note on exit."""
+    """Hydrate a local MCP client, enter Cortex, and capture a boundary note on exit."""
 
     def __init__(
         self,
@@ -50,7 +52,9 @@ class ClientSessionBridge:
         self.session_id = uuid.uuid4().hex[:12]
         self.started_at: float | None = None
         self.hydration: dict[str, Any] | None = None
+        self.cortex_session: dict[str, Any] | None = None
         self.start_error: str = ""
+        self.cortex_error: str = ""
         self._finished = False
 
     @classmethod
@@ -81,6 +85,8 @@ class ClientSessionBridge:
                 "client-session-boundary",
             ),
             enabled=_env_enabled(values.get("SYNAPSE_S2_CLIENT_SESSION_BRIDGE", "1")),
+            cortex_enabled=_env_enabled(values.get("SYNAPSE_S2_CLIENT_CORTEX", "1")),
+            cortex_mode=values.get("SYNAPSE_S2_CLIENT_CORTEX_MODE", "strict"),
             event_limit=_env_int(values.get("SYNAPSE_S2_CLIENT_EVENT_LIMIT"), default=20),
             graph_limit=_env_int(values.get("SYNAPSE_S2_CLIENT_GRAPH_LIMIT"), default=30),
         )
@@ -113,6 +119,7 @@ class ClientSessionBridge:
                 self.hydration.get("new_event_count"),
                 self.hydration.get("latest_event_id"),
             )
+            self._enter_cortex_session(backend)
             return self.hydration
         except Exception as exc:
             self.start_error = str(exc)
@@ -159,15 +166,24 @@ class ClientSessionBridge:
                 metadata={
                     "client_session_bridge": True,
                     "session_id": self.session_id,
+                    "cortex_session_id": self.cortex_session_id,
                     "agent_id": self.config.agent_id,
                     "started_at": self.started_at,
                     "ended_at": ended_at,
                     "duration_seconds": round(ended_at - (self.started_at or ended_at), 3),
                     "redaction_count": int(redaction_count),
                     "startup_error": self.start_error,
+                    "cortex_error": self.cortex_error,
                     "startup_latest_event_id": self._hydration_int("latest_event_id"),
                     "startup_new_event_count": self._hydration_int("new_event_count"),
                 },
+            )
+            cortex_result = self._commit_cortex_boundary(
+                text=redacted_text,
+                reason=reason,
+                ended_at=ended_at,
+                drop_path=drop_path,
+                redaction_count=redaction_count,
             )
             LOGGER.info(
                 "dropped SYNAPSE-S2 client session boundary agent_id=%s context_id=%s path=%s",
@@ -181,6 +197,7 @@ class ClientSessionBridge:
                 "drop_path": str(drop_path),
                 "redaction_count": int(redaction_count),
                 "session_id": self.session_id,
+                **cortex_result,
             }
         except Exception as exc:
             LOGGER.exception(
@@ -231,6 +248,158 @@ class ClientSessionBridge:
             return int((self.hydration or {}).get(key, 0))
         except (TypeError, ValueError):
             return 0
+
+    @property
+    def cortex_session_id(self) -> str:
+        if isinstance(self.cortex_session, dict):
+            return str(self.cortex_session.get("session_id", "") or "")
+        return ""
+
+    def _enter_cortex_session(self, backend: mlx_backend.SpikingAttentionBackend) -> None:
+        if not self.config.enabled or not self.config.cortex_enabled:
+            return
+        try:
+            session = backend.enter_spiking_cortex(
+                context_id=self.config.context_id,
+                agent_id=self.config.agent_id,
+                task=self.config.startup_prompt,
+                mode=self.config.cortex_mode,
+            )
+            session_id = str(session.get("session_id", "") or "")
+            if session_id and session_id in backend.cortex_sessions:
+                leased_session = dict(backend.cortex_sessions[session_id])
+                leased_session.update(
+                    {
+                        "client_bridge_session_id": self.session_id,
+                        "lease_kind": "mcp-client",
+                        "owner_pid": os.getpid(),
+                        "owner_ppid": os.getppid(),
+                        "owner_started_at": self.started_at or time.time(),
+                    }
+                )
+                backend.cortex_sessions[session_id] = backend._normalize_cortex_session(
+                    leased_session
+                )
+                backend._persist_runtime_state()
+                session = dict(session)
+                session.update(backend.cortex_sessions[session_id])
+            self.cortex_session = session
+            if isinstance(self.hydration, dict):
+                self.hydration["client_cortex_enabled"] = True
+                self.hydration["client_cortex_session_id"] = session_id
+                self.hydration["client_cortex_session"] = session
+                if session.get("cortex_state"):
+                    self.hydration["cortex_state"] = session["cortex_state"]
+            LOGGER.info(
+                "entered SYNAPSE-S2 Cortex session agent_id=%s context_id=%s session_id=%s",
+                self.config.agent_id,
+                self.config.context_id,
+                session.get("session_id"),
+            )
+        except Exception as exc:
+            self.cortex_error = str(exc)
+            if isinstance(self.hydration, dict):
+                self.hydration["client_cortex_enabled"] = True
+                self.hydration["client_cortex_error"] = str(exc)
+            LOGGER.exception(
+                "SYNAPSE-S2 Cortex session enter failed agent_id=%s context_id=%s",
+                self.config.agent_id,
+                self.config.context_id,
+            )
+
+    def _commit_cortex_boundary(
+        self,
+        *,
+        text: str,
+        reason: str,
+        ended_at: float,
+        drop_path: Path,
+        redaction_count: int,
+    ) -> dict[str, Any]:
+        if not self.config.enabled or not self.config.cortex_enabled:
+            return {"cortex_committed": False, "cortex_reason": "disabled"}
+        session_id = self.cortex_session_id
+        if not session_id:
+            return {
+                "cortex_committed": False,
+                "cortex_reason": "no-cortex-session",
+                "cortex_error": self.cortex_error,
+            }
+        backend = self.backend or mlx_backend.get_backend()
+        try:
+            commit = backend.commit_cortical_trace(
+                context_id=self.config.context_id,
+                agent_id=self.config.agent_id,
+                session_id=session_id,
+                trace_type="follow_up",
+                truth_posture="observed",
+                text=text,
+                confidence=0.76,
+                evidence={
+                    "client_session_bridge": True,
+                    "session_id": self.session_id,
+                    "cortex_session_id": session_id,
+                    "reason": reason,
+                    "ended_at": ended_at,
+                    "drop_path": str(drop_path),
+                    "redaction_count": int(redaction_count),
+                    "startup_error": self.start_error,
+                },
+            )
+            self._mark_cortex_session_finished(backend, reason=reason, ended_at=ended_at)
+            return {
+                "cortex_committed": True,
+                "cortex_session_id": session_id,
+                "cortex_memory_id": commit.get("memory_id", ""),
+                "cortex_trace_type": commit.get("trace_type", ""),
+            }
+        except Exception as exc:
+            self.cortex_error = str(exc)
+            self._mark_cortex_session_finished(backend, reason=reason, ended_at=ended_at)
+            LOGGER.exception(
+                "SYNAPSE-S2 Cortex boundary commit failed agent_id=%s context_id=%s session_id=%s",
+                self.config.agent_id,
+                self.config.context_id,
+                session_id,
+            )
+            return {
+                "cortex_committed": False,
+                "cortex_session_id": session_id,
+                "cortex_error": str(exc),
+            }
+
+    def _mark_cortex_session_finished(
+        self,
+        backend: mlx_backend.SpikingAttentionBackend,
+        *,
+        reason: str,
+        ended_at: float,
+    ) -> None:
+        session_id = self.cortex_session_id
+        if not session_id:
+            return
+        session = backend.cortex_sessions.get(session_id)
+        if not isinstance(session, dict):
+            return
+        finished_session = dict(session)
+        finished_session.update(
+            {
+                "status": "finished",
+                "finished_at": ended_at,
+                "finish_reason": str(reason or "client-session-finish"),
+                "updated_at": ended_at,
+            }
+        )
+        backend.cortex_sessions[session_id] = backend._normalize_cortex_session(finished_session)
+        try:
+            backend._persist_runtime_state()
+        except Exception:
+            LOGGER.exception(
+                "failed to persist finished Cortex session agent_id=%s context_id=%s session_id=%s",
+                self.config.agent_id,
+                self.config.context_id,
+                session_id,
+            )
 
 
 def run_with_client_session_bridge(run_server: Callable[[], Any]) -> Any:

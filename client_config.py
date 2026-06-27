@@ -48,6 +48,8 @@ def build_server_definition(
             "SYNAPSE_S2_CONTEXT_ID": context,
             "SYNAPSE_S2_CLIENT_AGENT_ID": agent,
             "SYNAPSE_S2_CLIENT_SESSION_BRIDGE": "1",
+            "SYNAPSE_S2_CLIENT_CORTEX": "1",
+            "SYNAPSE_S2_CLIENT_CORTEX_MODE": "strict",
             "SYNAPSE_S2_CLIENT_SESSION_SOURCE_TAG": "client-session-boundary",
             "SYNAPSE_S2_CLIENT_STARTUP_PROMPT": prompt,
         },

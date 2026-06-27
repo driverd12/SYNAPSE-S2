@@ -62,6 +62,54 @@ class ClientSessionBridgeTests(unittest.TestCase):
             self.assertEqual(cursor["agent_id"], "codex-desktop")
             self.assertEqual(cursor["last_event_id"], event["event_id"])
 
+    def test_start_enters_cortex_and_finish_commits_cortical_boundary_trace(self):
+        with TemporaryDirectory() as tmp:
+            backend = mlx_backend.SpikingAttentionBackend(
+                dimension=32,
+                num_neurons=24,
+                default_top_k=4,
+                recall_count=4,
+                compile_graph=False,
+                state_path=Path(tmp) / "state.json",
+                memory_path=Path(tmp) / "memory.sqlite3",
+            )
+            bridge = ClientSessionBridge(
+                ClientSessionBridgeConfig(
+                    context_id="demo",
+                    agent_id="codex-desktop",
+                    startup_prompt="Govern a Codex startup through Cortex.",
+                    capture_root=Path(tmp),
+                ),
+                backend=backend,
+            )
+
+            hydration = bridge.start()
+            started_state = backend.get_cortex_state(
+                context_id="demo",
+                agent_id="codex-desktop",
+            )
+            finished = bridge.finish(
+                reason="unit-test",
+                final_note="validated lifecycle trace",
+            )
+            finished_state = backend.get_cortex_state(
+                context_id="demo",
+                agent_id="codex-desktop",
+            )
+
+            self.assertIn("client_cortex_session_id", hydration)
+            self.assertEqual(started_state["active_session_count"], 1)
+            self.assertTrue(finished["cortex_committed"])
+            self.assertEqual(finished_state["active_session_count"], 0)
+            self.assertGreaterEqual(finished_state["typed_memory_counts"]["follow_up"], 1)
+            self.assertTrue(
+                any(
+                    item["trace_type"] == "follow_up"
+                    and item["session_id"] == hydration["client_cortex_session_id"]
+                    for item in finished_state["working_memory"]
+                )
+            )
+
     def test_finish_drops_sanitized_session_boundary_capture(self):
         with TemporaryDirectory() as tmp:
             backend = mlx_backend.SpikingAttentionBackend(
@@ -114,6 +162,8 @@ class ClientSessionBridgeTests(unittest.TestCase):
         bridge = ClientSessionBridge.from_environment(env=env, backend=None)
 
         self.assertTrue(bridge.config.enabled)
+        self.assertTrue(bridge.config.cortex_enabled)
+        self.assertEqual(bridge.config.cortex_mode, "strict")
         self.assertEqual(bridge.config.agent_id, "codex-desktop")
         self.assertEqual(bridge.config.context_id, "demo")
         self.assertEqual(bridge.config.capture_root, Path("/tmp/synapse-capture"))

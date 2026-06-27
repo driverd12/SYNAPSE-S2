@@ -855,6 +855,50 @@ def commit_spiking_cortical_trace(
 
 @mcp.tool(
     annotations={
+        "title": "Moderate SYNAPSE-S2 Cortical Trace",
+        "readOnlyHint": False,
+    }
+)
+def moderate_spiking_cortical_trace(
+    memory_id: str,
+    action: str,
+    context_id: str = "default",
+    reason: str = "",
+) -> str:
+    """Promote, demote, or prune a Cortex Governor trace by memory id."""
+    context = _sanitize_context_id(context_id)
+    try:
+        clean_memory_id = str(memory_id or "").strip()
+        if not clean_memory_id:
+            raise ValueError("memory_id is required")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.moderate_cortex_trace(
+            context_id=context,
+            memory_id=clean_memory_id,
+            action=str(action or ""),
+            reason=str(reason or ""),
+            source_surface="mcp-cortex",
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid cortical trace moderation for context_id=%s memory_id=%s: %s",
+            context,
+            str(memory_id or "").strip(),
+            exc,
+        )
+        return json.dumps({"error": f"invalid cortical trace moderation: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception(
+            "cortical trace moderation failed for context_id=%s memory_id=%s",
+            context,
+            str(memory_id or "").strip(),
+        )
+        return json.dumps({"error": f"cortical trace moderation failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
         "title": "Get SYNAPSE-S2 Cortex State",
         "readOnlyHint": True,
     }

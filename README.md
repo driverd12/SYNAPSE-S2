@@ -25,7 +25,7 @@ The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists b
 /Users/dan.driver/.local/bin/synapse-s2-mcp
 ```
 
-The launcher enters through `mcp_client_wrapper.py`, which hydrates SYNAPSE-S2 at MCP process startup and drops a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the client disconnects. `scripts/install_client_configs.py` stamps distinct delivery cursors for Codex, Claude Desktop, Claude Code, and the project `.mcp.json` manifest so one client does not consume another client's context deployments.
+The launcher enters through `mcp_client_wrapper.py`, which hydrates SYNAPSE-S2 at MCP process startup, enters a strict Cortex Governor session for that client, and drops a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the client disconnects. The same exit path also commits a typed `follow_up` cortical trace so the client lifecycle is visible in governed memory, not only the inbox. `scripts/install_client_configs.py` stamps distinct delivery cursors for Codex, Claude Desktop, Claude Code, and the project `.mcp.json` manifest so one client does not consume another client's context deployments.
 
 ### 2. Verify the Local Engine
 
@@ -215,6 +215,7 @@ The MCP server exposes these tools:
 | `enter_spiking_cortex` | Start a governed agent session with policy, recall, and a context-bus deployment. |
 | `tick_spiking_cortex` | Evaluate the current observation and proposed action against governed memory before proceeding. |
 | `commit_spiking_cortical_trace` | Persist a typed governed trace with truth posture, confidence, and evidence. |
+| `moderate_spiking_cortical_trace` | Promote, demote, or prune a governed trace from MCP clients by memory id. |
 | `get_spiking_cortex_state` | Inspect active governed sessions and typed cortical memory for a context. |
 | `benchmark_spiking_embedding_provider` | Benchmark the configured local embedding provider and return latency plus provenance. |
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
@@ -240,7 +241,7 @@ Project `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, Claude Desktop, and
 scripts/install_client_configs.py
 ```
 
-The installer preserves existing client settings, writes timestamped backups before mutating existing JSON/TOML files, and points every client at `/Users/dan.driver/.local/bin/synapse-s2-mcp` plus the shared `.synapse_s2` state directory. It also assigns per-client `SYNAPSE_S2_CLIENT_AGENT_ID` values: `codex-desktop`, `claude-desktop`, `claude-code`, and `project-mcp`. Restart Codex, Claude Desktop, and Claude Code after running it so each client reloads its MCP server registry and starts using the startup/session-boundary bridge.
+The installer preserves existing client settings, writes timestamped backups before mutating existing JSON/TOML files, and points every client at `/Users/dan.driver/.local/bin/synapse-s2-mcp` plus the shared `.synapse_s2` state directory. It also assigns per-client `SYNAPSE_S2_CLIENT_AGENT_ID` values: `codex-desktop`, `claude-desktop`, `claude-code`, and `project-mcp`, and stamps `SYNAPSE_S2_CLIENT_CORTEX=1` with `SYNAPSE_S2_CLIENT_CORTEX_MODE=strict`. Restart Codex, Claude Desktop, and Claude Code after running it so each client reloads its MCP server registry and starts using the startup/Cortex/session-boundary bridge.
 
 ### 6. Maintenance Lifecycle
 
@@ -273,7 +274,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

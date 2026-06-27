@@ -673,7 +673,7 @@ textarea {
 
 .cortex-memory-row {
   display: grid;
-  grid-template-columns: minmax(210px, 0.62fr) minmax(0, 1fr);
+  grid-template-columns: minmax(190px, 0.52fr) minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   min-width: 0;
@@ -708,6 +708,34 @@ textarea {
 .cortex-empty {
   color: var(--muted);
   font-size: 12px;
+}
+
+.cortex-memory-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.cortex-memory-actions button {
+  min-height: 28px;
+  border: 1px solid var(--row);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  color: var(--text);
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 820;
+}
+
+.cortex-memory-actions button:hover,
+.cortex-memory-actions button:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--panel);
+}
+
+.cortex-memory-actions button[data-cortex-action="prune"] {
+  color: var(--danger);
 }
 
 .cortex-empty {
@@ -2097,6 +2125,11 @@ textarea {
 
   .cortex-memory-row {
     grid-template-columns: 1fr;
+  }
+
+  .cortex-memory-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .runtime-health-grid {

@@ -8,6 +8,8 @@
         "PYTHONPATH": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture",
         "SYNAPSE_S2_CAPTURE_ROOT": "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture/.synapse_s2",
         "SYNAPSE_S2_CLIENT_AGENT_ID": "project-mcp",
+        "SYNAPSE_S2_CLIENT_CORTEX": "1",
+        "SYNAPSE_S2_CLIENT_CORTEX_MODE": "strict",
         "SYNAPSE_S2_CLIENT_SESSION_BRIDGE": "1",
         "SYNAPSE_S2_CLIENT_SESSION_SOURCE_TAG": "client-session-boundary",
         "SYNAPSE_S2_CLIENT_STARTUP_PROMPT": "Hydrate SYNAPSE-S2 context for project-mcp local MCP client startup.",

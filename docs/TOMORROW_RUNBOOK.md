@@ -19,7 +19,7 @@ scripts/install_client_configs.py
 scripts/install_capture_daemon.sh
 ```
 
-Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions. New SYNAPSE-S2 MCP server processes hydrate their own cursor at startup and drop a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the process exits.
+Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions. New SYNAPSE-S2 MCP server processes hydrate their own cursor at startup, enter a strict Cortex Governor session, and drop a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the process exits. The exit path also commits a typed `follow_up` cortical trace so the lifecycle is visible in Cortex state.
 
 ## Expected ready signal
 
@@ -212,7 +212,7 @@ Launch the loopback dashboard:
 open "http://127.0.0.1:8765/?context_id=default"
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, event ingestion, Cortex Governor enter/tick/commit controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default
@@ -275,6 +275,7 @@ Useful tool calls:
 | `enter_spiking_cortex` | Starts a governed agent session with recall and policy. |
 | `tick_spiking_cortex` | Checks the current observation and proposed action for mutation, confidence, and sensitive-data warnings. |
 | `commit_spiking_cortical_trace` | Persists typed validation, decision, constraint, risk, or implementation memory with evidence. |
+| `moderate_spiking_cortical_trace` | Promotes, demotes, or prunes a governed trace by memory id. |
 | `get_spiking_cortex_state` | Shows active governed sessions and typed cortical memory. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `certify_spiking_runtime` | Emits native MLX/mlxsnn/provider/envelope certification evidence. |

@@ -40,6 +40,8 @@ class ClientConfigTests(unittest.TestCase):
         self.assertEqual(server["env"]["SYNAPSE_S2_CONTEXT_ID"], "default")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"], "codex-desktop")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_SESSION_BRIDGE"], "1")
+        self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_CORTEX"], "1")
+        self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_CORTEX_MODE"], "strict")
         self.assertIn("codex-desktop", server["env"]["SYNAPSE_S2_CLIENT_STARTUP_PROMPT"])
 
     def test_install_merges_claude_codex_and_project_configs_without_clobbering(self):
@@ -108,6 +110,8 @@ class ClientConfigTests(unittest.TestCase):
         self.assertIn(str(launcher), codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_SESSION_BRIDGE = "1"', codex_text)
+        self.assertIn('SYNAPSE_S2_CLIENT_CORTEX = "1"', codex_text)
+        self.assertIn('SYNAPSE_S2_CLIENT_CORTEX_MODE = "strict"', codex_text)
         self.assertIn('SYNAPSE_S2_EMBEDDING_PROVIDER = "mlx-neural"', codex_text)
         self.assertIn(
             'SYNAPSE_S2_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"',

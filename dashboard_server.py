@@ -237,6 +237,23 @@ class DashboardRuntime:
                     confidence=confidence,
                 )
             )
+        if method == "POST" and path == "/api/cortex/moderate":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            memory_id = self._text_payload(payload, "memory_id", max_bytes=512)
+            action = str(payload.get("action", "") or "").strip()
+            reason = str(payload.get("reason", "") or "").strip()
+            if len(reason.encode("utf-8")) > MAX_TEXT_BYTES:
+                raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "reason is too large")
+            return self._json_response(
+                self.backend.moderate_cortex_trace(
+                    context_id=context,
+                    memory_id=memory_id,
+                    action=action,
+                    reason=reason,
+                    source_surface="dashboard-cortex",
+                )
+            )
 
         if method == "POST" and path == "/api/toggle":
             payload = self._parse_json_body(body)

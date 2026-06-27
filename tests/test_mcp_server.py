@@ -433,6 +433,7 @@ class McpServerTests(unittest.TestCase):
         self.assertTrue(hasattr(mcp_server, "enter_spiking_cortex"))
         self.assertTrue(hasattr(mcp_server, "tick_spiking_cortex"))
         self.assertTrue(hasattr(mcp_server, "commit_spiking_cortical_trace"))
+        self.assertTrue(hasattr(mcp_server, "moderate_spiking_cortical_trace"))
         self.assertTrue(hasattr(mcp_server, "get_spiking_cortex_state"))
 
         entered = json.loads(
@@ -465,6 +466,14 @@ class McpServerTests(unittest.TestCase):
                 evidence_json='{"tests":["tests.test_mcp_server"]}',
             )
         )
+        moderated = json.loads(
+            mcp_server.moderate_spiking_cortical_trace(
+                context_id="demo",
+                memory_id=committed["memory_id"],
+                action="promote",
+                reason="MCP operator verified",
+            )
+        )
         state = json.loads(
             mcp_server.get_spiking_cortex_state(
                 agent_id="mcp-agent",
@@ -475,6 +484,7 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(entered["action"], "enter-spiking-cortex")
         self.assertEqual(tick["decision"], "verify-first")
         self.assertEqual(committed["trace_type"], "validation")
+        self.assertEqual(moderated["moderation_action"], "promote")
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
         self.assertIn("cognitive_governance", state["policy"])
 

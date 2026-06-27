@@ -468,13 +468,23 @@ function renderCortexMemoryList(items, emptyLabel) {
       item.truth_posture || "observed",
       Number.isFinite(confidence) ? `${formatNumber(confidence, 2)} confidence` : "",
     ].filter(Boolean).join(" / ");
+    const memoryId = String(item.memory_id || "");
+    const label = item.tag || compactMemoryId(memoryId) || "cortex-trace";
+    const actions = memoryId ? `
+        <div class="cortex-memory-actions" aria-label="Cortex trace moderation">
+          <button type="button" data-cortex-action="promote" data-memory-id="${escapeHtml(memoryId)}" data-cortex-label="${escapeHtml(label)}">Promote</button>
+          <button type="button" data-cortex-action="demote" data-memory-id="${escapeHtml(memoryId)}" data-cortex-label="${escapeHtml(label)}">Demote</button>
+          <button type="button" data-cortex-action="prune" data-memory-id="${escapeHtml(memoryId)}" data-cortex-label="${escapeHtml(label)}">Prune</button>
+        </div>
+      ` : "";
     return `
       <article class="cortex-memory-row">
         <div>
-          <strong>${escapeHtml(item.tag || item.memory_id || "cortex-trace")}</strong>
+          <strong>${escapeHtml(label)}</strong>
           <small>${escapeHtml(meta)}</small>
         </div>
         <p>${escapeHtml(item.excerpt || "")}</p>
+        ${actions}
       </article>
     `;
   }).join("");
@@ -1554,6 +1564,31 @@ async function commitCorticalTrace(button) {
   });
 }
 
+async function moderateCortexTrace(button) {
+  const memoryId = button.dataset.memoryId || "";
+  const action = button.dataset.cortexAction || "";
+  const label = button.dataset.cortexLabel || compactMemoryId(memoryId);
+  if (!memoryId || !action) return null;
+  if (action === "prune" && !confirmPrune(label)) {
+    logOperation("Cortex prune cancelled", label);
+    return null;
+  }
+  return withBusy(button, `${action} trace`, async () => {
+    const payload = await requestJson("/api/cortex/moderate", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        memory_id: memoryId,
+        action,
+        reason: `dashboard ${action} from Cortex Governor panel`,
+      },
+    });
+    await publishAwareResult(payload);
+    await refreshSnapshot();
+    return payload;
+  });
+}
+
 function confirmPrune(label) {
   return window.confirm(`Permanently prune ${label || "this graph item"} from SYNAPSE-S2 memory?`);
 }
@@ -1773,6 +1808,13 @@ elements.cortexTickForm.addEventListener("submit", async (event) => {
 elements.cortexCommitForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await commitCorticalTrace(elements.cortexCommitForm.querySelector("button"));
+});
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-cortex-action]");
+  if (!button) return;
+  event.preventDefault();
+  await moderateCortexTrace(button);
 });
 
 elements.rememberForm.addEventListener("submit", async (event) => {

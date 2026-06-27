@@ -409,9 +409,9 @@ class SpikingAttentionBackend:
         if mode not in CORTEX_MODES:
             mode = "strict"
         status = str(session.get("status") or "active").strip().lower()
-        if status not in {"active", "closed"}:
+        if status not in {"active", "closed", "finished", "orphaned"}:
             status = "active"
-        return {
+        normalized = {
             "session_id": session_id,
             "context_id": sanitize_context_id(str(session.get("context_id", "default"))),
             "agent_id": sanitize_agent_id(str(session.get("agent_id", "unknown-agent"))),
@@ -429,6 +429,27 @@ class SpikingAttentionBackend:
                 {"items": session.get("last_warnings", [])}
             ).get("items", []),
         }
+        for key in (
+            "client_bridge_session_id",
+            "finish_reason",
+            "lease_kind",
+            "orphan_reason",
+        ):
+            if session.get(key):
+                normalized[key] = str(session.get(key, ""))[:500]
+        for key in ("finished_at", "owner_started_at"):
+            if session.get(key) is not None:
+                try:
+                    normalized[key] = float(session.get(key, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    normalized[key] = 0.0
+        for key in ("owner_pid", "owner_ppid"):
+            if session.get(key) is not None:
+                try:
+                    normalized[key] = int(session.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    normalized[key] = 0
+        return normalized
 
     def _build_lif_step(self, compile_graph: bool):
         native_mx = self._mx
@@ -1410,6 +1431,7 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id) if agent_id else ""
+        self._reap_orphaned_cortex_sessions(context_id=context, agent_id=agent)
         visible_limit = max(1, min(int(limit), 500))
         scan_limit = max(100, visible_limit * 5)
         scan_limit = min(scan_limit, 500)
@@ -1465,6 +1487,160 @@ class SpikingAttentionBackend:
             ),
             "memory_db_path": str(self.memory_store.db_path),
         }
+
+    def moderate_cortex_trace(
+        self,
+        *,
+        context_id: str = "default",
+        memory_id: str,
+        action: str,
+        reason: str = "",
+        source_surface: str = "operator",
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        clean_memory_id = str(memory_id or "").strip()
+        if not clean_memory_id:
+            raise ValueError("memory_id is required")
+        clean_action = str(action or "").strip().lower().replace("-", "_")
+        if clean_action not in {"promote", "demote", "prune"}:
+            raise ValueError("action must be promote, demote, or prune")
+        entry = self.memory_store.get_entry(clean_memory_id)
+        if not entry or entry.get("context_id") != context:
+            raise ValueError("cortical trace was not found in the selected context")
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        if metadata.get("cortex_governor") is not True:
+            raise ValueError("memory_id is not a Cortex Governor trace")
+
+        if clean_action == "prune":
+            prune = self.prune_memory(
+                context_id=context,
+                target_type="memory",
+                memory_id=clean_memory_id,
+                reason=reason,
+                source_surface=source_surface,
+                publish_audit=True,
+            )
+            return {
+                "action": "moderate-cortex-trace",
+                "context_id": context,
+                "memory_id": clean_memory_id,
+                "moderation_action": clean_action,
+                "reason": str(reason or ""),
+                "trace": self._summarize_cortex_memory(entry),
+                "prune": prune,
+            }
+
+        next_metadata = self._json_safe_metadata(dict(metadata))
+        current_confidence = float(next_metadata.get("confidence", 0.0) or 0.0)
+        now = time.time()
+        if clean_action == "promote":
+            next_metadata["confidence"] = round(max(current_confidence, 0.9), 3)
+            if next_metadata.get("truth_posture") not in {
+                "operator-confirmed",
+                "test-validated",
+            }:
+                next_metadata["truth_posture"] = "operator-confirmed"
+        else:
+            next_metadata["confidence"] = round(min(current_confidence, 0.35), 3)
+            next_metadata["truth_posture"] = "stale"
+        history = next_metadata.get("moderation_history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "action": clean_action,
+                "reason": str(reason or ""),
+                "source_surface": str(source_surface or "operator"),
+                "moderated_at": now,
+            }
+        )
+        next_metadata["moderation_history"] = history[-20:]
+        updated = self.memory_store.upsert_entry(
+            tag=str(entry["tag"]),
+            context_id=context,
+            source_text=str(entry.get("source_text", "")),
+            metadata=next_metadata,
+            embedding_dimensions=int(entry.get("embedding_dimensions", 0) or 0),
+            spike_indices=entry.get("spike_indices", []),
+            neuron_indices=entry.get("neuron_indices", []),
+            registered_at=float(entry.get("created_at", now) or now),
+        )
+        self._refresh_registered_traces()
+        trace = self._summarize_cortex_memory(updated)
+        audit = self.publish_context_event(
+            context_id=context,
+            source_surface=str(source_surface or "operator"),
+            event_type="cortex-trace-moderated",
+            summary=f"cortex trace {clean_action}: {trace.get('tag', clean_memory_id)}",
+            payload={
+                "memory_id": clean_memory_id,
+                "tag": trace.get("tag", ""),
+                "moderation_action": clean_action,
+                "reason": str(reason or ""),
+                "trace_type": trace.get("trace_type", ""),
+                "truth_posture": trace.get("truth_posture", ""),
+                "confidence": trace.get("confidence", 0.0),
+            },
+        )
+        return {
+            "action": "moderate-cortex-trace",
+            "context_id": context,
+            "memory_id": clean_memory_id,
+            "moderation_action": clean_action,
+            "reason": str(reason or ""),
+            "trace": trace,
+            "agent_deployment": audit,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def _reap_orphaned_cortex_sessions(
+        self,
+        *,
+        context_id: str = "",
+        agent_id: str = "",
+    ) -> None:
+        now = time.time()
+        changed = False
+        for session_id, session in list(self.cortex_sessions.items()):
+            if session.get("status") != "active":
+                continue
+            if context_id and session.get("context_id") != context_id:
+                continue
+            if agent_id and session.get("agent_id") != agent_id:
+                continue
+            if session.get("lease_kind") != "mcp-client":
+                continue
+            owner_pid = int(session.get("owner_pid", 0) or 0)
+            if self._process_is_alive(owner_pid):
+                continue
+            orphaned = dict(session)
+            orphaned.update(
+                {
+                    "status": "orphaned",
+                    "finished_at": now,
+                    "updated_at": now,
+                    "finish_reason": "owner-process-missing",
+                    "orphan_reason": f"owner pid {owner_pid} is not running",
+                }
+            )
+            self.cortex_sessions[session_id] = self._normalize_cortex_session(orphaned)
+            changed = True
+        if changed:
+            self._persist_runtime_state()
+
+    @staticmethod
+    def _process_is_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
 
     def _active_cortex_session(
         self,
@@ -3155,6 +3331,23 @@ def get_cortex_state(
         context_id=context_id,
         agent_id=agent_id,
         limit=limit,
+    )
+
+
+def moderate_cortex_trace(
+    *,
+    context_id: str = "default",
+    memory_id: str,
+    action: str,
+    reason: str = "",
+    source_surface: str = "operator",
+) -> dict[str, Any]:
+    return get_backend().moderate_cortex_trace(
+        context_id=context_id,
+        memory_id=memory_id,
+        action=action,
+        reason=reason,
+        source_surface=source_surface,
     )
 
 

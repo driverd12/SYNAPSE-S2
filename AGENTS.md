@@ -2,7 +2,7 @@
 
 Use SYNAPSE-S2 as the durable local memory substrate for this repository.
 
-SYNAPSE-S2 MCP clients launched through `/Users/dan.driver/.local/bin/synapse-s2-mcp` hydrate their own cursor at process startup and drop a sanitized session-boundary note on exit. At the start of substantive repo work, run a manual hydrate as well when you need the briefing visible in the terminal or thread context:
+SYNAPSE-S2 MCP clients launched through `/Users/dan.driver/.local/bin/synapse-s2-mcp` hydrate their own cursor at process startup, enter a strict Cortex Governor session, and drop a sanitized session-boundary note plus typed `follow_up` cortical trace on exit. At the start of substantive repo work, run a manual hydrate as well when you need the briefing visible in the terminal or thread context:
 
 ```bash
 .venv/bin/python synapse_cli.py --json agent-brief \
