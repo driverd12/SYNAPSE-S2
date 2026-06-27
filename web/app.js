@@ -11,6 +11,7 @@ const state = {
   context: new URLSearchParams(window.location.search).get("context_id")?.trim() || DEFAULT_CONTEXT,
   snapshot: null,
   lastQueryPayload: null,
+  neuralInspector: false,
   graph: {
     nodePositions: new Map(),
     transform: { x: 0, y: 0, scale: 1 },
@@ -89,6 +90,8 @@ const elements = collectElements([
   "memoryState",
   "modeLabel",
   "nativeCertifyButton",
+  "neuralInspectorToggle",
+  "neuralMathPanel",
   "modelUri",
   "operationLog",
   "platformLabel",
@@ -305,6 +308,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderArrays(profile.arrays || {});
   renderMaintenance(status, profile);
   renderGraph(graph, status);
+  renderNeuralInspector(graph, status, profile);
   renderRelationshipLedger(graph);
   renderContextEventLedger(snapshot.context_deployments || {});
   renderMemoryLedger(graph);
@@ -562,7 +566,7 @@ function renderGraph(graph, status) {
       "text-anchor": "middle",
       class: "graph-label",
     }, compactTag(entry.tag, 22));
-    const score = entry.spike_count ? `${formatNumber(entry.spike_count)} spikes` : "";
+    const score = formatSpikeSubLabel(entry);
     if (score) {
       appendSvg(group, "text", {
         y: 49,
@@ -573,6 +577,65 @@ function renderGraph(graph, status) {
   }
 
   applyGraphTransform();
+}
+
+function renderNeuralInspector(graph, status, profile) {
+  elements.neuralInspectorToggle.setAttribute("aria-pressed", String(state.neuralInspector));
+  elements.neuralInspectorToggle.textContent = state.neuralInspector ? "Hide Neural Inspector" : "Neural Inspector";
+  elements.neuralMathPanel.hidden = !state.neuralInspector;
+  if (!state.neuralInspector) return;
+
+  const entries = graph.entries || [];
+  const selected = entries.find((entry) => Number(entry.spike_count) > 0) || entries[0] || {};
+  const spikeSample = formatIndexSample(selected.spike_coordinate_sample);
+  const neuronSample = formatIndexSample(selected.neuron_index_sample);
+  const arrays = profile.arrays || {};
+  const provider = status.embedding_provider || {};
+  const providerLabel = formatEmbeddingProvider(provider);
+  const dimensions = Number(selected.embedding_dimensions || status.dimension);
+  const topK = Number(selected.spike_count || status.default_top_k);
+  const neurons = Number(status.num_neurons);
+  const projected = Number(selected.neuron_count || 0);
+  const traceLabel = selected.tag ? `${selected.tag} / ${compactMemoryId(selected.memory_id)}` : "No selected trace";
+
+  elements.neuralMathPanel.innerHTML = `
+    <div>
+      <p class="section-label">Sparse spike code</p>
+      <strong>${escapeHtml(formatNumber(topK))} active coordinates from ${escapeHtml(formatNumber(dimensions))} embedding dims</strong>
+      <code>Z_i = (E_i - mu_E) / sigma_E; S_i = 1 for top-k coordinates</code>
+      <small>${escapeHtml(providerLabel)} maps text to dense E, then top-k gating creates the sparse spike vector.</small>
+    </div>
+    <div>
+      <p class="section-label">Active neuron sample</p>
+      <strong>${escapeHtml(compactTag(traceLabel, 58))}</strong>
+      <div class="neural-path" aria-label="Projected neuron sample">${formatNeuronSampleDots(selected.neuron_index_sample)}</div>
+      <code>spike_coordinates=[${escapeHtml(spikeSample)}]</code>
+      <code>projected_neurons=[${escapeHtml(neuronSample)}]</code>
+      <small>${escapeHtml(formatNumber(projected))} projected neurons active inside a ${escapeHtml(formatNumber(neurons))}-neuron substrate.</small>
+    </div>
+    <div>
+      <p class="section-label">LIF update</p>
+      <strong>Functional membrane step</strong>
+      <code>U[t+1] = beta * U[t] + X[t+1] - S[t] * V_thr</code>
+      <small>beta=${escapeHtml(formatNumber(status.beta, 3))}; threshold=${escapeHtml(formatNumber(status.threshold, 3))}; arrays W_syn=${escapeHtml(formatArrayShape(arrays.W_syn?.shape))}, W_lateral=${escapeHtml(formatArrayShape(arrays.W_lateral?.shape))}</small>
+    </div>
+    <div>
+      <p class="section-label">STDP update</p>
+      <strong>Temporal association weights</strong>
+      <code>dw = A+ exp(-dt/tau+) if dt &gt; 0; dw = -A- exp(dt/tau-) if dt &lt;= 0</code>
+      <small>${escapeHtml(formatNumber(graph.relationship_summary?.temporal))} temporal / ${escapeHtml(formatNumber(graph.relationship_summary?.associative))} associative edges in this context.</small>
+    </div>
+  `;
+}
+
+function formatSpikeSubLabel(entry) {
+  const spikeCount = Number(entry.spike_count || 0);
+  if (!spikeCount) return "";
+  const neuronCount = Number(entry.neuron_count || 0);
+  if (state.neuralInspector) {
+    return `${formatNumber(spikeCount)} coords / ${formatNumber(neuronCount)} neurons`;
+  }
+  return `${formatNumber(spikeCount)} active coords`;
 }
 
 function layoutGraph(entries, width, height) {
@@ -1089,6 +1152,33 @@ function countEventEntries(entries) {
   return entries.filter((entry) => Boolean(entry.metadata?.event_segment)).length;
 }
 
+function formatIndexSample(values) {
+  if (!Array.isArray(values) || !values.length) return "";
+  return values
+    .slice(0, 12)
+    .map((value) => String(Math.trunc(Number(value))))
+    .join(", ");
+}
+
+function formatNeuronSampleDots(values) {
+  if (!Array.isArray(values) || !values.length) {
+    return '<span class="neural-path-empty">No projected neurons</span>';
+  }
+  return values
+    .slice(0, 12)
+    .map((value) => {
+      const index = Math.trunc(Number(value));
+      const label = Number.isFinite(index) ? `n${index}` : "n?";
+      return `<span title="projected neuron ${escapeHtml(label)}">${escapeHtml(label)}</span>`;
+    })
+    .join("");
+}
+
+function formatArrayShape(shape) {
+  if (!Array.isArray(shape) || !shape.length) return "--";
+  return shape.map((value) => formatNumber(value)).join(" x ");
+}
+
 function formatNumber(value, digits = 0) {
   if (value === null || value === undefined) return "--";
   const numeric = Number(value);
@@ -1445,6 +1535,17 @@ elements.graphZoomOut.addEventListener("click", () => zoomGraphBy(1 / 1.18));
 elements.graphZoomIn.addEventListener("click", () => zoomGraphBy(1.18));
 elements.graphFit.addEventListener("click", fitGraphToView);
 elements.graphReset.addEventListener("click", resetGraphLayout);
+elements.neuralInspectorToggle.addEventListener("click", () => {
+  state.neuralInspector = !state.neuralInspector;
+  if (state.snapshot?.graph) {
+    renderGraph(state.snapshot.graph, state.snapshot.status || {});
+    renderNeuralInspector(
+      state.snapshot.graph,
+      state.snapshot.status || {},
+      state.snapshot.profile || {},
+    );
+  }
+});
 
 elements.coreUnlockButton.addEventListener("click", unlockCoreToggleGuard);
 elements.toggleButton.addEventListener("click", () => toggleCore(elements.toggleButton));

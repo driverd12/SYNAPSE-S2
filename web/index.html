@@ -327,6 +327,7 @@
                 <button id="graphReset" class="icon-button compact" type="button" title="Reset layout" aria-label="Reset layout">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v6h6"/></svg>
                 </button>
+                <button id="neuralInspectorToggle" class="neural-inspector-toggle" type="button" aria-pressed="false">Neural Inspector</button>
                 <span id="graphSummary" class="status-chip">-- edges</span>
               </div>
             </div>
@@ -349,6 +350,32 @@
                 </div>
               </aside>
               <svg id="graphSvg" viewBox="0 0 760 420" role="img" aria-label="Memory relationship graph"></svg>
+            </div>
+            <div id="neuralMathPanel" class="neural-math-panel" hidden aria-live="polite">
+              <div>
+                <p class="section-label">Sparse spike code</p>
+                <strong>Top-k z-score encoder</strong>
+                <code>Z_i = (E_i - mu_E) / sigma_E; S_i = 1 for top-k coordinates</code>
+                <small>Embedding coordinates become sparse binary spikes before SNN projection.</small>
+              </div>
+              <div>
+                <p class="section-label">Active neuron sample</p>
+                <strong>Waiting for graph</strong>
+                <code>spike_coordinates=[]; projected_neurons=[]</code>
+                <small>Samples are loaded from persisted memory traces.</small>
+              </div>
+              <div>
+                <p class="section-label">LIF update</p>
+                <strong>Functional membrane step</strong>
+                <code>U[t+1] = beta * U[t] + X[t+1] - S[t] * V_thr</code>
+                <small>No in-place mutation in the compiled MLX path.</small>
+              </div>
+              <div>
+                <p class="section-label">STDP update</p>
+                <strong>Addition-only association rule</strong>
+                <code>dw = A+ exp(-dt/tau+) if dt &gt; 0; dw = -A- exp(dt/tau-) if dt &lt;= 0</code>
+                <small>Temporal and associative edges expose the resulting memory fabric.</small>
+              </div>
             </div>
             <div class="graph-safety-panel" aria-label="Graph safety pruning controls">
               <div>

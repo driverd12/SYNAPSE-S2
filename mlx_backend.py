@@ -923,6 +923,8 @@ class SpikingAttentionBackend:
             "num_neurons": int(self.num_neurons),
             "default_top_k": int(self.default_top_k),
             "recall_count": int(self.recall_count),
+            "beta": float(self.beta),
+            "threshold": float(self.threshold),
             "registered_trace_count": int(total_stats["entry_count"]),
             "registered_trace_cache_count": len(self.registered_traces),
             "memory_mapping_count": len(self.memory_mapping),
@@ -1921,6 +1923,8 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         if include_vectors:
             return dict(entry)
+        spike_indices = [int(value) for value in entry.get("spike_indices", [])]
+        neuron_indices = [int(value) for value in entry.get("neuron_indices", [])]
         return {
             "memory_id": entry["memory_id"],
             "tag": entry["tag"],
@@ -1928,8 +1932,10 @@ class SpikingAttentionBackend:
             "source_text": entry["source_text"],
             "metadata": entry["metadata"],
             "embedding_dimensions": entry["embedding_dimensions"],
-            "spike_count": len(entry.get("spike_indices", [])),
-            "neuron_count": len(entry.get("neuron_indices", [])),
+            "spike_count": len(spike_indices),
+            "neuron_count": len(neuron_indices),
+            "spike_coordinate_sample": spike_indices[:12],
+            "neuron_index_sample": neuron_indices[:12],
             "created_at": entry["created_at"],
             "updated_at": entry["updated_at"],
         }

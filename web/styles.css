@@ -255,6 +255,7 @@ dd {
 .danger-button,
 .switch-button,
 .guard-button,
+.neural-inspector-toggle,
 .action-row {
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -273,6 +274,7 @@ dd {
 .secondary-button:hover,
 .danger-button:hover,
 .guard-button:hover,
+.neural-inspector-toggle:hover,
 .action-row:hover {
   border-color: var(--border-strong);
   background: var(--panel-soft);
@@ -285,6 +287,7 @@ dd {
 .danger-button:focus-visible,
 .switch-button:focus-visible,
 .guard-button:focus-visible,
+.neural-inspector-toggle:focus-visible,
 .action-row:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -1056,6 +1059,24 @@ textarea {
   gap: 7px;
 }
 
+.neural-inspector-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 0 10px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.neural-inspector-toggle[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--teal) 72%, var(--border));
+  background: var(--teal-soft);
+  color: var(--teal-strong);
+}
+
 .graph-shell {
   display: grid;
   grid-template-columns: 152px minmax(0, 1fr);
@@ -1241,6 +1262,86 @@ textarea {
 
 .graph-empty {
   font-size: 13px;
+}
+
+.neural-math-panel {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.neural-math-panel[hidden] {
+  display: none;
+}
+
+.neural-math-panel > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.neural-math-panel strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 780;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.neural-math-panel code {
+  display: block;
+  overflow: auto;
+  border: 1px solid var(--row);
+  border-radius: 6px;
+  background: var(--log-bg);
+  color: var(--log-text);
+  padding: 6px 7px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.neural-path {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-height: 24px;
+}
+
+.neural-path span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 29px;
+  min-height: 22px;
+  border: 1px solid color-mix(in srgb, var(--teal) 45%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--teal-soft) 74%, var(--panel));
+  color: var(--teal-strong);
+  font-size: 10px;
+  font-weight: 820;
+}
+
+.neural-path .neural-path-empty {
+  justify-content: flex-start;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.neural-math-panel small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .memory-ledger {
@@ -1711,6 +1812,10 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .neural-math-panel {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .bottom-bar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1750,6 +1855,14 @@ textarea {
   .graph-toolbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .graph-toolbar-actions {
+    flex-wrap: wrap;
+  }
+
+  .neural-math-panel {
+    grid-template-columns: 1fr;
   }
 
   .panel {

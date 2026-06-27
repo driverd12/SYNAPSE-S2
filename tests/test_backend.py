@@ -200,6 +200,40 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             graph["relationship_summary"]["associative"],
         )
 
+    def test_memory_graph_entries_include_bounded_neural_inspector_samples(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=16,
+            default_top_k=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend.register_trace(
+            tag="inspector-memory",
+            embedding=[0.0, 0.2, 0.9, -0.7, 0.4, 0.8, -0.1, 0.3],
+            context_id="demo",
+        )
+
+        graph = backend.list_memory_graph(context_id="demo", limit=5)
+        entry = graph["entries"][0]
+        status = backend.status(context_id="demo")
+
+        self.assertEqual(entry["tag"], "inspector-memory")
+        self.assertEqual(entry["spike_count"], 3)
+        self.assertEqual(entry["neuron_count"], 3)
+        self.assertEqual(status["beta"], 0.95)
+        self.assertEqual(status["threshold"], 1.0)
+        self.assertIn("spike_coordinate_sample", entry)
+        self.assertIn("neuron_index_sample", entry)
+        self.assertLessEqual(len(entry["spike_coordinate_sample"]), 12)
+        self.assertLessEqual(len(entry["neuron_index_sample"]), 12)
+        self.assertTrue(
+            all(isinstance(value, int) for value in entry["spike_coordinate_sample"])
+        )
+        self.assertTrue(
+            all(isinstance(value, int) for value in entry["neuron_index_sample"])
+        )
+
     def test_query_expands_recall_with_related_event_graph_neighbors(self):
         backend = SpikingAttentionBackend(
             dimension=64,
