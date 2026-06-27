@@ -318,7 +318,7 @@ Quick-pruning is configured for the proposal's five-minute interval (`300` secon
 .venv/bin/python synapse_cli.py --json quick-prune
 ```
 
-Resource profiling reports the MLX topology footprint from the live arrays (`W_syn`, `W_lateral`, membrane state, spike state, and active traces). With the default 1,024 x 5,000 topology it is expected to land inside the proposal's 61-138 MB operating envelope; tiny test topologies correctly report a smaller footprint.
+Resource profiling reports the MLX topology footprint from the live arrays (`W_syn`, `W_lateral`, membrane state, spike state, and active traces). With the default 1,024 x 5,400 topology it is expected to land near 132 MB, still inside the proposal's 61-138 MB operating envelope while increasing the recurrent substrate above the original 5,000-neuron default; tiny test topologies correctly report a smaller footprint.
 
 ```bash
 .venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune

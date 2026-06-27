@@ -162,9 +162,9 @@ class SpikingAttentionBackend:
         self,
         *,
         dimension: int = 1024,
-        num_neurons: int = 5000,
-        default_top_k: int = 150,
-        recall_count: int = 5,
+        num_neurons: int = 5400,
+        default_top_k: int = 256,
+        recall_count: int = 10,
         beta: float = 0.95,
         threshold: float = 1.0,
         w_syn_scale: float = 0.01,
@@ -4303,9 +4303,9 @@ def get_backend() -> SpikingAttentionBackend:
     if _ENGINE_INSTANCE is None:
         _ENGINE_INSTANCE = SpikingAttentionBackend(
             dimension=int(os.getenv("SYNAPSE_S2_DIMENSION", "1024")),
-            num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", "5000")),
-            default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "150")),
-            recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "5")),
+            num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", "5400")),
+            default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "256")),
+            recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "10")),
             quick_pruning_interval_seconds=float(
                 os.getenv("SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS", "300")
             ),

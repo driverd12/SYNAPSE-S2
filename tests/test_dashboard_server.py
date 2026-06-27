@@ -10,6 +10,7 @@ import urllib.request
 from capture_daemon import write_capture_drop
 from dashboard_server import DEFAULT_CONTEXT, DashboardRuntime, SynapseDashboardServer, main
 from mlx_backend import SpikingAttentionBackend
+from transcript_capture import TranscriptCaptureManager
 
 
 class DashboardRuntimeTests(unittest.TestCase):
@@ -937,10 +938,10 @@ class DashboardRuntimeTests(unittest.TestCase):
                 runtime = self.make_runtime(tmp)
                 app_payload = {
                     "context_id": "demo",
-                    "app_name": "Codex IDE",
-                    "bundle_id": "com.openai.codex",
-                    "pid": 4242,
-                    "source_tag": "codex-ide",
+                    "app_name": "Manual MCP Probe",
+                    "bundle_id": "local.manual.probe",
+                    "pid": 424242,
+                    "source_tag": "manual-probe",
                     "speaker": "codex",
                     "allow_manual": True,
                 }
@@ -982,14 +983,108 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(rejected_status, 400)
         self.assertIn("confirmation_token", rejected_payload["error"])
         self.assertEqual(preflight_status, 200)
-        self.assertEqual(preflight_payload["app_name"], "Codex IDE")
+        self.assertEqual(preflight_payload["app_name"], "Manual MCP Probe")
         self.assertTrue(preflight_payload["requires_confirmation_token"])
         self.assertEqual(connect_status, 200)
-        self.assertEqual(connect_payload["app_name"], "Codex IDE")
+        self.assertEqual(connect_payload["app_name"], "Manual MCP Probe")
+        self.assertEqual(connect_payload["bundle_id"], "local.manual.probe")
+        self.assertEqual(list_status, 200)
+        self.assertEqual(list_payload["connection_count"], 1)
+        self.assertEqual(list_payload["connections"][0]["source_tag"], "manual-probe")
+
+    def test_app_connect_endpoint_attaches_detected_app_and_snapshots_memory(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            manager = TranscriptCaptureManager(
+                root=Path(tmp) / "capture-root",
+                backend=runtime.backend,
+                running_app_provider=lambda: [
+                    {
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "pid": 4242,
+                    }
+                ],
+                app_snapshot_provider=lambda app: (
+                    f"{app['app_name']} active session: SYNAPSE-S2 App Connect is reading UI state. "
+                    "api_key=sk-app-secret123"
+                ),
+            )
+            runtime.transcript_capture = lambda: manager  # type: ignore[method-assign]
+            app_payload = {
+                "context_id": "demo",
+                "app_name": "Codex",
+                "bundle_id": "com.openai.codex",
+                "pid": 4242,
+                "source_tag": "codex-app",
+                "speaker": "operator",
+                "allow_manual": False,
+            }
+
+            apps_status, apps_payload = self.decode(runtime.handle("GET", "/api/apps"))
+            preflight_status, preflight_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/app-connect/preflight",
+                    json.dumps(app_payload).encode(),
+                )
+            )
+            connect_status, connect_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/app-connect",
+                    json.dumps(
+                        {
+                            **app_payload,
+                            "confirmation_token": preflight_payload["confirmation_token"],
+                        }
+                    ).encode(),
+                )
+            )
+            list_status, list_payload = self.decode(runtime.handle("GET", "/api/app-connections"))
+            snapshot_preflight_status, snapshot_preflight_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/app-snapshot/preflight",
+                    json.dumps({"connection_id": connect_payload["connection_id"]}).encode(),
+                )
+            )
+            snapshot_status, snapshot_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/app-snapshot",
+                    json.dumps(
+                        {
+                            "connection_id": connect_payload["connection_id"],
+                            "confirmation_token": snapshot_preflight_payload["confirmation_token"],
+                        }
+                    ).encode(),
+                )
+            )
+            memory = runtime.backend.list_memory(context_id="demo", limit=20)
+            captured = [
+                entry
+                for entry in memory["entries"]
+                if entry["metadata"].get("adapter_kind") == "app-accessibility-snapshot"
+            ]
+
+        self.assertEqual(apps_status, 200)
+        self.assertEqual(apps_payload["app_count"], 1)
+        self.assertEqual(apps_payload["apps"][0]["app_name"], "Codex")
+        self.assertEqual(preflight_status, 200)
+        self.assertEqual(connect_status, 200)
+        self.assertEqual(connect_payload["app_name"], "Codex")
         self.assertEqual(connect_payload["bundle_id"], "com.openai.codex")
         self.assertEqual(list_status, 200)
         self.assertEqual(list_payload["connection_count"], 1)
-        self.assertEqual(list_payload["connections"][0]["source_tag"], "codex-ide")
+        self.assertEqual(snapshot_preflight_status, 200)
+        self.assertEqual(snapshot_preflight_payload["connection"]["app_name"], "Codex")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot_payload["adapter_kind"], "app-accessibility-snapshot")
+        self.assertGreaterEqual(snapshot_payload["event_count"], 1)
+        self.assertTrue(captured)
+        self.assertTrue(all("sk-app-secret123" not in entry["source_text"] for entry in captured))
+        self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))
 
     def test_context_events_endpoint_lists_published_agent_handoffs(self):
         with TemporaryDirectory() as tmp:

@@ -603,13 +603,13 @@ class SynapseCliTests(unittest.TestCase):
                 "--context",
                 "demo",
                 "--app-name",
-                "Codex IDE",
+                "Manual MCP Probe",
                 "--bundle-id",
-                "com.openai.codex",
+                "local.manual.probe",
                 "--pid",
-                "4242",
+                "424242",
                 "--tag",
-                "codex-ide",
+                "manual-probe",
                 "--speaker",
                 "codex",
                 "--capture-root",
@@ -629,7 +629,7 @@ class SynapseCliTests(unittest.TestCase):
 
         self.assertEqual(connected.returncode, 0, connected.stderr)
         self.assertEqual(connections.returncode, 0, connections.stderr)
-        self.assertEqual(json.loads(connected.stdout)["app_name"], "Codex IDE")
+        self.assertEqual(json.loads(connected.stdout)["app_name"], "Manual MCP Probe")
         self.assertEqual(json.loads(connections.stdout)["connection_count"], 1)
 
     def test_cli_publishes_and_acknowledges_context_deployments(self):

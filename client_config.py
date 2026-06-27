@@ -14,6 +14,10 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_LAUNCHER = Path.home() / ".local" / "bin" / "synapse-s2-mcp"
 DEFAULT_EMBEDDING_PROVIDER = "mlx-neural"
 DEFAULT_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+DEFAULT_DIMENSION = "1024"
+DEFAULT_NEURONS = "5400"
+DEFAULT_TOP_K = "256"
+DEFAULT_RECALL_COUNT = "10"
 
 
 def build_server_definition(
@@ -41,6 +45,11 @@ def build_server_definition(
             "SYNAPSE_S2_EMBEDDING_PROVIDER": DEFAULT_EMBEDDING_PROVIDER,
             "SYNAPSE_S2_NEURAL_MODEL": DEFAULT_NEURAL_MODEL,
             "SYNAPSE_S2_NEURAL_CACHE_DIR": str(repo / ".synapse_s2" / "models"),
+            "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY": "1",
+            "SYNAPSE_S2_DIMENSION": DEFAULT_DIMENSION,
+            "SYNAPSE_S2_NEURONS": DEFAULT_NEURONS,
+            "SYNAPSE_S2_TOP_K": DEFAULT_TOP_K,
+            "SYNAPSE_S2_RECALL_COUNT": DEFAULT_RECALL_COUNT,
             "SYNAPSE_S2_STATE_PATH": str(repo / ".synapse_s2" / "runtime_state.json"),
             "SYNAPSE_S2_MEMORY_DB": str(repo / ".synapse_s2" / "memory.sqlite3"),
             "SYNAPSE_S2_EXPORT_DIR": str(repo / ".synapse_s2"),

@@ -164,6 +164,52 @@ class EmbeddingProviderTests(unittest.TestCase):
         ):
             provider.embed("dependency failure path", dimensions=8)
 
+    def test_mlx_neural_runtime_falls_back_to_existing_cache_snapshot(self):
+        Runtime = embedding_providers.MLXNeuralEmbeddingRuntime
+
+        with TemporaryDirectory() as tmp:
+            cache_root = Path(tmp)
+            snapshot = (
+                cache_root
+                / "models--unit--fallback-model"
+                / "snapshots"
+                / "abc123"
+            )
+            snapshot.mkdir(parents=True)
+
+            fake_hub = type(sys)("huggingface_hub")
+
+            def broken_snapshot_download(**_kwargs):
+                raise BrokenPipeError("broken pipe")
+
+            fake_hub.snapshot_download = broken_snapshot_download
+            previous_hub = sys.modules.get("huggingface_hub")
+            sys.modules["huggingface_hub"] = fake_hub
+            runtime = object.__new__(Runtime)
+            runtime.source = "unit/fallback-model"
+            runtime.cache_fallback_used = False
+            try:
+                resolved = runtime._resolve_model_ref(
+                    embedding_providers.MLXNeuralEmbeddingConfig(
+                        model_id="unit/fallback-model",
+                        cache_dir=str(cache_root),
+                        revision=None,
+                        pooling="mean",
+                        max_tokens=512,
+                        normalize=True,
+                        local_files_only=False,
+                    )
+                )
+            finally:
+                if previous_hub is None:
+                    sys.modules.pop("huggingface_hub", None)
+                else:
+                    sys.modules["huggingface_hub"] = previous_hub
+
+        self.assertEqual(Path(resolved), snapshot)
+        self.assertEqual(runtime.source, str(snapshot))
+        self.assertTrue(runtime.cache_fallback_used)
+
 
 if __name__ == "__main__":
     unittest.main()

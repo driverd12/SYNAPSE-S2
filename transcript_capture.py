@@ -26,8 +26,13 @@ LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
 
 MAX_TRANSCRIPT_DELTA_BYTES = 256_000
-APP_DETECT_SYSTEM_EVENTS_TIMEOUT_SECONDS = 1.25
+APP_DETECT_SYSTEM_EVENTS_TIMEOUT_SECONDS = float(
+    os.getenv("SYNAPSE_S2_APP_DETECT_TIMEOUT_SECONDS", "12.0")
+)
 APP_DETECT_PS_TIMEOUT_SECONDS = 2.0
+APP_SNAPSHOT_ACCESSIBILITY_TIMEOUT_SECONDS = float(
+    os.getenv("SYNAPSE_S2_APP_SNAPSHOT_TIMEOUT_SECONDS", "20.0")
+)
 CLIPBOARD_READ_TIMEOUT_SECONDS = 5.0
 ALLOWED_TRANSCRIPT_SUFFIXES = {
     ".json",
@@ -94,7 +99,7 @@ class TranscriptCaptureManager:
     ) -> None:
         self.root = resolve_capture_root(root)
         self.backend = backend or mlx_backend.get_backend()
-        self.running_app_provider = running_app_provider or self._detect_running_apps_ps
+        self.running_app_provider = running_app_provider or self._detect_running_apps_macos
         self.app_snapshot_provider = app_snapshot_provider or self._snapshot_app_accessibility
 
     def paths(self) -> dict[str, Path]:
@@ -250,7 +255,9 @@ class TranscriptCaptureManager:
         if not confirmed:
             raise ValueError("explicit confirmation is required to capture an app snapshot")
         connection = self._get_connection(connection_id)
-        snapshot_text = str(self.app_snapshot_provider(connection) or "").strip()
+        snapshot_text = self._clean_accessibility_snapshot_text(
+            str(self.app_snapshot_provider(connection) or "")
+        )
         if not snapshot_text:
             raise ValueError("app snapshot did not return text")
         if len(snapshot_text.encode("utf-8")) > MAX_TRANSCRIPT_DELTA_BYTES:
@@ -258,6 +265,7 @@ class TranscriptCaptureManager:
                 "utf-8",
                 errors="replace",
             )
+        snapshot_quality = self._snapshot_quality(snapshot_text)
         redacted_text, redaction_count = redact_capture_text(snapshot_text)
         capture = self.backend.capture_conversation(
             text=redacted_text,
@@ -279,6 +287,7 @@ class TranscriptCaptureManager:
                 "redaction_count": int(redaction_count),
                 "input_sha256": _sha256_text(snapshot_text),
                 "remote_control_plane": False,
+                "snapshot_quality": snapshot_quality,
             },
         )
         return {
@@ -293,6 +302,7 @@ class TranscriptCaptureManager:
             "relationship_count": capture["relationship_count"],
             "agent_deployment": capture.get("agent_deployment"),
             "redaction_count": int(redaction_count),
+            "snapshot_quality": snapshot_quality,
         }
 
     def register_file_source(
@@ -652,7 +662,7 @@ class TranscriptCaptureManager:
             ) from exc
         return result.stdout
 
-    def _detect_running_apps_macos(self) -> list[dict[str, Any]]:
+    def _detect_visible_application_processes(self) -> list[dict[str, Any]]:
         script = """
         tell application "System Events"
           set appRows to {}
@@ -677,32 +687,36 @@ class TranscriptCaptureManager:
           return appRows as text
         end tell
         """
-        try:
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                text=True,
-                capture_output=True,
-                check=True,
-                timeout=APP_DETECT_SYSTEM_EVENTS_TIMEOUT_SECONDS,
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=APP_DETECT_SYSTEM_EVENTS_TIMEOUT_SECONDS,
+        )
+        apps: list[dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if not parts or not parts[0].strip():
+                continue
+            try:
+                pid = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
+            except ValueError:
+                pid = 0
+            bundle_id = parts[2].strip() if len(parts) > 2 else ""
+            apps.append(
+                {
+                    "app_name": parts[0].strip(),
+                    "pid": pid,
+                    "bundle_id": "" if bundle_id == "missing value" else bundle_id,
+                    "detection": "system-events",
+                }
             )
-            apps: list[dict[str, Any]] = []
-            for line in result.stdout.splitlines():
-                parts = line.split("\t")
-                if not parts or not parts[0].strip():
-                    continue
-                try:
-                    pid = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
-                except ValueError:
-                    pid = 0
-                apps.append(
-                    {
-                        "app_name": parts[0].strip(),
-                        "pid": pid,
-                        "bundle_id": parts[2].strip() if len(parts) > 2 else "",
-                        "detection": "system-events",
-                    }
-                )
-            return apps
+        return apps
+
+    def _detect_running_apps_macos(self) -> list[dict[str, Any]]:
+        try:
+            return self._detect_visible_application_processes()
         except Exception as exc:
             detail = str(getattr(exc, "stderr", "") or exc.__class__.__name__).strip()
             LOGGER.debug(
@@ -804,11 +818,73 @@ class TranscriptCaptureManager:
             return False
         return " " in name and bool(name[0].isupper())
 
-    def _snapshot_app_accessibility(self, app: dict[str, Any]) -> str:
+    def _resolve_accessibility_app_name(self, app: dict[str, Any]) -> str:
         app_name = " ".join(str(app.get("app_name") or "").split())
         if not app_name:
             raise ValueError("app_name must not be empty")
+        requested_name = app_name.lower()
+        requested_bundle = str(app.get("bundle_id") or "").strip().lower()
+        try:
+            requested_pid = int(app.get("pid") or 0)
+        except (TypeError, ValueError):
+            requested_pid = 0
+        try:
+            candidates = [
+                self._public_app(candidate)
+                for candidate in self._detect_visible_application_processes()
+            ]
+        except Exception:
+            return app_name
+        if requested_pid > 0:
+            for candidate in candidates:
+                if int(candidate.get("pid") or 0) == requested_pid:
+                    return str(candidate.get("app_name") or app_name)
+        if requested_bundle:
+            for candidate in candidates:
+                if str(candidate.get("bundle_id") or "").strip().lower() == requested_bundle:
+                    return str(candidate.get("app_name") or app_name)
+        for candidate in candidates:
+            if str(candidate.get("app_name") or "").strip().lower() == requested_name:
+                return str(candidate.get("app_name") or app_name)
+        return app_name
+
+    def _clean_accessibility_snapshot_text(self, text: str) -> str:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in str(text or "").splitlines():
+            line = " ".join(raw_line.split())
+            if not line or line.lower() == "missing value":
+                continue
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(line)
+        return "\n".join(lines).strip()
+
+    def _snapshot_quality(self, text: str) -> dict[str, Any]:
+        lines = [line for line in str(text or "").splitlines() if line.strip()]
+        signal_chars = sum(len(line) for line in lines)
+        return {
+            "line_count": len(lines),
+            "unique_line_count": len(set(line.lower() for line in lines)),
+            "signal_chars": signal_chars,
+            "low_signal": signal_chars < 160 or len(lines) < 4,
+        }
+
+    def _snapshot_app_accessibility(self, app: dict[str, Any]) -> str:
+        app_name = self._resolve_accessibility_app_name(app)
         script = """
+        on appendClean(rawValue)
+          try
+            set textValue to rawValue as text
+          on error
+            return ""
+          end try
+          if textValue is "" or textValue is "missing value" then return ""
+          return textValue & linefeed
+        end appendClean
+
         on run argv
           set appName to item 1 of argv
           set outputText to "Application: " & appName & linefeed
@@ -830,12 +906,16 @@ class TranscriptCaptureManager:
                   set uiItems to entire contents of win
                   repeat with itemRef in uiItems
                     try
-                      set itemName to name of itemRef as text
-                      if itemName is not "" then set outputText to outputText & itemName & linefeed
+                      set outputText to outputText & my appendClean(name of itemRef)
                     end try
                     try
-                      set itemValue to value of itemRef as text
-                      if itemValue is not "" then set outputText to outputText & itemValue & linefeed
+                      set outputText to outputText & my appendClean(title of itemRef)
+                    end try
+                    try
+                      set outputText to outputText & my appendClean(description of itemRef)
+                    end try
+                    try
+                      set outputText to outputText & my appendClean(value of itemRef)
                     end try
                   end repeat
                 end try
@@ -851,13 +931,13 @@ class TranscriptCaptureManager:
                 text=True,
                 capture_output=True,
                 check=True,
-                timeout=10,
+                timeout=APP_SNAPSHOT_ACCESSIBILITY_TIMEOUT_SECONDS,
             )
         except Exception as exc:
             raise ValueError(
                 "app snapshot failed; grant Accessibility permission or use selected-text capture"
             ) from exc
-        return result.stdout
+        return self._clean_accessibility_snapshot_text(result.stdout)
 
     def _public_app(self, app: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -914,8 +994,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", default=None)
     parser.add_argument("--memory-db", default=None)
     parser.add_argument("--dimension", type=int, default=1024)
-    parser.add_argument("--neurons", type=int, default=5000)
-    parser.add_argument("--top-k", type=int, default=150)
+    parser.add_argument("--neurons", type=int, default=5400)
+    parser.add_argument("--top-k", type=int, default=256)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--max-bytes", type=int, default=MAX_TRANSCRIPT_DELTA_BYTES)

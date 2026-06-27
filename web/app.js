@@ -427,6 +427,14 @@ function renderCaptureInbox(captureInbox) {
   `;
 }
 
+function setAppConnectState(headline, detail, mode = "") {
+  elements.appConnectState.className = `capture-inbox-state ${mode}`.trim();
+  elements.appConnectState.innerHTML = `
+    <strong>${escapeHtml(headline)}</strong>
+    <small>${escapeHtml(detail)}</small>
+  `;
+}
+
 function renderAppConnect(appPayload = null, connectionPayload = null) {
   if (appPayload?.apps) {
     state.appConnect.apps = appPayload.apps;
@@ -488,11 +496,7 @@ function renderAppConnect(appPayload = null, connectionPayload = null) {
     : detected
       ? "Select a detected app, set a source tag, then connect it to this context."
       : "Detect local apps, attach one, then capture a redacted snapshot into SYNAPSE-S2 memory.";
-  elements.appConnectState.className = `capture-inbox-state ${connected || detected ? "ready" : ""}`.trim();
-  elements.appConnectState.innerHTML = `
-    <strong>${escapeHtml(headline)}</strong>
-    <small>${escapeHtml(detail)}</small>
-  `;
+  setAppConnectState(headline, detail, connected || detected ? "ready" : "");
 }
 
 function appOptionLabel(app) {
@@ -1696,6 +1700,9 @@ async function refreshAppConnect({ detect = true } = {}) {
 }
 
 function selectedDetectedApp() {
+  if (elements.appSelect.value === "") {
+    return null;
+  }
   const index = Number(elements.appSelect.value);
   if (!Number.isInteger(index) || index < 0) {
     return null;
@@ -1709,6 +1716,11 @@ async function connectSelectedApp(button) {
   const appName = selected?.app_name || manualName;
   if (!appName) {
     logOperation("App Connect rejected", "detect and select a running app, or enter a manual app name");
+    setAppConnectState(
+      "App Connect needs a target",
+      "Detect and select a running app, or enter a manual app name.",
+      "error",
+    );
     elements.appManualName.focus();
     return null;
   }
@@ -1723,20 +1735,16 @@ async function connectSelectedApp(button) {
     metadata: { source: "dashboard-app-connect" },
   };
   return withBusy(button, "App Connect", async () => {
+    setAppConnectState("Preparing app attach", `${appName} -> ${connectBody.source_tag}`, "pending");
     const preflight = await requestJson("/api/app-connect/preflight", {
       method: "POST",
       body: connectBody,
     });
-    if (!confirmPreflight("Connect this local app to SYNAPSE-S2?", [
-      `App: ${preflight.app_name}`,
-      `Context: ${preflight.context_id}`,
-      `Source: ${preflight.source_tag}`,
-      `Bundle: ${preflight.bundle_id || "manual"}`,
-      `PID: ${preflight.pid || "manual"}`,
-    ])) {
-      logOperation("App Connect cancelled", preflight);
-      return preflight;
-    }
+    setAppConnectState(
+      "Connecting app",
+      `${preflight.app_name} is being attached to ${preflight.context_id} with source ${preflight.source_tag}.`,
+      "pending",
+    );
     const payload = await requestJson("/api/app-connect", {
       method: "POST",
       body: {
@@ -1746,14 +1754,27 @@ async function connectSelectedApp(button) {
     });
     await refreshAppConnect({ detect: false });
     elements.appConnectionSelect.value = payload.connection_id || "";
+    setAppConnectState(
+      "App connection armed",
+      `${payload.app_name} is attached and ready for an Accessibility snapshot.`,
+      "ready",
+    );
     return payload;
-  }, { refresh: false });
+  }, { refresh: false }).catch((error) => {
+    setAppConnectState("App Connect failed", error.message, "error");
+    return null;
+  });
 }
 
 async function snapshotConnectedApp(button) {
   const connectionId = elements.appConnectionSelect.value.trim();
   if (!connectionId) {
     logOperation("App snapshot rejected", "connect an app first, then choose the attached connection");
+    setAppConnectState(
+      "Snapshot needs a connection",
+      "Connect an app first, then choose the attached connection.",
+      "error",
+    );
     elements.appConnectionSelect.focus();
     return null;
   }
@@ -1762,20 +1783,17 @@ async function snapshotConnectedApp(button) {
       connection_id: connectionId,
       metadata: { source: "dashboard-app-snapshot" },
     };
+    setAppConnectState("Preparing snapshot", "Checking the attached app connection.", "pending");
     const preflight = await requestJson("/api/app-snapshot/preflight", {
       method: "POST",
       body: snapshotBody,
     });
     const connection = preflight.connection || {};
-    if (!confirmPreflight("Capture a redacted app snapshot into memory?", [
-      `App: ${connection.app_name || connectionId}`,
-      `Context: ${connection.context_id || state.context}`,
-      `Source: ${connection.source_tag || "app-connect"}`,
-      preflight.preview_note || "",
-    ])) {
-      logOperation("App snapshot cancelled", preflight);
-      return preflight;
-    }
+    setAppConnectState(
+      "Capturing app snapshot",
+      `${connection.app_name || connectionId} is being read locally and redacted before memory ingest.`,
+      "pending",
+    );
     const payload = await requestJson("/api/app-snapshot", {
       method: "POST",
       body: {
@@ -1785,7 +1803,18 @@ async function snapshotConnectedApp(button) {
     });
     await publishAwareResult(payload);
     await refreshAppConnect({ detect: false });
+    const lowSignal = payload.snapshot_quality?.low_signal === true;
+    setAppConnectState(
+      lowSignal ? "Low-signal snapshot captured" : "Snapshot captured",
+      lowSignal
+        ? `${payload.app_name} wrote ${formatNumber(payload.event_count || 0)} memory event${Number(payload.event_count || 0) === 1 ? "" : "s"} from limited Accessibility text.`
+        : `${payload.app_name} wrote ${formatNumber(payload.event_count || 0)} memory event${Number(payload.event_count || 0) === 1 ? "" : "s"}.`,
+      "ready",
+    );
     return payload;
+  }).catch((error) => {
+    setAppConnectState("App snapshot failed", error.message, "error");
+    return null;
   });
 }
 

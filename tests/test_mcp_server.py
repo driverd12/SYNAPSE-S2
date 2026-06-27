@@ -419,11 +419,11 @@ class McpServerTests(unittest.TestCase):
     def test_mcp_app_connect_can_register_manual_local_app(self):
         connected = json.loads(
             mcp_server.connect_spiking_app(
-                app_name="Codex IDE",
-                bundle_id="com.openai.codex",
-                pid=4242,
+                app_name="Manual MCP Probe",
+                bundle_id="local.manual.probe",
+                pid=424242,
                 context_id="demo",
-                source_tag="codex-ide",
+                source_tag="manual-probe",
                 speaker="codex",
                 confirmed=True,
                 allow_manual=True,
@@ -431,8 +431,8 @@ class McpServerTests(unittest.TestCase):
         )
         connections = json.loads(mcp_server.list_spiking_app_connections())
 
-        self.assertEqual(connected["app_name"], "Codex IDE")
-        self.assertEqual(connected["bundle_id"], "com.openai.codex")
+        self.assertEqual(connected["app_name"], "Manual MCP Probe")
+        self.assertEqual(connected["bundle_id"], "local.manual.probe")
         self.assertEqual(connections["connection_count"], 1)
 
     def test_context_deployment_tool_lists_published_thoughts_for_connected_agents(self):

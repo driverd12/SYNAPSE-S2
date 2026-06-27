@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from mlx_backend import SpikingAttentionBackend
 from transcript_capture import TranscriptCaptureManager
@@ -174,6 +176,47 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
         self.assertTrue(all("sk-app-secret123" not in entry["source_text"] for entry in captured))
         self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))
         self.assertEqual(captured[0]["metadata"]["app_name"], "Google Chrome")
+
+    def test_accessibility_snapshot_resolves_ps_name_to_visible_app_name(self):
+        with TemporaryDirectory() as tmp:
+            manager = TranscriptCaptureManager(
+                root=Path(tmp) / "capture-root",
+                backend=self.make_backend(tmp),
+            )
+            manager._detect_visible_application_processes = lambda: [  # type: ignore[method-assign]
+                {
+                    "app_name": "Codex",
+                    "bundle_id": "com.openai.codex",
+                    "pid": 4242,
+                    "detection": "system-events",
+                }
+            ]
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                return SimpleNamespace(
+                    stdout=(
+                        "Application: Codex\n"
+                        "missing value\n"
+                        "Window 1: Codex\n"
+                        "Window 1: Codex\n"
+                    )
+                )
+
+            with patch("transcript_capture.subprocess.run", side_effect=fake_run):
+                snapshot = manager._snapshot_app_accessibility(
+                    {
+                        "app_name": "codex",
+                        "bundle_id": "",
+                        "pid": 4242,
+                    }
+                )
+
+        self.assertEqual(calls[0][-1], "Codex")
+        self.assertIn("Application: Codex", snapshot)
+        self.assertNotIn("missing value", snapshot)
+        self.assertEqual(snapshot.count("Window 1: Codex"), 1)
 
     def test_running_app_detection_falls_back_to_process_list_when_provider_fails(self):
         with TemporaryDirectory() as tmp:

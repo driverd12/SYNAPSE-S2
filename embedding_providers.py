@@ -404,8 +404,12 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
                 "cache_dir": self.cache_dir or "",
                 "revision": self.revision or "",
                 "max_tokens": self.max_tokens,
+                "local_files_only": bool(self.local_files_only),
                 "projection": "signed-hash-projection-v1",
                 "runtime_source": str(getattr(runtime, "source", "")),
+                "cache_fallback_used": bool(
+                    getattr(runtime, "cache_fallback_used", False)
+                ),
             },
         )
         provenance.update(
@@ -476,6 +480,7 @@ class MLXNeuralEmbeddingRuntime:
         self.config = config
         self.model_id = config.model_id
         self.source = config.model_id
+        self.cache_fallback_used = False
         self.model_config: dict[str, Any] = {}
         self.model, self.tokenizer = self._load_model(config)
 
@@ -505,22 +510,30 @@ class MLXNeuralEmbeddingRuntime:
 
         cache_root = Path(config.cache_dir).expanduser()
         cache_root.mkdir(parents=True, exist_ok=True)
-        model_path = snapshot_download(
-            repo_id=config.model_id,
-            cache_dir=str(cache_root),
-            revision=config.revision,
-            local_files_only=config.local_files_only,
-            allow_patterns=[
-                "*.json",
-                "*.model",
-                "*.txt",
-                "*.py",
-                "*.safetensors",
-                "tokenizer*",
-                "special_tokens_map.json",
-                "generation_config.json",
-            ],
-        )
+        try:
+            model_path = snapshot_download(
+                repo_id=config.model_id,
+                cache_dir=str(cache_root),
+                revision=config.revision,
+                local_files_only=config.local_files_only,
+                allow_patterns=[
+                    "*.json",
+                    "*.model",
+                    "*.txt",
+                    "*.py",
+                    "*.safetensors",
+                    "tokenizer*",
+                    "special_tokens_map.json",
+                    "generation_config.json",
+                ],
+            )
+        except Exception:
+            cached_snapshot = _latest_cached_snapshot(cache_root, config.model_id)
+            if cached_snapshot is None:
+                raise
+            self.cache_fallback_used = True
+            self.source = str(cached_snapshot)
+            return str(cached_snapshot)
         self.source = model_path
         return model_path
 
@@ -576,6 +589,20 @@ class MLXNeuralEmbeddingRuntime:
 def _tokens(text: str) -> list[str]:
     tokens = TOKEN_RE.findall(text)
     return tokens or ["empty"]
+
+
+def _latest_cached_snapshot(cache_root: Path, model_id: str) -> Path | None:
+    snapshot_root = (
+        cache_root
+        / f"models--{str(model_id).strip().replace('/', '--')}"
+        / "snapshots"
+    )
+    if not snapshot_root.exists():
+        return None
+    candidates = [path for path in snapshot_root.iterdir() if path.is_dir()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _normalized_tokens(tokens: list[str]) -> list[str]:
