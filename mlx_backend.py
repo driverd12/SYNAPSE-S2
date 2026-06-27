@@ -81,6 +81,30 @@ CORTEX_TRUTH_POSTURES = {
     "stale",
 }
 CORTEX_MODES = {"strict", "creative", "operator", "security", "demo"}
+SURFACE_DETAIL_STOP_WORDS = {
+    "about",
+    "after",
+    "again",
+    "against",
+    "also",
+    "because",
+    "before",
+    "being",
+    "between",
+    "could",
+    "from",
+    "have",
+    "into",
+    "only",
+    "should",
+    "that",
+    "their",
+    "there",
+    "these",
+    "this",
+    "with",
+    "would",
+}
 
 
 class BackendUnavailable(RuntimeError):
@@ -691,10 +715,19 @@ class SpikingAttentionBackend:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = self.embed_text_payload(text)
+        base_metadata = {
+            **(metadata or {}),
+            "embedding_provider": payload["provenance"],
+        }
+        surface_details = self._surface_node_details(
+            tag=tag,
+            text=text,
+            metadata=base_metadata,
+        )
         merged_metadata = self._json_safe_metadata(
             {
-                **(metadata or {}),
-                "embedding_provider": payload["provenance"],
+                **base_metadata,
+                **surface_details,
             }
         )
         registration = self.register_trace(
@@ -823,7 +856,31 @@ class SpikingAttentionBackend:
             LOGGER.exception("trace registration failed for context_id=%s tag=%s", context, clean_tag)
             raise
 
-    def query(self, embedding: Any, *, context_id: str = "default", steps: int = 12) -> str:
+    def query_text(
+        self,
+        prompt: str,
+        *,
+        context_id: str = "default",
+        steps: int = 12,
+    ) -> str:
+        prompt_text = str(prompt or "").strip()
+        if not prompt_text:
+            raise ValueError("prompt must not be empty")
+        return self.query(
+            self.embed_text(prompt_text),
+            context_id=context_id,
+            steps=steps,
+            prompt_text=prompt_text,
+        )
+
+    def query(
+        self,
+        embedding: Any,
+        *,
+        context_id: str = "default",
+        steps: int = 12,
+        prompt_text: str = "",
+    ) -> str:
         context = sanitize_context_id(context_id)
         if not self.is_enabled(context):
             self._mark_activity()
@@ -839,6 +896,7 @@ class SpikingAttentionBackend:
                 context=context,
                 sensory_spikes=sensory_spikes,
                 firing_signature=firing_signature,
+                prompt_text=prompt_text,
             )
             if registered:
                 return " / ".join(registered)
@@ -875,6 +933,7 @@ class SpikingAttentionBackend:
         context: str,
         sensory_spikes: Any,
         firing_signature: Any,
+        prompt_text: str = "",
     ) -> list[str]:
         query_spikes = set(self._active_indices_from_spikes(sensory_spikes))
         if not query_spikes:
@@ -886,13 +945,13 @@ class SpikingAttentionBackend:
             firing_values=firing_values,
             limit=self.recall_count,
         )
+        candidates = self._merge_surface_text_recall_candidates(
+            context=context,
+            prompt_text=prompt_text,
+            candidates=candidates,
+        )
         rendered = [
-            (
-                f"{candidate['tag']} "
-                f"(score={float(candidate['score']):.3f}, "
-                f"context={candidate['context_id']}, "
-                f"id={candidate['memory_id']})"
-            )
+            self._format_recall_entry(candidate, score=float(candidate["score"]))
             for candidate in candidates
         ]
         rendered.extend(
@@ -942,15 +1001,130 @@ class SpikingAttentionBackend:
                     continue
                 seen_ids.add(neighbor_id)
                 related.append(
-                    (
-                        f"{entry['tag']} "
-                        f"(linked={relationship['relation_type']}, "
-                        f"weight={float(relationship['weight']):.3f}, "
-                        f"context={entry['context_id']}, "
-                        f"id={entry['memory_id']})"
+                    self._format_recall_entry(
+                        entry,
+                        linked=str(relationship["relation_type"]),
+                        weight=float(relationship["weight"]),
                     )
                 )
         return related
+
+    def _format_recall_entry(
+        self,
+        entry: dict[str, Any],
+        *,
+        score: float | None = None,
+        linked: str = "",
+        weight: float | None = None,
+    ) -> str:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        tag = str(entry.get("tag") or "untagged")
+        label = self._surface_label_for_entry(entry)
+        facets = metadata.get("semantic_facets")
+        facet_text = ""
+        if isinstance(facets, (list, tuple)):
+            facet_text = " | ".join(str(facet) for facet in facets[:4] if str(facet).strip())
+        summary = str(metadata.get("display_summary") or "").strip()
+        details: list[str] = []
+        def clean_value(value: str, limit: int) -> str:
+            return self._compact_text(value, limit).replace(",", ";")
+
+        if score is not None:
+            details.append(f"score={float(score):.3f}")
+        if linked:
+            details.append(f"linked={linked}")
+        if weight is not None:
+            details.append(f"weight={float(weight):.3f}")
+        if label and label != tag:
+            details.append(f"label={clean_value(label, 72)}")
+        if facet_text:
+            details.append(f"facets={clean_value(facet_text, 96)}")
+        if summary and summary != label:
+            details.append(f"summary={clean_value(summary, 96)}")
+        details.append(f"context={entry.get('context_id', '')}")
+        details.append(f"id={entry.get('memory_id', '')}")
+        return f"{tag} ({', '.join(details)})"
+
+    def _merge_surface_text_recall_candidates(
+        self,
+        *,
+        context: str,
+        prompt_text: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {
+            str(candidate["memory_id"]): dict(candidate)
+            for candidate in candidates
+        }
+        for candidate in self._surface_text_recall_candidates(
+            context=context,
+            prompt_text=prompt_text,
+        ):
+            memory_id = str(candidate["memory_id"])
+            current = merged.get(memory_id)
+            if current is None or float(candidate["score"]) > float(current.get("score", 0.0)):
+                merged[memory_id] = candidate
+        ranked = sorted(
+            merged.values(),
+            key=lambda item: (float(item.get("score", 0.0)), float(item.get("updated_at", 0.0))),
+            reverse=True,
+        )
+        return ranked[: max(1, self.recall_count)]
+
+    def _surface_text_recall_candidates(
+        self,
+        *,
+        context: str,
+        prompt_text: str,
+    ) -> list[dict[str, Any]]:
+        query_terms = set(self._surface_words(prompt_text))
+        if not query_terms:
+            return []
+        prompt_lower = " ".join(str(prompt_text or "").lower().split())
+        candidates: list[dict[str, Any]] = []
+        for entry in self.memory_store.list_entries(
+            context_id=context,
+            include_global=True,
+            limit=10_000,
+        ):
+            metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+            facets = self._surface_facets_for_entry(entry)
+            corpus = " ".join(
+                [
+                    self._surface_label_for_entry(entry),
+                    self._surface_summary_for_entry(entry),
+                    str(entry.get("tag") or ""),
+                    str(entry.get("source_text") or ""),
+                    " ".join(facets),
+                ]
+            )
+            corpus_terms = set(self._surface_words(corpus))
+            overlap = query_terms & corpus_terms
+            phrase_hits = 0
+            for facet in facets:
+                facet_text = " ".join(str(facet or "").lower().split())
+                if facet_text and (facet_text in prompt_lower or prompt_lower in facet_text):
+                    phrase_hits += 1
+            if len(overlap) < 2 and phrase_hits == 0:
+                continue
+            score = min(
+                0.99,
+                0.35
+                + (0.5 * len(overlap) / max(1, len(query_terms)))
+                + min(0.14, 0.07 * phrase_hits),
+            )
+            candidate = dict(entry)
+            candidate["score"] = round(score, 6)
+            metadata = dict(metadata)
+            metadata["surface_text_recall"] = True
+            metadata["surface_text_overlap"] = sorted(overlap)
+            candidate["metadata"] = self._json_safe_metadata(metadata)
+            candidates.append(candidate)
+        candidates.sort(
+            key=lambda item: (float(item["score"]), float(item["updated_at"])),
+            reverse=True,
+        )
+        return candidates[: max(self.recall_count * 3, 12)]
 
     def _recall_indices(self, firing_signature: Any, sensory_spikes: Any) -> list[int]:
         native_mx = self._mx
@@ -1232,7 +1406,7 @@ class SpikingAttentionBackend:
         )
         self.cortex_sessions[session_id] = session
         self._persist_runtime_state()
-        recall_result = self.query(self.embed_text(task_text), context_id=context)
+        recall_result = self.query_text(task_text, context_id=context)
         recall_items = self._split_recall_result(recall_result)
         policy = self._cortex_policy(clean_mode)
         state = self.get_cortex_state(context_id=context, agent_id=agent)
@@ -1294,7 +1468,7 @@ class SpikingAttentionBackend:
         state = self.get_cortex_state(context_id=context, agent_id=agent)
         recall_prompt = " ".join(part for part in (observation_text, proposed_text) if part)
         recall_result = (
-            self.query(self.embed_text(recall_prompt), context_id=context)
+            self.query_text(recall_prompt, context_id=context)
             if recall_prompt
             else ""
         )
@@ -2363,8 +2537,10 @@ class SpikingAttentionBackend:
             "weight": relationship.get("weight", 0.0),
             "source_memory_id": relationship.get("source_memory_id", ""),
             "source_tag": relationship.get("source_tag", ""),
+            "source_label": relationship.get("source_label", ""),
             "target_memory_id": relationship.get("target_memory_id", ""),
             "target_tag": relationship.get("target_tag", ""),
+            "target_label": relationship.get("target_label", ""),
             "updated_at": relationship.get("updated_at", 0.0),
         }
 
@@ -2598,6 +2774,134 @@ class SpikingAttentionBackend:
                 "dimensions": int(self.dimension),
             }
         )
+
+    def _surface_node_details(
+        self,
+        *,
+        tag: str,
+        text: str,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        source_text = str(text or "")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        label = self._surface_label_from_fields(
+            tag=tag,
+            text=source_text,
+            metadata=metadata,
+        )
+        summary = str(metadata.get("display_summary") or "").strip()
+        if not summary:
+            summary = self._compact_text(
+                self._extract_first_sentence(source_text) or source_text or label,
+                180,
+            )
+        facets = self._surface_facets(
+            label=label,
+            text=source_text,
+            metadata=metadata,
+        )
+        detail_badges = self._surface_detail_badges(metadata)
+        return self._json_safe_metadata(
+            {
+                "display_label": label,
+                "display_summary": summary,
+                "semantic_facets": facets,
+                "detail_badges": detail_badges,
+            }
+        )
+
+    def _surface_label_from_fields(
+        self,
+        *,
+        tag: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        existing = str(metadata.get("display_label") or "").strip()
+        if existing:
+            return self._compact_text(self._clean_context_label(existing), 72)
+        context_memory_type = str(metadata.get("context_memory_type") or "").strip().lower()
+        namespace_title = self._clean_context_label(
+            str(metadata.get("context_namespace_title") or "")
+        )
+        context_label = self._clean_context_label(str(metadata.get("context_label") or ""))
+        if context_memory_type == "namespace" and namespace_title:
+            return self._compact_text(namespace_title, 72)
+        if context_memory_type and context_label:
+            return self._compact_text(f"{context_memory_type.title()}: {context_label}", 72)
+        prefixed = self._extract_context_label_with_prefix(text)
+        if prefixed:
+            return self._compact_text(prefixed, 72)
+        first_sentence = self._extract_first_sentence(text)
+        if first_sentence:
+            return self._compact_text(first_sentence, 72)
+        clean_tag = sanitize_tag(tag)
+        return self._compact_text(clean_tag, 72)
+
+    def _extract_context_label_with_prefix(self, text: str) -> str:
+        for prefix in ("thread", "feature", "topic", "namespace", "goal", "objective", "event"):
+            value = self._extract_prefixed_context_value(text, prefixes=(prefix,))
+            if value:
+                label = self._clean_context_label(value)
+                if not label:
+                    continue
+                display_prefix = "Topic" if prefix in {"thread", "feature", "namespace"} else prefix.title()
+                return f"{display_prefix}: {label}"
+        return ""
+
+    def _surface_facets(
+        self,
+        *,
+        label: str,
+        text: str,
+        metadata: dict[str, Any],
+        limit: int = 8,
+    ) -> list[str]:
+        facets: list[str] = []
+
+        def add_facet(value: Any) -> None:
+            clean = self._clean_context_label(str(value or "")).lower()
+            if not clean:
+                return
+            clean = re.sub(r"\s+", " ", clean)
+            if len(clean) < 3 or clean in SURFACE_DETAIL_STOP_WORDS:
+                return
+            if clean not in facets:
+                facets.append(clean)
+
+        context_memory_type = metadata.get("context_memory_type")
+        if context_memory_type:
+            add_facet(context_memory_type)
+        for phrase_key in ("context_namespace_title", "context_label", "source_tag", "speaker"):
+            phrase = metadata.get(phrase_key)
+            if phrase and phrase_key != "speaker":
+                add_facet(phrase)
+        keywords = metadata.get("keywords")
+        if isinstance(keywords, (list, tuple)):
+            for keyword in keywords[:12]:
+                add_facet(keyword)
+        for word in self._surface_words(" ".join([label, text])):
+            add_facet(word)
+            if len(facets) >= limit:
+                break
+        return facets[:limit]
+
+    def _surface_words(self, value: str) -> list[str]:
+        words: list[str] = []
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", str(value or "").lower()):
+            if word in SURFACE_DETAIL_STOP_WORDS:
+                continue
+            if word not in words:
+                words.append(word)
+        return words
+
+    def _surface_detail_badges(self, metadata: dict[str, Any]) -> list[str]:
+        badges: list[str] = []
+        for key in ("context_memory_type", "source_tag", "source", "speaker"):
+            value = self._clean_context_label(str(metadata.get(key) or ""))
+            if value and value not in badges:
+                badges.append(value)
+        return badges[:4]
 
     def capture_conversation(
         self,
@@ -3120,15 +3424,89 @@ class SpikingAttentionBackend:
             context_id=context,
             limit=limit,
         )
+        relationship_entries = {str(entry["memory_id"]): entry for entry in entries}
+        enriched_relationships = [
+            self._decorate_memory_relationship(relationship, relationship_entries)
+            for relationship in relationships
+        ]
         return {
             "context_id": context,
             "memory_db_path": str(self.memory_store.db_path),
             "entry_count": len(entries),
-            "relationship_count": len(relationships),
-            "relationship_summary": self._summarize_relationship_modes(relationships),
+            "relationship_count": len(enriched_relationships),
+            "relationship_summary": self._summarize_relationship_modes(enriched_relationships),
             "entries": entries,
-            "relationships": relationships,
+            "relationships": enriched_relationships,
         }
+
+    def _decorate_memory_relationship(
+        self,
+        relationship: dict[str, Any],
+        entries_by_id: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        source_id = str(relationship.get("source_memory_id") or "")
+        target_id = str(relationship.get("target_memory_id") or "")
+        source_entry = self._relationship_entry(source_id, entries_by_id)
+        target_entry = self._relationship_entry(target_id, entries_by_id)
+        enriched = dict(relationship)
+        if source_entry:
+            enriched["source_label"] = self._surface_label_for_entry(source_entry)
+            enriched["source_summary"] = self._surface_summary_for_entry(source_entry)
+            enriched["source_facets"] = self._surface_facets_for_entry(source_entry)
+        else:
+            enriched["source_label"] = relationship.get("source_tag") or source_id
+            enriched["source_summary"] = ""
+            enriched["source_facets"] = []
+        if target_entry:
+            enriched["target_label"] = self._surface_label_for_entry(target_entry)
+            enriched["target_summary"] = self._surface_summary_for_entry(target_entry)
+            enriched["target_facets"] = self._surface_facets_for_entry(target_entry)
+        else:
+            enriched["target_label"] = relationship.get("target_tag") or target_id
+            enriched["target_summary"] = ""
+            enriched["target_facets"] = []
+        return self._json_safe_metadata(enriched)
+
+    def _relationship_entry(
+        self,
+        memory_id: str,
+        entries_by_id: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if memory_id in entries_by_id:
+            return entries_by_id[memory_id]
+        entry = self.memory_store.get_entry(memory_id)
+        if entry is None:
+            return None
+        return self._render_memory_entry(entry, include_vectors=False)
+
+    def _surface_label_for_entry(self, entry: dict[str, Any]) -> str:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        label = str(metadata.get("display_label") or "").strip()
+        if label:
+            return self._compact_text(label, 96)
+        return self._surface_label_from_fields(
+            tag=str(entry.get("tag") or ""),
+            text=str(entry.get("source_text") or ""),
+            metadata=metadata,
+        )
+
+    def _surface_summary_for_entry(self, entry: dict[str, Any]) -> str:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        summary = str(metadata.get("display_summary") or "").strip()
+        if summary:
+            return self._compact_text(summary, 180)
+        return self._compact_text(str(entry.get("source_text") or ""), 180)
+
+    def _surface_facets_for_entry(self, entry: dict[str, Any]) -> list[str]:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        facets = metadata.get("semantic_facets")
+        if isinstance(facets, (list, tuple)):
+            return [str(facet) for facet in facets[:8] if str(facet).strip()]
+        return self._surface_facets(
+            label=self._surface_label_for_entry(entry),
+            text=str(entry.get("source_text") or ""),
+            metadata=metadata,
+        )
 
     def _summarize_relationship_modes(
         self,
@@ -3767,8 +4145,7 @@ def simulate_spiking_retrieval(embedding: Any, context_id: str = "default") -> s
 
 
 def simulate_spiking_text_retrieval(prompt: str, context_id: str = "default") -> str:
-    backend = get_backend()
-    return backend.query(backend.embed_text(prompt), context_id=context_id)
+    return get_backend().query_text(prompt, context_id=context_id)
 
 
 def register_trace(

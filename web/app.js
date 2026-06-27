@@ -810,9 +810,9 @@ function renderGraph(graph, status) {
       transform: `translate(${position.x} ${position.y})`,
       tabindex: "0",
       role: "button",
-      "aria-label": `Move ${entry.tag}`,
+      "aria-label": `Move ${graphNodeLabel(entry)}`,
     });
-    appendSvg(group, "title", {}, `${entry.tag}\n${entry.source_text || ""}`.trim());
+    appendSvg(group, "title", {}, graphNodeTitle(entry));
     appendSvg(group, "circle", {
       r: entry.metadata?.event_segment ? 20 : 18,
       class: nodeClass(entry),
@@ -821,7 +821,7 @@ function renderGraph(graph, status) {
       y: 34,
       "text-anchor": "middle",
       class: "graph-label",
-    }, compactTag(graphNodeLabel(entry), 22));
+    }, compactTag(graphNodeLabel(entry), 28));
     const score = formatSpikeSubLabel(entry);
     if (score) {
       appendSvg(group, "text", {
@@ -885,6 +885,10 @@ function renderNeuralInspector(graph, status, profile) {
 }
 
 function formatSpikeSubLabel(entry) {
+  const facets = semanticFacets(entry).slice(0, state.neuralInspector ? 3 : 2);
+  if (facets.length) {
+    return facets.join(" / ");
+  }
   const contextMemoryType = entry.metadata?.context_memory_type;
   if (contextMemoryType) {
     return String(contextMemoryType).replaceAll("_", " ");
@@ -939,12 +943,34 @@ function nodeClass(entry) {
 }
 
 function graphNodeLabel(entry) {
+  if (entry.metadata?.display_label) {
+    return entry.metadata.display_label;
+  }
   const contextMemoryType = entry.metadata?.context_memory_type;
   if (!contextMemoryType) return entry.tag;
   if (contextMemoryType === "namespace") {
     return entry.metadata?.context_namespace_title || entry.tag;
   }
   return entry.metadata?.context_label || entry.source_text || entry.tag;
+}
+
+function graphNodeTitle(entry) {
+  const facets = semanticFacets(entry);
+  const lines = [
+    graphNodeLabel(entry),
+    entry.metadata?.display_summary || entry.source_text || "",
+    facets.length ? `facets: ${facets.join(" / ")}` : "",
+    `tag: ${entry.tag}`,
+    entry.memory_id ? `id: ${entry.memory_id}` : "",
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function semanticFacets(entry) {
+  const facets = entry.metadata?.semantic_facets;
+  return Array.isArray(facets)
+    ? facets.map((facet) => String(facet).trim()).filter(Boolean)
+    : [];
 }
 
 function graphTransformAttribute() {
@@ -1248,23 +1274,31 @@ function cssEscape(value) {
 function renderRelationshipLedger(graph) {
   const relationships = (graph.relationships || []).slice(0, 8);
   elements.relationshipLedger.innerHTML = relationships.length
-    ? relationships.map((relationship) => `
+    ? relationships.map((relationship) => {
+      const sourceLabel = relationship.source_label || relationship.source_tag || compactMemoryId(relationship.source_memory_id);
+      const targetLabel = relationship.target_label || relationship.target_tag || compactMemoryId(relationship.target_memory_id);
+      const sourceFacets = Array.isArray(relationship.source_facets) ? relationship.source_facets.slice(0, 2) : [];
+      const targetFacets = Array.isArray(relationship.target_facets) ? relationship.target_facets.slice(0, 2) : [];
+      const facetLine = [...sourceFacets, ...targetFacets].filter(Boolean).join(" / ");
+      const pruneLabel = `${relationship.relation_type || "relationship"} ${sourceLabel} to ${targetLabel}`;
+      return `
         <div class="relationship-ledger-row">
           <div>
             <strong>${escapeHtml(relationship.relation_type || "relationship")}</strong>
-            <small>${escapeHtml(relationship.source_tag || compactMemoryId(relationship.source_memory_id))} -> ${escapeHtml(relationship.target_tag || compactMemoryId(relationship.target_memory_id))}</small>
-            <p>${escapeHtml(compactMemoryId(relationship.relationship_id))}</p>
+            <small>${escapeHtml(sourceLabel)} -> ${escapeHtml(targetLabel)}</small>
+            <p>${escapeHtml(facetLine || compactMemoryId(relationship.relationship_id))}</p>
           </div>
           <span>${escapeHtml(formatNumber(relationship.weight, 3))}</span>
           <time>${escapeHtml(formatTimestamp(relationship.updated_at || relationship.created_at))}</time>
           <button class="danger-button prune-row-button" type="button"
             data-prune-target="relationship"
             data-relationship-id="${escapeHtml(relationship.relationship_id)}"
-            data-prune-label="${escapeHtml(relationship.relation_type || "relationship")}">
+            data-prune-label="${escapeHtml(pruneLabel)}">
             Delete edge
           </button>
         </div>
-      `).join("")
+      `;
+    }).join("")
     : '<div class="memory-ledger-empty">No relationship edges</div>';
 }
 
@@ -1296,13 +1330,15 @@ function renderMemoryLedger(graph) {
   elements.memoryLedger.innerHTML = entries.length
     ? entries.map((entry) => {
       const source = entry.metadata?.source_tag || entry.metadata?.source || entry.context_id || "--";
-      const sourceText = String(entry.source_text || "").trim();
+      const sourceText = String(entry.metadata?.display_summary || entry.source_text || "").trim();
+      const facets = semanticFacets(entry).slice(0, 4).join(" / ");
+      const label = graphNodeLabel(entry);
       const targetType = entry.metadata?.event_segment ? "event" : "memory";
       return `
         <div class="memory-ledger-row">
           <div>
-            <strong>${escapeHtml(entry.tag)}</strong>
-            <small>${escapeHtml(source)} / ${escapeHtml(compactMemoryId(entry.memory_id))}</small>
+            <strong>${escapeHtml(label)}</strong>
+            <small>${escapeHtml(source)} / ${escapeHtml(facets || entry.tag)} / ${escapeHtml(compactMemoryId(entry.memory_id))}</small>
             ${sourceText ? `<p>${escapeHtml(compactTag(sourceText, 120))}</p>` : ""}
           </div>
           <span>${formatNumber(entry.spike_count)} spikes</span>
@@ -1311,7 +1347,7 @@ function renderMemoryLedger(graph) {
             data-prune-target="${targetType}"
             data-memory-id="${escapeHtml(entry.memory_id)}"
             data-tag="${escapeHtml(entry.tag)}"
-            data-prune-label="${escapeHtml(entry.tag)}">
+            data-prune-label="${escapeHtml(label)}">
             Delete node
           </button>
         </div>
@@ -1353,12 +1389,18 @@ function resultCard(item) {
       : item.kind || "status";
   const relation = item.relation_type ? ` / ${item.relation_type}` : "";
   const context = item.context_id ? ` / ${item.context_id}` : "";
+  const facets = Array.isArray(item.facets) && item.facets.length
+    ? ` / ${item.facets.slice(0, 4).join(" / ")}`
+    : "";
+  const title = item.label || item.tag || item.raw || "--";
+  const identity = item.tag && item.tag !== title ? `${item.tag}${facets}` : facets.replace(/^ \/ /, "");
   return `
     <article class="result-card">
       <span>${formatNumber(item.rank || 0)}</span>
       <div>
-        <strong>${escapeHtml(item.tag || item.label || item.raw || "--")}</strong>
-        <small>${escapeHtml(`${score}${relation}${context}`)}</small>
+        <strong>${escapeHtml(title)}</strong>
+        <small>${escapeHtml(`${score}${relation}${context}${identity ? ` / ${identity}` : ""}`)}</small>
+        ${item.summary ? `<p>${escapeHtml(compactTag(item.summary, 120))}</p>` : ""}
       </div>
     </article>
   `;

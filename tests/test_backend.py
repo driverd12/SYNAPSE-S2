@@ -1120,6 +1120,104 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             "namespace-automation-release",
         )
 
+    def test_capture_conversation_adds_surface_node_details_and_relationship_labels(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+
+        backend.capture_conversation(
+            text=(
+                "Thread: Surface detail release. "
+                "Goal: add granular shorthand labels to graph memory nodes. "
+                "Objective: related-topic searches should recall semantic facets, not only event tags. "
+                "Event: user inspected spike nodes and asked for fine surface detail."
+            ),
+            context_id="demo",
+            source_tag="surface-session",
+            speaker="codex",
+        )
+        graph = backend.list_memory_graph(context_id="demo", limit=40)
+        detailed_entries = [
+            entry
+            for entry in graph["entries"]
+            if entry["metadata"].get("context_namespace") == "surface-detail-release"
+        ]
+        namespace_relationships = [
+            relationship
+            for relationship in graph["relationships"]
+            if relationship["relation_type"] == "namespace_contains"
+        ]
+        recall = backend.query(
+            backend.embed_text("fine grained related topic search facets"),
+            context_id="demo",
+        )
+
+        self.assertTrue(detailed_entries)
+        self.assertTrue(
+            all(entry["metadata"].get("display_label") for entry in detailed_entries)
+        )
+        self.assertTrue(
+            all(entry["metadata"].get("display_summary") for entry in detailed_entries)
+        )
+        self.assertTrue(
+            all(entry["metadata"].get("semantic_facets") for entry in detailed_entries)
+        )
+        self.assertTrue(namespace_relationships)
+        self.assertTrue(
+            all(relationship.get("source_label") for relationship in namespace_relationships)
+        )
+        self.assertTrue(
+            all(relationship.get("target_label") for relationship in namespace_relationships)
+        )
+        self.assertIn("label=", recall)
+        self.assertIn("facets=", recall)
+        self.assertIn("surface", recall.lower())
+
+    def test_query_text_uses_surface_facets_for_related_topic_recall(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        backend.capture_conversation(
+            text=(
+                "Thread: Surface detail release. "
+                "Goal: make graph nodes expose short semantic labels, summaries, and facets. "
+                "Objective: related-topic recall should show why nodes matched instead of only raw event tags."
+            ),
+            context_id="demo",
+            source_tag="surface-session",
+            speaker="codex",
+        )
+        backend.capture_conversation(
+            text=(
+                "Thread: Startup boundary noise. "
+                "Event: clients ended and reported generic recall statistics."
+            ),
+            context_id="demo",
+            source_tag="client-session-boundary",
+            speaker="codex",
+        )
+
+        recall = backend.query_text(
+            "surface detail semantic facets related topic",
+            context_id="demo",
+        )
+
+        self.assertIn("Surface detail release", recall)
+        self.assertIn("facets=", recall)
+        self.assertIn("semantic", recall.lower())
+
     def test_prune_memory_removes_nodes_edges_modes_and_context_events(self):
         backend = SpikingAttentionBackend(
             dimension=32,

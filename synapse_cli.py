@@ -166,7 +166,7 @@ def command_query_text(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "context_id": mlx_backend.sanitize_context_id(args.context),
         "embedding_provider": embedding["provenance"],
-        "result": backend.query(embedding["embedding"], context_id=args.context),
+        "result": backend.query_text(args.text, context_id=args.context),
     }
 
 
@@ -572,10 +572,7 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     memory_db_path = Path(status["memory_db_path"]).expanduser()
     query_result = ""
     if args.query_text:
-        query_result = backend.query(
-            backend.embed_text(args.query_text),
-            context_id=args.context,
-        )
+        query_result = backend.query_text(args.query_text, context_id=args.context)
 
     checks = {
         "dependencies_importable": all(

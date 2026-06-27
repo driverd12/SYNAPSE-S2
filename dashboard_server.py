@@ -282,10 +282,7 @@ class DashboardRuntime:
             context = self._context_from_payload(payload)
             prompt = self._text_payload(payload, "prompt", max_bytes=MAX_TEXT_BYTES)
             started = time.perf_counter()
-            result = self.backend.query(
-                self.backend.embed_text(prompt),
-                context_id=context,
-            )
+            result = self.backend.query_text(prompt, context_id=context)
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
             return self._json_response(
                 {
@@ -599,10 +596,7 @@ class DashboardRuntime:
         prompt = self._audit_prompt(graph)
         query_result = ""
         if prompt:
-            query_result = self.backend.query(
-                self.backend.embed_text(prompt),
-                context_id=context,
-            )
+            query_result = self.backend.query_text(prompt, context_id=context)
         target_max = float(profile.get("target_envelope_mb", {}).get("max", 138.0))
         estimated_mb = float(profile.get("estimated_total_mb") or 0.0)
         checks = {
@@ -774,6 +768,16 @@ class DashboardRuntime:
             item["memory_id"] = metadata["id"]
         if "linked" in metadata:
             item["relation_type"] = metadata["linked"]
+        if "label" in metadata:
+            item["label"] = metadata["label"]
+        if "facets" in metadata:
+            item["facets"] = [
+                facet.strip()
+                for facet in str(metadata["facets"]).split("|")
+                if facet.strip()
+            ]
+        if "summary" in metadata:
+            item["summary"] = metadata["summary"]
         return item
 
     def _parse_key_value_pairs(self, text: str) -> dict[str, Any]:
