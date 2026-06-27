@@ -162,7 +162,7 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 neuron_indices=[3, 4],
             )
             second = store.upsert_entry(
-                tag="safe-event-002",
+                tag="retained-event-002",
                 context_id="demo",
                 source_text="Retained context.",
                 metadata={"event_segment": True},
@@ -187,7 +187,7 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(deletion["deleted_memory_id"], first["memory_id"])
         self.assertEqual(deletion["deleted_relationship_count"], 1)
         self.assertGreaterEqual(deletion["deleted_memory_event_count"], 1)
-        self.assertEqual([entry["tag"] for entry in remaining_entries], ["safe-event-002"])
+        self.assertEqual([entry["tag"] for entry in remaining_entries], ["retained-event-002"])
         self.assertEqual(remaining_relationships, [])
 
     def test_delete_relationship_and_relationship_modes_are_precise(self):

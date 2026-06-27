@@ -328,6 +328,72 @@ class McpServerTests(unittest.TestCase):
             all("sk-test-secret123" not in entry["source_text"] for entry in graph["entries"])
         )
 
+    def test_mcp_transcript_source_register_poll_and_clipboard_capture(self):
+        transcript = Path(self.tmpdir.name) / "claude-session.log"
+        transcript.write_text("Existing Claude transcript line.\n", encoding="utf-8")
+
+        registered = json.loads(
+            mcp_server.register_spiking_transcript_source(
+                source_id="claude-file",
+                path=str(transcript),
+                context_id="demo",
+                source_tag="claude-file",
+                speaker="claude",
+                confirmed=True,
+            )
+        )
+        transcript.write_text(
+            transcript.read_text(encoding="utf-8")
+            + "New Claude Desktop transcript delta. api_key=sk-mcp-secret123\n",
+            encoding="utf-8",
+        )
+        polled = json.loads(
+            mcp_server.poll_spiking_transcript_sources(source_id="claude-file")
+        )
+        clipboard = json.loads(
+            mcp_server.capture_spiking_clipboard(
+                text="Selected app transcript copied intentionally. token=sk-clip-secret123",
+                context_id="demo",
+                source_tag="frontmost-selection",
+                speaker="operator",
+            )
+        )
+        listed = json.loads(mcp_server.list_spiking_transcript_sources())
+        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+
+        self.assertEqual(registered["source_id"], "claude-file")
+        self.assertGreaterEqual(polled["captured_event_count"], 1)
+        self.assertEqual(clipboard["adapter_kind"], "clipboard-once")
+        self.assertEqual(listed["source_count"], 1)
+        self.assertTrue(
+            any(
+                entry["metadata"].get("transcript_adapter") is True
+                for entry in graph["entries"]
+            )
+        )
+        self.assertTrue(
+            all("sk-mcp-secret123" not in entry["source_text"] for entry in graph["entries"])
+        )
+
+    def test_mcp_app_connect_can_register_manual_local_app(self):
+        connected = json.loads(
+            mcp_server.connect_spiking_app(
+                app_name="Codex IDE",
+                bundle_id="com.openai.codex",
+                pid=4242,
+                context_id="demo",
+                source_tag="codex-ide",
+                speaker="codex",
+                confirmed=True,
+                allow_manual=True,
+            )
+        )
+        connections = json.loads(mcp_server.list_spiking_app_connections())
+
+        self.assertEqual(connected["app_name"], "Codex IDE")
+        self.assertEqual(connected["bundle_id"], "com.openai.codex")
+        self.assertEqual(connections["connection_count"], 1)
+
     def test_context_deployment_tool_lists_published_thoughts_for_connected_agents(self):
         registration = json.loads(
             mcp_server.remember_spiking_context(

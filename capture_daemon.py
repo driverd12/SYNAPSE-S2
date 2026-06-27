@@ -326,6 +326,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-files", type=int, default=50)
+    parser.add_argument("--poll-transcript-sources", action="store_true")
+    parser.add_argument("--max-transcript-bytes", type=int, default=256_000)
     return parser
 
 
@@ -344,12 +346,43 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     daemon = CaptureInboxDaemon(root=args.capture_root, backend=backend_from_args(args))
     if args.once:
-        print(json.dumps(daemon.process_once(max_files=args.max_files), sort_keys=True, default=str))
+        result = daemon.process_once(max_files=args.max_files)
+        if args.poll_transcript_sources:
+            result["transcript_sources"] = _poll_transcript_sources(
+                root=args.capture_root,
+                backend=daemon.backend,
+                max_bytes=args.max_transcript_bytes,
+            )
+        print(json.dumps(result, sort_keys=True, default=str))
         return 0
     LOGGER.info("starting SYNAPSE-S2 capture inbox daemon root=%s", daemon.root)
     while True:
         daemon.process_once(max_files=args.max_files)
+        if args.poll_transcript_sources:
+            _poll_transcript_sources(
+                root=args.capture_root,
+                backend=daemon.backend,
+                max_bytes=args.max_transcript_bytes,
+            )
         time.sleep(max(0.25, float(args.poll_interval)))
+
+
+def _poll_transcript_sources(
+    *,
+    root: str | os.PathLike[str] | None,
+    backend: mlx_backend.SpikingAttentionBackend,
+    max_bytes: int,
+) -> dict[str, Any]:
+    try:
+        import transcript_capture
+
+        return transcript_capture.TranscriptCaptureManager(
+            root=root,
+            backend=backend,
+        ).poll_sources(max_bytes=max_bytes)
+    except Exception as exc:
+        LOGGER.exception("transcript source polling failed")
+        return {"error": str(exc)}
 
 
 if __name__ == "__main__":

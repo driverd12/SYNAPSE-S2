@@ -85,7 +85,7 @@ Event graph ingestion:
 .venv/bin/python synapse_cli.py --json graph --context default --limit 10
 ```
 
-The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship. Event memory metadata should also include `surprise_model`, `surprise_mode`, `semantic_surprise_score`, and `lexical_surprise_score`. `surprise_mode: embedding` means the boundary was cut from the configured local provider's cosine-distance signal; `surprise_mode: lexical` means SYNAPSE-S2 safely fell back to token-overlap surprise.
+The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship. Event memory metadata should also include `surprise_model`, `surprise_mode`, `semantic_surprise_score`, and `lexical_surprise_score`. `surprise_mode: embedding` means the boundary was cut from the configured local provider's cosine-distance signal; `surprise_mode: lexical` means SYNAPSE-S2 used the hardened token-overlap fallback.
 
 Agent context hydration:
 
@@ -129,7 +129,41 @@ scripts/install_capture_daemon.sh
 .venv/bin/python synapse_cli.py --json capture-inbox-status
 ```
 
-The sidecar watches `.synapse_s2/capture_inbox`, redacts common secret patterns, ingests pending payloads into real temporal event memories, then moves files to `.synapse_s2/capture_processed`. This is the production-safe "magic" layer: clients and hooks still opt in by writing payloads, but no running dashboard or terminal session has to stay open for ingestion.
+The sidecar watches `.synapse_s2/capture_inbox`, redacts common secret patterns, ingests pending payloads into real temporal event memories, then moves files to `.synapse_s2/capture_processed`. This is the production-hardened "magic" layer: clients and hooks still opt in by writing payloads, but no running dashboard or terminal session has to stay open for ingestion.
+
+App Connect:
+
+```bash
+.venv/bin/python synapse_cli.py --json app-list
+.venv/bin/python synapse_cli.py --json app-connect \
+  --context default \
+  --app-name "Google Chrome" \
+  --tag chrome-live \
+  --speaker operator \
+  --confirm
+.venv/bin/python synapse_cli.py --json app-connections
+.venv/bin/python synapse_cli.py --json app-snapshot \
+  --connection-id "<connection-id-from-app-connections>" \
+  --confirm
+scripts/capture_frontmost_selection.sh default frontmost-selection operator
+```
+
+Use App Connect when an already-running local app needs to contribute context. `app-list` detects attachable local apps through a fast filtered process-list scan, `app-connect` records an explicit local attachment, `app-snapshot` captures a redacted Accessibility snapshot into memory, and the frontmost-selection helper captures intentionally selected text once while restoring the prior clipboard. If macOS asks for Accessibility permission, approve Terminal/Codex for this local capture workflow and rerun the command.
+
+Transcript file deltas:
+
+```bash
+.venv/bin/python synapse_cli.py --json transcript-source-add \
+  --context default \
+  --source-id codex-live \
+  --path /path/to/session.log \
+  --tag codex-live \
+  --speaker codex \
+  --confirm
+.venv/bin/python synapse_cli.py --json transcript-source-poll --source-id codex-live
+```
+
+Use transcript sources for local tools that already write session logs. SYNAPSE-S2 stores the file path hash, tails only new bytes after registration by default, caps each poll, redacts common secret shapes, and writes captured deltas as real event graph memory.
 
 Hand pruning:
 
@@ -212,7 +246,7 @@ Launch the loopback dashboard:
 open "http://127.0.0.1:8765/?context_id=default"
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, App Connect local app detection/attachment/snapshot capture, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default

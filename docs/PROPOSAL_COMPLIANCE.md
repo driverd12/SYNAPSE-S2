@@ -34,7 +34,8 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Dual graph memory protocol for episodic-semantic relationships | Implemented | `memory_relationships` table in `memory_store.py`, `list_spiking_memory_graph`, graph-expanded recall, deep-sleep relationship extraction |
 | Agent/operator conversation capture into event memory | Implemented | `capture_spiking_conversation`, `synapse_cli.py capture-session`, `/api/capture-conversation`, GUI capture form |
 | Always-on local session capture sidecar | Implemented as opt-in capture inbox | `capture_daemon.py`, `drop_spiking_capture_inbox`, `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, `/api/capture-inbox`, `scripts/install_capture_daemon.sh` |
-| Operator safety pruning for bad or sensitive graph data | Implemented | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, `/api/prune-memory`, GUI safety prune controls |
+| Local app attachment and transcript capture lane | Implemented | `transcript_capture.py`, CLI `app-list` / `app-connect` / `app-snapshot` / `capture-clipboard` / `transcript-source-*`, MCP App Connect and transcript tools, dashboard App Connect panel, `scripts/capture_frontmost_selection.sh`, tests |
+| Operator graph pruning for bad or sensitive graph data | Implemented | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, `/api/prune-memory`, GUI graph prune controls |
 | Shared state across Codex/Claude/direct CLI surfaces | Implemented | `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, launcher, common `.synapse_s2/memory.sqlite3` |
 | Codex, Claude Desktop, and Claude Code client registration | Implemented | `client_config.py`, `scripts/install_client_configs.py`, `tests/test_client_config.py` |
 | Project-root state discovery through client environment | Implemented | `SYNAPSE_S2_*` envs, plus `CLAUDE_PROJECT_DIR` / `CODEX_PROJECT_DIR` fallback in `mlx_backend.py` |
@@ -64,11 +65,13 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Segment long text into event memory graph | `ingest_spiking_memory_text`, `synapse_cli.py ingest-text` |
 | Capture real session conversation notes | `capture_spiking_conversation`, `synapse_cli.py capture-session`, dashboard Conversation capture |
 | Drop and process sidecar session payloads | `drop_spiking_capture_inbox`, `get_spiking_capture_inbox_status`, `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, dashboard Magic Capture |
+| Attach a running local app and capture a redacted snapshot or selected text | `list_spiking_running_apps`, `connect_spiking_app`, `capture_spiking_app_snapshot`, `capture_spiking_clipboard`, CLI `app-list` / `app-connect` / `app-snapshot` / `capture-clipboard`, dashboard App Connect, `scripts/capture_frontmost_selection.sh` |
+| Register local transcript/log deltas | `register_spiking_transcript_source`, `list_spiking_transcript_sources`, `poll_spiking_transcript_sources`, CLI `transcript-source-*` |
 | Query vector or text recall | `query_spiking_attention`, `query_spiking_attention_text`, CLI equivalents |
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
 | List/export/backup persisted memory | MCP and CLI memory commands |
 | Inspect event relationships | `list_spiking_memory_graph`, `synapse_cli.py graph` |
-| Hand-prune nodes, edges, deployment events, temporal edges, or associative edges | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, dashboard Safety Prune |
+| Hand-prune nodes, edges, deployment events, temporal edges, or associative edges | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, dashboard Graph Prune |
 | Pull and acknowledge context deployments | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, `synapse_cli.py pull-context/ack-context/list-context-cursors` |
 | Hydrate a restarted agent from memory | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief` |
 | Run governed agent work sessions | `enter_spiking_cortex`, `tick_spiking_cortex` with intended file/tool scope, `commit_spiking_cortical_trace`, `moderate_spiking_cortical_trace`, `get_spiking_cortex_state`, CLI `enter-cortex` / `cortex-tick` / `commit-cortex` / `moderate-cortex` / `cortex-state`, dashboard Cortex Governor |
@@ -83,11 +86,11 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Proposal language | Current implementation | Rationale |
 | :--- | :--- | :--- |
 | Raw `uv run mcp_server.py` in client config | Configs point to `/Users/dan.driver/.local/bin/synapse-s2-mcp` | The workspace path contains spaces and a colon. The launcher preserves the same synced `uv` environment while avoiding client command-splitting failures. |
-| Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and safe for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
+| Deep sleep invokes a localized language model reasoning engine | Deep sleep is deterministic local Hebbian Distillation over MLX state and SQLite memory | Keeps the tool offline, reproducible, and hardened for stdio MCP use tomorrow. No external model call is needed to produce the semantic hierarchy. |
 | "Deploy to all connected agents" language | Deployment is durable local pull with per-agent acknowledgement cursors | Local desktop clients do not expose a reliable push bus. Durable pull plus receipts is auditable and survives client restarts. |
-| "Magic" passive capture | Implemented as a local always-on inbox plus MCP startup/Cortex/session-boundary bridge, not unauthorized scraping of arbitrary app state | MCP clients hydrate automatically on server startup, enter Cortex, and drop sanitized boundary notes plus typed cortical lifecycle traces on exit. Full chat capture still requires clients, hooks, or operators to explicitly write payloads. |
+| "Magic" passive capture | Implemented as a local always-on inbox, MCP startup/Cortex/session-boundary bridge, explicit transcript sources, selected-text capture, and confirmed App Connect snapshots | MCP clients hydrate automatically on server startup, enter Cortex, and drop sanitized boundary notes plus typed cortical lifecycle traces on exit. Full chat capture still requires a local capture path, but operators can now attach running apps through a hardened local connector. |
 | Text embeddings from arbitrary client text | Default installed client provider is `mlx-neural-v1` using `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`; deterministic `semantic-hash-v1` and `python:/path.py:function` remain available | Real local neural embeddings now back text capture/recall while preserving an offline no-model fallback and explicit provenance on every text memory. |
-| Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-safe 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
+| Proposal-scale multi-tier topology with very large neuron counts | Backend is configurable and defaults to a Mac-optimized 5,000-neuron recurrent substrate | A dense 150,000-neuron lateral matrix is not a practical default for a local tomorrow-ready tool. Neuron count can be raised through `SYNAPSE_S2_NEURONS` or CLI args after profiling. |
 | VRAM envelope language | Resource profile estimates resident MLX array footprint from live shapes and dtypes, with optional quick-prune benchmark and certification evidence payload | This is the right readiness signal for tomorrow. External Metal/Instruments counter capture can be added later for hardware certification. |
 
 ## Research Extensions Not Claimed Complete
@@ -98,7 +101,7 @@ These items are present in the architecture document as longer-horizon research 
 - Training-time MSLeaky/ALIF comparisons, chunked BPTT, state detachment, and STE gradient training.
 - Online probabilistic Bayesian surprise over live token streams; current event segmentation is deterministic over configured local embedding-provider cosine distance, persists semantic and lexical boundary scores, and keeps lexical fallback for predictable MCP stdio behavior.
 - External Metal counter / Instruments validation of peak GPU residency across multiple Apple Silicon SKUs; current certification evidence is MLX/topology/runtime based.
-- Invisible capture of arbitrary already-running Codex/Claude chat transcript content without client cooperation; the MCP process boundary is captured, but full chat text still requires explicit client/tool/hook payloads.
+- Invisible capture of arbitrary already-running Codex/Claude chat transcript content without a local capture path; the MCP process boundary is captured, App Connect can attach visible local apps, and selected text/transcript files can be captured, but unsupported private transcript stores are not treated as a guaranteed interface.
 
 ## Current Verification Command
 

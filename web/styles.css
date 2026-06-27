@@ -1265,6 +1265,25 @@ textarea {
   color: var(--red);
 }
 
+.app-connect-panel {
+  min-height: 264px;
+}
+
+.app-connect-form {
+  margin-top: 12px;
+}
+
+.app-connect-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.app-connect-actions .primary-button,
+.app-connect-actions .secondary-button {
+  min-width: 0;
+}
+
 .panel-note {
   border-top: 1px solid var(--row);
   margin-top: 12px;
@@ -1839,7 +1858,7 @@ textarea {
   gap: 8px;
 }
 
-.graph-safety-panel {
+.graph-prune-panel {
   display: grid;
   gap: 10px;
   margin-top: 12px;
@@ -1849,7 +1868,7 @@ textarea {
   padding: 12px;
 }
 
-.graph-safety-panel h3 {
+.graph-prune-panel h3 {
   margin: 0;
   color: var(--text);
   font-size: 14px;

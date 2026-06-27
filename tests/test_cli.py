@@ -510,6 +510,118 @@ class SynapseCliTests(unittest.TestCase):
             all("sk-test-secret123" not in entry["source_text"] for entry in graph_payload["entries"])
         )
 
+    def test_cli_transcript_source_register_poll_and_clipboard_capture(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            capture_root = Path(tmp) / "capture-root"
+            transcript = Path(tmp) / "codex-session.log"
+            transcript.write_text("Historical transcript line.\n", encoding="utf-8")
+
+            add_source = self.run_cli(
+                "transcript-source-add",
+                "--context",
+                "demo",
+                "--source-id",
+                "codex-file",
+                "--path",
+                str(transcript),
+                "--tag",
+                "codex-file",
+                "--speaker",
+                "codex",
+                "--capture-root",
+                str(capture_root),
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            transcript.write_text(
+                transcript.read_text(encoding="utf-8")
+                + "New Codex transcript delta reaches SYNAPSE-S2. token=sk-cli-secret123\n",
+                encoding="utf-8",
+            )
+            poll = self.run_cli(
+                "transcript-source-poll",
+                "--source-id",
+                "codex-file",
+                "--capture-root",
+                str(capture_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            clipboard = self.run_cli(
+                "capture-clipboard",
+                "--context",
+                "demo",
+                "--tag",
+                "operator-selection",
+                "--speaker",
+                "operator",
+                "--text",
+                "Selected browser transcript. password=clip-secret",
+                "--capture-root",
+                str(capture_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            listing = self.run_cli(
+                "transcript-source-list",
+                "--capture-root",
+                str(capture_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(add_source.returncode, 0, add_source.stderr)
+        self.assertEqual(poll.returncode, 0, poll.stderr)
+        self.assertEqual(clipboard.returncode, 0, clipboard.stderr)
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertEqual(json.loads(add_source.stdout)["source_id"], "codex-file")
+        self.assertGreaterEqual(json.loads(poll.stdout)["captured_event_count"], 1)
+        self.assertEqual(json.loads(clipboard.stdout)["adapter_kind"], "clipboard-once")
+        self.assertEqual(json.loads(listing.stdout)["source_count"], 1)
+
+    def test_cli_app_connect_can_register_manual_local_app(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            capture_root = Path(tmp) / "capture-root"
+
+            connected = self.run_cli(
+                "app-connect",
+                "--context",
+                "demo",
+                "--app-name",
+                "Codex IDE",
+                "--bundle-id",
+                "com.openai.codex",
+                "--pid",
+                "4242",
+                "--tag",
+                "codex-ide",
+                "--speaker",
+                "codex",
+                "--capture-root",
+                str(capture_root),
+                "--confirm",
+                "--allow-manual",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            connections = self.run_cli(
+                "app-connections",
+                "--capture-root",
+                str(capture_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(connected.returncode, 0, connected.stderr)
+        self.assertEqual(connections.returncode, 0, connections.stderr)
+        self.assertEqual(json.loads(connected.stdout)["app_name"], "Codex IDE")
+        self.assertEqual(json.loads(connections.stdout)["connection_count"], 1)
+
     def test_cli_publishes_and_acknowledges_context_deployments(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

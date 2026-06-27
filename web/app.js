@@ -26,6 +26,10 @@ const state = {
     unlockedUntilMs: 0,
     lockTimer: null,
   },
+  appConnect: {
+    apps: [],
+    connections: [],
+  },
   cortex: {
     sessionId: "",
   },
@@ -33,6 +37,17 @@ const state = {
 
 const elements = collectElements([
   "apiState",
+  "appConnectButton",
+  "appConnectForm",
+  "appConnectState",
+  "appConnectSubmitButton",
+  "appConnectionSelect",
+  "appManualName",
+  "appRefreshButton",
+  "appSelect",
+  "appSnapshotButton",
+  "appSourceTag",
+  "appSpeaker",
   "arrayCount",
   "arrayList",
   "backupButton",
@@ -403,6 +418,80 @@ function renderCaptureInbox(captureInbox) {
     <strong>${escapeHtml(headline)}</strong>
     <small>${escapeHtml(detail)}</small>
   `;
+}
+
+function renderAppConnect(appPayload = null, connectionPayload = null) {
+  if (appPayload?.apps) {
+    state.appConnect.apps = appPayload.apps;
+  }
+  if (connectionPayload?.connections) {
+    state.appConnect.connections = connectionPayload.connections;
+  }
+
+  const previousAppValue = elements.appSelect.value;
+  const appOptions = [
+    new Option(
+      state.appConnect.apps.length
+        ? "Select a detected app"
+        : "Press Detect to list running apps",
+      "",
+    ),
+  ];
+  state.appConnect.apps.forEach((app, index) => {
+    const option = new Option(appOptionLabel(app), String(index));
+    option.title = `${app.bundle_id || "no bundle id"} pid:${app.pid || 0}`;
+    appOptions.push(option);
+  });
+  elements.appSelect.replaceChildren(...appOptions);
+  if ([...elements.appSelect.options].some((option) => option.value === previousAppValue)) {
+    elements.appSelect.value = previousAppValue;
+  }
+
+  const previousConnection = elements.appConnectionSelect.value;
+  const connectionOptions = [
+    new Option(
+      state.appConnect.connections.length
+        ? "Select attached connection"
+        : "No apps attached",
+      "",
+    ),
+  ];
+  state.appConnect.connections.forEach((connection) => {
+    const option = new Option(
+      `${connection.app_name} -> ${connection.source_tag}`,
+      connection.connection_id,
+    );
+    option.title = `${connection.bundle_id || "no bundle id"} pid:${connection.pid || 0}`;
+    connectionOptions.push(option);
+  });
+  elements.appConnectionSelect.replaceChildren(...connectionOptions);
+  if ([...elements.appConnectionSelect.options].some((option) => option.value === previousConnection)) {
+    elements.appConnectionSelect.value = previousConnection;
+  }
+
+  const detected = Number(appPayload?.app_count ?? state.appConnect.apps.length);
+  const connected = Number(connectionPayload?.connection_count ?? state.appConnect.connections.length);
+  const headline = connected
+    ? `${formatNumber(connected)} app connection${connected === 1 ? "" : "s"} armed`
+    : detected
+      ? `${formatNumber(detected)} running app${detected === 1 ? "" : "s"} detected`
+      : "App Connect idle";
+  const detail = connected
+    ? "Choose an attached connection and snapshot it into memory when the app state matters."
+    : detected
+      ? "Select a detected app, set a source tag, then connect it to this context."
+      : "Detect local apps, attach one, then capture a redacted snapshot into SYNAPSE-S2 memory.";
+  elements.appConnectState.className = `capture-inbox-state ${connected || detected ? "ready" : ""}`.trim();
+  elements.appConnectState.innerHTML = `
+    <strong>${escapeHtml(headline)}</strong>
+    <small>${escapeHtml(detail)}</small>
+  `;
+}
+
+function appOptionLabel(app) {
+  const pid = Number(app.pid || 0);
+  const bundle = app.bundle_id ? ` / ${app.bundle_id}` : "";
+  return `${app.app_name}${bundle}${pid ? ` / pid ${pid}` : ""}`;
 }
 
 function renderCortexState(cortex) {
@@ -1520,6 +1609,81 @@ async function publishAwareResult(payload) {
   return payload;
 }
 
+async function refreshAppConnect({ detect = true } = {}) {
+  const [apps, connections] = await Promise.all([
+    detect ? requestJson("/api/apps") : Promise.resolve(null),
+    requestJson("/api/app-connections"),
+  ]);
+  renderAppConnect(apps, connections);
+  return {
+    action: "refresh-app-connect",
+    detected_apps: apps?.app_count ?? state.appConnect.apps.length,
+    app_connections: connections.connection_count,
+    apps: apps?.apps ?? state.appConnect.apps,
+    connections: connections.connections,
+  };
+}
+
+function selectedDetectedApp() {
+  const index = Number(elements.appSelect.value);
+  if (!Number.isInteger(index) || index < 0) {
+    return null;
+  }
+  return state.appConnect.apps[index] || null;
+}
+
+async function connectSelectedApp(button) {
+  const selected = selectedDetectedApp();
+  const manualName = elements.appManualName.value.trim();
+  const appName = selected?.app_name || manualName;
+  if (!appName) {
+    logOperation("App Connect rejected", "detect and select a running app, or enter a manual app name");
+    elements.appManualName.focus();
+    return null;
+  }
+  return withBusy(button, "App Connect", async () => {
+    const payload = await requestJson("/api/app-connect", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        app_name: appName,
+        bundle_id: selected?.bundle_id || "",
+        pid: Number(selected?.pid || 0),
+        source_tag: elements.appSourceTag.value.trim() || "app-connect",
+        speaker: elements.appSpeaker.value.trim() || "operator",
+        confirm: true,
+        allow_manual: !selected,
+        metadata: { source: "dashboard-app-connect" },
+      },
+    });
+    await refreshAppConnect({ detect: false });
+    elements.appConnectionSelect.value = payload.connection_id || "";
+    return payload;
+  }, { refresh: false });
+}
+
+async function snapshotConnectedApp(button) {
+  const connectionId = elements.appConnectionSelect.value.trim();
+  if (!connectionId) {
+    logOperation("App snapshot rejected", "connect an app first, then choose the attached connection");
+    elements.appConnectionSelect.focus();
+    return null;
+  }
+  return withBusy(button, "App snapshot", async () => {
+    const payload = await requestJson("/api/app-snapshot", {
+      method: "POST",
+      body: {
+        connection_id: connectionId,
+        confirm: true,
+        metadata: { source: "dashboard-app-snapshot" },
+      },
+    });
+    await publishAwareResult(payload);
+    await refreshAppConnect({ detect: false });
+    return payload;
+  });
+}
+
 function currentCortexAgentId() {
   return elements.cortexAgentId.value.trim() || "dashboard-ui";
 }
@@ -2079,7 +2243,34 @@ elements.captureInboxButton.addEventListener("click", () => {
   });
 });
 
+elements.appConnectButton.addEventListener("click", () => {
+  document.getElementById("appConnect")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  withBusy(elements.appConnectButton, "App Connect detect", () => (
+    refreshAppConnect({ detect: true })
+  ), { refresh: false });
+});
+
+elements.appRefreshButton.addEventListener("click", () => {
+  withBusy(elements.appRefreshButton, "Detect apps", () => (
+    refreshAppConnect({ detect: true })
+  ), { refresh: false });
+});
+
+elements.appConnectForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await connectSelectedApp(elements.appConnectSubmitButton);
+});
+
+elements.appSnapshotButton.addEventListener("click", () => {
+  snapshotConnectedApp(elements.appSnapshotButton);
+});
+
 refreshSnapshot()
   .catch((error) => {
     logOperation("Initial load failed", error.message);
+  });
+
+refreshAppConnect({ detect: false })
+  .catch((error) => {
+    logOperation("App Connect init failed", error.message);
   });

@@ -10,6 +10,7 @@ from typing import Any
 
 from capture_daemon import CaptureInboxDaemon, write_capture_drop
 import mlx_backend
+from transcript_capture import TranscriptCaptureManager
 
 
 def _json_default(value: Any) -> str:
@@ -280,6 +281,76 @@ def command_capture_inbox_status(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_capture_inbox_process(args: argparse.Namespace) -> dict[str, Any]:
     return _capture_daemon_from_args(args).process_once(max_files=args.max_files)
+
+
+def _transcript_manager_from_args(args: argparse.Namespace) -> TranscriptCaptureManager:
+    return TranscriptCaptureManager(root=args.capture_root, backend=build_backend(args))
+
+
+def command_transcript_source_add(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).register_file_source(
+        source_id=args.source_id,
+        path=args.path,
+        context_id=args.context,
+        source_tag=args.tag,
+        speaker=args.speaker,
+        metadata=parse_metadata(args.metadata),
+        confirmed=bool(args.confirm),
+        start_at_end=not bool(args.start_at_beginning),
+        enabled=not bool(args.disabled),
+    )
+
+
+def command_transcript_source_list(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).list_sources()
+
+
+def command_transcript_source_poll(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).poll_sources(
+        source_id=args.source_id,
+        max_bytes=args.max_bytes,
+    )
+
+
+def command_capture_clipboard(args: argparse.Namespace) -> dict[str, Any]:
+    text = _text_from_args(args)
+    return _transcript_manager_from_args(args).capture_clipboard_once(
+        text=text if text.strip() else None,
+        context_id=args.context,
+        source_tag=args.tag,
+        speaker=args.speaker,
+        metadata=parse_metadata(args.metadata),
+    )
+
+
+def command_app_list(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).detect_running_apps()
+
+
+def command_app_connect(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).connect_running_app(
+        app_name=args.app_name,
+        bundle_id=args.bundle_id,
+        pid=args.pid,
+        context_id=args.context,
+        source_tag=args.tag,
+        speaker=args.speaker,
+        metadata=parse_metadata(args.metadata),
+        confirmed=bool(args.confirm),
+        allow_manual=bool(args.allow_manual),
+    )
+
+
+def command_app_connections(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).list_app_connections()
+
+
+def command_app_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).capture_app_snapshot(
+        connection_id=args.connection_id,
+        confirmed=bool(args.confirm),
+        metadata=parse_metadata(args.metadata),
+    )
 
 
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
@@ -717,6 +788,67 @@ def build_parser() -> argparse.ArgumentParser:
     capture_inbox_process.add_argument("--capture-root", default=None)
     capture_inbox_process.add_argument("--max-files", type=int, default=50)
     capture_inbox_process.set_defaults(func=command_capture_inbox_process)
+
+    transcript_source_add = subparsers.add_parser("transcript-source-add")
+    add_context(transcript_source_add)
+    transcript_source_add.add_argument("--source-id", required=True)
+    transcript_source_add.add_argument("--path", required=True)
+    transcript_source_add.add_argument("--tag", default="transcript-source")
+    transcript_source_add.add_argument("--speaker", default="operator")
+    transcript_source_add.add_argument("--metadata", default=None)
+    transcript_source_add.add_argument("--capture-root", default=None)
+    transcript_source_add.add_argument("--start-at-beginning", action="store_true")
+    transcript_source_add.add_argument("--disabled", action="store_true")
+    transcript_source_add.add_argument("--confirm", action="store_true")
+    transcript_source_add.set_defaults(func=command_transcript_source_add)
+
+    transcript_source_list = subparsers.add_parser("transcript-source-list")
+    transcript_source_list.add_argument("--capture-root", default=None)
+    transcript_source_list.set_defaults(func=command_transcript_source_list)
+
+    transcript_source_poll = subparsers.add_parser("transcript-source-poll")
+    transcript_source_poll.add_argument("--capture-root", default=None)
+    transcript_source_poll.add_argument("--source-id", default="")
+    transcript_source_poll.add_argument("--max-bytes", type=int, default=256000)
+    transcript_source_poll.set_defaults(func=command_transcript_source_poll)
+
+    capture_clipboard = subparsers.add_parser("capture-clipboard")
+    add_context(capture_clipboard)
+    capture_clipboard.add_argument("--tag", default="frontmost-selection")
+    capture_clipboard.add_argument("--speaker", default="operator")
+    capture_clipboard.add_argument("--text", default="")
+    capture_clipboard.add_argument("--text-file", default=None)
+    capture_clipboard.add_argument("--metadata", default=None)
+    capture_clipboard.add_argument("--capture-root", default=None)
+    capture_clipboard.set_defaults(func=command_capture_clipboard)
+
+    app_list = subparsers.add_parser("app-list")
+    app_list.add_argument("--capture-root", default=None)
+    app_list.set_defaults(func=command_app_list)
+
+    app_connect = subparsers.add_parser("app-connect")
+    add_context(app_connect)
+    app_connect.add_argument("--app-name", required=True)
+    app_connect.add_argument("--bundle-id", default="")
+    app_connect.add_argument("--pid", type=int, default=0)
+    app_connect.add_argument("--tag", default="app-connect")
+    app_connect.add_argument("--speaker", default="operator")
+    app_connect.add_argument("--metadata", default=None)
+    app_connect.add_argument("--capture-root", default=None)
+    app_connect.add_argument("--confirm", action="store_true")
+    app_connect.add_argument("--allow-manual", action="store_true")
+    app_connect.set_defaults(func=command_app_connect)
+
+    app_connections = subparsers.add_parser("app-connections")
+    app_connections.add_argument("--capture-root", default=None)
+    app_connections.set_defaults(func=command_app_connections)
+
+    app_snapshot = subparsers.add_parser("app-snapshot")
+    app_snapshot.add_argument("--connection-id", required=True)
+    app_snapshot.add_argument("--metadata", default=None)
+    app_snapshot.add_argument("--capture-root", default=None)
+    app_snapshot.add_argument("--confirm", action="store_true")
+    app_snapshot.set_defaults(func=command_app_snapshot)
 
     graph = subparsers.add_parser("graph")
     add_context(graph)

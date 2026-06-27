@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from capture_daemon import CaptureInboxDaemon
 import mlx_backend
+from transcript_capture import TranscriptCaptureManager
 
 
 LOGGER = logging.getLogger("synapse_s2.dashboard")
@@ -73,6 +74,12 @@ class DashboardRuntime:
 
     def capture_daemon(self) -> CaptureInboxDaemon:
         return CaptureInboxDaemon(
+            root=os.getenv("SYNAPSE_S2_CAPTURE_ROOT"),
+            backend=self.backend,
+        )
+
+    def transcript_capture(self) -> TranscriptCaptureManager:
+        return TranscriptCaptureManager(
             root=os.getenv("SYNAPSE_S2_CAPTURE_ROOT"),
             backend=self.backend,
         )
@@ -149,6 +156,10 @@ class DashboardRuntime:
             )
         if method == "GET" and path == "/api/capture-inbox":
             return self._json_response(self.capture_daemon().status())
+        if method == "GET" and path == "/api/apps":
+            return self._json_response(self.transcript_capture().detect_running_apps())
+        if method == "GET" and path == "/api/app-connections":
+            return self._json_response(self.transcript_capture().list_app_connections())
         if method == "GET" and path == "/api/cortex/state":
             context = self._context_from_params(params)
             agent_raw = str(params.get("agent_id", [""])[0] or "").strip()
@@ -370,6 +381,44 @@ class DashboardRuntime:
                 },
             )
             return self._json_response(capture)
+        if method == "POST" and path == "/api/app-connect":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            app_name = self._text_payload(payload, "app_name", max_bytes=1024)
+            metadata = self._metadata_payload(payload)
+            try:
+                pid = int(payload.get("pid", 0) or 0)
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "pid must be an integer") from exc
+            return self._json_response(
+                self.transcript_capture().connect_running_app(
+                    app_name=app_name,
+                    bundle_id=str(payload.get("bundle_id", "") or ""),
+                    pid=pid,
+                    context_id=context,
+                    source_tag=str(payload.get("source_tag", "app-connect") or "app-connect"),
+                    speaker=mlx_backend.sanitize_agent_id(str(payload.get("speaker", "operator"))),
+                    metadata={
+                        **metadata,
+                        "source_surface": "dashboard-app-connect",
+                    },
+                    confirmed=payload.get("confirm") is True,
+                    allow_manual=payload.get("allow_manual") is True,
+                )
+            )
+        if method == "POST" and path == "/api/app-snapshot":
+            payload = self._parse_json_body(body)
+            connection_id = self._text_payload(payload, "connection_id", max_bytes=512)
+            return self._json_response(
+                self.transcript_capture().capture_app_snapshot(
+                    connection_id=connection_id,
+                    metadata={
+                        **self._metadata_payload(payload),
+                        "source_surface": "dashboard-app-snapshot",
+                    },
+                    confirmed=payload.get("confirm") is True,
+                )
+            )
         if method == "POST" and path == "/api/prune-memory":
             payload = self._parse_json_body(body)
             if payload.get("confirm") is not True:

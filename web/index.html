@@ -66,6 +66,10 @@
         </div>
 
         <div class="top-actions">
+          <a class="utility-button" href="#appConnect">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/><path d="M5 5h5v5H5z"/><path d="M14 14h5v5h-5z"/></svg>
+            App Connect
+          </a>
           <a class="utility-button" href="#operationLog">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h8"/><path d="M8 10h8"/><path d="M8 14h5"/><rect x="4" y="3" width="16" height="18" rx="2"/></svg>
             View Logs
@@ -104,6 +108,10 @@
           <a href="#cortex" class="nav-item" data-section-target="cortex">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 0-4 4v1H7a4 4 0 0 0 0 8h1v1a4 4 0 0 0 8 0v-1h1a4 4 0 0 0 0-8h-1V7a4 4 0 0 0-4-4Z"/><path d="M8 8h8"/><path d="M8 16h8"/><path d="M12 3v18"/></svg>
             Cortex Governor
+          </a>
+          <a href="#appConnect" class="nav-item" data-section-target="appConnect">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a4 4 0 0 1 4-4h2"/><path d="M18 16a4 4 0 0 1-4 4h-2"/><path d="M9 12h6"/><path d="M14 7l5 5-5 5"/><path d="M10 17l-5-5 5-5"/></svg>
+            App Connect
           </a>
           <a href="#maintenance" class="nav-item" data-section-target="maintenance">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 0 5.4-5.4"/></svg>
@@ -217,7 +225,7 @@
               </div>
               <div class="envelope-scale">
                 <span>61 MB<br /><small>Minimum</small></span>
-                <span>Safe operating range</span>
+                <span>Optimized operating range</span>
                 <span>138 MB<br /><small>Maximum</small></span>
               </div>
             </div>
@@ -292,6 +300,11 @@
                 <span><strong>Magic Capture</strong><small>Process local session inbox drops</small></span>
                 <em>Process</em>
               </button>
+              <button class="action-row" type="button" id="appConnectButton">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a4 4 0 0 1 4-4h2"/><path d="M18 16a4 4 0 0 1-4 4h-2"/><path d="M9 12h6"/><path d="M14 7l5 5-5 5"/><path d="M10 17l-5-5 5-5"/></svg>
+                <span><strong>App Connect</strong><small>Detect, attach, and snapshot local apps</small></span>
+                <em>Open</em>
+              </button>
               <div id="captureInboxState" class="capture-inbox-state" aria-live="polite">
                 <strong>Capture inbox pending</strong>
                 <small>Waiting for local clients to drop session payloads.</small>
@@ -308,6 +321,64 @@
               </button>
             </div>
             <p class="panel-note">All actions are local and reversible except persisted memory writes.</p>
+          </article>
+
+          <article class="panel app-connect-panel" id="appConnect" aria-labelledby="appConnectTitle">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Local App Intake</p>
+                <h2 id="appConnectTitle">Attach running app</h2>
+              </div>
+              <button id="appRefreshButton" class="utility-button small" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+                Detect
+              </button>
+            </div>
+            <div id="appConnectState" class="capture-inbox-state ready" aria-live="polite">
+              <strong>App Connect idle</strong>
+              <small>Detect local apps, attach one, then capture a redacted snapshot into SYNAPSE-S2 memory.</small>
+            </div>
+            <form id="appConnectForm" class="write-form app-connect-form">
+              <div class="field-grid">
+                <label for="appSelect">Detected app</label>
+                <select id="appSelect">
+                  <option value="">Press Detect to list running apps</option>
+                </select>
+              </div>
+              <div class="field-row">
+                <div class="field-grid">
+                  <label for="appManualName">Manual app name</label>
+                  <input id="appManualName" autocomplete="off" placeholder="Codex IDE" />
+                </div>
+                <div class="field-grid">
+                  <label for="appSourceTag">Source tag</label>
+                  <input id="appSourceTag" autocomplete="off" value="app-connect" />
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field-grid">
+                  <label for="appSpeaker">Speaker</label>
+                  <input id="appSpeaker" autocomplete="off" value="operator" />
+                </div>
+                <div class="field-grid">
+                  <label for="appConnectionSelect">Attached connection</label>
+                  <select id="appConnectionSelect">
+                    <option value="">No apps attached</option>
+                  </select>
+                </div>
+              </div>
+              <div class="app-connect-actions">
+                <button id="appConnectSubmitButton" class="secondary-button" type="submit">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+                  Connect app
+                </button>
+                <button id="appSnapshotButton" class="primary-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="M8 9h8"/><path d="M8 13h5"/><path d="M8 17h7"/></svg>
+                  Snapshot to memory
+                </button>
+              </div>
+            </form>
+            <p class="panel-note">App Connect uses local process detection and confirmed accessibility snapshots. Selected-text capture remains the fallback when an app blocks UI introspection.</p>
           </article>
         </section>
 
@@ -552,9 +623,9 @@
                 <small>Temporal and associative edges expose the resulting memory fabric.</small>
               </div>
             </div>
-            <div class="graph-safety-panel" aria-label="Graph safety pruning controls">
+            <div class="graph-prune-panel" aria-label="Graph pruning controls">
               <div>
-                <p class="section-label">Safety Prune</p>
+                <p class="section-label">Graph Prune</p>
                 <h3>Remove bad memory graph data</h3>
               </div>
               <form id="pruneForm" class="prune-form">

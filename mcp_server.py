@@ -194,6 +194,12 @@ def _load_capture_daemon():
     return capture_daemon
 
 
+def _load_transcript_capture():
+    import transcript_capture
+
+    return transcript_capture
+
+
 def _publish_tool_deployment(
     mlx_backend_module: Any,
     *,
@@ -534,6 +540,242 @@ def process_spiking_capture_inbox(max_files: int = 50) -> str:
     except Exception as exc:
         LOGGER.exception("capture inbox process failed")
         return json.dumps({"error": f"capture inbox process failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def register_spiking_transcript_source(
+    source_id: str,
+    path: str,
+    context_id: str = "default",
+    source_tag: str = "transcript-source",
+    speaker: str = "operator",
+    metadata: dict[str, Any] | None = None,
+    confirmed: bool = False,
+    start_at_end: bool = True,
+    enabled: bool = True,
+) -> str:
+    """Register an explicitly approved local transcript file for delta capture."""
+    context = _sanitize_context_id(context_id)
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        payload = manager.register_file_source(
+            source_id=source_id,
+            path=path,
+            context_id=context,
+            source_tag=source_tag,
+            speaker=speaker,
+            metadata={
+                **(metadata or {}),
+                "source_surface": "mcp-transcript-source",
+            },
+            confirmed=bool(confirmed),
+            start_at_end=bool(start_at_end),
+            enabled=bool(enabled),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid transcript source registration for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid transcript source registration: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("transcript source registration failed for context_id=%s", context)
+        return json.dumps({"error": f"transcript source registration failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "List SYNAPSE-S2 Transcript Sources",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_transcript_sources() -> str:
+    """List explicitly registered local transcript capture sources."""
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        return json.dumps(manager.list_sources(), sort_keys=True, default=str)
+    except Exception as exc:
+        LOGGER.exception("transcript source list failed")
+        return json.dumps({"error": f"transcript source list failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def poll_spiking_transcript_sources(
+    source_id: str = "",
+    max_bytes: int = 256000,
+) -> str:
+    """Poll registered transcript source deltas into the SYNAPSE-S2 memory graph."""
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        payload = manager.poll_sources(
+            source_id=source_id,
+            max_bytes=max(1, min(int(max_bytes), 256000)),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid transcript source poll request: %s", exc)
+        return json.dumps({"error": f"invalid transcript source poll request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("transcript source poll failed")
+        return json.dumps({"error": f"transcript source poll failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def capture_spiking_clipboard(
+    text: str = "",
+    context_id: str = "default",
+    source_tag: str = "frontmost-selection",
+    speaker: str = "operator",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Capture explicitly selected/copied text as a one-shot transcript payload."""
+    context = _sanitize_context_id(context_id)
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        payload = manager.capture_clipboard_once(
+            text=str(text or "") if str(text or "").strip() else None,
+            context_id=context,
+            source_tag=source_tag,
+            speaker=speaker,
+            metadata={
+                **(metadata or {}),
+                "source_surface": "mcp-clipboard",
+            },
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid clipboard capture for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid clipboard capture: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("clipboard capture failed for context_id=%s", context)
+        return json.dumps({"error": f"clipboard capture failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "List Local Apps for SYNAPSE-S2 App Connect",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_running_apps() -> str:
+    """List locally visible foreground applications that can be explicitly attached."""
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        return json.dumps(manager.detect_running_apps(), sort_keys=True, default=str)
+    except Exception as exc:
+        LOGGER.exception("running app detection failed")
+        return json.dumps({"error": f"running app detection failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def connect_spiking_app(
+    app_name: str,
+    bundle_id: str = "",
+    pid: int = 0,
+    context_id: str = "default",
+    source_tag: str = "app-connect",
+    speaker: str = "operator",
+    metadata: dict[str, Any] | None = None,
+    confirmed: bool = False,
+    allow_manual: bool = False,
+) -> str:
+    """Attach a confirmed local app to SYNAPSE-S2 for explicit snapshot/selection capture."""
+    context = _sanitize_context_id(context_id)
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        payload = manager.connect_running_app(
+            app_name=app_name,
+            bundle_id=bundle_id,
+            pid=int(pid or 0),
+            context_id=context,
+            source_tag=source_tag,
+            speaker=speaker,
+            metadata={
+                **(metadata or {}),
+                "source_surface": "mcp-app-connect",
+            },
+            confirmed=bool(confirmed),
+            allow_manual=bool(allow_manual),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid app connect request for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid app connect request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("app connect failed for context_id=%s", context)
+        return json.dumps({"error": f"app connect failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "List SYNAPSE-S2 App Connections",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_app_connections() -> str:
+    """List local app connections registered with SYNAPSE-S2."""
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        return json.dumps(manager.list_app_connections(), sort_keys=True, default=str)
+    except Exception as exc:
+        LOGGER.exception("app connection list failed")
+        return json.dumps({"error": f"app connection list failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def capture_spiking_app_snapshot(
+    connection_id: str,
+    metadata: dict[str, Any] | None = None,
+    confirmed: bool = False,
+) -> str:
+    """Capture a confirmed local app accessibility snapshot into the SYNAPSE-S2 graph."""
+    try:
+        transcript_capture = _load_transcript_capture()
+        _, mlx_backend = _load_backend()
+        manager = transcript_capture.TranscriptCaptureManager(
+            backend=mlx_backend.get_backend()
+        )
+        payload = manager.capture_app_snapshot(
+            connection_id=connection_id,
+            metadata={
+                **(metadata or {}),
+                "source_surface": "mcp-app-snapshot",
+            },
+            confirmed=bool(confirmed),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid app snapshot request: %s", exc)
+        return json.dumps({"error": f"invalid app snapshot request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("app snapshot failed")
+        return json.dumps({"error": f"app snapshot failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool()

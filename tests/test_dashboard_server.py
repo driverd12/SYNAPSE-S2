@@ -374,7 +374,12 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Magic Capture", index)
         self.assertIn("captureInboxButton", index)
         self.assertIn("captureInboxState", index)
-        self.assertIn("graph-safety-panel", index)
+        self.assertIn("App Connect", index)
+        self.assertIn("appConnectButton", index)
+        self.assertIn("appConnectForm", index)
+        self.assertIn("appSnapshotButton", index)
+        self.assertIn("Optimized operating range", index)
+        self.assertIn("graph-prune-panel", index)
         self.assertIn("pruneForm", index)
         self.assertIn("relationshipLedger", index)
         self.assertIn("contextEventLedger", index)
@@ -431,8 +436,15 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/capture-conversation", app)
         self.assertIn("/api/prune-memory", app)
         self.assertIn("/api/capture-inbox", app)
+        self.assertIn("/api/apps", app)
+        self.assertIn("/api/app-connect", app)
+        self.assertIn("/api/app-connections", app)
+        self.assertIn("/api/app-snapshot", app)
+        self.assertIn("renderAppConnect", app)
+        self.assertIn("snapshotConnectedApp", app)
         self.assertIn("/api/context-events", app)
         self.assertIn("danger-button", styles)
+        self.assertIn("app-connect-panel", styles)
         self.assertIn("neural-math-panel", styles)
         self.assertIn("neural-inspector-toggle", styles)
         self.assertIn("cortex-panel", styles)
@@ -767,6 +779,46 @@ class DashboardRuntimeTests(unittest.TestCase):
                 for entry in graph_payload["entries"]
             )
         )
+
+    def test_app_connect_endpoint_registers_manual_local_app_connection(self):
+        with TemporaryDirectory() as tmp:
+            previous_root = os.environ.get("SYNAPSE_S2_CAPTURE_ROOT")
+            os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = tmp
+            try:
+                runtime = self.make_runtime(tmp)
+                connect_status, connect_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/app-connect",
+                        json.dumps(
+                            {
+                                "context_id": "demo",
+                                "app_name": "Codex IDE",
+                                "bundle_id": "com.openai.codex",
+                                "pid": 4242,
+                                "source_tag": "codex-ide",
+                                "speaker": "codex",
+                                "confirm": True,
+                                "allow_manual": True,
+                            }
+                        ).encode(),
+                    )
+                )
+                list_status, list_payload = self.decode(
+                    runtime.handle("GET", "/api/app-connections")
+                )
+            finally:
+                if previous_root is None:
+                    os.environ.pop("SYNAPSE_S2_CAPTURE_ROOT", None)
+                else:
+                    os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = previous_root
+
+        self.assertEqual(connect_status, 200)
+        self.assertEqual(connect_payload["app_name"], "Codex IDE")
+        self.assertEqual(connect_payload["bundle_id"], "com.openai.codex")
+        self.assertEqual(list_status, 200)
+        self.assertEqual(list_payload["connection_count"], 1)
+        self.assertEqual(list_payload["connections"][0]["source_tag"], "codex-ide")
 
     def test_context_events_endpoint_lists_published_agent_handoffs(self):
         with TemporaryDirectory() as tmp:

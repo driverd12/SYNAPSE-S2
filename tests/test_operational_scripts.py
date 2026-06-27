@@ -25,7 +25,17 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertIn("aero.boom.synapse-s2.capture-daemon", script)
         self.assertIn("capture_daemon.py", script)
         self.assertIn("SYNAPSE_S2_CAPTURE_ROOT", script)
+        self.assertIn("SYNAPSE_S2_TRANSCRIPT_POLL", script)
+        self.assertIn("--poll-transcript-sources", script)
         self.assertIn("launchctl bootstrap", script)
+
+    def test_frontmost_selection_helper_is_one_shot_and_restores_clipboard(self):
+        script = (ROOT / "scripts" / "capture_frontmost_selection.sh").read_text(encoding="utf-8")
+
+        self.assertIn("osascript", script)
+        self.assertIn("pbcopy < \"$CLIPBOARD_BACKUP\"", script)
+        self.assertIn("capture-clipboard", script)
+        self.assertNotIn("while true", script)
 
     def test_local_launcher_uses_client_session_wrapper(self):
         script = (ROOT / "scripts" / "install_local_launcher.sh").read_text(encoding="utf-8")

@@ -163,6 +163,38 @@ scripts/install_capture_daemon.sh
 .venv/bin/python synapse_cli.py --json graph --context default --limit 30
 ```
 
+App Connect gives operators a local attach path for already-running apps. It detects attachable local apps through a fast filtered process-list scan, records a confirmed attachment, and can capture either intentionally selected text or a redacted Accessibility snapshot into the same temporal event graph and context bus. This is a hardened local connector, not a remote control plane.
+
+```bash
+.venv/bin/python synapse_cli.py --json app-list
+.venv/bin/python synapse_cli.py --json app-connect \
+  --context default \
+  --app-name "Google Chrome" \
+  --tag chrome-live \
+  --speaker operator \
+  --confirm
+.venv/bin/python synapse_cli.py --json app-connections
+.venv/bin/python synapse_cli.py --json app-snapshot \
+  --connection-id "<connection-id-from-app-connections>" \
+  --confirm
+scripts/capture_frontmost_selection.sh default frontmost-selection operator
+```
+
+If a target application blocks Accessibility introspection, select the relevant visible text in that app and run the frontmost-selection helper. The helper copies the selection once, calls `capture-clipboard`, restores the prior clipboard, and exits.
+
+Local transcript files can also be registered as bounded delta sources for clients or tools that write their own logs:
+
+```bash
+.venv/bin/python synapse_cli.py --json transcript-source-add \
+  --context default \
+  --source-id codex-live \
+  --path /path/to/session.log \
+  --tag codex-live \
+  --speaker codex \
+  --confirm
+.venv/bin/python synapse_cli.py --json transcript-source-poll --source-id codex-live
+```
+
 Hand-prune bad or sensitive memory from the same durable store:
 
 ```bash
@@ -210,6 +242,14 @@ The MCP server exposes these tools:
 | `drop_spiking_capture_inbox` | Drop opt-in session text into the local capture inbox sidecar. |
 | `get_spiking_capture_inbox_status` | Show pending, processed, and failed inbox file counts. |
 | `process_spiking_capture_inbox` | Process pending inbox drops into the real memory graph. |
+| `register_spiking_transcript_source` | Register a confirmed local transcript/log file for bounded delta capture. |
+| `list_spiking_transcript_sources` | List registered local transcript sources. |
+| `poll_spiking_transcript_sources` | Poll registered transcript deltas into temporal event memory. |
+| `capture_spiking_clipboard` | Capture intentionally selected/copied text as a one-shot redacted memory payload. |
+| `list_spiking_running_apps` | Detect locally visible foreground apps for App Connect. |
+| `connect_spiking_app` | Attach a confirmed local app connection for snapshot/selection capture. |
+| `list_spiking_app_connections` | List App Connect attachments. |
+| `capture_spiking_app_snapshot` | Capture a confirmed redacted local app Accessibility snapshot into memory. |
 | `list_spiking_memory_graph` | List compact memory entries and relationship edges for a context. |
 | `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
@@ -278,7 +318,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect local app attachment/snapshot capture, magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

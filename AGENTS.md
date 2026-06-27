@@ -39,6 +39,23 @@ If the capture sidecar is not running or you need immediate synchronous capture,
   --text "<factual decisions, implementation details, validation evidence, and follow-up constraints>"
 ```
 
+When relevant context lives in another already-running local app, use App Connect instead of inventing a brittle scrape path. Detect, attach, and snapshot only what is locally visible and relevant:
+
+```bash
+.venv/bin/python synapse_cli.py --json app-list
+.venv/bin/python synapse_cli.py --json app-connect \
+  --context default \
+  --app-name "<running app name>" \
+  --tag app-connect \
+  --speaker operator \
+  --confirm
+.venv/bin/python synapse_cli.py --json app-snapshot \
+  --connection-id "<connection-id>" \
+  --confirm
+```
+
+If an app blocks Accessibility snapshots, select the relevant text in that app and run `scripts/capture_frontmost_selection.sh default frontmost-selection operator`; it performs one selected-text capture and restores the previous clipboard.
+
 Capture real decisions, corrections, temporal order, blockers, and validation evidence. Do not capture credentials, tokens, private keys, unnecessary personal data, or speculative claims as memory. The inbox path redacts common secret shapes before ingestion, but do not rely on redaction as permission to capture sensitive material.
 
 If memory is wrong, sensitive, or only partially true, prune it rather than leaving it in the graph:
