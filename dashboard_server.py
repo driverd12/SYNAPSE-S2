@@ -168,6 +168,12 @@ class DashboardRuntime:
             return self._json_response(self.transcript_capture().detect_running_apps())
         if method == "GET" and path == "/api/app-connections":
             return self._json_response(self.transcript_capture().list_app_connections())
+        if method == "GET" and path == "/api/self-test":
+            context = self._context_from_params(params)
+            include_apps = self._bool_param(params, "include_apps", True)
+            return self._json_response(
+                self.self_test(context_id=context, include_apps=include_apps)
+            )
         if method == "GET" and path == "/api/cortex/state":
             context = self._context_from_params(params)
             agent_raw = str(params.get("agent_id", [""])[0] or "").strip()
@@ -499,6 +505,28 @@ class DashboardRuntime:
                     confirmed=True,
                 )
             )
+        if method == "POST" and path == "/api/app-selection-capture":
+            payload = self._parse_json_body(body)
+            if payload.get("confirm") is not True:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "confirm must be true before capturing selected app text",
+                )
+            return self._json_response(
+                self.transcript_capture().capture_app_selected_text(
+                    connection_id=self._text_payload(
+                        payload,
+                        "connection_id",
+                        max_bytes=512,
+                    ),
+                    text=self._text_payload(payload, "text", max_bytes=MAX_TEXT_BYTES),
+                    metadata={
+                        **self._metadata_payload(payload),
+                        "source_surface": "dashboard-app-selection-capture",
+                    },
+                    confirmed=True,
+                )
+            )
         if method == "POST" and path == "/api/prune-memory":
             payload = self._parse_json_body(body)
             if payload.get("confirm") is not True:
@@ -675,6 +703,247 @@ class DashboardRuntime:
                 "by_type": {},
             },
             "memory_db_path": status.get("memory_db_path"),
+        }
+
+    def self_test(
+        self,
+        *,
+        context_id: str,
+        include_apps: bool = True,
+    ) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        started = time.perf_counter()
+        components: dict[str, dict[str, Any]] = {}
+        recommended_actions: list[str] = []
+
+        def set_component(
+            name: str,
+            *,
+            status: str,
+            label: str,
+            detail: str,
+            **extra: Any,
+        ) -> None:
+            components[name] = {
+                "status": status,
+                "label": label,
+                "detail": detail,
+                **extra,
+            }
+
+        try:
+            runtime_status = self.backend.status(context_id=context)
+            resource_profile = self.backend.resource_profile(benchmark_quick_prune=False)
+            runtime_ready = (
+                bool(runtime_status.get("effective_enabled"))
+                and str(runtime_status.get("runtime") or "").lower() == "ready"
+            )
+            runtime_detail = (
+                f"{runtime_status.get('runtime', 'unknown')} runtime, "
+                f"{int(runtime_status.get('num_neurons') or 0)} neurons, "
+                f"{resource_profile.get('estimated_total_mb', 0)} MB estimated substrate"
+            )
+            set_component(
+                "runtime",
+                status="ready" if runtime_ready else "blocked",
+                label="Runtime ready" if runtime_ready else "Runtime disabled",
+                detail=runtime_detail,
+                effective_enabled=bool(runtime_status.get("effective_enabled")),
+                num_neurons=int(runtime_status.get("num_neurons") or 0),
+                estimated_total_mb=resource_profile.get("estimated_total_mb"),
+            )
+            if not runtime_ready:
+                recommended_actions.append("Enable the SYNAPSE-S2 core before relying on capture or recall.")
+
+            memory_path = str(runtime_status.get("memory_db_path") or "")
+            memory_entries = int(runtime_status.get("memory_context_entry_count") or 0)
+            memory_relationships = int(runtime_status.get("memory_context_relationship_count") or 0)
+            set_component(
+                "memory",
+                status="ready" if memory_path else "blocked",
+                label="Memory store reachable" if memory_path else "Memory store unavailable",
+                detail=(
+                    f"{memory_entries} entries and {memory_relationships} relationships "
+                    f"in context {context}"
+                ),
+                entry_count=memory_entries,
+                relationship_count=memory_relationships,
+                memory_db_path=memory_path,
+            )
+            if not memory_path:
+                recommended_actions.append("Check the SQLite memory store path and local write permissions.")
+
+            provider = dict(runtime_status.get("embedding_provider") or {})
+            if not provider:
+                provider = self.backend.embedding_provider_info()
+            provider_error = str(provider.get("error") or "")
+            provider_type = str(provider.get("provider_type") or "")
+            embedding_status = (
+                "blocked"
+                if provider_error or provider_type == "unavailable"
+                else "ready"
+            )
+            provider_id = str(provider.get("provider") or "unknown")
+            model_id = str(provider.get("model_id") or provider.get("model") or provider_id)
+            set_component(
+                "embedding",
+                status=embedding_status,
+                label="Embedding provider ready"
+                if embedding_status == "ready"
+                else "Embedding provider blocked",
+                detail=provider_error or f"{provider_id} / {model_id}",
+                provider=provider_id,
+                model_id=model_id,
+                provider_type=provider_type,
+                semantic=bool(provider.get("semantic")),
+                local_only=bool(provider.get("local_only", True)),
+            )
+            if embedding_status != "ready":
+                recommended_actions.append("Resolve the embedding provider load path before trusting semantic recall.")
+        except Exception as exc:
+            error = str(exc)
+            set_component(
+                "runtime",
+                status="blocked",
+                label="Runtime check failed",
+                detail=error,
+            )
+            set_component(
+                "memory",
+                status="blocked",
+                label="Memory check failed",
+                detail=error,
+                entry_count=0,
+                relationship_count=0,
+            )
+            set_component(
+                "embedding",
+                status="blocked",
+                label="Embedding check failed",
+                detail=error,
+            )
+            recommended_actions.append("Inspect runtime startup logs; the core status call failed.")
+
+        try:
+            context_events = self.backend.list_context_events(
+                context_id=context,
+                since_event_id=0,
+                limit=1,
+            )
+            set_component(
+                "context_bus",
+                status="ready",
+                label="Context bus reachable",
+                detail=(
+                    f"{context_events.get('delivery_mode', 'polling')} delivery, "
+                    f"{int(context_events.get('event_count') or 0)} recent event sample"
+                ),
+                delivery_mode=context_events.get("delivery_mode"),
+                event_count=int(context_events.get("event_count") or 0),
+            )
+        except Exception as exc:
+            set_component(
+                "context_bus",
+                status="blocked",
+                label="Context bus blocked",
+                detail=str(exc),
+                event_count=0,
+            )
+            recommended_actions.append("Repair context bus reads before depending on client hydration.")
+
+        try:
+            inbox_status = self.capture_daemon().status()
+            pending = int(inbox_status.get("pending_file_count") or 0)
+            errors = int(inbox_status.get("error_file_count") or 0)
+            set_component(
+                "capture_inbox",
+                status="blocked" if errors else "ready",
+                label="Capture inbox ready" if not errors else "Capture inbox has errors",
+                detail=(
+                    f"{pending} pending files, {errors} error files, "
+                    f"root {inbox_status.get('root', '')}"
+                ),
+                pending_file_count=pending,
+                error_file_count=errors,
+                root=inbox_status.get("root"),
+            )
+            if errors:
+                recommended_actions.append("Process or clear capture inbox error files before more ingestion.")
+        except Exception as exc:
+            set_component(
+                "capture_inbox",
+                status="blocked",
+                label="Capture inbox blocked",
+                detail=str(exc),
+                pending_file_count=0,
+                error_file_count=0,
+            )
+            recommended_actions.append("Check capture inbox root permissions and daemon state.")
+
+        try:
+            manager = self.transcript_capture()
+            connections = manager.list_app_connections()
+            app_payload: dict[str, Any] = {
+                "app_count": None,
+                "apps": [],
+                "warning": "",
+            }
+            if include_apps:
+                app_payload = manager.detect_running_apps()
+            app_count_raw = app_payload.get("app_count")
+            app_count = int(app_count_raw) if app_count_raw is not None else None
+            connection_count = int(connections.get("connection_count") or 0)
+            warning = str(app_payload.get("warning") or "")
+            app_status = "ready" if connection_count or (app_count or 0) > 0 else "degraded"
+            detail = (
+                f"{connection_count} attached connection"
+                f"{'' if connection_count == 1 else 's'}"
+            )
+            if app_count is not None:
+                detail = f"{app_count} detected app{'' if app_count == 1 else 's'}, {detail}"
+            if warning:
+                detail = f"{detail}; detection warning: {warning}"
+                app_status = "degraded"
+            set_component(
+                "app_connect",
+                status=app_status,
+                label="App Connect ready" if app_status == "ready" else "App Connect needs attention",
+                detail=detail,
+                app_count=app_count,
+                connection_count=connection_count,
+                mode=app_payload.get("mode", "skipped-app-detection"),
+            )
+            if app_status != "ready":
+                recommended_actions.append(
+                    "Use Detect to list running apps, then attach one or use selected-text capture."
+                )
+        except Exception as exc:
+            set_component(
+                "app_connect",
+                status="blocked",
+                label="App Connect blocked",
+                detail=str(exc),
+                app_count=0,
+                connection_count=0,
+            )
+            recommended_actions.append("Grant local Automation or Accessibility permissions for app snapshots.")
+
+        statuses = [component["status"] for component in components.values()]
+        if any(status == "blocked" for status in statuses):
+            overall_status = "blocked"
+        elif any(status == "degraded" for status in statuses):
+            overall_status = "degraded"
+        else:
+            overall_status = "ready"
+        return {
+            "action": "self-test",
+            "context_id": context,
+            "overall_status": overall_status,
+            "ready": overall_status == "ready",
+            "components": components,
+            "recommended_actions": recommended_actions,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "generated_at": time.time(),
         }
 
     def readiness_audit(self, *, context_id: str) -> dict[str, Any]:

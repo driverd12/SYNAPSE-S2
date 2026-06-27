@@ -216,6 +216,7 @@ class TranscriptCaptureManager:
                 "frontmost-selection",
                 "clipboard-once",
                 "app-accessibility-snapshot",
+                "app-selected-text",
             ],
             "created_at": float(connections.get(connection_id, {}).get("created_at") or now),
             "updated_at": now,
@@ -303,6 +304,63 @@ class TranscriptCaptureManager:
             "agent_deployment": capture.get("agent_deployment"),
             "redaction_count": int(redaction_count),
             "snapshot_quality": snapshot_quality,
+        }
+
+    def capture_app_selected_text(
+        self,
+        *,
+        connection_id: str,
+        text: str | None = None,
+        confirmed: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("explicit confirmation is required to capture app selected text")
+        connection = self._get_connection(connection_id)
+        raw_text = self._read_clipboard() if text is None else str(text or "")
+        clean_text = raw_text.strip()
+        if not clean_text:
+            raise ValueError("selected app text must not be empty")
+        if len(clean_text.encode("utf-8")) > MAX_TRANSCRIPT_DELTA_BYTES:
+            clean_text = clean_text.encode("utf-8")[:MAX_TRANSCRIPT_DELTA_BYTES].decode(
+                "utf-8",
+                errors="replace",
+            )
+        redacted_text, redaction_count = redact_capture_text(clean_text)
+        capture = self.backend.capture_conversation(
+            text=redacted_text,
+            context_id=str(connection.get("context_id") or "default"),
+            source_tag=str(connection.get("source_tag") or "app-connect"),
+            speaker=str(connection.get("speaker") or "operator"),
+            surprise_threshold=0.5,
+            min_segment_sentences=1,
+            metadata={
+                **_json_safe(connection.get("metadata") or {}, {}),
+                **_json_safe(metadata or {}, {}),
+                "transcript_adapter": True,
+                "adapter_kind": "app-selected-text",
+                "capture_mode": "confirmed-selected-text-fallback",
+                "connection_id": connection["connection_id"],
+                "app_name": connection["app_name"],
+                "bundle_id": connection.get("bundle_id", ""),
+                "pid": connection.get("pid", 0),
+                "redaction_count": int(redaction_count),
+                "input_sha256": _sha256_text(clean_text),
+                "remote_control_plane": False,
+            },
+        )
+        return {
+            "action": "capture-app-selected-text",
+            "adapter_kind": "app-selected-text",
+            "connection_id": connection["connection_id"],
+            "app_name": connection["app_name"],
+            "context_id": capture["context_id"],
+            "source_tag": capture["source_tag"],
+            "speaker": capture.get("speaker"),
+            "event_count": capture["event_count"],
+            "relationship_count": capture["relationship_count"],
+            "agent_deployment": capture.get("agent_deployment"),
+            "redaction_count": int(redaction_count),
         }
 
     def register_file_source(

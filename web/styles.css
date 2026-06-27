@@ -1265,6 +1265,58 @@ textarea {
   color: var(--red);
 }
 
+.self-test-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.self-test-item {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 9px 10px;
+}
+
+.self-test-item span {
+  width: fit-content;
+  border-radius: 999px;
+  background: var(--teal-soft);
+  color: var(--teal-strong);
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.self-test-item.pending span {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.self-test-item.blocked span {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.self-test-item strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.self-test-item small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .app-connect-panel {
   min-height: 264px;
 }
@@ -1282,6 +1334,23 @@ textarea {
 .app-connect-actions .primary-button,
 .app-connect-actions .secondary-button {
   min-width: 0;
+}
+
+.app-selection-capture {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--row);
+  margin-top: 4px;
+  padding-top: 12px;
+}
+
+.app-selection-capture textarea {
+  min-height: 86px;
+  resize: vertical;
+}
+
+.app-selection-capture .secondary-button {
+  justify-self: start;
 }
 
 .panel-note {

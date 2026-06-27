@@ -285,6 +285,11 @@
                 <span><strong>Readiness Audit</strong><small>Probe runtime, memory, graph, recall</small></span>
                 <em>Audit</em>
               </button>
+              <button class="action-row" type="button" id="selfTestButton">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                <span><strong>Self Test</strong><small>Check page features and local intake paths</small></span>
+                <em>Test</em>
+              </button>
               <button class="action-row" type="button" id="nativeCertifyButton">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 7v6c0 5 3.4 7.7 8 9 4.6-1.3 8-4 8-9V7l-8-4Z"/><path d="m9 12 2 2 4-5"/></svg>
                 <span><strong>Native Certify</strong><small>Verify MLX, mlxsnn, envelope, prune budget</small></span>
@@ -309,6 +314,11 @@
                 <strong>Capture inbox pending</strong>
                 <small>Waiting for local clients to drop session payloads.</small>
               </div>
+              <div id="selfTestState" class="capture-inbox-state" aria-live="polite">
+                <strong>Self test idle</strong>
+                <small>Run a feature check before relying on the local control plane.</small>
+              </div>
+              <div id="selfTestGrid" class="self-test-grid" aria-live="polite"></div>
               <button class="action-row" type="button" id="quickPruneButton">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"/><path d="M6 16h12"/><path d="M8 12h8"/><path d="M10 8h4"/><path d="M12 4v16"/></svg>
                 <span><strong>Quick Prune</strong><small>Reclaim ephemeral nodes</small></span>
@@ -375,6 +385,14 @@
                 <button id="appSnapshotButton" class="primary-button" type="button">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="M8 9h8"/><path d="M8 13h5"/><path d="M8 17h7"/></svg>
                   Snapshot to memory
+                </button>
+              </div>
+              <div class="app-selection-capture">
+                <label for="appSelectionText">Selected text fallback</label>
+                <textarea id="appSelectionText" rows="4" placeholder="Paste selected app text"></textarea>
+                <button id="appSelectionCaptureButton" class="secondary-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+                  Capture selection
                 </button>
               </div>
             </form>

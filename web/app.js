@@ -44,6 +44,8 @@ const elements = collectElements([
   "appConnectionSelect",
   "appManualName",
   "appRefreshButton",
+  "appSelectionCaptureButton",
+  "appSelectionText",
   "appSelect",
   "appSnapshotButton",
   "appSourceTag",
@@ -177,6 +179,9 @@ const elements = collectElements([
   "runtimeMaintenance",
   "runtimeMaintenanceDetail",
   "sidebarStatus",
+  "selfTestButton",
+  "selfTestGrid",
+  "selfTestState",
   "sleepButton",
   "themeButton",
   "toggleActionButton",
@@ -497,6 +502,53 @@ function renderAppConnect(appPayload = null, connectionPayload = null) {
       ? "Select a detected app, set a source tag, then connect it to this context."
       : "Detect local apps, attach one, then capture a redacted snapshot into SYNAPSE-S2 memory.";
   setAppConnectState(headline, detail, connected || detected ? "ready" : "");
+}
+
+function setSelfTestState(headline, detail, mode = "") {
+  elements.selfTestState.className = `capture-inbox-state ${mode}`.trim();
+  elements.selfTestState.innerHTML = `
+    <strong>${escapeHtml(headline)}</strong>
+    <small>${escapeHtml(detail)}</small>
+  `;
+}
+
+function renderSelfTest(payload) {
+  if (!payload) {
+    elements.selfTestGrid.replaceChildren();
+    return;
+  }
+  const status = String(payload.overall_status || "degraded");
+  const statusMode = status === "blocked" ? "error" : status === "degraded" ? "pending" : "ready";
+  setSelfTestState(
+    `Self test ${status}`,
+    `${formatNumber(payload.elapsed_ms || 0, 1)} ms across ${formatNumber(Object.keys(payload.components || {}).length)} components.`,
+    statusMode,
+  );
+  const order = [
+    "runtime",
+    "memory",
+    "embedding",
+    "context_bus",
+    "capture_inbox",
+    "app_connect",
+  ];
+  const components = payload.components || {};
+  const cards = order
+    .filter((name) => components[name])
+    .map((name) => {
+      const component = components[name];
+      const item = document.createElement("article");
+      const itemStatus = String(component.status || "degraded");
+      const itemMode = itemStatus === "blocked" ? "blocked" : itemStatus === "degraded" ? "pending" : "ready";
+      item.className = `self-test-item ${itemMode}`;
+      item.innerHTML = `
+        <span>${escapeHtml(itemStatus)}</span>
+        <strong>${escapeHtml(component.label || name.replaceAll("_", " "))}</strong>
+        <small>${escapeHtml(component.detail || "")}</small>
+      `;
+      return item;
+    });
+  elements.selfTestGrid.replaceChildren(...cards);
 }
 
 function appOptionLabel(app) {
@@ -1699,6 +1751,23 @@ async function refreshAppConnect({ detect = true } = {}) {
   };
 }
 
+async function runSelfTest(button) {
+  return withBusy(button, "Self test", async () => {
+    setSelfTestState("Self test running", "Checking local runtime, memory, capture, and app intake.", "pending");
+    const payload = await requestJson("/api/self-test", {
+      params: {
+        context_id: state.context,
+        include_apps: "true",
+      },
+    });
+    renderSelfTest(payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    setSelfTestState("Self test failed", error.message, "error");
+    return null;
+  });
+}
+
 function selectedDetectedApp() {
   if (elements.appSelect.value === "") {
     return null;
@@ -1807,13 +1876,63 @@ async function snapshotConnectedApp(button) {
     setAppConnectState(
       lowSignal ? "Low-signal snapshot captured" : "Snapshot captured",
       lowSignal
-        ? `${payload.app_name} wrote ${formatNumber(payload.event_count || 0)} memory event${Number(payload.event_count || 0) === 1 ? "" : "s"} from limited Accessibility text.`
+        ? `${payload.app_name} wrote ${formatNumber(payload.event_count || 0)} memory event${Number(payload.event_count || 0) === 1 ? "" : "s"} from limited Accessibility text. Use selected-text fallback for exact content.`
         : `${payload.app_name} wrote ${formatNumber(payload.event_count || 0)} memory event${Number(payload.event_count || 0) === 1 ? "" : "s"}.`,
       "ready",
     );
     return payload;
   }).catch((error) => {
     setAppConnectState("App snapshot failed", error.message, "error");
+    return null;
+  });
+}
+
+async function captureSelectedAppText(button) {
+  const connectionId = elements.appConnectionSelect.value.trim();
+  const text = elements.appSelectionText.value.trim();
+  if (!connectionId) {
+    logOperation("App selection rejected", "connect an app first, then choose the attached connection");
+    setAppConnectState(
+      "Selection needs a connection",
+      "Connect an app first, then choose the attached connection.",
+      "error",
+    );
+    elements.appConnectionSelect.focus();
+    return null;
+  }
+  if (!text) {
+    logOperation("App selection rejected", "paste selected text from the attached app before capture");
+    setAppConnectState(
+      "Selection text is empty",
+      "Paste selected app text before capture.",
+      "error",
+    );
+    elements.appSelectionText.focus();
+    return null;
+  }
+  return withBusy(button, "App selection capture", async () => {
+    setAppConnectState("Capturing selected text", "Redacting selected app text before memory ingest.", "pending");
+    const payload = await requestJson("/api/app-selection-capture", {
+      method: "POST",
+      body: {
+        connection_id: connectionId,
+        text,
+        confirm: true,
+        metadata: { source: "dashboard-app-selected-text" },
+      },
+    });
+    await publishAwareResult(payload);
+    await refreshAppConnect({ detect: false });
+    elements.appConnectionSelect.value = connectionId;
+    elements.appSelectionText.value = "";
+    setAppConnectState(
+      "Selected text captured",
+      `${payload.app_name} wrote ${formatNumber(payload.event_count || 0)} memory event${Number(payload.event_count || 0) === 1 ? "" : "s"}.`,
+      "ready",
+    );
+    return payload;
+  }).catch((error) => {
+    setAppConnectState("Selection capture failed", error.message, "error");
     return null;
   });
 }
@@ -2354,6 +2473,10 @@ elements.readinessAuditButton.addEventListener("click", () => {
   ));
 });
 
+elements.selfTestButton.addEventListener("click", () => {
+  runSelfTest(elements.selfTestButton);
+});
+
 elements.evidencePackButton.addEventListener("click", () => {
   withBusy(elements.evidencePackButton, "Evidence pack", () => (
     requestJson("/api/evidence-pack", {
@@ -2419,6 +2542,10 @@ elements.appConnectForm.addEventListener("submit", async (event) => {
 
 elements.appSnapshotButton.addEventListener("click", () => {
   snapshotConnectedApp(elements.appSnapshotButton);
+});
+
+elements.appSelectionCaptureButton.addEventListener("click", () => {
+  captureSelectedAppText(elements.appSelectionCaptureButton);
 });
 
 refreshSnapshot()

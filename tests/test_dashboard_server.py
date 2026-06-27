@@ -463,6 +463,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Local recall only", index)
         self.assertIn("query_spiking_attention_text", index)
         self.assertIn("readinessAuditButton", index)
+        self.assertIn("selfTestButton", index)
+        self.assertIn("selfTestState", index)
+        self.assertIn("selfTestGrid", index)
         self.assertIn("evidencePackButton", index)
         self.assertIn("coreUnlockButton", index)
         self.assertIn("coreToggleGuardHint", index)
@@ -478,6 +481,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("appConnectButton", index)
         self.assertIn("appConnectForm", index)
         self.assertIn("appSnapshotButton", index)
+        self.assertIn("appSelectionText", index)
+        self.assertIn("appSelectionCaptureButton", index)
         self.assertIn("Optimized operating range", index)
         self.assertIn("graph-prune-panel", index)
         self.assertIn("pruneForm", index)
@@ -534,6 +539,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("initializeSectionNavigation", app)
         self.assertIn("scrollSectionIntoView", app)
         self.assertIn("/api/readiness-audit", app)
+        self.assertIn("/api/self-test", app)
         self.assertIn("/api/evidence-pack", app)
         self.assertIn('include_graph: "false"', app)
         self.assertIn("namespace-node", styles)
@@ -553,10 +559,12 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/app-connections", app)
         self.assertIn("/api/app-snapshot", app)
         self.assertIn("/api/app-snapshot/preflight", app)
+        self.assertIn("/api/app-selection-capture", app)
         self.assertIn("confirmation_token", app)
         self.assertIn("confirmPreflight", app)
         self.assertIn("renderAppConnect", app)
         self.assertIn("snapshotConnectedApp", app)
+        self.assertIn("captureSelectedAppText", app)
         self.assertIn("/api/context-events", app)
         self.assertIn("danger-button", styles)
         self.assertIn("app-connect-panel", styles)
@@ -568,6 +576,44 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)
         self.assertNotIn('dispatchEvent(new Event("submit"', app)
+
+    def test_self_test_endpoint_reports_operator_readiness(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            manager = TranscriptCaptureManager(
+                root=Path(tmp) / "capture-root",
+                backend=runtime.backend,
+                running_app_provider=lambda: [
+                    {
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "pid": 4242,
+                    }
+                ],
+            )
+            runtime.transcript_capture = lambda: manager  # type: ignore[method-assign]
+
+            status, payload = self.decode(runtime.handle("GET", "/api/self-test?context_id=demo"))
+
+        components = payload["components"]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["action"], "self-test")
+        self.assertEqual(payload["context_id"], "demo")
+        self.assertIn(payload["overall_status"], {"ready", "degraded", "blocked"})
+        for component in (
+            "runtime",
+            "memory",
+            "embedding",
+            "context_bus",
+            "capture_inbox",
+            "app_connect",
+        ):
+            self.assertIn(component, components)
+            self.assertIn(components[component]["status"], {"ready", "degraded", "blocked"})
+            self.assertTrue(components[component]["label"])
+            self.assertIn("detail", components[component])
+        self.assertGreaterEqual(components["app_connect"]["app_count"], 1)
+        self.assertIsInstance(payload["recommended_actions"], list)
 
     def test_http_handler_rejects_cross_origin_mutations(self):
         with TemporaryDirectory() as tmp:
@@ -1084,6 +1130,75 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(snapshot_payload["event_count"], 1)
         self.assertTrue(captured)
         self.assertTrue(all("sk-app-secret123" not in entry["source_text"] for entry in captured))
+        self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))
+
+    def test_app_selection_capture_endpoint_persists_selected_text(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            manager = TranscriptCaptureManager(
+                root=Path(tmp) / "capture-root",
+                backend=runtime.backend,
+                running_app_provider=lambda: [
+                    {
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "pid": 4242,
+                    }
+                ],
+            )
+            runtime.transcript_capture = lambda: manager  # type: ignore[method-assign]
+            attached = manager.connect_running_app(
+                app_name="Codex",
+                bundle_id="com.openai.codex",
+                pid=4242,
+                context_id="demo",
+                source_tag="codex-app",
+                speaker="operator",
+                confirmed=True,
+            )
+
+            rejected_status, rejected_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/app-selection-capture",
+                    json.dumps(
+                        {
+                            "connection_id": attached["connection_id"],
+                            "text": "Selected Codex text should require confirmation.",
+                        }
+                    ).encode(),
+                )
+            )
+            capture_status, capture_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/app-selection-capture",
+                    json.dumps(
+                        {
+                            "connection_id": attached["connection_id"],
+                            "text": "Selected Codex text has password=selected-secret.",
+                            "confirm": True,
+                            "metadata": {"source": "dashboard-unit-test"},
+                        }
+                    ).encode(),
+                )
+            )
+            memory = runtime.backend.list_memory(context_id="demo", limit=20)
+            captured = [
+                entry
+                for entry in memory["entries"]
+                if entry["metadata"].get("adapter_kind") == "app-selected-text"
+            ]
+
+        self.assertEqual(rejected_status, 400)
+        self.assertIn("confirm", rejected_payload["error"])
+        self.assertEqual(capture_status, 200)
+        self.assertEqual(capture_payload["adapter_kind"], "app-selected-text")
+        self.assertEqual(capture_payload["app_name"], "Codex")
+        self.assertEqual(capture_payload["connection_id"], attached["connection_id"])
+        self.assertGreaterEqual(capture_payload["event_count"], 1)
+        self.assertTrue(captured)
+        self.assertTrue(all("selected-secret" not in entry["source_text"] for entry in captured))
         self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))
 
     def test_context_events_endpoint_lists_published_agent_handoffs(self):

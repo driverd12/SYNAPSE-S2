@@ -177,6 +177,62 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
         self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))
         self.assertEqual(captured[0]["metadata"]["app_name"], "Google Chrome")
 
+    def test_app_selected_text_capture_uses_connection_metadata_and_redacts(self):
+        with TemporaryDirectory() as tmp:
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(
+                root=Path(tmp) / "capture-root",
+                backend=backend,
+                running_app_provider=lambda: [
+                    {
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "pid": 4242,
+                    }
+                ],
+            )
+            attached = manager.connect_running_app(
+                app_name="Codex",
+                bundle_id="com.openai.codex",
+                pid=4242,
+                context_id="demo",
+                source_tag="codex-app",
+                speaker="operator",
+                confirmed=True,
+            )
+
+            with self.assertRaises(ValueError):
+                manager.capture_app_selected_text(
+                    connection_id=attached["connection_id"],
+                    text="Selected Codex transcript should require confirmation.",
+                    confirmed=False,
+                )
+
+            capture = manager.capture_app_selected_text(
+                connection_id=attached["connection_id"],
+                text="Selected Codex transcript contains token=sk-selected-secret123.",
+                confirmed=True,
+                metadata={"source": "unit-test"},
+            )
+            memory = backend.list_memory(context_id="demo", limit=10)
+            captured = [
+                entry
+                for entry in memory["entries"]
+                if entry["metadata"].get("adapter_kind") == "app-selected-text"
+            ]
+
+        self.assertEqual(capture["adapter_kind"], "app-selected-text")
+        self.assertEqual(capture["app_name"], "Codex")
+        self.assertEqual(capture["connection_id"], attached["connection_id"])
+        self.assertIn("app-selected-text", attached["adapter_kinds"])
+        self.assertGreaterEqual(capture["event_count"], 1)
+        self.assertTrue(captured)
+        self.assertEqual(captured[0]["metadata"]["app_name"], "Codex")
+        self.assertEqual(captured[0]["metadata"]["connection_id"], attached["connection_id"])
+        self.assertEqual(captured[0]["metadata"]["capture_mode"], "confirmed-selected-text-fallback")
+        self.assertTrue(all("sk-selected-secret123" not in entry["source_text"] for entry in captured))
+        self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))
+
     def test_accessibility_snapshot_resolves_ps_name_to_visible_app_name(self):
         with TemporaryDirectory() as tmp:
             manager = TranscriptCaptureManager(
