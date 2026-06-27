@@ -138,7 +138,7 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
 .venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
 ```
 
-The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goal, assumptions, contradictions, suggested next move, and capture queue in Cortex state.
+The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goal, assumptions, contradictions, suggested next move, and capture queue in Cortex state.
 
 Capture real operator/Codex conversation notes into the event graph:
 
@@ -149,6 +149,8 @@ Capture real operator/Codex conversation notes into the event graph:
   --speaker codex \
   --text "User asked for future conversation details to appear in the event relationship graph. Codex added durable session capture plus surgical memory pruning. Operators can remove sensitive, wrong, or partial-truth graph data by node, edge, deployment event, or relationship mode."
 ```
+
+Conversation capture automatically builds a local context namespace for the active topic or feature. Prefixes such as `Thread:`, `Feature:`, `Topic:`, `Goal:`, `Objective:`, and `Event:` become typed graph nodes, while the original conversation events receive the same `context_namespace` metadata and are linked back to the namespace anchor with `namespace_contains` edges. This is what makes new topics, current features, objectives, and temporal session details visibly grow in the relationship visualizer.
 
 For the always-on "magic" capture lane, run the launchd sidecar and drop session payloads into the local inbox. This is still opt-in and local: clients, hooks, or operators write a payload, then the sidecar redacts common secret shapes and ingests it into the same real graph used by MCP, CLI, and the dashboard.
 

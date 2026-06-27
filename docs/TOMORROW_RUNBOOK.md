@@ -115,7 +115,7 @@ Conversation capture:
   --text "Capture real decisions, corrections, temporal order, validation evidence, and follow-up constraints from the current operator or agent session."
 ```
 
-This creates event nodes in the relationship visualizer and publishes a durable context-bus event for connected clients to pull. Do not capture secrets, credentials, raw tokens, private keys, or speculative claims.
+This creates event nodes in the relationship visualizer and publishes a durable context-bus event for connected clients to pull. Conversation capture also auto-builds a context namespace: `Thread:`, `Feature:`, `Topic:`, `Goal:`, `Objective:`, and `Event:` prefixes become typed namespace/topic/goal/objective/event nodes, and the original session events are linked back with `namespace_contains` edges so new topics and feature efforts visibly grow in the graph. Do not capture secrets, credentials, raw tokens, private keys, or speculative claims.
 
 Always-on capture inbox:
 

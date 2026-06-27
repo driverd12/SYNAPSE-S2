@@ -298,6 +298,8 @@ class McpServerTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(capture["event_count"], 2)
+        self.assertIn("context_namespace", capture)
+        self.assertGreaterEqual(capture["context_namespace"]["node_count"], 2)
         self.assertTrue(capture["agent_deployment"]["published"])
         self.assertTrue(edge_prune["result"]["deleted"])
         self.assertTrue(memory_prune["result"]["deleted"])

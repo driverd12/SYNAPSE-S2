@@ -61,6 +61,7 @@ DEFAULT_AGENT_TARGETS = ("mcp-clients", "codex-desktop", "local-ide-adapters")
 CONTEXT_BUS_DELIVERY_MODE = "durable-mcp-pull"
 CORTEX_TRACE_TYPES = {
     "goal",
+    "objective",
     "decision",
     "constraint",
     "evidence",
@@ -2615,6 +2616,13 @@ class SpikingAttentionBackend:
         if not clean_text:
             raise ValueError("conversation text must not be empty")
         clean_speaker = sanitize_agent_id(speaker)
+        namespace_profile = self._infer_context_namespace(
+            text=clean_text,
+            context_id=context,
+            source_tag=source,
+            speaker=clean_speaker,
+            metadata=metadata or {},
+        )
         capture_metadata = self._json_safe_metadata(
             {
                 **(metadata or {}),
@@ -2622,6 +2630,9 @@ class SpikingAttentionBackend:
                 "conversation_capture": True,
                 "speaker": clean_speaker,
                 "temporal": True,
+                "context_namespace": namespace_profile["namespace_id"],
+                "context_namespace_title": namespace_profile["namespace_title"],
+                "context_namespace_source": namespace_profile["namespace_source"],
             }
         )
         try:
@@ -2633,8 +2644,20 @@ class SpikingAttentionBackend:
                 min_segment_sentences=min_segment_sentences,
                 metadata=capture_metadata,
             )
+            context_namespace = self._materialize_context_namespace(
+                context_id=context,
+                source_tag=source,
+                speaker=clean_speaker,
+                namespace_profile=namespace_profile,
+                ingestion=ingestion,
+            )
             ingestion["action"] = "capture-conversation"
             ingestion["speaker"] = clean_speaker
+            ingestion["context_namespace"] = context_namespace
+            ingestion["relationship_count"] = int(ingestion.get("relationship_count") or 0) + int(
+                context_namespace.get("relationship_count") or 0
+            )
+            ingestion["relationships"].extend(context_namespace.get("relationships", []))
             ingestion["agent_deployment"] = self.publish_context_event(
                 context_id=context,
                 source_surface="conversation-capture",
@@ -2648,6 +2671,7 @@ class SpikingAttentionBackend:
                     "speaker": clean_speaker,
                     "event_count": ingestion["event_count"],
                     "relationship_count": ingestion["relationship_count"],
+                    "context_namespace": context_namespace,
                     "events": ingestion["events"],
                     "relationships": ingestion["relationships"],
                 },
@@ -2660,6 +2684,280 @@ class SpikingAttentionBackend:
                 source,
             )
             raise
+
+    def _infer_context_namespace(
+        self,
+        *,
+        text: str,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        explicit = metadata.get("context_namespace") or metadata.get("namespace")
+        if isinstance(explicit, dict):
+            title = str(
+                explicit.get("title")
+                or explicit.get("namespace_title")
+                or explicit.get("namespace_id")
+                or ""
+            )
+        else:
+            title = str(explicit or "")
+        namespace_source = "metadata" if title.strip() else "text"
+        if not title.strip():
+            title = self._extract_prefixed_context_value(
+                text,
+                prefixes=("thread", "feature", "topic", "namespace"),
+            )
+        if not title.strip():
+            namespace_source = "source-tag"
+            title = source_tag
+        title = self._clean_context_label(title)
+        namespace_id = self._slugify_context_namespace(title)
+        labels = self._extract_context_memory_labels(text, namespace_title=title)
+        return {
+            "namespace_id": namespace_id,
+            "namespace_title": title,
+            "namespace_source": namespace_source,
+            "context_id": context_id,
+            "source_tag": source_tag,
+            "speaker": speaker,
+            "labels": labels,
+        }
+
+    def _materialize_context_namespace(
+        self,
+        *,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+        namespace_profile: dict[str, Any],
+        ingestion: dict[str, Any],
+    ) -> dict[str, Any]:
+        namespace_id = str(namespace_profile.get("namespace_id") or "default")
+        namespace_title = str(namespace_profile.get("namespace_title") or namespace_id)
+        sequence_id = str(ingestion.get("sequence_id") or "")
+        base_metadata = {
+            "source": "context-namespace-automation",
+            "context_automation": True,
+            "context_namespace": namespace_id,
+            "context_namespace_title": namespace_title,
+            "context_namespace_source": namespace_profile.get("namespace_source", ""),
+            "source_tag": source_tag,
+            "speaker": speaker,
+            "sequence_id": sequence_id,
+        }
+        nodes: list[dict[str, Any]] = []
+        relationships: list[dict[str, Any]] = []
+
+        namespace_node = self.register_text_trace(
+            tag=f"namespace-{namespace_id}",
+            context_id=context_id,
+            text=f"Namespace: {namespace_title}",
+            metadata={
+                **base_metadata,
+                "context_namespace_anchor": True,
+                "context_memory_type": "namespace",
+            },
+        )
+        nodes.append(
+            {
+                "memory_id": namespace_node["memory_id"],
+                "tag": namespace_node["tag"],
+                "context_memory_type": "namespace",
+                "text": f"Namespace: {namespace_title}",
+            }
+        )
+
+        typed_nodes: list[dict[str, Any]] = []
+        labels = namespace_profile.get("labels") if isinstance(namespace_profile.get("labels"), dict) else {}
+        for memory_type in ("topic", "goal", "objective", "event"):
+            values = labels.get(memory_type, [])
+            if not isinstance(values, list):
+                continue
+            for index, label in enumerate(values, start=1):
+                clean_label = self._clean_context_label(str(label or ""))
+                if not clean_label:
+                    continue
+                digest = hashlib.sha256(
+                    f"{namespace_id}\x1f{memory_type}\x1f{index}\x1f{clean_label}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:8]
+                tag = f"namespace-{namespace_id}-{memory_type}-{index}-{digest}"
+                text = f"{memory_type.title()}: {clean_label}"
+                node = self.register_text_trace(
+                    tag=tag,
+                    context_id=context_id,
+                    text=text,
+                    metadata={
+                        **base_metadata,
+                        "context_memory_type": memory_type,
+                        "context_label": clean_label,
+                        "context_label_index": index,
+                    },
+                )
+                typed_node = {
+                    "memory_id": node["memory_id"],
+                    "tag": node["tag"],
+                    "context_memory_type": memory_type,
+                    "text": text,
+                }
+                typed_nodes.append(typed_node)
+                nodes.append(typed_node)
+
+        for node in typed_nodes:
+            relationships.append(
+                self.memory_store.upsert_relationship(
+                    context_id=context_id,
+                    source_memory_id=namespace_node["memory_id"],
+                    target_memory_id=node["memory_id"],
+                    relation_type="namespace_contains",
+                    weight=0.95,
+                    evidence={
+                        "namespace_id": namespace_id,
+                        "target_type": node["context_memory_type"],
+                        "source_tag": source_tag,
+                    },
+                )
+            )
+
+        source_events = ingestion.get("events") if isinstance(ingestion.get("events"), list) else []
+        for item in source_events:
+            memory_id = str(item.get("memory_id") or "")
+            if not memory_id:
+                continue
+            relationships.append(
+                self.memory_store.upsert_relationship(
+                    context_id=context_id,
+                    source_memory_id=namespace_node["memory_id"],
+                    target_memory_id=memory_id,
+                    relation_type="namespace_contains",
+                    weight=0.88,
+                    evidence={
+                        "namespace_id": namespace_id,
+                        "target_type": "conversation_event",
+                        "source_tag": source_tag,
+                    },
+                )
+            )
+
+        for previous, current in zip(typed_nodes, typed_nodes[1:]):
+            relationships.append(
+                self.memory_store.upsert_relationship(
+                    context_id=context_id,
+                    source_memory_id=previous["memory_id"],
+                    target_memory_id=current["memory_id"],
+                    relation_type="typed_context_sequence",
+                    weight=0.74,
+                    evidence={
+                        "namespace_id": namespace_id,
+                        "source_type": previous["context_memory_type"],
+                        "target_type": current["context_memory_type"],
+                        "source_tag": source_tag,
+                    },
+                )
+            )
+
+        self._refresh_registered_traces()
+        return {
+            "namespace_id": namespace_id,
+            "namespace_title": namespace_title,
+            "namespace_source": namespace_profile.get("namespace_source", ""),
+            "context_id": context_id,
+            "source_tag": source_tag,
+            "speaker": speaker,
+            "node_count": len(nodes),
+            "source_event_count": len(source_events),
+            "relationship_count": len(relationships),
+            "nodes": nodes,
+            "relationships": relationships,
+            "automated": True,
+        }
+
+    def _extract_context_memory_labels(
+        self,
+        text: str,
+        *,
+        namespace_title: str,
+    ) -> dict[str, list[str]]:
+        labels: dict[str, list[str]] = {
+            "topic": [self._clean_context_label(namespace_title)],
+            "goal": [],
+            "objective": [],
+            "event": [],
+        }
+        prefix_map = {
+            "thread": "topic",
+            "feature": "topic",
+            "topic": "topic",
+            "namespace": "topic",
+            "goal": "goal",
+            "goals": "goal",
+            "objective": "objective",
+            "objectives": "objective",
+            "event": "event",
+            "events": "event",
+        }
+        pattern = re.compile(
+            r"\b(thread|feature|topic|namespace|goals?|objectives?|events?)\s*:\s*([^.\n;]+)",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(str(text or "")):
+            target = prefix_map.get(match.group(1).lower(), "")
+            label = self._clean_context_label(match.group(2))
+            if target and label:
+                labels.setdefault(target, []).append(label)
+        lowered = str(text or "").lower()
+        if not labels["event"] and any(token in lowered for token in ("began", "started", "opened")):
+            labels["event"].append(
+                self._clean_context_label(
+                    self._extract_first_sentence(text) or f"{namespace_title} started"
+                )
+            )
+        return {
+            key: self._dedupe_context_labels(values)
+            for key, values in labels.items()
+            if self._dedupe_context_labels(values)
+        }
+
+    def _extract_prefixed_context_value(
+        self,
+        text: str,
+        *,
+        prefixes: tuple[str, ...],
+    ) -> str:
+        joined = "|".join(re.escape(prefix) for prefix in prefixes)
+        match = re.search(rf"\b({joined})\s*:\s*([^.\n;]+)", str(text or ""), re.IGNORECASE)
+        if match:
+            return match.group(2)
+        return ""
+
+    def _extract_first_sentence(self, text: str) -> str:
+        match = re.search(r"[^.!?\n]+", str(text or "").strip())
+        return self._clean_context_label(match.group(0)) if match else ""
+
+    def _clean_context_label(self, value: str) -> str:
+        cleaned = " ".join(str(value or "").replace("\n", " ").split()).strip(" .:-")
+        return cleaned[:160]
+
+    def _dedupe_context_labels(self, values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for value in values:
+            cleaned = self._clean_context_label(value)
+            key = cleaned.lower()
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(cleaned)
+        return deduped
+
+    def _slugify_context_namespace(self, value: str) -> str:
+        words = re.findall(r"[A-Za-z0-9]+", str(value or "").lower())
+        slug = "-".join(words[:8]).strip("-")
+        return sanitize_context_id(slug or "default")
 
     def prune_memory(
         self,

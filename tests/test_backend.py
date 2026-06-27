@@ -1060,6 +1060,66 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             "codex-session",
         )
 
+    def test_capture_conversation_automates_context_namespace_and_typed_nodes(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        capture = backend.capture_conversation(
+            text=(
+                "Thread: Namespace automation release. "
+                "Goal: automatically create visible contextual memory namespaces. "
+                "Objective: grow graph nodes for each new topic, feature, goal, and event. "
+                "Event: user began the namespace automation feature and expects nodes to grow."
+            ),
+            context_id="demo",
+            source_tag="namespace-session",
+            speaker="codex",
+        )
+        graph = backend.list_memory_graph(context_id="demo", limit=40)
+        deployments = backend.list_context_events(context_id="demo", limit=10)
+        namespace = capture["context_namespace"]
+        typed_entries = [
+            entry
+            for entry in graph["entries"]
+            if entry["metadata"].get("context_automation") is True
+        ]
+        typed_memory_types = {
+            entry["metadata"].get("context_memory_type")
+            for entry in typed_entries
+        }
+        namespace_relationships = [
+            relationship
+            for relationship in graph["relationships"]
+            if relationship["relation_type"] == "namespace_contains"
+        ]
+
+        self.assertEqual(namespace["namespace_id"], "namespace-automation-release")
+        self.assertGreaterEqual(namespace["node_count"], 5)
+        self.assertIn("namespace", typed_memory_types)
+        self.assertIn("topic", typed_memory_types)
+        self.assertIn("goal", typed_memory_types)
+        self.assertIn("objective", typed_memory_types)
+        self.assertIn("event", typed_memory_types)
+        self.assertGreaterEqual(len(namespace_relationships), 4)
+        self.assertTrue(
+            any(
+                entry["metadata"].get("context_namespace")
+                == "namespace-automation-release"
+                for entry in graph["entries"]
+                if entry["tag"].startswith("namespace-session-event")
+            )
+        )
+        self.assertEqual(
+            deployments["events"][-1]["payload"]["context_namespace"]["namespace_id"],
+            "namespace-automation-release",
+        )
+
     def test_prune_memory_removes_nodes_edges_modes_and_context_events(self):
         backend = SpikingAttentionBackend(
             dimension=32,

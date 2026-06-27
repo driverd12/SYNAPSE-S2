@@ -1456,6 +1456,11 @@ textarea {
   stroke: color-mix(in srgb, var(--teal) 72%, var(--blue));
 }
 
+.graph-edge.namespace {
+  stroke: var(--blue);
+  stroke-dasharray: 5 4;
+}
+
 .graph-node {
   fill: var(--panel);
   stroke: var(--teal);
@@ -1488,6 +1493,31 @@ textarea {
 
 .concept-node {
   fill: var(--teal-soft);
+}
+
+.namespace-node {
+  fill: color-mix(in srgb, var(--teal) 72%, var(--panel));
+  stroke: var(--teal-strong);
+}
+
+.topic-node {
+  fill: color-mix(in srgb, var(--blue) 20%, var(--panel));
+  stroke: var(--blue);
+}
+
+.goal-node {
+  fill: color-mix(in srgb, var(--green) 20%, var(--panel));
+  stroke: var(--green);
+}
+
+.objective-node {
+  fill: color-mix(in srgb, var(--orange) 22%, var(--panel));
+  stroke: var(--orange);
+}
+
+.namespace-event-node {
+  fill: color-mix(in srgb, var(--purple) 18%, var(--panel));
+  stroke: var(--purple);
 }
 
 .graph-label {

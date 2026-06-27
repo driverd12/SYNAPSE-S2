@@ -39,6 +39,8 @@ If the capture sidecar is not running or you need immediate synchronous capture,
   --text "<factual decisions, implementation details, validation evidence, and follow-up constraints>"
 ```
 
+For new topics, threads, or feature work, make the namespace explicit in the capture text when possible. Use short prefixes such as `Thread:`, `Feature:`, `Goal:`, `Objective:`, and `Event:` so SYNAPSE-S2 creates typed namespace nodes and temporal event relationships automatically.
+
 When relevant context lives in another already-running local app, use App Connect instead of inventing a brittle scrape path. Detect, attach, and snapshot only what is locally visible and relevant:
 
 ```bash

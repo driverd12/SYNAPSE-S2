@@ -410,6 +410,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("data-cortex-action", app)
         self.assertIn("moderateCortexTrace", app)
         self.assertIn("formatSpikeSubLabel", app)
+        self.assertIn("contextMemoryType", app)
         self.assertIn("active coordinates", app)
         self.assertIn("projected neurons", app)
         self.assertIn("renderContextEventLedger", app)
@@ -428,6 +429,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/readiness-audit", app)
         self.assertIn("/api/evidence-pack", app)
         self.assertIn('include_graph: "false"', app)
+        self.assertIn("namespace-node", styles)
+        self.assertIn("objective-node", styles)
         self.assertIn('"/api/graph"', app)
         self.assertIn("graph.deferred", app)
         self.assertIn("data-theme", styles)
@@ -605,12 +608,20 @@ class DashboardRuntimeTests(unittest.TestCase):
 
         self.assertEqual(capture_status, 200)
         self.assertGreaterEqual(capture_payload["event_count"], 2)
+        self.assertIn("context_namespace", capture_payload)
+        self.assertGreaterEqual(capture_payload["context_namespace"]["node_count"], 2)
         self.assertTrue(capture_payload["agent_deployment"]["published"])
         self.assertEqual(capture_payload["agent_deployment"]["event_type"], "conversation-capture")
         self.assertEqual(graph_status, 200)
         self.assertTrue(
             any(
                 entry["metadata"].get("conversation_capture") is True
+                for entry in graph_payload["entries"]
+            )
+        )
+        self.assertTrue(
+            any(
+                entry["metadata"].get("context_automation") is True
                 for entry in graph_payload["entries"]
             )
         )

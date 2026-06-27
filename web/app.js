@@ -821,7 +821,7 @@ function renderGraph(graph, status) {
       y: 34,
       "text-anchor": "middle",
       class: "graph-label",
-    }, compactTag(entry.tag, 22));
+    }, compactTag(graphNodeLabel(entry), 22));
     const score = formatSpikeSubLabel(entry);
     if (score) {
       appendSvg(group, "text", {
@@ -885,6 +885,10 @@ function renderNeuralInspector(graph, status, profile) {
 }
 
 function formatSpikeSubLabel(entry) {
+  const contextMemoryType = entry.metadata?.context_memory_type;
+  if (contextMemoryType) {
+    return String(contextMemoryType).replaceAll("_", " ");
+  }
   const spikeCount = Number(entry.spike_count || 0);
   if (!spikeCount) return "";
   const neuronCount = Number(entry.neuron_count || 0);
@@ -913,6 +917,9 @@ function layoutGraph(entries, width, height) {
 function edgeClass(relationship, weight) {
   const relation = String(relationship.relation_type || "");
   if (relation.includes("temporal")) return "graph-edge temporal";
+  if (relation.includes("namespace") || relation.includes("typed_context")) {
+    return "graph-edge namespace";
+  }
   if (relation.includes("semantic") || relation.includes("associative")) {
     return weight >= 0.5 ? "graph-edge associative strong" : "graph-edge associative weak";
   }
@@ -920,9 +927,24 @@ function edgeClass(relationship, weight) {
 }
 
 function nodeClass(entry) {
+  const contextMemoryType = entry.metadata?.context_memory_type;
+  if (contextMemoryType === "namespace") return "graph-node namespace-node";
+  if (contextMemoryType === "topic") return "graph-node topic-node";
+  if (contextMemoryType === "goal") return "graph-node goal-node";
+  if (contextMemoryType === "objective") return "graph-node objective-node";
+  if (contextMemoryType === "event") return "graph-node namespace-event-node";
   if (entry.metadata?.event_segment) return "graph-node event-node";
   if (entry.metadata?.source_tag || entry.metadata?.source) return "graph-node concept-node";
   return "graph-node";
+}
+
+function graphNodeLabel(entry) {
+  const contextMemoryType = entry.metadata?.context_memory_type;
+  if (!contextMemoryType) return entry.tag;
+  if (contextMemoryType === "namespace") {
+    return entry.metadata?.context_namespace_title || entry.tag;
+  }
+  return entry.metadata?.context_label || entry.source_text || entry.tag;
 }
 
 function graphTransformAttribute() {
