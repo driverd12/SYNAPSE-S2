@@ -352,11 +352,15 @@ class McpServerTests(unittest.TestCase):
             )
         )
         status_before = json.loads(mcp_server.get_spiking_capture_inbox_status())
-        processed = json.loads(mcp_server.process_spiking_capture_inbox(max_files=10))
+        rejected = json.loads(mcp_server.process_spiking_capture_inbox(max_files=10))
+        processed = json.loads(
+            mcp_server.process_spiking_capture_inbox(max_files=10, confirm=True)
+        )
         graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
 
         self.assertFalse(Path(drop["drop_path"]).exists())
         self.assertEqual(status_before["pending_file_count"], 1)
+        self.assertIn("confirm", rejected["error"])
         self.assertEqual(processed["processed_file_count"], 1)
         self.assertTrue(
             any(entry["tag"].startswith("mcp-magic-event") for entry in graph["entries"])

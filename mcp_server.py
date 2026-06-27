@@ -524,9 +524,11 @@ def get_spiking_capture_inbox_status() -> str:
 
 
 @mcp.tool()
-def process_spiking_capture_inbox(max_files: int = 50) -> str:
+def process_spiking_capture_inbox(max_files: int = 50, confirm: bool = False) -> str:
     """Process pending local capture inbox files into the real SYNAPSE-S2 graph."""
     try:
+        if confirm is not True:
+            raise ValueError("confirm must be true before processing capture inbox files")
         bounded_max = min(max(int(max_files), 1), 250)
         capture_daemon = _load_capture_daemon()
         return json.dumps(

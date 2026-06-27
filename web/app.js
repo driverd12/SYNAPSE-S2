@@ -228,6 +228,13 @@ async function requestJson(path, { method = "GET", params = {}, body = null } = 
   return payload;
 }
 
+function confirmPreflight(title, lines) {
+  const cleanLines = lines
+    .map((line) => String(line || "").trim())
+    .filter(Boolean);
+  return window.confirm([title, "", ...cleanLines].join("\n"));
+}
+
 function loadTheme() {
   try {
     const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -1705,19 +1712,36 @@ async function connectSelectedApp(button) {
     elements.appManualName.focus();
     return null;
   }
+  const connectBody = {
+    context_id: state.context,
+    app_name: appName,
+    bundle_id: selected?.bundle_id || "",
+    pid: Number(selected?.pid || 0),
+    source_tag: elements.appSourceTag.value.trim() || "app-connect",
+    speaker: elements.appSpeaker.value.trim() || "operator",
+    allow_manual: !selected,
+    metadata: { source: "dashboard-app-connect" },
+  };
   return withBusy(button, "App Connect", async () => {
+    const preflight = await requestJson("/api/app-connect/preflight", {
+      method: "POST",
+      body: connectBody,
+    });
+    if (!confirmPreflight("Connect this local app to SYNAPSE-S2?", [
+      `App: ${preflight.app_name}`,
+      `Context: ${preflight.context_id}`,
+      `Source: ${preflight.source_tag}`,
+      `Bundle: ${preflight.bundle_id || "manual"}`,
+      `PID: ${preflight.pid || "manual"}`,
+    ])) {
+      logOperation("App Connect cancelled", preflight);
+      return preflight;
+    }
     const payload = await requestJson("/api/app-connect", {
       method: "POST",
       body: {
-        context_id: state.context,
-        app_name: appName,
-        bundle_id: selected?.bundle_id || "",
-        pid: Number(selected?.pid || 0),
-        source_tag: elements.appSourceTag.value.trim() || "app-connect",
-        speaker: elements.appSpeaker.value.trim() || "operator",
-        confirm: true,
-        allow_manual: !selected,
-        metadata: { source: "dashboard-app-connect" },
+        ...connectBody,
+        confirmation_token: preflight.confirmation_token,
       },
     });
     await refreshAppConnect({ detect: false });
@@ -1734,12 +1758,29 @@ async function snapshotConnectedApp(button) {
     return null;
   }
   return withBusy(button, "App snapshot", async () => {
+    const snapshotBody = {
+      connection_id: connectionId,
+      metadata: { source: "dashboard-app-snapshot" },
+    };
+    const preflight = await requestJson("/api/app-snapshot/preflight", {
+      method: "POST",
+      body: snapshotBody,
+    });
+    const connection = preflight.connection || {};
+    if (!confirmPreflight("Capture a redacted app snapshot into memory?", [
+      `App: ${connection.app_name || connectionId}`,
+      `Context: ${connection.context_id || state.context}`,
+      `Source: ${connection.source_tag || "app-connect"}`,
+      preflight.preview_note || "",
+    ])) {
+      logOperation("App snapshot cancelled", preflight);
+      return preflight;
+    }
     const payload = await requestJson("/api/app-snapshot", {
       method: "POST",
       body: {
-        connection_id: connectionId,
-        confirm: true,
-        metadata: { source: "dashboard-app-snapshot" },
+        ...snapshotBody,
+        confirmation_token: preflight.confirmation_token,
       },
     });
     await publishAwareResult(payload);
@@ -2295,9 +2336,30 @@ elements.evidencePackButton.addEventListener("click", () => {
 
 elements.captureInboxButton.addEventListener("click", () => {
   withBusy(elements.captureInboxButton, "Magic capture", async () => {
+    const maxFiles = 50;
+    const preflight = await requestJson("/api/capture-inbox/preflight", {
+      method: "POST",
+      body: { context_id: state.context, max_files: maxFiles },
+    });
+    if (Number(preflight.selected_file_count || 0) <= 0) {
+      logOperation("Magic capture idle", preflight);
+      return preflight;
+    }
+    if (!confirmPreflight("Process pending capture inbox files?", [
+      `Files: ${preflight.selected_file_count} of ${preflight.pending_file_count}`,
+      `Bytes: ${formatNumber(preflight.selected_total_bytes || 0)}`,
+      `Root: ${preflight.root}`,
+    ])) {
+      logOperation("Magic capture cancelled", preflight);
+      return preflight;
+    }
     const payload = await requestJson("/api/capture-inbox/process", {
       method: "POST",
-      body: { context_id: state.context, max_files: 50 },
+      body: {
+        context_id: state.context,
+        max_files: maxFiles,
+        confirmation_token: preflight.confirmation_token,
+      },
     });
     renderCaptureInbox({
       ...(state.snapshot?.capture_inbox || {}),

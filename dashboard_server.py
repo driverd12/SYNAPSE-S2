@@ -36,6 +36,8 @@ WEB_ROOT = ROOT / "web"
 MAX_JSON_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 64 * 1024
 DEFAULT_CONTEXT = os.getenv("SYNAPSE_S2_DASHBOARD_CONTEXT", "default")
+CONFIRMATION_TOKEN_TTL_SECONDS = 120.0
+MAX_CONFIRMATION_TOKENS = 256
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; "
@@ -67,6 +69,7 @@ class DashboardRuntime:
         self._backend = backend
         self.started_at = time.time()
         self._system_info_cache: dict[str, Any] | None = None
+        self._confirmation_tokens: dict[str, dict[str, Any]] = {}
 
     @property
     def backend(self) -> mlx_backend.SpikingAttentionBackend:
@@ -183,6 +186,62 @@ class DashboardRuntime:
             include_graph = self._bool_param(params, "include_graph", True)
             return self._json_response(
                 self.snapshot(context_id=context, limit=limit, include_graph=include_graph)
+            )
+
+        if method == "POST" and path == "/api/app-connect/preflight":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            app_target = self._app_connect_target(payload, context_id=context)
+            preview = {
+                "action": "app-connect-preflight",
+                "context_id": context,
+                "app_name": app_target["app_name"],
+                "bundle_id": app_target["bundle_id"],
+                "pid": app_target["pid"],
+                "source_tag": app_target["source_tag"],
+                "speaker": app_target["speaker"],
+                "allow_manual": app_target["allow_manual"],
+                "mode": "operator-confirmed-local-app-attach",
+            }
+            return self._json_response(
+                self._issue_confirmation_token(
+                    action="app-connect",
+                    target=app_target,
+                    preview=preview,
+                )
+            )
+        if method == "POST" and path == "/api/app-snapshot/preflight":
+            payload = self._parse_json_body(body)
+            snapshot_target = self._app_snapshot_target(payload)
+            connection = self._connection_preview(snapshot_target["connection_id"])
+            preview = {
+                "action": "app-snapshot-preflight",
+                "connection_id": snapshot_target["connection_id"],
+                "connection": connection,
+                "mode": "operator-confirmed-local-app-snapshot",
+                "preview_note": "snapshot text is harvested only after confirmation",
+            }
+            return self._json_response(
+                self._issue_confirmation_token(
+                    action="app-snapshot",
+                    target=snapshot_target,
+                    preview=preview,
+                )
+            )
+        if method == "POST" and path == "/api/capture-inbox/preflight":
+            payload = self._parse_json_body(body)
+            max_files = self._max_files_from_payload(payload)
+            preflight = self.capture_daemon().preflight(max_files=max_files)
+            target = self._capture_inbox_target(
+                max_files=max_files,
+                preflight=preflight,
+            )
+            return self._json_response(
+                self._issue_confirmation_token(
+                    action="capture-inbox-process",
+                    target=target,
+                    preview=preflight,
+                )
             )
 
         if method == "POST" and path == "/api/cortex/enter":
@@ -400,39 +459,44 @@ class DashboardRuntime:
         if method == "POST" and path == "/api/app-connect":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
-            app_name = self._text_payload(payload, "app_name", max_bytes=1024)
-            metadata = self._metadata_payload(payload)
-            try:
-                pid = int(payload.get("pid", 0) or 0)
-            except (TypeError, ValueError) as exc:
-                raise DashboardError(HTTPStatus.BAD_REQUEST, "pid must be an integer") from exc
+            app_target = self._app_connect_target(payload, context_id=context)
+            self._consume_confirmation_token(
+                token=str(payload.get("confirmation_token", "") or ""),
+                action="app-connect",
+                target=app_target,
+            )
             return self._json_response(
                 self.transcript_capture().connect_running_app(
-                    app_name=app_name,
-                    bundle_id=str(payload.get("bundle_id", "") or ""),
-                    pid=pid,
+                    app_name=app_target["app_name"],
+                    bundle_id=app_target["bundle_id"],
+                    pid=int(app_target["pid"]),
                     context_id=context,
-                    source_tag=str(payload.get("source_tag", "app-connect") or "app-connect"),
-                    speaker=mlx_backend.sanitize_agent_id(str(payload.get("speaker", "operator"))),
+                    source_tag=app_target["source_tag"],
+                    speaker=app_target["speaker"],
                     metadata={
-                        **metadata,
+                        **app_target["metadata"],
                         "source_surface": "dashboard-app-connect",
                     },
-                    confirmed=payload.get("confirm") is True,
-                    allow_manual=payload.get("allow_manual") is True,
+                    confirmed=True,
+                    allow_manual=bool(app_target["allow_manual"]),
                 )
             )
         if method == "POST" and path == "/api/app-snapshot":
             payload = self._parse_json_body(body)
-            connection_id = self._text_payload(payload, "connection_id", max_bytes=512)
+            snapshot_target = self._app_snapshot_target(payload)
+            self._consume_confirmation_token(
+                token=str(payload.get("confirmation_token", "") or ""),
+                action="app-snapshot",
+                target=snapshot_target,
+            )
             return self._json_response(
                 self.transcript_capture().capture_app_snapshot(
-                    connection_id=connection_id,
+                    connection_id=snapshot_target["connection_id"],
                     metadata={
-                        **self._metadata_payload(payload),
+                        **snapshot_target["metadata"],
                         "source_surface": "dashboard-app-snapshot",
                     },
-                    confirmed=payload.get("confirm") is True,
+                    confirmed=True,
                 )
             )
         if method == "POST" and path == "/api/prune-memory":
@@ -514,12 +578,19 @@ class DashboardRuntime:
             return self._json_response(self.evidence_pack(context_id=context))
         if method == "POST" and path == "/api/capture-inbox/process":
             payload = self._parse_json_body(body)
-            try:
-                max_files = int(payload.get("max_files", 50))
-            except (TypeError, ValueError) as exc:
-                raise DashboardError(HTTPStatus.BAD_REQUEST, "max_files must be an integer") from exc
+            max_files = self._max_files_from_payload(payload)
+            preflight = self.capture_daemon().preflight(max_files=max_files)
+            target = self._capture_inbox_target(
+                max_files=max_files,
+                preflight=preflight,
+            )
+            self._consume_confirmation_token(
+                token=str(payload.get("confirmation_token", "") or ""),
+                action="capture-inbox-process",
+                target=target,
+            )
             return self._json_response(
-                self.capture_daemon().process_once(max_files=min(max(max_files, 1), 250))
+                self.capture_daemon().process_once(max_files=max_files)
             )
 
         raise DashboardError(HTTPStatus.NOT_FOUND, "route not found")
@@ -873,6 +944,153 @@ class DashboardRuntime:
         if not isinstance(payload, dict):
             raise DashboardError(HTTPStatus.BAD_REQUEST, "JSON body must be an object")
         return payload
+
+    def _issue_confirmation_token(
+        self,
+        *,
+        action: str,
+        target: dict[str, Any],
+        preview: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._purge_confirmation_tokens()
+        if len(self._confirmation_tokens) >= MAX_CONFIRMATION_TOKENS:
+            oldest = sorted(
+                self._confirmation_tokens.items(),
+                key=lambda item: float(item[1].get("issued_at", 0.0)),
+            )
+            for token, _record in oldest[: max(1, len(oldest) - MAX_CONFIRMATION_TOKENS + 1)]:
+                self._confirmation_tokens.pop(token, None)
+        now = time.time()
+        token = uuid.uuid4().hex
+        target_hash = self._confirmation_target_hash(target)
+        expires_at = now + CONFIRMATION_TOKEN_TTL_SECONDS
+        self._confirmation_tokens[token] = {
+            "action": str(action),
+            "target_hash": target_hash,
+            "issued_at": now,
+            "expires_at": expires_at,
+        }
+        return {
+            **preview,
+            "confirmation_token": token,
+            "confirmation_expires_at": expires_at,
+            "confirmation_ttl_seconds": CONFIRMATION_TOKEN_TTL_SECONDS,
+            "target_hash": target_hash,
+            "requires_confirmation_token": True,
+        }
+
+    def _consume_confirmation_token(
+        self,
+        *,
+        token: str,
+        action: str,
+        target: dict[str, Any],
+    ) -> None:
+        self._purge_confirmation_tokens()
+        clean_token = str(token or "").strip()
+        if not clean_token:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                f"confirmation_token is required for {action}",
+            )
+        record = self._confirmation_tokens.pop(clean_token, None)
+        if record is None:
+            raise DashboardError(
+                HTTPStatus.CONFLICT,
+                "confirmation_token is missing, expired, or already used",
+            )
+        if str(record.get("action") or "") != str(action):
+            raise DashboardError(HTTPStatus.CONFLICT, "confirmation_token action mismatch")
+        if float(record.get("expires_at", 0.0) or 0.0) < time.time():
+            raise DashboardError(HTTPStatus.CONFLICT, "confirmation_token expired")
+        expected_hash = str(record.get("target_hash") or "")
+        actual_hash = self._confirmation_target_hash(target)
+        if expected_hash != actual_hash:
+            raise DashboardError(HTTPStatus.CONFLICT, "confirmation target changed after preflight")
+
+    def _purge_confirmation_tokens(self) -> None:
+        now = time.time()
+        expired = [
+            token
+            for token, record in self._confirmation_tokens.items()
+            if float(record.get("expires_at", 0.0) or 0.0) < now
+        ]
+        for token in expired:
+            self._confirmation_tokens.pop(token, None)
+
+    def _confirmation_target_hash(self, target: dict[str, Any]) -> str:
+        target_json = json.dumps(target, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(target_json.encode("utf-8")).hexdigest()
+
+    def _max_files_from_payload(self, payload: dict[str, Any]) -> int:
+        try:
+            max_files = int(payload.get("max_files", 50))
+        except (TypeError, ValueError) as exc:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, "max_files must be an integer") from exc
+        return min(max(max_files, 1), 250)
+
+    def _app_connect_target(self, payload: dict[str, Any], *, context_id: str) -> dict[str, Any]:
+        app_name = self._text_payload(payload, "app_name", max_bytes=1024)
+        try:
+            pid = int(payload.get("pid", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, "pid must be an integer") from exc
+        return {
+            "context_id": context_id,
+            "app_name": app_name,
+            "bundle_id": str(payload.get("bundle_id", "") or ""),
+            "pid": pid,
+            "source_tag": str(payload.get("source_tag", "app-connect") or "app-connect"),
+            "speaker": mlx_backend.sanitize_agent_id(str(payload.get("speaker", "operator"))),
+            "allow_manual": payload.get("allow_manual") is True,
+            "metadata": self._metadata_payload(payload),
+        }
+
+    def _app_snapshot_target(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "connection_id": self._text_payload(payload, "connection_id", max_bytes=512),
+            "metadata": self._metadata_payload(payload),
+        }
+
+    def _connection_preview(self, connection_id: str) -> dict[str, Any]:
+        connections = self.transcript_capture().list_app_connections().get("connections", [])
+        for connection in connections:
+            if str(connection.get("connection_id") or "") == connection_id:
+                return {
+                    "connection_id": connection_id,
+                    "app_name": str(connection.get("app_name") or ""),
+                    "bundle_id": str(connection.get("bundle_id") or ""),
+                    "pid": int(connection.get("pid") or 0),
+                    "context_id": str(connection.get("context_id") or ""),
+                    "source_tag": str(connection.get("source_tag") or ""),
+                    "speaker": str(connection.get("speaker") or ""),
+                }
+        raise DashboardError(HTTPStatus.BAD_REQUEST, "app connection was not found")
+
+    def _capture_inbox_target(
+        self,
+        *,
+        max_files: int,
+        preflight: dict[str, Any],
+    ) -> dict[str, Any]:
+        selected_files = preflight.get("selected_files", [])
+        if not isinstance(selected_files, list):
+            selected_files = []
+        return {
+            "root": str(preflight.get("root") or ""),
+            "max_files": int(max_files),
+            "selected_file_count": int(preflight.get("selected_file_count") or 0),
+            "selected_files": [
+                {
+                    "file": str(item.get("file") or ""),
+                    "bytes": int(item.get("bytes") or 0),
+                    "modified_at": float(item.get("modified_at") or 0.0),
+                    "sha256": str(item.get("sha256") or ""),
+                }
+                for item in selected_files
+                if isinstance(item, dict)
+            ],
+        }
 
     def _debug_error_details_enabled(self) -> bool:
         return os.getenv("SYNAPSE_S2_DASHBOARD_DEBUG_ERRORS", "").strip().lower() in {

@@ -280,6 +280,8 @@ def command_capture_inbox_status(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_capture_inbox_process(args: argparse.Namespace) -> dict[str, Any]:
+    if args.confirm is not True:
+        raise ValueError("--confirm is required to process capture inbox files")
     return _capture_daemon_from_args(args).process_once(max_files=args.max_files)
 
 
@@ -785,6 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     capture_inbox_process = subparsers.add_parser("capture-inbox-process")
     capture_inbox_process.add_argument("--capture-root", default=None)
     capture_inbox_process.add_argument("--max-files", type=int, default=50)
+    capture_inbox_process.add_argument("--confirm", action="store_true")
     capture_inbox_process.set_defaults(func=command_capture_inbox_process)
 
     transcript_source_add = subparsers.add_parser("transcript-source-add")

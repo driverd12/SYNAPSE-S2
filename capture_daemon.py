@@ -165,6 +165,43 @@ class CaptureInboxDaemon:
             "mode": "capture-inbox",
         }
 
+    def preflight(self, *, max_files: int = 50) -> dict[str, Any]:
+        paths = self.paths()
+        for key in ("inbox_dir", "processed_dir", "error_dir"):
+            _ensure_private_dir(paths[key])
+        bounded_max = min(max(int(max_files), 1), 250)
+        pending = self._capture_files(paths["inbox_dir"])
+        selected = pending[:bounded_max]
+        selected_files: list[dict[str, Any]] = []
+        selected_total_bytes = 0
+        for path in selected:
+            try:
+                stat_result = path.lstat()
+                size = int(stat_result.st_size)
+                modified_at = float(stat_result.st_mtime)
+            except FileNotFoundError:
+                continue
+            selected_total_bytes += size
+            selected_files.append(
+                {
+                    "file": path.name,
+                    "bytes": size,
+                    "modified_at": modified_at,
+                    "sha256": hashlib.sha256(path.name.encode("utf-8")).hexdigest(),
+                }
+            )
+        return {
+            "action": "capture-inbox-preflight",
+            "root": str(self.root),
+            "inbox_dir": str(paths["inbox_dir"]),
+            "pending_file_count": len(pending),
+            "selected_file_count": len(selected_files),
+            "selected_total_bytes": selected_total_bytes,
+            "selected_files": selected_files,
+            "max_files": bounded_max,
+            "mode": "manual-confirmation-preflight",
+        }
+
     def process_once(self, *, max_files: int = 50) -> dict[str, Any]:
         paths = self.paths()
         for key in ("inbox_dir", "processed_dir", "error_dir"):

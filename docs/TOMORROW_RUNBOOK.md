@@ -35,6 +35,8 @@ Restart Codex, Claude Desktop, and Claude Code after the client-config installer
 - Capture inbox payloads are redacted before the pending file is written. Pending, processed, error, export, backup, runtime, and SQLite paths are created private to the local user where the filesystem permits it.
 - Capture processing refuses symlinks and oversized payloads. It does not follow arbitrary filesystem targets from the inbox.
 - Direct `capture-session`, MCP `capture_spiking_conversation`, context-bus deployments, graph metadata, and returned API payloads all share the same redaction layer.
+- Manual capture inbox processing is confirmation-gated: CLI requires `--confirm`, MCP requires `confirm=true`, and the dashboard Magic Capture flow requires a short-lived preflight token tied to the pending file list.
+- Dashboard App Connect attach and snapshot actions require short-lived preflight tokens bound to the selected app or connection before they can write to memory.
 - Destructive memory and Cortex pruning are confirmation-gated: CLI requires `--confirm`, MCP requires `confirm=true`, and the dashboard requires an explicit confirmation action before deleting graph data or governed traces.
 - `test-validated` Cortex memory requires concrete validation evidence such as a test command, test list, output summary, artifact path, commit, or verification report. Use `observed` or `operator-confirmed` for ordinary notes.
 - Recall is backed by durable SQLite indexes for sparse spikes and surface terms. Existing databases are backfilled automatically, and `memory_store.stats()` exposes the populated index counts.
@@ -146,9 +148,10 @@ scripts/install_capture_daemon.sh
   --speaker codex \
   --text "Capture a concise factual session boundary note here."
 .venv/bin/python synapse_cli.py --json capture-inbox-status
+.venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
 ```
 
-The sidecar watches `.synapse_s2/capture_inbox`, redacts common secret patterns, ingests pending payloads into real temporal event memories, then moves files to `.synapse_s2/capture_processed`. This is the production-hardened "magic" layer: clients and hooks still opt in by writing payloads, but no running dashboard or terminal session has to stay open for ingestion.
+The sidecar watches `.synapse_s2/capture_inbox`, redacts common secret patterns, ingests pending payloads into real temporal event memories, then moves files to `.synapse_s2/capture_processed`. This is the production-hardened "magic" layer: clients and hooks still opt in by writing payloads, but no running dashboard or terminal session has to stay open for ingestion. Manual one-shot processing remains explicit: the CLI uses `--confirm`, MCP uses `confirm=true`, and the dashboard preflights the exact pending files before committing.
 
 App Connect:
 
@@ -320,7 +323,7 @@ Useful tool calls:
 | `capture_spiking_conversation` | Captures real operator/agent session notes into event memory. |
 | `drop_spiking_capture_inbox` | Drops opt-in session notes for the always-on local sidecar. |
 | `get_spiking_capture_inbox_status` | Shows pending and processed capture inbox counts. |
-| `process_spiking_capture_inbox` | Manually processes pending capture inbox files. |
+| `process_spiking_capture_inbox` | Manually processes pending capture inbox files; requires `confirm=true`. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
 | `prune_spiking_memory` | Removes a node, relationship edge, deployment event, or relationship mode. |

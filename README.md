@@ -180,10 +180,13 @@ scripts/install_capture_daemon.sh
   --speaker codex \
   --text "Capture a concise factual session note here."
 .venv/bin/python synapse_cli.py --json capture-inbox-status
+.venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
 .venv/bin/python synapse_cli.py --json graph --context default --limit 30
 ```
 
-App Connect gives operators a local attach path for already-running apps. It detects attachable local apps through a fast filtered process-list scan, records a confirmed attachment, and can capture either intentionally selected text or a redacted Accessibility snapshot into the same temporal event graph and context bus. This is a hardened local connector, not a remote control plane.
+Manual inbox processing is confirmation-gated. The launchd sidecar can process its own local queue continuously, but CLI and MCP one-shot processing require `--confirm` / `confirm=true`, and the dashboard Magic Capture button performs a preflight with a short-lived confirmation token before committing pending files.
+
+App Connect gives operators a local attach path for already-running apps. It detects attachable local apps through a fast filtered process-list scan, records a confirmed attachment, and can capture either intentionally selected text or a redacted Accessibility snapshot into the same temporal event graph and context bus. Dashboard app attach and snapshot actions use preflight confirmation tokens bound to the selected app/connection so a stale click cannot silently retarget capture. This is a hardened local connector, not a remote control plane.
 
 ```bash
 .venv/bin/python synapse_cli.py --json app-list
@@ -261,7 +264,7 @@ The MCP server exposes these tools:
 | `capture_spiking_conversation` | Capture real operator/agent conversation notes as temporal event memories. |
 | `drop_spiking_capture_inbox` | Drop opt-in session text into the local capture inbox sidecar. |
 | `get_spiking_capture_inbox_status` | Show pending, processed, and failed inbox file counts. |
-| `process_spiking_capture_inbox` | Process pending inbox drops into the real memory graph. |
+| `process_spiking_capture_inbox` | Process pending inbox drops into the real memory graph; requires `confirm=true`. |
 | `register_spiking_transcript_source` | Register a confirmed local transcript/log file for bounded delta capture. |
 | `list_spiking_transcript_sources` | List registered local transcript sources. |
 | `poll_spiking_transcript_sources` | Poll registered transcript deltas into temporal event memory. |
@@ -338,7 +341,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect local app attachment/snapshot capture, magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only operator surface for the same runtime and memory store used by MCP and the CLI. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, tokenized App Connect local app attachment/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

@@ -480,10 +480,18 @@ class SynapseCliTests(unittest.TestCase):
                 state_path=state_path,
                 memory_path=memory_path,
             )
+            rejected = self.run_cli(
+                "capture-inbox-process",
+                "--capture-root",
+                str(inbox_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
             processed = self.run_cli(
                 "capture-inbox-process",
                 "--capture-root",
                 str(inbox_root),
+                "--confirm",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -497,6 +505,8 @@ class SynapseCliTests(unittest.TestCase):
 
         self.assertEqual(drop.returncode, 0, drop.stderr)
         self.assertEqual(status_before.returncode, 0, status_before.stderr)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("--confirm", rejected.stdout + rejected.stderr)
         self.assertEqual(processed.returncode, 0, processed.stderr)
         self.assertEqual(graph.returncode, 0, graph.stderr)
         self.assertFalse(Path(json.loads(drop.stdout)["drop_path"]).exists())

@@ -545,10 +545,15 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/capture-conversation", app)
         self.assertIn("/api/prune-memory", app)
         self.assertIn("/api/capture-inbox", app)
+        self.assertIn("/api/capture-inbox/preflight", app)
         self.assertIn("/api/apps", app)
         self.assertIn("/api/app-connect", app)
+        self.assertIn("/api/app-connect/preflight", app)
         self.assertIn("/api/app-connections", app)
         self.assertIn("/api/app-snapshot", app)
+        self.assertIn("/api/app-snapshot/preflight", app)
+        self.assertIn("confirmation_token", app)
+        self.assertIn("confirmPreflight", app)
         self.assertIn("renderAppConnect", app)
         self.assertIn("snapshotConnectedApp", app)
         self.assertIn("/api/context-events", app)
@@ -869,11 +874,31 @@ class DashboardRuntimeTests(unittest.TestCase):
                 status_before, payload_before = self.decode(
                     runtime.handle("GET", "/api/capture-inbox")
                 )
-                process_status, process_payload = self.decode(
+                rejected_status, rejected_payload = self.decode(
                     runtime.handle(
                         "POST",
                         "/api/capture-inbox/process",
                         json.dumps({"context_id": "demo"}).encode(),
+                    )
+                )
+                preflight_status, preflight_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/capture-inbox/preflight",
+                        json.dumps({"context_id": "demo", "max_files": 50}).encode(),
+                    )
+                )
+                process_status, process_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/capture-inbox/process",
+                        json.dumps(
+                            {
+                                "context_id": "demo",
+                                "max_files": 50,
+                                "confirmation_token": preflight_payload["confirmation_token"],
+                            }
+                        ).encode(),
                     )
                 )
                 graph_status, graph_payload = self.decode(
@@ -887,6 +912,11 @@ class DashboardRuntimeTests(unittest.TestCase):
 
         self.assertEqual(status_before, 200)
         self.assertEqual(payload_before["pending_file_count"], 1)
+        self.assertEqual(rejected_status, 400)
+        self.assertIn("confirmation_token", rejected_payload["error"])
+        self.assertEqual(preflight_status, 200)
+        self.assertEqual(preflight_payload["selected_file_count"], 1)
+        self.assertTrue(preflight_payload["requires_confirmation_token"])
         self.assertEqual(process_status, 200)
         self.assertEqual(process_payload["processed_file_count"], 1)
         self.assertEqual(graph_status, 200)
@@ -903,20 +933,37 @@ class DashboardRuntimeTests(unittest.TestCase):
             os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = tmp
             try:
                 runtime = self.make_runtime(tmp)
+                app_payload = {
+                    "context_id": "demo",
+                    "app_name": "Codex IDE",
+                    "bundle_id": "com.openai.codex",
+                    "pid": 4242,
+                    "source_tag": "codex-ide",
+                    "speaker": "codex",
+                    "allow_manual": True,
+                }
+                rejected_status, rejected_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/app-connect",
+                        json.dumps({**app_payload, "confirm": True}).encode(),
+                    )
+                )
+                preflight_status, preflight_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/app-connect/preflight",
+                        json.dumps(app_payload).encode(),
+                    )
+                )
                 connect_status, connect_payload = self.decode(
                     runtime.handle(
                         "POST",
                         "/api/app-connect",
                         json.dumps(
                             {
-                                "context_id": "demo",
-                                "app_name": "Codex IDE",
-                                "bundle_id": "com.openai.codex",
-                                "pid": 4242,
-                                "source_tag": "codex-ide",
-                                "speaker": "codex",
-                                "confirm": True,
-                                "allow_manual": True,
+                                **app_payload,
+                                "confirmation_token": preflight_payload["confirmation_token"],
                             }
                         ).encode(),
                     )
@@ -930,6 +977,11 @@ class DashboardRuntimeTests(unittest.TestCase):
                 else:
                     os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = previous_root
 
+        self.assertEqual(rejected_status, 400)
+        self.assertIn("confirmation_token", rejected_payload["error"])
+        self.assertEqual(preflight_status, 200)
+        self.assertEqual(preflight_payload["app_name"], "Codex IDE")
+        self.assertTrue(preflight_payload["requires_confirmation_token"])
         self.assertEqual(connect_status, 200)
         self.assertEqual(connect_payload["app_name"], "Codex IDE")
         self.assertEqual(connect_payload["bundle_id"], "com.openai.codex")
