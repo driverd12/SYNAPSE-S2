@@ -812,6 +812,43 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertIn("## Cortex Governor", hydrated["briefing_markdown"])
         self.assertIn("Active Sessions", hydrated["briefing_markdown"])
 
+    def test_cortex_state_scans_beyond_visible_limit_for_typed_counts(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        session = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Keep governed memory visible with a small UI limit.",
+            mode="strict",
+        )
+        backend.commit_cortical_trace(
+            context_id="demo",
+            agent_id="codex",
+            session_id=session["session_id"],
+            trace_type="validation",
+            truth_posture="test-validated",
+            text="Cortex typed counts must survive newer non-cortex graph entries.",
+            evidence={"source": "unit-test"},
+        )
+        for index in range(8):
+            backend.register_text_trace(
+                tag=f"ordinary-memory-{index}",
+                context_id="demo",
+                text=f"Ordinary newer memory {index} should not hide cortical counts.",
+                metadata={"source": "unit-test"},
+            )
+
+        state = backend.get_cortex_state(context_id="demo", agent_id="codex", limit=2)
+
+        self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
+        self.assertLessEqual(len(state["working_memory"]), 2)
+
     def test_capture_conversation_creates_event_graph_and_context_deployment(self):
         backend = SpikingAttentionBackend(
             dimension=32,

@@ -1410,6 +1410,9 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id) if agent_id else ""
+        visible_limit = max(1, min(int(limit), 500))
+        scan_limit = max(100, visible_limit * 5)
+        scan_limit = min(scan_limit, 500)
         active_sessions = [
             dict(session)
             for session in self.cortex_sessions.values()
@@ -1421,7 +1424,7 @@ class SpikingAttentionBackend:
         entries = self.memory_store.list_entries(
             context_id=context,
             include_global=True,
-            limit=max(1, min(int(limit), 500)),
+            limit=scan_limit,
         )
         cortical_entries = [
             self._summarize_cortex_memory(entry)
@@ -1456,7 +1459,7 @@ class SpikingAttentionBackend:
             "constraints": constraints,
             "risks": risks,
             "decisions": decisions,
-            "working_memory": cortical_entries[:10],
+            "working_memory": cortical_entries[:visible_limit],
             "policy": self._cortex_policy(
                 str(active_sessions[0].get("mode", "strict")) if active_sessions else "strict"
             ),
