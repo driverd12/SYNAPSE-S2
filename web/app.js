@@ -23,6 +23,7 @@ const state = {
     lockUntilMs: 0,
   },
   coreToggle: {
+    enabled: true,
     unlockedUntilMs: 0,
     lockTimer: null,
   },
@@ -61,6 +62,7 @@ const elements = collectElements([
   "contextInput",
   "contextUri",
   "coreToggleGuardHint",
+  "coreStateIndicator",
   "coreUnlockButton",
   "coreVersion",
   "cortexAgentId",
@@ -186,7 +188,6 @@ const elements = collectElements([
   "themeButton",
   "toggleActionButton",
   "toggleActionState",
-  "toggleButton",
   "toggleText",
   "traceCache",
   "uptimeLabel",
@@ -344,10 +345,15 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
     graphDeferred,
   });
 
+  state.coreToggle.enabled = enabled;
   elements.toggleText.textContent = enabled ? "Enabled" : "Disabled";
   elements.toggleActionState.textContent = enabled ? "Enabled" : "Disabled";
-  elements.toggleButton.classList.toggle("off", !enabled);
-  elements.toggleButton.setAttribute("aria-pressed", String(enabled));
+  elements.coreStateIndicator.classList.toggle("off", !enabled);
+  elements.coreStateIndicator.setAttribute(
+    "aria-label",
+    `SYNAPSE-S2 Core currently ${enabled ? "enabled" : "disabled"}`,
+  );
+  elements.coreStateIndicator.title = `SYNAPSE-S2 Core is currently ${enabled ? "enabled" : "disabled"}`;
   updateCoreToggleGuard();
 
   elements.graphSummary.textContent = graphDeferred
@@ -497,10 +503,10 @@ function renderAppConnect(appPayload = null, connectionPayload = null) {
       ? `${formatNumber(detected)} running app${detected === 1 ? "" : "s"} detected`
       : "App Connect idle";
   const detail = connected
-    ? "Choose an attached connection and snapshot it into memory when the app state matters."
+    ? "Choose an attached connection and snapshot locally exposed Accessibility text into memory; use selected-text fallback for exact content."
     : detected
-      ? "Select a detected app, set a source tag, then connect it to this context."
-      : "Detect local apps, attach one, then capture a redacted snapshot into SYNAPSE-S2 memory.";
+      ? "Select a detected app, set a source tag, then connect it before capturing exposed UI text."
+      : "Detect local apps, attach one, then capture locally exposed Accessibility text into SYNAPSE-S2 memory.";
   setAppConnectState(headline, detail, connected || detected ? "ready" : "");
 }
 
@@ -1860,7 +1866,7 @@ async function snapshotConnectedApp(button) {
     const connection = preflight.connection || {};
     setAppConnectState(
       "Capturing app snapshot",
-      `${connection.app_name || connectionId} is being read locally and redacted before memory ingest.`,
+      `${connection.app_name || connectionId} is being read through locally exposed Accessibility text and redacted before memory ingest.`,
       "pending",
     );
     const payload = await requestJson("/api/app-snapshot", {
@@ -2135,7 +2141,7 @@ async function toggleCore(button) {
     logOperation("Core toggle locked", "Press Unlock before enabling or disabling SYNAPSE-S2 Core.");
     return;
   }
-  const enabled = !elements.toggleButton.classList.contains("off");
+  const enabled = Boolean(state.coreToggle.enabled);
   try {
     await withBusy(button, "Toggle", () => (
       requestJson("/api/toggle", {
@@ -2173,23 +2179,18 @@ function lockCoreToggleGuard() {
 
 function updateCoreToggleGuard() {
   const unlocked = isCoreToggleUnlocked();
-  const enabled = !elements.toggleButton.classList.contains("off");
+  const enabled = Boolean(state.coreToggle.enabled);
   const nextAction = enabled ? "Disable" : "Enable";
   const lockedHint = "Locked. Press Unlock before enabling or disabling SYNAPSE-S2 Core.";
   const unlockedHint = `Unlocked for one ${nextAction.toLowerCase()} action. Relocks after use or timeout.`;
-  elements.toggleButton.disabled = !unlocked;
   elements.toggleActionButton.disabled = !unlocked;
   elements.coreUnlockButton.disabled = unlocked;
   elements.coreUnlockButton.textContent = unlocked ? "Unlocked" : "Unlock";
   elements.coreUnlockButton.setAttribute("aria-pressed", String(unlocked));
   elements.coreToggleGuardHint.textContent = unlocked ? unlockedHint : lockedHint;
-  elements.toggleButton.title = unlocked
-    ? `${nextAction} SYNAPSE-S2 Core`
-    : "Unlock in Maintenance Controls before changing SYNAPSE-S2 Core";
   elements.toggleActionButton.title = unlocked
     ? `${nextAction} SYNAPSE-S2 Core`
     : "Unlock before changing SYNAPSE-S2 Core";
-  elements.toggleButton.setAttribute("aria-label", `${nextAction} SYNAPSE-S2 Core`);
   elements.toggleActionButton.setAttribute("aria-label", `${nextAction} SYNAPSE-S2 Core`);
 }
 
@@ -2265,7 +2266,6 @@ elements.neuralInspectorToggle.addEventListener("click", () => {
 });
 
 elements.coreUnlockButton.addEventListener("click", unlockCoreToggleGuard);
-elements.toggleButton.addEventListener("click", () => toggleCore(elements.toggleButton));
 elements.toggleActionButton.addEventListener("click", () => toggleCore(elements.toggleActionButton));
 
 elements.cortexEnterForm.addEventListener("submit", async (event) => {

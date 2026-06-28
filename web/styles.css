@@ -253,7 +253,7 @@ dd {
 .primary-button,
 .secondary-button,
 .danger-button,
-.switch-button,
+.core-state-indicator,
 .guard-button,
 .neural-inspector-toggle,
 .action-row {
@@ -285,7 +285,6 @@ dd {
 .primary-button:focus-visible,
 .secondary-button:focus-visible,
 .danger-button:focus-visible,
-.switch-button:focus-visible,
 .guard-button:focus-visible,
 .neural-inspector-toggle:focus-visible,
 .action-row:focus-visible,
@@ -774,13 +773,15 @@ textarea {
   min-height: 208px;
 }
 
-.switch-button {
+.core-state-indicator {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  align-self: start;
   min-height: 38px;
   padding: 0 8px 0 10px;
   color: var(--green);
+  cursor: default;
   font-size: 11px;
   font-weight: 840;
   text-transform: uppercase;
@@ -807,21 +808,16 @@ textarea {
   transition: transform 160ms ease;
 }
 
-.switch-button.off {
+.core-state-indicator.off {
   color: var(--red);
 }
 
-.switch-button.off .switch-track {
+.core-state-indicator.off .switch-track {
   background: var(--border-strong);
 }
 
-.switch-button.off .switch-track span {
+.core-state-indicator.off .switch-track span {
   transform: translateX(-20px);
-}
-
-.switch-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.72;
 }
 
 .system-list {
@@ -1131,6 +1127,32 @@ textarea {
 
 .action-list {
   display: grid;
+  gap: 10px;
+}
+
+.action-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.action-section h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 820;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.action-group-grid {
+  display: grid;
+  grid-template-columns: 1fr;
   gap: 8px;
 }
 
@@ -2037,12 +2059,12 @@ textarea {
   display: grid;
   grid-column: 1 / -1;
   grid-template-columns:
-    minmax(520px, 2fr)
-    minmax(190px, 0.72fr)
-    minmax(210px, 0.82fr)
-    minmax(190px, 0.72fr)
-    minmax(170px, 0.62fr)
-    minmax(190px, 0.72fr);
+    minmax(440px, 2fr)
+    minmax(140px, 0.72fr)
+    minmax(160px, 0.82fr)
+    minmax(140px, 0.72fr)
+    minmax(130px, 0.62fr)
+    minmax(140px, 0.72fr);
   align-items: center;
   border-top: 1px solid var(--border);
   background: var(--shell);
@@ -2196,6 +2218,7 @@ textarea {
   .write-grid,
   .prune-form,
   .field-row,
+  .action-group-grid,
   .bottom-bar {
     grid-template-columns: 1fr;
   }

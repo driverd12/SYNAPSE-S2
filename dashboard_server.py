@@ -13,7 +13,7 @@ import time
 import tomllib
 import uuid
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -1529,8 +1529,7 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-class SynapseDashboardServer(ThreadingHTTPServer):
-    daemon_threads = True
+class SynapseDashboardServer(HTTPServer):
     request_queue_size = 32
 
     def __init__(

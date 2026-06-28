@@ -162,10 +162,10 @@
                 <p class="section-label">Runtime Ready</p>
                 <h2 id="runtimeTitle">SYNAPSE-S2 Core</h2>
               </div>
-              <button id="toggleButton" class="switch-button" aria-pressed="true" aria-describedby="coreToggleGuardHint" disabled title="Unlock in Maintenance Controls before changing SYNAPSE-S2 Core">
+              <div id="coreStateIndicator" class="core-state-indicator" role="status" aria-live="polite" title="SYNAPSE-S2 Core is currently enabled">
                 <span class="switch-track" aria-hidden="true"><span></span></span>
                 <span id="toggleText">Enabled</span>
-              </button>
+              </div>
             </div>
             <div class="system-list">
               <div><span>Spiking Engine</span><strong id="engineState">ACTIVE</strong></div>
@@ -258,77 +258,98 @@
                 <h2 id="maintenanceTitle">Local actions</h2>
               </div>
             </div>
-            <div class="action-list">
-              <div class="action-row guarded-action" role="group" aria-labelledby="coreToggleActionTitle" aria-describedby="coreToggleGuardHint">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
-                <span><strong id="coreToggleActionTitle">Enable / Disable Core</strong><small>Unlock required to change state</small></span>
-                <span class="guard-controls">
-                  <button id="coreUnlockButton" class="guard-button unlock-button" type="button" aria-pressed="false">Unlock</button>
-                  <button id="toggleActionButton" class="guard-button state-toggle" type="button" disabled>
-                    <span id="toggleActionState">Enabled</span>
+            <div class="action-list" aria-label="Maintenance action groups">
+              <section id="coreActionGroup" class="action-section" aria-labelledby="coreActionGroupTitle">
+                <h3 id="coreActionGroupTitle">Core control</h3>
+                <div class="action-row guarded-action" role="group" aria-labelledby="coreToggleActionTitle" aria-describedby="coreToggleGuardHint">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+                  <span><strong id="coreToggleActionTitle">Enable / Disable Core</strong><small>Only control that changes runtime state</small></span>
+                  <span class="guard-controls">
+                    <button id="coreUnlockButton" class="guard-button unlock-button" type="button" aria-pressed="false">Unlock</button>
+                    <button id="toggleActionButton" class="guard-button state-toggle" type="button" disabled>
+                      <span id="toggleActionState">Enabled</span>
+                    </button>
+                  </span>
+                </div>
+                <p id="coreToggleGuardHint" class="guard-hint">Locked. Press Unlock before enabling or disabling SYNAPSE-S2 Core.</p>
+              </section>
+
+              <section id="reliabilityActionGroup" class="action-section" aria-labelledby="reliabilityActionGroupTitle">
+                <h3 id="reliabilityActionGroupTitle">Reliability checks</h3>
+                <div class="action-group-grid">
+                  <button class="action-row" type="button" id="refreshActionButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+                    <span><strong>Refresh Runtime State</strong><small>Reload metrics and health</small></span>
+                    <em>Refresh</em>
                   </button>
-                </span>
-              </div>
-              <p id="coreToggleGuardHint" class="guard-hint">Locked. Press Unlock before enabling or disabling SYNAPSE-S2 Core.</p>
-              <button class="action-row" type="button" id="refreshActionButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
-                <span><strong>Refresh Runtime State</strong><small>Reload metrics and health</small></span>
-                <em>Refresh</em>
-              </button>
-              <button class="action-row" type="button" id="backupButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v14c0 1.7 3.1 3 7 3s7-1.3 7-3V5"/><path d="M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></svg>
-                <span><strong>Create Backup</strong><small>Snapshot memory and config</small></span>
-                <em>Backup</em>
-              </button>
-              <button class="action-row" type="button" id="readinessAuditButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/><path d="M21 12a9 9 0 1 1-2.64-6.36"/></svg>
-                <span><strong>Readiness Audit</strong><small>Probe runtime, memory, graph, recall</small></span>
-                <em>Audit</em>
-              </button>
-              <button class="action-row" type="button" id="selfTestButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-                <span><strong>Self Test</strong><small>Check page features and local intake paths</small></span>
-                <em>Test</em>
-              </button>
-              <button class="action-row" type="button" id="nativeCertifyButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 7v6c0 5 3.4 7.7 8 9 4.6-1.3 8-4 8-9V7l-8-4Z"/><path d="m9 12 2 2 4-5"/></svg>
-                <span><strong>Native Certify</strong><small>Verify MLX, mlxsnn, envelope, prune budget</small></span>
-                <em>Certify</em>
-              </button>
-              <button class="action-row" type="button" id="evidencePackButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="M8 8h8"/><path d="M8 12h8"/><path d="M8 16h5"/></svg>
-                <span><strong>Evidence Pack</strong><small>Write report plus SQLite backup</small></span>
-                <em>Pack</em>
-              </button>
-              <button class="action-row" type="button" id="captureInboxButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
-                <span><strong>Magic Capture</strong><small>Process local session inbox drops</small></span>
-                <em>Process</em>
-              </button>
-              <button class="action-row" type="button" id="appConnectButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a4 4 0 0 1 4-4h2"/><path d="M18 16a4 4 0 0 1-4 4h-2"/><path d="M9 12h6"/><path d="M14 7l5 5-5 5"/><path d="M10 17l-5-5 5-5"/></svg>
-                <span><strong>App Connect</strong><small>Detect, attach, and snapshot local apps</small></span>
-                <em>Open</em>
-              </button>
-              <div id="captureInboxState" class="capture-inbox-state" aria-live="polite">
-                <strong>Capture inbox pending</strong>
-                <small>Waiting for local clients to drop session payloads.</small>
-              </div>
-              <div id="selfTestState" class="capture-inbox-state" aria-live="polite">
-                <strong>Self test idle</strong>
-                <small>Run a feature check before relying on the local control plane.</small>
-              </div>
-              <div id="selfTestGrid" class="self-test-grid" aria-live="polite"></div>
-              <button class="action-row" type="button" id="quickPruneButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"/><path d="M6 16h12"/><path d="M8 12h8"/><path d="M10 8h4"/><path d="M12 4v16"/></svg>
-                <span><strong>Quick Prune</strong><small>Reclaim ephemeral nodes</small></span>
-                <em>Prune</em>
-              </button>
-              <button class="action-row" type="button" id="sleepButton">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15.5A8.5 8.5 0 0 1 8.5 3a7 7 0 1 0 12.5 12.5Z"/></svg>
-                <span><strong>Deep Sleep</strong><small>Hebbian distillation pass</small></span>
-                <em>Sleep</em>
-              </button>
+                  <button class="action-row" type="button" id="selfTestButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                    <span><strong>Self Test</strong><small>Check page, memory, capture, apps</small></span>
+                    <em>Test</em>
+                  </button>
+                  <button class="action-row" type="button" id="readinessAuditButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/><path d="M21 12a9 9 0 1 1-2.64-6.36"/></svg>
+                    <span><strong>Readiness Audit</strong><small>Probe runtime, graph, recall</small></span>
+                    <em>Audit</em>
+                  </button>
+                  <button class="action-row" type="button" id="nativeCertifyButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 7v6c0 5 3.4 7.7 8 9 4.6-1.3 8-4 8-9V7l-8-4Z"/><path d="m9 12 2 2 4-5"/></svg>
+                    <span><strong>Native Certify</strong><small>Verify MLX, envelope, prune budget</small></span>
+                    <em>Certify</em>
+                  </button>
+                  <button class="action-row" type="button" id="evidencePackButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="M8 8h8"/><path d="M8 12h8"/><path d="M8 16h5"/></svg>
+                    <span><strong>Evidence Pack</strong><small>Write report plus SQLite backup</small></span>
+                    <em>Pack</em>
+                  </button>
+                </div>
+                <div id="selfTestState" class="capture-inbox-state" aria-live="polite">
+                  <strong>Self test idle</strong>
+                  <small>Run a feature check before relying on the local control plane.</small>
+                </div>
+                <div id="selfTestGrid" class="self-test-grid" aria-live="polite"></div>
+              </section>
+
+              <section id="intakeActionGroup" class="action-section" aria-labelledby="intakeActionGroupTitle">
+                <h3 id="intakeActionGroupTitle">Local intake</h3>
+                <div class="action-group-grid">
+                  <button class="action-row" type="button" id="appConnectButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a4 4 0 0 1 4-4h2"/><path d="M18 16a4 4 0 0 1-4 4h-2"/><path d="M9 12h6"/><path d="M14 7l5 5-5 5"/><path d="M10 17l-5-5 5-5"/></svg>
+                    <span><strong>App Connect</strong><small>Detect apps and capture exposed UI text</small></span>
+                    <em>Open</em>
+                  </button>
+                  <button class="action-row" type="button" id="captureInboxButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+                    <span><strong>Magic Capture</strong><small>Process local session inbox drops</small></span>
+                    <em>Process</em>
+                  </button>
+                </div>
+                <div id="captureInboxState" class="capture-inbox-state" aria-live="polite">
+                  <strong>Capture inbox pending</strong>
+                  <small>Waiting for local clients to drop session payloads.</small>
+                </div>
+              </section>
+
+              <section id="memoryMaintenanceActionGroup" class="action-section" aria-labelledby="memoryMaintenanceActionGroupTitle">
+                <h3 id="memoryMaintenanceActionGroupTitle">Memory maintenance</h3>
+                <div class="action-group-grid">
+                  <button class="action-row" type="button" id="backupButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v14c0 1.7 3.1 3 7 3s7-1.3 7-3V5"/><path d="M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></svg>
+                    <span><strong>Create Backup</strong><small>Snapshot memory and config</small></span>
+                    <em>Backup</em>
+                  </button>
+                  <button class="action-row" type="button" id="quickPruneButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"/><path d="M6 16h12"/><path d="M8 12h8"/><path d="M10 8h4"/><path d="M12 4v16"/></svg>
+                    <span><strong>Quick Prune</strong><small>Reclaim ephemeral nodes</small></span>
+                    <em>Prune</em>
+                  </button>
+                  <button class="action-row" type="button" id="sleepButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15.5A8.5 8.5 0 0 1 8.5 3a7 7 0 1 0 12.5 12.5Z"/></svg>
+                    <span><strong>Deep Sleep</strong><small>Hebbian distillation pass</small></span>
+                    <em>Sleep</em>
+                  </button>
+                </div>
+              </section>
             </div>
             <p class="panel-note">All actions are local and reversible except persisted memory writes.</p>
           </article>
@@ -346,7 +367,7 @@
             </div>
             <div id="appConnectState" class="capture-inbox-state ready" aria-live="polite">
               <strong>App Connect idle</strong>
-              <small>Detect local apps, attach one, then capture a redacted snapshot into SYNAPSE-S2 memory.</small>
+              <small>Detect local apps, attach one, then capture locally exposed Accessibility text into SYNAPSE-S2 memory.</small>
             </div>
             <form id="appConnectForm" class="write-form app-connect-form">
               <div class="field-grid">
@@ -396,7 +417,7 @@
                 </button>
               </div>
             </form>
-            <p class="panel-note">App Connect uses local process detection and confirmed accessibility snapshots. Selected-text capture remains the fallback when an app blocks UI introspection.</p>
+            <p class="panel-note">App Connect uses local process detection and confirmed Accessibility snapshots for locally exposed UI text; selected-text capture remains the exact-content fallback when an app blocks UI introspection.</p>
           </article>
         </section>
 

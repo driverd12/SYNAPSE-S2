@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import unittest
+from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import urllib.error
@@ -14,6 +15,10 @@ from transcript_capture import TranscriptCaptureManager
 
 
 class DashboardRuntimeTests(unittest.TestCase):
+    def test_dashboard_server_preserves_single_threaded_mlx_affinity(self):
+        self.assertTrue(issubclass(SynapseDashboardServer, HTTPServer))
+        self.assertFalse(issubclass(SynapseDashboardServer, ThreadingHTTPServer))
+
     def make_runtime(self, tmp: str) -> DashboardRuntime:
         backend = SpikingAttentionBackend(
             dimension=32,
@@ -466,6 +471,17 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("selfTestButton", index)
         self.assertIn("selfTestState", index)
         self.assertIn("selfTestGrid", index)
+        self.assertIn("coreStateIndicator", index)
+        self.assertNotIn('id="toggleButton"', index)
+        self.assertIn("coreActionGroup", index)
+        self.assertIn("reliabilityActionGroup", index)
+        self.assertIn("intakeActionGroup", index)
+        self.assertIn("memoryMaintenanceActionGroup", index)
+        self.assertIn("Reliability checks", index)
+        self.assertIn("Local intake", index)
+        self.assertIn("Memory maintenance", index)
+        self.assertIn("locally exposed Accessibility text", index)
+        self.assertIn("selected-text capture remains the exact-content fallback", index)
         self.assertIn("evidencePackButton", index)
         self.assertIn("coreUnlockButton", index)
         self.assertIn("coreToggleGuardHint", index)
@@ -532,6 +548,12 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("logSnapshotResponse", app)
         self.assertIn("unlockCoreToggleGuard", app)
         self.assertIn("lockCoreToggleGuard", app)
+        self.assertNotIn("toggleButton.addEventListener", app)
+        self.assertNotIn("elements.toggleButton.disabled", app)
+        self.assertIn("elements.coreStateIndicator", app)
+        self.assertIn("state.coreToggle.enabled", app)
+        self.assertIn("locally exposed Accessibility text", app)
+        self.assertIn("selected-text fallback for exact content", app)
         self.assertIn("data-section-target", index)
         self.assertIn("rememberForm", index)
         self.assertIn("ingestForm", index)
@@ -619,7 +641,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
             server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
-            self.assertTrue(server.daemon_threads)
+            self.assertNotIsInstance(server, ThreadingHTTPServer)
             self.assertGreaterEqual(server.request_queue_size, 32)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
