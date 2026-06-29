@@ -328,6 +328,12 @@ textarea:focus-visible {
   font-size: 12px;
 }
 
+.wizard-toggle-button[aria-pressed="true"] {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  color: var(--teal-strong);
+}
+
 svg {
   flex: 0 0 auto;
 }
@@ -347,6 +353,129 @@ svg {
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 2;
+}
+
+.wizard-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  pointer-events: none;
+}
+
+.wizard-spotlight {
+  position: fixed;
+  z-index: 1001;
+  border: 2px solid var(--teal-strong);
+  border-radius: calc(var(--radius) + 4px);
+  box-shadow:
+    0 0 0 9999px rgba(5, 15, 19, 0.68),
+    0 0 0 6px var(--teal-shadow),
+    0 16px 48px rgba(0, 0, 0, 0.28);
+  transition:
+    left 180ms ease,
+    top 180ms ease,
+    width 180ms ease,
+    height 180ms ease;
+}
+
+.wizard-arrow {
+  position: fixed;
+  inset: 0;
+  z-index: 1002;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+}
+
+.wizard-arrow path {
+  fill: none;
+  stroke: var(--teal-strong);
+  stroke-linecap: round;
+  stroke-width: 3;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.24));
+}
+
+.wizard-arrow circle {
+  fill: var(--teal-strong);
+  stroke: var(--shell);
+  stroke-width: 2;
+}
+
+.wizard-panel {
+  position: fixed;
+  z-index: 1003;
+  display: grid;
+  gap: 14px;
+  max-height: calc(100vh - 96px);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  pointer-events: auto;
+  overflow: auto;
+}
+
+.wizard-panel-header,
+.wizard-footer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.wizard-panel h2 {
+  margin-top: 3px;
+  font-size: 18px;
+}
+
+.wizard-body {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.wizard-checklist {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.wizard-checklist li::marker {
+  color: var(--teal-strong);
+}
+
+.wizard-capability {
+  border: 1px solid color-mix(in srgb, var(--teal) 34%, var(--border));
+  border-radius: var(--radius);
+  background: var(--teal-soft);
+  color: var(--teal-strong);
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.wizard-footer {
+  align-items: center;
+  border-top: 1px solid var(--row);
+  padding-top: 12px;
+}
+
+.wizard-footer > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.wizard-footer > div {
+  display: flex;
+  gap: 8px;
+}
+
+.wizard-highlight-target {
+  position: relative;
+  box-shadow: 0 0 0 3px var(--teal-shadow);
 }
 
 .theme-button[aria-pressed="true"] {
@@ -2219,6 +2348,12 @@ textarea {
 
   .top-actions {
     justify-content: start;
+    flex-wrap: wrap;
+  }
+
+  .wizard-panel {
+    width: calc(100vw - 24px) !important;
+    max-height: calc(100vh - 96px);
   }
 
   .graph-toolbar {

@@ -469,6 +469,13 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("query_spiking_attention_text", index)
         self.assertIn("readinessAuditButton", index)
         self.assertIn("mondayReadinessButton", index)
+        self.assertIn("connectionStatusCard", index)
+        self.assertIn("wizardToggleButton", index)
+        self.assertIn("wizardLayer", index)
+        self.assertIn("wizardSpotlight", index)
+        self.assertIn("wizardArrow", index)
+        self.assertIn("wizardPanel", index)
+        self.assertIn("wizardChecklist", index)
         self.assertIn("selfTestButton", index)
         self.assertIn("selfTestState", index)
         self.assertIn("selfTestGrid", index)
@@ -555,6 +562,29 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("elements.toggleActionState.textContent = nextAction", app)
         self.assertIn("/api/monday-readiness", app)
         self.assertIn("renderMondayReadiness", app)
+        self.assertIn("WIZARD_STEPS", app)
+        self.assertIn("startWizard", app)
+        self.assertIn("stopWizard", app)
+        self.assertIn("renderWizardStep", app)
+        self.assertIn("positionWizardOverlay", app)
+        self.assertIn("wizard-highlight-target", app)
+        self.assertIn("real local state", app)
+        for selector in (
+            "#wizardToggleButton",
+            "#modelUri",
+            "#mondayReadinessButton",
+            "#contextInput",
+            "#coreActionGroup",
+            "#rememberForm",
+            "#queryForm",
+            "#appConnect",
+            "#cortexPanel",
+            "#memory",
+            ".graph-prune-panel",
+            "#evidencePackButton",
+            "#operationLog",
+        ):
+            self.assertIn(selector, app)
         self.assertNotIn("toggleButton.addEventListener", app)
         self.assertNotIn("elements.toggleButton.disabled", app)
         self.assertIn("elements.coreStateIndicator", app)
@@ -599,6 +629,11 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("app-connect-panel", styles)
         self.assertIn("core-status-badge", styles)
         self.assertIn("core-status-dot", styles)
+        self.assertIn("wizard-layer", styles)
+        self.assertIn("wizard-spotlight", styles)
+        self.assertIn("wizard-panel", styles)
+        self.assertIn("wizard-arrow", styles)
+        self.assertIn("wizard-highlight-target", styles)
         self.assertNotIn(".switch-track", styles)
         self.assertIn("neural-math-panel", styles)
         self.assertIn("neural-inspector-toggle", styles)

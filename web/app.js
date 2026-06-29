@@ -6,6 +6,162 @@ const GRAPH_HEIGHT = 420;
 const GRAPH_MIN_SCALE = 0.45;
 const GRAPH_MAX_SCALE = 3.2;
 const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
+const WIZARD_STEPS = [
+  {
+    selector: "#wizardToggleButton",
+    title: "Start or stop the guide",
+    body: "Use this top-right control whenever you want the live first-use guide. The wizard walks real dashboard controls and can be stopped at any time.",
+    capability: "Guided onboarding: a live overlay for real local state, not a demo walkthrough.",
+    items: [
+      "Start Wizard opens the guide; Stop Wizard closes it.",
+      "Use Next, Back, Escape, or the close button while walking the page.",
+      "Each step points at a functioning SYNAPSE-S2 capability.",
+    ],
+  },
+  {
+    selector: "#modelUri",
+    title: "Confirm the local memory target",
+    body: "Start real work by checking the top readouts. They show the runtime, active memory URI, embedding provider, platform, and core state.",
+    capability: "Setup: LaunchAgent dashboard, local SQLite memory, Codex/Claude MCP clients, and durable pull context bus.",
+    items: [
+      "Use the dashboard at 127.0.0.1:8765 for local operation.",
+      "Check the Memory URI before relying on stored context.",
+      "Use the Memory Context field when you need to isolate work.",
+    ],
+  },
+  {
+    selector: "#mondayReadinessButton",
+    title: "Run Monday Readiness first",
+    body: "This scorecard checks real local state: runtime, memory, embeddings, capture inbox, App Connect, resource envelope, quick-prune budget, and recall.",
+    capability: "Reliability: one operator-facing score before first use, handoff, or a live walkthrough.",
+    items: [
+      "Click Score and wait for the required checks.",
+      "Resolve critical failures before writing or recalling memory.",
+      "Use Self Test and Native Certify when you need lower-level evidence.",
+    ],
+  },
+  {
+    selector: "#contextInput",
+    title: "Choose the memory namespace",
+    body: "Every capture, recall, graph query, and MCP hydration uses the active context. Keep each project or thread in the right namespace.",
+    capability: "Context bus: remembered traces publish durable updates for local MCP clients to pull.",
+    items: [
+      "Use default for general project work unless you need isolation.",
+      "Enter a context name and press the check button.",
+      "The Memory URI readout shows the active namespace.",
+    ],
+  },
+  {
+    selector: "#coreActionGroup",
+    title: "Control the core deliberately",
+    body: "There is one runtime enable/disable path. Unlock gives you a short window to change state, then it relocks.",
+    capability: "Runtime control: guarded state mutation with visible ready/disabled status.",
+    items: [
+      "The top Runtime badge is read-only status.",
+      "Use Unlock, then Enable or Disable only when you intend to pause recall/capture.",
+      "Refresh Runtime State after changing state.",
+    ],
+  },
+  {
+    selector: "#rememberForm",
+    title: "Write durable memory",
+    body: "Use Memory Write for real facts, decisions, corrections, and validation evidence that should survive client restarts.",
+    capability: "Memory write: Remember + publish, Ingest + publish, and Capture conversation.",
+    items: [
+      "Remember stores one concise trace with a tag.",
+      "Ingest breaks sequential notes into event memories and relationships.",
+      "Capture conversation records validated session summaries.",
+    ],
+  },
+  {
+    selector: "#queryForm",
+    title: "Recall what has been captured",
+    body: "Recall embeds your prompt locally, gates the spiking memory graph, and returns matching traces from the active context.",
+    capability: "Recall: local neural embedding, sparse spiking attention, graph-backed results.",
+    items: [
+      "Ask for decisions, incidents, project state, or prior validation.",
+      "If results are thin, capture better traces rather than broad filler.",
+      "MCP clients use the same memory through the query tool.",
+    ],
+  },
+  {
+    selector: "#appConnect",
+    title: "Attach a running app",
+    body: "App Connect captures locally exposed Accessibility text. It does not promise hidden internals; selected-text capture is the exact-content fallback.",
+    capability: "App intake: Detect, Connect app, Snapshot to memory, and selected-text capture.",
+    items: [
+      "Press Detect to list running apps.",
+      "Connect the selected app before snapshotting.",
+      "When an app exposes only window chrome, select the exact text and capture it here.",
+    ],
+  },
+  {
+    selector: "#captureInboxButton",
+    title: "Process client session drops",
+    body: "Magic Capture processes local inbox payloads dropped by MCP clients and the session bridge.",
+    capability: "Capture daemon: sanitized local drops, startup hydration traces, and session-boundary notes.",
+    items: [
+      "Use this after client sessions have produced inbox files.",
+      "The preflight confirmation names what will be processed.",
+      "Errors stay visible until processed or repaired.",
+    ],
+  },
+  {
+    selector: "#cortexPanel",
+    title: "Govern agent work",
+    body: "Cortex Governor keeps agent work under explicit goals, warnings, assumptions, and typed memory.",
+    capability: "Cortex: enter, tick, commit typed traces, and moderate working memory.",
+    items: [
+      "Enter Cortex before risky or multi-step work.",
+      "Tick with observations and intended actions.",
+      "Commit verified decisions, validations, constraints, or risks.",
+    ],
+  },
+  {
+    selector: "#memory",
+    title: "Inspect the memory graph",
+    body: "The graph shows temporal and associative relationships created from captures, ingested events, and typed traces.",
+    capability: "Graph: event relationships, neural inspector, node ledger, and relationship ledger.",
+    items: [
+      "Use zoom and fit controls to inspect graph structure.",
+      "Open Neural Inspector for sparse spike and LIF/STDP details.",
+      "Use ledgers to verify exact nodes and relationships.",
+    ],
+  },
+  {
+    selector: ".graph-prune-panel",
+    title: "Prune wrong or sensitive memory",
+    body: "Bad memory should be removed rather than explained around. Prune the smallest bad node or relationship you can identify.",
+    capability: "Memory hygiene: event, relationship, context event, temporal, and associative pruning.",
+    items: [
+      "Prefer a single node or edge over broad pruning.",
+      "Always provide a concrete reason.",
+      "Use temporal or associative clears only when the entire relationship class is bad.",
+    ],
+  },
+  {
+    selector: "#evidencePackButton",
+    title: "Package evidence before sharing claims",
+    body: "Evidence Pack writes a report and SQLite backup so another operator can inspect what was true at the time.",
+    capability: "Operational evidence: readiness audit, snapshot, report, memory backup, and operation log.",
+    items: [
+      "Run this after a successful first-use flow or before a handoff.",
+      "Use the Operation Log to inspect backend responses.",
+      "Backups stay local inside the SYNAPSE-S2 export root.",
+    ],
+  },
+  {
+    selector: "#operationLog",
+    title: "Audit each live action",
+    body: "The Operation Log records dashboard requests, backend responses, cancellations, and errors as you try features in real time.",
+    capability: "Operator audit: every guided action leaves visible local evidence for troubleshooting and handoff.",
+    items: [
+      "Check this panel after each wizard step you actively try.",
+      "Use failures here to decide whether to rerun, repair, or capture a blocker.",
+      "Package an Evidence Pack when the log proves the workflow is ready to share.",
+    ],
+  },
+];
 
 const state = {
   context: new URLSearchParams(window.location.search).get("context_id")?.trim() || DEFAULT_CONTEXT,
@@ -33,6 +189,12 @@ const state = {
   },
   cortex: {
     sessionId: "",
+  },
+  wizard: {
+    active: false,
+    index: 0,
+    target: null,
+    scrollTimer: null,
   },
 };
 
@@ -192,6 +354,22 @@ const elements = collectElements([
   "toggleText",
   "traceCache",
   "uptimeLabel",
+  "wizardArrow",
+  "wizardArrowPath",
+  "wizardArrowTip",
+  "wizardBackButton",
+  "wizardBody",
+  "wizardCapability",
+  "wizardChecklist",
+  "wizardCloseButton",
+  "wizardLayer",
+  "wizardNextButton",
+  "wizardPanel",
+  "wizardProgress",
+  "wizardSpotlight",
+  "wizardTitle",
+  "wizardToggleButton",
+  "wizardToggleText",
 ]);
 
 elements.contextInput.value = state.context;
@@ -199,6 +377,7 @@ elements.endpointLabel.textContent = window.location.host || "127.0.0.1:8765";
 applyTheme(loadTheme());
 initializeGraphInteractions();
 initializeSectionNavigation();
+initializeWizard();
 
 function collectElements(ids) {
   return Object.fromEntries(ids.map((id) => [id, requiredElement(id)]));
@@ -1365,6 +1544,205 @@ function dashboardScrollTarget() {
     rect: () => ({ top: 0 }),
     scrollTop: () => root.scrollTop,
   };
+}
+
+function initializeWizard() {
+  elements.wizardToggleButton.addEventListener("click", () => {
+    if (state.wizard.active) {
+      stopWizard();
+    } else {
+      startWizard();
+    }
+  });
+  elements.wizardCloseButton.addEventListener("click", stopWizard);
+  elements.wizardBackButton.addEventListener("click", previousWizardStep);
+  elements.wizardNextButton.addEventListener("click", nextWizardStep);
+  window.addEventListener("resize", scheduleWizardPosition, { passive: true });
+  document.addEventListener("scroll", scheduleWizardPosition, { passive: true, capture: true });
+  document.addEventListener("keydown", (event) => {
+    if (!state.wizard.active) return;
+    if (event.key === "Escape") {
+      stopWizard();
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      nextWizardStep();
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      previousWizardStep();
+    }
+  });
+}
+
+function startWizard() {
+  state.wizard.active = true;
+  state.wizard.index = 0;
+  elements.wizardLayer.hidden = false;
+  elements.wizardLayer.setAttribute("aria-hidden", "false");
+  elements.wizardToggleButton.setAttribute("aria-pressed", "true");
+  elements.wizardToggleText.textContent = "Stop Wizard";
+  renderWizardStep();
+}
+
+function stopWizard() {
+  state.wizard.active = false;
+  elements.wizardLayer.hidden = true;
+  elements.wizardLayer.setAttribute("aria-hidden", "true");
+  elements.wizardToggleButton.setAttribute("aria-pressed", "false");
+  elements.wizardToggleText.textContent = "Start Wizard";
+  if (state.wizard.target) {
+    state.wizard.target.classList.remove("wizard-highlight-target");
+    state.wizard.target = null;
+  }
+}
+
+function nextWizardStep() {
+  if (!state.wizard.active) return;
+  if (state.wizard.index >= WIZARD_STEPS.length - 1) {
+    stopWizard();
+    return;
+  }
+  state.wizard.index += 1;
+  renderWizardStep();
+}
+
+function previousWizardStep() {
+  if (!state.wizard.active || state.wizard.index <= 0) return;
+  state.wizard.index -= 1;
+  renderWizardStep();
+}
+
+function renderWizardStep() {
+  const step = WIZARD_STEPS[state.wizard.index] || WIZARD_STEPS[0];
+  const target = document.querySelector(step.selector) || document.getElementById("overview");
+  if (state.wizard.target && state.wizard.target !== target) {
+    state.wizard.target.classList.remove("wizard-highlight-target");
+  }
+  state.wizard.target = target;
+  state.wizard.target?.classList.add("wizard-highlight-target");
+
+  elements.wizardTitle.textContent = step.title;
+  elements.wizardBody.textContent = step.body;
+  elements.wizardCapability.textContent = step.capability;
+  elements.wizardProgress.textContent = `Step ${state.wizard.index + 1} / ${WIZARD_STEPS.length}`;
+  elements.wizardBackButton.disabled = state.wizard.index === 0;
+  elements.wizardNextButton.textContent = state.wizard.index === WIZARD_STEPS.length - 1 ? "Finish" : "Next";
+  elements.wizardChecklist.replaceChildren(
+    ...step.items.map((item) => {
+      const node = document.createElement("li");
+      node.textContent = item;
+      return node;
+    }),
+  );
+  scrollWizardTargetIntoView(target);
+  elements.wizardPanel.focus({ preventScroll: true });
+  window.setTimeout(positionWizardOverlay, 220);
+}
+
+function scrollWizardTargetIntoView(target) {
+  if (!target) return;
+  target.scrollIntoView({
+    behavior: "smooth",
+    block: window.innerWidth <= 760 ? "start" : "center",
+    inline: "center",
+  });
+}
+
+function scheduleWizardPosition() {
+  if (!state.wizard.active) return;
+  if (state.wizard.scrollTimer) {
+    window.cancelAnimationFrame(state.wizard.scrollTimer);
+  }
+  state.wizard.scrollTimer = window.requestAnimationFrame(() => {
+    state.wizard.scrollTimer = null;
+    positionWizardOverlay();
+  });
+}
+
+function positionWizardOverlay() {
+  if (!state.wizard.active || !state.wizard.target) return;
+  const viewportWidth = document.documentElement.clientWidth;
+  const viewportHeight = window.innerHeight;
+  const targetRect = visibleRect(state.wizard.target.getBoundingClientRect(), viewportWidth, viewportHeight);
+  const spotlightPadding = 8;
+  const spotlightLeft = clamp(targetRect.left - spotlightPadding, 8, viewportWidth - 16);
+  const spotlightTop = clamp(targetRect.top - spotlightPadding, 8, viewportHeight - 16);
+  const spotlightRight = clamp(targetRect.right + spotlightPadding, spotlightLeft + 12, viewportWidth - 8);
+  const spotlightBottom = clamp(targetRect.bottom + spotlightPadding, spotlightTop + 12, viewportHeight - 8);
+
+  Object.assign(elements.wizardSpotlight.style, {
+    left: `${spotlightLeft}px`,
+    top: `${spotlightTop}px`,
+    width: `${spotlightRight - spotlightLeft}px`,
+    height: `${spotlightBottom - spotlightTop}px`,
+  });
+
+  const panelWidth = Math.min(430, Math.max(288, viewportWidth - 24));
+  elements.wizardPanel.style.width = `${panelWidth}px`;
+  elements.wizardPanel.style.maxHeight = "calc(100vh - 96px)";
+  const panelHeight = elements.wizardPanel.offsetHeight || 320;
+  let panelLeft = targetRect.right + 24;
+  if (panelLeft + panelWidth > viewportWidth - 12) {
+    panelLeft = targetRect.left - panelWidth - 24;
+  }
+  if (panelLeft < 12) {
+    panelLeft = clamp(targetRect.left, 12, viewportWidth - panelWidth - 12);
+  }
+  let panelTop = clamp(
+    targetRect.top + targetRect.height / 2 - panelHeight / 2,
+    84,
+    viewportHeight - panelHeight - 12,
+  );
+  if (viewportWidth <= 760) {
+    panelLeft = 12;
+    const belowTop = targetRect.bottom + 16;
+    const belowSpace = viewportHeight - belowTop - 12;
+    const aboveTop = 72;
+    const aboveSpace = targetRect.top - aboveTop - 16;
+    if (belowSpace >= 240 || belowSpace >= aboveSpace) {
+      panelTop = belowTop;
+      elements.wizardPanel.style.maxHeight = `${Math.max(220, belowSpace)}px`;
+    } else {
+      panelTop = aboveTop;
+      elements.wizardPanel.style.maxHeight = `${Math.max(220, aboveSpace)}px`;
+    }
+  }
+
+  Object.assign(elements.wizardPanel.style, {
+    left: `${panelLeft}px`,
+    top: `${panelTop}px`,
+  });
+  positionWizardArrow(targetRect);
+}
+
+function visibleRect(rect, viewportWidth, viewportHeight) {
+  const left = clamp(rect.left, 0, viewportWidth);
+  const top = clamp(rect.top, 0, viewportHeight);
+  const right = clamp(rect.right, left + 1, viewportWidth);
+  const bottom = clamp(rect.bottom, top + 1, viewportHeight);
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function positionWizardArrow(targetRect) {
+  const panelRect = elements.wizardPanel.getBoundingClientRect();
+  const targetX = targetRect.left + targetRect.width / 2;
+  const targetY = targetRect.top + targetRect.height / 2;
+  const panelX = panelRect.left + panelRect.width / 2;
+  const panelY = panelRect.top + panelRect.height / 2;
+  const controlX = (targetX + panelX) / 2;
+  const controlY = Math.min(targetY, panelY) - 30;
+  elements.wizardArrowPath.setAttribute(
+    "d",
+    `M ${panelX} ${panelY} Q ${controlX} ${controlY} ${targetX} ${targetY}`,
+  );
+  elements.wizardArrowTip.setAttribute("cx", String(targetX));
+  elements.wizardArrowTip.setAttribute("cy", String(targetY));
 }
 
 function cssEscape(value) {

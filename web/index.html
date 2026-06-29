@@ -66,6 +66,10 @@
         </div>
 
         <div class="top-actions">
+          <button id="wizardToggleButton" class="utility-button wizard-toggle-button" type="button" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v4"/><path d="M12 17v4"/><path d="M3 12h4"/><path d="M17 12h4"/><path d="m6 6 3 3"/><path d="m15 15 3 3"/><path d="m18 6-3 3"/><path d="m9 15-3 3"/></svg>
+            <span id="wizardToggleText">Start Wizard</span>
+          </button>
           <a class="utility-button" href="#appConnect">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/><path d="M5 5h5v5H5z"/><path d="M14 14h5v5h-5z"/></svg>
             App Connect
@@ -135,7 +139,7 @@
           <small id="contextHelp">Current memory URI: <span id="contextUri">s2://local/default</span></small>
         </div>
 
-        <div class="sidebar-status">
+        <div id="connectionStatusCard" class="sidebar-status">
           <div>
             <span class="status-dot" aria-hidden="true"></span>
             <strong>SYNAPSE-S2</strong>
@@ -847,6 +851,34 @@
         <div><strong>Contexts</strong><small id="footerContexts">--</small></div>
         <div><strong>Time</strong><small id="footerTime">--</small></div>
       </footer>
+      <div id="wizardLayer" class="wizard-layer" hidden aria-hidden="true">
+        <div id="wizardSpotlight" class="wizard-spotlight" aria-hidden="true"></div>
+        <svg id="wizardArrow" class="wizard-arrow" aria-hidden="true">
+          <path id="wizardArrowPath" d="" />
+          <circle id="wizardArrowTip" cx="0" cy="0" r="4" />
+        </svg>
+        <section id="wizardPanel" class="wizard-panel" role="dialog" aria-labelledby="wizardTitle" tabindex="-1">
+          <div class="wizard-panel-header">
+            <div>
+              <p class="section-label">First-use wizard</p>
+              <h2 id="wizardTitle">Use SYNAPSE-S2 live</h2>
+            </div>
+            <button id="wizardCloseButton" class="icon-button compact" type="button" aria-label="Stop wizard">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
+            </button>
+          </div>
+          <p id="wizardBody" class="wizard-body">Walk through the local memory workflow.</p>
+          <ul id="wizardChecklist" class="wizard-checklist"></ul>
+          <div id="wizardCapability" class="wizard-capability">Capability ready</div>
+          <div class="wizard-footer">
+            <span id="wizardProgress">Step 1 / 1</span>
+            <div>
+              <button id="wizardBackButton" class="secondary-button" type="button">Back</button>
+              <button id="wizardNextButton" class="primary-button" type="button">Next</button>
+            </div>
+          </div>
+        </section>
+      </div>
     </div>
     <script src="/app.js" type="module"></script>
   </body>
