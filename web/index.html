@@ -90,6 +90,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4z"/><path d="M13 4h7v7h-7z"/><path d="M4 13h7v7H4z"/><path d="M13 13h7v7h-7z"/></svg>
             Workbench
           </a>
+          <a href="#operatorLoopPanel" class="nav-item" data-section-target="operatorLoopPanel">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/><path d="m16 15 2 2 4-5"/></svg>
+            Operator Loop
+          </a>
           <a href="#runtime" class="nav-item" data-section-target="runtime">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg>
             Runtime
@@ -156,6 +160,85 @@
       </aside>
 
       <main class="main">
+        <section class="operator-loop-panel" id="operatorLoopPanel" aria-label="Daily Operator Trust Loop">
+          <article class="panel operator-loop-card">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Operator Trust Loop</p>
+                <h2>Start, capture, repair, hand off</h2>
+              </div>
+              <span id="contextHealthBadge" class="quality-badge">Context Health --</span>
+            </div>
+            <div class="operator-loop-grid">
+              <section class="operator-loop-block">
+                <div class="operator-loop-heading">
+                  <span>Daily workflow</span>
+                  <strong>Start Work</strong>
+                </div>
+                <div class="operator-action-row">
+                  <button id="startWorkButton" class="primary-button" type="button">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 14 9-14 9V3Z"/></svg>
+                    Start Work
+                  </button>
+                  <button id="contextHealthButton" class="secondary-button" type="button">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg>
+                    Context Health
+                  </button>
+                </div>
+                <div id="startWorkOutput" class="operator-output">No Start Work brief loaded</div>
+                <div id="contextHealthOutput" class="operator-mini-output">Context health idle</div>
+              </section>
+
+              <section class="operator-loop-block">
+                <div class="operator-loop-heading">
+                  <span>Trust and repair</span>
+                  <strong>Doctor / Repair</strong>
+                </div>
+                <div class="operator-action-row">
+                  <button id="doctorReportButton" class="secondary-button" type="button">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 0 5.4-5.4"/></svg>
+                    Doctor / Repair
+                  </button>
+                  <button id="memoryHygieneButton" class="secondary-button" type="button">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M7 12h10"/><path d="M10 17h4"/></svg>
+                    Memory Hygiene
+                  </button>
+                </div>
+                <div id="doctorReportOutput" class="operator-mini-output">Doctor idle</div>
+                <div id="memoryHygieneQueue" class="hygiene-queue">No hygiene queue loaded</div>
+              </section>
+
+              <section class="operator-loop-block">
+                <div class="operator-loop-heading">
+                  <span>Handoff</span>
+                  <strong>Wrap Session</strong>
+                </div>
+                <textarea id="wrapSessionNotes" rows="4" placeholder="Decisions, validation evidence, changed files, blockers, and next actions"></textarea>
+                <div class="operator-action-row">
+                  <button id="wrapSessionPreviewButton" class="secondary-button" type="button">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h8"/><path d="M8 10h8"/><path d="M8 14h5"/><rect x="4" y="3" width="16" height="18" rx="2"/></svg>
+                    Preview
+                  </button>
+                  <button id="wrapSessionButton" class="primary-button" type="button">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
+                    Wrap Session
+                  </button>
+                </div>
+                <div id="wrapSessionOutput" class="operator-output">Wrap preview idle</div>
+              </section>
+
+              <section class="operator-loop-block">
+                <div class="operator-loop-heading">
+                  <span>Recipes</span>
+                  <strong>What to do next</strong>
+                </div>
+                <div id="operatorRecipes" class="operator-recipes"></div>
+                <div id="operatorReceipts" class="operator-receipts">No operation receipts yet</div>
+              </section>
+            </div>
+          </article>
+        </section>
+
         <section class="control-grid" aria-label="Primary controls">
           <article class="panel runtime-panel" id="runtime" aria-labelledby="runtimeTitle">
             <div class="panel-header">
@@ -409,11 +492,16 @@
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
                   Connect app
                 </button>
+                <button id="appPreviewButton" class="secondary-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"/><path d="M8 9h8"/><path d="M8 13h5"/></svg>
+                  Preview snapshot
+                </button>
                 <button id="appSnapshotButton" class="primary-button" type="button">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="M8 9h8"/><path d="M8 13h5"/><path d="M8 17h7"/></svg>
                   Snapshot to memory
                 </button>
               </div>
+              <div id="appPreviewReceipt" class="preview-receipt">Preview an attached app before writing memory.</div>
               <div class="app-selection-capture">
                 <label for="appSelectionText">Selected text fallback</label>
                 <textarea id="appSelectionText" rows="4" placeholder="Paste selected app text"></textarea>

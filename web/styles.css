@@ -705,6 +705,179 @@ textarea {
   gap: 12px;
 }
 
+.operator-loop-panel {
+  margin-bottom: 12px;
+}
+
+.operator-loop-card {
+  display: grid;
+  gap: 12px;
+}
+
+.operator-loop-grid {
+  display: grid;
+  grid-template-columns: minmax(250px, 1fr) minmax(250px, 1fr) minmax(270px, 1.05fr) minmax(240px, 0.95fr);
+  gap: 10px;
+}
+
+.operator-loop-block {
+  display: grid;
+  align-content: start;
+  gap: 9px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.operator-loop-heading {
+  display: grid;
+  gap: 2px;
+}
+
+.operator-loop-heading span {
+  color: var(--muted);
+  font-family: var(--terminal-font);
+  font-size: 10px;
+  font-weight: 820;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.operator-loop-heading strong {
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.operator-action-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.operator-loop-block textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+
+.operator-output,
+.operator-mini-output,
+.hygiene-queue,
+.operator-recipes,
+.operator-receipts,
+.preview-receipt {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.operator-output pre,
+.preview-receipt pre {
+  max-height: 158px;
+  overflow: auto;
+  border: 1px solid var(--row);
+  border-radius: 6px;
+  background: var(--input);
+  color: var(--text);
+  padding: 8px;
+  white-space: pre-wrap;
+}
+
+.brief-section,
+.recipe-row,
+.hygiene-item,
+.receipt-card {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 8px;
+}
+
+.brief-section span,
+.receipt-card span,
+.quality-badge {
+  width: fit-content;
+  border: 1px solid color-mix(in srgb, var(--teal) 36%, var(--border));
+  border-radius: 999px;
+  background: var(--teal-soft);
+  color: var(--teal-strong);
+  padding: 2px 8px;
+  font-family: var(--terminal-font);
+  font-size: 10px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.brief-section.degraded span,
+.brief-section.blocked span,
+.receipt-card.degraded span,
+.quality-badge.degraded {
+  border-color: color-mix(in srgb, var(--amber) 48%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.receipt-card.blocked span,
+.quality-badge.blocked {
+  border-color: color-mix(in srgb, var(--red) 52%, var(--border));
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.brief-section strong,
+.recipe-row strong,
+.receipt-card strong,
+.hygiene-item strong,
+.operator-mini-output strong {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.brief-section p,
+.receipt-card p,
+.hygiene-item p,
+.operator-mini-output p {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.receipt-card em {
+  color: var(--teal-strong);
+  font-style: normal;
+}
+
+.hygiene-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.hygiene-item.high {
+  border-color: color-mix(in srgb, var(--red) 46%, var(--border));
+}
+
+.hygiene-item.medium {
+  border-color: color-mix(in srgb, var(--amber) 46%, var(--border));
+}
+
+.hygiene-item button {
+  min-height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--input);
+  color: var(--text);
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
 .analysis-grid {
   display: grid;
   grid-template-columns: minmax(520px, 1.35fr) minmax(360px, 0.95fr);
@@ -1546,7 +1719,7 @@ textarea {
 
 .app-connect-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -2098,7 +2271,7 @@ textarea {
 
 .result-card {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr);
+  grid-template-columns: 28px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   min-height: 52px;
@@ -2119,7 +2292,7 @@ textarea {
   font-weight: 820;
 }
 
-.result-card div {
+.result-body {
   display: grid;
   gap: 2px;
   min-width: 0;
@@ -2134,6 +2307,17 @@ textarea {
 
 .result-card small {
   color: var(--muted);
+}
+
+.result-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.recall-pin-button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .write-grid {
@@ -2364,6 +2548,7 @@ textarea {
   }
 
   .control-grid,
+  .operator-loop-grid,
   .analysis-grid,
   .write-log-grid {
     grid-template-columns: 1fr;
@@ -2413,9 +2598,11 @@ textarea {
   .query-form,
   .result-list,
   .write-grid,
+  .operator-action-row,
   .prune-form,
   .field-row,
   .action-group-grid,
+  .app-connect-actions,
   .bottom-bar {
     grid-template-columns: 1fr;
   }

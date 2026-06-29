@@ -360,6 +360,12 @@ def command_app_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_app_snapshot_preview(args: argparse.Namespace) -> dict[str, Any]:
+    return _transcript_manager_from_args(args).preview_app_snapshot(
+        connection_id=args.connection_id,
+    )
+
+
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.list_memory_graph(context_id=args.context, limit=args.limit)
@@ -517,6 +523,58 @@ def command_monday_readiness(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _dashboard_runtime_from_args(args: argparse.Namespace):
+    from dashboard_server import DashboardRuntime
+
+    return DashboardRuntime(build_backend(args))
+
+
+def command_start_work(args: argparse.Namespace) -> dict[str, Any]:
+    return _dashboard_runtime_from_args(args).start_work(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        prompt=args.prompt,
+    )
+
+
+def command_context_health(args: argparse.Namespace) -> dict[str, Any]:
+    return _dashboard_runtime_from_args(args).context_health(context_id=args.context)
+
+
+def command_memory_hygiene(args: argparse.Namespace) -> dict[str, Any]:
+    return _dashboard_runtime_from_args(args).memory_hygiene(
+        context_id=args.context,
+        limit=args.limit,
+    )
+
+
+def command_wrap_session(args: argparse.Namespace) -> dict[str, Any]:
+    text = _text_from_args(args).strip()
+    operation_log: list[Any] = []
+    if args.operation_log_json:
+        try:
+            parsed = json.loads(args.operation_log_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--operation-log-json must be a JSON array") from exc
+        if not isinstance(parsed, list):
+            raise ValueError("--operation-log-json must be a JSON array")
+        operation_log = parsed
+    payload: dict[str, Any] = {
+        "context_id": args.context,
+        "agent_id": args.agent_id,
+        "text": text,
+        "operation_log": operation_log,
+    }
+    if args.source_tag:
+        payload["source_tag"] = args.source_tag
+    if args.preview:
+        return _dashboard_runtime_from_args(args).wrap_session_preview(payload)
+    if not args.confirm:
+        raise ValueError("--confirm is required to write a wrap session; use --preview to inspect first")
+    payload["confirm"] = True
+    return _dashboard_runtime_from_args(args).wrap_session(payload)
+
+
 def command_certify_runtime(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.certify_runtime(
@@ -661,26 +719,23 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
-    backend = build_backend(args)
-    return {
-        "python": sys.version.split()[0],
-        "executable": sys.executable,
-        "cwd": str(Path.cwd()),
-        "environment": {
-            "MLX_DEVICE": os.getenv("MLX_DEVICE", ""),
-            "SYNAPSE_S2_STATE_PATH": os.getenv("SYNAPSE_S2_STATE_PATH", ""),
-            "SYNAPSE_S2_MEMORY_DB": os.getenv("SYNAPSE_S2_MEMORY_DB", ""),
-            "SYNAPSE_S2_EXPORT_DIR": os.getenv("SYNAPSE_S2_EXPORT_DIR", ""),
-        },
-        "dependencies": {
-            "mlx": dependency_status("mlx"),
-            "mlx.core": dependency_status("mlx.core"),
-            "mlxsnn": dependency_status("mlxsnn"),
-            "fastmcp": dependency_status("fastmcp"),
-            "mcp": dependency_status("mcp"),
-        },
-        "status": backend.status(context_id=args.context),
+    runtime = _dashboard_runtime_from_args(args)
+    payload = runtime.doctor_report(
+        context_id=args.context,
+        include_apps=bool(args.include_apps),
+        repair_plan=bool(args.repair_plan),
+    )
+    payload["python"] = sys.version.split()[0]
+    payload["executable"] = sys.executable
+    payload["cwd"] = str(Path.cwd())
+    payload["dependencies"] = {
+        "mlx": dependency_status("mlx"),
+        "mlx.core": dependency_status("mlx.core"),
+        "mlxsnn": dependency_status("mlxsnn"),
+        "fastmcp": dependency_status("fastmcp"),
+        "mcp": dependency_status("mcp"),
     }
+    return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -866,6 +921,11 @@ def build_parser() -> argparse.ArgumentParser:
     app_snapshot.add_argument("--confirm", action="store_true")
     app_snapshot.set_defaults(func=command_app_snapshot)
 
+    app_snapshot_preview = subparsers.add_parser("app-snapshot-preview")
+    app_snapshot_preview.add_argument("--connection-id", required=True)
+    app_snapshot_preview.add_argument("--capture-root", default=None)
+    app_snapshot_preview.set_defaults(func=command_app_snapshot_preview)
+
     graph = subparsers.add_parser("graph")
     add_context(graph)
     graph.add_argument("--limit", type=int, default=100)
@@ -980,6 +1040,32 @@ def build_parser() -> argparse.ArgumentParser:
     monday_readiness.add_argument("--include-apps", action="store_true")
     monday_readiness.set_defaults(func=command_monday_readiness)
 
+    start_work = subparsers.add_parser("start-work")
+    add_context(start_work)
+    start_work.add_argument("--agent-id", default="codex-desktop")
+    start_work.add_argument("--prompt", default="")
+    start_work.set_defaults(func=command_start_work)
+
+    context_health = subparsers.add_parser("context-health")
+    add_context(context_health)
+    context_health.set_defaults(func=command_context_health)
+
+    memory_hygiene = subparsers.add_parser("memory-hygiene")
+    add_context(memory_hygiene)
+    memory_hygiene.add_argument("--limit", type=int, default=25)
+    memory_hygiene.set_defaults(func=command_memory_hygiene)
+
+    wrap_session = subparsers.add_parser("wrap-session")
+    add_context(wrap_session)
+    wrap_session.add_argument("--agent-id", default="codex-desktop")
+    wrap_session.add_argument("--source-tag", default="")
+    wrap_session.add_argument("--text", default="")
+    wrap_session.add_argument("--text-file", default=None)
+    wrap_session.add_argument("--operation-log-json", default="")
+    wrap_session.add_argument("--preview", action="store_true")
+    wrap_session.add_argument("--confirm", action="store_true")
+    wrap_session.set_defaults(func=command_wrap_session)
+
     certify_runtime = subparsers.add_parser("certify-runtime")
     certify_runtime.add_argument("--strict-native", action="store_true")
     certify_runtime.add_argument("--require-gpu", action="store_true")
@@ -1035,6 +1121,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor")
     add_context(doctor)
+    doctor.add_argument("--include-apps", action="store_true")
+    doctor.add_argument("--repair-plan", action="store_true")
     doctor.set_defaults(func=command_doctor)
 
     return parser

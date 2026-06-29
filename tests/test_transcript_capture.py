@@ -177,6 +177,89 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
         self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))
         self.assertEqual(captured[0]["metadata"]["app_name"], "Google Chrome")
 
+    def test_app_snapshot_preview_reports_quality_without_writing_memory(self):
+        with TemporaryDirectory() as tmp:
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(
+                root=Path(tmp) / "capture-root",
+                backend=backend,
+                running_app_provider=lambda: [
+                    {
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "pid": 4242,
+                    }
+                ],
+                app_snapshot_provider=lambda app: (
+                    f"{app['app_name']} active transcript: SYNAPSE-S2 is validating App Connect. "
+                    "token=sk-preview-secret123\nWindow: Workbench\nButton: Snapshot to memory"
+                ),
+            )
+            attached = manager.connect_running_app(
+                app_name="Codex",
+                bundle_id="com.openai.codex",
+                pid=4242,
+                context_id="demo",
+                source_tag="codex-app",
+                speaker="operator",
+                confirmed=True,
+            )
+            before = backend.list_memory(context_id="demo", limit=20)["entry_count"]
+
+            preview = manager.preview_app_snapshot(connection_id=attached["connection_id"])
+            after = backend.list_memory(context_id="demo", limit=20)["entry_count"]
+
+        self.assertEqual(preview["action"], "preview-app-snapshot")
+        self.assertEqual(preview["adapter_kind"], "app-accessibility-snapshot")
+        self.assertEqual(preview["app_name"], "Codex")
+        self.assertIn("SYNAPSE-S2 is validating App Connect", preview["preview_text"])
+        self.assertNotIn("sk-preview-secret123", preview["preview_text"])
+        self.assertGreaterEqual(preview["snapshot_quality"]["signal_chars"], 40)
+        self.assertIn(preview["quality_badge"]["status"], {"ready", "degraded", "blocked"})
+        self.assertTrue(preview["capture_guidance"])
+        self.assertEqual(after, before)
+
+    def test_app_snapshot_preview_failure_returns_blocked_receipt_without_writing_memory(self):
+        def fail_snapshot(_app):
+            raise ValueError("Accessibility blocked this app")
+
+        with TemporaryDirectory() as tmp:
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(
+                root=Path(tmp) / "capture-root",
+                backend=backend,
+                running_app_provider=lambda: [
+                    {
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "pid": 4242,
+                    }
+                ],
+                app_snapshot_provider=fail_snapshot,
+            )
+            attached = manager.connect_running_app(
+                app_name="Codex",
+                bundle_id="com.openai.codex",
+                pid=4242,
+                context_id="demo",
+                source_tag="codex-app",
+                speaker="operator",
+                confirmed=True,
+            )
+            before = backend.list_memory(context_id="demo", limit=20)["entry_count"]
+
+            preview = manager.preview_app_snapshot(connection_id=attached["connection_id"])
+            after = backend.list_memory(context_id="demo", limit=20)["entry_count"]
+
+        self.assertEqual(preview["action"], "preview-app-snapshot")
+        self.assertEqual(preview["app_name"], "Codex")
+        self.assertEqual(preview["quality_badge"]["status"], "blocked")
+        self.assertEqual(preview["snapshot_quality"]["quality"], "blocked")
+        self.assertEqual(preview["snapshot_quality"]["signal_chars"], 0)
+        self.assertIn("selected-text", " ".join(preview["capture_guidance"]))
+        self.assertFalse(preview["writes_memory"])
+        self.assertEqual(after, before)
+
     def test_app_selected_text_capture_uses_connection_metadata_and_redacts(self):
         with TemporaryDirectory() as tmp:
             backend = self.make_backend(tmp)

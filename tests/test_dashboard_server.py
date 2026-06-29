@@ -479,6 +479,18 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("wizardArrow", index)
         self.assertIn("wizardPanel", index)
         self.assertIn("wizardChecklist", index)
+        self.assertIn("operatorLoopPanel", index)
+        self.assertIn("Start Work", index)
+        self.assertIn("Wrap Session", index)
+        self.assertIn("Doctor / Repair", index)
+        self.assertIn("Context Health", index)
+        self.assertIn("Memory Hygiene", index)
+        self.assertIn("Recipes", index)
+        self.assertIn("startWorkButton", index)
+        self.assertIn("wrapSessionButton", index)
+        self.assertIn("doctorReportButton", index)
+        self.assertIn("memoryHygieneButton", index)
+        self.assertIn("contextHealthButton", index)
         self.assertIn("selfTestButton", index)
         self.assertIn("selfTestState", index)
         self.assertIn("selfTestGrid", index)
@@ -510,6 +522,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("App Connect", index)
         self.assertIn("appConnectButton", index)
         self.assertIn("appConnectForm", index)
+        self.assertIn("appPreviewButton", index)
+        self.assertIn("appPreviewReceipt", index)
         self.assertIn("appSnapshotButton", index)
         self.assertIn("appSelectionText", index)
         self.assertIn("appSelectionCaptureButton", index)
@@ -556,6 +570,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("active coordinates", app)
         self.assertIn("projected neurons", app)
         self.assertIn("renderContextEventLedger", app)
+        self.assertIn("pinRecallMemory", app)
+        self.assertIn("/api/pin-memory", app)
+        self.assertIn("data-recall-action", app)
         self.assertIn("pruneGraphItem", app)
         self.assertIn("captureForm", app)
         self.assertIn("renderCaptureInbox", app)
@@ -566,6 +583,20 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/monday-readiness", app)
         self.assertIn("renderMondayReadiness", app)
         self.assertIn("WIZARD_STEPS", app)
+        self.assertIn("runStartWork", app)
+        self.assertIn("runWrapSession", app)
+        self.assertIn("runDoctorReport", app)
+        self.assertIn("runContextHealth", app)
+        self.assertIn("runMemoryHygiene", app)
+        self.assertIn("renderOperationReceipt", app)
+        self.assertIn("previewConnectedAppSnapshot", app)
+        self.assertIn("/api/start-work", app)
+        self.assertIn("/api/wrap-session/preview", app)
+        self.assertIn("/api/wrap-session", app)
+        self.assertIn("/api/context-health", app)
+        self.assertIn("/api/memory-hygiene", app)
+        self.assertIn("/api/doctor", app)
+        self.assertIn("/api/app-snapshot/preview", app)
         self.assertIn("startWizard", app)
         self.assertIn("stopWizard", app)
         self.assertIn("renderWizardStep", app)
@@ -639,6 +670,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("wizard-panel", styles)
         self.assertIn("wizard-arrow", styles)
         self.assertIn("wizard-highlight-target", styles)
+        self.assertIn("operator-loop-panel", styles)
+        self.assertIn("receipt-card", styles)
+        self.assertIn("quality-badge", styles)
         self.assertIn("--accent-gradient", styles)
         self.assertIn("--magenta", styles)
         self.assertIn("--terminal-font", styles)
@@ -725,6 +759,177 @@ class DashboardRuntimeTests(unittest.TestCase):
             self.assertIn(checks_by_id[check_id]["status"], {"ready", "degraded", "blocked"})
             self.assertIn("detail", checks_by_id[check_id])
             self.assertIn("required", checks_by_id[check_id])
+
+    def test_operator_trust_loop_endpoints_report_actionable_workflow(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime.backend.commit_cortical_trace(
+                context_id="demo",
+                agent_id="codex-desktop",
+                session_id="unit-session",
+                trace_type="assumption",
+                truth_posture="inferred",
+                text="Feature: App Connect snapshot quality needs operator review.",
+                confidence=0.44,
+            )
+            runtime.backend.register_text_trace(
+                tag="low-signal-app-capture",
+                context_id="demo",
+                text="Codex ended.",
+                metadata={
+                    "adapter_kind": "app-accessibility-snapshot",
+                    "snapshot_quality": {
+                        "quality": "low",
+                        "low_signal": True,
+                        "signal_chars": 12,
+                    },
+                },
+            )
+
+            health_status, health_payload = self.decode(
+                runtime.handle("GET", "/api/context-health?context_id=demo")
+            )
+            hygiene_status, hygiene_payload = self.decode(
+                runtime.handle("GET", "/api/memory-hygiene?context_id=demo")
+            )
+            doctor_status, doctor_payload = self.decode(
+                runtime.handle("GET", "/api/doctor?context_id=demo")
+            )
+            start_status, start_payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/start-work?context_id=demo&agent_id=codex-desktop&prompt=Monday%20operator%20brief",
+                )
+            )
+            preview_status, preview_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/wrap-session/preview",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "codex-desktop",
+                            "text": "Feature: Implemented Operator Trust Loop endpoint tests.",
+                            "operation_log": [
+                                {
+                                    "action": "test",
+                                    "summary": "Added failing workflow coverage.",
+                                }
+                            ],
+                        }
+                    ).encode(),
+                )
+            )
+            wrap_status, wrap_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/wrap-session",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "codex-desktop",
+                            "text": "Feature: Operator Trust Loop tests are now captured.",
+                            "operation_log": [
+                                {
+                                    "action": "test",
+                                    "summary": "Verified wrap session capture path.",
+                                }
+                            ],
+                            "confirm": True,
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(health_status, 200)
+        self.assertEqual(health_payload["action"], "context-health")
+        self.assertEqual(health_payload["context_id"], "demo")
+        self.assertIn(health_payload["status"], {"ready", "degraded", "blocked"})
+        self.assertGreaterEqual(health_payload["score"], 0)
+        self.assertLessEqual(health_payload["score"], 100)
+        self.assertGreaterEqual(health_payload["memory_quality_score"], 0)
+        self.assertIsInstance(health_payload["factors"], list)
+        self.assertEqual(health_payload["receipt"]["action"], "context-health")
+
+        self.assertEqual(hygiene_status, 200)
+        self.assertEqual(hygiene_payload["action"], "memory-hygiene")
+        self.assertGreaterEqual(hygiene_payload["backlog_count"], 1)
+        self.assertTrue(hygiene_payload["review_items"])
+        self.assertIn("low_signal_app_capture", hygiene_payload["queue_summary"])
+        self.assertEqual(hygiene_payload["receipt"]["action"], "memory-hygiene")
+
+        self.assertEqual(doctor_status, 200)
+        self.assertEqual(doctor_payload["action"], "doctor-report")
+        self.assertIn(doctor_payload["overall_status"], {"ready", "degraded", "blocked"})
+        self.assertTrue(doctor_payload["checks"])
+        self.assertIn("repair_plan", doctor_payload)
+        self.assertEqual(doctor_payload["receipt"]["action"], "doctor-report")
+
+        self.assertEqual(start_status, 200)
+        self.assertEqual(start_payload["action"], "start-work")
+        self.assertEqual(start_payload["context_id"], "demo")
+        self.assertTrue(start_payload["brief_sections"])
+        self.assertGreaterEqual(len(start_payload["recipes"]), 3)
+        self.assertTrue(start_payload["next_actions"])
+        self.assertIn("context_health", start_payload)
+        self.assertIn("memory_hygiene", start_payload)
+        self.assertEqual(start_payload["receipt"]["action"], "start-work")
+
+        self.assertEqual(preview_status, 200)
+        self.assertEqual(preview_payload["action"], "wrap-session-preview")
+        self.assertIn("Feature:", preview_payload["preview_text"])
+        self.assertTrue(preview_payload["proposed_capture"]["source_tag"])
+        self.assertEqual(preview_payload["receipt"]["action"], "wrap-session-preview")
+
+        self.assertEqual(wrap_status, 200)
+        self.assertEqual(wrap_payload["action"], "wrap-session")
+        self.assertGreaterEqual(wrap_payload["event_count"], 1)
+        self.assertEqual(wrap_payload["receipt"]["action"], "wrap-session")
+        self.assertEqual(wrap_payload["receipt"]["status"], "ready")
+
+    def test_recall_result_can_be_pinned_to_working_memory(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            query_status, query_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/query",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "prompt": "SYNAPSE-S2 dashboard recalls local memory",
+                        }
+                    ).encode(),
+                )
+            )
+            memory_id = next(
+                item["memory_id"]
+                for item in query_payload["results"]
+                if item.get("memory_id")
+            )
+            pin_status, pin_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/pin-memory",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "memory_id": memory_id,
+                            "agent_id": "dashboard-ui",
+                            "note": "Use this recalled memory for the current operator task.",
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(query_status, 200)
+        self.assertEqual(pin_status, 200)
+        self.assertEqual(pin_payload["action"], "pin-memory")
+        self.assertEqual(pin_payload["pinned_memory_id"], memory_id)
+        self.assertEqual(pin_payload["trace_type"], "evidence")
+        self.assertEqual(pin_payload["receipt"]["action"], "pin-memory")
+        self.assertEqual(pin_payload["receipt"]["status"], "ready")
 
     def test_http_handler_rejects_cross_origin_mutations(self):
         with TemporaryDirectory() as tmp:
@@ -1199,6 +1404,19 @@ class DashboardRuntimeTests(unittest.TestCase):
                 )
             )
             list_status, list_payload = self.decode(runtime.handle("GET", "/api/app-connections"))
+            memory_before_preview = runtime.backend.list_memory(context_id="demo", limit=20)[
+                "entry_count"
+            ]
+            preview_status, preview_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/app-snapshot/preview",
+                    json.dumps({"connection_id": connect_payload["connection_id"]}).encode(),
+                )
+            )
+            memory_after_preview = runtime.backend.list_memory(context_id="demo", limit=20)[
+                "entry_count"
+            ]
             snapshot_preflight_status, snapshot_preflight_payload = self.decode(
                 runtime.handle(
                     "POST",
@@ -1234,11 +1452,20 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(connect_payload["bundle_id"], "com.openai.codex")
         self.assertEqual(list_status, 200)
         self.assertEqual(list_payload["connection_count"], 1)
+        self.assertEqual(preview_status, 200)
+        self.assertEqual(preview_payload["action"], "preview-app-snapshot")
+        self.assertEqual(preview_payload["app_name"], "Codex")
+        self.assertNotIn("sk-app-secret123", preview_payload["preview_text"])
+        self.assertIn(preview_payload["quality_badge"]["status"], {"ready", "degraded", "blocked"})
+        self.assertTrue(preview_payload["capture_guidance"])
+        self.assertEqual(memory_after_preview, memory_before_preview)
         self.assertEqual(snapshot_preflight_status, 200)
         self.assertEqual(snapshot_preflight_payload["connection"]["app_name"], "Codex")
         self.assertEqual(snapshot_status, 200)
         self.assertEqual(snapshot_payload["adapter_kind"], "app-accessibility-snapshot")
         self.assertGreaterEqual(snapshot_payload["event_count"], 1)
+        self.assertEqual(snapshot_payload["receipt"]["action"], "capture-app-snapshot")
+        self.assertIn(snapshot_payload["receipt"]["status"], {"ready", "degraded", "blocked"})
         self.assertTrue(captured)
         self.assertTrue(all("sk-app-secret123" not in entry["source_text"] for entry in captured))
         self.assertTrue(any("[REDACTED_SECRET]" in entry["source_text"] for entry in captured))

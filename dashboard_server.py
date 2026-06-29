@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -180,6 +181,35 @@ class DashboardRuntime:
             return self._json_response(
                 self.monday_readiness(context_id=context, include_apps=include_apps)
             )
+        if method == "GET" and path == "/api/context-health":
+            context = self._context_from_params(params)
+            return self._json_response(self.context_health(context_id=context))
+        if method == "GET" and path == "/api/memory-hygiene":
+            context = self._context_from_params(params)
+            limit = self._int_param(params, "limit", 25, minimum=1, maximum=100)
+            return self._json_response(self.memory_hygiene(context_id=context, limit=limit))
+        if method == "GET" and path == "/api/doctor":
+            context = self._context_from_params(params)
+            include_apps = self._bool_param(params, "include_apps", True)
+            repair_plan = self._bool_param(params, "repair_plan", True)
+            return self._json_response(
+                self.doctor_report(
+                    context_id=context,
+                    include_apps=include_apps,
+                    repair_plan=repair_plan,
+                )
+            )
+        if method == "GET" and path == "/api/start-work":
+            context = self._context_from_params(params)
+            agent_raw = str(params.get("agent_id", ["codex-desktop"])[0] or "codex-desktop")
+            prompt = str(params.get("prompt", [""])[0] or "")
+            return self._json_response(
+                self.start_work(
+                    context_id=context,
+                    agent_id=mlx_backend.sanitize_agent_id(agent_raw),
+                    prompt=prompt,
+                )
+            )
         if method == "GET" and path == "/api/cortex/state":
             context = self._context_from_params(params)
             agent_raw = str(params.get("agent_id", [""])[0] or "").strip()
@@ -240,6 +270,26 @@ class DashboardRuntime:
                     preview=preview,
                 )
             )
+        if method == "POST" and path == "/api/app-snapshot/preview":
+            payload = self._parse_json_body(body)
+            snapshot_target = self._app_snapshot_target(payload)
+            preview = self.transcript_capture().preview_app_snapshot(
+                connection_id=snapshot_target["connection_id"],
+            )
+            preview["receipt"] = self._operation_receipt(
+                action="preview-app-snapshot",
+                status=str(preview.get("quality_badge", {}).get("status") or "degraded"),
+                title=f"{preview.get('app_name', 'App')} snapshot preview",
+                summary=(
+                    f"{preview.get('snapshot_quality', {}).get('signal_chars', 0)} signal chars; "
+                    "no memory write performed"
+                ),
+                context_id=str(preview.get("context_id") or DEFAULT_CONTEXT),
+                source_tag=str(preview.get("source_tag") or "app-connect"),
+                quality=str(preview.get("quality_badge", {}).get("label") or "preview"),
+                next_action=str(preview.get("quality_badge", {}).get("next_action") or ""),
+            )
+            return self._json_response(preview)
         if method == "POST" and path == "/api/capture-inbox/preflight":
             payload = self._parse_json_body(body)
             max_files = self._max_files_from_payload(payload)
@@ -349,6 +399,15 @@ class DashboardRuntime:
                     confirm=confirm,
                 )
             )
+        if method == "POST" and path == "/api/wrap-session/preview":
+            payload = self._parse_json_body(body)
+            return self._json_response(self.wrap_session_preview(payload))
+        if method == "POST" and path == "/api/wrap-session":
+            payload = self._parse_json_body(body)
+            return self._json_response(self.wrap_session(payload))
+        if method == "POST" and path == "/api/pin-memory":
+            payload = self._parse_json_body(body)
+            return self._json_response(self.pin_memory(payload))
 
         if method == "POST" and path == "/api/toggle":
             payload = self._parse_json_body(body)
@@ -478,7 +537,8 @@ class DashboardRuntime:
                 target=app_target,
             )
             return self._json_response(
-                self.transcript_capture().connect_running_app(
+                self._with_receipt(
+                    self.transcript_capture().connect_running_app(
                     app_name=app_target["app_name"],
                     bundle_id=app_target["bundle_id"],
                     pid=int(app_target["pid"]),
@@ -491,6 +551,14 @@ class DashboardRuntime:
                     },
                     confirmed=True,
                     allow_manual=bool(app_target["allow_manual"]),
+                    ),
+                    action="app-connect",
+                    status="ready",
+                    title=f"{app_target['app_name']} attached",
+                    summary="Local app connection is available for preview, snapshot, and selected-text capture.",
+                    context_id=context,
+                    source_tag=app_target["source_tag"],
+                    next_action="Preview the app snapshot before writing memory.",
                 )
             )
         if method == "POST" and path == "/api/app-snapshot":
@@ -519,7 +587,8 @@ class DashboardRuntime:
                     "confirm must be true before capturing selected app text",
                 )
             return self._json_response(
-                self.transcript_capture().capture_app_selected_text(
+                self._with_receipt(
+                    self.transcript_capture().capture_app_selected_text(
                     connection_id=self._text_payload(
                         payload,
                         "connection_id",
@@ -531,6 +600,14 @@ class DashboardRuntime:
                         "source_surface": "dashboard-app-selection-capture",
                     },
                     confirmed=True,
+                    ),
+                    action="capture-app-selected-text",
+                    status="ready",
+                    title="Selected app text captured",
+                    summary="Exact selected text was redacted and written to memory.",
+                    context_id=DEFAULT_CONTEXT,
+                    source_tag="app-selected-text",
+                    next_action="Use recall to verify the captured content is findable.",
                 )
             )
         if method == "POST" and path == "/api/prune-memory":
@@ -620,6 +697,9 @@ class DashboardRuntime:
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
             return self._json_response(self.evidence_pack(context_id=context))
+        if method == "POST" and path == "/api/memory-hygiene/action":
+            payload = self._parse_json_body(body)
+            return self._json_response(self.memory_hygiene_action(payload))
         if method == "POST" and path == "/api/capture-inbox/process":
             payload = self._parse_json_body(body)
             max_files = self._max_files_from_payload(payload)
@@ -960,6 +1040,689 @@ class DashboardRuntime:
             "recommended_actions": recommended_actions,
             "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
             "generated_at": time.time(),
+        }
+
+    def context_health(self, *, context_id: str) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        started = time.perf_counter()
+        factors: list[dict[str, Any]] = []
+        recommended_actions: list[str] = []
+        score = 100
+
+        def add_factor(
+            factor_id: str,
+            *,
+            label: str,
+            status: str,
+            detail: str,
+            points_lost: int = 0,
+            action: str = "",
+        ) -> None:
+            nonlocal score
+            clean_status = status if status in {"ready", "degraded", "blocked"} else "blocked"
+            loss = max(0, int(points_lost))
+            score -= loss
+            factors.append(
+                {
+                    "id": factor_id,
+                    "label": label,
+                    "status": clean_status,
+                    "detail": detail,
+                    "points_lost": loss,
+                }
+            )
+            if action and clean_status != "ready":
+                recommended_actions.append(action)
+
+        self_test_payload = self.self_test(context_id=context, include_apps=False)
+        for component_id, component in self_test_payload.get("components", {}).items():
+            status = str(component.get("status") or "blocked")
+            if status == "blocked":
+                loss = 18 if component_id in {"runtime", "memory", "embedding"} else 10
+            elif status == "degraded":
+                loss = 6
+            else:
+                loss = 0
+            add_factor(
+                f"self_test_{component_id}",
+                label=str(component.get("label") or component_id),
+                status=status,
+                detail=str(component.get("detail") or ""),
+                points_lost=loss,
+            )
+
+        hygiene = self.memory_hygiene(context_id=context, limit=25)
+        hygiene_loss = min(22, int(hygiene.get("backlog_count") or 0) * 4)
+        memory_quality_score = max(0, 100 - hygiene_loss)
+        add_factor(
+            "memory_quality",
+            label="Memory quality",
+            status="ready"
+            if hygiene_loss == 0
+            else "degraded"
+            if hygiene_loss < 16
+            else "blocked",
+            detail=(
+                f"{hygiene.get('backlog_count', 0)} hygiene review items; "
+                f"quality score {memory_quality_score}"
+            ),
+            points_lost=hygiene_loss,
+            action="Review Memory Hygiene before relying on stale or low-signal traces.",
+        )
+
+        try:
+            profile = self.backend.resource_profile(benchmark_quick_prune=False)
+            envelope_ok = bool(profile.get("within_target_envelope"))
+            add_factor(
+                "resource_envelope",
+                label="Resource envelope",
+                status="ready" if envelope_ok else "degraded",
+                detail=(
+                    f"{profile.get('estimated_total_mb', 0)} MB estimated topology memory"
+                ),
+                points_lost=0 if envelope_ok else 6,
+                action="Tune SYNAPSE_S2_NEURONS or resource envelope settings.",
+            )
+        except Exception as exc:
+            add_factor(
+                "resource_envelope",
+                label="Resource envelope",
+                status="blocked",
+                detail=str(exc),
+                points_lost=10,
+                action="Run Doctor and inspect resource profile errors.",
+            )
+
+        score = max(0, min(100, score))
+        if score >= 86:
+            overall_status = "ready"
+        elif score >= 60:
+            overall_status = "degraded"
+        else:
+            overall_status = "blocked"
+        return {
+            "action": "context-health",
+            "context_id": context,
+            "status": overall_status,
+            "score": score,
+            "memory_quality_score": memory_quality_score,
+            "factors": factors,
+            "recommended_actions": self._unique_strings(
+                [
+                    *recommended_actions,
+                    *list(self_test_payload.get("recommended_actions") or []),
+                ]
+            ),
+            "hygiene_summary": hygiene.get("queue_summary", {}),
+            "receipt": self._operation_receipt(
+                action="context-health",
+                status=overall_status,
+                title=f"Context health {score}/100",
+                summary=f"{len(factors)} factors checked for {context}",
+                context_id=context,
+                quality=str(memory_quality_score),
+                next_action=(
+                    "Proceed with Start Work."
+                    if overall_status == "ready"
+                    else "Resolve degraded factors before depending on recall."
+                ),
+            ),
+            "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "generated_at": time.time(),
+        }
+
+    def memory_hygiene(self, *, context_id: str, limit: int = 25) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        graph = self.backend.list_memory_graph(context_id=context, limit=250)
+        entries = list(graph.get("entries") or [])
+        duplicate_seen: dict[str, str] = {}
+        review_items: list[dict[str, Any]] = []
+        queue_summary: dict[str, int] = {}
+
+        for entry in entries:
+            item = self._memory_hygiene_item(entry, duplicate_seen=duplicate_seen)
+            if item is None:
+                continue
+            review_items.append(item)
+            for category in item["categories"]:
+                queue_summary[category] = queue_summary.get(category, 0) + 1
+
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        review_items.sort(
+            key=lambda item: (
+                severity_order.get(str(item.get("severity") or "low"), 3),
+                -float(item.get("updated_at") or 0.0),
+            )
+        )
+        bounded_items = review_items[: max(1, min(int(limit), 100))]
+        backlog_count = len(review_items)
+        status = "ready" if backlog_count == 0 else "degraded" if backlog_count < 8 else "blocked"
+        return {
+            "action": "memory-hygiene",
+            "context_id": context,
+            "status": status,
+            "backlog_count": backlog_count,
+            "review_items": bounded_items,
+            "queue_summary": dict(sorted(queue_summary.items())),
+            "memory_quality_score": max(0, 100 - min(60, backlog_count * 5)),
+            "recommended_actions": self._memory_hygiene_recommendations(queue_summary),
+            "receipt": self._operation_receipt(
+                action="memory-hygiene",
+                status=status,
+                title=f"{backlog_count} memory hygiene item{'s' if backlog_count != 1 else ''}",
+                summary="Review stale, low-signal, duplicate, or sensitive-looking memory before reuse.",
+                context_id=context,
+                quality=str(max(0, 100 - min(60, backlog_count * 5))),
+                next_action="Open the queue and prune, demote, or recapture flagged memory.",
+            ),
+            "generated_at": time.time(),
+        }
+
+    def memory_hygiene_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = self._context_from_payload(payload)
+        action = str(payload.get("action", "acknowledge") or "acknowledge").strip().lower()
+        memory_id = str(payload.get("memory_id", "") or "").strip()
+        reason = str(payload.get("reason", "") or "").strip()
+        if action == "prune":
+            if payload.get("confirm") is not True:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "confirm must be true before pruning memory from hygiene",
+                )
+            result = self.backend.prune_memory(
+                context_id=context,
+                target_type="event",
+                memory_id=memory_id,
+                reason=reason or "memory hygiene prune",
+                source_surface="dashboard-memory-hygiene",
+            )
+            return {
+                "action": "memory-hygiene-action",
+                "context_id": context,
+                "hygiene_action": "prune",
+                "memory_id": memory_id,
+                "result": result,
+                "receipt": self._operation_receipt(
+                    action="memory-hygiene-action",
+                    status="ready",
+                    title="Memory item pruned",
+                    summary=reason or "Memory hygiene removed one graph item.",
+                    context_id=context,
+                    next_action="Refresh Memory Hygiene.",
+                ),
+            }
+
+        audit = self.backend.publish_context_event(
+            context_id=context,
+            source_surface="dashboard-memory-hygiene",
+            event_type="memory-hygiene-action",
+            summary=f"memory hygiene {action}: {memory_id or 'queue'}",
+            payload={
+                "hygiene_action": action,
+                "memory_id": memory_id,
+                "reason": reason,
+            },
+        )
+        return {
+            "action": "memory-hygiene-action",
+            "context_id": context,
+            "hygiene_action": action,
+            "memory_id": memory_id,
+            "agent_deployment": audit,
+            "receipt": self._operation_receipt(
+                action="memory-hygiene-action",
+                status="ready",
+                title=f"Memory hygiene {action}",
+                summary=reason or "Hygiene action recorded on the context bus.",
+                context_id=context,
+                event_count=1,
+                next_action="Refresh Memory Hygiene.",
+            ),
+        }
+
+    def doctor_report(
+        self,
+        *,
+        context_id: str,
+        include_apps: bool = True,
+        repair_plan: bool = True,
+    ) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        started = time.perf_counter()
+        checks: list[dict[str, Any]] = []
+
+        def add_check(
+            check_id: str,
+            *,
+            label: str,
+            status: str,
+            detail: str,
+            repair: str,
+        ) -> None:
+            checks.append(
+                {
+                    "id": check_id,
+                    "label": label,
+                    "status": status if status in {"ready", "degraded", "blocked"} else "blocked",
+                    "detail": detail,
+                    "repair": repair,
+                }
+            )
+
+        status_payload = self.backend.status(context_id=context)
+        provider = dict(status_payload.get("embedding_provider") or {})
+        memory_path = Path(str(status_payload.get("memory_db_path") or ""))
+        add_check(
+            "python",
+            label="Python runtime",
+            status="ready" if sys.executable else "blocked",
+            detail=f"{sys.version.split()[0]} at {sys.executable}",
+            repair="Run from the project virtualenv or reinstall local launcher.",
+        )
+        add_check(
+            "memory_db",
+            label="SQLite memory",
+            status="ready" if memory_path else "blocked",
+            detail=str(memory_path),
+            repair="Set SYNAPSE_S2_MEMORY_DB to a writable local SQLite path.",
+        )
+        provider_error = str(provider.get("error") or "")
+        provider_type = str(provider.get("provider_type") or "")
+        add_check(
+            "embedding_provider",
+            label="Embedding provider",
+            status="blocked" if provider_error or provider_type == "unavailable" else "ready",
+            detail=provider_error or str(provider.get("provider") or "unknown"),
+            repair="Use semantic-hash fallback or resolve the MLX neural model path.",
+        )
+        for module in ("mlx", "mlx.core", "mlxsnn", "fastmcp", "mcp"):
+            dependency = self._dependency_status(module)
+            add_check(
+                f"dependency_{module.replace('.', '_')}",
+                label=f"Dependency {module}",
+                status="ready" if dependency["importable"] else "degraded",
+                detail=str(dependency.get("origin") or "not importable"),
+                repair=f"Install or repair optional dependency {module}.",
+            )
+        mcp_check = self._mcp_tool_name_check()
+        add_check(
+            "mcp_tool_names",
+            label="MCP tool names",
+            status="ready" if not mcp_check["invalid_tool_names"] else "blocked",
+            detail=mcp_check["detail"],
+            repair="Rename MCP tools to contain only alphanumeric characters and underscores.",
+        )
+        try:
+            inbox = self.capture_daemon().status()
+            errors = int(inbox.get("error_file_count") or 0)
+            add_check(
+                "capture_inbox",
+                label="Capture inbox",
+                status="ready" if errors == 0 else "degraded",
+                detail=f"{inbox.get('pending_file_count', 0)} pending, {errors} errors",
+                repair="Process pending drops or inspect error files in the capture root.",
+            )
+        except Exception as exc:
+            add_check(
+                "capture_inbox",
+                label="Capture inbox",
+                status="blocked",
+                detail=str(exc),
+                repair="Check capture root permissions and daemon configuration.",
+            )
+        if include_apps:
+            try:
+                apps = self.transcript_capture().detect_running_apps()
+                add_check(
+                    "app_connect_detect",
+                    label="App Connect detection",
+                    status="ready" if int(apps.get("app_count") or 0) > 0 else "degraded",
+                    detail=f"{apps.get('app_count', 0)} detected apps",
+                    repair="Grant Automation or use manual app connect plus selected-text fallback.",
+                )
+            except Exception as exc:
+                add_check(
+                    "app_connect_detect",
+                    label="App Connect detection",
+                    status="blocked",
+                    detail=str(exc),
+                    repair="Grant macOS Automation/Accessibility permissions or use selected-text capture.",
+                )
+
+        if any(check["status"] == "blocked" for check in checks):
+            overall_status = "blocked"
+        elif any(check["status"] == "degraded" for check in checks):
+            overall_status = "degraded"
+        else:
+            overall_status = "ready"
+        plan = [
+            check["repair"]
+            for check in checks
+            if check["status"] != "ready" and str(check.get("repair") or "").strip()
+        ]
+        if repair_plan and not plan:
+            plan = ["No repair required. Run Start Work and capture a Wrap Session at handoff."]
+        return {
+            "action": "doctor-report",
+            "context_id": context,
+            "overall_status": overall_status,
+            "checks": checks,
+            "repair_plan": self._unique_strings(plan) if repair_plan else [],
+            "environment": {
+                "MLX_DEVICE": os.getenv("MLX_DEVICE", ""),
+                "SYNAPSE_S2_STATE_PATH": os.getenv("SYNAPSE_S2_STATE_PATH", ""),
+                "SYNAPSE_S2_MEMORY_DB": os.getenv("SYNAPSE_S2_MEMORY_DB", ""),
+                "SYNAPSE_S2_EXPORT_DIR": os.getenv("SYNAPSE_S2_EXPORT_DIR", ""),
+            },
+            "status": status_payload,
+            "receipt": self._operation_receipt(
+                action="doctor-report",
+                status=overall_status,
+                title=f"Doctor {overall_status}",
+                summary=f"{len(checks)} checks completed",
+                context_id=context,
+                next_action=(
+                    "No repair required."
+                    if overall_status == "ready"
+                    else "Apply the repair plan, then rerun Doctor."
+                ),
+            ),
+            "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "generated_at": time.time(),
+        }
+
+    def start_work(
+        self,
+        *,
+        context_id: str,
+        agent_id: str,
+        prompt: str = "",
+    ) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        agent = mlx_backend.sanitize_agent_id(agent_id or "codex-desktop")
+        started = time.perf_counter()
+        health = self.context_health(context_id=context)
+        hygiene = self.memory_hygiene(context_id=context, limit=8)
+        hydrate = self.backend.hydrate_agent_context(
+            context_id=context,
+            agent_id=agent,
+            prompt=prompt,
+            event_limit=20,
+            graph_limit=30,
+            acknowledge=True,
+        )
+        recipes = self.operator_recipes()
+        brief_sections = [
+            {
+                "id": "health",
+                "title": "Context health",
+                "status": health["status"],
+                "body": f"{health['score']}/100 with memory quality {health['memory_quality_score']}/100.",
+            },
+            {
+                "id": "events",
+                "title": "New durable events",
+                "status": "ready" if hydrate.get("new_event_count", 0) else "degraded",
+                "body": f"{hydrate.get('new_event_count', 0)} new context-bus events since last cursor.",
+                "items": hydrate.get("events", [])[:5],
+            },
+            {
+                "id": "recall",
+                "title": "Recall evidence",
+                "status": "ready" if hydrate.get("recall_items") else "degraded",
+                "body": hydrate.get("recall_result") or "No prompt recall yet; run Recall or capture current work.",
+                "items": hydrate.get("recall_items", [])[:5],
+            },
+            {
+                "id": "hygiene",
+                "title": "Memory hygiene",
+                "status": hygiene["status"],
+                "body": f"{hygiene['backlog_count']} review items waiting.",
+                "items": hygiene.get("review_items", [])[:5],
+            },
+            {
+                "id": "recipes",
+                "title": "Recommended recipes",
+                "status": "ready",
+                "body": "Use the first recipe that matches the current operator moment.",
+                "items": recipes[:3],
+            },
+        ]
+        next_actions = self._unique_strings(
+            [
+                *list(health.get("recommended_actions") or []),
+                *list(hygiene.get("recommended_actions") or []),
+                "Use App Connect Preview before writing app snapshots to memory.",
+                "Capture a Wrap Session before switching projects or clients.",
+            ]
+        )[:8]
+        return {
+            "action": "start-work",
+            "context_id": context,
+            "agent_id": agent,
+            "prompt": str(prompt or ""),
+            "status": health["status"],
+            "score": health["score"],
+            "memory_quality_score": health["memory_quality_score"],
+            "brief_sections": brief_sections,
+            "next_actions": next_actions,
+            "recipes": recipes,
+            "context_health": health,
+            "memory_hygiene": hygiene,
+            "agent_brief": hydrate,
+            "receipt": self._operation_receipt(
+                action="start-work",
+                status=health["status"],
+                title=f"Start Work brief for {context}",
+                summary=f"{len(brief_sections)} sections generated for {agent}",
+                context_id=context,
+                next_action=next_actions[0] if next_actions else "Proceed with governed work.",
+            ),
+            "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "generated_at": time.time(),
+        }
+
+    def operator_recipes(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "daily_start",
+                "title": "Start daily work",
+                "steps": [
+                    "Run Start Work.",
+                    "Resolve Doctor or Context Health blockers.",
+                    "Use Recall for prior decisions before editing.",
+                ],
+            },
+            {
+                "id": "app_capture",
+                "title": "Capture from an app",
+                "steps": [
+                    "Detect apps and connect the target app.",
+                    "Preview the app snapshot and inspect the quality badge.",
+                    "Snapshot to memory only when the preview contains the intended content.",
+                ],
+            },
+            {
+                "id": "handoff",
+                "title": "Wrap a session",
+                "steps": [
+                    "Summarize decisions, tests, and follow-ups.",
+                    "Preview Wrap Session.",
+                    "Confirm Wrap Session to persist handoff memory.",
+                ],
+            },
+            {
+                "id": "repair",
+                "title": "Repair reliability",
+                "steps": [
+                    "Run Doctor / Repair.",
+                    "Clear Memory Hygiene review items.",
+                    "Generate an Evidence Pack after fixes.",
+                ],
+            },
+        ]
+
+    def wrap_session_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = self._context_from_payload(payload)
+        agent_id = mlx_backend.sanitize_agent_id(str(payload.get("agent_id", "codex-desktop")))
+        text = str(payload.get("text", "") or "").strip()
+        operation_log = payload.get("operation_log", [])
+        if not text and not operation_log:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "text or operation_log is required for wrap session preview",
+            )
+        preview_text = self._render_wrap_session_text(
+            context_id=context,
+            agent_id=agent_id,
+            text=text,
+            operation_log=operation_log,
+        )
+        source_tag = mlx_backend.sanitize_tag(
+            str(payload.get("source_tag", f"wrap-session-{agent_id}") or f"wrap-session-{agent_id}")
+        ).replace(" ", "-")
+        return {
+            "action": "wrap-session-preview",
+            "context_id": context,
+            "agent_id": agent_id,
+            "preview_text": preview_text,
+            "proposed_capture": {
+                "source_tag": source_tag,
+                "speaker": agent_id,
+                "metadata": {
+                    "source_surface": "dashboard-wrap-session",
+                    "operation_log_count": len(operation_log) if isinstance(operation_log, list) else 0,
+                },
+            },
+            "capture_required": True,
+            "receipt": self._operation_receipt(
+                action="wrap-session-preview",
+                status="ready",
+                title="Wrap Session preview ready",
+                summary=f"{len(preview_text)} preview characters prepared",
+                context_id=context,
+                source_tag=source_tag,
+                next_action="Confirm Wrap Session to write this handoff to memory.",
+            ),
+        }
+
+    def wrap_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("confirm") is not True:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "confirm must be true before wrapping a session into memory",
+            )
+        preview = self.wrap_session_preview(payload)
+        capture = self.backend.capture_conversation(
+            text=preview["preview_text"],
+            context_id=preview["context_id"],
+            source_tag=preview["proposed_capture"]["source_tag"],
+            speaker=preview["proposed_capture"]["speaker"],
+            surprise_threshold=0.5,
+            min_segment_sentences=1,
+            metadata={
+                **preview["proposed_capture"]["metadata"],
+                **self._metadata_payload(payload),
+                "wrap_session": True,
+                "agent_id": preview["agent_id"],
+            },
+        )
+        capture["action"] = "wrap-session"
+        capture["receipt"] = self._operation_receipt(
+            action="wrap-session",
+            status="ready",
+            title="Session wrapped into memory",
+            summary=(
+                f"{capture.get('event_count', 0)} events and "
+                f"{capture.get('relationship_count', 0)} relationships captured"
+            ),
+            context_id=preview["context_id"],
+            source_tag=preview["proposed_capture"]["source_tag"],
+            event_count=int(capture.get("event_count") or 0),
+            relationship_count=int(capture.get("relationship_count") or 0),
+            next_action="Run Start Work in the next client or session to hydrate this handoff.",
+        )
+        return capture
+
+    def pin_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = self._context_from_payload(payload)
+        agent_id = mlx_backend.sanitize_agent_id(
+            str(payload.get("agent_id", "dashboard-ui") or "dashboard-ui")
+        )
+        memory_id = str(payload.get("memory_id", "") or "").strip()
+        if not memory_id:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, "memory_id is required")
+        note = str(payload.get("note", "") or "").strip()
+        if len(note.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "note is too large")
+        entry = self.backend.memory_store.get_entry(memory_id)
+        if entry is None:
+            raise DashboardError(HTTPStatus.NOT_FOUND, "memory was not found")
+        entry_context = str(entry.get("context_id") or "")
+        if entry_context not in {context, "global"}:
+            raise DashboardError(
+                HTTPStatus.NOT_FOUND,
+                "memory was not found in the selected context",
+            )
+
+        pinned_tag = str(entry.get("tag") or memory_id)
+        source_excerpt = self._compact_text(str(entry.get("source_text") or ""), 640)
+        note_line = f"Operator note: {note}" if note else "Operator note: none provided."
+        trace_text = "\n".join(
+            [
+                "Feature: Recall result pinned for the current operator task.",
+                f"Context: {context}",
+                f"Agent: {agent_id}",
+                f"Pinned memory: {pinned_tag}",
+                f"Pinned memory id: {memory_id}",
+                f"Original context: {entry_context}",
+                note_line,
+                "Evidence excerpt:",
+                source_excerpt or "(empty source text)",
+            ]
+        ).strip()
+        commit = self.backend.commit_cortical_trace(
+            context_id=context,
+            agent_id=agent_id,
+            session_id="dashboard-recall-pin",
+            trace_type="evidence",
+            truth_posture="operator-confirmed",
+            text=trace_text,
+            evidence={
+                "source": "dashboard-recall-pin",
+                "pinned_memory_id": memory_id,
+                "pinned_tag": pinned_tag,
+                "pinned_context_id": entry_context,
+                "note_sha256": hashlib.sha256(note.encode("utf-8")).hexdigest()
+                if note
+                else "",
+            },
+            confidence=0.9,
+        )
+        return {
+            "action": "pin-memory",
+            "context_id": context,
+            "agent_id": agent_id,
+            "pinned_memory_id": memory_id,
+            "pinned_tag": pinned_tag,
+            "pinned_context_id": entry_context,
+            "trace_type": commit.get("trace_type", "evidence"),
+            "truth_posture": commit.get("truth_posture", "operator-confirmed"),
+            "confidence": commit.get("confidence"),
+            "memory_id": commit.get("memory_id"),
+            "tag": commit.get("tag"),
+            "agent_deployment": commit.get("agent_deployment"),
+            "receipt": self._operation_receipt(
+                action="pin-memory",
+                status="ready",
+                title="Recall pinned to working memory",
+                summary=f"{pinned_tag} pinned as operator-confirmed evidence.",
+                context_id=context,
+                source_tag=str(commit.get("tag") or ""),
+                event_count=1,
+                quality="operator-confirmed",
+                next_action="Use the pinned evidence in Cortex Governor or Wrap Session handoff.",
+            ),
         }
 
     def readiness_audit(self, *, context_id: str) -> dict[str, Any]:
@@ -1661,6 +2424,262 @@ class DashboardRuntime:
                 if isinstance(item, dict)
             ],
         }
+
+    def _memory_hygiene_item(
+        self,
+        entry: dict[str, Any],
+        *,
+        duplicate_seen: dict[str, str],
+    ) -> dict[str, Any] | None:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        source_text = str(entry.get("source_text") or "")
+        categories: list[str] = []
+        reasons: list[str] = []
+        recommended_actions: list[str] = []
+        severity = "low"
+
+        snapshot_quality = metadata.get("snapshot_quality")
+        if isinstance(snapshot_quality, dict) and bool(snapshot_quality.get("low_signal")):
+            categories.append("low_signal_app_capture")
+            reasons.append("App snapshot produced low signal text.")
+            recommended_actions.append("Recapture from selected text or a richer app view.")
+            severity = "medium"
+
+        confidence_raw = metadata.get("confidence")
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = None
+        truth_posture = str(metadata.get("truth_posture") or "").lower()
+        trace_type = str(metadata.get("trace_type") or "").lower()
+        if confidence is not None and confidence < 0.6:
+            categories.append("low_confidence_trace")
+            reasons.append(f"Confidence is {confidence:.2f}.")
+            recommended_actions.append("Promote with evidence, demote, or prune after review.")
+            severity = "medium"
+        if truth_posture in {"inferred", "stale"} or trace_type in {"assumption", "follow_up"}:
+            categories.append("assumption_or_follow_up")
+            reasons.append("Trace is an assumption, follow-up, inferred, or stale.")
+            recommended_actions.append("Resolve or convert to observed/test-validated memory.")
+            if severity == "low":
+                severity = "medium"
+
+        normalized = " ".join(source_text.lower().split())[:220]
+        if normalized and normalized in duplicate_seen:
+            categories.append("duplicate_candidate")
+            reasons.append("Source text resembles another memory entry.")
+            recommended_actions.append("Prune or merge duplicate memory if it is redundant.")
+        elif normalized:
+            duplicate_seen[normalized] = str(entry.get("memory_id") or "")
+
+        sensitive_markers = (
+            "[redacted_secret]",
+            "api_key=",
+            "password=",
+            "private_key",
+            "secret=",
+            "sk-",
+            "token=",
+        )
+        lowered = source_text.lower()
+        if any(marker in lowered for marker in sensitive_markers):
+            categories.append("sensitive_redaction_review")
+            reasons.append("Entry contains redacted or sensitive-looking material.")
+            recommended_actions.append("Verify redaction and prune if the memory is unnecessary.")
+            severity = "high"
+
+        if not categories:
+            return None
+
+        return {
+            "item_id": f"hygiene_{hashlib.sha256(str(entry.get('memory_id', '')).encode('utf-8')).hexdigest()[:10]}",
+            "memory_id": str(entry.get("memory_id") or ""),
+            "tag": str(entry.get("tag") or ""),
+            "categories": self._unique_strings(categories),
+            "category": categories[0],
+            "severity": severity,
+            "reason": " ".join(reasons),
+            "recommended_action": recommended_actions[0],
+            "recommended_actions": self._unique_strings(recommended_actions),
+            "source_excerpt": self._compact_text(source_text, 220),
+            "updated_at": float(entry.get("updated_at") or 0.0),
+            "metadata": {
+                "trace_type": trace_type,
+                "truth_posture": truth_posture,
+                "confidence": confidence,
+                "adapter_kind": metadata.get("adapter_kind"),
+                "snapshot_quality": snapshot_quality if isinstance(snapshot_quality, dict) else {},
+            },
+        }
+
+    def _memory_hygiene_recommendations(self, queue_summary: dict[str, int]) -> list[str]:
+        recommendations: list[str] = []
+        if queue_summary.get("low_signal_app_capture"):
+            recommendations.append("Recapture low-signal app snapshots using preview or selected-text fallback.")
+        if queue_summary.get("low_confidence_trace") or queue_summary.get("assumption_or_follow_up"):
+            recommendations.append("Promote supported assumptions or prune stale follow-ups.")
+        if queue_summary.get("sensitive_redaction_review"):
+            recommendations.append("Review redacted/sensitive-looking entries and prune anything unnecessary.")
+        if queue_summary.get("duplicate_candidate"):
+            recommendations.append("Prune duplicate memory entries that do not add new evidence.")
+        if not recommendations:
+            recommendations.append("No hygiene action required.")
+        return recommendations
+
+    def _operation_receipt(
+        self,
+        *,
+        action: str,
+        status: str,
+        title: str,
+        summary: str,
+        context_id: str,
+        source_tag: str = "",
+        event_count: int = 0,
+        relationship_count: int = 0,
+        quality: str = "",
+        next_action: str = "",
+    ) -> dict[str, Any]:
+        normalized_status = status if status in {"ready", "degraded", "blocked"} else "degraded"
+        return {
+            "receipt_id": f"rcpt_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}",
+            "action": str(action),
+            "status": normalized_status,
+            "title": str(title),
+            "summary": str(summary),
+            "context_id": mlx_backend.sanitize_context_id(context_id),
+            "source_tag": str(source_tag or ""),
+            "event_count": int(event_count or 0),
+            "relationship_count": int(relationship_count or 0),
+            "quality": str(quality or normalized_status),
+            "next_action": str(next_action or ""),
+            "created_at": time.time(),
+        }
+
+    def _with_receipt(
+        self,
+        payload: dict[str, Any],
+        *,
+        action: str,
+        status: str,
+        title: str,
+        summary: str,
+        context_id: str,
+        source_tag: str = "",
+        event_count: int | None = None,
+        relationship_count: int | None = None,
+        quality: str = "",
+        next_action: str = "",
+    ) -> dict[str, Any]:
+        result = dict(payload)
+        result["receipt"] = self._operation_receipt(
+            action=action,
+            status=status,
+            title=title,
+            summary=summary,
+            context_id=str(result.get("context_id") or context_id),
+            source_tag=str(result.get("source_tag") or source_tag),
+            event_count=int(
+                event_count
+                if event_count is not None
+                else int(result.get("event_count") or 0)
+            ),
+            relationship_count=int(
+                relationship_count
+                if relationship_count is not None
+                else int(result.get("relationship_count") or 0)
+            ),
+            quality=quality,
+            next_action=next_action,
+        )
+        return result
+
+    def _dependency_status(self, module: str) -> dict[str, Any]:
+        spec = importlib.util.find_spec(module)
+        return {
+            "importable": spec is not None,
+            "origin": getattr(spec, "origin", None) if spec is not None else None,
+        }
+
+    def _mcp_tool_name_check(self) -> dict[str, Any]:
+        server_path = ROOT / "mcp_server.py"
+        invalid: list[str] = []
+        tool_names: list[str] = []
+        if not server_path.exists():
+            return {
+                "invalid_tool_names": invalid,
+                "tool_names": tool_names,
+                "detail": "mcp_server.py not found",
+            }
+        text = server_path.read_text(encoding="utf-8")
+        patterns = [
+            re.compile(r"@(?:mcp|server)\.tool\(\s*name\s*=\s*[\"']([^\"']+)[\"']"),
+            re.compile(r"@(?:mcp|server)\.tool\(\s*[\"']([^\"']+)[\"']"),
+            re.compile(r"name\s*=\s*[\"']([A-Za-z0-9_.:-]+)[\"']"),
+        ]
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                name = match.group(1)
+                if name in tool_names:
+                    continue
+                tool_names.append(name)
+                if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+                    invalid.append(name)
+        return {
+            "invalid_tool_names": invalid,
+            "tool_names": tool_names,
+            "detail": (
+                "all declared MCP tool names are client-safe"
+                if not invalid
+                else f"invalid names: {', '.join(invalid[:8])}"
+            ),
+        }
+
+    def _unique_strings(self, values: list[Any]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in values:
+            text = " ".join(str(value or "").split())
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _compact_text(self, value: str, limit: int) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)].rstrip() + "..."
+
+    def _render_wrap_session_text(
+        self,
+        *,
+        context_id: str,
+        agent_id: str,
+        text: str,
+        operation_log: Any,
+    ) -> str:
+        lines = [
+            f"Context: {context_id}",
+            f"Agent: {agent_id}",
+            f"Wrapped at: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+            "",
+            "Session notes:",
+            str(text or "").strip() or "No free-form notes provided.",
+        ]
+        if isinstance(operation_log, list) and operation_log:
+            lines.extend(["", "Operation receipts:"])
+            for item in operation_log[-10:]:
+                if isinstance(item, dict):
+                    action = str(item.get("action") or item.get("title") or "operation")
+                    summary = str(item.get("summary") or item.get("detail") or "")
+                    status = str(item.get("status") or "")
+                    rendered = " - ".join(part for part in (action, status, summary) if part)
+                    lines.append(f"- {rendered}")
+                else:
+                    lines.append(f"- {str(item)}")
+        return "\n".join(lines).strip()
 
     def _debug_error_details_enabled(self) -> bool:
         return os.getenv("SYNAPSE_S2_DASHBOARD_DEBUG_ERRORS", "").strip().lower() in {

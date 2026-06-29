@@ -246,6 +246,122 @@ class SynapseCliTests(unittest.TestCase):
             {check["id"] for check in payload["checks"]},
         )
 
+    def test_operator_loop_cli_commands_report_receipts(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "operator-loop-memory",
+                "--text",
+                "Feature: Start Work should brief the operator before daily use.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            start = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "start-work",
+                "--context",
+                "demo",
+                "--agent-id",
+                "codex-desktop",
+                "--prompt",
+                "Start Monday SYNAPSE-S2 workflow",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            health = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "context-health",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            hygiene = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "memory-hygiene",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            doctor = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "doctor",
+                "--context",
+                "demo",
+                "--repair-plan",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            preview = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "wrap-session",
+                "--context",
+                "demo",
+                "--agent-id",
+                "codex-desktop",
+                "--text",
+                "Feature: CLI preview should show wrap session content.",
+                "--preview",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            wrapped = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "wrap-session",
+                "--context",
+                "demo",
+                "--agent-id",
+                "codex-desktop",
+                "--text",
+                "Feature: CLI confirmed wrap session captures reliable handoff evidence.",
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        for result in (remember, start, health, hygiene, doctor, preview, wrapped):
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        start_payload = json.loads(start.stdout)
+        health_payload = json.loads(health.stdout)
+        hygiene_payload = json.loads(hygiene.stdout)
+        doctor_payload = json.loads(doctor.stdout)
+        preview_payload = json.loads(preview.stdout)
+        wrapped_payload = json.loads(wrapped.stdout)
+
+        self.assertEqual(start_payload["action"], "start-work")
+        self.assertIn(start_payload["status"], {"ready", "degraded", "blocked"})
+        self.assertGreaterEqual(start_payload["score"], 0)
+        self.assertLessEqual(start_payload["score"], 100)
+        self.assertTrue(start_payload["brief_sections"])
+        self.assertEqual(start_payload["receipt"]["action"], "start-work")
+        self.assertEqual(health_payload["action"], "context-health")
+        self.assertEqual(health_payload["receipt"]["action"], "context-health")
+        self.assertEqual(hygiene_payload["action"], "memory-hygiene")
+        self.assertIn("queue_summary", hygiene_payload)
+        self.assertEqual(doctor_payload["action"], "doctor-report")
+        self.assertIn("repair_plan", doctor_payload)
+        self.assertEqual(preview_payload["action"], "wrap-session-preview")
+        self.assertIn("Feature:", preview_payload["preview_text"])
+        self.assertEqual(wrapped_payload["action"], "wrap-session")
+        self.assertGreaterEqual(wrapped_payload["event_count"], 1)
+        self.assertEqual(wrapped_payload["receipt"]["status"], "ready")
+
     def test_cli_certify_runtime_writes_evidence_pack(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

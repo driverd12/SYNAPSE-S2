@@ -30,6 +30,17 @@ const WIZARD_STEPS = [
     ],
   },
   {
+    selector: "#operatorLoopPanel",
+    title: "Run the Operator Trust Loop",
+    body: "Use this band for the everyday path: start work, check context health, repair problems, preview captures, and wrap the session before handoff.",
+    capability: "Daily workflow: Start Work, Context Health, Doctor / Repair, Memory Hygiene, Wrap Session, recipes, and receipts.",
+    items: [
+      "Run Start Work before relying on memory.",
+      "Run Doctor or Memory Hygiene when confidence is degraded.",
+      "Wrap Session before switching clients, threads, or projects.",
+    ],
+  },
+  {
     selector: "#mondayReadinessButton",
     title: "Run Monday Readiness first",
     body: "This scorecard checks real local state: runtime, memory, embeddings, capture inbox, App Connect, resource envelope, quick-prune budget, and recall.",
@@ -87,11 +98,11 @@ const WIZARD_STEPS = [
   {
     selector: "#appConnect",
     title: "Attach a running app",
-    body: "App Connect captures locally exposed Accessibility text. It does not promise hidden internals; selected-text capture is the exact-content fallback.",
-    capability: "App intake: Detect, Connect app, Snapshot to memory, and selected-text capture.",
+    body: "App Connect captures locally exposed Accessibility text. Preview first to see exactly what would be captured; selected-text capture is the exact-content fallback.",
+    capability: "App intake: Detect, Connect app, Preview snapshot, Snapshot to memory, and selected-text capture.",
     items: [
       "Press Detect to list running apps.",
-      "Connect the selected app before snapshotting.",
+      "Connect the selected app, then preview before snapshotting.",
       "When an app exposes only window chrome, select the exact text and capture it here.",
     ],
   },
@@ -187,6 +198,10 @@ const state = {
     apps: [],
     connections: [],
   },
+  operator: {
+    receipts: [],
+    lastWrapPreview: null,
+  },
   cortex: {
     sessionId: "",
   },
@@ -206,6 +221,8 @@ const elements = collectElements([
   "appConnectSubmitButton",
   "appConnectionSelect",
   "appManualName",
+  "appPreviewButton",
+  "appPreviewReceipt",
   "appRefreshButton",
   "appSelectionCaptureButton",
   "appSelectionText",
@@ -221,6 +238,9 @@ const elements = collectElements([
   "contextApply",
   "contextBusState",
   "contextEventLedger",
+  "contextHealthBadge",
+  "contextHealthButton",
+  "contextHealthOutput",
   "contextInput",
   "contextUri",
   "coreToggleGuardHint",
@@ -253,6 +273,8 @@ const elements = collectElements([
   "cortexTypedCounts",
   "cortexWarnings",
   "cortexWorkingMemory",
+  "doctorReportButton",
+  "doctorReportOutput",
   "captureForm",
   "captureInboxButton",
   "captureInboxState",
@@ -296,6 +318,8 @@ const elements = collectElements([
   "lastTick",
   "latencyLabel",
   "memoryDbLabel",
+  "memoryHygieneButton",
+  "memoryHygieneQueue",
   "memoryLedger",
   "memoryState",
   "modeLabel",
@@ -305,6 +329,8 @@ const elements = collectElements([
   "neuralMathPanel",
   "modelUri",
   "operationLog",
+  "operatorReceipts",
+  "operatorRecipes",
   "platformLabel",
   "profileButton",
   "pruneBudget",
@@ -348,6 +374,8 @@ const elements = collectElements([
   "selfTestGrid",
   "selfTestState",
   "sleepButton",
+  "startWorkButton",
+  "startWorkOutput",
   "themeButton",
   "toggleActionButton",
   "toggleActionState",
@@ -370,6 +398,10 @@ const elements = collectElements([
   "wizardTitle",
   "wizardToggleButton",
   "wizardToggleText",
+  "wrapSessionButton",
+  "wrapSessionNotes",
+  "wrapSessionOutput",
+  "wrapSessionPreviewButton",
 ]);
 
 elements.contextInput.value = state.context;
@@ -378,6 +410,7 @@ applyTheme(loadTheme());
 initializeGraphInteractions();
 initializeSectionNavigation();
 initializeWizard();
+renderOperatorRecipes(defaultOperatorRecipes());
 
 function collectElements(ids) {
   return Object.fromEntries(ids.map((id) => [id, requiredElement(id)]));
@@ -763,6 +796,248 @@ function renderMondayReadiness(payload) {
     return item;
   });
   elements.selfTestGrid.replaceChildren(...cards);
+}
+
+function runStartWork(button) {
+  return withBusy(button, "Start Work", async () => {
+    elements.startWorkOutput.textContent = "Generating Start Work brief...";
+    const payload = await requestJson("/api/start-work", {
+      params: {
+        context_id: state.context,
+        agent_id: "dashboard-ui",
+        prompt: elements.queryInput.value.trim() || "Daily SYNAPSE-S2 operator brief",
+      },
+    });
+    renderStartWork(payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    elements.startWorkOutput.textContent = `Start Work failed: ${error.message}`;
+    return null;
+  });
+}
+
+function runContextHealth(button) {
+  return withBusy(button, "Context Health", async () => {
+    const payload = await requestJson("/api/context-health", {
+      params: { context_id: state.context },
+    });
+    renderContextHealth(payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    elements.contextHealthOutput.textContent = `Context Health failed: ${error.message}`;
+    elements.contextHealthBadge.textContent = "Context Health blocked";
+    elements.contextHealthBadge.className = "quality-badge blocked";
+    return null;
+  });
+}
+
+function runDoctorReport(button) {
+  return withBusy(button, "Doctor / Repair", async () => {
+    elements.doctorReportOutput.textContent = "Running Doctor...";
+    const payload = await requestJson("/api/doctor", {
+      params: {
+        context_id: state.context,
+        include_apps: "true",
+        repair_plan: "true",
+      },
+    });
+    renderDoctorReport(payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    elements.doctorReportOutput.textContent = `Doctor failed: ${error.message}`;
+    return null;
+  });
+}
+
+function runMemoryHygiene(button) {
+  return withBusy(button, "Memory Hygiene", async () => {
+    const payload = await requestJson("/api/memory-hygiene", {
+      params: { context_id: state.context, limit: 12 },
+    });
+    renderMemoryHygiene(payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    elements.memoryHygieneQueue.textContent = `Memory Hygiene failed: ${error.message}`;
+    return null;
+  });
+}
+
+function runWrapSession(button, { previewOnly = false } = {}) {
+  const text = elements.wrapSessionNotes.value.trim();
+  if (!text) {
+    logOperation("Wrap Session rejected", "session notes are required");
+    elements.wrapSessionNotes.focus();
+    return Promise.resolve(null);
+  }
+  return withBusy(button, previewOnly ? "Wrap Session preview" : "Wrap Session", async () => {
+    const body = {
+      context_id: state.context,
+      agent_id: "dashboard-ui",
+      text,
+      operation_log: operationLogForWrap(),
+    };
+    const preview = await requestJson("/api/wrap-session/preview", {
+      method: "POST",
+      body,
+    });
+    renderWrapSessionPreview(preview);
+    if (previewOnly) return preview;
+    const firstLine = preview.preview_text.split("\n").find(Boolean) || "Wrap Session";
+    if (!confirmPreflight("Write Wrap Session to SYNAPSE-S2 memory?", [
+      firstLine,
+      preview.receipt?.summary || "",
+      "This creates durable local memory for handoff.",
+    ])) {
+      logOperation("Wrap Session cancelled", preview);
+      return preview;
+    }
+    const payload = await requestJson("/api/wrap-session", {
+      method: "POST",
+      body: {
+        ...body,
+        confirm: true,
+      },
+    });
+    await publishAwareResult(payload);
+    state.operator.lastWrapPreview = null;
+    elements.wrapSessionNotes.value = "";
+    elements.wrapSessionOutput.innerHTML = renderReceiptCard(payload.receipt);
+    return payload;
+  }).catch((error) => {
+    elements.wrapSessionOutput.textContent = `Wrap Session failed: ${error.message}`;
+    return null;
+  });
+}
+
+function renderStartWork(payload) {
+  renderContextHealth(payload.context_health);
+  renderMemoryHygiene(payload.memory_hygiene);
+  renderOperatorRecipes(payload.recipes || []);
+  const sections = (payload.brief_sections || []).slice(0, 5);
+  elements.startWorkOutput.innerHTML = sections.map((section) => `
+    <article class="brief-section ${escapeHtml(section.status || "degraded")}">
+      <span>${escapeHtml(section.status || "degraded")}</span>
+      <strong>${escapeHtml(section.title || section.id || "Brief section")}</strong>
+      <p>${escapeHtml(section.body || "")}</p>
+    </article>
+  `).join("") || "No Start Work sections returned";
+}
+
+function renderContextHealth(payload) {
+  if (!payload) return;
+  const status = String(payload.status || "degraded");
+  elements.contextHealthBadge.textContent = `Context Health ${formatNumber(payload.score)} / 100`;
+  elements.contextHealthBadge.className = `quality-badge ${status}`;
+  elements.contextHealthOutput.innerHTML = `
+    <strong>${escapeHtml(status)}</strong>
+    <small>Memory quality ${escapeHtml(formatNumber(payload.memory_quality_score))} / 100</small>
+    <p>${escapeHtml((payload.recommended_actions || [])[0] || "No immediate action required.")}</p>
+  `;
+}
+
+function renderDoctorReport(payload) {
+  const status = String(payload.overall_status || "degraded");
+  const checks = payload.checks || [];
+  const failures = checks.filter((check) => check.status !== "ready");
+  elements.doctorReportOutput.innerHTML = `
+    <strong>Doctor ${escapeHtml(status)}</strong>
+    <small>${formatNumber(checks.length)} checks / ${formatNumber(failures.length)} need attention</small>
+    <ul>${(payload.repair_plan || []).slice(0, 4).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+  `;
+}
+
+function renderMemoryHygiene(payload) {
+  if (!payload) return;
+  const items = payload.review_items || [];
+  elements.memoryHygieneQueue.innerHTML = items.length
+    ? items.slice(0, 6).map((item) => `
+        <article class="hygiene-item ${escapeHtml(item.severity || "low")}">
+          <div>
+            <strong>${escapeHtml(item.tag || compactMemoryId(item.memory_id))}</strong>
+            <small>${escapeHtml((item.categories || []).join(" / "))}</small>
+            <p>${escapeHtml(item.reason || item.source_excerpt || "")}</p>
+          </div>
+          <button type="button"
+            data-hygiene-action="acknowledge"
+            data-memory-id="${escapeHtml(item.memory_id)}"
+            data-hygiene-label="${escapeHtml(item.tag || item.memory_id)}">
+            Ack
+          </button>
+        </article>
+      `).join("")
+    : '<div class="memory-ledger-empty">No memory hygiene review items</div>';
+}
+
+function renderOperatorRecipes(recipes) {
+  const visible = recipes.length ? recipes : defaultOperatorRecipes();
+  elements.operatorRecipes.innerHTML = visible.slice(0, 4).map((recipe) => `
+    <article class="recipe-row">
+      <strong>${escapeHtml(recipe.title || recipe.id || "Recipe")}</strong>
+      <small>${escapeHtml((recipe.steps || []).slice(0, 3).join(" / "))}</small>
+    </article>
+  `).join("");
+}
+
+function defaultOperatorRecipes() {
+  return [
+    {
+      title: "Start daily work",
+      steps: ["Run Start Work", "Resolve health blockers", "Recall prior decisions"],
+    },
+    {
+      title: "Capture from an app",
+      steps: ["Connect app", "Preview snapshot", "Capture only useful text"],
+    },
+    {
+      title: "Wrap a session",
+      steps: ["Summarize decisions", "Preview wrap", "Confirm capture"],
+    },
+  ];
+}
+
+function renderWrapSessionPreview(payload) {
+  state.operator.lastWrapPreview = payload;
+  elements.wrapSessionOutput.innerHTML = `
+    ${renderReceiptCard(payload.receipt)}
+    <pre>${escapeHtml(payload.preview_text || "")}</pre>
+  `;
+}
+
+function renderOperationReceipt(receipt) {
+  if (!receipt) return;
+  state.operator.receipts = [receipt, ...state.operator.receipts].slice(0, 5);
+  elements.operatorReceipts.innerHTML = state.operator.receipts.map(renderReceiptCard).join("");
+}
+
+function renderReceiptCard(receipt) {
+  if (!receipt) return "";
+  const status = String(receipt.status || "degraded");
+  const meta = [
+    receipt.context_id || "",
+    receipt.source_tag || "",
+    receipt.event_count ? `${formatNumber(receipt.event_count)} events` : "",
+    receipt.relationship_count ? `${formatNumber(receipt.relationship_count)} links` : "",
+  ].filter(Boolean).join(" / ");
+  return `
+    <article class="receipt-card ${escapeHtml(status)}">
+      <span>${escapeHtml(status)}</span>
+      <strong>${escapeHtml(receipt.title || receipt.action || "Receipt")}</strong>
+      <small>${escapeHtml(meta || receipt.quality || "")}</small>
+      <p>${escapeHtml(receipt.summary || "")}</p>
+      ${receipt.next_action ? `<em>${escapeHtml(receipt.next_action)}</em>` : ""}
+    </article>
+  `;
+}
+
+function operationLogForWrap() {
+  const logText = elements.operationLog.textContent.trim();
+  if (!logText || logText === "idle") return [];
+  return [
+    {
+      action: "dashboard-operation-log",
+      summary: logText.slice(0, 1800),
+    },
+  ];
 }
 
 function appOptionLabel(app) {
@@ -1872,16 +2147,57 @@ function resultCard(item) {
     : "";
   const title = item.label || item.tag || item.raw || "--";
   const identity = item.tag && item.tag !== title ? `${item.tag}${facets}` : facets.replace(/^ \/ /, "");
+  const memoryId = String(item.memory_id || "");
+  const recallAction = memoryId
+    ? `<div class="result-actions">
+        <button type="button"
+          class="secondary-button recall-pin-button"
+          data-recall-action="pin"
+          data-memory-id="${escapeHtml(memoryId)}"
+          data-recall-label="${escapeHtml(title)}">
+          Pin
+        </button>
+      </div>`
+    : "";
   return `
     <article class="result-card">
       <span>${formatNumber(item.rank || 0)}</span>
-      <div>
+      <div class="result-body">
         <strong>${escapeHtml(title)}</strong>
         <small>${escapeHtml(`${score}${relation}${context}${identity ? ` / ${identity}` : ""}`)}</small>
         ${item.summary ? `<p>${escapeHtml(compactTag(item.summary, 120))}</p>` : ""}
       </div>
+      ${recallAction}
     </article>
   `;
+}
+
+async function pinRecallMemory(button) {
+  const memoryId = button.dataset.memoryId || "";
+  const label = button.dataset.recallLabel || compactMemoryId(memoryId);
+  if (!memoryId) {
+    logOperation("Pin recall rejected", "recall result is missing a memory id");
+    return null;
+  }
+  const prompt = elements.queryInput.value.trim();
+  return withBusy(button, "Pin recall", async () => {
+    const payload = await requestJson("/api/pin-memory", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        memory_id: memoryId,
+        agent_id: "dashboard-ui",
+        note: prompt
+          ? `Pinned from recall prompt: ${compactTag(prompt, 180)}`
+          : `Pinned from recall result: ${compactTag(label, 180)}`,
+      },
+    });
+    await publishAwareResult(payload);
+    return payload;
+  }).catch((error) => {
+    logOperation("Pin recall failed", error.message);
+    return null;
+  });
 }
 
 function parseResultString(result) {
@@ -2250,6 +2566,55 @@ async function connectSelectedApp(button) {
   });
 }
 
+async function previewConnectedAppSnapshot(button) {
+  const connectionId = elements.appConnectionSelect.value.trim();
+  if (!connectionId) {
+    logOperation("App preview rejected", "connect an app first, then choose the attached connection");
+    setAppConnectState(
+      "Preview needs a connection",
+      "Connect an app first, then choose the attached connection.",
+      "error",
+    );
+    elements.appConnectionSelect.focus();
+    return null;
+  }
+  return withBusy(button, "App snapshot preview", async () => {
+    const payload = await requestJson("/api/app-snapshot/preview", {
+      method: "POST",
+      body: {
+        connection_id: connectionId,
+        metadata: { source: "dashboard-app-snapshot-preview" },
+      },
+    });
+    renderAppSnapshotPreview(payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    elements.appPreviewReceipt.textContent = `Preview failed: ${error.message}`;
+    setAppConnectState("App preview failed", error.message, "error");
+    return null;
+  });
+}
+
+function renderAppSnapshotPreview(payload) {
+  const badge = payload.quality_badge || {};
+  const status = String(badge.status || "degraded");
+  const quality = payload.snapshot_quality || {};
+  elements.appPreviewReceipt.innerHTML = `
+    <article class="receipt-card ${escapeHtml(status)}">
+      <span>${escapeHtml(status)}</span>
+      <strong>${escapeHtml(badge.label || "Snapshot preview")}</strong>
+      <small>${escapeHtml(`${formatNumber(quality.line_count)} lines / ${formatNumber(quality.signal_chars)} signal chars`)}</small>
+      <p>${escapeHtml((payload.capture_guidance || []).join(" "))}</p>
+      <pre>${escapeHtml(payload.preview_text || "")}</pre>
+    </article>
+  `;
+  setAppConnectState(
+    `${payload.app_name} preview ${badge.label || status}`,
+    badge.next_action || "Capture snapshot only if the preview matches the intended content.",
+    status === "blocked" ? "error" : status === "degraded" ? "pending" : "ready",
+  );
+}
+
 async function snapshotConnectedApp(button) {
   const connectionId = elements.appConnectionSelect.value.trim();
   if (!connectionId) {
@@ -2526,6 +2891,9 @@ async function withBusy(button, label, task, options = { refresh: true }) {
   try {
     const payload = await task();
     logOperation(label, payload);
+    if (payload?.receipt) {
+      renderOperationReceipt(payload.receipt);
+    }
     if (payload?.agent_deployment) {
       renderContextBus(state.snapshot?.status || {}, {
         ...payload.agent_deployment,
@@ -2632,6 +3000,49 @@ elements.refreshButton.addEventListener("click", () => {
 
 elements.refreshActionButton.addEventListener("click", () => {
   withBusy(elements.refreshActionButton, "Refresh", refreshSnapshot);
+});
+
+elements.startWorkButton.addEventListener("click", () => {
+  runStartWork(elements.startWorkButton);
+});
+
+elements.contextHealthButton.addEventListener("click", () => {
+  runContextHealth(elements.contextHealthButton);
+});
+
+elements.doctorReportButton.addEventListener("click", () => {
+  runDoctorReport(elements.doctorReportButton);
+});
+
+elements.memoryHygieneButton.addEventListener("click", () => {
+  runMemoryHygiene(elements.memoryHygieneButton);
+});
+
+elements.wrapSessionPreviewButton.addEventListener("click", () => {
+  runWrapSession(elements.wrapSessionPreviewButton, { previewOnly: true });
+});
+
+elements.wrapSessionButton.addEventListener("click", () => {
+  runWrapSession(elements.wrapSessionButton, { previewOnly: false });
+});
+
+elements.memoryHygieneQueue.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-hygiene-action]");
+  if (!button) return;
+  event.preventDefault();
+  withBusy(button, "Memory hygiene action", async () => {
+    const payload = await requestJson("/api/memory-hygiene/action", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        action: button.dataset.hygieneAction || "acknowledge",
+        memory_id: button.dataset.memoryId || "",
+        reason: `dashboard acknowledged ${button.dataset.hygieneLabel || "memory item"}`,
+      },
+    });
+    await runMemoryHygiene(elements.memoryHygieneButton);
+    return payload;
+  }, { refresh: false });
 });
 
 elements.mondayReadinessButton.addEventListener("click", () => {
@@ -2859,6 +3270,13 @@ elements.queryForm.addEventListener("submit", async (event) => {
   }, { refresh: false });
 });
 
+elements.queryResults.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-recall-action='pin']");
+  if (!button) return;
+  event.preventDefault();
+  pinRecallMemory(button);
+});
+
 elements.recallLimit.addEventListener("change", () => {
   if (state.lastQueryPayload) {
     renderQueryResult(state.lastQueryPayload);
@@ -2965,6 +3383,10 @@ elements.appRefreshButton.addEventListener("click", () => {
 elements.appConnectForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await connectSelectedApp(elements.appConnectSubmitButton);
+});
+
+elements.appPreviewButton.addEventListener("click", () => {
+  previewConnectedAppSnapshot(elements.appPreviewButton);
 });
 
 elements.appSnapshotButton.addEventListener("click", () => {

@@ -31,7 +31,7 @@ APP_DETECT_SYSTEM_EVENTS_TIMEOUT_SECONDS = float(
 )
 APP_DETECT_PS_TIMEOUT_SECONDS = 2.0
 APP_SNAPSHOT_ACCESSIBILITY_TIMEOUT_SECONDS = float(
-    os.getenv("SYNAPSE_S2_APP_SNAPSHOT_TIMEOUT_SECONDS", "20.0")
+    os.getenv("SYNAPSE_S2_APP_SNAPSHOT_TIMEOUT_SECONDS", "8.0")
 )
 CLIPBOARD_READ_TIMEOUT_SECONDS = 5.0
 ALLOWED_TRANSCRIPT_SUFFIXES = {
@@ -246,6 +246,104 @@ class TranscriptCaptureManager:
             "connections": connections,
         }
 
+    def preview_app_snapshot(
+        self,
+        *,
+        connection_id: str,
+    ) -> dict[str, Any]:
+        connection = self._get_connection(connection_id)
+        try:
+            snapshot_text = self._clean_accessibility_snapshot_text(
+                str(self.app_snapshot_provider(connection) or "")
+            )
+        except Exception as exc:
+            return self._blocked_app_snapshot_preview(
+                connection=connection,
+                reason="app snapshot failed; grant Accessibility permission or use selected-text capture",
+                error_type=exc.__class__.__name__,
+            )
+        if not snapshot_text:
+            return self._blocked_app_snapshot_preview(
+                connection=connection,
+                reason="app snapshot did not return text; use selected-text capture",
+                error_type="empty-snapshot",
+            )
+        if len(snapshot_text.encode("utf-8")) > MAX_TRANSCRIPT_DELTA_BYTES:
+            snapshot_text = snapshot_text.encode("utf-8")[:MAX_TRANSCRIPT_DELTA_BYTES].decode(
+                "utf-8",
+                errors="replace",
+            )
+        redacted_text, redaction_count = redact_capture_text(snapshot_text)
+        quality = self._snapshot_quality(snapshot_text)
+        badge = self._snapshot_quality_badge(quality)
+        preview_text = self._preview_text(redacted_text, limit=1200)
+        return {
+            "action": "preview-app-snapshot",
+            "adapter_kind": "app-accessibility-snapshot",
+            "connection_id": connection["connection_id"],
+            "app_name": connection["app_name"],
+            "bundle_id": connection.get("bundle_id", ""),
+            "pid": int(connection.get("pid") or 0),
+            "context_id": str(connection.get("context_id") or "default"),
+            "source_tag": str(connection.get("source_tag") or "app-connect"),
+            "speaker": str(connection.get("speaker") or "operator"),
+            "preview_text": preview_text,
+            "preview_line_count": len([line for line in preview_text.splitlines() if line.strip()]),
+            "redaction_count": int(redaction_count),
+            "input_sha256": _sha256_text(snapshot_text),
+            "snapshot_quality": quality,
+            "quality_badge": badge,
+            "capture_guidance": self._app_capture_guidance(
+                connection=connection,
+                quality=quality,
+                badge=badge,
+            ),
+            "writes_memory": False,
+        }
+
+    def _blocked_app_snapshot_preview(
+        self,
+        *,
+        connection: dict[str, Any],
+        reason: str,
+        error_type: str,
+    ) -> dict[str, Any]:
+        quality = {
+            "line_count": 0,
+            "unique_line_count": 0,
+            "signal_chars": 0,
+            "low_signal": True,
+            "repetitive": False,
+            "quality": "blocked",
+            "blocked_reason": str(reason or "app snapshot unavailable"),
+        }
+        badge = self._snapshot_quality_badge(quality)
+        return {
+            "action": "preview-app-snapshot",
+            "adapter_kind": "app-accessibility-snapshot",
+            "connection_id": connection["connection_id"],
+            "app_name": connection["app_name"],
+            "bundle_id": connection.get("bundle_id", ""),
+            "pid": int(connection.get("pid") or 0),
+            "context_id": str(connection.get("context_id") or "default"),
+            "source_tag": str(connection.get("source_tag") or "app-connect"),
+            "speaker": str(connection.get("speaker") or "operator"),
+            "preview_text": "",
+            "preview_line_count": 0,
+            "redaction_count": 0,
+            "input_sha256": "",
+            "snapshot_quality": quality,
+            "quality_badge": badge,
+            "capture_guidance": self._app_capture_guidance(
+                connection=connection,
+                quality=quality,
+                badge=badge,
+            ),
+            "writes_memory": False,
+            "error_type": str(error_type or "snapshot-unavailable"),
+            "error": quality["blocked_reason"],
+        }
+
     def capture_app_snapshot(
         self,
         *,
@@ -267,6 +365,7 @@ class TranscriptCaptureManager:
                 errors="replace",
             )
         snapshot_quality = self._snapshot_quality(snapshot_text)
+        quality_badge = self._snapshot_quality_badge(snapshot_quality)
         redacted_text, redaction_count = redact_capture_text(snapshot_text)
         capture = self.backend.capture_conversation(
             text=redacted_text,
@@ -304,6 +403,28 @@ class TranscriptCaptureManager:
             "agent_deployment": capture.get("agent_deployment"),
             "redaction_count": int(redaction_count),
             "snapshot_quality": snapshot_quality,
+            "quality_badge": quality_badge,
+            "capture_guidance": self._app_capture_guidance(
+                connection=connection,
+                quality=snapshot_quality,
+                badge=quality_badge,
+            ),
+            "receipt": {
+                "action": "capture-app-snapshot",
+                "status": quality_badge["status"],
+                "title": f"{connection['app_name']} snapshot captured",
+                "summary": (
+                    f"{capture['event_count']} events, "
+                    f"{capture['relationship_count']} relationships, "
+                    f"{snapshot_quality['signal_chars']} signal chars"
+                ),
+                "context_id": capture["context_id"],
+                "source_tag": capture["source_tag"],
+                "event_count": capture["event_count"],
+                "relationship_count": capture["relationship_count"],
+                "quality": quality_badge["label"],
+                "next_action": quality_badge["next_action"],
+            },
         }
 
     def capture_app_selected_text(
@@ -923,12 +1044,79 @@ class TranscriptCaptureManager:
     def _snapshot_quality(self, text: str) -> dict[str, Any]:
         lines = [line for line in str(text or "").splitlines() if line.strip()]
         signal_chars = sum(len(line) for line in lines)
+        unique_count = len(set(line.lower() for line in lines))
+        low_signal = signal_chars < 160 or len(lines) < 4
+        repetitive = bool(lines) and unique_count / max(len(lines), 1) < 0.55
+        if not lines:
+            quality = "blocked"
+        elif low_signal:
+            quality = "low"
+        elif repetitive:
+            quality = "degraded"
+        else:
+            quality = "high"
         return {
             "line_count": len(lines),
-            "unique_line_count": len(set(line.lower() for line in lines)),
+            "unique_line_count": unique_count,
             "signal_chars": signal_chars,
-            "low_signal": signal_chars < 160 or len(lines) < 4,
+            "low_signal": low_signal,
+            "repetitive": repetitive,
+            "quality": quality,
         }
+
+    def _snapshot_quality_badge(self, quality: dict[str, Any]) -> dict[str, Any]:
+        quality_id = str(quality.get("quality") or "low")
+        if quality_id == "high":
+            return {
+                "status": "ready",
+                "label": "High signal",
+                "detail": "Accessibility returned enough distinct UI text for memory capture.",
+                "next_action": "Capture snapshot to memory if this preview matches the intended work.",
+            }
+        if quality_id == "degraded":
+            return {
+                "status": "degraded",
+                "label": "Repetitive",
+                "detail": "The snapshot has enough text, but repeated UI labels may dilute recall value.",
+                "next_action": "Prefer selected-text capture for exact content if this preview is mostly chrome.",
+            }
+        if quality_id == "blocked":
+            return {
+                "status": "blocked",
+                "label": "No text",
+                "detail": "The app did not expose readable Accessibility text.",
+                "next_action": "Select relevant text in the app and use the selected-text fallback.",
+            }
+        return {
+            "status": "degraded",
+            "label": "Low signal",
+            "detail": "The snapshot returned only a small amount of app text.",
+            "next_action": "Open the relevant app view or use selected-text capture before writing memory.",
+        }
+
+    def _app_capture_guidance(
+        self,
+        *,
+        connection: dict[str, Any],
+        quality: dict[str, Any],
+        badge: dict[str, Any],
+    ) -> list[str]:
+        app_name = str(connection.get("app_name") or "the app")
+        guidance = [
+            f"Preview shows locally exposed Accessibility text from {app_name}.",
+            str(badge.get("next_action") or "Capture only if the preview matches the intended content."),
+        ]
+        if bool(quality.get("low_signal")):
+            guidance.append("Use selected-text capture for exact content when the preview is short.")
+        if int(quality.get("line_count") or 0) <= 2:
+            guidance.append("Bring the target window forward and expand the relevant panel before retrying.")
+        return guidance
+
+    def _preview_text(self, text: str, *, limit: int) -> str:
+        clean = str(text or "").strip()
+        if len(clean) <= limit:
+            return clean
+        return clean[: max(0, limit - 14)].rstrip() + "\n[truncated]"
 
     def _snapshot_app_accessibility(self, app: dict[str, Any]) -> str:
         app_name = self._resolve_accessibility_app_name(app)
