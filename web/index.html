@@ -160,6 +160,28 @@
       </aside>
 
       <main class="main">
+        <section id="operatorActionBanner" class="operator-action-banner pending" aria-live="polite" aria-label="Current operator action">
+          <div class="operator-action-copy">
+            <div class="operator-action-meta">
+              <span id="operatorActionStatus">Action required</span>
+              <small id="operatorActionContext">default context</small>
+            </div>
+            <h2 id="operatorActionTitle">Start governed work before risky actions</h2>
+            <p id="operatorActionBody">Cortex is idle until you start a governed session. Run Start Work, enter the current task in Cortex Governor, then tick before mutations and commit verified outcomes.</p>
+          </div>
+          <ol class="operator-run-order" aria-label="Recommended SYNAPSE-S2 run order">
+            <li><span>1</span><strong>Start Work</strong></li>
+            <li><span>2</span><strong>Enter Cortex</strong></li>
+            <li><span>3</span><strong>Tick Action</strong></li>
+            <li><span>4</span><strong>Commit / Wrap</strong></li>
+          </ol>
+          <div class="operator-action-shortcuts" aria-label="Operator shortcuts">
+            <a href="#operatorLoopPanel">Start Work</a>
+            <a href="#cortex">Cortex</a>
+            <a href="#appConnect">App Connect</a>
+          </div>
+        </section>
+
         <section class="operator-loop-panel" id="operatorLoopPanel" aria-label="Daily Operator Trust Loop">
           <article class="panel operator-loop-card">
             <div class="panel-header">
@@ -522,19 +544,38 @@
                 <p class="section-label">Agent Governance</p>
                 <h2 id="cortexTitle">Cortex Governor</h2>
               </div>
-              <span id="cortexPolicy" class="status-chip">cognitive_governance:strict</span>
+              <div class="cortex-header-actions">
+                <span id="cortexPolicy" class="status-chip">cognitive_governance:strict</span>
+                <button id="cortexCloseButton" class="secondary-button compact-action" type="button" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
+                  <span id="cortexCloseText">No Session</span>
+                </button>
+              </div>
+            </div>
+
+            <div id="cortexSessionCallout" class="cortex-session-callout pending" role="status" aria-live="polite">
+              <div>
+                <strong id="cortexSessionCalloutTitle">Cortex is idle, not broken</strong>
+                <p id="cortexSessionCalloutBody">No agent is currently governed. That is expected before work starts; enter the current task before mutating files, capturing risky data, or making handoff claims.</p>
+              </div>
+              <ol aria-label="Cortex Governor run order">
+                <li>Start Work</li>
+                <li>Enter Cortex</li>
+                <li>Tick before risky actions</li>
+                <li>Commit / Wrap / End</li>
+              </ol>
             </div>
 
             <div class="cortex-status-grid" aria-label="Cortex Governor live state">
               <div>
-                <span>Active Sessions</span>
-                <strong id="cortexSessionCount">0</strong>
-                <small id="cortexSessionId">no active session</small>
+                <span>Session State</span>
+                <strong id="cortexSessionCount">Not started</strong>
+                <small id="cortexSessionId">start Cortex before risky work</small>
               </div>
               <div>
                 <span>Last Decision</span>
                 <strong id="cortexDecision">standby</strong>
-                <small>tick before risky actions</small>
+                <small>tick records proceed / verify / sanitize</small>
               </div>
               <div>
                 <span>Typed Memory</span>
@@ -581,7 +622,7 @@
                 </div>
                 <button class="primary-button" type="submit">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18"/><path d="M5 12h14"/><path d="m14 7 5 5-5 5"/></svg>
-                  Enter + hydrate
+                  Start Cortex Session
                 </button>
               </form>
 
@@ -923,11 +964,11 @@
         <div id="operatorGuide" class="operator-guide">
           <strong>Operator Flow</strong>
           <small>
-            <span>1 Capture trace</span>
-            <span>2 Enter cortex</span>
-            <span>3 Recall context</span>
-            <span>4 Inspect graph</span>
-            <span>5 Audit + pack</span>
+            <span>1 Start Work</span>
+            <span>2 Enter Cortex</span>
+            <span>3 Tick Action</span>
+            <span>4 Capture / Recall</span>
+            <span>5 Wrap + Pack</span>
           </small>
         </div>
         <div class="footer-health-cell"><span class="status-dot" aria-hidden="true"></span><strong>Health</strong><small id="footerHealth">GOOD</small></div>

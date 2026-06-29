@@ -213,10 +213,15 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --truth-posture test-validated \
   --text "Focused and full validation passed for the governed change." \
   --evidence '{"tests":["unittest discover"],"surface":"cli"}'
+.venv/bin/python synapse_cli.py --json close-cortex \
+  --context default \
+  --agent-id codex-desktop \
+  --session-id "$SESSION_ID" \
+  --reason "validated-and-wrapped"
 .venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
 ```
 
-The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goal, assumptions, contradictions, suggested next move, and capture queue in Cortex state.
+The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goal, assumptions, contradictions, suggested next move, and capture queue in Cortex state. Close the session after verified traces or Wrap Session handoff are captured so the dashboard returns to an explicit idle state instead of leaving stale active sessions.
 
 Capture real operator/Codex conversation notes into the event graph:
 
@@ -343,6 +348,7 @@ The MCP server exposes these tools:
 | `hydrate_spiking_agent_context` | Return an agent-ready briefing with new deployments, prompt recall, graph highlights, and optional ack. |
 | `enter_spiking_cortex` | Start a governed agent session with policy, recall, and a context-bus deployment. |
 | `tick_spiking_cortex` | Evaluate the current observation, proposed action, intended files, and intended tools against governed memory before proceeding. |
+| `close_spiking_cortex` | End an active governed session after validation or handoff and publish a `cortex-closed` lifecycle event. |
 | `commit_spiking_cortical_trace` | Persist a typed governed trace with truth posture, confidence, and evidence. |
 | `moderate_spiking_cortical_trace` | Promote, demote, or prune a governed trace from MCP clients by memory id. |
 | `get_spiking_cortex_state` | Inspect active governed sessions and typed cortical memory for a context. |
@@ -403,7 +409,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect quality preview plus tokenized snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect quality preview plus tokenized snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

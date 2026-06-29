@@ -866,6 +866,13 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             evidence={"tests": ["tests.test_backend"], "commit": "pending"},
         )
         state = backend.get_cortex_state(context_id="demo", agent_id="codex")
+        close = backend.close_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entry["session_id"],
+            reason="unit-test-complete",
+        )
+        closed_state = backend.get_cortex_state(context_id="demo", agent_id="codex")
 
         self.assertEqual(entry["action"], "enter-spiking-cortex")
         self.assertEqual(entry["mode"], "strict")
@@ -905,6 +912,11 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertTrue(
             any(item["trace_type"] == "validation" for item in state["high_confidence_truths"])
         )
+        self.assertEqual(close["action"], "close-spiking-cortex")
+        self.assertEqual(close["status"], "closed")
+        self.assertEqual(close["agent_deployment"]["event_type"], "cortex-closed")
+        self.assertEqual(close["cortex_state"]["active_session_count"], 0)
+        self.assertEqual(closed_state["active_session_count"], 0)
 
     def test_agent_context_hydration_includes_cortex_state(self):
         backend = SpikingAttentionBackend(

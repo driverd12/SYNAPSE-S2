@@ -327,7 +327,7 @@ Launch the loopback dashboard:
 open "http://127.0.0.1:8765/?context_id=default"
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, App Connect local app detection/attachment/snapshot capture, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, App Connect local app detection/attachment/snapshot capture, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default
@@ -359,7 +359,12 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --type validation \
   --truth-posture test-validated \
   --text "The governed session path entered, ticked, and committed a typed validation trace." \
-  --evidence '{"tests":["runbook cortex path"],"test_command":"synapse_cli.py enter-cortex && cortex-tick && commit-cortex"}'
+  --evidence '{"tests":["runbook cortex path"],"test_command":"synapse_cli.py enter-cortex && cortex-tick && commit-cortex && close-cortex"}'
+.venv/bin/python synapse_cli.py --json close-cortex \
+  --context default \
+  --agent-id codex-desktop \
+  --session-id "$SESSION_ID" \
+  --reason "runbook-smoke-complete"
 .venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
 ```
 
@@ -392,6 +397,7 @@ Useful tool calls:
 | `hydrate_spiking_agent_context` | Hydrates a restarted client with new deployments, prompt recall, graph highlights, and an optional ack cursor update. |
 | `enter_spiking_cortex` | Starts a governed agent session with recall and policy. |
 | `tick_spiking_cortex` | Checks the current observation, proposed action, intended files, intended tools, mutation, confidence, and sensitive-data scope before acting. |
+| `close_spiking_cortex` | Ends an active governed session after validation or handoff and publishes a lifecycle event. |
 | `commit_spiking_cortical_trace` | Persists typed validation, decision, constraint, risk, or implementation memory with evidence. |
 | `moderate_spiking_cortical_trace` | Promotes, demotes, or prunes a governed trace by memory id. |
 | `get_spiking_cortex_state` | Shows active governed sessions and typed cortical memory. |

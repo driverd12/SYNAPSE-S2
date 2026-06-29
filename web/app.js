@@ -30,14 +30,25 @@ const WIZARD_STEPS = [
     ],
   },
   {
+    selector: "#operatorActionBanner",
+    title: "Follow the current required action",
+    body: "This banner turns raw status into the next operator move. If Cortex says idle, that is not a failure; it means governed work has not been started for this task yet.",
+    capability: "Run-order guidance: Start Work, Enter Cortex, Tick before risky actions, then Commit Trace or Wrap Session.",
+    items: [
+      "Use the banner first when a coworker asks what to do next.",
+      "Idle Cortex means start a session before mutations or handoff claims.",
+      "After validation, Commit Trace or Wrap Session, then End Session.",
+    ],
+  },
+  {
     selector: "#operatorLoopPanel",
     title: "Run the Operator Trust Loop",
-    body: "Use this band for the everyday path: start work, check context health, repair problems, preview captures, and wrap the session before handoff.",
+    body: "Use this band for the everyday path. Start Work gives the brief, health checks prove trust, and Wrap Session records what changed before handoff.",
     capability: "Daily workflow: Start Work, Context Health, Doctor / Repair, Memory Hygiene, Wrap Session, recipes, and receipts.",
     items: [
-      "Run Start Work before relying on memory.",
-      "Run Doctor or Memory Hygiene when confidence is degraded.",
-      "Wrap Session before switching clients, threads, or projects.",
+      "Run Start Work before relying on recall or starting risky work.",
+      "Run Doctor or Memory Hygiene when confidence is degraded or the banner shows a blocker.",
+      "Wrap Session before switching clients, threads, projects, or operators.",
     ],
   },
   {
@@ -120,12 +131,12 @@ const WIZARD_STEPS = [
   {
     selector: "#cortexPanel",
     title: "Govern agent work",
-    body: "Cortex Governor keeps agent work under explicit goals, warnings, assumptions, and typed memory.",
+    body: "Cortex Governor starts idle by design. Enter the current task when work becomes risky, tick before the next action, and commit only verified decisions or validation evidence.",
     capability: "Cortex: enter, tick, commit typed traces, and moderate working memory.",
     items: [
-      "Enter Cortex before risky or multi-step work.",
-      "Tick with observations and intended actions.",
-      "Commit verified decisions, validations, constraints, or risks.",
+      "Not started means no agent is currently governed; it does not mean the system is broken.",
+      "Start Cortex Session before file mutations, sensitive captures, or handoff claims.",
+      "Tick before action, then Commit Trace, Wrap Session, and End Session after validation.",
     ],
   },
   {
@@ -248,6 +259,8 @@ const elements = collectElements([
   "coreUnlockButton",
   "coreVersion",
   "cortexAgentId",
+  "cortexCloseButton",
+  "cortexCloseText",
   "cortexCommitForm",
   "cortexConfidence",
   "cortexDecision",
@@ -264,6 +277,9 @@ const elements = collectElements([
   "cortexPolicy",
   "cortexProposedAction",
   "cortexSessionCount",
+  "cortexSessionCallout",
+  "cortexSessionCalloutBody",
+  "cortexSessionCalloutTitle",
   "cortexSessionId",
   "cortexTask",
   "cortexTickForm",
@@ -331,6 +347,11 @@ const elements = collectElements([
   "operationLog",
   "operatorReceipts",
   "operatorRecipes",
+  "operatorActionBanner",
+  "operatorActionBody",
+  "operatorActionContext",
+  "operatorActionStatus",
+  "operatorActionTitle",
   "platformLabel",
   "profileButton",
   "pruneBudget",
@@ -1046,6 +1067,62 @@ function appOptionLabel(app) {
   return `${app.app_name}${bundle}${pid ? ` / pid ${pid}` : ""}`;
 }
 
+function renderOperatorActionBanner(cortex, derived = {}) {
+  const status = state.snapshot?.status || {};
+  const contextId = state.snapshot?.context_id || state.context;
+  const activeCount = Number(derived.activeCount ?? 0);
+  const hasSession = activeCount > 0 && Boolean(derived.currentSessionId || derived.activeSession);
+  const lastDecision = String(derived.lastDecision || "standby");
+  const warnings = Array.isArray(derived.warnings) ? derived.warnings : [];
+  const criticalWarning = warnings.find((warning) => warning.severity === "critical");
+  const enabled = status.effective_enabled !== false;
+
+  let mode = "pending";
+  let statusText = "Action required";
+  let title = "Start governed work before risky actions";
+  let body = "Cortex is idle, which is normal before work starts. Run Start Work for context, then start a Cortex session before file mutations, sensitive captures, or handoff claims.";
+  let calloutTitle = "Cortex is idle, not broken";
+  let calloutBody = "No agent is currently governed. Enter the current task before mutating files, capturing risky data, or making handoff claims.";
+
+  if (!enabled) {
+    mode = "blocked";
+    statusText = "Runtime paused";
+    title = "Enable SYNAPSE-S2 Core before relying on memory";
+    body = "The core is disabled, so recall and capture are intentionally paused. Unlock the core control, enable the runtime, then refresh and rerun Start Work.";
+    calloutTitle = "Cortex is paused with the core";
+    calloutBody = "Enable the core before starting a governed Cortex session.";
+  } else if (criticalWarning || lastDecision === "stop-and-sanitize") {
+    mode = "blocked";
+    statusText = "Stop";
+    title = "Cortex guardrail requires operator attention";
+    body = criticalWarning?.message || "The last governor tick detected a high-risk action. Sanitize sensitive data or resolve the blocker before continuing.";
+    calloutTitle = "Guardrail is blocking the next action";
+    calloutBody = body;
+  } else if (hasSession) {
+    const sessionLabel = compactTag(String(derived.currentSessionId || ""), 28);
+    mode = lastDecision === "verify-first" || lastDecision === "proceed-with-verification"
+      ? "pending"
+      : "ready";
+    statusText = mode === "ready" ? "Governed" : "Verify first";
+    title = `Cortex session active${sessionLabel ? `: ${sessionLabel}` : ""}`;
+    body = mode === "ready"
+      ? "This work is attached to a governed session. Tick before each risky action, then commit verified decisions, validation evidence, constraints, or risks."
+      : "The last governor decision requires verification. Capture the evidence, adjust the proposed action if needed, then tick again before continuing.";
+    calloutTitle = mode === "ready" ? "Cortex is governing this work" : "Verification required before continuing";
+    calloutBody = body;
+  }
+
+  elements.operatorActionBanner.className = `operator-action-banner ${mode}`;
+  elements.operatorActionStatus.textContent = statusText;
+  elements.operatorActionContext.textContent = `s2://local/${contextId}`;
+  elements.operatorActionTitle.textContent = title;
+  elements.operatorActionBody.textContent = body;
+
+  elements.cortexSessionCallout.className = `cortex-session-callout ${mode}`;
+  elements.cortexSessionCalloutTitle.textContent = calloutTitle;
+  elements.cortexSessionCalloutBody.textContent = calloutBody;
+}
+
 function renderCortexState(cortex) {
   const activeSessions = Array.isArray(cortex.active_sessions) ? cortex.active_sessions : [];
   const activeSession = activeSessions[0] || null;
@@ -1062,22 +1139,32 @@ function renderCortexState(cortex) {
   const captureQueue = Array.isArray(cortex.capture_queue) ? cortex.capture_queue : [];
   const workingMemory = Array.isArray(cortex.working_memory) ? cortex.working_memory : [];
   const warnings = Array.isArray(activeSession?.last_warnings) ? activeSession.last_warnings : [];
+  const activeCount = Number(cortex.active_session_count ?? activeSessions.length);
 
   if (!state.cortex.sessionId && activeSession?.session_id) {
     state.cortex.sessionId = String(activeSession.session_id);
+  } else if (activeCount <= 0) {
+    state.cortex.sessionId = "";
   }
 
-  const currentSessionId = state.cortex.sessionId || String(activeSession?.session_id || "");
+  const currentSessionId = activeCount > 0
+    ? state.cortex.sessionId || String(activeSession?.session_id || "")
+    : "";
   const lastDecision = String(activeSession?.last_decision || "standby");
 
   elements.cortexPolicy.textContent = policyId;
   elements.cortexPolicy.title = Array.isArray(policy.contract)
     ? policy.contract.join(" / ")
     : policyId;
-  elements.cortexSessionCount.textContent = formatNumber(cortex.active_session_count ?? activeSessions.length);
+  elements.cortexSessionCount.textContent = activeCount > 0
+    ? `${formatNumber(activeCount)} active`
+    : "Not started";
+  elements.cortexSessionCount.className = activeCount > 0 ? "good" : "warn";
+  elements.cortexCloseButton.disabled = !currentSessionId;
+  elements.cortexCloseText.textContent = currentSessionId ? "End Session" : "No Session";
   elements.cortexSessionId.textContent = currentSessionId
     ? compactTag(currentSessionId, 34)
-    : "no active session";
+    : "Start Cortex Session before risky work";
   elements.cortexSessionId.title = currentSessionId || "";
   elements.cortexDecision.textContent = lastDecision;
   elements.cortexDecision.className = decisionClass(lastDecision);
@@ -1100,6 +1187,13 @@ function renderCortexState(cortex) {
   const nextMove = String(cortex.suggested_next_move || "Enter Cortex Governor before substantial work.");
   elements.cortexNextMove.textContent = compactTag(nextMove, 44);
   elements.cortexNextMove.title = nextMove;
+  renderOperatorActionBanner(cortex, {
+    activeCount,
+    activeSession,
+    currentSessionId,
+    lastDecision,
+    warnings,
+  });
 
   elements.cortexHighConfidence.innerHTML = renderCortexMemoryList(
     highConfidence,
@@ -2729,7 +2823,7 @@ function setCortexSessionId(sessionId) {
   state.cortex.sessionId = String(sessionId || "");
   elements.cortexSessionId.textContent = state.cortex.sessionId
     ? compactTag(state.cortex.sessionId, 34)
-    : "no active session";
+    : "Start Cortex Session before risky work";
   elements.cortexSessionId.title = state.cortex.sessionId;
 }
 
@@ -2740,7 +2834,7 @@ async function enterCortexSession(button) {
     elements.cortexTask.focus();
     return null;
   }
-  return withBusy(button, "Enter cortex", async () => {
+  return withBusy(button, "Start Cortex", async () => {
     const payload = await requestJson("/api/cortex/enter", {
       method: "POST",
       body: {
@@ -2781,6 +2875,30 @@ async function tickCortexGovernor(button) {
       },
     });
     await publishAwareResult(payload);
+    if (payload.cortex_state) renderCortexState(payload.cortex_state);
+    return payload;
+  });
+}
+
+async function closeCortexSession(button) {
+  const sessionId = currentCortexSessionId();
+  if (!sessionId) {
+    logOperation("Cortex close rejected", "there is no active Cortex session to end");
+    elements.cortexTask.focus();
+    return null;
+  }
+  return withBusy(button, "End Cortex Session", async () => {
+    const payload = await requestJson("/api/cortex/close", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        agent_id: currentCortexAgentId(),
+        session_id: sessionId,
+        reason: "operator-ended-dashboard-session",
+      },
+    });
+    await publishAwareResult(payload);
+    setCortexSessionId("");
     if (payload.cortex_state) renderCortexState(payload.cortex_state);
     return payload;
   });
@@ -3109,6 +3227,10 @@ elements.toggleActionButton.addEventListener("click", () => toggleCore(elements.
 elements.cortexEnterForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await enterCortexSession(elements.cortexEnterForm.querySelector("button"));
+});
+
+elements.cortexCloseButton.addEventListener("click", async () => {
+  await closeCortexSession(elements.cortexCloseButton);
 });
 
 elements.cortexTickForm.addEventListener("submit", async (event) => {

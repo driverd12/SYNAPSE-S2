@@ -1615,6 +1615,61 @@ class SpikingAttentionBackend:
             "agent_deployment": deployment,
         }
 
+    def close_spiking_cortex(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        session_id: str,
+        reason: str = "operator-complete",
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        clean_session_id = str(session_id or "").strip()
+        clean_reason = str(reason or "operator-complete").strip()[:240] or "operator-complete"
+        session = self._active_cortex_session(
+            context=context,
+            agent_id=agent,
+            session_id=clean_session_id,
+        )
+        now = time.time()
+        closed_session = dict(session)
+        closed_session.update(
+            {
+                "status": "closed",
+                "finished_at": now,
+                "updated_at": now,
+                "finish_reason": clean_reason,
+            }
+        )
+        self.cortex_sessions[clean_session_id] = self._normalize_cortex_session(closed_session)
+        self._persist_runtime_state()
+        deployment = self.publish_context_event(
+            context_id=context,
+            source_surface="cortex-governor",
+            event_type="cortex-closed",
+            summary=f"{agent} closed Cortex Governor session {clean_session_id}",
+            payload={
+                "session_id": clean_session_id,
+                "agent_id": agent,
+                "reason": clean_reason,
+                "task": str(session.get("task", "")),
+                "tick_count": int(session.get("tick_count", 0) or 0),
+                "last_decision": str(session.get("last_decision", "")),
+            },
+        )
+        return {
+            "action": "close-spiking-cortex",
+            "context_id": context,
+            "agent_id": agent,
+            "session_id": clean_session_id,
+            "status": "closed",
+            "reason": clean_reason,
+            "closed_session": self._normalize_cortex_session(closed_session),
+            "cortex_state": self.get_cortex_state(context_id=context, agent_id=agent),
+            "agent_deployment": deployment,
+        }
+
     def commit_cortical_trace(
         self,
         *,
@@ -4493,6 +4548,21 @@ def cortex_tick(
         intended_tools=intended_tools,
         mutation_intent=mutation_intent,
         confidence=confidence,
+    )
+
+
+def close_spiking_cortex(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    session_id: str,
+    reason: str = "operator-complete",
+) -> dict[str, Any]:
+    return get_backend().close_spiking_cortex(
+        context_id=context_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        reason=reason,
     )
 
 

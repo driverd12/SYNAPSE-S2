@@ -457,6 +457,16 @@ def command_cortex_tick(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_close_cortex(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.close_spiking_cortex(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        session_id=args.session_id,
+        reason=args.reason,
+    )
+
+
 def command_commit_cortex(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     text = _text_from_args(args).strip()
@@ -992,6 +1002,13 @@ def build_parser() -> argparse.ArgumentParser:
     cortex_tick.add_argument("--mutation-intent", action="store_true")
     cortex_tick.add_argument("--confidence", type=float, default=0.5)
     cortex_tick.set_defaults(func=command_cortex_tick)
+
+    close_cortex = subparsers.add_parser("close-cortex")
+    add_context(close_cortex)
+    close_cortex.add_argument("--agent-id", required=True)
+    close_cortex.add_argument("--session-id", required=True)
+    close_cortex.add_argument("--reason", default="operator-complete")
+    close_cortex.set_defaults(func=command_close_cortex)
 
     commit_cortex = subparsers.add_parser("commit-cortex")
     add_context(commit_cortex)

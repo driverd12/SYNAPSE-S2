@@ -349,6 +349,20 @@ class DashboardRuntime:
                     confidence=confidence,
                 )
             )
+        if method == "POST" and path == "/api/cortex/close":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            agent_id = mlx_backend.sanitize_agent_id(str(payload.get("agent_id", "dashboard-ui")))
+            session_id = self._text_payload(payload, "session_id", max_bytes=512)
+            reason = str(payload.get("reason", "operator-ended-dashboard-session") or "").strip()
+            return self._json_response(
+                self.backend.close_spiking_cortex(
+                    context_id=context,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    reason=reason,
+                )
+            )
         if method == "POST" and path == "/api/cortex/commit":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)

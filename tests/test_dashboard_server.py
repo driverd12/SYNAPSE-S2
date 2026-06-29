@@ -315,6 +315,23 @@ class DashboardRuntimeTests(unittest.TestCase):
             state_status, state_payload = self.decode(
                 runtime.handle("GET", "/api/cortex/state?context_id=demo&agent_id=dashboard-agent")
             )
+            close_status, close_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/cortex/close",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-agent",
+                            "session_id": enter_payload["session_id"],
+                            "reason": "unit-test-complete",
+                        }
+                    ).encode(),
+                )
+            )
+            closed_state_status, closed_state_payload = self.decode(
+                runtime.handle("GET", "/api/cortex/state?context_id=demo&agent_id=dashboard-agent")
+            )
             snapshot_status, snapshot_payload = self.decode(
                 runtime.handle("GET", "/api/snapshot?context_id=demo&limit=10")
             )
@@ -324,6 +341,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(commit_status, 200)
         self.assertEqual(promote_status, 200)
         self.assertEqual(state_status, 200)
+        self.assertEqual(close_status, 200)
+        self.assertEqual(closed_state_status, 200)
         self.assertEqual(snapshot_status, 200)
         self.assertEqual(enter_payload["action"], "enter-spiking-cortex")
         self.assertEqual(tick_payload["decision"], "verify-first")
@@ -334,9 +353,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(promote_payload["moderation_action"], "promote")
         self.assertGreaterEqual(promote_payload["trace"]["confidence"], 0.9)
         self.assertGreaterEqual(state_payload["typed_memory_counts"]["decision"], 1)
+        self.assertEqual(state_payload["active_session_count"], 1)
         self.assertIn("suggested_next_move", state_payload)
         self.assertIn("capture_queue", state_payload)
         self.assertEqual(len(state_payload["capture_queue"]), 0)
+        self.assertEqual(close_payload["action"], "close-spiking-cortex")
+        self.assertEqual(close_payload["status"], "closed")
+        self.assertEqual(close_payload["cortex_state"]["active_session_count"], 0)
+        self.assertEqual(closed_state_payload["active_session_count"], 0)
         self.assertIn("cortex_state", snapshot_payload)
         self.assertGreaterEqual(
             snapshot_payload["cortex_state"]["typed_memory_counts"]["decision"],
@@ -480,6 +504,11 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("wizardPanel", index)
         self.assertIn("wizardChecklist", index)
         self.assertIn("operatorLoopPanel", index)
+        self.assertIn("operatorActionBanner", index)
+        self.assertIn("operatorActionStatus", index)
+        self.assertIn("operatorActionTitle", index)
+        self.assertIn("Start governed work before risky actions", index)
+        self.assertIn("Tick Action", index)
         self.assertIn("Start Work", index)
         self.assertIn("Wrap Session", index)
         self.assertIn("Doctor / Repair", index)
@@ -536,6 +565,15 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("neuralMathPanel", index)
         self.assertIn("cortexPanel", index)
         self.assertIn("Cortex Governor", index)
+        self.assertIn("cortexSessionCallout", index)
+        self.assertIn("Cortex is idle, not broken", index)
+        self.assertIn("Start Cortex Session", index)
+        self.assertIn("cortexCloseButton", index)
+        self.assertIn("cortexCloseText", index)
+        self.assertIn("No Session", index)
+        self.assertIn("Commit / Wrap / End", index)
+        self.assertNotIn("no active session", index)
+        self.assertNotIn("Enter + hydrate", index)
         self.assertIn("cortexIntendedFiles", index)
         self.assertIn("cortexIntendedTools", index)
         self.assertIn("cortexNextMove", index)
@@ -556,10 +594,17 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("graphNodeTitle", app)
         self.assertIn("relationship.source_label", app)
         self.assertIn("renderCortexState", app)
+        self.assertIn("renderOperatorActionBanner", app)
+        self.assertIn("operatorActionBanner", app)
+        self.assertIn("Cortex is idle, which is normal before work starts", app)
+        self.assertIn("Start Cortex Session before risky work", app)
+        self.assertIn("End Session", app)
         self.assertIn("splitIntentList", app)
         self.assertIn("renderCortexCaptureQueue", app)
+        self.assertIn("closeCortexSession", app)
         self.assertIn("/api/cortex/enter", app)
         self.assertIn("/api/cortex/tick", app)
+        self.assertIn("/api/cortex/close", app)
         self.assertIn("/api/cortex/commit", app)
         self.assertIn("/api/cortex/moderate", app)
         self.assertIn("data-cortex-action", app)
@@ -606,6 +651,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         for selector in (
             "#wizardToggleButton",
             "#modelUri",
+            "#operatorActionBanner",
+            "#operatorLoopPanel",
             "#mondayReadinessButton",
             "#contextInput",
             "#coreActionGroup",
@@ -671,6 +718,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("wizard-arrow", styles)
         self.assertIn("wizard-highlight-target", styles)
         self.assertIn("operator-loop-panel", styles)
+        self.assertIn("operator-action-banner", styles)
+        self.assertIn("operator-run-order", styles)
+        self.assertIn("operator-action-shortcuts", styles)
         self.assertIn("receipt-card", styles)
         self.assertIn("quality-badge", styles)
         self.assertIn("--accent-gradient", styles)
@@ -681,6 +731,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("neural-math-panel", styles)
         self.assertIn("neural-inspector-toggle", styles)
         self.assertIn("cortex-panel", styles)
+        self.assertIn("cortex-header-actions", styles)
+        self.assertIn("compact-action", styles)
+        self.assertIn("cortex-session-callout", styles)
         self.assertIn("cortex-memory-actions", styles)
         self.assertNotIn("board-demo", index)
         self.assertNotIn("board-demo", app)

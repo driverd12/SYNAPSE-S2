@@ -539,6 +539,7 @@ class McpServerTests(unittest.TestCase):
     def test_cortex_governor_tools_enter_tick_commit_and_state(self):
         self.assertTrue(hasattr(mcp_server, "enter_spiking_cortex"))
         self.assertTrue(hasattr(mcp_server, "tick_spiking_cortex"))
+        self.assertTrue(hasattr(mcp_server, "close_spiking_cortex"))
         self.assertTrue(hasattr(mcp_server, "commit_spiking_cortical_trace"))
         self.assertTrue(hasattr(mcp_server, "moderate_spiking_cortical_trace"))
         self.assertTrue(hasattr(mcp_server, "get_spiking_cortex_state"))
@@ -589,6 +590,20 @@ class McpServerTests(unittest.TestCase):
                 context_id="demo",
             )
         )
+        closed = json.loads(
+            mcp_server.close_spiking_cortex(
+                agent_id="mcp-agent",
+                context_id="demo",
+                session_id=entered["session_id"],
+                reason="mcp-test-complete",
+            )
+        )
+        closed_state = json.loads(
+            mcp_server.get_spiking_cortex_state(
+                agent_id="mcp-agent",
+                context_id="demo",
+            )
+        )
 
         self.assertEqual(entered["action"], "enter-spiking-cortex")
         self.assertEqual(tick["decision"], "verify-first")
@@ -598,6 +613,10 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(moderated["moderation_action"], "promote")
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
         self.assertIn("cognitive_governance", state["policy"])
+        self.assertEqual(closed["action"], "close-spiking-cortex")
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(closed["cortex_state"]["active_session_count"], 0)
+        self.assertEqual(closed_state["active_session_count"], 0)
 
     def test_mcp_cortex_prune_requires_explicit_confirmation(self):
         entered = json.loads(

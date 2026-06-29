@@ -1072,6 +1072,46 @@ def tick_spiking_cortex(
 
 @mcp.tool(
     annotations={
+        "title": "Close SYNAPSE-S2 Cortex Governor",
+        "readOnlyHint": False,
+    }
+)
+def close_spiking_cortex(
+    agent_id: str,
+    session_id: str,
+    context_id: str = "default",
+    reason: str = "operator-complete",
+) -> str:
+    """End an active governed agent session after verified traces or handoff are captured."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            raise ValueError("session_id must not be empty")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.close_spiking_cortex(
+            context_id=context,
+            agent_id=agent,
+            session_id=clean_session_id,
+            reason=str(reason or "operator-complete"),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid cortex close for context_id=%s agent_id=%s: %s",
+            context,
+            agent,
+            exc,
+        )
+        return json.dumps({"error": f"invalid cortex close: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("cortex close failed for context_id=%s agent_id=%s", context, agent)
+        return json.dumps({"error": f"cortex close failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
         "title": "Commit SYNAPSE-S2 Cortical Trace",
         "readOnlyHint": False,
     }
