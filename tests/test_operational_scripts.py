@@ -64,6 +64,28 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertIn("mlx-neural", script)
         self.assertIn("Qwen3-Embedding-0.6B-4bit-DWQ", script)
 
+    def test_operator_readiness_certifier_covers_required_trust_gates(self):
+        script_path = ROOT / "scripts" / "operator_readiness_certify.py"
+
+        self.assertTrue(script_path.exists(), "operator readiness certifier must exist")
+        script = script_path.read_text(encoding="utf-8")
+        for token in (
+            "client_config",
+            "mcp_connect",
+            "neural_embedding",
+            "doctor",
+            "start_work",
+            "memory_write",
+            "recall",
+            "app_preview",
+            "wrap_session",
+            "dashboard",
+            "evidence_packs",
+        ):
+            self.assertIn(token, script)
+        self.assertIn("mlx-neural", script)
+        self.assertIn("writes_memory=false", script)
+
 
 if __name__ == "__main__":
     unittest.main()

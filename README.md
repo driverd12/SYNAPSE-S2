@@ -90,7 +90,18 @@ The launcher enters through `mcp_client_wrapper.py`, which hydrates SYNAPSE-S2 a
   --require-resource-envelope
 ```
 
-For the full morning readiness path, run:
+For the Monday operator-trust certification path, run:
+
+```bash
+.venv/bin/python scripts/operator_readiness_certify.py \
+  --context default \
+  --agent-id codex-desktop \
+  --embedding-provider mlx-neural
+```
+
+This writes a single evidence pack under `.synapse_s2/evidence_packs/` proving client config, MCP launcher connection, native MLX neural embeddings, Doctor, Start Work, real memory write and recall, App Connect no-write preview, Wrap Session persistence, and dashboard render smoke. The command exits non-zero unless every required proof is ready.
+
+For the full install/prep path, run:
 
 ```bash
 scripts/prep_tomorrow.sh
@@ -103,6 +114,7 @@ scripts/prep_tomorrow.sh --verify-only
 ```
 
 The detailed operator runbook is in `docs/TOMORROW_RUNBOOK.md`.
+The single-pack readiness certification runbook is in `docs/OPERATOR_READINESS_CERTIFICATION.md`.
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
 
@@ -445,6 +457,15 @@ For non-interactive readiness checks:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default
+```
+
+For a complete operator-trust evidence pack:
+
+```bash
+.venv/bin/python scripts/operator_readiness_certify.py \
+  --context default \
+  --agent-id codex-desktop \
+  --embedding-provider mlx-neural
 ```
 
 ## **System Architecture**

@@ -2,14 +2,30 @@
 
 This is the fast operator path for using SYNAPSE-S2 from this Mac tomorrow.
 
-## One-command preflight
+## Monday operator-trust certification
+
+Run this first when the question is "can we trust SYNAPSE-S2 for real work right now?"
+
+```bash
+cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture"
+.venv/bin/python scripts/operator_readiness_certify.py \
+  --context default \
+  --agent-id codex-desktop \
+  --embedding-provider mlx-neural
+```
+
+The certifier writes one evidence pack under `.synapse_s2/evidence_packs/` and exits non-zero unless client config, MCP connection, native neural embedding, Doctor, Start Work, real memory write and recall, App Connect no-write preview, Wrap Session persistence, and dashboard smoke are all ready. Start with this pack before showing coworkers the system.
+
+The detailed certification runbook is `docs/OPERATOR_READINESS_CERTIFICATION.md`.
+
+## One-command install and preflight
 
 ```bash
 cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture"
 scripts/prep_tomorrow.sh
 ```
 
-The script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, writes a native certification evidence payload, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
+The prep script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, writes a native certification evidence payload, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
 
 For an audit pass that avoids installs, memory writes, inbox processing, MCP wrapper launches, dashboard smoke, maintenance, and backup writes:
 

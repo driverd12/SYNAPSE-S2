@@ -81,4 +81,5 @@ The current bar for calling a local build presentable is:
 21. The Daily Operator Trust Loop can produce a Start Work brief, Context Health score, Doctor/Repair report, Memory Hygiene queue, Wrap Session preview/commit receipt, and matching CLI receipts.
 22. Goal Ledger traces can be created, updated, listed, surfaced in Cortex state, and included in the Start Work morning brief across CLI, MCP, and dashboard surfaces.
 23. App Connect preview returns a quality badge and no-write receipt before a snapshot is committed; blocked or low-signal previews direct the operator to selected-text capture.
-23. A recalled item can be pinned into Cortex as `operator-confirmed` evidence with a receipt.
+24. A recalled item can be pinned into Cortex as `operator-confirmed` evidence with a receipt.
+25. `scripts/operator_readiness_certify.py` produces one evidence pack proving client config, MCP connect, native neural embedding, Doctor, Start Work, memory write, recall, App Connect no-write preview, Wrap Session persistence, and dashboard smoke before claiming SYNAPSE-S2 is operator-ready.

@@ -63,6 +63,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Seven-phase consolidation lifecycle | Implemented and tested | `CONSOLIDATION_PHASES`, deep-sleep `phases`, `tests/test_backend.py` |
 | MCP Inspector validation path | Implemented | `README.md`, `docs/TOMORROW_RUNBOOK.md`, `scripts/prep_tomorrow.sh` |
 | Readiness preflight | Implemented | `synapse_cli.py preflight`, `scripts/prep_tomorrow.sh`, `tests/test_cli.py` |
+| Single-pack operator readiness certification | Implemented | `scripts/operator_readiness_certify.py`, `docs/OPERATOR_READINESS_CERTIFICATION.md`, `tests/test_operator_readiness_certifier.py`; proves client config, MCP connect, native neural embedding, Doctor, Start Work, memory write, recall, App Connect no-write preview, Wrap Session persistence, and dashboard smoke in one evidence pack |
 
 ## Operator-Visible Controls
 
