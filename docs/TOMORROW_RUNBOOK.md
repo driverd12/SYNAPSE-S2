@@ -66,6 +66,63 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context default`. |
 | `query_returned_context` | Recall did not return a registered context. | Seed or remember a matching trace, then query again. |
 
+## Daily Operator Trust Loop
+
+Use this flow at the beginning and end of each real working block. It is the same loop exposed in the dashboard's Daily Operator Trust Loop panel.
+
+Start Work:
+
+```bash
+.venv/bin/python synapse_cli.py --json start-work \
+  --context default \
+  --agent-id codex-desktop \
+  --prompt "Prepare SYNAPSE-S2 for today's operator work."
+```
+
+This returns a morning brief, current health score, memory quality score, recommended recipes, and an operation receipt. If the health score is degraded or blocked, run the next two commands before trusting recall.
+
+Doctor and repair report:
+
+```bash
+.venv/bin/python synapse_cli.py --json doctor \
+  --context default \
+  --include-apps \
+  --repair-plan
+```
+
+Memory Hygiene queue:
+
+```bash
+.venv/bin/python synapse_cli.py --json memory-hygiene \
+  --context default \
+  --limit 25
+```
+
+Context Health:
+
+```bash
+.venv/bin/python synapse_cli.py --json context-health --context default
+```
+
+Wrap Session preview, then commit only if the receipt is accurate:
+
+```bash
+.venv/bin/python synapse_cli.py --json wrap-session \
+  --context default \
+  --agent-id codex-desktop \
+  --source-tag codex-session \
+  --text "Summarize factual decisions, implementation details, validation evidence, blockers, and follow-up constraints here." \
+  --preview
+.venv/bin/python synapse_cli.py --json wrap-session \
+  --context default \
+  --agent-id codex-desktop \
+  --source-tag codex-session \
+  --text "Same final factual summary after preview review." \
+  --confirm
+```
+
+The dashboard adds the same receipts visually: Start Work shows what to do next, Doctor explains what is healthy or blocked, Memory Hygiene queues stale/duplicate/low-confidence work, App Preview proves capture quality before writing memory, Recall Pin turns a recalled item into operator-confirmed evidence, and Wrap Session captures a clean handoff.
+
 ## Operator commands
 
 Status:
@@ -164,13 +221,15 @@ App Connect:
   --speaker operator \
   --confirm
 .venv/bin/python synapse_cli.py --json app-connections
+.venv/bin/python synapse_cli.py --json app-snapshot-preview \
+  --connection-id "<connection-id-from-app-connections>"
 .venv/bin/python synapse_cli.py --json app-snapshot \
   --connection-id "<connection-id-from-app-connections>" \
   --confirm
 scripts/capture_frontmost_selection.sh default frontmost-selection operator
 ```
 
-Use App Connect when an already-running local app needs to contribute context. `app-list` detects attachable local apps through a fast filtered process-list scan, `app-connect` records an explicit local attachment, `app-snapshot` captures a redacted Accessibility snapshot into memory, and the frontmost-selection helper captures intentionally selected text once while restoring the prior clipboard. If macOS asks for Accessibility permission, approve Terminal/Codex for this local capture workflow and rerun the command.
+Use App Connect when an already-running local app needs to contribute context. `app-list` detects attachable local apps through a fast filtered process-list scan, `app-connect` records an explicit local attachment, `app-snapshot-preview` reports capability/quality badges and a no-write receipt, `app-snapshot` captures a confirmed redacted Accessibility snapshot into memory, and the frontmost-selection helper captures intentionally selected text once while restoring the prior clipboard. If the preview is blocked or low-signal, select the relevant app text and use `scripts/capture_frontmost_selection.sh`. If macOS asks for Accessibility permission, approve Terminal/Codex for this local capture workflow and rerun the command.
 
 Transcript file deltas:
 

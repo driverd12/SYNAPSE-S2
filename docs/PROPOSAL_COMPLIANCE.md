@@ -37,6 +37,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Agent/operator conversation capture into event memory | Implemented | `capture_spiking_conversation`, `synapse_cli.py capture-session`, `/api/capture-conversation`, GUI capture form |
 | Always-on local session capture sidecar | Implemented as opt-in capture inbox | `capture_daemon.py`, `drop_spiking_capture_inbox`, confirmed `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, `/api/capture-inbox`, dashboard capture preflight tokens, `scripts/install_capture_daemon.sh` |
 | Local app attachment and transcript capture lane | Implemented | `transcript_capture.py`, CLI `app-list` / `app-connect` / `app-snapshot` / `capture-clipboard` / `transcript-source-*`, MCP App Connect and transcript tools, dashboard App Connect preflight-token panel, `scripts/capture_frontmost_selection.sh`, tests |
+| App Connect preview receipts before memory writes | Implemented | `app-snapshot-preview`, dashboard `/api/app-snapshot-preview`, quality/capability badges, no-write blocked receipts, `tests/test_transcript_capture.py`, `tests/test_dashboard_server.py` |
 | Operator graph pruning for bad or sensitive graph data | Implemented | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, `/api/prune-memory`, GUI graph prune controls |
 | Hardened capture, pruning, and high-confidence memory safety envelope | Implemented | `redaction.py`, pre-write capture inbox redaction, private local file modes, symlink rejection, direct capture/context-bus response redaction, MCP `confirm=true` pruning and capture-inbox processing, CLI `--confirm`, dashboard confirmation/preflight tokens, Cortex prune confirmation, `test-validated` evidence enforcement, and tests |
 | Loopback-only dashboard default | Implemented | `dashboard_server.py` refuses non-loopback binds unless `SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD=true`; static/API responses include browser security headers |
@@ -50,6 +51,8 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Recall does not fabricate historical tags when memory is empty | Implemented | no-memory queries return transparent raw activation summaries instead of synthetic `context::neuron-*` memory labels |
 | Real-time agent cognitive governance loop | Implemented | Cortex Governor backend, scoped file/tool tick intent, CLI `enter-cortex` / `cortex-tick` / `commit-cortex` / `moderate-cortex` / `cortex-state`, MCP tools, dashboard panel with promote/demote/prune controls, hydration state, and tests |
 | Operator-visible local control surface | Implemented | `dashboard_server.py`, `web/index.html`, `web/app.js`, `web/styles.css`, `scripts/smoke_dashboard.py`, `tests/test_dashboard_server.py` |
+| Daily operator trust workflow | Implemented | Start Work, Context Health, Doctor/Repair, Memory Hygiene, Wrap Session, operation receipts, dashboard recipes, CLI `start-work` / `context-health` / `doctor --repair-plan` / `memory-hygiene` / `wrap-session`, and tests |
+| Recall result promotion into operator-confirmed evidence | Implemented | Dashboard Recall Pin `/api/pin-memory`, Cortex `operator-confirmed` trace commits, receipt rendering, and dashboard tests |
 | Quick-pruning mode every 5 minutes | Implemented and tested | `quick_pruning_interval_seconds=300.0`, auto-prune in `query()` / `register_trace()`, `tests/test_backend.py` |
 | Quick-pruning completes under 60 ms budget as measured locally | Implemented as runtime check | `run_quick_pruning()` returns `within_60ms_budget`; unit test asserts the local path stays under budget |
 | Quick-pruning is non-LLM GPU/array maintenance | Implemented | `run_quick_pruning()` decays MLX arrays and resets transient membrane state |
@@ -71,9 +74,15 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Capture real session conversation notes | `capture_spiking_conversation`, `synapse_cli.py capture-session`, dashboard Conversation capture |
 | Drop and process sidecar session payloads | `drop_spiking_capture_inbox`, `get_spiking_capture_inbox_status`, confirmed `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, dashboard Magic Capture preflight |
 | Attach a running local app and capture a redacted snapshot or selected text | `list_spiking_running_apps`, `connect_spiking_app`, `capture_spiking_app_snapshot`, `capture_spiking_clipboard`, CLI `app-list` / `app-connect` / `app-snapshot` / `capture-clipboard`, dashboard App Connect preflight, `scripts/capture_frontmost_selection.sh` |
+| Preview App Connect capture quality before writing memory | CLI `app-snapshot-preview`, dashboard App Preview quality badge, no-write receipt, and selected-text fallback guidance |
 | Register local transcript/log deltas | `register_spiking_transcript_source`, `list_spiking_transcript_sources`, `poll_spiking_transcript_sources`, CLI `transcript-source-*` |
 | Query vector or text recall | `query_spiking_attention`, `query_spiking_attention_text`, CLI equivalents |
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
+| Start the daily work loop | `synapse_cli.py start-work`, dashboard Start Work brief, health score, recipes, and receipt |
+| Inspect context health and memory quality | `synapse_cli.py context-health`, dashboard Context Health badge |
+| Run a repair-oriented doctor report | `synapse_cli.py doctor --repair-plan`, dashboard Doctor/Repair |
+| Review memory hygiene work | `synapse_cli.py memory-hygiene`, dashboard Memory Hygiene queue and action receipts |
+| Preview and commit a session handoff | `synapse_cli.py wrap-session --preview/--confirm`, dashboard Wrap Session preview/commit receipts |
 | List/export/backup persisted memory | MCP and CLI memory commands |
 | Inspect event relationships | `list_spiking_memory_graph`, `synapse_cli.py graph` |
 | Hand-prune nodes, edges, deployment events, temporal edges, associative edges, or governed Cortex traces | `prune_spiking_memory`, `moderate_spiking_cortical_trace(confirm=true)`, `synapse_cli.py prune-memory --confirm`, `synapse_cli.py moderate-cortex --confirm`, dashboard Graph Prune and Cortex Governor controls |
@@ -83,6 +92,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
 | Certify native runtime execution | `certify_spiking_runtime`, `synapse_cli.py certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope`, dashboard Native Certify |
 | Use a local dashboard | `dashboard_server.py`, `scripts/smoke_dashboard.py` |
+| Pin a recalled result as current-task evidence | dashboard Recall Pin `/api/pin-memory` with `operator-confirmed` receipt |
 | Manual quick prune | `synapse_cli.py quick-prune` |
 | Manual or forced idle deep sleep | `trigger_sleep_consolidation`, `trigger_idle_maintenance`, `synapse_cli.py sleep`, `synapse_cli.py idle-maintenance --force-deep-sleep` |
 

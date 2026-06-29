@@ -2,7 +2,45 @@
 
 SYNAPSE-S2 (Synaptic Plasticity & Spiking Encoding via $S^2$) is an Apple Silicon-optimized Model Context Protocol (MCP) server. It provides local large language models (LLMs) with high-efficiency, associative memory capabilities using a persistent, biologically grounded Spiking Neural Network (SNN) substrate.
 
-Unlike traditional vector similarity retrieval methods, SYNAPSE-S2 runs natively on M-series GPUs, completely eliminating the $O(N^2)$ memory wall of traditional self-attention by implementing the Spiking STDP Transformer ($S^2TDPT$) mathematical framework. It operates as a multiplication-free, addition-only system that embeds query-key correlations directly in synaptic weights using Spike-Timing-Dependent Plasticity (STDP).
+Traditional transformer self-attention forms a dense token-token score matrix for every layer and attention head, so the attention logits and probabilities scale as $O(N^2)$ in sequence length $N$. SYNAPSE-S2 does not materialize that per-request all-pairs attention matrix during recall. It projects local embeddings into sparse spike sets, runs bounded recurrent Leaky Integrate-and-Fire (LIF) dynamics, and stores learned co-activation structure in durable sparse spike, surface-term, relationship, and synaptic indexes. The practical scaling shift is from dense request-time self-attention memory to sparse spike propagation plus indexed local memory lookup. SYNAPSE-S2 still has a configurable topology resource envelope, so the precise claim is that it avoids the transformer attention-matrix memory wall rather than making every internal structure sub-quadratic in every parameter.
+
+### Math Note: What Replaces the $O(N^2)$ Attention Wall
+
+In standard scaled dot-product self-attention, an input sequence $X \in \mathbb{R}^{N \times d}$ is projected into query, key, and value matrices:
+
+$$
+Q = XW_Q,\quad K = XW_K,\quad V = XW_V
+$$
+
+Each token compares against every other token:
+
+$$
+S = \frac{QK^\top}{\sqrt{d_k}},\quad A = \operatorname{softmax}(S),\quad Y = AV
+$$
+
+Because $S$ and $A$ are both $N \times N$, their memory footprint is $\Theta(N^2)$ per head before counting values, activations, caches, or batching. Doubling the usable context length roughly quadruples the attention-matrix storage. That is the self-attention memory wall.
+
+SYNAPSE-S2 uses a different runtime object. Text is embedded locally, converted to sparse sensory spikes, and propagated through a recurrent substrate:
+
+$$
+z = \operatorname{embed}(\text{text}),\quad s_0 = \operatorname{TopK}(\operatorname{zscore}(z), k)
+$$
+
+$$
+u_{t+1} = \beta u_t + W_{\text{syn}}s_t + W_{\text{lat}}s_t - V_{\text{thr}}s_t,\quad
+s_{t+1} = H(u_{t+1} - V_{\text{thr}})
+$$
+
+Temporal co-activation changes durable relationship strength through STDP:
+
+$$
+\Delta w_{ij} =
+\eta_+ s_i(t-\Delta t_{\text{pre}})s_j(t)
+-
+\eta_- s_i(t)s_j(t-\Delta t_{\text{post}})
+$$
+
+At inference time, active spike operations are dominated by additions, threshold comparisons, decay, and sparse/indexed retrieval rather than dense query-key matrix multiplication over all token pairs. The implementation still uses MLX arrays and scalar multiplications for decay, weighting, and setup where appropriate; "multiplication-free" should be read as the neuromorphic recall path avoiding dense per-token dot-product attention, not as a claim that no numeric multiplication exists anywhere in the codebase.
 
 ## **Operational Quickstart**
 
@@ -58,6 +96,28 @@ scripts/prep_tomorrow.sh --verify-only
 The detailed operator runbook is in `docs/TOMORROW_RUNBOOK.md`.
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
+
+### Daily Operator Trust Loop
+
+The loopback dashboard now has a single operator workflow for first-use and handoff confidence: Start Work, Context Health, Doctor/Repair, Memory Hygiene, App Preview receipts, Recall Pin, and Wrap Session. The same loop is available from the CLI:
+
+```bash
+.venv/bin/python synapse_cli.py --json start-work \
+  --context default \
+  --agent-id codex-desktop \
+  --prompt "Prepare SYNAPSE-S2 for today's operator work."
+.venv/bin/python synapse_cli.py --json context-health --context default
+.venv/bin/python synapse_cli.py --json memory-hygiene --context default --limit 25
+.venv/bin/python synapse_cli.py --json doctor --context default --include-apps --repair-plan
+.venv/bin/python synapse_cli.py --json wrap-session \
+  --context default \
+  --agent-id codex-desktop \
+  --source-tag codex-session \
+  --text "Session decisions, validation evidence, and follow-up constraints." \
+  --preview
+```
+
+Use `wrap-session --confirm` only after the preview receipt matches the facts you intend to preserve.
 
 ### Hardened Local Operating Contract
 
@@ -197,13 +257,15 @@ App Connect gives operators a local attach path for already-running apps. It det
   --speaker operator \
   --confirm
 .venv/bin/python synapse_cli.py --json app-connections
+.venv/bin/python synapse_cli.py --json app-snapshot-preview \
+  --connection-id "<connection-id-from-app-connections>"
 .venv/bin/python synapse_cli.py --json app-snapshot \
   --connection-id "<connection-id-from-app-connections>" \
   --confirm
 scripts/capture_frontmost_selection.sh default frontmost-selection operator
 ```
 
-If a target application blocks Accessibility introspection, select the relevant visible text in that app and run the frontmost-selection helper. The helper copies the selection once, calls `capture-clipboard`, restores the prior clipboard, and exits.
+Preview before snapshot is the trust step: it reports a quality badge, signal character count, line count, redaction count, and recommended next action without writing memory. If the badge is blocked or low-signal, select the relevant visible text in that app and run the frontmost-selection helper. The helper copies the selection once, calls `capture-clipboard`, restores the prior clipboard, and exits.
 
 Local transcript files can also be registered as bounded delta sources for clients or tools that write their own logs:
 
@@ -341,7 +403,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, context toggles, resource envelope profiling, native certification, durable trace capture, conversation capture, tokenized App Connect local app attachment/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect quality preview plus tokenized snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit plus promote/demote/prune controls, Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default
@@ -358,89 +420,79 @@ For non-interactive readiness checks:
 
 The plugin acts as a middleware daemon communicating with local editor interfaces and LLM desktop wrappers via JSON-RPC 2.0 over standard input/output (stdio) channels.
 
-```
-+-----------------------------------------------------------+
-|                      LOCAL LLM CLIENT                     |
-|         (Codex Client / Claude Desktop / Claude Code)     |
-+-----------------------------+-----------------------------+
-                              |
-                              | Invokes Tool Calls (JSON-RPC)
-                              v
-+-----------------------------------------------------------+
-|                FASTMCP MODEL CONTEXT LAYER                |
-|             (Native Background Process Daemon)            |
-+-----------------------------+-----------------------------+
-                              |
-                              | Projects prompt embeddings
-                              | to sparse sensory spikes
-                              v
-+-----------------------------------------------------------+
-|              SYNAPSE-S2 SPIKING SUBSTRATE                 |
-|        (Metal-Accelerated Recurrent mlx-snn Model)        |
-+-----------------------------------------------------------+
+```mermaid
+flowchart TB
+  Client["Local LLM Client<br/>Codex / Claude Desktop / Claude Code"]
+  MCP["FastMCP Model Context Layer<br/>stdio JSON-RPC + client session bridge"]
+  Embedding["Local Embedding Provider<br/>MLX neural / semantic hash / Python callable"]
+  Cortex["Cortex Governor<br/>policy, tick, typed evidence"]
+  Memory["SYNAPSE-S2 Spiking Substrate<br/>MLX/mlxsnn recurrent LIF + STDP"]
+  Store["Durable Memory Store<br/>SQLite entries, spikes, surface terms, relationships"]
+  Dashboard["Loopback Dashboard<br/>Operator Trust Loop + receipts"]
+
+  Client -->|"tool calls"| MCP
+  MCP --> Embedding
+  Embedding -->|"sparse sensory spikes"| Memory
+  MCP --> Cortex
+  Cortex -->|"governed traces"| Store
+  Memory -->|"co-activation evidence"| Store
+  Dashboard -->|"confirmed local actions"| MCP
+  Dashboard -->|"status, receipts, graph"| Store
 ```
 
 ## **Hierarchical Neural Network Topology**
 
 The SNN is organized into a multi-tiered hierarchical network designed to route, associate, and gate conceptual activations dynamically.
 
-```
-            
-                             |
-                             v
-+-----------------------------------------------------------+
-| LAYER 1: Sensory Population (5,000 Neurons)               |
-| (Translates dense coordinates to sparse z-score spike top-k) |
-|  o   o   o   x   o   o   x   o   x   o   o   o   x   o   o    | <-- Active Spikes (x)
-+----------------------------+------------------------------+
-                             |
-                             | Synaptic Projection (W_syn)
-                             v
-+-----------------------------------------------------------+
-| LAYER 2: Associative Fabric (150,000 Neurons)             |
-| (Recurrent synaptic loops modified dynamically via STDP)  |
-|      /--- o <=======> o <-------\                         | <-- Plastic Synapses
-|     |     ^           ^         |                         |
-|     v     |           |         v                         |
-|     o <---+           +-------> o                         |
-+----------------------------+------------------------------+
-                             |
-                             | Lateral Spreading Activation
-                             v
-+-----------------------------------------------------------+
-| LAYER 3: Categorical & Concept Groups (25,000 Neurons)    |
-| (Prefrontal cortex-inspired contextual gating maps)       |
-|   [Concept A]                 [Concept C]     |
-+----------------------------+------------------------------+
-                             |
-                             | High-salience Context Injection
-                             v
-+-----------------------------------------------------------+
-|            LLM REASONING CONTEXT FILTER                   |
-+-----------------------------------------------------------+
+```mermaid
+flowchart TB
+  Input["Input text / selected app text / session note"]
+  Embed["Local embedding vector z"]
+  TopK["Layer 1: sensory spike coding<br/>s0 = TopK(z-score(z), k)"]
+  LIF["Layer 2: recurrent LIF substrate<br/>u(t+1)=beta u(t)+Wsyn s(t)+Wlat s(t)-Vthr s(t)"]
+  STDP["STDP plasticity<br/>strengthen or depress temporally aligned co-activations"]
+  Graph["Layer 3: durable concept graph<br/>memory_spikes + memory_surface_terms + relationships"]
+  Recall["High-salience context injected into the LLM"]
+
+  Input --> Embed --> TopK --> LIF --> STDP --> Graph --> Recall
+  Graph -. "indexed recall" .-> LIF
 ```
 
 ## **Core Mathematical Formulation**
 
-### **1\. Dimension-Independent Population Coding**
+### **1. Dimension-Independent Population Coding**
 
-Dense embeddings $E$ are mapped into discrete binary spike states $S\_i \\in \\{0, 1\\}$ using coordinate-wise standardized z-scores to ensure consistent representation across varying dimensionality boundaries :
+Dense embeddings $E$ are mapped into binary spike states $S_i \in \{0, 1\}$ using coordinate-wise standardized z-scores. This keeps the sensory coding stable even when the upstream embedding provider changes dimensionality:
 
-$$Z\_i \= \\frac{E\_i \- \\mu\_E}{\\sigma\_E}$$  
-Neurons corresponding to indices within the top-$k$ percentile fire a spike ($S\_i \= 1$), while the remainder stay silent ($S\_i \= 0$).
+$$
+Z_i = \frac{E_i - \mu_E}{\sigma_E}
+$$
 
-### **2\. Leaky Integrate-and-Fire (LIF) Dynamics**
+Neurons corresponding to the top-$k$ standardized coordinates fire ($S_i = 1$); the remainder stay silent ($S_i = 0$).
 
-Individual neuron potentials are processed dynamically using discrete-time updates :
+### **2. Leaky Integrate-and-Fire (LIF) Dynamics**
 
-$$U\[t+1\] \= \\beta \\cdot U\[t\] \+ X\[t+1\] \- S\[t\] \\cdot V\_{\\text{thr}}$$  
-where $U$ is the membrane potential, $X$ is the input synaptic current, $\\beta \\in (0,1)$ is the decay factor, and $V\_{\\text{thr}}$ is the constant spike threshold. Updates are strictly immutable to compile efficiently on Apple Silicon GPUs.
+Individual neuron potentials are processed with bounded discrete-time updates:
 
-### **3\. Asymmetric Temporal STDP**
+$$
+U[t+1] = \beta U[t] + X[t+1] - S[t]V_{\text{thr}}
+$$
 
-Rather than storing dense attention matrices, correlation values are updated inside the associative fabric according to biological temporal differences ($\\Delta t$) :
+Here $U$ is membrane potential, $X$ is input synaptic current, $\beta \in (0,1)$ is decay, and $V_{\text{thr}}$ is the spike threshold. Updates are written as new MLX arrays so the recurrent step can compile cleanly on Apple Silicon.
 
-$$\\Delta w \= \\begin{cases} A\_+ \\exp\\left(-\\frac{\\Delta t}{\\tau\_+}\\right) & \\text{if } \\Delta t \> 0 \\\\ \-A\_- \\exp\\left(\\frac{\\Delta t}{\\tau\_-}\\right) & \\text{if } \\Delta t \\le 0 \\end{cases}$$
+### **3. Asymmetric Temporal STDP**
+
+Rather than storing dense request-time attention matrices, temporal correlation is consolidated into synaptic and graph weights. A pre-before-post spike pair potentiates the connection; a post-before-pre pair depresses it:
+
+$$
+\Delta w_{ij} =
+\begin{cases}
+A_+\exp\left(-\frac{\Delta t}{\tau_+}\right) & \text{if } \Delta t > 0 \\
+-A_-\exp\left(\frac{\Delta t}{\tau_-}\right) & \text{if } \Delta t \le 0
+\end{cases}
+$$
+
+This is the mathematical difference from vector similarity retrieval. Vector search compares a query vector against stored vectors at query time; STDP turns repeated temporal co-activation into durable structure, so future recall can follow learned activation paths instead of recomputing every pairwise token-token relation.
 
 ## **Memory Consolidation and Pruning Lifecycle**
 
@@ -448,13 +500,13 @@ The SNN maintains long-term structural efficiency and manages Apple Silicon VRAM
 
 | Phase | System Process | Core Mathematical Operation | Downstream Cognitive Function |
 | :---- | :---- | :---- | :---- |
-| Phase 1 | Connection Weight Decay | $W\_{ij} \\leftarrow W\_{ij} \\cdot \\gamma\_{\\text{decay}}$ | Lowers weight values for weak connections |
-| Phase 2 | Synaptic Clustering | Density-based connection profiling | Identifies overlapping spiking patterns |
-| Phase 3 | Semantic Merging | Mathematical node pooling | Consolidates redundant memory paths |
-| Phase 4 | Threshold Rescoring | Adaptive adjustments to $V\_{\\text{thr}}$ | Keeps firing rates in healthy, balanced ranges |
-| Phase 5 | Trace Promotion | Long-term Synaptic Facilitation | Moves active traces to persistent storage |
-| Phase 6 | Relationship Extraction | Hebbian Distillation | Builds structured semantic connection graphs |
-| Phase 7 | Neurogenesis | State re-initialization | Frees up inactive nodes for new memory traces |
+| Phase 1 | Connection Weight Decay | $W_{ij} \leftarrow \gamma_{\text{decay}} W_{ij}$ where $0 < \gamma_{\text{decay}} < 1$ | Lowers weight values for weak connections |
+| Phase 2 | Synaptic Clustering | $C_m = \{i \mid \operatorname{density}(i) \ge \tau_c\}$ | Identifies overlapping spiking patterns |
+| Phase 3 | Semantic Merging | Merge $m_i,m_j$ when $\operatorname{sim}(m_i,m_j) \ge \tau_{\text{merge}}$ | Consolidates redundant memory paths |
+| Phase 4 | Threshold Rescoring | $V_{\text{thr}} \leftarrow V_{\text{thr}} + \alpha(r_{\text{observed}} - r_{\text{target}})$ | Keeps firing rates in healthy, balanced ranges |
+| Phase 5 | Trace Promotion | $p_i \leftarrow p_i + \mathbf{1}[\operatorname{activation}(i) \ge \tau_{\text{promote}}]$ | Moves active traces to persistent storage |
+| Phase 6 | Relationship Extraction | $\operatorname{edge}(i,j) \leftarrow \operatorname{HebbianEvidence}(i,j) + \operatorname{STDPEvidence}(i,j)$ | Builds structured semantic connection graphs |
+| Phase 7 | Neurogenesis | Reset inactive state: $u_i,s_i \leftarrow 0$ for recycled nodes | Frees up inactive nodes for new memory traces |
 
 ## **Hardware Integration Optimization**
 
@@ -462,7 +514,7 @@ By executing directly inside Apple's Unified Memory Architecture via mlx-snn, SY
 
 * **Metal JIT Acceleration**: Synaptic weight updates are compiled natively into GPU kernels using mx.compile to prevent execution overhead on the CPU.  
 * **No-Copy Memory Sharing**: The host CPU pre-processes input embeddings, while the integrated M-series GPU computes the spiking networks inside the same physical RAM, completely avoiding costly PCIe bus data copies.  
-* **Footprint Control**: Peak VRAM consumption remains constrained between $61\\text{ MB}$ and $138\\text{ MB}$, compared to the heavy allocations required by traditional tensor frameworks.
+* **Footprint Control**: The default Mac-optimized topology is certified against a $96\text{ MB}$ to $256\text{ MB}$ estimated resident MLX array envelope, with the current dashboard/resource profile typically reporting about $115\text{ MB}$ for the 6,800-neuron substrate. That is a live topology estimate, not a blanket hardware counter claim.
 
 ## **Verification and Diagnostics**
 
