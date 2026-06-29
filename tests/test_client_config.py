@@ -38,6 +38,7 @@ class ClientConfigTests(unittest.TestCase):
         )
         self.assertEqual(server["env"]["SYNAPSE_S2_CAPTURE_ROOT"], str(resolved_repo / ".synapse_s2"))
         self.assertEqual(server["env"]["SYNAPSE_S2_CONTEXT_ID"], "default")
+        self.assertEqual(server["env"]["SYNAPSE_S2_NEURONS"], "6800")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"], "codex-desktop")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_SESSION_BRIDGE"], "1")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_CORTEX"], "1")

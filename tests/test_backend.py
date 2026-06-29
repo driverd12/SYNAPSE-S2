@@ -647,6 +647,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(profile["arrays"]["W_lateral"]["elements"], 36)
         self.assertGreater(profile["estimated_total_mb"], 0.0)
         self.assertIn("within_target_envelope", profile)
+        self.assertEqual(profile["target_envelope_mb"], {"min": 96.0, "max": 256.0})
         self.assertTrue(profile["quick_pruning"]["within_60ms_budget"])
 
     def test_backend_exports_and_backs_up_real_memory_store(self):

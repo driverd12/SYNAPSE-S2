@@ -10,6 +10,11 @@ from typing import Any
 
 from capture_daemon import CaptureInboxDaemon, write_capture_drop
 import mlx_backend
+from mlx_backend import (
+    DEFAULT_NUM_NEURONS,
+    DEFAULT_RESOURCE_TARGET_MAX_MB,
+    DEFAULT_RESOURCE_TARGET_MIN_MB,
+)
 from transcript_capture import TranscriptCaptureManager
 
 
@@ -675,7 +680,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--state", default=None, help="Runtime state JSON path.")
     parser.add_argument("--dimension", type=int, default=1024)
-    parser.add_argument("--neurons", type=int, default=5400)
+    parser.add_argument("--neurons", type=int, default=DEFAULT_NUM_NEURONS)
     parser.add_argument("--top-k", type=int, default=256)
     parser.add_argument("--recall-count", type=int, default=10)
     parser.add_argument("--quick-pruning-interval", type=float, default=300.0)
@@ -950,8 +955,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile = subparsers.add_parser("profile")
     profile.add_argument("--benchmark-quick-prune", action="store_true")
-    profile.add_argument("--target-min-mb", type=float, default=61.0)
-    profile.add_argument("--target-max-mb", type=float, default=138.0)
+    profile.add_argument("--target-min-mb", type=float, default=DEFAULT_RESOURCE_TARGET_MIN_MB)
+    profile.add_argument("--target-max-mb", type=float, default=DEFAULT_RESOURCE_TARGET_MAX_MB)
     profile.set_defaults(func=command_profile)
 
     provider_benchmark = subparsers.add_parser("provider-benchmark")
@@ -965,8 +970,8 @@ def build_parser() -> argparse.ArgumentParser:
     certify_runtime.add_argument("--require-gpu", action="store_true")
     certify_runtime.add_argument("--benchmark-quick-prune", action="store_true")
     certify_runtime.add_argument("--require-resource-envelope", action="store_true")
-    certify_runtime.add_argument("--target-min-mb", type=float, default=61.0)
-    certify_runtime.add_argument("--target-max-mb", type=float, default=138.0)
+    certify_runtime.add_argument("--target-min-mb", type=float, default=DEFAULT_RESOURCE_TARGET_MIN_MB)
+    certify_runtime.add_argument("--target-max-mb", type=float, default=DEFAULT_RESOURCE_TARGET_MAX_MB)
     certify_runtime.add_argument("--output", default=None)
     certify_runtime.set_defaults(func=command_certify_runtime)
 

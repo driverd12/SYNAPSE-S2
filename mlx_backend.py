@@ -46,6 +46,9 @@ LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
 
 MAX_EMBEDDING_DIMS = 32_768
+DEFAULT_NUM_NEURONS = 6800
+DEFAULT_RESOURCE_TARGET_MIN_MB = 96.0
+DEFAULT_RESOURCE_TARGET_MAX_MB = 256.0
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 TAG_RE = re.compile(r"[^A-Za-z0-9_.: /#-]+")
 AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
@@ -162,7 +165,7 @@ class SpikingAttentionBackend:
         self,
         *,
         dimension: int = 1024,
-        num_neurons: int = 5400,
+        num_neurons: int = DEFAULT_NUM_NEURONS,
         default_top_k: int = 256,
         recall_count: int = 10,
         beta: float = 0.95,
@@ -3714,8 +3717,8 @@ class SpikingAttentionBackend:
         self,
         *,
         benchmark_quick_prune: bool = False,
-        target_min_mb: float = 61.0,
-        target_max_mb: float = 138.0,
+        target_min_mb: float = DEFAULT_RESOURCE_TARGET_MIN_MB,
+        target_max_mb: float = DEFAULT_RESOURCE_TARGET_MAX_MB,
     ) -> dict[str, Any]:
         arrays = {
             "W_syn": self._array_profile(self.W_syn),
@@ -3761,8 +3764,8 @@ class SpikingAttentionBackend:
         require_gpu: bool = False,
         benchmark_quick_prune: bool = False,
         require_resource_envelope: bool = False,
-        target_min_mb: float = 61.0,
-        target_max_mb: float = 138.0,
+        target_min_mb: float = DEFAULT_RESOURCE_TARGET_MIN_MB,
+        target_max_mb: float = DEFAULT_RESOURCE_TARGET_MAX_MB,
         output_path: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         profile = self.resource_profile(
@@ -4303,7 +4306,7 @@ def get_backend() -> SpikingAttentionBackend:
     if _ENGINE_INSTANCE is None:
         _ENGINE_INSTANCE = SpikingAttentionBackend(
             dimension=int(os.getenv("SYNAPSE_S2_DIMENSION", "1024")),
-            num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", "5400")),
+            num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", str(DEFAULT_NUM_NEURONS))),
             default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "256")),
             recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "10")),
             quick_pruning_interval_seconds=float(
@@ -4623,8 +4626,8 @@ def list_memory_graph(
 def resource_profile(
     *,
     benchmark_quick_prune: bool = False,
-    target_min_mb: float = 61.0,
-    target_max_mb: float = 138.0,
+    target_min_mb: float = DEFAULT_RESOURCE_TARGET_MIN_MB,
+    target_max_mb: float = DEFAULT_RESOURCE_TARGET_MAX_MB,
 ) -> dict[str, Any]:
     return get_backend().resource_profile(
         benchmark_quick_prune=benchmark_quick_prune,
@@ -4652,8 +4655,8 @@ def certify_runtime(
     require_gpu: bool = False,
     benchmark_quick_prune: bool = False,
     require_resource_envelope: bool = False,
-    target_min_mb: float = 61.0,
-    target_max_mb: float = 138.0,
+    target_min_mb: float = DEFAULT_RESOURCE_TARGET_MIN_MB,
+    target_max_mb: float = DEFAULT_RESOURCE_TARGET_MAX_MB,
     output_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     return get_backend().certify_runtime(

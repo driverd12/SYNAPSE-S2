@@ -584,8 +584,18 @@ class DashboardRuntime:
                     require_resource_envelope=bool(
                         payload.get("require_resource_envelope", False)
                     ),
-                    target_min_mb=float(payload.get("target_min_mb", 61.0)),
-                    target_max_mb=float(payload.get("target_max_mb", 138.0)),
+                    target_min_mb=float(
+                        payload.get(
+                            "target_min_mb",
+                            mlx_backend.DEFAULT_RESOURCE_TARGET_MIN_MB,
+                        )
+                    ),
+                    target_max_mb=float(
+                        payload.get(
+                            "target_max_mb",
+                            mlx_backend.DEFAULT_RESOURCE_TARGET_MAX_MB,
+                        )
+                    ),
                     output_path=output_path or None,
                 )
             )
@@ -956,7 +966,12 @@ class DashboardRuntime:
         query_result = ""
         if prompt:
             query_result = self.backend.query_text(prompt, context_id=context)
-        target_max = float(profile.get("target_envelope_mb", {}).get("max", 138.0))
+        target_max = float(
+            profile.get("target_envelope_mb", {}).get(
+                "max",
+                mlx_backend.DEFAULT_RESOURCE_TARGET_MAX_MB,
+            )
+        )
         estimated_mb = float(profile.get("estimated_total_mb") or 0.0)
         checks = {
             "runtime_ready": bool(status.get("effective_enabled"))

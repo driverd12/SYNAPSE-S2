@@ -737,8 +737,8 @@ function renderHydrationTiming(snapshot, clientElapsedMs) {
 }
 
 function renderEnvelope(profile, status) {
-  const min = Number(profile.target_envelope_mb?.min ?? 61);
-  const max = Number(profile.target_envelope_mb?.max ?? 138);
+  const min = Number(profile.target_envelope_mb?.min ?? 96);
+  const max = Number(profile.target_envelope_mb?.max ?? 256);
   const current = Number(profile.estimated_total_mb ?? 0);
   const headroom = Math.max(0, max - current);
   const pct = max > min ? clamp(((current - min) / (max - min)) * 100, 0, 100) : 0;
@@ -751,7 +751,9 @@ function renderEnvelope(profile, status) {
   elements.envelopeFill.style.width = `${trackPct}%`;
   elements.envelopeMarker.style.left = `calc(14% + ${trackPct}%)`;
   elements.currentEnvelope.style.left = `calc(14% + ${trackPct}% - 28px)`;
-  elements.envelopeState.textContent = profile.within_target_envelope ? "inside 61-138 MB" : "outside target";
+  elements.envelopeState.textContent = profile.within_target_envelope
+    ? `inside ${formatNumber(min, 0)}-${formatNumber(max, 0)} MB`
+    : "outside target";
   elements.headroomMb.textContent = `${formatNumber(headroom, 1)} MB`;
   elements.headroomState.textContent = `${formatNumber(max, 0)} MB ceiling`;
   elements.traceCache.textContent = formatNumber(status.registered_trace_cache_count);
@@ -1427,7 +1429,7 @@ function renderMemoryLedger(graph) {
 
 function renderFooter(snapshot, status, profile, contextCount) {
   const current = Number(profile.estimated_total_mb ?? 0);
-  const max = Number(profile.target_envelope_mb?.max ?? 138);
+  const max = Number(profile.target_envelope_mb?.max ?? 256);
   const healthy = Boolean(status.effective_enabled) && Boolean(profile.within_target_envelope);
   elements.footerHealth.textContent = healthy ? "GOOD" : "CHECK";
   elements.footerMemory.textContent = `${formatNumber(current, 1)} MB / ${formatNumber(max, 0)} MB`;
