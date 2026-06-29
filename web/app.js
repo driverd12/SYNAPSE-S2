@@ -1,5 +1,5 @@
 const DEFAULT_CONTEXT = "default";
-const THEME_STORAGE_KEY = "synapse-s2-control-theme-v3";
+const THEME_STORAGE_KEY = "synapse-s2-control-theme-v4";
 const SNAPSHOT_LIMIT = 80;
 const GRAPH_WIDTH = 760;
 const GRAPH_HEIGHT = 420;
@@ -424,9 +424,9 @@ function confirmPreflight(title, lines) {
 function loadTheme() {
   try {
     const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-    return stored === "dark" || stored === "light" ? stored : "light";
+    return stored === "dark" || stored === "light" ? stored : "dark";
   } catch {
-    return "light";
+    return "dark";
   }
 }
 
