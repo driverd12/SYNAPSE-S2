@@ -20,30 +20,41 @@ $$
 Z_i = \frac{E_i - \mu_E}{\sigma_E},\quad
 s_i =
 \begin{cases}
-1 & \text{if } Z_i \in \operatorname{TopK}(Z,k) \\
+1 & \text{if } i \in \operatorname{argTopK}(Z,k) \\
 0 & \text{otherwise}
 \end{cases}
 $$
 
-The active sparse pattern is then propagated through bounded Leaky Integrate-and-Fire dynamics:
+The active sparse pattern is then propagated through bounded Leaky Integrate-and-Fire dynamics. The production loop first combines sensory and lateral current:
 
 $$
-U[t+1] = \beta U[t] + X[t+1] - S[t]V_{\text{thr}}
+X_t = S_{\text{in}}W_{\text{syn}}\gamma_{\text{syn}} + S_tW_{\text{lat}}\gamma_{\text{lat}}
+$$
+
+and then applies the subtract-reset LIF step:
+
+$$
+\tilde{U}_{t+1} = \beta U_t + X_t,\quad
+S_{t+1}=H(\tilde{U}_{t+1}-V_{\text{thr}}),\quad
+U_{t+1}=\tilde{U}_{t+1}-S_{t+1}V_{\text{thr}}
 $$
 
 where $U$ is membrane potential, $X$ is synaptic input current, $S$ is the emitted binary spike state, $\beta \in (0,1)$ is leak/decay, and $V_{\text{thr}}$ is the firing threshold. Information salience is encoded in which neurons fire and when, not in a dense token-token attention matrix.
 
-Temporal co-activation is consolidated through localized STDP:
+Temporal co-activation is consolidated through the implemented one-step discrete STDP update:
 
 $$
-\Delta w_{ij} =
-\begin{cases}
-A_+\exp\left(-\frac{\Delta t}{\tau_+}\right) & \text{if } \Delta t > 0 \\
--A_-\exp\left(\frac{\Delta t}{\tau_-}\right) & \text{if } \Delta t \le 0
-\end{cases}
+\Delta W_{ij} =
+A_+e^{-1/\tau_+}S_i[t]S_j[t+1]
+-
+A_-e^{-1/\tau_-}S_i[t+1]S_j[t]
 $$
 
-Here $\Delta t$ is the pre/post spike timing difference, $A_+$ and $A_-$ are potentiation/depression magnitudes, and $\tau_+$ and $\tau_-$ are asymmetric temporal constants. Repeated co-activation becomes durable synaptic and graph structure, so later recall can follow learned sparse activation paths and indexed memory relationships. This avoids materializing Transformer-style $N \times N$ attention matrices during recall. It does not mean the implementation has no multiplications anywhere; decay, weighting, MLX setup, and indexing still use ordinary numeric operations where useful.
+$$
+W_{ij} \leftarrow \operatorname{clip}(W_{ij}+\Delta W_{ij}, -c, c)
+$$
+
+This is a fixed-step version of the usual exponential STDP rule: previous spikes potentiate current spikes in the forward direction, current spikes depress the reverse direction, and lateral weights stay inside a configured clip envelope. The runtime also skips STDP when the active set exceeds the configured guardrail. Repeated co-activation becomes durable synaptic and graph structure, so later recall can follow learned sparse activation paths and indexed memory relationships. This avoids materializing Transformer-style $N \times N$ attention matrices during recall. It does not mean the implementation has no multiplications anywhere; decay, weighting, MLX setup, and indexing still use ordinary numeric operations where useful.
 
 ## **Unified Memory and Hardware-Level Optimization on Apple Silicon**
 
@@ -54,8 +65,7 @@ The backend of the spiking engine is constructed natively with the mlx-snn libra
 * **Just-In-Time Compilation (mx.compile)**: The state transitions of recurrent spiking layers are JIT-compiled into optimized Metal kernels, executing natively on the M-series GPU accelerators.6
 * **Immutable Array Updates**: MLX prohibits in-place array mutations to ensure mathematical purity in the computation graph.5 Neuron potential resets must be declared as functional assignments (e.g., mem \= beta \* mem \+ x rather than mem \+= x), allowing the compiler to optimize the memory hierarchy.5
 
-The system incorporates a multi-scale leaky integrate-and-fire formulation (MSLeaky) to process multi-scale temporal context.11 Rather than utilizing a uniform decay factor, MSLeaky assigns frequency-matched decay rates $\beta_f$ to parallel spiking branches.11 This layout mimics biological delta, theta, alpha, beta, and gamma oscillations, capturing both immediate transient changes and long-term contextual patterns in a single network.11 To scale temporal sequences without running out of RAM, the training loop implements chunked backpropagation-through-time (chunked\_bptt\_forward) and state detachment (detach\_state), which isolates the computation graph at defined temporal boundaries.11
-Gradient propagation through the non-differentiable Heaviside step function is managed using a custom Straight-Through Estimator (STE) pattern.5 This pattern works around current MLX limitations with vector-Jacobian products (VJPs) by blending a smooth surrogate gradient with the discrete forward thresholding operation:
+The shipped runtime uses recurrent LIF with `mlxsnn.Leaky` when available and an explicit MLX subtract-reset fallback when it is not. MSLeaky, ALIF, chunked BPTT, state detachment, and STE training are architecture-compatible research extensions, not the current production inference path. If a future training mode is added, gradient propagation through the non-differentiable Heaviside step function can use a Straight-Through Estimator (STE) pattern:
 
 $$
 \frac{\partial H(x)}{\partial x} \approx \frac{\partial \sigma_{\text{surrogate}}(x)}{\partial x}
@@ -83,23 +93,24 @@ The implementation decouples abstract semantic operations from associative memor
 
 ```mermaid
 flowchart TB
-  Client["Local LLM client<br/>Claude Desktop / Claude Code / Codex"]
-  Bridge["FastMCP model context layer<br/>stdio JSON-RPC local process bridge"]
-  Provider["Local embedding provider<br/>MLX neural / semantic hash / Python callable"]
-  Substrate["Persistent spiking substrate<br/>MLX/mlxsnn recurrent LIF"]
-  Sensory["Layer 1: sensory population<br/>z-score TopK spike coding"]
-  Associative["Layer 2: associative fabric<br/>STDP-modified recurrent co-activation"]
-  Concept["Layer 3: concept and gated categories<br/>context-specific activation maps"]
-  Filter["Context consolidation filter<br/>salience gating and LLM injection"]
-  Store["Durable graph and recall indexes<br/>SQLite memory, spikes, surface terms, relationships"]
+  Client["LLM client<br/>Claude + Codex"]
+  Bridge["MCP bridge<br/>stdio JSON-RPC"]
+  Provider["Embedding<br/>MLX / hash"]
+  Sensory["Layer 1<br/>Top-k spikes"]
+  Associative["Layer 2<br/>STDP fabric"]
+  Concept["Layer 3<br/>concept graph"]
+  Filter["Context filter<br/>salience gate"]
+  Store["Memory DB<br/>SQLite indexes"]
+  Substrate["Spiking core<br/>recurrent LIF"]
 
-  Client -->|"tool calls and resources"| Bridge
-  Bridge --> Provider --> Sensory
+  Client -->|"tools"| Bridge
+  Bridge -->|"embed"| Provider
+  Provider --> Sensory
   Sensory --> Associative --> Concept --> Filter
-  Filter -->|"high-salience context"| Client
+  Filter -->|"inject"| Client
   Associative --> Substrate
   Concept --> Store
-  Store -. "indexed recall" .-> Associative
+  Store -. "recall" .-> Associative
 ```
 
 The system is organized into a multi-tiered spiking neural network featuring hierarchical sensory, concept, and categorical layer topologies.8 Layer 1 acts as a fixed sensory translation barrier, mapping standardized input embeddings into precise spatial spike distributions.8 Layer 2 functions as the plastic associative fabric, where dynamic connections are established, potentiated, or depressed based on temporal co-occurrence via active STDP rules.8 Layer 3 maps these associations into abstract conceptual groupings, stabilizing memory recall.8
@@ -114,15 +125,15 @@ The primary rapid-development shortcut lies in configuring a single, unified loc
 
 ```mermaid
 flowchart TB
-  Codex["Codex Desktop<br/>~/.codex/config.toml"]
-  ClaudeDesktop["Claude Desktop<br/>claude_desktop_config.json"]
-  ClaudeCode["Claude Code<br/>~/.claude.json and project .mcp.json"]
-  Installer["Client config installer<br/>scripts/install_client_configs.py"]
-  Launcher["Stable local launcher<br/>/Users/dan.driver/.local/bin/synapse-s2-mcp"]
-  Wrapper["MCP client wrapper<br/>startup hydration + Cortex entry + session-boundary note"]
-  Daemon["FastMCP neuromorphic daemon<br/>stdio JSON-RPC"]
-  State["Shared local state<br/>.synapse_s2/memory.sqlite3 + runtime_state.json"]
-  Dashboard["Loopback dashboard<br/>operator trust loop and receipts"]
+  Codex["Codex<br/>config.toml"]
+  ClaudeDesktop["Claude Desktop<br/>config JSON"]
+  ClaudeCode["Claude Code<br/>project MCP"]
+  Installer["Installer<br/>client configs"]
+  Launcher["Launcher<br/>synapse-s2-mcp"]
+  Wrapper["Wrapper<br/>hydrate + Cortex"]
+  Daemon["FastMCP<br/>stdio daemon"]
+  State["Local state<br/>SQLite + JSON"]
+  Dashboard["Dashboard<br/>receipts"]
 
   Installer --> Codex
   Installer --> ClaudeDesktop
@@ -425,17 +436,17 @@ To minimize execution overhead on consumer hardware, this consolidation process 
 
 ```mermaid
 flowchart TB
-  Active["Active operator work<br/>query, remember, capture, App Connect"]
-  Quick["Quick-pruning mode<br/>5-minute interval; array decay and transient reset; target under 60 ms"]
-  Idle{"Host idle or forced maintenance?"}
-  Deep["Deep-sleep consolidation<br/>seven deterministic phases; no external LLM call"]
-  Graph["Durable semantic graph<br/>temporal, associative, and namespace relationships"]
-  Ready["Ready substrate<br/>bounded resource envelope and fresh recall indexes"]
+  Active["Active work<br/>query + capture"]
+  Quick["Quick prune<br/>decay + reset"]
+  Idle{"Idle or forced?"}
+  Deep["Deep sleep<br/>7 phases"]
+  Graph["Memory graph<br/>relationships"]
+  Ready["Ready core<br/>fresh indexes"]
 
   Active --> Quick
   Quick --> Idle
-  Idle -->|"not idle"| Ready
-  Idle -->|"idle / forced"| Deep
+  Idle -->|"active"| Ready
+  Idle -->|"idle"| Deep
   Deep --> Graph --> Ready
   Ready --> Active
 ```

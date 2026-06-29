@@ -15,7 +15,9 @@ class DocumentationTests(unittest.TestCase):
         self.assertNotIn(r"U\[t+1\] \=", readme)
         self.assertNotIn(r"\\Delta w \=", readme)
         self.assertIn("```math\nZ_i = \\frac{E_i - \\mu_E}{\\sigma_E}\n```", readme)
-        self.assertIn("```math\nU[t+1] = \\beta U[t] + X[t+1] - S[t]V_{\\text{thr}}\n```", readme)
+        self.assertIn("X_t = S_{\\text{in}}W_{\\text{syn}}\\gamma_{\\text{syn}}", readme)
+        self.assertIn("\\tilde{U}_{t+1} = \\beta U_t + X_t", readme)
+        self.assertIn("W_{ij} \\leftarrow \\operatorname{clip}", readme)
         self.assertIn("\\begin{cases}", readme)
 
     def test_readme_core_math_section_avoids_inline_dollar_math(self):
@@ -25,8 +27,8 @@ class DocumentationTests(unittest.TestCase):
         section = readme[start:end]
 
         self.assertNotIn("$", section)
-        self.assertIn("top-`k`", section)
-        self.assertIn("`S_i = 1`", section)
+        self.assertIn("\\operatorname{argTopK}(Z,k)", section)
+        self.assertIn("one-cycle discrete form of asymmetric STDP", section)
         self.assertIn("`V_thr`", section)
 
 

@@ -27,20 +27,29 @@ z = \operatorname{embed}(\text{text}),\quad s_0 = \operatorname{TopK}(\operatorn
 ```
 
 ```math
-u_{t+1} = \beta u_t + W_{\text{syn}}s_t + W_{\text{lat}}s_t - V_{\text{thr}}s_t,\quad
-s_{t+1} = H(u_{t+1} - V_{\text{thr}})
+x_t = s_{\text{in}}W_{\text{syn}}\gamma_{\text{syn}} + s_tW_{\text{lat}}\gamma_{\text{lat}}
+```
+
+```math
+\tilde{u}_{t+1} = \beta u_t + x_t,\quad
+s_{t+1} = H(\tilde{u}_{t+1} - V_{\text{thr}}),\quad
+u_{t+1} = \tilde{u}_{t+1} - s_{t+1}V_{\text{thr}}
 ```
 
 Temporal co-activation changes durable relationship strength through STDP:
 
 ```math
-\Delta w_{ij} =
-\eta_+ s_i(t-\Delta t_{\text{pre}})s_j(t)
+\Delta W_{\text{lat}} =
+A_+e^{-1/\tau_+}s_t s_{t+1}^{\top}
 -
-\eta_- s_i(t)s_j(t-\Delta t_{\text{post}})
+A_-e^{-1/\tau_-}s_{t+1}s_t^{\top}
 ```
 
-At inference time, active spike operations are dominated by additions, threshold comparisons, decay, and sparse/indexed retrieval rather than dense query-key matrix multiplication over all token pairs. The implementation still uses MLX arrays and scalar multiplications for decay, weighting, and setup where appropriate; "multiplication-free" should be read as the neuromorphic recall path avoiding dense per-token dot-product attention, not as a claim that no numeric multiplication exists anywhere in the codebase.
+```math
+W_{\text{lat}} \leftarrow \operatorname{clip}(W_{\text{lat}} + \Delta W_{\text{lat}}, -c, c)
+```
+
+At inference time, active spike operations are dominated by additions, threshold comparisons, decay, and sparse/indexed retrieval rather than dense query-key matrix multiplication over all token pairs. The implementation still uses MLX arrays and scalar multiplications for decay, weighting, and setup where appropriate; "multiplication-free" should be read as the neuromorphic recall path avoiding dense per-token dot-product attention, not as a claim that no numeric multiplication exists anywhere in the codebase. The STDP equation above is the implemented one-step discrete update: previous spikes potentiate current spikes, current spikes depress the reverse direction, and lateral weights are clipped to a configured envelope.
 
 ## **Operational Quickstart**
 
@@ -444,23 +453,25 @@ The plugin acts as a middleware daemon communicating with local editor interface
 
 ```mermaid
 flowchart TB
-  Client["Local LLM Client<br/>Codex / Claude Desktop / Claude Code"]
-  MCP["FastMCP Model Context Layer<br/>stdio JSON-RPC + client session bridge"]
-  Embedding["Local Embedding Provider<br/>MLX neural / semantic hash / Python callable"]
-  Cortex["Cortex Governor<br/>policy, tick, typed evidence"]
-  Memory["SYNAPSE-S2 Spiking Substrate<br/>MLX/mlxsnn recurrent LIF + STDP"]
-  Store["Durable Memory Store<br/>SQLite entries, spikes, surface terms, relationships"]
-  Dashboard["Loopback Dashboard<br/>Operator Trust Loop + receipts"]
+  Client["LLM client<br/>Codex + Claude"]
+  MCP["MCP bridge<br/>stdio JSON-RPC"]
+  Embedding["Embedding<br/>MLX / hash"]
+  Cortex["Cortex<br/>policy gate"]
+  Memory["Spiking core<br/>LIF + STDP"]
+  Store["Memory DB<br/>SQLite indexes"]
+  Dashboard["Dashboard<br/>operator loop"]
 
-  Client -->|"tool calls"| MCP
-  MCP --> Embedding
-  Embedding -->|"sparse sensory spikes"| Memory
-  MCP --> Cortex
-  Cortex -->|"governed traces"| Store
-  Memory -->|"co-activation evidence"| Store
-  Dashboard -->|"confirmed local actions"| MCP
-  Dashboard -->|"status, receipts, graph"| Store
+  Client -->|"tools"| MCP
+  MCP -->|"embed"| Embedding
+  Embedding -->|"spikes"| Memory
+  MCP -->|"govern"| Cortex
+  Cortex -->|"traces"| Store
+  Memory -->|"evidence"| Store
+  Dashboard -->|"actions"| MCP
+  Dashboard -->|"receipts"| Store
 ```
+
+The diagram labels are intentionally compact so hosted Mermaid renderers do not clip them. The full path is: local clients call the FastMCP bridge over stdio; text is embedded through MLX neural, semantic hash, or a Python callable provider; the spiking core runs recurrent LIF/STDP; confirmed operator actions and receipts are surfaced through the loopback dashboard; durable memory lands in SQLite entries, spike indexes, surface terms, and relationships.
 
 ## **Hierarchical Neural Network Topology**
 
@@ -468,17 +479,19 @@ The SNN is organized into a multi-tiered hierarchical network designed to route,
 
 ```mermaid
 flowchart TB
-  Input["Input text / selected app text / session note"]
-  Embed["Local embedding vector z"]
-  TopK["Layer 1: sensory spike coding<br/>s0 = TopK(z-score(z), k)"]
-  LIF["Layer 2: recurrent LIF substrate<br/>u(t+1)=beta u(t)+Wsyn s(t)+Wlat s(t)-Vthr s(t)"]
-  STDP["STDP plasticity<br/>strengthen or depress temporally aligned co-activations"]
-  Graph["Layer 3: durable concept graph<br/>memory_spikes + memory_surface_terms + relationships"]
-  Recall["High-salience context injected into the LLM"]
+  Input["Input<br/>text / app / session"]
+  Embed["Embedding<br/>z vector"]
+  TopK["Layer 1<br/>Top-k spikes"]
+  LIF["Layer 2<br/>Recurrent LIF"]
+  STDP["STDP<br/>weight update"]
+  Graph["Layer 3<br/>memory graph"]
+  Recall["Recall<br/>context injection"]
 
   Input --> Embed --> TopK --> LIF --> STDP --> Graph --> Recall
-  Graph -. "indexed recall" .-> LIF
+  Graph -. "index" .-> LIF
 ```
+
+Layer 1 computes z-score top-`k` sensory spikes. Layer 2 projects those spikes through `W_syn`, adds lateral current from `W_lateral`, emits thresholded spikes, and subtracts `V_thr` after firing. STDP updates the lateral matrix from previous/current spike co-activation, while durable recall also uses `memory_spikes`, `memory_surface_terms`, and relationship rows in SQLite.
 
 ## **Core Mathematical Formulation**
 
@@ -490,31 +503,48 @@ Dense embeddings `E` are mapped into binary spike states `S_i in {0, 1}` using c
 Z_i = \frac{E_i - \mu_E}{\sigma_E}
 ```
 
-Neurons corresponding to the top-`k` standardized coordinates fire (`S_i = 1`); the remainder stay silent (`S_i = 0`).
-
-### **2. Leaky Integrate-and-Fire (LIF) Dynamics**
-
-Individual neuron potentials are processed with bounded discrete-time updates:
-
 ```math
-U[t+1] = \beta U[t] + X[t+1] - S[t]V_{\text{thr}}
-```
-
-Here `U` is membrane potential, `X` is input synaptic current, `beta in (0,1)` is decay, and `V_thr` is the spike threshold. Updates are written as new MLX arrays so the recurrent step can compile cleanly on Apple Silicon.
-
-### **3. Asymmetric Temporal STDP**
-
-Rather than storing dense request-time attention matrices, temporal correlation is consolidated into synaptic and graph weights. A pre-before-post spike pair potentiates the connection; a post-before-pre pair depresses it:
-
-```math
-\Delta w_{ij} =
+S_i =
 \begin{cases}
-A_+\exp\left(-\frac{\Delta t}{\tau_+}\right) & \text{if } \Delta t > 0 \\
--A_-\exp\left(\frac{\Delta t}{\tau_-}\right) & \text{if } \Delta t \le 0
+1 & \text{if } i \in \operatorname{argTopK}(Z,k) \\
+0 & \text{otherwise}
 \end{cases}
 ```
 
-This is the mathematical difference from vector similarity retrieval. Vector search compares a query vector against stored vectors at query time; STDP turns repeated temporal co-activation into durable structure, so future recall can follow learned activation paths instead of recomputing every pairwise token-token relation.
+### **2. Leaky Integrate-and-Fire (LIF) Dynamics**
+
+The recurrent cycle first builds total current from the sensory projection plus lateral recurrence:
+
+```math
+X_t = S_{\text{in}}W_{\text{syn}}\gamma_{\text{syn}} + S_tW_{\text{lat}}\gamma_{\text{lat}}
+```
+
+Individual neuron potentials are then processed with bounded discrete-time updates:
+
+```math
+\tilde{U}_{t+1} = \beta U_t + X_t,\quad
+S_{t+1}=H(\tilde{U}_{t+1}-V_{\text{thr}}),\quad
+U_{t+1}=\tilde{U}_{t+1}-S_{t+1}V_{\text{thr}}
+```
+
+Here `U` is membrane potential, `X` is total synaptic input current, `beta in (0,1)` is decay, and `V_thr` is the spike threshold. Updates are written as new MLX arrays so the recurrent step can compile cleanly on Apple Silicon.
+
+### **3. Asymmetric Temporal STDP**
+
+Rather than storing dense request-time attention matrices, temporal correlation is consolidated into synaptic and graph weights. SYNAPSE-S2 implements a one-cycle discrete form of asymmetric STDP:
+
+```math
+\Delta W_{ij} =
+A_+e^{-1/\tau_+}S_i[t]S_j[t+1]
+-
+A_-e^{-1/\tau_-}S_i[t+1]S_j[t]
+```
+
+```math
+W_{ij} \leftarrow \operatorname{clip}(W_{ij}+\Delta W_{ij}, -c, c)
+```
+
+This is the fixed-step implementation of the usual exponential STDP rule: pre-before-post spike pairs potentiate the forward direction, while post-before-pre pairs depress it. The runtime also skips STDP when the active set exceeds the configured guardrail and clips updated weights into a bounded envelope. Vector search compares a query vector against stored vectors at query time; STDP turns repeated temporal co-activation into durable structure, so future recall can follow learned activation paths instead of recomputing every pairwise token-token relation.
 
 ## **Memory Consolidation and Pruning Lifecycle**
 
