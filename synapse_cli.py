@@ -507,6 +507,16 @@ def command_provider_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_monday_readiness(args: argparse.Namespace) -> dict[str, Any]:
+    from dashboard_server import DashboardRuntime
+
+    runtime = DashboardRuntime(build_backend(args))
+    return runtime.monday_readiness(
+        context_id=args.context,
+        include_apps=args.include_apps,
+    )
+
+
 def command_certify_runtime(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.certify_runtime(
@@ -964,6 +974,11 @@ def build_parser() -> argparse.ArgumentParser:
     provider_benchmark.add_argument("--runs", type=int, default=1)
     provider_benchmark.add_argument("--embedding-dimensions", type=int, default=None)
     provider_benchmark.set_defaults(func=command_provider_benchmark)
+
+    monday_readiness = subparsers.add_parser("monday-readiness")
+    add_context(monday_readiness)
+    monday_readiness.add_argument("--include-apps", action="store_true")
+    monday_readiness.set_defaults(func=command_monday_readiness)
 
     certify_runtime = subparsers.add_parser("certify-runtime")
     certify_runtime.add_argument("--strict-native", action="store_true")

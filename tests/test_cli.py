@@ -202,6 +202,50 @@ class SynapseCliTests(unittest.TestCase):
         self.assertGreaterEqual(payload["elapsed_ms"], 0.0)
         self.assertGreaterEqual(payload["average_latency_ms"], 0.0)
 
+    def test_cli_monday_readiness_reports_scorecard(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "monday-readiness-memory",
+                "--text",
+                "Monday readiness should prove recall, runtime health, and local memory.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            result = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "monday-readiness",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["action"], "monday-readiness")
+        self.assertEqual(payload["context_id"], "demo")
+        self.assertGreaterEqual(payload["score"], 0)
+        self.assertLessEqual(payload["score"], 100)
+        self.assertIsInstance(payload["demo_ready"], bool)
+        self.assertGreater(payload["summary"]["required_total"], 0)
+        self.assertIn("operator_steps", payload)
+        self.assertGreaterEqual(len(payload["operator_steps"]), 3)
+        self.assertIn(
+            "embedding_latency",
+            {check["id"] for check in payload["checks"]},
+        )
+
     def test_cli_certify_runtime_writes_evidence_pack(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

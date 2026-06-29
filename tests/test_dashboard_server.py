@@ -468,10 +468,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Local recall only", index)
         self.assertIn("query_spiking_attention_text", index)
         self.assertIn("readinessAuditButton", index)
+        self.assertIn("mondayReadinessButton", index)
         self.assertIn("selfTestButton", index)
         self.assertIn("selfTestState", index)
         self.assertIn("selfTestGrid", index)
         self.assertIn("coreStateIndicator", index)
+        self.assertIn("core-status-badge", index)
+        self.assertIn("core-status-dot", index)
+        self.assertNotIn("switch-track", index)
         self.assertNotIn('id="toggleButton"', index)
         self.assertIn("coreActionGroup", index)
         self.assertIn("reliabilityActionGroup", index)
@@ -548,6 +552,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("logSnapshotResponse", app)
         self.assertIn("unlockCoreToggleGuard", app)
         self.assertIn("lockCoreToggleGuard", app)
+        self.assertIn("elements.toggleActionState.textContent = nextAction", app)
+        self.assertIn("/api/monday-readiness", app)
+        self.assertIn("renderMondayReadiness", app)
         self.assertNotIn("toggleButton.addEventListener", app)
         self.assertNotIn("elements.toggleButton.disabled", app)
         self.assertIn("elements.coreStateIndicator", app)
@@ -590,6 +597,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/context-events", app)
         self.assertIn("danger-button", styles)
         self.assertIn("app-connect-panel", styles)
+        self.assertIn("core-status-badge", styles)
+        self.assertIn("core-status-dot", styles)
+        self.assertNotIn(".switch-track", styles)
         self.assertIn("neural-math-panel", styles)
         self.assertIn("neural-inspector-toggle", styles)
         self.assertIn("cortex-panel", styles)
@@ -636,6 +646,41 @@ class DashboardRuntimeTests(unittest.TestCase):
             self.assertIn("detail", components[component])
         self.assertGreaterEqual(components["app_connect"]["app_count"], 1)
         self.assertIsInstance(payload["recommended_actions"], list)
+
+    def test_monday_readiness_endpoint_reports_demo_scorecard(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            status, payload = self.decode(
+                runtime.handle("GET", "/api/monday-readiness?context_id=demo&include_apps=false")
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["action"], "monday-readiness")
+        self.assertEqual(payload["context_id"], "demo")
+        self.assertIn(payload["overall_status"], {"ready", "degraded", "blocked"})
+        self.assertIsInstance(payload["demo_ready"], bool)
+        self.assertGreaterEqual(payload["score"], 0)
+        self.assertLessEqual(payload["score"], 100)
+        self.assertGreater(payload["summary"]["required_total"], 0)
+        self.assertIn("operator_steps", payload)
+        self.assertGreaterEqual(len(payload["operator_steps"]), 3)
+        checks_by_id = {check["id"]: check for check in payload["checks"]}
+        for check_id in (
+            "runtime",
+            "memory",
+            "embedding",
+            "context_bus",
+            "capture_inbox",
+            "resource_envelope",
+            "quick_prune",
+            "embedding_latency",
+            "recall_audit",
+        ):
+            self.assertIn(check_id, checks_by_id)
+            self.assertIn(checks_by_id[check_id]["status"], {"ready", "degraded", "blocked"})
+            self.assertIn("detail", checks_by_id[check_id])
+            self.assertIn("required", checks_by_id[check_id])
 
     def test_http_handler_rejects_cross_origin_mutations(self):
         with TemporaryDirectory() as tmp:

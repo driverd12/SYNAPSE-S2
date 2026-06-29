@@ -162,9 +162,9 @@
                 <p class="section-label">Runtime Ready</p>
                 <h2 id="runtimeTitle">SYNAPSE-S2 Core</h2>
               </div>
-              <div id="coreStateIndicator" class="core-state-indicator" role="status" aria-live="polite" title="SYNAPSE-S2 Core is currently enabled">
-                <span class="switch-track" aria-hidden="true"><span></span></span>
-                <span id="toggleText">Enabled</span>
+              <div id="coreStateIndicator" class="core-status-badge" role="status" aria-live="polite" title="SYNAPSE-S2 Core is currently enabled">
+                <span class="core-status-dot" aria-hidden="true"></span>
+                <span id="toggleText">Core enabled</span>
               </div>
             </div>
             <div class="system-list">
@@ -267,7 +267,7 @@
                   <span class="guard-controls">
                     <button id="coreUnlockButton" class="guard-button unlock-button" type="button" aria-pressed="false">Unlock</button>
                     <button id="toggleActionButton" class="guard-button state-toggle" type="button" disabled>
-                      <span id="toggleActionState">Enabled</span>
+                      <span id="toggleActionState">Disable</span>
                     </button>
                   </span>
                 </div>
@@ -277,6 +277,11 @@
               <section id="reliabilityActionGroup" class="action-section" aria-labelledby="reliabilityActionGroupTitle">
                 <h3 id="reliabilityActionGroupTitle">Reliability checks</h3>
                 <div class="action-group-grid">
+                  <button class="action-row" type="button" id="mondayReadinessButton">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 12 11 14 15 9"/><path d="M4 4h16v16H4z"/><path d="M8 18h8"/></svg>
+                    <span><strong>Monday Readiness</strong><small>Score demo-critical runtime paths</small></span>
+                    <em>Score</em>
+                  </button>
                   <button class="action-row" type="button" id="refreshActionButton">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
                     <span><strong>Refresh Runtime State</strong><small>Reload metrics and health</small></span>

@@ -174,6 +174,12 @@ class DashboardRuntime:
             return self._json_response(
                 self.self_test(context_id=context, include_apps=include_apps)
             )
+        if method == "GET" and path == "/api/monday-readiness":
+            context = self._context_from_params(params)
+            include_apps = self._bool_param(params, "include_apps", True)
+            return self._json_response(
+                self.monday_readiness(context_id=context, include_apps=include_apps)
+            )
         if method == "GET" and path == "/api/cortex/state":
             context = self._context_from_params(params)
             agent_raw = str(params.get("agent_id", [""])[0] or "").strip()
@@ -1013,6 +1019,286 @@ class DashboardRuntime:
                 "mlx_device": profile.get("mlx_device"),
                 "mlxsnn_lif_execution_path": profile.get("mlxsnn_lif_execution_path"),
             },
+        }
+
+    def monday_readiness(
+        self,
+        *,
+        context_id: str,
+        include_apps: bool = True,
+    ) -> dict[str, Any]:
+        context = mlx_backend.sanitize_context_id(context_id)
+        started = time.perf_counter()
+        checks: list[dict[str, Any]] = []
+        recommended_actions: list[str] = []
+        artifacts: dict[str, Any] = {}
+
+        def add_check(
+            check_id: str,
+            *,
+            label: str,
+            status: str,
+            detail: str,
+            required: bool = True,
+            metrics: dict[str, Any] | None = None,
+        ) -> None:
+            normalized_status = status if status in {"ready", "degraded", "blocked"} else "blocked"
+            checks.append(
+                {
+                    "id": check_id,
+                    "label": label,
+                    "status": normalized_status,
+                    "detail": detail,
+                    "required": bool(required),
+                    "metrics": metrics or {},
+                }
+            )
+
+        try:
+            self_test = self.self_test(context_id=context, include_apps=include_apps)
+            artifacts["self_test"] = self_test
+            recommended_actions.extend(self_test.get("recommended_actions", []))
+            component_labels = {
+                "runtime": "Core runtime",
+                "memory": "Memory store",
+                "embedding": "Embedding provider",
+                "context_bus": "Context bus",
+                "capture_inbox": "Capture inbox",
+                "app_connect": "App Connect",
+            }
+            for component_id, label in component_labels.items():
+                component = dict(self_test.get("components", {}).get(component_id) or {})
+                if not component:
+                    add_check(
+                        component_id,
+                        label=label,
+                        status="blocked",
+                        detail="component did not report",
+                        required=component_id != "app_connect" or include_apps,
+                    )
+                    continue
+                add_check(
+                    component_id,
+                    label=str(component.get("label") or label),
+                    status=str(component.get("status") or "blocked"),
+                    detail=str(component.get("detail") or ""),
+                    required=component_id != "app_connect" or include_apps,
+                    metrics={
+                        key: value
+                        for key, value in component.items()
+                        if key
+                        not in {
+                            "status",
+                            "label",
+                            "detail",
+                        }
+                    },
+                )
+        except Exception as exc:
+            add_check(
+                "self_test",
+                label="Self test",
+                status="blocked",
+                detail=str(exc),
+                required=True,
+            )
+            recommended_actions.append("Run Self Test and inspect the failing component before demo use.")
+
+        try:
+            profile = self.backend.resource_profile(benchmark_quick_prune=True)
+            artifacts["resource_profile"] = profile
+            envelope = profile.get("target_envelope_mb") or {}
+            estimated_mb = float(profile.get("estimated_total_mb") or 0.0)
+            add_check(
+                "resource_envelope",
+                label="Resource envelope",
+                status="ready" if profile.get("within_target_envelope") else "blocked",
+                detail=(
+                    f"{estimated_mb:.3f} MB estimated substrate inside "
+                    f"{envelope.get('min', '?')}-{envelope.get('max', '?')} MB target"
+                ),
+                required=True,
+                metrics={
+                    "estimated_total_mb": profile.get("estimated_total_mb"),
+                    "target_envelope_mb": envelope,
+                    "num_neurons": profile.get("num_neurons"),
+                    "dimension": profile.get("dimension"),
+                },
+            )
+            quick = dict(profile.get("quick_pruning") or {})
+            quick_ok = bool(quick.get("within_60ms_budget"))
+            add_check(
+                "quick_prune",
+                label="Quick prune budget",
+                status="ready" if quick_ok else "blocked",
+                detail=(
+                    f"{quick.get('elapsed_ms', '?')} ms quick-prune sample"
+                    if quick
+                    else "quick-prune benchmark did not return a sample"
+                ),
+                required=True,
+                metrics=quick,
+            )
+            if not profile.get("within_target_envelope"):
+                recommended_actions.append("Tune SYNAPSE_S2_NEURONS before demo; the memory substrate is outside target.")
+            if not quick_ok:
+                recommended_actions.append("Investigate quick-pruning latency before relying on long sessions.")
+        except Exception as exc:
+            add_check(
+                "resource_envelope",
+                label="Resource envelope",
+                status="blocked",
+                detail=str(exc),
+                required=True,
+            )
+            add_check(
+                "quick_prune",
+                label="Quick prune budget",
+                status="blocked",
+                detail=str(exc),
+                required=True,
+            )
+            recommended_actions.append("Run the resource profile locally and resolve the reported error.")
+
+        try:
+            benchmark = self.backend.benchmark_embedding_provider(
+                text="SYNAPSE-S2 Monday readiness embedding warmup",
+                runs=1,
+            )
+            artifacts["embedding_benchmark"] = benchmark
+            nonzero = int(benchmark.get("vector_nonzero_count") or 0)
+            latency_ms = float(benchmark.get("average_latency_ms") or 0.0)
+            add_check(
+                "embedding_latency",
+                label="Embedding warm path",
+                status="ready" if nonzero > 0 else "blocked",
+                detail=f"{latency_ms:.3f} ms average embedding latency, {nonzero} nonzero dimensions",
+                required=True,
+                metrics={
+                    "average_latency_ms": benchmark.get("average_latency_ms"),
+                    "dimensions": benchmark.get("dimensions"),
+                    "provider": benchmark.get("embedding_provider"),
+                    "vector_nonzero_count": nonzero,
+                },
+            )
+            if nonzero <= 0:
+                recommended_actions.append("Resolve embedding vector generation before trusting recall quality.")
+        except Exception as exc:
+            add_check(
+                "embedding_latency",
+                label="Embedding warm path",
+                status="blocked",
+                detail=str(exc),
+                required=True,
+            )
+            recommended_actions.append("Resolve the embedding provider load path before Monday demo.")
+
+        try:
+            audit = self.readiness_audit(context_id=context)
+            artifacts["readiness_audit"] = audit
+            failed_checks = list(audit.get("failed_checks") or [])
+            add_check(
+                "recall_audit",
+                label="Recall audit",
+                status="ready" if audit.get("ready") else "blocked",
+                detail=(
+                    "query and graph audit passed"
+                    if audit.get("ready")
+                    else f"failed checks: {', '.join(failed_checks) or 'unknown'}"
+                ),
+                required=True,
+                metrics={
+                    "failed_checks": failed_checks,
+                    "elapsed_ms": audit.get("elapsed_ms"),
+                    "query_prompt": audit.get("query_prompt"),
+                },
+            )
+            if failed_checks:
+                recommended_actions.append(
+                    f"Fix readiness audit checks before demo: {', '.join(failed_checks)}."
+                )
+        except Exception as exc:
+            add_check(
+                "recall_audit",
+                label="Recall audit",
+                status="blocked",
+                detail=str(exc),
+                required=True,
+            )
+            recommended_actions.append("Seed real memory and rerun Readiness Audit before demo use.")
+
+        required_checks = [check for check in checks if check["required"]]
+        optional_checks = [check for check in checks if not check["required"]]
+
+        def check_value(check: dict[str, Any]) -> float:
+            if check["status"] == "ready":
+                return 1.0
+            if check["status"] == "degraded":
+                return 0.5
+            return 0.0
+
+        weighted_total = (len(required_checks) * 2.0) + len(optional_checks)
+        weighted_score = (
+            sum(check_value(check) * (2.0 if check["required"] else 1.0) for check in checks)
+            / weighted_total
+            if weighted_total
+            else 0.0
+        )
+        required_failures = [
+            check for check in required_checks if check["status"] != "ready"
+        ]
+        optional_failures = [
+            check for check in optional_checks if check["status"] != "ready"
+        ]
+        if any(check["status"] == "blocked" for check in required_failures):
+            overall_status = "blocked"
+        elif required_failures or optional_failures:
+            overall_status = "degraded"
+        else:
+            overall_status = "ready"
+
+        unique_actions: list[str] = []
+        seen_actions: set[str] = set()
+        for action in recommended_actions:
+            clean = " ".join(str(action or "").split())
+            if clean and clean not in seen_actions:
+                seen_actions.add(clean)
+                unique_actions.append(clean)
+
+        return {
+            "action": "monday-readiness",
+            "context_id": context,
+            "overall_status": overall_status,
+            "demo_ready": not required_failures,
+            "score": int(round(weighted_score * 100)),
+            "checks": checks,
+            "summary": {
+                "required_ready": len(required_checks) - len(required_failures),
+                "required_total": len(required_checks),
+                "optional_ready": len(optional_checks) - len(optional_failures),
+                "optional_total": len(optional_checks),
+                "blocked": sum(1 for check in checks if check["status"] == "blocked"),
+                "degraded": sum(1 for check in checks if check["status"] == "degraded"),
+            },
+            "critical_failures": [
+                {
+                    "id": check["id"],
+                    "label": check["label"],
+                    "detail": check["detail"],
+                }
+                for check in required_failures
+            ],
+            "recommended_actions": unique_actions,
+            "operator_steps": [
+                "Open the LaunchAgent dashboard at http://127.0.0.1:8765/?context_id=default.",
+                "Run Monday Readiness and resolve every required failure before demo use.",
+                "Use App Connect Detect, attach the target app, then snapshot exposed UI text or use selected-text capture for exact content.",
+                "Capture decisions and validation evidence into SYNAPSE-S2 before switching clients.",
+                "Generate an Evidence Pack after the demo run or before sharing claims.",
+            ],
+            "artifacts": artifacts,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "generated_at": time.time(),
         }
 
     def evidence_pack(self, *, context_id: str) -> dict[str, Any]:

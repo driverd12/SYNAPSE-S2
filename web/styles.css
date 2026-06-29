@@ -253,7 +253,7 @@ dd {
 .primary-button,
 .secondary-button,
 .danger-button,
-.core-state-indicator,
+.core-status-badge,
 .guard-button,
 .neural-inspector-toggle,
 .action-row {
@@ -773,13 +773,16 @@ textarea {
   min-height: 208px;
 }
 
-.core-state-indicator {
+.core-status-badge {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   align-self: start;
   min-height: 38px;
-  padding: 0 8px 0 10px;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 0 10px;
   color: var(--green);
   cursor: default;
   font-size: 11px;
@@ -787,37 +790,22 @@ textarea {
   text-transform: uppercase;
 }
 
-.switch-track {
-  position: relative;
+.core-status-dot {
   display: inline-block;
-  width: 42px;
-  height: 22px;
+  width: 9px;
+  height: 9px;
   border-radius: 999px;
-  background: linear-gradient(135deg, var(--teal), var(--teal-strong));
+  background: var(--green);
+  box-shadow: 0 0 0 4px var(--green-soft);
 }
 
-.switch-track span {
-  position: absolute;
-  top: 3px;
-  right: 3px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.22);
-  transition: transform 160ms ease;
-}
-
-.core-state-indicator.off {
+.core-status-badge.off {
   color: var(--red);
 }
 
-.core-state-indicator.off .switch-track {
-  background: var(--border-strong);
-}
-
-.core-state-indicator.off .switch-track span {
-  transform: translateX(-20px);
+.core-status-badge.off .core-status-dot {
+  background: var(--red);
+  box-shadow: 0 0 0 4px var(--red-soft);
 }
 
 .system-list {

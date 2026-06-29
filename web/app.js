@@ -137,6 +137,7 @@ const elements = collectElements([
   "memoryLedger",
   "memoryState",
   "modeLabel",
+  "mondayReadinessButton",
   "nativeCertifyButton",
   "neuralInspectorToggle",
   "neuralMathPanel",
@@ -346,8 +347,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   });
 
   state.coreToggle.enabled = enabled;
-  elements.toggleText.textContent = enabled ? "Enabled" : "Disabled";
-  elements.toggleActionState.textContent = enabled ? "Enabled" : "Disabled";
+  elements.toggleText.textContent = enabled ? "Core enabled" : "Core disabled";
   elements.coreStateIndicator.classList.toggle("off", !enabled);
   elements.coreStateIndicator.setAttribute(
     "aria-label",
@@ -554,6 +554,35 @@ function renderSelfTest(payload) {
       `;
       return item;
     });
+  elements.selfTestGrid.replaceChildren(...cards);
+}
+
+function renderMondayReadiness(payload) {
+  if (!payload) {
+    elements.selfTestGrid.replaceChildren();
+    return;
+  }
+  const status = String(payload.overall_status || "degraded");
+  const statusMode = status === "blocked" ? "error" : status === "degraded" ? "pending" : "ready";
+  const summary = payload.summary || {};
+  setSelfTestState(
+    `Monday readiness ${payload.score ?? "--"} / 100`,
+    `${formatNumber(summary.required_ready)} of ${formatNumber(summary.required_total)} required checks ready.`,
+    statusMode,
+  );
+  const cards = (payload.checks || []).map((check) => {
+    const item = document.createElement("article");
+    const itemStatus = String(check.status || "degraded");
+    const itemMode = itemStatus === "blocked" ? "blocked" : itemStatus === "degraded" ? "pending" : "ready";
+    const scope = check.required ? "required" : "optional";
+    item.className = `self-test-item ${itemMode}`;
+    item.innerHTML = `
+      <span>${escapeHtml(itemStatus)}</span>
+      <strong>${escapeHtml(check.label || check.id || "check")}</strong>
+      <small>${escapeHtml(`${scope} / ${check.detail || ""}`)}</small>
+    `;
+    return item;
+  });
   elements.selfTestGrid.replaceChildren(...cards);
 }
 
@@ -2186,6 +2215,7 @@ function updateCoreToggleGuard() {
   const lockedHint = "Locked. Press Unlock before enabling or disabling SYNAPSE-S2 Core.";
   const unlockedHint = `Unlocked for one ${nextAction.toLowerCase()} action. Relocks after use or timeout.`;
   elements.toggleActionButton.disabled = !unlocked;
+  elements.toggleActionState.textContent = nextAction;
   elements.coreUnlockButton.disabled = unlocked;
   elements.coreUnlockButton.textContent = unlocked ? "Unlocked" : "Unlock";
   elements.coreUnlockButton.setAttribute("aria-pressed", String(unlocked));
@@ -2224,6 +2254,23 @@ elements.refreshButton.addEventListener("click", () => {
 
 elements.refreshActionButton.addEventListener("click", () => {
   withBusy(elements.refreshActionButton, "Refresh", refreshSnapshot);
+});
+
+elements.mondayReadinessButton.addEventListener("click", () => {
+  withBusy(elements.mondayReadinessButton, "Monday readiness", async () => {
+    setSelfTestState("Monday readiness running", "Scoring runtime, memory, embeddings, App Connect, and recall.", "pending");
+    const payload = await requestJson("/api/monday-readiness", {
+      params: {
+        context_id: state.context,
+        include_apps: "true",
+      },
+    });
+    renderMondayReadiness(payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    setSelfTestState("Monday readiness failed", error.message, "error");
+    return null;
+  });
 });
 
 elements.profileButton.addEventListener("click", async () => {
