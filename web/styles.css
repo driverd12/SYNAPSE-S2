@@ -940,8 +940,15 @@ textarea {
 
 .operator-loop-grid {
   display: grid;
-  grid-template-columns: minmax(250px, 1fr) minmax(250px, 1fr) minmax(270px, 1.05fr) minmax(240px, 0.95fr);
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
   gap: 10px;
+}
+
+.quality-badge-stack {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .operator-loop-block {
@@ -988,6 +995,7 @@ textarea {
 .operator-output,
 .operator-mini-output,
 .hygiene-queue,
+.goal-ledger,
 .operator-recipes,
 .operator-receipts,
 .preview-receipt {
@@ -1011,7 +1019,9 @@ textarea {
 }
 
 .brief-section,
+.goal-item,
 .recipe-row,
+.recipe-card,
 .hygiene-item,
 .receipt-card {
   display: grid;
@@ -1065,6 +1075,8 @@ textarea {
 }
 
 .brief-section p,
+.goal-item p,
+.recipe-card p,
 .receipt-card p,
 .hygiene-item p,
 .operator-mini-output p {
@@ -1100,6 +1112,59 @@ textarea {
   padding: 0 10px;
   font-size: 11px;
   font-weight: 800;
+}
+
+.brief-meta,
+.recall-evidence,
+.goal-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  color: var(--muted);
+  font-family: var(--terminal-font);
+  font-size: 10px;
+  font-weight: 720;
+  text-transform: uppercase;
+}
+
+.recipe-drawer {
+  position: fixed;
+  z-index: 38;
+  right: 14px;
+  top: 82px;
+  display: grid;
+  gap: 10px;
+  width: min(420px, calc(100vw - 28px));
+  max-height: calc(100vh - 120px);
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, var(--magenta) 38%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 94%, black);
+  box-shadow: var(--shadow);
+  padding: 12px;
+}
+
+.recipe-drawer[hidden] {
+  display: none;
+}
+
+.recipe-drawer-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.recipe-checklist {
+  display: grid;
+  gap: 8px;
+}
+
+.recipe-card ol {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .analysis-grid {
@@ -2571,10 +2636,10 @@ textarea {
 
 .result-card {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) auto;
-  align-items: center;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: start;
   gap: 8px;
-  min-height: 52px;
+  min-height: 78px;
   border: 1px solid var(--row);
   border-radius: var(--radius);
   background: var(--panel-soft);
@@ -2611,10 +2676,14 @@ textarea {
 
 .result-actions {
   display: flex;
-  justify-content: flex-end;
+  flex-wrap: wrap;
+  grid-column: 2;
+  justify-content: flex-start;
+  gap: 6px;
 }
 
-.recall-pin-button {
+.recall-pin-button,
+.recall-moderate-button {
   min-height: 30px;
   padding: 0 10px;
   font-size: 12px;

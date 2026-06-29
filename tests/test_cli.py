@@ -362,6 +362,73 @@ class SynapseCliTests(unittest.TestCase):
         self.assertGreaterEqual(wrapped_payload["event_count"], 1)
         self.assertEqual(wrapped_payload["receipt"]["status"], "ready")
 
+    def test_cli_goal_ledger_create_update_and_list(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            created = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "goal.create",
+                "--context",
+                "demo",
+                "--agent-id",
+                "codex-desktop",
+                "--title",
+                "Prepare SYNAPSE-S2 Monday operator demo",
+                "--owner",
+                "operator",
+                "--goal-state",
+                "in_progress",
+                "--next-action",
+                "Run Start Work and verify receipts.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            created_payload = json.loads(created.stdout) if created.stdout else {}
+            updated = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "goal.update",
+                "--context",
+                "demo",
+                "--agent-id",
+                "codex-desktop",
+                "--goal-id",
+                created_payload.get("memory_id", ""),
+                "--goal-state",
+                "blocked",
+                "--evidence",
+                "Blocked until the GitHub mirror repository exists.",
+                "--next-action",
+                "Create private GitHub repo or sign in.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            listed = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "goal.list",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        for result in (created, updated, listed):
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        create_payload = json.loads(created.stdout)
+        update_payload = json.loads(updated.stdout)
+        list_payload = json.loads(listed.stdout)
+        self.assertEqual(create_payload["action"], "goal-create")
+        self.assertEqual(update_payload["action"], "goal-update")
+        self.assertEqual(list_payload["action"], "goal-list")
+        self.assertTrue(list_payload["goals"])
+        self.assertEqual(list_payload["goals"][0]["state"], "blocked")
+        self.assertIn("Monday operator demo", list_payload["goals"][0]["title"])
+
     def test_cli_certify_runtime_writes_evidence_pack(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
@@ -902,6 +969,61 @@ class SynapseCliTests(unittest.TestCase):
         self.assertIn("source_text_bytes", first_payload["events"][0]["payload_summary"])
         self.assertEqual(second_payload["new_event_count"], 0)
         self.assertEqual(second_payload["since_event_id"], event_id)
+
+    def test_cli_agent_brief_morning_mode_returns_operator_start_work_sections(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+
+            remember = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "remember-text",
+                "--context",
+                "demo",
+                "--tag",
+                "morning-brief-memory",
+                "--text",
+                "Decision: Morning Brief should tell the operator what to verify before touching code.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            brief = self.run_cli(
+                "--embedding-provider",
+                "semantic-hash",
+                "agent-brief",
+                "--mode",
+                "morning",
+                "--context",
+                "demo",
+                "--agent-id",
+                "cli-agent",
+                "--prompt",
+                "Morning Brief operator workflow",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        self.assertEqual(brief.returncode, 0, brief.stderr)
+        payload = json.loads(brief.stdout)
+        self.assertEqual(payload["action"], "agent-brief-morning")
+        self.assertEqual(payload["mode"], "morning")
+        section_ids = [section["id"] for section in payload["brief_sections"]]
+        self.assertEqual(
+            section_ids[:5],
+            [
+                "current_objective",
+                "relevant_memories",
+                "open_risks",
+                "recent_app_session_traces",
+                "recommended_next_actions",
+            ],
+        )
+        for section in payload["brief_sections"][:5]:
+            self.assertIn("confidence", section)
+            self.assertIn("source_memories", section)
+        self.assertEqual(payload["receipt"]["action"], "agent-brief-morning")
 
     def test_cli_cortex_governor_enters_ticks_commits_and_reports_state(self):
         with TemporaryDirectory() as tmp:

@@ -293,6 +293,7 @@ class TranscriptCaptureManager:
             "input_sha256": _sha256_text(snapshot_text),
             "snapshot_quality": quality,
             "quality_badge": badge,
+            "capability_badge": self._app_capability_badge(connection, quality=quality),
             "capture_guidance": self._app_capture_guidance(
                 connection=connection,
                 quality=quality,
@@ -334,6 +335,7 @@ class TranscriptCaptureManager:
             "input_sha256": "",
             "snapshot_quality": quality,
             "quality_badge": badge,
+            "capability_badge": self._app_capability_badge(connection, quality=quality),
             "capture_guidance": self._app_capture_guidance(
                 connection=connection,
                 quality=quality,
@@ -404,6 +406,7 @@ class TranscriptCaptureManager:
             "redaction_count": int(redaction_count),
             "snapshot_quality": snapshot_quality,
             "quality_badge": quality_badge,
+            "capability_badge": self._app_capability_badge(connection, quality=snapshot_quality),
             "capture_guidance": self._app_capture_guidance(
                 connection=connection,
                 quality=snapshot_quality,
@@ -1227,10 +1230,76 @@ class TranscriptCaptureManager:
             "speaker": str(connection.get("speaker") or "operator"),
             "enabled": bool(connection.get("enabled", True)),
             "adapter_kinds": list(connection.get("adapter_kinds") or []),
+            "capability_badge": self._app_capability_badge(connection),
             "created_at": float(connection.get("created_at") or 0.0),
             "updated_at": float(connection.get("updated_at") or 0.0),
             "metadata": _json_safe(connection.get("metadata") or {}, {}),
             "consent": _json_safe(connection.get("consent") or {}, {}),
+        }
+
+    def _app_capability_badge(
+        self,
+        connection: dict[str, Any],
+        *,
+        quality: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        app_name = str(connection.get("app_name") or "").lower()
+        bundle_id = str(connection.get("bundle_id") or "").lower()
+        quality_id = str((quality or {}).get("quality") or "")
+        if quality_id == "blocked":
+            return {
+                "level": "accessibility_blocked",
+                "label": "Accessibility blocked",
+                "detail": "The app did not expose readable UI text to the local snapshot adapter.",
+                "recommended_capture": "Select the relevant text in the app and use Capture selected text.",
+            }
+        if quality_id == "high":
+            return {
+                "level": "rich_text_available",
+                "label": "Rich text available",
+                "detail": "Accessibility returned enough distinct text for a useful memory snapshot.",
+                "recommended_capture": "Preview, confirm the text is useful, then snapshot to memory.",
+            }
+        if quality_id in {"low", "degraded"}:
+            return {
+                "level": "selection_capture_recommended",
+                "label": "Selection capture recommended",
+                "detail": "The app exposed limited or repetitive text; exact selected text will be more trustworthy.",
+                "recommended_capture": "Select the important text in the app and use Capture selected text.",
+            }
+        if "chrome" in app_name or "chrome" in bundle_id:
+            return {
+                "level": "selection_capture_recommended",
+                "label": "Chrome selected text best",
+                "detail": "Chrome reliably provides tab title and URL, but page internals vary by site.",
+                "recommended_capture": "Capture active tab metadata plus selected page text.",
+            }
+        if "cursor" in app_name or "cursor" in bundle_id:
+            return {
+                "level": "selection_capture_recommended",
+                "label": "Cursor selection best",
+                "detail": "Editor and terminal internals are often low-signal through Accessibility snapshots.",
+                "recommended_capture": "Select editor or terminal text before capture.",
+            }
+        if "terminal" in app_name or "iterm" in app_name:
+            return {
+                "level": "selection_capture_recommended",
+                "label": "Terminal selection best",
+                "detail": "Terminal snapshots can include chrome or stale scrollback.",
+                "recommended_capture": "Select the command output you want remembered.",
+            }
+        if "codex" in app_name or "openai" in bundle_id:
+            return {
+                "level": "selection_capture_recommended",
+                "label": "Codex selected text best",
+                "detail": "Thread chrome is visible, but exact conversation or terminal content should be selected.",
+                "recommended_capture": "Select the relevant Codex text or terminal output before capture.",
+            }
+        return {
+            "level": "window_metadata_only",
+            "label": "Window metadata only",
+            "detail": "This app has no specialized adapter yet; snapshot quality depends on Accessibility output.",
+            "recommended_capture": "Preview first, then use selected-text capture if the preview is low signal.",
         }
 
 

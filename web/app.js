@@ -481,6 +481,7 @@ const elements = collectElements([
   "footerHealth",
   "footerMemory",
   "footerTime",
+  "goalLedger",
   "graphActiveCount",
   "graphEdgeCount",
   "graphLastPrune",
@@ -507,6 +508,7 @@ const elements = collectElements([
   "memoryDbLabel",
   "memoryHygieneButton",
   "memoryHygieneQueue",
+  "memoryQualityBadge",
   "memoryLedger",
   "memoryState",
   "modeLabel",
@@ -541,6 +543,10 @@ const elements = collectElements([
   "queryResults",
   "quickPruneButton",
   "recallLimit",
+  "recipeChecklist",
+  "recipeDrawer",
+  "recipesCloseButton",
+  "recipesToggleButton",
   "refreshActionButton",
   "refreshButton",
   "rememberForm",
@@ -607,6 +613,7 @@ initializeGraphInteractions();
 initializeSectionNavigation();
 initializeWizard();
 renderOperatorRecipes(defaultOperatorRecipes());
+renderRecipeDrawer(defaultOperatorRecipes());
 
 function collectElements(ids) {
   return Object.fromEntries(ids.map((id) => [id, requiredElement(id)]));
@@ -892,10 +899,10 @@ function renderAppConnect(appPayload = null, connectionPayload = null) {
   ];
   state.appConnect.connections.forEach((connection) => {
     const option = new Option(
-      `${connection.app_name} -> ${connection.source_tag}`,
+      `${connection.app_name} -> ${connection.source_tag} / ${appCapabilityLabel(connection)}`,
       connection.connection_id,
     );
-    option.title = `${connection.bundle_id || "no bundle id"} pid:${connection.pid || 0}`;
+    option.title = `${connection.bundle_id || "no bundle id"} pid:${connection.pid || 0} / ${connection.capability_badge?.detail || ""}`;
     connectionOptions.push(option);
   });
   elements.appConnectionSelect.replaceChildren(...connectionOptions);
@@ -911,7 +918,7 @@ function renderAppConnect(appPayload = null, connectionPayload = null) {
       ? `${formatNumber(detected)} running app${detected === 1 ? "" : "s"} detected`
       : "App Connect idle";
   const detail = connected
-    ? "Choose an attached connection and snapshot locally exposed Accessibility text into memory; use selected-text fallback for exact content."
+    ? `Choose an attached connection and preview before capture. ${appCapabilityLabel(state.appConnect.connections[0])}: ${state.appConnect.connections[0]?.capability_badge?.recommended_capture || "Use selected-text fallback for exact content."}`
     : detected
       ? "Select a detected app, set a source tag, then connect it before capturing exposed UI text."
       : "Detect local apps, attach one, then capture locally exposed Accessibility text into SYNAPSE-S2 memory.";
@@ -1109,11 +1116,17 @@ function renderStartWork(payload) {
   renderContextHealth(payload.context_health);
   renderMemoryHygiene(payload.memory_hygiene);
   renderOperatorRecipes(payload.recipes || []);
+  renderRecipeDrawer(payload.recipes || []);
+  renderGoalLedger(payload.goals_ledger || payload.agent_brief?.cortex_state || null);
   const sections = (payload.brief_sections || []).slice(0, 5);
   elements.startWorkOutput.innerHTML = sections.map((section) => `
     <article class="brief-section ${escapeHtml(section.status || "degraded")}">
       <span>${escapeHtml(section.status || "degraded")}</span>
       <strong>${escapeHtml(section.title || section.id || "Brief section")}</strong>
+      <small class="brief-meta">
+        <b>${escapeHtml(`confidence ${formatNumber(section.confidence, 2)}`)}</b>
+        <b>${escapeHtml(`${(section.source_memories || []).length} source memories`)}</b>
+      </small>
       <p>${escapeHtml(section.body || "")}</p>
     </article>
   `).join("") || "No Start Work sections returned";
@@ -1124,6 +1137,8 @@ function renderContextHealth(payload) {
   const status = String(payload.status || "degraded");
   elements.contextHealthBadge.textContent = `Context Health ${formatNumber(payload.score)} / 100`;
   elements.contextHealthBadge.className = `quality-badge ${status}`;
+  elements.memoryQualityBadge.textContent = `Memory Quality ${formatNumber(payload.memory_quality_score)} / 100`;
+  elements.memoryQualityBadge.className = `quality-badge ${status}`;
   elements.contextHealthOutput.innerHTML = `
     <strong>${escapeHtml(status)}</strong>
     <small>Memory quality ${escapeHtml(formatNumber(payload.memory_quality_score))} / 100</small>
@@ -1172,6 +1187,7 @@ function renderOperatorRecipes(recipes) {
       <small>${escapeHtml((recipe.steps || []).slice(0, 3).join(" / "))}</small>
     </article>
   `).join("");
+  renderRecipeDrawer(visible);
 }
 
 function defaultOperatorRecipes() {
@@ -1181,14 +1197,98 @@ function defaultOperatorRecipes() {
       steps: ["Run Start Work", "Resolve health blockers", "Recall prior decisions"],
     },
     {
+      title: "Resume yesterday's work",
+      steps: ["Run Start Work", "Open recent session traces", "Pin relevant memory", "Enter Cortex"],
+    },
+    {
       title: "Capture from an app",
       steps: ["Connect app", "Preview snapshot", "Capture only useful text"],
+    },
+    {
+      title: "Capture exact selected text",
+      steps: ["Select text in the source app", "Paste into selected-text fallback", "Capture selected text"],
+    },
+    {
+      title: "Verify before claiming success",
+      steps: ["Run Doctor / Repair", "Check operation receipts", "Commit validation trace"],
+    },
+    {
+      title: "Clean bad memory",
+      steps: ["Run Memory Hygiene", "Review stale or noisy traces", "Promote, demote, prune, or mark resolved"],
     },
     {
       title: "Wrap a session",
       steps: ["Summarize decisions", "Preview wrap", "Confirm capture"],
     },
+    {
+      title: "Create evidence pack",
+      steps: ["Run Doctor", "Run Evidence Pack", "Keep receipt with backup path"],
+    },
   ];
+}
+
+function renderRecipeDrawer(recipes) {
+  const visible = recipes.length ? recipes : defaultOperatorRecipes();
+  elements.recipeChecklist.innerHTML = visible.map((recipe) => `
+    <article class="recipe-card">
+      <strong>${escapeHtml(recipe.title || recipe.id || "Recipe")}</strong>
+      <p>${escapeHtml(recipe.description || "Follow this checklist against the live dashboard controls.")}</p>
+      <ol>
+        ${(recipe.steps || []).map((step) => `<li>${escapeHtml(step)}</li>`).join("")}
+      </ol>
+    </article>
+  `).join("");
+}
+
+function renderGoalLedger(goals) {
+  const ledgerGoals = Array.isArray(goals?.goals)
+    ? goals.goals
+    : Array.isArray(goals)
+      ? goals
+      : [];
+  const source = goals?.active_goal || goals?.current_goal || "";
+  const activeSessions = Array.isArray(goals?.active_sessions) ? goals.active_sessions : [];
+  const risks = [
+    ...(Array.isArray(goals?.risks) ? goals.risks : []),
+    ...(Array.isArray(goals?.stale_or_uncertain_memories) ? goals.stale_or_uncertain_memories : []),
+  ];
+  const nextMove = goals?.suggested_next_move || "Run Start Work, define the task, then enter Cortex before risky work.";
+  if (ledgerGoals.length) {
+    elements.goalLedger.innerHTML = ledgerGoals.slice(0, 4).map((goal) => {
+      const stateLabel = String(goal.state || "planned").replaceAll("_", " ");
+      const confidence = Number(goal.confidence ?? NaN);
+      const meta = [
+        stateLabel,
+        goal.owner ? `owner: ${goal.owner}` : "",
+        Number.isFinite(confidence) ? `${formatNumber(confidence, 2)} confidence` : "",
+      ].filter(Boolean);
+      const evidence = goal.last_verified_evidence
+        ? `<p><b>Evidence:</b> ${escapeHtml(compactTag(goal.last_verified_evidence, 180))}</p>`
+        : "";
+      return `
+        <article class="goal-item">
+          <strong>${escapeHtml(goal.title || goal.goal_id || "Untitled goal")}</strong>
+          <small class="goal-meta">
+            ${meta.map((item) => `<b>${escapeHtml(item)}</b>`).join("")}
+          </small>
+          <p>${escapeHtml(goal.next_action || nextMove)}</p>
+          ${evidence}
+        </article>
+      `;
+    }).join("");
+    return;
+  }
+  const activeGoal = source || "No active goal recorded.";
+  elements.goalLedger.innerHTML = `
+    <article class="goal-item">
+      <strong>${escapeHtml(activeGoal)}</strong>
+      <small class="goal-meta">
+        <b>${escapeHtml(activeSessions.length ? "in progress" : "planned")}</b>
+        <b>${escapeHtml(`${formatNumber(risks.length)} open risks`)}</b>
+      </small>
+      <p>${escapeHtml(nextMove)}</p>
+    </article>
+  `;
 }
 
 function renderWrapSessionPreview(payload) {
@@ -1240,6 +1340,10 @@ function appOptionLabel(app) {
   const pid = Number(app.pid || 0);
   const bundle = app.bundle_id ? ` / ${app.bundle_id}` : "";
   return `${app.app_name}${bundle}${pid ? ` / pid ${pid}` : ""}`;
+}
+
+function appCapabilityLabel(record) {
+  return record?.capability_badge?.label || "Selection capture recommended";
 }
 
 function renderOperatorActionBanner(cortex, derived = {}) {
@@ -1369,6 +1473,7 @@ function renderCortexState(cortex) {
     lastDecision,
     warnings,
   });
+  renderGoalLedger(cortex);
 
   elements.cortexHighConfidence.innerHTML = renderCortexMemoryList(
     highConfidence,
@@ -2482,6 +2587,18 @@ function resultCard(item) {
   const title = item.label || item.tag || item.raw || "--";
   const identity = item.tag && item.tag !== title ? `${item.tag}${facets}` : facets.replace(/^ \/ /, "");
   const memoryId = String(item.memory_id || "");
+  const provenance = [
+    item.tag ? `source ${item.tag}` : "",
+    item.context_id ? `context ${item.context_id}` : "",
+    memoryId ? `id ${compactMemoryId(memoryId)}` : "",
+  ].filter(Boolean).join(" / ");
+  const whyMatched = [
+    Number.isFinite(Number(item.score)) ? "embedding score" : "",
+    Number.isFinite(Number(item.weight)) ? "graph relationship weight" : "",
+    item.relation_type ? `related by ${item.relation_type}` : "",
+    Array.isArray(item.facets) && item.facets.length ? "facet overlap" : "",
+    item.context_id ? "same context namespace" : "",
+  ].filter(Boolean).join(" / ") || "status result";
   const recallAction = memoryId
     ? `<div class="result-actions">
         <button type="button"
@@ -2489,7 +2606,28 @@ function resultCard(item) {
           data-recall-action="pin"
           data-memory-id="${escapeHtml(memoryId)}"
           data-recall-label="${escapeHtml(title)}">
-          Pin
+          Use this memory now
+        </button>
+        <button type="button"
+          class="recall-moderate-button"
+          data-recall-action="promote"
+          data-memory-id="${escapeHtml(memoryId)}"
+          data-recall-label="${escapeHtml(title)}">
+          Promote
+        </button>
+        <button type="button"
+          class="recall-moderate-button"
+          data-recall-action="demote"
+          data-memory-id="${escapeHtml(memoryId)}"
+          data-recall-label="${escapeHtml(title)}">
+          Demote
+        </button>
+        <button type="button"
+          class="recall-moderate-button danger-button"
+          data-recall-action="prune"
+          data-memory-id="${escapeHtml(memoryId)}"
+          data-recall-label="${escapeHtml(title)}">
+          Prune
         </button>
       </div>`
     : "";
@@ -2499,6 +2637,8 @@ function resultCard(item) {
       <div class="result-body">
         <strong>${escapeHtml(title)}</strong>
         <small>${escapeHtml(`${score}${relation}${context}${identity ? ` / ${identity}` : ""}`)}</small>
+        <small class="recall-evidence"><b>Why this matched</b> ${escapeHtml(whyMatched)}</small>
+        <small class="recall-evidence">${escapeHtml(provenance || "No source memory id available")}</small>
         ${item.summary ? `<p>${escapeHtml(compactTag(item.summary, 120))}</p>` : ""}
       </div>
       ${recallAction}
@@ -2530,6 +2670,35 @@ async function pinRecallMemory(button) {
     return payload;
   }).catch((error) => {
     logOperation("Pin recall failed", error.message);
+    return null;
+  });
+}
+
+async function moderateRecallMemory(button) {
+  const memoryId = button.dataset.memoryId || "";
+  const action = button.dataset.recallAction || "";
+  const label = button.dataset.recallLabel || compactMemoryId(memoryId);
+  if (!memoryId || !["promote", "demote", "prune"].includes(action)) return null;
+  if (action === "prune" && !confirmPrune(label)) {
+    logOperation("Recall prune cancelled", label);
+    return null;
+  }
+  return withBusy(button, `${action} recall`, async () => {
+    const payload = await requestJson("/api/cortex/moderate", {
+      method: "POST",
+      body: {
+        context_id: state.context,
+        memory_id: memoryId,
+        action,
+        reason: `dashboard ${action} from Recall Console`,
+        confirm: action === "prune",
+      },
+    });
+    await publishAwareResult(payload);
+    logOperation(`Recall ${action}`, payload);
+    return payload;
+  }, { refresh: false }).catch((error) => {
+    logOperation(`Recall ${action} failed`, error.message);
     return null;
   });
 }
@@ -2931,13 +3100,14 @@ async function previewConnectedAppSnapshot(button) {
 
 function renderAppSnapshotPreview(payload) {
   const badge = payload.quality_badge || {};
+  const capability = payload.capability_badge || {};
   const status = String(badge.status || "degraded");
   const quality = payload.snapshot_quality || {};
   elements.appPreviewReceipt.innerHTML = `
     <article class="receipt-card ${escapeHtml(status)}">
       <span>${escapeHtml(status)}</span>
       <strong>${escapeHtml(badge.label || "Snapshot preview")}</strong>
-      <small>${escapeHtml(`${formatNumber(quality.line_count)} lines / ${formatNumber(quality.signal_chars)} signal chars`)}</small>
+      <small>${escapeHtml(`${capability.label || "Capability unknown"} / ${formatNumber(quality.line_count)} lines / ${formatNumber(quality.signal_chars)} signal chars`)}</small>
       <p>${escapeHtml((payload.capture_guidance || []).join(" "))}</p>
       <pre>${escapeHtml(payload.preview_text || "")}</pre>
     </article>
@@ -3360,6 +3530,17 @@ elements.refreshActionButton.addEventListener("click", () => {
   withBusy(elements.refreshActionButton, "Refresh", refreshSnapshot);
 });
 
+elements.recipesToggleButton.addEventListener("click", () => {
+  const nextOpen = elements.recipeDrawer.hidden;
+  elements.recipeDrawer.hidden = !nextOpen;
+  elements.recipesToggleButton.setAttribute("aria-expanded", String(nextOpen));
+});
+
+elements.recipesCloseButton.addEventListener("click", () => {
+  elements.recipeDrawer.hidden = true;
+  elements.recipesToggleButton.setAttribute("aria-expanded", "false");
+});
+
 elements.startWorkButton.addEventListener("click", () => {
   runStartWork(elements.startWorkButton);
 });
@@ -3633,10 +3814,14 @@ elements.queryForm.addEventListener("submit", async (event) => {
 });
 
 elements.queryResults.addEventListener("click", (event) => {
-  const button = event.target.closest?.("[data-recall-action='pin']");
+  const button = event.target.closest?.("[data-recall-action]");
   if (!button) return;
   event.preventDefault();
-  pinRecallMemory(button);
+  if (button.dataset.recallAction === "pin") {
+    pinRecallMemory(button);
+    return;
+  }
+  moderateRecallMemory(button);
 });
 
 elements.recallLimit.addEventListener("change", () => {

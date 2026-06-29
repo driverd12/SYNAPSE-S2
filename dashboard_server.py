@@ -1466,42 +1466,33 @@ class DashboardRuntime:
             acknowledge=True,
         )
         recipes = self.operator_recipes()
-        brief_sections = [
-            {
-                "id": "health",
-                "title": "Context health",
-                "status": health["status"],
-                "body": f"{health['score']}/100 with memory quality {health['memory_quality_score']}/100.",
-            },
-            {
-                "id": "events",
-                "title": "New durable events",
-                "status": "ready" if hydrate.get("new_event_count", 0) else "degraded",
-                "body": f"{hydrate.get('new_event_count', 0)} new context-bus events since last cursor.",
-                "items": hydrate.get("events", [])[:5],
-            },
-            {
-                "id": "recall",
-                "title": "Recall evidence",
-                "status": "ready" if hydrate.get("recall_items") else "degraded",
-                "body": hydrate.get("recall_result") or "No prompt recall yet; run Recall or capture current work.",
-                "items": hydrate.get("recall_items", [])[:5],
-            },
-            {
-                "id": "hygiene",
-                "title": "Memory hygiene",
-                "status": hygiene["status"],
-                "body": f"{hygiene['backlog_count']} review items waiting.",
-                "items": hygiene.get("review_items", [])[:5],
-            },
-            {
-                "id": "recipes",
-                "title": "Recommended recipes",
-                "status": "ready",
-                "body": "Use the first recipe that matches the current operator moment.",
-                "items": recipes[:3],
-            },
-        ]
+        cortex_state = hydrate.get("cortex_state") if isinstance(hydrate.get("cortex_state"), dict) else {}
+        current_objective = (
+            str(cortex_state.get("active_goal") or "").strip()
+            or str(prompt or "").strip()
+            or "No active goal recorded. Define the task in Cortex Governor before mutating files."
+        )
+        recall_items = list(hydrate.get("recall_items") or [])[:5]
+        risks = self._unique_dict_items(
+            [
+                *list(cortex_state.get("risks") or []),
+                *list(cortex_state.get("unverified_assumptions") or []),
+                *list(cortex_state.get("stale_or_uncertain_memories") or []),
+                *list(cortex_state.get("contradictions") or []),
+            ],
+            key="memory_id",
+        )[:5]
+        recent_traces = [
+            event
+            for event in hydrate.get("events", [])[:10]
+            if any(
+                token in str(event.get(field, "")).lower()
+                for field in ("source_surface", "event_type", "summary")
+                for token in ("app", "session", "client", "wrap", "capture")
+            )
+        ][:5]
+        if not recent_traces:
+            recent_traces = list(hydrate.get("events", [])[:5])
         next_actions = self._unique_strings(
             [
                 *list(health.get("recommended_actions") or []),
@@ -1510,6 +1501,108 @@ class DashboardRuntime:
                 "Capture a Wrap Session before switching projects or clients.",
             ]
         )[:8]
+        brief_sections = [
+            {
+                "id": "current_objective",
+                "title": "Current objective",
+                "status": "ready" if current_objective else "degraded",
+                "body": current_objective,
+                "items": [{"label": current_objective}],
+                "confidence": 0.86 if cortex_state.get("active_goal") else 0.58,
+                "source_memories": self._source_memory_refs(cortex_state.get("active_sessions") or []),
+            },
+            {
+                "id": "relevant_memories",
+                "title": "Relevant memories",
+                "status": "ready" if recall_items else "degraded",
+                "body": hydrate.get("recall_result") or "No relevant memories recalled yet; capture or query current context.",
+                "items": recall_items,
+                "confidence": 0.82 if recall_items else 0.42,
+                "source_memories": self._source_memory_refs(recall_items, hydrate.get("graph_entries") or []),
+            },
+            {
+                "id": "open_risks",
+                "title": "Open risks",
+                "status": "blocked" if cortex_state.get("contradictions") else "degraded" if risks or hygiene.get("backlog_count") else "ready",
+                "body": (
+                    f"{len(risks)} risks or uncertain traces; {hygiene.get('backlog_count', 0)} hygiene items."
+                    if risks or hygiene.get("backlog_count")
+                    else "No unresolved risks surfaced in the current context."
+                ),
+                "items": risks or hygiene.get("review_items", [])[:3],
+                "confidence": 0.78 if risks or hygiene.get("backlog_count") else 0.9,
+                "source_memories": self._source_memory_refs(risks, hygiene.get("review_items", [])),
+            },
+            {
+                "id": "recent_app_session_traces",
+                "title": "Recent app/session traces",
+                "status": "ready" if recent_traces else "degraded",
+                "body": (
+                    f"{len(recent_traces)} recent app, session, capture, or context-bus traces."
+                    if recent_traces
+                    else "No recent app or session traces for this cursor."
+                ),
+                "items": recent_traces,
+                "confidence": 0.74 if recent_traces else 0.44,
+                "source_memories": self._source_memory_refs(recent_traces),
+            },
+            {
+                "id": "recommended_next_actions",
+                "title": "Recommended next 3 actions",
+                "status": "ready",
+                "body": "Follow these before touching code or claiming success.",
+                "items": next_actions[:3],
+                "confidence": 0.88,
+                "source_memories": self._source_memory_refs(
+                    health.get("factors", []),
+                    hygiene.get("review_items", []),
+                ),
+            },
+            {
+                "id": "health",
+                "title": "Context health",
+                "status": health["status"],
+                "body": f"{health['score']}/100 with memory quality {health['memory_quality_score']}/100.",
+                "confidence": 0.84,
+                "source_memories": [],
+            },
+            {
+                "id": "events",
+                "title": "New durable events",
+                "status": "ready" if hydrate.get("new_event_count", 0) else "degraded",
+                "body": f"{hydrate.get('new_event_count', 0)} new context-bus events since last cursor.",
+                "items": hydrate.get("events", [])[:5],
+                "confidence": 0.8 if hydrate.get("new_event_count", 0) else 0.55,
+                "source_memories": self._source_memory_refs(hydrate.get("events", [])),
+            },
+            {
+                "id": "recall",
+                "title": "Recall evidence",
+                "status": "ready" if hydrate.get("recall_items") else "degraded",
+                "body": hydrate.get("recall_result") or "No prompt recall yet; run Recall or capture current work.",
+                "items": hydrate.get("recall_items", [])[:5],
+                "confidence": 0.82 if hydrate.get("recall_items") else 0.42,
+                "source_memories": self._source_memory_refs(hydrate.get("recall_items", [])),
+            },
+            {
+                "id": "hygiene",
+                "title": "Memory hygiene",
+                "status": hygiene["status"],
+                "body": f"{hygiene['backlog_count']} review items waiting.",
+                "items": hygiene.get("review_items", [])[:5],
+                "confidence": max(0.35, min(0.95, 1.0 - (int(hygiene.get("backlog_count") or 0) * 0.08))),
+                "source_memories": self._source_memory_refs(hygiene.get("review_items", [])),
+            },
+            {
+                "id": "recipes",
+                "title": "Recommended recipes",
+                "status": "ready",
+                "body": "Use the first recipe that matches the current operator moment.",
+                "items": recipes[:3],
+                "confidence": 0.88,
+                "source_memories": [],
+            },
+        ]
         return {
             "action": "start-work",
             "context_id": context,
@@ -1524,6 +1617,7 @@ class DashboardRuntime:
             "context_health": health,
             "memory_hygiene": hygiene,
             "agent_brief": hydrate,
+            "goals_ledger": cortex_state,
             "receipt": self._operation_receipt(
                 action="start-work",
                 status=health["status"],
@@ -1536,11 +1630,82 @@ class DashboardRuntime:
             "generated_at": time.time(),
         }
 
+    def _source_memory_refs(self, *collections: Any) -> list[dict[str, str]]:
+        refs: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        def add_ref(memory_id: str, label: str = "", source: str = "") -> None:
+            clean_id = str(memory_id or "").strip()
+            if not clean_id or clean_id in seen:
+                return
+            seen.add(clean_id)
+            refs.append(
+                {
+                    "memory_id": clean_id,
+                    "label": self._compact_text(str(label or clean_id), 96),
+                    "source": self._compact_text(str(source or "memory"), 48),
+                }
+            )
+
+        def visit(item: Any, source: str = "") -> None:
+            if isinstance(item, dict):
+                memory_id = (
+                    item.get("memory_id")
+                    or item.get("pinned_memory_id")
+                    or item.get("source_memory_id")
+                    or item.get("target_memory_id")
+                )
+                label = (
+                    item.get("tag")
+                    or item.get("label")
+                    or item.get("summary")
+                    or item.get("excerpt")
+                    or item.get("event_type")
+                    or memory_id
+                )
+                if memory_id:
+                    add_ref(str(memory_id), str(label or memory_id), source or str(item.get("source_surface") or "memory"))
+                for nested_key in ("items", "events", "relationships", "source_memories"):
+                    nested = item.get(nested_key)
+                    if isinstance(nested, list):
+                        visit(nested, source or nested_key)
+                return
+            if isinstance(item, str):
+                for match in re.finditer(r"\bid=([^,\)\s]+)", item):
+                    add_ref(match.group(1), item.split("(", 1)[0].strip(), source or "recall")
+                return
+            if isinstance(item, (list, tuple)):
+                for nested_item in item:
+                    visit(nested_item, source)
+
+        for collection in collections:
+            visit(collection)
+        return refs[:8]
+
+    def _unique_dict_items(
+        self,
+        items: list[Any],
+        *,
+        key: str,
+    ) -> list[dict[str, Any]]:
+        unique: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            identity = str(item.get(key) or item.get("tag") or item.get("excerpt") or item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(item)
+        return unique
+
     def operator_recipes(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": "daily_start",
                 "title": "Start daily work",
+                "description": "Open the daily trust loop before relying on memory or changing code.",
                 "steps": [
                     "Run Start Work.",
                     "Resolve Doctor or Context Health blockers.",
@@ -1548,8 +1713,20 @@ class DashboardRuntime:
                 ],
             },
             {
+                "id": "resume_work",
+                "title": "Resume yesterday's work",
+                "description": "Recover objective, risks, and useful traces before continuing.",
+                "steps": [
+                    "Run Start Work.",
+                    "Review recent app/session traces.",
+                    "Pin relevant memory into working context.",
+                    "Enter Cortex before risky changes.",
+                ],
+            },
+            {
                 "id": "app_capture",
                 "title": "Capture from an app",
+                "description": "Attach a running local app and write only useful, previewed context.",
                 "steps": [
                     "Detect apps and connect the target app.",
                     "Preview the app snapshot and inspect the quality badge.",
@@ -1557,8 +1734,39 @@ class DashboardRuntime:
                 ],
             },
             {
+                "id": "selected_text_capture",
+                "title": "Capture exact selected text",
+                "description": "Use this when Accessibility only exposes window metadata.",
+                "steps": [
+                    "Select the relevant text in the source app.",
+                    "Use the selected-text fallback.",
+                    "Confirm the receipt includes the expected source tag.",
+                ],
+            },
+            {
+                "id": "verify_before_claim",
+                "title": "Verify before claiming success",
+                "description": "Turn validation evidence into governed memory.",
+                "steps": [
+                    "Run Doctor / Repair.",
+                    "Run the relevant test or self-test.",
+                    "Commit a validation trace or Wrap Session with evidence.",
+                ],
+            },
+            {
+                "id": "memory_cleanup",
+                "title": "Clean bad memory",
+                "description": "Keep the graph useful by removing stale, noisy, or conflicting traces.",
+                "steps": [
+                    "Run Memory Hygiene.",
+                    "Review stale, duplicate, low-confidence, or sensitive-looking items.",
+                    "Promote, demote, prune, merge, or mark resolved.",
+                ],
+            },
+            {
                 "id": "handoff",
                 "title": "Wrap a session",
+                "description": "Capture the final verified state before switching tools or people.",
                 "steps": [
                     "Summarize decisions, tests, and follow-ups.",
                     "Preview Wrap Session.",
@@ -1566,12 +1774,13 @@ class DashboardRuntime:
                 ],
             },
             {
-                "id": "repair",
-                "title": "Repair reliability",
+                "id": "evidence_pack",
+                "title": "Create evidence pack",
+                "description": "Collect proof before showing the system to someone else.",
                 "steps": [
-                    "Run Doctor / Repair.",
-                    "Clear Memory Hygiene review items.",
-                    "Generate an Evidence Pack after fixes.",
+                    "Run Doctor.",
+                    "Run Evidence Pack.",
+                    "Keep the operation receipt with the backup or report path.",
                 ],
             },
         ]

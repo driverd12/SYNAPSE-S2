@@ -412,6 +412,18 @@ def command_list_context_cursors(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_agent_brief(args: argparse.Namespace) -> dict[str, Any]:
+    if args.mode == "morning":
+        payload = _dashboard_runtime_from_args(args).start_work(
+            context_id=args.context,
+            agent_id=args.agent_id,
+            prompt=args.prompt,
+        )
+        payload["action"] = "agent-brief-morning"
+        payload["mode"] = "morning"
+        if isinstance(payload.get("receipt"), dict):
+            payload["receipt"]["action"] = "agent-brief-morning"
+            payload["receipt"]["title"] = payload["receipt"].get("title") or "Morning brief"
+        return payload
     backend = build_backend(args)
     return backend.hydrate_agent_context(
         context_id=args.context,
@@ -553,6 +565,41 @@ def command_context_health(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_memory_hygiene(args: argparse.Namespace) -> dict[str, Any]:
     return _dashboard_runtime_from_args(args).memory_hygiene(
+        context_id=args.context,
+        limit=args.limit,
+    )
+
+
+def command_goal_create(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.create_goal(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        title=args.title,
+        owner=args.owner,
+        state=args.goal_state,
+        next_action=args.next_action,
+        evidence=args.evidence,
+    )
+
+
+def command_goal_update(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.update_goal(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        goal_id=args.goal_id,
+        title=args.title,
+        owner=args.owner,
+        state=args.goal_state,
+        next_action=args.next_action,
+        evidence=args.evidence,
+    )
+
+
+def command_goal_list(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_goals(
         context_id=args.context,
         limit=args.limit,
     )
@@ -962,6 +1009,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(agent_brief)
     agent_brief.add_argument("--agent-id", required=True)
     agent_brief.add_argument("--prompt", default="")
+    agent_brief.add_argument(
+        "--mode",
+        default="hydrate",
+        choices=("hydrate", "morning"),
+        help="Use morning for the operator Start Work brief; hydrate preserves raw MCP hydration.",
+    )
     agent_brief.add_argument("--since-event-id", type=int, default=None)
     agent_brief.add_argument("--limit", type=int, default=20)
     agent_brief.add_argument("--graph-limit", type=int, default=30)
@@ -1071,6 +1124,47 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(memory_hygiene)
     memory_hygiene.add_argument("--limit", type=int, default=25)
     memory_hygiene.set_defaults(func=command_memory_hygiene)
+
+    for command_name in ("goal.create", "goal-create"):
+        goal_create = subparsers.add_parser(command_name)
+        add_context(goal_create)
+        goal_create.add_argument("--agent-id", default="codex-desktop")
+        goal_create.add_argument("--title", required=True)
+        goal_create.add_argument("--owner", default="")
+        goal_create.add_argument(
+            "--goal-state",
+            "--state",
+            dest="goal_state",
+            default="planned",
+            choices=("planned", "in_progress", "blocked", "done", "stale"),
+        )
+        goal_create.add_argument("--next-action", default="")
+        goal_create.add_argument("--evidence", default="")
+        goal_create.set_defaults(func=command_goal_create)
+
+    for command_name in ("goal.update", "goal-update"):
+        goal_update = subparsers.add_parser(command_name)
+        add_context(goal_update)
+        goal_update.add_argument("--agent-id", default="codex-desktop")
+        goal_update.add_argument("--goal-id", default="")
+        goal_update.add_argument("--title", default="")
+        goal_update.add_argument("--owner", default="")
+        goal_update.add_argument(
+            "--goal-state",
+            "--state",
+            dest="goal_state",
+            default="",
+            choices=("", "planned", "in_progress", "blocked", "done", "stale"),
+        )
+        goal_update.add_argument("--next-action", default="")
+        goal_update.add_argument("--evidence", default="")
+        goal_update.set_defaults(func=command_goal_update)
+
+    for command_name in ("goal.list", "goal-list"):
+        goal_list = subparsers.add_parser(command_name)
+        add_context(goal_list)
+        goal_list.add_argument("--limit", type=int, default=20)
+        goal_list.set_defaults(func=command_goal_list)
 
     wrap_session = subparsers.add_parser("wrap-session")
     add_context(wrap_session)

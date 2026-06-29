@@ -77,9 +77,36 @@ Start Work:
   --context default \
   --agent-id codex-desktop \
   --prompt "Prepare SYNAPSE-S2 for today's operator work."
+.venv/bin/python synapse_cli.py --json agent-brief \
+  --mode morning \
+  --context default \
+  --agent-id codex-desktop \
+  --prompt "Prepare SYNAPSE-S2 for today's operator work."
 ```
 
-This returns a morning brief, current health score, memory quality score, recommended recipes, and an operation receipt. If the health score is degraded or blocked, run the next two commands before trusting recall.
+This returns a morning brief, current objective, relevant memories, open risks, recent app/session traces, recommended next actions, source memory references, current health score, memory quality score, recommended recipes, goal ledger state, and an operation receipt. If the health score is degraded or blocked, run the next two commands before trusting recall.
+
+Goal Ledger:
+
+```bash
+.venv/bin/python synapse_cli.py --json goal.create \
+  --context default \
+  --agent-id codex-desktop \
+  --title "Prepare SYNAPSE-S2 for Monday operator use" \
+  --owner operator \
+  --goal-state in_progress \
+  --next-action "Run Start Work, Doctor, App Preview, Recall Pin, and Wrap Session."
+.venv/bin/python synapse_cli.py --json goal.update \
+  --context default \
+  --agent-id codex-desktop \
+  --goal-id "<memory-id-from-goal-create>" \
+  --goal-state blocked \
+  --evidence "Waiting on an external prerequisite." \
+  --next-action "Clear the prerequisite, then rerun Start Work."
+.venv/bin/python synapse_cli.py --json goal.list --context default
+```
+
+Goals are governed `goal` traces. The dashboard Goal Ledger, `agent-brief --mode morning`, MCP hydration, and `get_spiking_cortex_state` all read the same owner/state/evidence/next-action ledger.
 
 Doctor and repair report:
 
@@ -121,7 +148,7 @@ Wrap Session preview, then commit only if the receipt is accurate:
   --confirm
 ```
 
-The dashboard adds the same receipts visually: Start Work shows what to do next, Doctor explains what is healthy or blocked, Memory Hygiene queues stale/duplicate/low-confidence work, App Preview proves capture quality before writing memory, Recall Pin turns a recalled item into operator-confirmed evidence, and Wrap Session captures a clean handoff.
+The dashboard adds the same receipts visually: Start Work shows what to do next, Goal Ledger shows current owner/state/evidence/next action, Doctor explains what is healthy or blocked, Memory Hygiene queues stale/duplicate/low-confidence work, App Preview proves capture quality before writing memory, Recall Pin turns a recalled item into operator-confirmed evidence, and Wrap Session captures a clean handoff.
 
 ## Operator commands
 

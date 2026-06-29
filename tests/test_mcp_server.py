@@ -618,6 +618,41 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(closed["cortex_state"]["active_session_count"], 0)
         self.assertEqual(closed_state["active_session_count"], 0)
 
+    def test_goal_ledger_mcp_tools_create_update_list_and_surface_in_cortex_state(self):
+        self.assertTrue(hasattr(mcp_server, "create_spiking_goal"))
+        self.assertTrue(hasattr(mcp_server, "update_spiking_goal"))
+        self.assertTrue(hasattr(mcp_server, "list_spiking_goals"))
+
+        created = json.loads(
+            mcp_server.create_spiking_goal(
+                agent_id="mcp-agent",
+                context_id="demo",
+                title="Prepare SYNAPSE-S2 operator handoff",
+                owner="operator",
+                state="in_progress",
+                next_action="Run Start Work and verify receipts.",
+            )
+        )
+        updated = json.loads(
+            mcp_server.update_spiking_goal(
+                agent_id="mcp-agent",
+                context_id="demo",
+                goal_id=created["memory_id"],
+                state="blocked",
+                evidence="Waiting on external GitHub mirror creation.",
+                next_action="Retry mirror after authentication is available.",
+            )
+        )
+        listed = json.loads(mcp_server.list_spiking_goals(context_id="demo"))
+        state = json.loads(mcp_server.get_spiking_cortex_state(context_id="demo"))
+
+        self.assertEqual(created["action"], "goal-create")
+        self.assertEqual(updated["action"], "goal-update")
+        self.assertEqual(listed["action"], "goal-list")
+        self.assertEqual(listed["goals"][0]["state"], "blocked")
+        self.assertIn("operator handoff", listed["goals"][0]["title"])
+        self.assertEqual(state["goals"][0]["state"], "blocked")
+
     def test_mcp_cortex_prune_requires_explicit_confirmation(self):
         entered = json.loads(
             mcp_server.enter_spiking_cortex(

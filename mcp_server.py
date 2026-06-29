@@ -1252,6 +1252,107 @@ def get_spiking_cortex_state(
 
 @mcp.tool(
     annotations={
+        "title": "Create SYNAPSE-S2 Goal",
+        "readOnlyHint": False,
+    }
+)
+def create_spiking_goal(
+    title: str,
+    agent_id: str = "mcp-client",
+    context_id: str = "default",
+    owner: str = "",
+    state: str = "planned",
+    next_action: str = "",
+    evidence: str = "",
+) -> str:
+    """Create a lightweight goal-ledger trace for the active local context."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        clean_title = _validate_text(title, field_name="title")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.create_goal(
+            context_id=context,
+            agent_id=agent,
+            title=clean_title,
+            owner=str(owner or ""),
+            state=str(state or "planned"),
+            next_action=str(next_action or ""),
+            evidence=str(evidence or ""),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid goal create for context_id=%s agent_id=%s: %s", context, agent, exc)
+        return json.dumps({"error": f"invalid goal create: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("goal create failed for context_id=%s agent_id=%s", context, agent)
+        return json.dumps({"error": f"goal create failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Update SYNAPSE-S2 Goal",
+        "readOnlyHint": False,
+    }
+)
+def update_spiking_goal(
+    agent_id: str = "mcp-client",
+    context_id: str = "default",
+    goal_id: str = "",
+    title: str = "",
+    owner: str = "",
+    state: str = "",
+    next_action: str = "",
+    evidence: str = "",
+) -> str:
+    """Append an auditable state update to an existing goal-ledger trace."""
+    context = _sanitize_context_id(context_id)
+    agent = _sanitize_agent_id(agent_id)
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.update_goal(
+            context_id=context,
+            agent_id=agent,
+            goal_id=str(goal_id or ""),
+            title=str(title or ""),
+            owner=str(owner or ""),
+            state=str(state or ""),
+            next_action=str(next_action or ""),
+            evidence=str(evidence or ""),
+        )
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid goal update for context_id=%s agent_id=%s: %s", context, agent, exc)
+        return json.dumps({"error": f"invalid goal update: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("goal update failed for context_id=%s agent_id=%s", context, agent)
+        return json.dumps({"error": f"goal update failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "List SYNAPSE-S2 Goals",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_goals(context_id: str = "default", limit: int = 20) -> str:
+    """List current goal-ledger state for the active local context."""
+    context = _sanitize_context_id(context_id)
+    try:
+        bounded_limit = _validate_limit(limit)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.list_goals(context_id=context, limit=bounded_limit)
+        return json.dumps(payload, sort_keys=True, default=str)
+    except ValueError as exc:
+        LOGGER.warning("invalid goal list for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid goal list: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("goal list failed for context_id=%s", context)
+        return json.dumps({"error": f"goal list failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
         "title": "Profile SYNAPSE-S2 Runtime Resources",
         "readOnlyHint": False,
     }

@@ -85,6 +85,7 @@ CORTEX_TRUTH_POSTURES = {
     "stale",
 }
 CORTEX_MODES = {"strict", "creative", "operator", "security", "demo"}
+GOAL_LEDGER_STATES = {"planned", "in_progress", "blocked", "done", "stale"}
 SURFACE_DETAIL_STOP_WORDS = {
     "about",
     "after",
@@ -1845,14 +1846,15 @@ class SpikingAttentionBackend:
                 for token in ("assume", "maybe", "might", "uncertain")
             )
         ][:10]
+        goals = self._goal_ledger_from_cortical_summaries(cortical_entries, limit=10)
         active_goal = (
             str(active_sessions[0].get("task", ""))
             if active_sessions
             else next(
                 (
-                    str(entry.get("excerpt", ""))
-                    for entry in cortical_entries
-                    if entry.get("trace_type") == "goal"
+                    str(goal.get("title", ""))
+                    for goal in goals
+                    if goal.get("state") not in {"done", "stale"}
                 ),
                 "",
             )
@@ -1875,6 +1877,8 @@ class SpikingAttentionBackend:
             "current_goal": active_goal,
             "active_session_count": len(active_sessions),
             "active_sessions": active_sessions[:10],
+            "goals": goals,
+            "goal_count": len(goals),
             "typed_memory_counts": dict(sorted(typed_counts.items())),
             "high_confidence_truths": high_confidence,
             "constraints": constraints,
@@ -1891,6 +1895,218 @@ class SpikingAttentionBackend:
             "policy": self._cortex_policy(
                 str(active_sessions[0].get("mode", "strict")) if active_sessions else "strict"
             ),
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def create_goal(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "operator",
+        title: str,
+        owner: str = "",
+        state: str = "planned",
+        next_action: str = "",
+        evidence: str = "",
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        clean_title = " ".join(str(title or "").split())
+        if not clean_title:
+            raise ValueError("title is required")
+        clean_state = self._normalize_goal_state(state or "planned")
+        clean_owner = " ".join(str(owner or agent).split())
+        clean_next_action = " ".join(str(next_action or "").split())
+        clean_evidence = " ".join(str(evidence or "").split())
+        evidence_payload = {
+            "source": "goal-ledger",
+            "title": clean_title,
+            "owner": clean_owner,
+            "goal_state": clean_state,
+            "next_action": clean_next_action,
+            "last_verified_evidence": clean_evidence,
+        }
+        text = self._format_goal_trace_text(
+            title=clean_title,
+            owner=clean_owner,
+            state=clean_state,
+            next_action=clean_next_action,
+            evidence=clean_evidence,
+        )
+        commit = self.commit_cortical_trace(
+            context_id=context,
+            agent_id=agent,
+            session_id="goal-ledger",
+            trace_type="goal",
+            truth_posture="observed",
+            text=text,
+            evidence=evidence_payload,
+            confidence=0.82,
+        )
+        goal = self._goal_from_cortex_summary(
+            {
+                "memory_id": commit.get("memory_id", ""),
+                "tag": commit.get("tag", ""),
+                "context_id": context,
+                "trace_type": "goal",
+                "truth_posture": "observed",
+                "confidence": commit.get("confidence", 0.82),
+                "agent_id": agent,
+                "session_id": "goal-ledger",
+                "excerpt": text,
+                "evidence": evidence_payload,
+                "updated_at": time.time(),
+            }
+        )
+        return {
+            "action": "goal-create",
+            "context_id": context,
+            "agent_id": agent,
+            "memory_id": commit.get("memory_id", ""),
+            "tag": commit.get("tag", ""),
+            "goal": goal,
+            "receipt": self._simple_operation_receipt(
+                action="goal-create",
+                status="ready",
+                title="Goal recorded",
+                summary=f"{clean_title} is {clean_state}.",
+                context_id=context,
+                memory_id=str(commit.get("memory_id", "")),
+                next_action=clean_next_action or "Run Start Work to surface this goal in the operator brief.",
+            ),
+            "agent_deployment": commit.get("agent_deployment"),
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def update_goal(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "operator",
+        goal_id: str = "",
+        title: str = "",
+        owner: str = "",
+        state: str = "",
+        next_action: str = "",
+        evidence: str = "",
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        clean_goal_id = str(goal_id or "").strip()
+        existing: dict[str, Any] | None = None
+        if clean_goal_id:
+            entry = self.memory_store.get_entry(clean_goal_id)
+            if entry and entry.get("context_id") == context:
+                metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+                if metadata.get("cortex_governor") is True and metadata.get("trace_type") == "goal":
+                    existing = self._goal_from_cortex_summary(self._summarize_cortex_memory(entry))
+        clean_title = " ".join(str(title or (existing or {}).get("title", "")).split())
+        if not clean_title:
+            raise ValueError("title is required when goal_id does not point to an existing goal")
+        clean_state = self._normalize_goal_state(state or str((existing or {}).get("state", "in_progress")))
+        clean_owner = " ".join(str(owner or (existing or {}).get("owner", "") or agent).split())
+        clean_next_action = " ".join(
+            str(next_action or (existing or {}).get("next_action", "")).split()
+        )
+        clean_evidence = " ".join(str(evidence or "").split())
+        root_goal_id = clean_goal_id or str((existing or {}).get("goal_id", ""))
+        if not root_goal_id:
+            root_goal_id = hashlib.sha256(f"{context}\x1f{clean_title}".encode("utf-8")).hexdigest()[:16]
+        evidence_payload = {
+            "source": "goal-ledger",
+            "goal_id": root_goal_id,
+            "title": clean_title,
+            "owner": clean_owner,
+            "goal_state": clean_state,
+            "next_action": clean_next_action,
+            "last_verified_evidence": clean_evidence,
+            "previous_memory_id": clean_goal_id,
+        }
+        text = self._format_goal_trace_text(
+            title=clean_title,
+            owner=clean_owner,
+            state=clean_state,
+            next_action=clean_next_action,
+            evidence=clean_evidence,
+            prefix="Goal update",
+        )
+        commit = self.commit_cortical_trace(
+            context_id=context,
+            agent_id=agent,
+            session_id="goal-ledger",
+            trace_type="goal",
+            truth_posture="observed",
+            text=text,
+            evidence=evidence_payload,
+            confidence=0.84,
+        )
+        goal = self._goal_from_cortex_summary(
+            {
+                "memory_id": commit.get("memory_id", ""),
+                "tag": commit.get("tag", ""),
+                "context_id": context,
+                "trace_type": "goal",
+                "truth_posture": "observed",
+                "confidence": commit.get("confidence", 0.84),
+                "agent_id": agent,
+                "session_id": "goal-ledger",
+                "excerpt": text,
+                "evidence": evidence_payload,
+                "updated_at": time.time(),
+            }
+        )
+        return {
+            "action": "goal-update",
+            "context_id": context,
+            "agent_id": agent,
+            "goal_id": root_goal_id,
+            "memory_id": commit.get("memory_id", ""),
+            "tag": commit.get("tag", ""),
+            "goal": goal,
+            "receipt": self._simple_operation_receipt(
+                action="goal-update",
+                status="ready",
+                title="Goal updated",
+                summary=f"{clean_title} is now {clean_state}.",
+                context_id=context,
+                memory_id=str(commit.get("memory_id", "")),
+                next_action=clean_next_action or "Run goal.list or Start Work to confirm current state.",
+            ),
+            "agent_deployment": commit.get("agent_deployment"),
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def list_goals(
+        self,
+        *,
+        context_id: str = "default",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        bounded_limit = max(1, min(int(limit), 100))
+        entries = self.memory_store.list_entries(
+            context_id=context,
+            include_global=True,
+            limit=max(100, bounded_limit * 10),
+        )
+        summaries = [
+            self._summarize_cortex_memory(entry)
+            for entry in entries
+            if isinstance(entry.get("metadata"), dict)
+            and entry["metadata"].get("cortex_governor") is True
+            and entry["metadata"].get("trace_type") == "goal"
+        ]
+        goals = self._goal_ledger_from_cortical_summaries(summaries, limit=bounded_limit)
+        active_goal = next(
+            (goal for goal in goals if goal.get("state") not in {"done", "stale"}),
+            goals[0] if goals else None,
+        )
+        return {
+            "action": "goal-list",
+            "context_id": context,
+            "goal_count": len(goals),
+            "goals": goals,
+            "active_goal": active_goal,
             "memory_db_path": str(self.memory_store.db_path),
         }
 
@@ -2000,6 +2216,138 @@ class SpikingAttentionBackend:
             "trace": trace,
             "agent_deployment": audit,
             "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def _normalize_goal_state(self, state: str) -> str:
+        clean_state = str(state or "planned").strip().lower().replace("-", "_").replace(" ", "_")
+        if clean_state not in GOAL_LEDGER_STATES:
+            raise ValueError(
+                "goal state must be one of " + ", ".join(sorted(GOAL_LEDGER_STATES))
+            )
+        return clean_state
+
+    def _format_goal_trace_text(
+        self,
+        *,
+        title: str,
+        owner: str,
+        state: str,
+        next_action: str = "",
+        evidence: str = "",
+        prefix: str = "Goal",
+    ) -> str:
+        return "\n".join(
+            [
+                f"{prefix}: {title}",
+                f"Owner: {owner or 'operator'}",
+                f"State: {state}",
+                f"Next action: {next_action or 'none recorded'}",
+                f"Last verified evidence: {evidence or 'none recorded'}",
+            ]
+        ).strip()
+
+    def _goal_ledger_from_cortical_summaries(
+        self,
+        summaries: list[dict[str, Any]],
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        goal_summaries = [
+            summary
+            for summary in summaries
+            if str(summary.get("trace_type", "")) == "goal"
+        ]
+        goal_summaries.sort(
+            key=lambda item: float(item.get("updated_at", 0.0) or 0.0),
+            reverse=True,
+        )
+        goals: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for summary in goal_summaries:
+            goal = self._goal_from_cortex_summary(summary)
+            goal_id = str(goal.get("goal_id", "") or goal.get("memory_id", ""))
+            if not goal_id or goal_id in seen:
+                continue
+            seen.add(goal_id)
+            goals.append(goal)
+            if len(goals) >= max(1, int(limit)):
+                break
+        return goals
+
+    def _goal_from_cortex_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
+        evidence = summary.get("evidence") if isinstance(summary.get("evidence"), dict) else {}
+        excerpt = str(summary.get("excerpt", "") or "")
+        title = (
+            str(evidence.get("title") or "").strip()
+            or self._extract_labeled_line(excerpt, {"goal", "goal update", "objective"})
+            or self._compact_text(excerpt, 140)
+        )
+        state = str(evidence.get("goal_state") or evidence.get("state") or "planned")
+        try:
+            normalized_state = self._normalize_goal_state(state)
+        except ValueError:
+            normalized_state = "planned"
+        memory_id = str(summary.get("memory_id", "") or "")
+        goal_id = str(evidence.get("goal_id") or memory_id)
+        owner = str(evidence.get("owner") or summary.get("agent_id") or "operator")
+        next_action = str(
+            evidence.get("next_action")
+            or self._extract_labeled_line(excerpt, {"next action"})
+            or ""
+        )
+        last_evidence = str(
+            evidence.get("last_verified_evidence")
+            or self._extract_labeled_line(excerpt, {"last verified evidence", "evidence"})
+            or ""
+        )
+        return {
+            "goal_id": goal_id,
+            "memory_id": memory_id,
+            "tag": summary.get("tag", ""),
+            "context_id": summary.get("context_id", ""),
+            "title": title or "Untitled goal",
+            "owner": owner,
+            "state": normalized_state,
+            "next_action": next_action,
+            "last_verified_evidence": last_evidence,
+            "confidence": summary.get("confidence", 0.0),
+            "truth_posture": summary.get("truth_posture", "observed"),
+            "updated_at": summary.get("updated_at", 0.0),
+            "related_memory_id": memory_id,
+        }
+
+    def _extract_labeled_line(self, text: str, labels: set[str]) -> str:
+        wanted = {label.strip().lower() for label in labels if label.strip()}
+        for line in str(text or "").splitlines():
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            if label.strip().lower() in wanted:
+                return " ".join(value.split())
+        return ""
+
+    def _simple_operation_receipt(
+        self,
+        *,
+        action: str,
+        status: str,
+        title: str,
+        summary: str,
+        context_id: str,
+        memory_id: str = "",
+        next_action: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "action": action,
+            "status": status,
+            "title": title,
+            "summary": summary,
+            "context_id": sanitize_context_id(context_id),
+            "memory_id": str(memory_id or ""),
+            "event_count": 1 if memory_id else 0,
+            "quality": "operator-confirmed" if memory_id else "pending",
+            "next_action": next_action,
+            "generated_at": time.time(),
         }
 
     def _reap_orphaned_cortex_sessions(
@@ -4600,6 +4948,58 @@ def get_cortex_state(
         agent_id=agent_id,
         limit=limit,
     )
+
+
+def create_goal(
+    *,
+    context_id: str = "default",
+    agent_id: str = "operator",
+    title: str,
+    owner: str = "",
+    state: str = "planned",
+    next_action: str = "",
+    evidence: str = "",
+) -> dict[str, Any]:
+    return get_backend().create_goal(
+        context_id=context_id,
+        agent_id=agent_id,
+        title=title,
+        owner=owner,
+        state=state,
+        next_action=next_action,
+        evidence=evidence,
+    )
+
+
+def update_goal(
+    *,
+    context_id: str = "default",
+    agent_id: str = "operator",
+    goal_id: str = "",
+    title: str = "",
+    owner: str = "",
+    state: str = "",
+    next_action: str = "",
+    evidence: str = "",
+) -> dict[str, Any]:
+    return get_backend().update_goal(
+        context_id=context_id,
+        agent_id=agent_id,
+        goal_id=goal_id,
+        title=title,
+        owner=owner,
+        state=state,
+        next_action=next_action,
+        evidence=evidence,
+    )
+
+
+def list_goals(
+    *,
+    context_id: str = "default",
+    limit: int = 20,
+) -> dict[str, Any]:
+    return get_backend().list_goals(context_id=context_id, limit=limit)
 
 
 def moderate_cortex_trace(

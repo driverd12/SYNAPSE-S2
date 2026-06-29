@@ -216,6 +216,12 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
         self.assertNotIn("sk-preview-secret123", preview["preview_text"])
         self.assertGreaterEqual(preview["snapshot_quality"]["signal_chars"], 40)
         self.assertIn(preview["quality_badge"]["status"], {"ready", "degraded", "blocked"})
+        self.assertIn(preview["capability_badge"]["level"], {
+            "rich_text_available",
+            "window_metadata_only",
+            "selection_capture_recommended",
+            "accessibility_blocked",
+        })
         self.assertTrue(preview["capture_guidance"])
         self.assertEqual(after, before)
 

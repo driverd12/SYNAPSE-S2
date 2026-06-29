@@ -51,7 +51,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Recall does not fabricate historical tags when memory is empty | Implemented | no-memory queries return transparent raw activation summaries instead of synthetic `context::neuron-*` memory labels |
 | Real-time agent cognitive governance loop | Implemented | Cortex Governor backend, scoped file/tool tick intent, CLI `enter-cortex` / `cortex-tick` / `commit-cortex` / `close-cortex` / `moderate-cortex` / `cortex-state`, MCP tools, dashboard panel with end-session plus promote/demote/prune controls, hydration state, and tests |
 | Operator-visible local control surface | Implemented | `dashboard_server.py`, `web/index.html`, `web/app.js`, `web/styles.css`, `scripts/smoke_dashboard.py`, `tests/test_dashboard_server.py` |
-| Daily operator trust workflow | Implemented | Start Work, Context Health, Doctor/Repair, Memory Hygiene, Wrap Session, operation receipts, dashboard recipes, CLI `start-work` / `context-health` / `doctor --repair-plan` / `memory-hygiene` / `wrap-session`, and tests |
+| Daily operator trust workflow | Implemented | Start Work, `agent-brief --mode morning`, Context Health, Doctor/Repair, Memory Hygiene, Goal Ledger, Wrap Session, operation receipts, dashboard recipes, CLI `start-work` / `context-health` / `doctor --repair-plan` / `memory-hygiene` / `goal.create` / `goal.update` / `goal.list` / `wrap-session`, MCP `create_spiking_goal` / `update_spiking_goal` / `list_spiking_goals`, and tests |
 | Recall result promotion into operator-confirmed evidence | Implemented | Dashboard Recall Pin `/api/pin-memory`, Cortex `operator-confirmed` trace commits, receipt rendering, and dashboard tests |
 | Quick-pruning mode every 5 minutes | Implemented and tested | `quick_pruning_interval_seconds=300.0`, auto-prune in `query()` / `register_trace()`, `tests/test_backend.py` |
 | Quick-pruning completes under 60 ms budget as measured locally | Implemented as runtime check | `run_quick_pruning()` returns `within_60ms_budget`; unit test asserts the local path stays under budget |
@@ -79,7 +79,9 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Query vector or text recall | `query_spiking_attention`, `query_spiking_attention_text`, CLI equivalents |
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
 | Start the daily work loop | `synapse_cli.py start-work`, dashboard Start Work brief, health score, recipes, and receipt |
+| Start an agent/operator morning brief | `synapse_cli.py agent-brief --mode morning`, including current objective, relevant memories, open risks, app/session traces, recommended next actions, source memory references, and goal ledger state |
 | Inspect context health and memory quality | `synapse_cli.py context-health`, dashboard Context Health badge |
+| Track active goals across days | `create_spiking_goal`, `update_spiking_goal`, `list_spiking_goals`, CLI `goal.create` / `goal.update` / `goal.list`, dashboard Goal Ledger |
 | Run a repair-oriented doctor report | `synapse_cli.py doctor --repair-plan`, dashboard Doctor/Repair |
 | Review memory hygiene work | `synapse_cli.py memory-hygiene`, dashboard Memory Hygiene queue and action receipts |
 | Preview and commit a session handoff | `synapse_cli.py wrap-session --preview/--confirm`, dashboard Wrap Session preview/commit receipts |
@@ -87,7 +89,7 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Inspect event relationships | `list_spiking_memory_graph`, `synapse_cli.py graph` |
 | Hand-prune nodes, edges, deployment events, temporal edges, associative edges, or governed Cortex traces | `prune_spiking_memory`, `moderate_spiking_cortical_trace(confirm=true)`, `synapse_cli.py prune-memory --confirm`, `synapse_cli.py moderate-cortex --confirm`, dashboard Graph Prune and Cortex Governor controls |
 | Pull and acknowledge context deployments | `pull_spiking_context_deployments`, `ack_spiking_context_deployments`, `list_spiking_context_cursors`, `synapse_cli.py pull-context/ack-context/list-context-cursors` |
-| Hydrate a restarted agent from memory | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief` |
+| Hydrate a restarted agent from memory | `hydrate_spiking_agent_context`, `synapse_cli.py agent-brief`, `synapse_cli.py agent-brief --mode morning` |
 | Run governed agent work sessions | `enter_spiking_cortex`, `tick_spiking_cortex` with intended file/tool scope, `commit_spiking_cortical_trace`, `close_spiking_cortex`, `moderate_spiking_cortical_trace`, `get_spiking_cortex_state`, CLI `enter-cortex` / `cortex-tick` / `commit-cortex` / `close-cortex` / `moderate-cortex` / `cortex-state`, dashboard Cortex Governor |
 | Profile topology memory and pruning budget | `profile_spiking_resources`, `synapse_cli.py profile --benchmark-quick-prune` |
 | Certify native runtime execution | `certify_spiking_runtime`, `synapse_cli.py certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope`, dashboard Native Certify |
