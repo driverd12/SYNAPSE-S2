@@ -1,44 +1,44 @@
 # **SYNAPSE-S2: Spiking STDP Transformer MCP Server**
 
-SYNAPSE-S2 (Synaptic Plasticity & Spiking Encoding via $S^2$) is an Apple Silicon-optimized Model Context Protocol (MCP) server. It provides local large language models (LLMs) with high-efficiency, associative memory capabilities using a persistent, biologically grounded Spiking Neural Network (SNN) substrate.
+SYNAPSE-S2 (Synaptic Plasticity & Spiking Encoding via S2) is an Apple Silicon-optimized Model Context Protocol (MCP) server. It provides local large language models (LLMs) with high-efficiency, associative memory capabilities using a persistent, biologically grounded Spiking Neural Network (SNN) substrate.
 
-Traditional transformer self-attention forms a dense token-token score matrix for every layer and attention head, so the attention logits and probabilities scale as $O(N^2)$ in sequence length $N$. SYNAPSE-S2 does not materialize that per-request all-pairs attention matrix during recall. It projects local embeddings into sparse spike sets, runs bounded recurrent Leaky Integrate-and-Fire (LIF) dynamics, and stores learned co-activation structure in durable sparse spike, surface-term, relationship, and synaptic indexes. The practical scaling shift is from dense request-time self-attention memory to sparse spike propagation plus indexed local memory lookup. SYNAPSE-S2 still has a configurable topology resource envelope, so the precise claim is that it avoids the transformer attention-matrix memory wall rather than making every internal structure sub-quadratic in every parameter.
+Traditional transformer self-attention forms a dense token-token score matrix for every layer and attention head, so the attention logits and probabilities scale as `O(N^2)` in sequence length `N`. SYNAPSE-S2 does not materialize that per-request all-pairs attention matrix during recall. It projects local embeddings into sparse spike sets, runs bounded recurrent Leaky Integrate-and-Fire (LIF) dynamics, and stores learned co-activation structure in durable sparse spike, surface-term, relationship, and synaptic indexes. The practical scaling shift is from dense request-time self-attention memory to sparse spike propagation plus indexed local memory lookup. SYNAPSE-S2 still has a configurable topology resource envelope, so the precise claim is that it avoids the transformer attention-matrix memory wall rather than making every internal structure sub-quadratic in every parameter.
 
-### Math Note: What Replaces the $O(N^2)$ Attention Wall
+### Math Note: What Replaces the `O(N^2)` Attention Wall
 
-In standard scaled dot-product self-attention, an input sequence $X \in \mathbb{R}^{N \times d}$ is projected into query, key, and value matrices:
+In standard scaled dot-product self-attention, an input sequence `X` with shape `N x d` is projected into query, key, and value matrices:
 
-$$
+```math
 Q = XW_Q,\quad K = XW_K,\quad V = XW_V
-$$
+```
 
 Each token compares against every other token:
 
-$$
+```math
 S = \frac{QK^\top}{\sqrt{d_k}},\quad A = \operatorname{softmax}(S),\quad Y = AV
-$$
+```
 
-Because $S$ and $A$ are both $N \times N$, their memory footprint is $\Theta(N^2)$ per head before counting values, activations, caches, or batching. Doubling the usable context length roughly quadruples the attention-matrix storage. That is the self-attention memory wall.
+Because `S` and `A` are both `N x N`, their memory footprint is `Theta(N^2)` per head before counting values, activations, caches, or batching. Doubling the usable context length roughly quadruples the attention-matrix storage. That is the self-attention memory wall.
 
 SYNAPSE-S2 uses a different runtime object. Text is embedded locally, converted to sparse sensory spikes, and propagated through a recurrent substrate:
 
-$$
+```math
 z = \operatorname{embed}(\text{text}),\quad s_0 = \operatorname{TopK}(\operatorname{zscore}(z), k)
-$$
+```
 
-$$
+```math
 u_{t+1} = \beta u_t + W_{\text{syn}}s_t + W_{\text{lat}}s_t - V_{\text{thr}}s_t,\quad
 s_{t+1} = H(u_{t+1} - V_{\text{thr}})
-$$
+```
 
 Temporal co-activation changes durable relationship strength through STDP:
 
-$$
+```math
 \Delta w_{ij} =
 \eta_+ s_i(t-\Delta t_{\text{pre}})s_j(t)
 -
 \eta_- s_i(t)s_j(t-\Delta t_{\text{post}})
-$$
+```
 
 At inference time, active spike operations are dominated by additions, threshold comparisons, decay, and sparse/indexed retrieval rather than dense query-key matrix multiplication over all token pairs. The implementation still uses MLX arrays and scalar multiplications for decay, weighting, and setup where appropriate; "multiplication-free" should be read as the neuromorphic recall path avoiding dense per-token dot-product attention, not as a claim that no numeric multiplication exists anywhere in the codebase.
 
@@ -468,35 +468,35 @@ flowchart TB
 
 ### **1. Dimension-Independent Population Coding**
 
-Dense embeddings $E$ are mapped into binary spike states $S_i \in \{0, 1\}$ using coordinate-wise standardized z-scores. This keeps the sensory coding stable even when the upstream embedding provider changes dimensionality:
+Dense embeddings `E` are mapped into binary spike states `S_i in {0, 1}` using coordinate-wise standardized z-scores. This keeps the sensory coding stable even when the upstream embedding provider changes dimensionality:
 
-$$
+```math
 Z_i = \frac{E_i - \mu_E}{\sigma_E}
-$$
+```
 
-Neurons corresponding to the top-$k$ standardized coordinates fire ($S_i = 1$); the remainder stay silent ($S_i = 0$).
+Neurons corresponding to the top-`k` standardized coordinates fire (`S_i = 1`); the remainder stay silent (`S_i = 0`).
 
 ### **2. Leaky Integrate-and-Fire (LIF) Dynamics**
 
 Individual neuron potentials are processed with bounded discrete-time updates:
 
-$$
+```math
 U[t+1] = \beta U[t] + X[t+1] - S[t]V_{\text{thr}}
-$$
+```
 
-Here $U$ is membrane potential, $X$ is input synaptic current, $\beta \in (0,1)$ is decay, and $V_{\text{thr}}$ is the spike threshold. Updates are written as new MLX arrays so the recurrent step can compile cleanly on Apple Silicon.
+Here `U` is membrane potential, `X` is input synaptic current, `beta in (0,1)` is decay, and `V_thr` is the spike threshold. Updates are written as new MLX arrays so the recurrent step can compile cleanly on Apple Silicon.
 
 ### **3. Asymmetric Temporal STDP**
 
 Rather than storing dense request-time attention matrices, temporal correlation is consolidated into synaptic and graph weights. A pre-before-post spike pair potentiates the connection; a post-before-pre pair depresses it:
 
-$$
+```math
 \Delta w_{ij} =
 \begin{cases}
 A_+\exp\left(-\frac{\Delta t}{\tau_+}\right) & \text{if } \Delta t > 0 \\
 -A_-\exp\left(\frac{\Delta t}{\tau_-}\right) & \text{if } \Delta t \le 0
 \end{cases}
-$$
+```
 
 This is the mathematical difference from vector similarity retrieval. Vector search compares a query vector against stored vectors at query time; STDP turns repeated temporal co-activation into durable structure, so future recall can follow learned activation paths instead of recomputing every pairwise token-token relation.
 
@@ -506,13 +506,13 @@ The SNN maintains long-term structural efficiency and manages Apple Silicon VRAM
 
 | Phase | System Process | Core Mathematical Operation | Downstream Cognitive Function |
 | :---- | :---- | :---- | :---- |
-| Phase 1 | Connection Weight Decay | $W_{ij} \leftarrow \gamma_{\text{decay}} W_{ij}$ where $0 < \gamma_{\text{decay}} < 1$ | Lowers weight values for weak connections |
-| Phase 2 | Synaptic Clustering | $C_m = \{i \mid \operatorname{density}(i) \ge \tau_c\}$ | Identifies overlapping spiking patterns |
-| Phase 3 | Semantic Merging | Merge $m_i,m_j$ when $\operatorname{sim}(m_i,m_j) \ge \tau_{\text{merge}}$ | Consolidates redundant memory paths |
-| Phase 4 | Threshold Rescoring | $V_{\text{thr}} \leftarrow V_{\text{thr}} + \alpha(r_{\text{observed}} - r_{\text{target}})$ | Keeps firing rates in healthy, balanced ranges |
-| Phase 5 | Trace Promotion | $p_i \leftarrow p_i + \mathbf{1}[\operatorname{activation}(i) \ge \tau_{\text{promote}}]$ | Moves active traces to persistent storage |
-| Phase 6 | Relationship Extraction | $\operatorname{edge}(i,j) \leftarrow \operatorname{HebbianEvidence}(i,j) + \operatorname{STDPEvidence}(i,j)$ | Builds structured semantic connection graphs |
-| Phase 7 | Neurogenesis | Reset inactive state: $u_i,s_i \leftarrow 0$ for recycled nodes | Frees up inactive nodes for new memory traces |
+| Phase 1 | Connection Weight Decay | `W_ij <- gamma_decay W_ij`, where `0 < gamma_decay < 1` | Lowers weight values for weak connections |
+| Phase 2 | Synaptic Clustering | `C_m = {i | density(i) >= tau_c}` | Identifies overlapping spiking patterns |
+| Phase 3 | Semantic Merging | Merge `m_i,m_j` when `sim(m_i,m_j) >= tau_merge` | Consolidates redundant memory paths |
+| Phase 4 | Threshold Rescoring | `V_thr <- V_thr + alpha(r_observed - r_target)` | Keeps firing rates in healthy, balanced ranges |
+| Phase 5 | Trace Promotion | `p_i <- p_i + 1[activation(i) >= tau_promote]` | Moves active traces to persistent storage |
+| Phase 6 | Relationship Extraction | `edge(i,j) <- HebbianEvidence(i,j) + STDPEvidence(i,j)` | Builds structured semantic connection graphs |
+| Phase 7 | Neurogenesis | Reset inactive state: `u_i,s_i <- 0` for recycled nodes | Frees up inactive nodes for new memory traces |
 
 ## **Hardware Integration Optimization**
 
@@ -520,7 +520,7 @@ By executing directly inside Apple's Unified Memory Architecture via mlx-snn, SY
 
 * **Metal JIT Acceleration**: Synaptic weight updates are compiled natively into GPU kernels using mx.compile to prevent execution overhead on the CPU.  
 * **No-Copy Memory Sharing**: The host CPU pre-processes input embeddings, while the integrated M-series GPU computes the spiking networks inside the same physical RAM, completely avoiding costly PCIe bus data copies.  
-* **Footprint Control**: The default Mac-optimized topology is certified against a $96\text{ MB}$ to $256\text{ MB}$ estimated resident MLX array envelope, with the current dashboard/resource profile typically reporting about $115\text{ MB}$ for the 6,800-neuron substrate. That is a live topology estimate, not a blanket hardware counter claim.
+* **Footprint Control**: The default Mac-optimized topology is certified against a 96 MB to 256 MB estimated resident MLX array envelope, with the current dashboard/resource profile typically reporting about 115 MB for the 6,800-neuron substrate. That is a live topology estimate, not a blanket hardware counter claim.
 
 ## **Verification and Diagnostics**
 
