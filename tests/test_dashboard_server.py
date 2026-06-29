@@ -502,7 +502,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("wizardSpotlight", index)
         self.assertIn("wizardArrow", index)
         self.assertIn("wizardPanel", index)
+        self.assertIn("wizardEyebrow", index)
+        self.assertIn("wizardFlowPicker", index)
+        self.assertIn("wizardIntroFlowButton", index)
+        self.assertIn("wizardOperatorFlowButton", index)
         self.assertIn("wizardChecklist", index)
+        self.assertIn("First-time orientation", index)
+        self.assertIn("Operator use", index)
+        self.assertIn("Skip the tour and walk through the required fields", index)
         self.assertIn("operatorLoopPanel", index)
         self.assertIn("operatorActionBanner", index)
         self.assertIn("operatorActionStatus", index)
@@ -627,7 +634,19 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("elements.toggleActionState.textContent = nextAction", app)
         self.assertIn("/api/monday-readiness", app)
         self.assertIn("renderMondayReadiness", app)
+        self.assertIn("WIZARD_FLOWS", app)
         self.assertIn("WIZARD_STEPS", app)
+        self.assertIn("intro: {", app)
+        self.assertIn("operator: {", app)
+        self.assertIn("startWizardFlow", app)
+        self.assertIn("renderWizardChoice", app)
+        self.assertIn("currentWizardSteps", app)
+        self.assertIn("Choose a flow", app)
+        self.assertIn("Start orientation", app)
+        self.assertIn('progressLabel: "Operator"', app)
+        self.assertIn("Required field: current task", app)
+        self.assertIn("Required tick field: observation", app)
+        self.assertIn("Required tick field: proposed action", app)
         self.assertIn("runStartWork", app)
         self.assertIn("runWrapSession", app)
         self.assertIn("runDoctorReport", app)
@@ -655,6 +674,17 @@ class DashboardRuntimeTests(unittest.TestCase):
             "#operatorLoopPanel",
             "#mondayReadinessButton",
             "#contextInput",
+            "#startWorkButton",
+            "#cortexAgentId",
+            "#cortexTask",
+            "#cortexEnterForm",
+            "#cortexObservation",
+            "#cortexProposedAction",
+            "#cortexIntendedFiles",
+            "#cortexConfidence",
+            "#cortexTickForm",
+            "#cortexTraceText",
+            "#wrapSessionButton",
             "#coreActionGroup",
             "#rememberForm",
             "#queryForm",

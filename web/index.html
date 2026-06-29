@@ -986,7 +986,7 @@
         <section id="wizardPanel" class="wizard-panel" role="dialog" aria-labelledby="wizardTitle" tabindex="-1">
           <div class="wizard-panel-header">
             <div>
-              <p class="section-label">First-use wizard</p>
+              <p id="wizardEyebrow" class="section-label">First-use wizard</p>
               <h2 id="wizardTitle">Use SYNAPSE-S2 live</h2>
             </div>
             <button id="wizardCloseButton" class="icon-button compact" type="button" aria-label="Stop wizard">
@@ -994,6 +994,18 @@
             </button>
           </div>
           <p id="wizardBody" class="wizard-body">Walk through the local memory workflow.</p>
+          <div id="wizardFlowPicker" class="wizard-flow-picker" aria-label="Choose wizard flow">
+            <button id="wizardIntroFlowButton" class="wizard-flow-card" type="button" data-wizard-flow="intro">
+              <span>First-time orientation</span>
+              <strong>Learn what SYNAPSE-S2 is doing</strong>
+              <small>Short, informational guide through the runtime, memory, trust loop, App Connect, Cortex, and evidence surfaces.</small>
+            </button>
+            <button id="wizardOperatorFlowButton" class="wizard-flow-card primary-flow" type="button" data-wizard-flow="operator">
+              <span>Operator use</span>
+              <strong>Start using it now</strong>
+              <small>Skip the tour and walk through the required fields for context, Start Work, Cortex, governor tick, trace commit, and handoff.</small>
+            </button>
+          </div>
           <ul id="wizardChecklist" class="wizard-checklist"></ul>
           <div id="wizardCapability" class="wizard-capability">Capability ready</div>
           <div class="wizard-footer">

@@ -6,7 +6,12 @@ const GRAPH_HEIGHT = 420;
 const GRAPH_MIN_SCALE = 0.45;
 const GRAPH_MAX_SCALE = 3.2;
 const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
-const WIZARD_STEPS = [
+const WIZARD_FLOWS = {
+  intro: {
+    label: "First-time orientation",
+    progressLabel: "Orientation",
+    description: "Learn what each SYNAPSE-S2 surface does before operating it.",
+    steps: [
   {
     selector: "#wizardToggleButton",
     title: "Start or stop the guide",
@@ -183,7 +188,172 @@ const WIZARD_STEPS = [
       "Package an Evidence Pack when the log proves the workflow is ready to share.",
     ],
   },
-];
+    ],
+  },
+  operator: {
+    label: "Operator use",
+    progressLabel: "Operator",
+    description: "Walk through the required fields for a real governed work session.",
+    steps: [
+      {
+        selector: "#operatorActionBanner",
+        title: "Start with the required action",
+        body: "Use the front banner as the current instruction. If it says Cortex is idle, that means you should start a governed session before risky work.",
+        capability: "Run order: Start Work, Enter Cortex, Tick Action, Commit or Wrap.",
+        items: [
+          "Read this banner before using lower panels.",
+          "Treat idle Cortex as an operator action, not a broken state.",
+          "Use the shortcuts when you need to jump to the next surface.",
+        ],
+      },
+      {
+        selector: "#contextInput",
+        title: "Choose the memory context",
+        body: "Confirm the context namespace before writing, recalling, or governing work. This field decides where traces, graph links, and client hydration events live.",
+        capability: "Required field: active memory context.",
+        items: [
+          "Use default for shared SYNAPSE-S2 project work.",
+          "Use a specific project or thread name when the memory should be isolated.",
+          "Press the context check button and confirm the Memory URI updates.",
+        ],
+      },
+      {
+        selector: "#startWorkButton",
+        title: "Generate the Start Work brief",
+        body: "Run Start Work before relying on recall or beginning a handoff. It summarizes health, recent memory, recipes, and the next operator move.",
+        capability: "Daily startup: briefing, context health, recipes, and receipts.",
+        items: [
+          "Click Start Work and wait for the output panel.",
+          "Resolve Doctor or Context Health blockers before continuing.",
+          "Use the recipe list as the live workflow checklist.",
+        ],
+      },
+      {
+        selector: "#cortexAgentId",
+        title: "Confirm agent and mode",
+        body: "The Agent field identifies who is being governed. The default dashboard-ui is correct for this UI; use strict mode for normal operator work.",
+        capability: "Required fields: agent id and governance mode.",
+        items: [
+          "Leave dashboard-ui unless a named client or coworker is operating.",
+          "Use strict for normal work and security for sensitive investigations.",
+          "These values appear in Cortex state and committed trace evidence.",
+        ],
+      },
+      {
+        selector: "#cortexTask",
+        title: "Describe the current task",
+        body: "Enter the concrete work the agent is about to perform. This task becomes the governed session objective and helps future recall understand why traces were written.",
+        capability: "Required field: current task before Start Cortex Session.",
+        items: [
+          "Write one clear outcome, not a vague project name.",
+          "Include the app, repo, or customer surface when relevant.",
+          "Start the session only after this field reflects the real task.",
+        ],
+      },
+      {
+        selector: "#cortexEnterForm",
+        title: "Start Cortex Session",
+        body: "Submit Enter Cortex after the agent, mode, and task are correct. This makes the session active and removes the idle operator warning.",
+        capability: "Governance start: recall, policy, and session tracking.",
+        items: [
+          "Click Start Cortex Session.",
+          "Check Active Sessions and Last Decision after the call returns.",
+          "If it fails, use Doctor / Repair before continuing.",
+        ],
+      },
+      {
+        selector: "#cortexObservation",
+        title: "Record what was observed",
+        body: "Before a risky action, write the evidence or state you just observed. This makes the governor decision auditable instead of relying on memory.",
+        capability: "Required tick field: observation.",
+        items: [
+          "Use concrete facts from the screen, test output, or app state.",
+          "Do not paste secrets or unnecessary personal data.",
+          "Keep it concise enough that another operator can scan it.",
+        ],
+      },
+      {
+        selector: "#cortexProposedAction",
+        title: "Describe the next action",
+        body: "Write the action you are about to take. The governor compares this against memory, warnings, file scope, and confidence before you mutate anything.",
+        capability: "Required tick field: proposed action.",
+        items: [
+          "State the exact action, such as edit file, run test, attach app, or capture memory.",
+          "Do this before mutations, sensitive captures, or handoff claims.",
+          "If the action changes, tick again.",
+        ],
+      },
+      {
+        selector: "#cortexIntendedFiles",
+        title: "Declare files and tools",
+        body: "Add intended files and tools so the governor can warn when scope drifts. One path, glob, command, or tool belongs on each line.",
+        capability: "Scope fields: intended files and intended tools.",
+        items: [
+          "Use file paths or globs for code and docs you expect to touch.",
+          "List key commands or tools, such as unittest, browser QA, or app snapshot.",
+          "Leave a field blank only when it truly does not apply.",
+        ],
+      },
+      {
+        selector: "#cortexConfidence",
+        title: "Set confidence and mutation intent",
+        body: "Mutation intent tells SYNAPSE-S2 that the next action can change state. Confidence below the safe threshold should trigger verification first.",
+        capability: "Guardrails: mutation warnings and confidence thresholding.",
+        items: [
+          "Keep Mutation intent checked before edits, captures, pruning, or deploys.",
+          "Use lower confidence when assumptions remain unresolved.",
+          "Tick governor after these values match the planned action.",
+        ],
+      },
+      {
+        selector: "#cortexTickForm",
+        title: "Tick the governor",
+        body: "Submit the tick before acting. The response updates Last Decision, Guardrails, Next Move, and any capture recommendations.",
+        capability: "Governed action check: memory-aware recommendation and warnings.",
+        items: [
+          "Click Tick governor and wait for the decision.",
+          "Follow warnings before mutating state.",
+          "Use capture recommendations when SYNAPSE-S2 asks for evidence.",
+        ],
+      },
+      {
+        selector: "#cortexTraceText",
+        title: "Commit verified trace",
+        body: "After the action is validated, commit a typed trace. Use observed for ordinary facts and test-validated only when you have concrete test or artifact evidence.",
+        capability: "Required handoff field: verified trace text.",
+        items: [
+          "Choose a trace type that matches the fact: decision, validation, risk, correction, or evidence.",
+          "Write the exact outcome and validation evidence.",
+          "Commit only facts you want future agents to reuse.",
+        ],
+      },
+      {
+        selector: "#wrapSessionButton",
+        title: "Wrap the session",
+        body: "Use Wrap Session before switching tools, operators, threads, or projects. Preview first, then commit the handoff when the summary is accurate.",
+        capability: "Handoff: preview, capture, receipt, and durable memory.",
+        items: [
+          "Add notes when the operation log does not tell the whole story.",
+          "Preview the wrap before committing it to memory.",
+          "End the Cortex session when the work block is complete.",
+        ],
+      },
+      {
+        selector: "#operationLog",
+        title: "Verify the receipts",
+        body: "The Operation Log is the final proof surface. It should show Start Work, Cortex, tick, commit, wrap, app capture, or repair actions as they happen.",
+        capability: "Audit trail: visible receipts for first-use support and handoff.",
+        items: [
+          "Check the log after each guided action.",
+          "Use failures here to rerun, repair, or capture a blocker.",
+          "Restart the wizard anytime from the top-right button.",
+        ],
+      },
+    ],
+  },
+};
+
+const WIZARD_STEPS = WIZARD_FLOWS.intro.steps;
 
 const state = {
   context: new URLSearchParams(window.location.search).get("context_id")?.trim() || DEFAULT_CONTEXT,
@@ -218,6 +388,7 @@ const state = {
   },
   wizard: {
     active: false,
+    flow: null,
     index: 0,
     target: null,
     scrollTimer: null,
@@ -411,8 +582,12 @@ const elements = collectElements([
   "wizardCapability",
   "wizardChecklist",
   "wizardCloseButton",
+  "wizardEyebrow",
+  "wizardFlowPicker",
+  "wizardIntroFlowButton",
   "wizardLayer",
   "wizardNextButton",
+  "wizardOperatorFlowButton",
   "wizardPanel",
   "wizardProgress",
   "wizardSpotlight",
@@ -1923,6 +2098,11 @@ function initializeWizard() {
       startWizard();
     }
   });
+  elements.wizardFlowPicker.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-wizard-flow]");
+    if (!button) return;
+    startWizardFlow(button.dataset.wizardFlow);
+  });
   elements.wizardCloseButton.addEventListener("click", stopWizard);
   elements.wizardBackButton.addEventListener("click", previousWizardStep);
   elements.wizardNextButton.addEventListener("click", nextWizardStep);
@@ -1944,16 +2124,26 @@ function initializeWizard() {
 
 function startWizard() {
   state.wizard.active = true;
+  state.wizard.flow = null;
   state.wizard.index = 0;
   elements.wizardLayer.hidden = false;
   elements.wizardLayer.setAttribute("aria-hidden", "false");
   elements.wizardToggleButton.setAttribute("aria-pressed", "true");
   elements.wizardToggleText.textContent = "Stop Wizard";
+  renderWizardChoice();
+}
+
+function startWizardFlow(flowKey = "intro") {
+  const flow = WIZARD_FLOWS[flowKey] ? flowKey : "intro";
+  state.wizard.flow = flow;
+  state.wizard.index = 0;
   renderWizardStep();
 }
 
 function stopWizard() {
   state.wizard.active = false;
+  state.wizard.flow = null;
+  state.wizard.index = 0;
   elements.wizardLayer.hidden = true;
   elements.wizardLayer.setAttribute("aria-hidden", "true");
   elements.wizardToggleButton.setAttribute("aria-pressed", "false");
@@ -1966,7 +2156,12 @@ function stopWizard() {
 
 function nextWizardStep() {
   if (!state.wizard.active) return;
-  if (state.wizard.index >= WIZARD_STEPS.length - 1) {
+  if (!state.wizard.flow) {
+    startWizardFlow("intro");
+    return;
+  }
+  const steps = currentWizardSteps();
+  if (state.wizard.index >= steps.length - 1) {
     stopWizard();
     return;
   }
@@ -1975,26 +2170,63 @@ function nextWizardStep() {
 }
 
 function previousWizardStep() {
-  if (!state.wizard.active || state.wizard.index <= 0) return;
+  if (!state.wizard.active) return;
+  if (!state.wizard.flow) return;
+  if (state.wizard.index <= 0) {
+    renderWizardChoice();
+    return;
+  }
   state.wizard.index -= 1;
   renderWizardStep();
 }
 
-function renderWizardStep() {
-  const step = WIZARD_STEPS[state.wizard.index] || WIZARD_STEPS[0];
-  const target = document.querySelector(step.selector) || document.getElementById("overview");
-  if (state.wizard.target && state.wizard.target !== target) {
-    state.wizard.target.classList.remove("wizard-highlight-target");
-  }
-  state.wizard.target = target;
-  state.wizard.target?.classList.add("wizard-highlight-target");
+function currentWizardFlow() {
+  return WIZARD_FLOWS[state.wizard.flow] || WIZARD_FLOWS.intro;
+}
 
+function currentWizardSteps() {
+  return currentWizardFlow().steps;
+}
+
+function renderWizardChoice() {
+  state.wizard.flow = null;
+  state.wizard.index = 0;
+  const target = elements.wizardToggleButton || document.getElementById("overview");
+  updateWizardTarget(target);
+  elements.wizardEyebrow.textContent = "Choose wizard flow";
+  elements.wizardTitle.textContent = "How do you want to start?";
+  elements.wizardBody.textContent = "Use the orientation guide for first-time learning, or skip directly into the operator workflow when you are ready to enter fields and run SYNAPSE-S2.";
+  elements.wizardFlowPicker.hidden = false;
+  elements.wizardChecklist.replaceChildren();
+  elements.wizardChecklist.hidden = true;
+  elements.wizardCapability.hidden = true;
+  elements.wizardProgress.textContent = "Choose a flow";
+  elements.wizardBackButton.disabled = true;
+  elements.wizardBackButton.textContent = "Back";
+  elements.wizardNextButton.textContent = "Start orientation";
+  scrollWizardTargetIntoView(target);
+  elements.wizardPanel.focus({ preventScroll: true });
+  window.setTimeout(positionWizardOverlay, 220);
+}
+
+function renderWizardStep() {
+  const flow = currentWizardFlow();
+  const steps = currentWizardSteps();
+  const step = steps[state.wizard.index] || steps[0];
+  const target = document.querySelector(step.selector) || document.getElementById("overview");
+  updateWizardTarget(target);
+
+  elements.wizardEyebrow.textContent = flow.label;
   elements.wizardTitle.textContent = step.title;
   elements.wizardBody.textContent = step.body;
+  elements.wizardFlowPicker.hidden = true;
+  elements.wizardChecklist.hidden = false;
+  elements.wizardCapability.hidden = false;
   elements.wizardCapability.textContent = step.capability;
-  elements.wizardProgress.textContent = `Step ${state.wizard.index + 1} / ${WIZARD_STEPS.length}`;
-  elements.wizardBackButton.disabled = state.wizard.index === 0;
-  elements.wizardNextButton.textContent = state.wizard.index === WIZARD_STEPS.length - 1 ? "Finish" : "Next";
+  elements.wizardProgress.textContent = `${flow.progressLabel} step ${state.wizard.index + 1} / ${steps.length}`;
+  elements.wizardBackButton.disabled = false;
+  elements.wizardBackButton.textContent = state.wizard.index === 0 ? "Flows" : "Back";
+  elements.wizardNextButton.textContent = state.wizard.index === steps.length - 1 ? "Finish" : "Next";
   elements.wizardChecklist.replaceChildren(
     ...step.items.map((item) => {
       const node = document.createElement("li");
@@ -2005,6 +2237,14 @@ function renderWizardStep() {
   scrollWizardTargetIntoView(target);
   elements.wizardPanel.focus({ preventScroll: true });
   window.setTimeout(positionWizardOverlay, 220);
+}
+
+function updateWizardTarget(target) {
+  if (state.wizard.target && state.wizard.target !== target) {
+    state.wizard.target.classList.remove("wizard-highlight-target");
+  }
+  state.wizard.target = target;
+  state.wizard.target?.classList.add("wizard-highlight-target");
 }
 
 function scrollWizardTargetIntoView(target) {

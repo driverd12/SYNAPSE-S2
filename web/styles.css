@@ -496,6 +496,63 @@ svg {
   font-size: 14px;
 }
 
+.wizard-flow-picker {
+  display: grid;
+  gap: 10px;
+}
+
+.wizard-flow-picker[hidden],
+.wizard-checklist[hidden],
+.wizard-capability[hidden] {
+  display: none;
+}
+
+.wizard-flow-card {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-strong);
+  color: var(--text);
+  padding: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.wizard-flow-card:hover,
+.wizard-flow-card:focus-visible {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px var(--teal-shadow);
+  outline: none;
+}
+
+.wizard-flow-card span {
+  color: var(--teal-strong);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.wizard-flow-card strong {
+  font-size: 14px;
+}
+
+.wizard-flow-card small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.wizard-flow-card.primary-flow {
+  border-color: color-mix(in srgb, var(--teal) 46%, var(--border));
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--teal-soft) 78%, transparent), transparent 72%),
+    var(--panel-strong);
+}
+
 .wizard-checklist {
   display: grid;
   gap: 8px;
