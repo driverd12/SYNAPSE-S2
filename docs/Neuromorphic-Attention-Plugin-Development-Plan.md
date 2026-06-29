@@ -9,7 +9,7 @@ Q = XW_Q,\quad K = XW_K,\quad V = XW_V
 $$
 
 $$
-S = \frac{QK^\top}{\sqrt{d_k}},\quad A = \operatorname{softmax}(S),\quad Y = AV
+S = \frac{QK^\top}{\sqrt{d_k}},\quad A = \mathrm{softmax}(S),\quad Y = AV
 $$
 
 The score matrix $S$ and probability matrix $A$ are both $N \times N$, so attention memory grows as $\Theta(N^2)$ per head. This is the practical long-context memory wall: increasing sequence length increases attention-matrix storage quadratically before counting value activations, KV cache, batch size, or layer count.
@@ -20,7 +20,7 @@ $$
 Z_i = \frac{E_i - \mu_E}{\sigma_E},\quad
 s_i =
 \begin{cases}
-1 & \text{if } i \in \operatorname{argTopK}(Z,k) \\
+1 & \text{if } i \in \mathrm{argTopK}(Z,k) \\
 0 & \text{otherwise}
 \end{cases}
 $$
@@ -51,7 +51,7 @@ A_-e^{-1/\tau_-}S_i[t+1]S_j[t]
 $$
 
 $$
-W_{ij} \leftarrow \operatorname{clip}(W_{ij}+\Delta W_{ij}, -c, c)
+W_{ij} \leftarrow \mathrm{clip}(W_{ij}+\Delta W_{ij}, -c, c)
 $$
 
 This is a fixed-step version of the usual exponential STDP rule: previous spikes potentiate current spikes in the forward direction, current spikes depress the reverse direction, and lateral weights stay inside a configured clip envelope. The runtime also skips STDP when the active set exceeds the configured guardrail. Repeated co-activation becomes durable synaptic and graph structure, so later recall can follow learned sparse activation paths and indexed memory relationships. This avoids materializing Transformer-style $N \times N$ attention matrices during recall. It does not mean the implementation has no multiplications anywhere; decay, weighting, MLX setup, and indexing still use ordinary numeric operations where useful.
@@ -425,11 +425,11 @@ The offline processing architecture uses a structured sequence to manage this co
 | Phase | System Process | Core Mathematical Operation | Downstream Cognitive Function |
 | :---- | :---- | :---- | :---- |
 | **Phase 1** | Connection Weight Decay | $W_{ij} \leftarrow \gamma_{\text{decay}}W_{ij}$ where $0 < \gamma_{\text{decay}} < 1$ | Lowers weight values for weak connections 34 |
-| **Phase 2** | Synaptic Clustering | $C_m = \{i \mid \operatorname{density}(i) \ge \tau_c\}$ | Identifies overlapping spiking patterns 34 |
-| **Phase 3** | Semantic Merging | Merge $m_i,m_j$ when $\operatorname{sim}(m_i,m_j) \ge \tau_{\text{merge}}$ | Consolidates redundant memory paths 34 |
+| **Phase 2** | Synaptic Clustering | $C_m = \{i \mid \mathrm{density}(i) \ge \tau_c\}$ | Identifies overlapping spiking patterns 34 |
+| **Phase 3** | Semantic Merging | Merge $m_i,m_j$ when $\mathrm{sim}(m_i,m_j) \ge \tau_{\text{merge}}$ | Consolidates redundant memory paths 34 |
 | **Phase 4** | Threshold Rescoring | $V_{\text{thr}} \leftarrow V_{\text{thr}} + \alpha(r_{\text{observed}} - r_{\text{target}})$ | Keeps firing rates in healthy, balanced ranges |
-| **Phase 5** | Trace Promotion | $p_i \leftarrow p_i + \mathbf{1}[\operatorname{activation}(i) \ge \tau_{\text{promote}}]$ | Moves active traces to persistent storage 34 |
-| **Phase 6** | Relationship Extraction | $\operatorname{edge}(i,j) \leftarrow \operatorname{HebbianEvidence}(i,j) + \operatorname{STDPEvidence}(i,j)$ | Builds structured semantic connection graphs 14 |
+| **Phase 5** | Trace Promotion | $p_i \leftarrow p_i + \mathbf{1}[\mathrm{activation}(i) \ge \tau_{\text{promote}}]$ | Moves active traces to persistent storage 34 |
+| **Phase 6** | Relationship Extraction | $\mathrm{edge}(i,j) \leftarrow \mathrm{HebbianEvidence}(i,j) + \mathrm{STDPEvidence}(i,j)$ | Builds structured semantic connection graphs 14 |
 | **Phase 7** | Neurogenesis | Reset inactive state: $u_i,s_i \leftarrow 0$ for recycled nodes | Frees up inactive nodes for new memory traces 34 |
 
 To minimize execution overhead on consumer hardware, this consolidation process is divided into two distinct runtime modes 34:

@@ -15,7 +15,7 @@ Q = XW_Q,\quad K = XW_K,\quad V = XW_V
 Each token compares against every other token:
 
 ```math
-S = \frac{QK^\top}{\sqrt{d_k}},\quad A = \operatorname{softmax}(S),\quad Y = AV
+S = \frac{QK^\top}{\sqrt{d_k}},\quad A = \mathrm{softmax}(S),\quad Y = AV
 ```
 
 Because `S` and `A` are both `N x N`, their memory footprint is `Theta(N^2)` per head before counting values, activations, caches, or batching. Doubling the usable context length roughly quadruples the attention-matrix storage. That is the self-attention memory wall.
@@ -23,7 +23,7 @@ Because `S` and `A` are both `N x N`, their memory footprint is `Theta(N^2)` per
 SYNAPSE-S2 uses a different runtime object. Text is embedded locally, converted to sparse sensory spikes, and propagated through a recurrent substrate:
 
 ```math
-z = \operatorname{embed}(\text{text}),\quad s_0 = \operatorname{TopK}(\operatorname{zscore}(z), k)
+z = \mathrm{embed}(\text{text}),\quad s_0 = \mathrm{TopK}(\mathrm{zscore}(z), k)
 ```
 
 ```math
@@ -46,7 +46,7 @@ A_-e^{-1/\tau_-}s_{t+1}s_t^{\top}
 ```
 
 ```math
-W_{\text{lat}} \leftarrow \operatorname{clip}(W_{\text{lat}} + \Delta W_{\text{lat}}, -c, c)
+W_{\text{lat}} \leftarrow \mathrm{clip}(W_{\text{lat}} + \Delta W_{\text{lat}}, -c, c)
 ```
 
 At inference time, active spike operations are dominated by additions, threshold comparisons, decay, and sparse/indexed retrieval rather than dense query-key matrix multiplication over all token pairs. The implementation still uses MLX arrays and scalar multiplications for decay, weighting, and setup where appropriate; "multiplication-free" should be read as the neuromorphic recall path avoiding dense per-token dot-product attention, not as a claim that no numeric multiplication exists anywhere in the codebase. The STDP equation above is the implemented one-step discrete update: previous spikes potentiate current spikes, current spikes depress the reverse direction, and lateral weights are clipped to a configured envelope.
@@ -506,7 +506,7 @@ Z_i = \frac{E_i - \mu_E}{\sigma_E}
 ```math
 S_i =
 \begin{cases}
-1 & \text{if } i \in \operatorname{argTopK}(Z,k) \\
+1 & \text{if } i \in \mathrm{argTopK}(Z,k) \\
 0 & \text{otherwise}
 \end{cases}
 ```
@@ -541,7 +541,7 @@ A_-e^{-1/\tau_-}S_i[t+1]S_j[t]
 ```
 
 ```math
-W_{ij} \leftarrow \operatorname{clip}(W_{ij}+\Delta W_{ij}, -c, c)
+W_{ij} \leftarrow \mathrm{clip}(W_{ij}+\Delta W_{ij}, -c, c)
 ```
 
 This is the fixed-step implementation of the usual exponential STDP rule: pre-before-post spike pairs potentiate the forward direction, while post-before-pre pairs depress it. The runtime also skips STDP when the active set exceeds the configured guardrail and clips updated weights into a bounded envelope. Vector search compares a query vector against stored vectors at query time; STDP turns repeated temporal co-activation into durable structure, so future recall can follow learned activation paths instead of recomputing every pairwise token-token relation.
