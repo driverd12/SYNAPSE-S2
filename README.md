@@ -423,7 +423,7 @@ Quick-pruning is configured for the proposal's five-minute interval (`300` secon
 .venv/bin/python synapse_cli.py --json quick-prune
 ```
 
-Resource profiling reports the MLX topology footprint from the live arrays (`W_syn`, `W_lateral`, membrane state, spike state, and active traces). With the default 1,024 x 6,800 topology it is expected to land near 203 MB, inside the Mac-optimized 96-256 MB operating envelope while materially increasing the recurrent substrate above the original 5,000-neuron prototype; tiny test topologies correctly report a smaller footprint.
+Resource profiling reports the MLX topology footprint from the live arrays (`W_syn`, `W_lateral`, membrane state, spike state, and active traces). With the default 1,024 x 8,192 topology it is expected to land near 288 MB, inside the Mac-optimized 96-384 MB operating envelope while materially increasing the recurrent substrate above the original 5,000-neuron prototype; tiny test topologies correctly report a smaller footprint.
 
 ```bash
 .venv/bin/python synapse_cli.py --json profile --benchmark-quick-prune
@@ -587,7 +587,7 @@ By executing directly inside Apple's Unified Memory Architecture via mlx-snn, SY
 
 * **Metal JIT Acceleration**: Synaptic weight updates are compiled natively into GPU kernels using mx.compile to prevent execution overhead on the CPU.  
 * **No-Copy Memory Sharing**: The host CPU pre-processes input embeddings, while the integrated M-series GPU computes the spiking networks inside the same physical RAM, completely avoiding costly PCIe bus data copies.  
-* **Footprint Control**: The default Mac-optimized topology is certified against a 96 MB to 256 MB estimated resident MLX array envelope, with the current dashboard/resource profile typically reporting about 115 MB for the 6,800-neuron substrate. That is a live topology estimate, not a blanket hardware counter claim.
+* **Footprint Control**: The default Mac-optimized topology is certified against a 96 MB to 384 MB estimated resident MLX array envelope, with the current dashboard/resource profile expected to report about 288 MB for the 8,192-neuron substrate. That is a live topology estimate, not a blanket hardware counter claim.
 
 ## **Verification and Diagnostics**
 

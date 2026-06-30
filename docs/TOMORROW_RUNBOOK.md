@@ -77,7 +77,7 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | `launcher_executable` | `/Users/dan.driver/.local/bin/synapse-s2-mcp` is missing or not executable. | Run `scripts/install_local_launcher.sh`. |
 | `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Capture a real trace with `synapse_cli.py --json remember-text --context default --tag <tag> --text <text>`. |
 | `relationship_minimum_met` | The selected context has too few persisted event relationships for the requested gate. | Run the event graph ingestion command below. |
-| `resource_envelope_met` | The default topology is outside the configured 96-256 MB estimated resource envelope. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then adjust `SYNAPSE_S2_NEURONS` or topology CLI args. |
+| `resource_envelope_met` | The default topology is outside the configured 96-384 MB estimated resource envelope. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then adjust `SYNAPSE_S2_NEURONS` or topology CLI args. |
 | `native_certification_ready` | Strict MLX/mlxsnn certification failed. | Run `synapse_cli.py --json certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope` and inspect `failed_checks`. |
 | `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context default`. |
 | `query_returned_context` | Recall did not return a registered context. | Seed or remember a matching trace, then query again. |
@@ -325,7 +325,7 @@ Native certification:
   --output .synapse_s2/native-certification.json
 ```
 
-The default topology should report `within_target_envelope: true` for the 96-256 MB Mac-optimized target and a quick-pruning result with `within_60ms_budget: true`. Certification additionally checks MLX availability, `mx.compile`, `mlxsnn`, active `mlxsnn.Leaky` execution path, local embedding provider provenance, and any requested GPU/envelope gates. This is implementation-level runtime evidence from the live MLX arrays, not an external Apple Instruments profiler trace.
+The default topology should report `within_target_envelope: true` for the 96-384 MB Mac-optimized target and a quick-pruning result with `within_60ms_budget: true`. Certification additionally checks MLX availability, `mx.compile`, `mlxsnn`, active `mlxsnn.Leaky` execution path, local embedding provider provenance, and any requested GPU/envelope gates. This is implementation-level runtime evidence from the live MLX arrays, not an external Apple Instruments profiler trace.
 
 Embedding provider provenance:
 

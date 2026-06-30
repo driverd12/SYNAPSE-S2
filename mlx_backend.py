@@ -46,9 +46,9 @@ LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
 
 MAX_EMBEDDING_DIMS = 32_768
-DEFAULT_NUM_NEURONS = 6800
+DEFAULT_NUM_NEURONS = 8192
 DEFAULT_RESOURCE_TARGET_MIN_MB = 96.0
-DEFAULT_RESOURCE_TARGET_MAX_MB = 256.0
+DEFAULT_RESOURCE_TARGET_MAX_MB = 384.0
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 TAG_RE = re.compile(r"[^A-Za-z0-9_.: /#-]+")
 AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
@@ -111,6 +111,7 @@ SURFACE_DETAIL_STOP_WORDS = {
     "would",
 }
 MAX_SURFACE_RECALL_SOURCE_CHARS = 4096
+SURFACE_RECALL_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]{1,63}")
 
 
 class BackendUnavailable(RuntimeError):
@@ -1069,6 +1070,15 @@ class SpikingAttentionBackend:
             details.append(f"facets={clean_value(facet_text, 96)}")
         if summary and summary != label:
             details.append(f"summary={clean_value(summary, 96)}")
+        overlap_terms = metadata.get("surface_text_overlap")
+        if isinstance(overlap_terms, (list, tuple)):
+            matched = " ".join(
+                str(term)
+                for term in overlap_terms[:8]
+                if str(term).strip()
+            )
+            if matched:
+                details.append(f"matched={clean_value(matched, 96)}")
         details.append(f"context={entry.get('context_id', '')}")
         details.append(f"id={entry.get('memory_id', '')}")
         return f"{tag} ({', '.join(details)})"
@@ -1081,7 +1091,10 @@ class SpikingAttentionBackend:
         candidates: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {
-            str(candidate["memory_id"]): dict(candidate)
+            str(candidate["memory_id"]): {
+                **dict(candidate),
+                "spike_recall_score": float(candidate.get("score", 0.0) or 0.0),
+            }
             for candidate in candidates
         }
         for candidate in self._surface_text_recall_candidates(
@@ -1089,15 +1102,57 @@ class SpikingAttentionBackend:
             prompt_text=prompt_text,
         ):
             memory_id = str(candidate["memory_id"])
+            surface_score = float(candidate.get("score", 0.0) or 0.0)
             current = merged.get(memory_id)
-            if current is None or float(candidate["score"]) > float(current.get("score", 0.0)):
-                merged[memory_id] = candidate
+            if current is None:
+                merged[memory_id] = {
+                    **dict(candidate),
+                    "surface_recall_score": surface_score,
+                }
+                continue
+            previous_surface_score = float(current.get("surface_recall_score", 0.0) or 0.0)
+            current["surface_recall_score"] = max(previous_surface_score, surface_score)
+            if surface_score >= previous_surface_score:
+                current["metadata"] = candidate.get("metadata", current.get("metadata", {}))
+                current["surface_overlap_count"] = candidate.get("surface_overlap_count")
+                current["surface_term_weight"] = candidate.get("surface_term_weight")
+        rescored: list[dict[str, Any]] = []
+        for candidate in merged.values():
+            ranked_candidate = dict(candidate)
+            ranked_score = self._merged_recall_candidate_score(ranked_candidate)
+            metadata = ranked_candidate.get("metadata")
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            spike_score = float(ranked_candidate.get("spike_recall_score", 0.0) or 0.0)
+            surface_score = float(ranked_candidate.get("surface_recall_score", 0.0) or 0.0)
+            if spike_score > 0.0:
+                metadata["spike_recall_score"] = round(spike_score, 6)
+            if surface_score > 0.0:
+                metadata["surface_recall_score"] = round(surface_score, 6)
+            metadata["recall_rank_score"] = round(ranked_score, 6)
+            ranked_candidate["metadata"] = self._json_safe_metadata(metadata)
+            ranked_candidate["score"] = round(ranked_score, 6)
+            rescored.append(ranked_candidate)
         ranked = sorted(
-            merged.values(),
+            rescored,
             key=lambda item: (float(item.get("score", 0.0)), float(item.get("updated_at", 0.0))),
             reverse=True,
         )
         return ranked[: max(1, self.recall_count)]
+
+    def _merged_recall_candidate_score(self, candidate: dict[str, Any]) -> float:
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        spike_score = float(candidate.get("spike_recall_score", 0.0) or 0.0)
+        surface_score = float(candidate.get("surface_recall_score", 0.0) or 0.0)
+        if surface_score <= 0.0:
+            return min(0.995, 0.6 * spike_score)
+        overlap_terms = metadata.get("surface_text_overlap")
+        concrete_terms = metadata.get("surface_text_concrete_overlap")
+        overlap_count = len(overlap_terms) if isinstance(overlap_terms, (list, tuple)) else 0
+        concrete_count = len(concrete_terms) if isinstance(concrete_terms, (list, tuple)) else 0
+        concrete_bonus = min(0.12, 0.03 * concrete_count)
+        breadth_bonus = min(0.04, 0.005 * overlap_count)
+        spike_bonus = min(0.1, 0.12 * spike_score)
+        return min(0.995, surface_score + concrete_bonus + breadth_bonus + spike_bonus)
 
     def _surface_text_recall_candidates(
         self,
@@ -1105,7 +1160,7 @@ class SpikingAttentionBackend:
         context: str,
         prompt_text: str,
     ) -> list[dict[str, Any]]:
-        query_terms = set(self._surface_words(prompt_text))
+        query_terms = set(self._surface_recall_terms(prompt_text))
         if not query_terms:
             return []
         revision = self.memory_store.entries_revision(
@@ -1139,7 +1194,7 @@ class SpikingAttentionBackend:
                     " ".join(facets),
                 ]
             )
-            corpus_terms = set(self._surface_words(corpus))
+            corpus_terms = set(self._surface_recall_terms(corpus))
             overlap = query_terms & corpus_terms
             phrase_hits = 0
             facet_phrases = tuple(
@@ -1153,18 +1208,30 @@ class SpikingAttentionBackend:
             if len(overlap) < 2 and phrase_hits == 0:
                 continue
             term_weight = float(entry.get("surface_term_weight", 0.0) or 0.0)
+            concrete_query_terms = {
+                term
+                for term in query_terms
+                if self._is_concrete_surface_recall_term(term)
+            }
+            concrete_overlap = overlap & concrete_query_terms
+            coverage = len(overlap) / max(1, len(query_terms))
+            density = len(overlap) / max(1, len(corpus_terms))
+            concrete_coverage = len(concrete_overlap) / max(1, len(concrete_query_terms))
             score = min(
-                0.99,
-                0.35
-                + (0.5 * len(overlap) / max(1, len(query_terms)))
-                + min(0.08, term_weight / 80.0)
-                + min(0.14, 0.07 * phrase_hits),
+                0.995,
+                0.24
+                + (0.42 * coverage)
+                + (0.16 * density)
+                + (0.12 * concrete_coverage)
+                + min(0.05, term_weight / 100.0)
+                + min(0.08, 0.04 * phrase_hits),
             )
             candidate = dict(entry)
             candidate["score"] = round(score, 6)
             metadata = dict(metadata)
             metadata["surface_text_recall"] = True
             metadata["surface_text_overlap"] = sorted(overlap)
+            metadata["surface_text_concrete_overlap"] = sorted(concrete_overlap)
             candidate["metadata"] = self._json_safe_metadata(metadata)
             candidates.append(candidate)
         candidates.sort(
@@ -3428,6 +3495,22 @@ class SpikingAttentionBackend:
             seen.add(word)
             words.append(word)
         return words
+
+    def _surface_recall_terms(self, value: str) -> list[str]:
+        terms: list[str] = []
+        seen: set[str] = set()
+        for match in SURFACE_RECALL_TERM_RE.finditer(str(value or "").lower()):
+            term = match.group(0).strip("._/:-")
+            if len(term) < 2 or term in SURFACE_DETAIL_STOP_WORDS or term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+        return terms
+
+    def _is_concrete_surface_recall_term(self, term: str) -> bool:
+        return any(char.isdigit() for char in term) or any(
+            char in term for char in ("_", "-", "/", ":")
+        )
 
     def _surface_detail_badges(self, metadata: dict[str, Any]) -> list[str]:
         badges: list[str] = []

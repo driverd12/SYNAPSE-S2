@@ -283,7 +283,7 @@ class OperatorReadinessCertifier:
         env.setdefault("MLX_DEVICE", "gpu")
         env["SYNAPSE_S2_EMBEDDING_PROVIDER"] = str(self.args.embedding_provider)
         env.setdefault("SYNAPSE_S2_DIMENSION", "1024")
-        env.setdefault("SYNAPSE_S2_NEURONS", "6800")
+        env.setdefault("SYNAPSE_S2_NEURONS", "8192")
         env.setdefault("SYNAPSE_S2_TOP_K", "256")
         env.setdefault("SYNAPSE_S2_RECALL_COUNT", "10")
         env.setdefault("SYNAPSE_S2_STATE_PATH", str(ROOT / ".synapse_s2" / "runtime_state.json"))

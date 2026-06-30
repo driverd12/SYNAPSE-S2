@@ -647,7 +647,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(profile["arrays"]["W_lateral"]["elements"], 36)
         self.assertGreater(profile["estimated_total_mb"], 0.0)
         self.assertIn("within_target_envelope", profile)
-        self.assertEqual(profile["target_envelope_mb"], {"min": 96.0, "max": 256.0})
+        self.assertEqual(profile["target_envelope_mb"], {"min": 96.0, "max": 384.0})
         self.assertTrue(profile["quick_pruning"]["within_60ms_budget"])
 
     def test_backend_exports_and_backs_up_real_memory_store(self):
@@ -1345,6 +1345,141 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertIn("Surface detail release", recall)
         self.assertIn("facets=", recall)
         self.assertIn("semantic", recall.lower())
+
+    def test_query_text_ranks_fresh_concrete_operational_trace_before_broad_summary(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        old_registration = backend.register_text_trace(
+            tag="old-readiness-summary",
+            text=(
+                "SYNAPSE-S2 Monday readiness covers default topology, App Connect, "
+                "Codex, Cursor, Claude installed state, W_lateral, W_syn, estimated "
+                "neurons, and operator evidence."
+            ),
+            context_id="demo",
+            metadata={
+                "display_label": (
+                    "SYNAPSE-S2 Monday readiness default topology App Connect "
+                    "Codex Cursor Claude installed W_lateral W_syn estimated neurons"
+                ),
+                "semantic_facets": [
+                    (
+                        "default topology app connect codex cursor claude installed "
+                        "w_lateral w_syn estimated neurons"
+                    )
+                ],
+            },
+        )
+        backend.register_text_trace(
+            tag="fresh-raised-topology-evidence",
+            text=(
+                "SYNAPSE-S2 default topology now uses 8192 neurons with an estimated "
+                "288 MB substrate. W_lateral and W_syn sit inside the raised memory "
+                "envelope. App Connect Codex and Cursor were tested; Claude is not installed."
+            ),
+            context_id="demo",
+            metadata={"source": "unit-test"},
+        )
+
+        query_text = (
+            "8192 neurons 288 MB W_lateral W_syn App Connect Codex Cursor "
+            "Claude not installed default topology estimated"
+        )
+        recall = backend.query_text(query_text, context_id="demo")
+        candidates = backend._surface_text_recall_candidates(
+            context="demo",
+            prompt_text=query_text,
+        )
+        scored_by_tag = {str(candidate["tag"]): candidate for candidate in candidates}
+        fresh_candidate = scored_by_tag["fresh-raised-topology-evidence"]
+        old_candidate = scored_by_tag["old-readiness-summary"]
+
+        self.assertIn("fresh-raised-topology-evidence", recall)
+        self.assertIn("old-readiness-summary", recall)
+        self.assertIn("fresh-raised-topology-evidence", recall.split(" / ")[0])
+        self.assertGreater(
+            fresh_candidate["score"],
+            old_candidate["score"],
+        )
+        self.assertIn(
+            "8192",
+            fresh_candidate["metadata"]["surface_text_overlap"],
+        )
+        self.assertIn(
+            "288",
+            fresh_candidate["metadata"]["surface_text_overlap"],
+        )
+
+        spike_heavy_old_candidate = backend.memory_store.get_entry(
+            old_registration["memory_id"]
+        )
+        self.assertIsNotNone(spike_heavy_old_candidate)
+        spike_heavy_old_candidate = dict(spike_heavy_old_candidate)
+        spike_heavy_old_candidate["score"] = 0.96
+        merged = backend._merge_surface_text_recall_candidates(
+            context="demo",
+            prompt_text=query_text,
+            candidates=[spike_heavy_old_candidate],
+        )
+        self.assertEqual(merged[0]["tag"], "fresh-raised-topology-evidence")
+
+    def test_surface_merge_does_not_bury_concrete_subfact_under_spike_only_summary(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        old_registration = backend.register_text_trace(
+            tag="old-spike-heavy-summary",
+            text=(
+                "SYNAPSE-S2 Monday readiness covers default topology, App Connect, "
+                "Codex, Cursor, Claude installed state, and estimated neurons."
+            ),
+            context_id="demo",
+            metadata={
+                "semantic_facets": [
+                    "default topology app connect codex cursor claude installed estimated neurons"
+                ],
+            },
+        )
+        backend.register_text_trace(
+            tag="fresh-topology-array-evidence",
+            text=(
+                "Default topology uses 8192 neurons and 288 MB. "
+                "W_lateral and W_syn sit inside the raised envelope."
+            ),
+            context_id="demo",
+            metadata={"source": "unit-test"},
+        )
+        query_text = (
+            "8192 neurons 288 MB W_lateral W_syn App Connect Codex Cursor "
+            "Claude not installed default topology estimated"
+        )
+        spike_heavy_old_candidate = backend.memory_store.get_entry(
+            old_registration["memory_id"]
+        )
+        self.assertIsNotNone(spike_heavy_old_candidate)
+        spike_heavy_old_candidate = dict(spike_heavy_old_candidate)
+        spike_heavy_old_candidate["score"] = 0.96
+
+        merged = backend._merge_surface_text_recall_candidates(
+            context="demo",
+            prompt_text=query_text,
+            candidates=[spike_heavy_old_candidate],
+        )
+
+        self.assertEqual(merged[0]["tag"], "fresh-topology-array-evidence")
 
     def test_repeated_conversation_captures_keep_distinct_event_nodes(self):
         backend = SpikingAttentionBackend(

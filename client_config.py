@@ -15,7 +15,7 @@ DEFAULT_LAUNCHER = Path.home() / ".local" / "bin" / "synapse-s2-mcp"
 DEFAULT_EMBEDDING_PROVIDER = "mlx-neural"
 DEFAULT_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
 DEFAULT_DIMENSION = "1024"
-DEFAULT_NEURONS = "6800"
+DEFAULT_NEURONS = "8192"
 DEFAULT_TOP_K = "256"
 DEFAULT_RECALL_COUNT = "10"
 
