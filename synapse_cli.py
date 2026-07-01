@@ -22,16 +22,26 @@ def _json_default(value: Any) -> str:
     return str(value)
 
 
+def _emit_line(line: str) -> None:
+    try:
+        print(line)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        finally:
+            raise SystemExit(0)
+
+
 def emit(payload: dict[str, Any], *, as_json: bool) -> None:
     if as_json:
-        print(json.dumps(payload, sort_keys=True, default=_json_default))
+        _emit_line(json.dumps(payload, sort_keys=True, default=_json_default))
         return
 
     for key, value in payload.items():
         if isinstance(value, (dict, list)):
-            print(f"{key}: {json.dumps(value, sort_keys=True, default=_json_default)}")
+            _emit_line(f"{key}: {json.dumps(value, sort_keys=True, default=_json_default)}")
         else:
-            print(f"{key}: {value}")
+            _emit_line(f"{key}: {value}")
 
 
 def parse_vector(raw: str) -> list[float]:

@@ -36,6 +36,34 @@ class SynapseCliTests(unittest.TestCase):
             check=False,
         )
 
+    def test_emit_exits_cleanly_when_stdout_pipe_closes(self):
+        import synapse_cli
+
+        class ClosedPipeStdout:
+            def __init__(self):
+                self.closed = False
+
+            def write(self, _text: str) -> int:
+                raise BrokenPipeError("pipe closed")
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        original_stdout = sys.stdout
+        closed_stdout = ClosedPipeStdout()
+        try:
+            sys.stdout = closed_stdout
+            with self.assertRaises(SystemExit) as raised:
+                synapse_cli.emit({"ok": True}, as_json=True)
+        finally:
+            sys.stdout = original_stdout
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertTrue(closed_stdout.closed)
+
     def test_cli_does_not_expose_seed_demo_command(self):
         help_result = subprocess.run(
             [sys.executable, str(ROOT / "synapse_cli.py"), "--help"],

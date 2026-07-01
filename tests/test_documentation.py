@@ -32,6 +32,22 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("one-cycle discrete form of asymmetric STDP", section)
         self.assertIn("`V_thr`", section)
 
+    def test_operational_status_docs_are_linked_from_primary_docs(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        compliance = (ROOT / "docs" / "PROPOSAL_COMPLIANCE.md").read_text(encoding="utf-8")
+        gap_audit = (ROOT / "docs" / "PRODUCTION_GAP_AUDIT.md").read_text(encoding="utf-8")
+
+        self.assertIn("docs/CURRENT_STATUS.md", readme)
+        self.assertIn("scripts/synapse_status_report.py", readme)
+        self.assertIn("saved memory namespace selector", readme)
+        self.assertIn("Saved memory namespace selector", compliance)
+        self.assertIn("Current status report generator", compliance)
+        self.assertIn("Cross-process Cortex session closure persistence", compliance)
+        self.assertIn("Dashboard context selector was manual-only", gap_audit)
+        self.assertIn("The dashboard Memory Context control lists existing namespaces", gap_audit)
+        self.assertIn("cross-process Cortex session closures", readme)
+        self.assertIn("Closed Cortex sessions could be resurrected", gap_audit)
+
 
 if __name__ == "__main__":
     unittest.main()

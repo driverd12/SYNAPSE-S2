@@ -117,10 +117,19 @@ The detailed operator runbook is in `docs/TOMORROW_RUNBOOK.md`.
 The single-pack readiness certification runbook is in `docs/OPERATOR_READINESS_CERTIFICATION.md`.
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
+The point-in-time live status report is in `docs/CURRENT_STATUS.md`.
+Regenerate it before demos, handoffs, or readiness claims:
+
+```bash
+.venv/bin/python scripts/synapse_status_report.py \
+  --context default \
+  --agent-id codex-desktop \
+  --embedding-provider mlx-neural
+```
 
 ### Daily Operator Trust Loop
 
-The loopback dashboard now has a single operator workflow for first-use and handoff confidence: Start Work, Context Health, Doctor/Repair, Memory Hygiene, Goal Ledger, App Preview receipts, Recall Pin, Recipes, and Wrap Session. The same loop is available from the CLI:
+The loopback dashboard now has a single operator workflow for first-use and handoff confidence: the saved memory namespace selector, Start Work, Context Health, Doctor/Repair, Memory Hygiene, Goal Ledger, App Preview receipts, Recall Pin, Recipes, and Wrap Session. The same loop is available from the CLI:
 
 ```bash
 .venv/bin/python synapse_cli.py --json start-work \
@@ -255,7 +264,7 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
 .venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
 ```
 
-The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goals, assumptions, contradictions, suggested next move, and capture queue in Cortex state. Use `goal.create`, `goal.update`, and `goal.list` to track lightweight operational goals with owner, state, evidence, and next action; MCP clients use `create_spiking_goal`, `update_spiking_goal`, and `list_spiking_goals` for the same ledger. Close the session after verified traces or Wrap Session handoff are captured so the dashboard returns to an explicit idle state instead of leaving stale active sessions.
+The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goals, assumptions, contradictions, suggested next move, and capture queue in Cortex state. Use `goal.create`, `goal.update`, and `goal.list` to track lightweight operational goals with owner, state, evidence, and next action; MCP clients use `create_spiking_goal`, `update_spiking_goal`, and `list_spiking_goals` for the same ledger. Close the session after verified traces or Wrap Session handoff are captured so the dashboard returns to an explicit idle state instead of leaving stale active sessions. Runtime state persistence now merges cross-process Cortex session closures, so a long-running dashboard or capture daemon cannot resurrect a session that a fresh CLI/MCP process already closed.
 
 Capture real operator/Codex conversation notes into the event graph:
 
@@ -446,7 +455,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default

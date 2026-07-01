@@ -68,13 +68,13 @@ const WIZARD_FLOWS = {
     ],
   },
   {
-    selector: "#contextInput",
+    selector: "#contextSelect",
     title: "Choose the memory namespace",
-    body: "Every capture, recall, graph query, and MCP hydration uses the active context. Keep each project or thread in the right namespace.",
+    body: "Every capture, recall, graph query, and MCP hydration uses the active context. Choose an existing namespace from the menu, or type a new one when you need isolation.",
     capability: "Context bus: remembered traces publish durable updates for local MCP clients to pull.",
     items: [
       "Use default for general project work unless you need isolation.",
-      "Enter a context name and press the check button.",
+      "Pick a saved namespace from the menu, or enter a context name and press the check button.",
       "The Memory URI readout shows the active namespace.",
     ],
   },
@@ -207,13 +207,13 @@ const WIZARD_FLOWS = {
         ],
       },
       {
-        selector: "#contextInput",
+        selector: "#contextSelect",
         title: "Choose the memory context",
-        body: "Confirm the context namespace before writing, recalling, or governing work. This field decides where traces, graph links, and client hydration events live.",
+        body: "Confirm the context namespace before writing, recalling, or governing work. The menu shows saved namespaces; the text field remains available for a deliberate new namespace.",
         capability: "Required field: active memory context.",
         items: [
           "Use default for shared SYNAPSE-S2 project work.",
-          "Use a specific project or thread name when the memory should be isolated.",
+          "Choose a specific project or thread name when the memory should be isolated.",
           "Press the context check button and confirm the Memory URI updates.",
         ],
       },
@@ -424,6 +424,9 @@ const elements = collectElements([
   "contextHealthButton",
   "contextHealthOutput",
   "contextInput",
+  "contextMenuDetails",
+  "contextMenuList",
+  "contextSelect",
   "contextUri",
   "coreToggleGuardHint",
   "coreStateIndicator",
@@ -729,6 +732,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   const contexts = status.memory_contexts || {};
   const contextCount = Object.keys(contexts).length;
 
+  renderContextSelector(contexts);
   elements.contextUri.textContent = memoryUri;
   elements.modelUri.textContent = memoryUri;
   elements.embeddingModelLabel.textContent = formatEmbeddingProvider(status.embedding_provider || {});
@@ -794,6 +798,74 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderCortexState(snapshot.cortex_state || {});
   renderFooter(snapshot, status, profile, contextCount);
   renderHydrationTiming(snapshot, clientElapsedMs);
+}
+
+function renderContextSelector(contexts = {}) {
+  const currentContext = state.context || DEFAULT_CONTEXT;
+  const rows = Object.entries(contexts)
+    .map(([name, count]) => ({
+      name: String(name || "").trim(),
+      count: Number(count),
+    }))
+    .filter((row) => row.name);
+
+  if (!rows.some((row) => row.name === currentContext)) {
+    rows.push({ name: currentContext, count: NaN });
+  }
+
+  rows.sort((left, right) => {
+    if (left.name === DEFAULT_CONTEXT) return -1;
+    if (right.name === DEFAULT_CONTEXT) return 1;
+    return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+  });
+
+  elements.contextSelect.innerHTML = rows
+    .map((row) => {
+      const selected = row.name === currentContext ? " selected" : "";
+      return `<option value="${escapeHtml(row.name)}"${selected}>${escapeHtml(formatContextOption(row))}</option>`;
+    })
+    .join("");
+  elements.contextSelect.disabled = rows.length === 0;
+  elements.contextSelect.value = currentContext;
+  elements.contextSelect.title = rows.length
+    ? `${formatNumber(rows.length)} saved memory contexts`
+    : "No saved contexts returned yet";
+  elements.contextSelect.setAttribute(
+    "aria-label",
+    `Choose existing memory context. ${formatNumber(rows.length)} saved contexts available.`,
+  );
+  elements.contextMenuList.innerHTML = rows
+    .map((row) => {
+      const selected = row.name === currentContext ? "true" : "false";
+      return [
+        `<button type="button" class="context-choice-button" data-context="${escapeHtml(row.name)}" aria-current="${selected}" role="option" aria-selected="${selected}">`,
+        `<span>${escapeHtml(row.name)}</span>`,
+        `<span>${Number.isFinite(row.count) ? escapeHtml(formatNumber(row.count)) : "current"}</span>`,
+        "</button>",
+      ].join("");
+    })
+    .join("");
+  elements.contextMenuDetails.hidden = rows.length === 0;
+}
+
+function formatContextOption(row) {
+  if (!Number.isFinite(row.count)) {
+    return `${row.name} (current)`;
+  }
+  return `${row.name} (${formatNumber(row.count)})`;
+}
+
+async function applySelectedContext(context, busyElement = elements.contextApply) {
+  const nextContext = String(context || "").trim() || DEFAULT_CONTEXT;
+  state.context = nextContext;
+  elements.contextInput.value = nextContext;
+  if ([...elements.contextSelect.options].some((option) => option.value === nextContext)) {
+    elements.contextSelect.value = nextContext;
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.set("context_id", nextContext);
+  history.replaceState(null, "", url);
+  await withBusy(busyElement, "Context", refreshSnapshot, { refresh: false });
 }
 
 function renderContextBus(status, deployment = null) {
@@ -3500,13 +3572,8 @@ function updateCoreToggleGuard() {
   elements.toggleActionButton.setAttribute("aria-label", `${nextAction} SYNAPSE-S2 Core`);
 }
 
-elements.contextApply.addEventListener("click", async () => {
-  state.context = elements.contextInput.value.trim() || DEFAULT_CONTEXT;
-  elements.contextInput.value = state.context;
-  const url = new URL(window.location.href);
-  url.searchParams.set("context_id", state.context);
-  history.replaceState(null, "", url);
-  await withBusy(elements.contextApply, "Context", refreshSnapshot);
+elements.contextApply.addEventListener("click", () => {
+  void applySelectedContext(elements.contextInput.value, elements.contextApply);
 });
 
 elements.contextInput.addEventListener("keydown", (event) => {
@@ -3514,6 +3581,20 @@ elements.contextInput.addEventListener("keydown", (event) => {
     event.preventDefault();
     elements.contextApply.click();
   }
+});
+
+elements.contextSelect.addEventListener("change", () => {
+  void applySelectedContext(elements.contextSelect.value, elements.contextSelect);
+});
+
+elements.contextMenuList.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-context]");
+  if (!button) {
+    return;
+  }
+  event.preventDefault();
+  elements.contextMenuDetails.open = false;
+  void applySelectedContext(button.dataset.context, button);
 });
 
 elements.themeButton.addEventListener("click", () => {

@@ -85,6 +85,7 @@ CORTEX_TRUTH_POSTURES = {
     "stale",
 }
 CORTEX_MODES = {"strict", "creative", "operator", "security", "demo"}
+CORTEX_TERMINAL_SESSION_STATUSES = {"closed", "finished", "orphaned"}
 GOAL_LEDGER_STATES = {"planned", "in_progress", "blocked", "done", "stale"}
 SURFACE_DETAIL_STOP_WORDS = {
     "about",
@@ -362,6 +363,7 @@ class SpikingAttentionBackend:
     def _persist_runtime_state(self) -> None:
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cortex_sessions = self._merged_cortex_sessions_for_persist()
             payload = {
                 "version": 2,
                 "global_enabled": self.global_enabled,
@@ -379,6 +381,58 @@ class SpikingAttentionBackend:
         except Exception:
             LOGGER.exception("failed to persist runtime state to %s", self.state_path)
             raise
+
+    def _merged_cortex_sessions_for_persist(self) -> dict[str, dict[str, Any]]:
+        existing_sessions: dict[str, dict[str, Any]] = {}
+        if self.state_path.exists():
+            try:
+                payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+                raw_sessions = payload.get("cortex_sessions", {}) if isinstance(payload, dict) else {}
+                if isinstance(raw_sessions, dict):
+                    existing_sessions = {
+                        str(session_id): self._normalize_cortex_session(raw_session)
+                        for session_id, raw_session in raw_sessions.items()
+                        if isinstance(raw_session, dict)
+                    }
+            except Exception as exc:
+                LOGGER.warning(
+                    "continuing without runtime state merge from %s: %s",
+                    self.state_path,
+                    exc,
+                )
+
+        merged = dict(existing_sessions)
+        for session_id, raw_session in self.cortex_sessions.items():
+            clean_session_id = str(session_id)
+            normalized = self._normalize_cortex_session(raw_session)
+            merged[clean_session_id] = self._prefer_cortex_session(
+                merged.get(clean_session_id),
+                normalized,
+            )
+        return merged
+
+    @staticmethod
+    def _prefer_cortex_session(
+        existing: dict[str, Any] | None,
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not existing:
+            return incoming
+        existing_status = str(existing.get("status", "active"))
+        incoming_status = str(incoming.get("status", "active"))
+        if (
+            existing_status in CORTEX_TERMINAL_SESSION_STATUSES
+            and incoming_status == "active"
+        ):
+            return existing
+        if (
+            incoming_status in CORTEX_TERMINAL_SESSION_STATUSES
+            and existing_status == "active"
+        ):
+            return incoming
+        existing_updated_at = float(existing.get("updated_at", 0.0) or 0.0)
+        incoming_updated_at = float(incoming.get("updated_at", 0.0) or 0.0)
+        return incoming if incoming_updated_at >= existing_updated_at else existing
 
     def _refresh_registered_traces(self) -> None:
         try:

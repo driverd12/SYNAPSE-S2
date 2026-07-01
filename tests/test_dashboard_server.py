@@ -497,6 +497,11 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("readinessAuditButton", index)
         self.assertIn("mondayReadinessButton", index)
         self.assertIn("connectionStatusCard", index)
+        self.assertIn("contextSelect", index)
+        self.assertIn("contextMenuList", index)
+        self.assertIn("Choose existing memory context", index)
+        self.assertIn("Loading saved contexts", index)
+        self.assertIn("Saved namespaces", index)
         self.assertIn("wizardToggleButton", index)
         self.assertIn("wizardLayer", index)
         self.assertIn("wizardSpotlight", index)
@@ -685,7 +690,7 @@ class DashboardRuntimeTests(unittest.TestCase):
             "#operatorActionBanner",
             "#operatorLoopPanel",
             "#mondayReadinessButton",
-            "#contextInput",
+            "#contextSelect",
             "#startWorkButton",
             "#cortexAgentId",
             "#cortexTask",
@@ -718,6 +723,11 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("rememberForm", index)
         self.assertIn("ingestForm", index)
         self.assertIn("dataset.theme", app)
+        self.assertIn("renderContextSelector", app)
+        self.assertIn("applySelectedContext", app)
+        self.assertIn("context-choice-button", app)
+        self.assertIn("contextMenuList.addEventListener", app)
+        self.assertIn("status.memory_contexts", app)
         self.assertIn('synapse-s2-control-theme-v4', app)
         self.assertIn('stored : "dark"', app)
         self.assertIn("initializeSectionNavigation", app)

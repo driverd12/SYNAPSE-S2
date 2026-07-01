@@ -133,10 +133,17 @@
         </nav>
 
         <div class="context-block">
-          <label for="contextInput">Memory Context</label>
-          <p>Namespace for local recall and writes.</p>
+          <label for="contextSelect">Memory Context</label>
+          <p>Choose a saved namespace or type a new one.</p>
+          <select id="contextSelect" class="context-select" aria-label="Choose existing memory context">
+            <option value="" selected>Loading saved contexts...</option>
+          </select>
+          <details id="contextMenuDetails" class="context-menu-details">
+            <summary>Saved namespaces</summary>
+            <div id="contextMenuList" class="context-menu-list" role="listbox" aria-label="Saved memory contexts"></div>
+          </details>
           <div class="context-row">
-            <input id="contextInput" value="default" autocomplete="off" aria-describedby="contextHelp" />
+            <input id="contextInput" value="default" autocomplete="off" aria-label="Manual memory context" aria-describedby="contextHelp" />
             <button id="contextApply" class="icon-button" title="Apply memory context" aria-label="Apply memory context">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
             </button>

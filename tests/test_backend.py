@@ -918,6 +918,67 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(close["cortex_state"]["active_session_count"], 0)
         self.assertEqual(closed_state["active_session_count"], 0)
 
+    def test_cortex_close_survives_stale_backend_runtime_persist(self):
+        backend_a = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        first = backend_a.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Stale process first session.",
+            mode="strict",
+        )
+        second = backend_a.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Stale process second session.",
+            mode="strict",
+        )
+
+        backend_b = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend_b.close_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            session_id=first["session_id"],
+            reason="closed-by-fresh-process",
+        )
+        backend_b.close_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            session_id=second["session_id"],
+            reason="closed-by-fresh-process",
+        )
+
+        # Simulates a long-running dashboard/backend persisting an unrelated
+        # setting after another process closed the sessions.
+        backend_a.set_enabled(True, context_id="demo")
+
+        backend_c = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        state = backend_c.get_cortex_state(context_id="demo", agent_id="codex")
+
+        self.assertEqual(state["active_session_count"], 0)
+        self.assertEqual(backend_c.cortex_sessions[first["session_id"]]["status"], "closed")
+        self.assertEqual(backend_c.cortex_sessions[second["session_id"]]["status"], "closed")
+
     def test_agent_context_hydration_includes_cortex_state(self):
         backend = SpikingAttentionBackend(
             dimension=32,

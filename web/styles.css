@@ -674,6 +674,55 @@ svg {
   gap: 8px;
 }
 
+.context-select {
+  padding-right: 30px;
+  background:
+    linear-gradient(45deg, transparent 50%, var(--teal) 50%) calc(100% - 17px) 50% / 6px 6px no-repeat,
+    linear-gradient(135deg, var(--teal) 50%, transparent 50%) calc(100% - 12px) 50% / 6px 6px no-repeat,
+    linear-gradient(180deg, color-mix(in srgb, var(--teal) 4%, transparent), transparent),
+    var(--input);
+}
+
+.context-menu-details {
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+}
+
+.context-menu-details summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 820;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.context-menu-list {
+  display: grid;
+  gap: 5px;
+  max-height: 168px;
+  overflow: auto;
+  padding: 0 8px 8px;
+}
+
+.context-choice-button {
+  justify-content: space-between;
+  min-height: 30px;
+  padding: 6px 8px;
+  border-color: color-mix(in srgb, var(--border) 82%, transparent);
+  background: color-mix(in srgb, var(--input) 86%, transparent);
+  font-size: 12px;
+  text-align: left;
+}
+
+.context-choice-button[aria-current="true"] {
+  border-color: color-mix(in srgb, var(--teal) 78%, var(--border));
+  color: var(--teal);
+  box-shadow: inset 3px 0 0 var(--teal);
+}
+
 input,
 select,
 textarea {
