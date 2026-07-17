@@ -119,6 +119,15 @@ def _validate_limit(limit: int) -> int:
     return min(max(value, 1), 500)
 
 
+def _validate_recall_scope(recall_scope: str) -> str:
+    normalized = str(recall_scope or "local").strip().lower()
+    if normalized == "broad":
+        normalized = "all"
+    if normalized not in {"local", "connected", "all"}:
+        raise ValueError("recall_scope must be local, connected, or all")
+    return normalized
+
+
 def _parse_json_object(raw: str, *, field_name: str) -> dict[str, Any]:
     value = str(raw or "").strip()
     if not value:
@@ -226,16 +235,19 @@ def _publish_tool_deployment(
 def query_spiking_attention(
     prompt_embedding: list[float],
     context_id: str = "default",
+    recall_scope: str = "local",
 ) -> str:
-    """Return activated historical context tags for a dense prompt embedding."""
+    """Return context-local, approved connected, or all-context memory matches."""
     context = _sanitize_context_id(context_id)
     try:
         values = _validate_embedding(prompt_embedding)
+        scope = _validate_recall_scope(recall_scope)
         mx, mlx_backend = _load_backend()
         embedding_arr = mx.array(values, dtype=mx.float32)
         return mlx_backend.simulate_spiking_retrieval(
             embedding=embedding_arr,
             context_id=context,
+            recall_scope=scope,
         )
     except ValueError as exc:
         LOGGER.warning("invalid prompt_embedding for context_id=%s: %s", context, exc)
@@ -251,15 +263,21 @@ def query_spiking_attention(
         "readOnlyHint": True,
     }
 )
-def query_spiking_attention_text(prompt: str, context_id: str = "default") -> str:
-    """Return activated context tags using the configured local text embedding provider."""
+def query_spiking_attention_text(
+    prompt: str,
+    context_id: str = "default",
+    recall_scope: str = "local",
+) -> str:
+    """Return scoped context matches using the configured local text embedding provider."""
     context = _sanitize_context_id(context_id)
     try:
         prompt_text = _validate_text(prompt, field_name="prompt")
+        scope = _validate_recall_scope(recall_scope)
         _, mlx_backend = _load_backend()
         return mlx_backend.simulate_spiking_text_retrieval(
             prompt=prompt_text,
             context_id=context,
+            recall_scope=scope,
         )
     except ValueError as exc:
         LOGGER.warning("invalid prompt text for context_id=%s: %s", context, exc)
@@ -267,6 +285,78 @@ def query_spiking_attention_text(prompt: str, context_id: str = "default") -> st
     except Exception as exc:
         LOGGER.exception("text spiking attention query failed for context_id=%s", context)
         return f"spiking attention unavailable: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "List SYNAPSE-S2 Namespace Galaxy",
+        "readOnlyHint": True,
+    }
+)
+def list_spiking_namespace_map(
+    context_id: str = "default",
+    limit: int = 500,
+    include_suggestions: bool = True,
+) -> str:
+    """List every namespace, approved bridge, and read-only bridge suggestion."""
+    context = _sanitize_context_id(context_id)
+    try:
+        bounded_limit = _validate_limit(limit)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.list_namespace_map(
+            context_id=context,
+            limit=bounded_limit,
+            include_suggestions=bool(include_suggestions),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid namespace map request for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid namespace map request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("namespace map failed for context_id=%s", context)
+        return json.dumps({"error": f"namespace map failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Approve SYNAPSE-S2 Namespace Link",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
+)
+def approve_spiking_namespace_link(
+    source_context_id: str,
+    target_context_id: str,
+    relation_type: str = "related",
+    weight: float = 1.0,
+    evidence: dict[str, Any] | None = None,
+    direction: str = "bidirectional",
+    approved_by: str = "operator",
+    confirm: bool = False,
+) -> str:
+    """Persist one typed link after explicit confirmation; never copies memories."""
+    source = _sanitize_context_id(source_context_id)
+    target = _sanitize_context_id(target_context_id)
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.approve_namespace_link(
+            source_context_id=source,
+            target_context_id=target,
+            relation_type=relation_type,
+            weight=float(weight),
+            evidence=evidence or {},
+            direction=direction,
+            approved_by=_sanitize_agent_id(approved_by),
+            confirm=bool(confirm),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid namespace link request for %s -> %s: %s", source, target, exc)
+        return json.dumps({"error": f"invalid namespace link request: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("namespace link approval failed for %s -> %s", source, target)
+        return json.dumps({"error": f"namespace link approval failed: {exc}"}, sort_keys=True)
 
 
 @mcp.tool()

@@ -142,6 +142,149 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("memory_entry_revision", query_payload["diagnostics"])
         self.assertEqual(query_payload["results"][0]["kind"], "status")
 
+    def test_query_defaults_to_local_scope_and_rejects_unknown_scope(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+
+            local_status, local_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/query",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "prompt": "SYNAPSE-S2 dashboard recalls local memory",
+                        }
+                    ).encode(),
+                )
+            )
+            invalid_status, invalid_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/query",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "prompt": "SYNAPSE-S2 dashboard recalls local memory",
+                            "recall_scope": "unbounded",
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(local_status, 200)
+        self.assertEqual(local_payload["recall_scope"], "local")
+        self.assertEqual(local_payload["diagnostics"]["recall_scope"], "local")
+        self.assertEqual(invalid_status, 400)
+        self.assertEqual(
+            invalid_payload["error"],
+            "recall_scope must be local, connected, or all",
+        )
+
+    def test_namespace_map_and_confirmed_link_api(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime.backend.register_trace(
+                tag="linked-memory",
+                embedding=runtime.backend.embed_text(
+                    "SYNAPSE-S2 dashboard recalls related camera work"
+                ),
+                context_id="camera-work",
+                source_text="SYNAPSE-S2 dashboard recalls related camera work",
+                metadata={"source": "unit-test"},
+            )
+
+            map_status, map_payload = self.decode(
+                runtime.handle("GET", "/api/namespace-map?context_id=demo")
+            )
+            refused_status, refused_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/namespace-links",
+                    json.dumps(
+                        {
+                            "source_context_id": "demo",
+                            "target_context_id": "camera-work",
+                            "relation_type": "related",
+                            "confirm": False,
+                        }
+                    ).encode(),
+                )
+            )
+            approved_status, approved_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/namespace-links",
+                    json.dumps(
+                        {
+                            "source_context_id": "demo",
+                            "target_context_id": "camera-work",
+                            "relation_type": "related",
+                            "weight": 0.8,
+                            "evidence": {"source": "dashboard-unit-test"},
+                            "confirm": True,
+                        }
+                    ).encode(),
+                )
+            )
+            connected_status, connected_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/query",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "prompt": "related camera work",
+                            "recall_scope": "connected",
+                        }
+                    ).encode(),
+                )
+            )
+            linked_status, linked_payload = self.decode(
+                runtime.handle("GET", "/api/namespace-map?context_id=demo")
+            )
+
+        self.assertEqual(map_status, 200)
+        self.assertEqual(map_payload["scope"], "all")
+        self.assertEqual(map_payload["selected_context_id"], "demo")
+        self.assertEqual(
+            {node["context_id"] for node in map_payload["nodes"]},
+            {"camera-work", "demo"},
+        )
+        self.assertEqual(refused_status, 400)
+        self.assertEqual(
+            refused_payload["error"],
+            "confirm=true is required to approve a namespace link",
+        )
+        self.assertEqual(approved_status, 200)
+        self.assertTrue(approved_payload["approved"])
+        self.assertFalse(approved_payload["automatic_cross_namespace_write"])
+        self.assertEqual(approved_payload["link"]["recall_hops"], 1)
+        self.assertEqual(connected_status, 200)
+        self.assertEqual(
+            set(connected_payload["diagnostics"]["effective_context_ids"]),
+            {"camera-work", "demo", "global"},
+        )
+        self.assertEqual(
+            set(
+                connected_payload["diagnostics"]["memory_entry_revision"][
+                    "context_ids"
+                ]
+            ),
+            {"camera-work", "demo", "global"},
+        )
+        camera_result = next(
+            result
+            for result in connected_payload["results"]
+            if result.get("context_id") == "camera-work"
+        )
+        self.assertEqual(camera_result["recall_scope"], "connected")
+        self.assertEqual(camera_result["recall_provenance"], "connected")
+        self.assertTrue(camera_result["via_context_link_id"])
+        self.assertEqual(linked_status, 200)
+        self.assertEqual(linked_payload["link_count"], 1)
+        self.assertIn("camera-work", linked_payload["nodes"][0]["connected_context_ids"])
+
     def test_api_errors_hide_internal_details_by_default(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -243,6 +386,63 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertTrue(audit_payload["checks"]["memory_ready"])
         self.assertTrue(audit_payload["checks"]["graph_ready"])
         self.assertIn("dashboard-memory", audit_payload["query_result"])
+
+    def test_namespace_detail_endpoint_validates_and_preserves_bounded_projection(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime.backend.register_text_trace(
+                tag="dashboard-detail-objective",
+                text="Objective adds another visible ganglion.",
+                context_id="demo",
+                metadata={"context_memory_type": "objective"},
+            )
+            detail_status, detail_payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/namespace-detail?context_id=demo&level=neurons&limit=1",
+                )
+            )
+            selected_cluster_id = detail_payload["clusters"][0]["cluster_id"]
+            selected_status, selected_payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    (
+                        "/api/namespace-detail?context_id=demo&level=neurons"
+                        f"&cluster_id={selected_cluster_id}&limit=20"
+                    ),
+                )
+            )
+            invalid_status, invalid_payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/namespace-detail?context_id=demo&level=unbounded",
+                )
+            )
+            oversized_status, oversized_payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/namespace-detail?context_id=demo&cluster_id=" + ("x" * 129),
+                )
+            )
+
+        self.assertEqual(detail_status, 200)
+        self.assertTrue(detail_payload["read_only"])
+        self.assertFalse(detail_payload["automatic_cross_namespace_write"])
+        self.assertEqual(detail_payload["level"], "neurons")
+        self.assertEqual(detail_payload["counts"]["returned_nodes"], 1)
+        self.assertGreaterEqual(detail_payload["counts"]["returned_clusters"], 2)
+        self.assertTrue(detail_payload["truncation"]["nodes"]["truncated"])
+        self.assertEqual(selected_status, 200)
+        self.assertEqual(selected_payload["selected_cluster_id"], selected_cluster_id)
+        self.assertEqual(selected_payload["counts"]["eligible_clusters"], 1)
+        self.assertEqual(
+            {node["cluster_id"] for node in selected_payload["nodes"]},
+            {selected_cluster_id},
+        )
+        self.assertEqual(invalid_status, 400)
+        self.assertEqual(invalid_payload["error"], "level must be cortex, ganglion, or neurons")
+        self.assertEqual(oversized_status, 413)
+        self.assertEqual(oversized_payload["error"], "cluster_id is too large")
 
     def test_cortex_governor_endpoints_and_snapshot_state(self):
         with TemporaryDirectory() as tmp:
@@ -492,7 +692,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("runtimeHealthGrid", index)
         self.assertIn("operatorGuide", index)
         self.assertIn("recallGuide", index)
-        self.assertIn("Local recall only", index)
+        self.assertIn("Local uses this namespace plus global memory", index)
+        self.assertIn("Connected adds approved one-hop bridges", index)
         self.assertIn("query_spiking_attention_text", index)
         self.assertIn("readinessAuditButton", index)
         self.assertIn("mondayReadinessButton", index)

@@ -68,6 +68,44 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("demo_with_spaces", result)
         self.assertNotIn("..", result)
 
+    def test_namespace_map_requires_confirmation_before_linking(self):
+        for context, tag, vector in (
+            ("alpha", "alpha-memory", [1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            ("beta", "beta-memory", [1.0, 0.0, 0.8, 0.0, 0.0, 0.0]),
+        ):
+            mcp_server.remember_spiking_context(
+                tag=tag,
+                context_id=context,
+                prompt_embedding=vector,
+                text=f"{context} shared topic",
+            )
+
+        refused = json.loads(
+            mcp_server.approve_spiking_namespace_link(
+                source_context_id="alpha",
+                target_context_id="beta",
+            )
+        )
+        approved = json.loads(
+            mcp_server.approve_spiking_namespace_link(
+                source_context_id="alpha",
+                target_context_id="beta",
+                weight=0.75,
+                evidence={"source": "mcp-unit-test"},
+                confirm=True,
+            )
+        )
+        namespace_map = json.loads(
+            mcp_server.list_spiking_namespace_map(context_id="alpha")
+        )
+
+        self.assertIn("confirm=true is required", refused["error"])
+        self.assertTrue(approved["approved"])
+        self.assertFalse(approved["automatic_cross_namespace_write"])
+        self.assertEqual(namespace_map["node_count"], 2)
+        self.assertEqual(namespace_map["link_count"], 1)
+        self.assertEqual(namespace_map["connected_scope_hops"], 1)
+
     def test_sleep_consolidation_returns_status_string(self):
         result = mcp_server.trigger_sleep_consolidation()
 
@@ -188,9 +226,17 @@ class McpServerTests(unittest.TestCase):
         result = mcp_server.query_spiking_attention_text(
             prompt="SYNAPSE-S2 local spiking memory demo",
             context_id="demo",
+            recall_scope="local",
         )
 
         self.assertIn("local-demo-memory", result)
+
+        invalid_scope = mcp_server.query_spiking_attention_text(
+            prompt="SYNAPSE-S2 local spiking memory demo",
+            context_id="demo",
+            recall_scope="unbounded",
+        )
+        self.assertIn("recall_scope must be local, connected, or all", invalid_scope)
 
     def test_memory_list_export_and_backup_tools_are_json_safe(self):
         mcp_server.remember_spiking_context(

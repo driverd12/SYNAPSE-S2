@@ -180,8 +180,13 @@ def command_query_text(args: argparse.Namespace) -> dict[str, Any]:
     embedding = backend.embed_text_payload(args.text)
     return {
         "context_id": mlx_backend.sanitize_context_id(args.context),
+        "recall_scope": args.recall_scope,
         "embedding_provider": embedding["provenance"],
-        "result": backend.query_text(args.text, context_id=args.context),
+        "result": backend.query_text(
+            args.text,
+            context_id=args.context,
+            recall_scope=args.recall_scope,
+        ),
     }
 
 
@@ -189,7 +194,12 @@ def command_query_vector(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return {
         "context_id": mlx_backend.sanitize_context_id(args.context),
-        "result": backend.query(parse_vector(args.vector), context_id=args.context),
+        "recall_scope": args.recall_scope,
+        "result": backend.query(
+            parse_vector(args.vector),
+            context_id=args.context,
+            recall_scope=args.recall_scope,
+        ),
     }
 
 
@@ -379,6 +389,32 @@ def command_app_snapshot_preview(args: argparse.Namespace) -> dict[str, Any]:
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.list_memory_graph(context_id=args.context, limit=args.limit)
+
+
+def command_namespace_map(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_namespace_map(
+        context_id=args.context,
+        limit=args.limit,
+        include_suggestions=not bool(args.no_suggestions),
+        suggestion_limit=args.suggestion_limit,
+        min_suggestion_score=args.min_suggestion_score,
+    )
+
+
+def command_namespace_link(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.approve_namespace_link(
+        source_context_id=args.source_context,
+        target_context_id=args.target_context,
+        relation_type=args.relation_type,
+        weight=args.weight,
+        evidence=parse_metadata(args.evidence),
+        direction=args.direction,
+        approved_by=args.approved_by,
+        enabled=not bool(args.disabled),
+        confirm=bool(args.confirm),
+    )
 
 
 def _publish_cli_deployment(
@@ -868,11 +904,25 @@ def build_parser() -> argparse.ArgumentParser:
     query_text = subparsers.add_parser("query-text")
     add_context(query_text)
     query_text.add_argument("--text", required=True)
+    query_text.add_argument(
+        "--scope",
+        dest="recall_scope",
+        choices=("local", "connected", "all"),
+        default="local",
+        help="Recall only this context, approved one-hop connections, or every context.",
+    )
     query_text.set_defaults(func=command_query_text)
 
     query_vector = subparsers.add_parser("query-vector")
     add_context(query_vector)
     query_vector.add_argument("--vector", required=True)
+    query_vector.add_argument(
+        "--scope",
+        dest="recall_scope",
+        choices=("local", "connected", "all"),
+        default="local",
+        help="Recall only this context, approved one-hop connections, or every context.",
+    )
     query_vector.set_defaults(func=command_query_vector)
 
     ingest_text = subparsers.add_parser("ingest-text")
@@ -997,6 +1047,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(graph)
     graph.add_argument("--limit", type=int, default=100)
     graph.set_defaults(func=command_graph)
+
+    namespace_map = subparsers.add_parser("namespace-map")
+    add_context(namespace_map)
+    namespace_map.add_argument("--limit", type=int, default=500)
+    namespace_map.add_argument("--suggestion-limit", type=int, default=50)
+    namespace_map.add_argument("--min-suggestion-score", type=float, default=0.05)
+    namespace_map.add_argument("--no-suggestions", action="store_true")
+    namespace_map.set_defaults(func=command_namespace_map)
+
+    namespace_link = subparsers.add_parser("namespace-link")
+    namespace_link.add_argument("--source-context", required=True)
+    namespace_link.add_argument("--target-context", required=True)
+    namespace_link.add_argument("--relation-type", default="related")
+    namespace_link.add_argument("--weight", type=float, default=1.0)
+    namespace_link.add_argument("--evidence", default=None)
+    namespace_link.add_argument(
+        "--direction",
+        choices=("bidirectional", "directed"),
+        default="bidirectional",
+    )
+    namespace_link.add_argument("--approved-by", default="operator")
+    namespace_link.add_argument("--disabled", action="store_true")
+    namespace_link.add_argument("--confirm", action="store_true")
+    namespace_link.set_defaults(func=command_namespace_link)
 
     pull_context = subparsers.add_parser("pull-context")
     add_context(pull_context)

@@ -137,6 +137,62 @@ class DashboardRuntime:
             return self._json_response(
                 self.backend.list_memory_graph(context_id=context, limit=limit)
             )
+        if method == "GET" and path == "/api/namespace-map":
+            context = self._context_from_params(params)
+            limit = self._int_param(params, "limit", 500, minimum=1, maximum=2_000)
+            suggestion_limit = self._int_param(
+                params,
+                "suggestion_limit",
+                50,
+                minimum=0,
+                maximum=500,
+            )
+            include_suggestions = self._bool_param(params, "include_suggestions", True)
+            min_suggestion_score = self._float_param(
+                params,
+                "min_suggestion_score",
+                0.05,
+                minimum=0.0,
+                maximum=1.0,
+            )
+            return self._json_response(
+                self.backend.list_namespace_map(
+                    context_id=context,
+                    limit=limit,
+                    include_suggestions=include_suggestions,
+                    suggestion_limit=suggestion_limit,
+                    min_suggestion_score=min_suggestion_score,
+                )
+            )
+        if method == "GET" and path == "/api/namespace-detail":
+            context = self._context_from_params(params)
+            level = str(params.get("level", ["cortex"])[0] or "cortex").strip().lower()
+            cluster_id = str(params.get("cluster_id", [""])[0] or "").strip()
+            if len(level.encode("utf-8")) > 32:
+                raise DashboardError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "level is too large",
+                )
+            if len(cluster_id.encode("utf-8")) > 128:
+                raise DashboardError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "cluster_id is too large",
+                )
+            limit = self._int_param(
+                params,
+                "limit",
+                100,
+                minimum=1,
+                maximum=500,
+            )
+            return self._json_response(
+                self.backend.list_namespace_detail(
+                    context_id=context,
+                    level=level,
+                    cluster_id=cluster_id,
+                    limit=limit,
+                )
+            )
         if method == "GET" and path == "/api/context-events":
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 50, minimum=1, maximum=500)
@@ -434,28 +490,88 @@ class DashboardRuntime:
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
             prompt = self._text_payload(payload, "prompt", max_bytes=MAX_TEXT_BYTES)
+            recall_scope = str(payload.get("recall_scope", "local") or "local").strip().lower()
+            if recall_scope == "broad":
+                recall_scope = "all"
+            if recall_scope not in {"local", "connected", "all"}:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "recall_scope must be local, connected, or all",
+                )
             started = time.perf_counter()
-            result = self.backend.query_text(prompt, context_id=context)
+            result = self.backend.query_text(
+                prompt,
+                context_id=context,
+                recall_scope=recall_scope,
+            )
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
             results = self._parse_recall_result(result)
+            recall_contexts = self.backend.memory_store.resolve_recall_contexts(
+                context_id=context,
+                scope=recall_scope,
+            )
+            effective_context_ids = [
+                str(record.get("context_id") or "")
+                for record in recall_contexts
+                if str(record.get("context_id") or "")
+            ]
             return self._json_response(
                 {
                     "context_id": context,
+                    "recall_scope": recall_scope,
                     "prompt": prompt,
                     "result": result,
                     "results": results,
                     "latency_ms": elapsed_ms,
                     "diagnostics": {
                         "result_count": len(results),
+                        "recall_scope": recall_scope,
+                        "effective_context_ids": effective_context_ids,
                         "runtime": "ready" if self.backend.is_enabled(context) else "disabled",
                         "embedding_provider": self.backend.embedding_provider_info(),
                         "memory_entry_revision": self.backend.memory_store.entries_revision(
-                            context_id=context,
-                            include_global=True,
+                            context_ids=effective_context_ids,
                         ),
                     },
                     "query_id": self._query_id(context=context),
                 }
+            )
+        if method == "POST" and path == "/api/namespace-links":
+            payload = self._parse_json_body(body)
+            source_context_id = mlx_backend.sanitize_context_id(
+                self._text_payload(payload, "source_context_id", max_bytes=256)
+            )
+            target_context_id = mlx_backend.sanitize_context_id(
+                self._text_payload(payload, "target_context_id", max_bytes=256)
+            )
+            relation_type = str(payload.get("relation_type", "related") or "related").strip()
+            direction = str(payload.get("direction", "bidirectional") or "bidirectional").strip()
+            approved_by = str(payload.get("approved_by", "operator") or "operator").strip()
+            try:
+                weight = float(payload.get("weight", 1.0))
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "weight must be a number") from exc
+            evidence = payload.get("evidence", {})
+            if evidence is None:
+                evidence = {}
+            if not isinstance(evidence, dict):
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "evidence must be an object")
+            enabled = payload.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "enabled must be a boolean")
+            confirm = self._required_bool(payload, "confirm")
+            return self._json_response(
+                self.backend.approve_namespace_link(
+                    source_context_id=source_context_id,
+                    target_context_id=target_context_id,
+                    relation_type=relation_type,
+                    weight=weight,
+                    evidence=evidence,
+                    direction=direction,
+                    approved_by=approved_by,
+                    enabled=enabled,
+                    confirm=confirm,
+                )
             )
         if method == "POST" and path == "/api/remember":
             payload = self._parse_json_body(body)
@@ -2428,6 +2544,14 @@ class DashboardRuntime:
             ]
         if "summary" in metadata:
             item["summary"] = metadata["summary"]
+        if "scope" in metadata:
+            item["recall_scope"] = metadata["scope"]
+        if "provenance" in metadata:
+            item["recall_provenance"] = metadata["provenance"]
+        if "via_context_link" in metadata:
+            item["via_context_link_id"] = metadata["via_context_link"]
+        if "via_relation" in metadata:
+            item["via_relation_type"] = metadata["via_relation"]
         return item
 
     def _parse_key_value_pairs(self, text: str) -> dict[str, Any]:
@@ -2941,6 +3065,21 @@ class DashboardRuntime:
             value = int(params.get(key, [str(default)])[0])
         except (TypeError, ValueError) as exc:
             raise DashboardError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer") from exc
+        return min(max(value, minimum), maximum)
+
+    def _float_param(
+        self,
+        params: dict[str, list[str]],
+        key: str,
+        default: float,
+        *,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        try:
+            value = float(params.get(key, [str(default)])[0])
+        except (TypeError, ValueError) as exc:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, f"{key} must be a number") from exc
         return min(max(value, minimum), maximum)
 
     def _required_bool(self, payload: dict[str, Any], key: str) -> bool:

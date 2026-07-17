@@ -107,6 +107,8 @@ class SynapseCliTests(unittest.TestCase):
                 "demo",
                 "--text",
                 "SYNAPSE-S2 remembers local MCP state",
+                "--scope",
+                "local",
                 state_path=state_path,
             )
             disable = self.run_cli("disable", "--context", "demo", state_path=state_path)
@@ -125,8 +127,73 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(disabled_query.returncode, 0, disabled_query.stderr)
         self.assertEqual(json.loads(remember.stdout)["tag"], "cli-memory")
         self.assertIn("cli-memory", json.loads(query.stdout)["result"])
+        self.assertEqual(json.loads(query.stdout)["recall_scope"], "local")
         self.assertFalse(json.loads(disable.stdout)["effective_enabled"])
         self.assertIn("disabled", json.loads(disabled_query.stdout)["result"].lower())
+
+    def test_cli_lists_and_approves_namespace_links(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            for context, tag, text in (
+                ("alpha", "alpha-memory", "shared camera control topic"),
+                ("beta", "beta-memory", "shared control room topic"),
+            ):
+                remembered = self.run_cli(
+                    "remember-text",
+                    "--context",
+                    context,
+                    "--tag",
+                    tag,
+                    "--text",
+                    text,
+                    state_path=state_path,
+                    memory_path=memory_path,
+                )
+                self.assertEqual(remembered.returncode, 0, remembered.stderr)
+
+            refused = self.run_cli(
+                "namespace-link",
+                "--source-context",
+                "alpha",
+                "--target-context",
+                "beta",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            approved = self.run_cli(
+                "namespace-link",
+                "--source-context",
+                "alpha",
+                "--target-context",
+                "beta",
+                "--weight",
+                "0.8",
+                "--evidence",
+                '{"source":"cli-unit-test"}',
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            namespace_map = self.run_cli(
+                "namespace-map",
+                "--context",
+                "alpha",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("confirm=true is required", json.loads(refused.stdout)["error"])
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        approved_payload = json.loads(approved.stdout)
+        self.assertTrue(approved_payload["approved"])
+        self.assertFalse(approved_payload["automatic_cross_namespace_write"])
+        self.assertEqual(namespace_map.returncode, 0, namespace_map.stderr)
+        map_payload = json.loads(namespace_map.stdout)
+        self.assertEqual(map_payload["node_count"], 2)
+        self.assertEqual(map_payload["link_count"], 1)
+        self.assertEqual(map_payload["default_recall_scope"], "local")
 
     def test_cli_doctor_reports_runtime_fields(self):
         with TemporaryDirectory() as tmp:

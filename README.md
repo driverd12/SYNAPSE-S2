@@ -457,6 +457,24 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
 
+### Connected namespace recall and neural galaxy
+
+The namespace selector remains the precise control surface, while the Neural Galaxy provides a navigable overview of every live namespace. Namespace bodies scale with stored memory volume; approved typed links form durable bridges; and suggested bridges stay visually distinct until an operator explicitly approves them. A click on a namespace body loads that namespace through the same saved-context path as the sidebar selector and enters its read-only internal cortex.
+
+The internal view uses semantic level of detail rather than decorative particles. The outer cortex shows deterministic ganglia derived from stored typed namespaces and relationships; zooming or selecting a ganglion reveals its bounded memory neurons and real relationship edges. Breadcrumbs, browser history, Back/Escape, keyboard controls, and an equivalent DOM list move between `all namespaces -> cortex -> ganglion -> neuron inspection`. The server re-redacts legacy display text, emits only bounded allowlisted summaries and provenance, strictly scopes every row to the selected context, and reports sampling/truncation whenever the complete graph is larger than the response limit. This drill-down never writes, copies, links, or mutates memory.
+
+The dashboard reads that projection from `GET /api/namespace-detail` with `context_id`, `level=cortex|ganglion|neurons`, optional `cluster_id`, and a bounded `limit`. Stable IDs and ordering make an unchanged namespace render consistently across refreshes.
+
+Recall always declares one of three scopes:
+
+- `local` (default) reads the selected namespace plus memories explicitly stored in the inherited `global` context.
+- `connected` adds directly connected, enabled namespaces to the local/global set and retains source/link provenance on every recalled trace.
+- `all` deliberately searches all namespaces plus global memory. It is never selected implicitly.
+
+Connected recall is a bounded read operation. Similarity and density-normalized suggestion scores never copy or write durable memories into another namespace, and links require explicit confirmation. Phase-delay values are presentation metadata used only for bridge styling and inspection in the galaxy, not a claim that the SQLite memory store runs a validated biological synchronization model.
+
+The visual and suggestion model is informed by [S2-Net's time-delayed coordination preprint](https://arxiv.org/abs/2605.01656), [Spike Dice Attention's density-bias work](https://openreview.net/forum?id=8clCPAImE3), and the [Spiking Graph Transformer Network paper](https://www.frontiersin.org/journals/behavioral-neuroscience/articles/10.3389/fnbeh.2026.1797210/full). Those papers study spiking neural systems, not durable memory namespace synchronization; SYNAPSE-S2 therefore treats the cross-namespace adaptation as an operator-governed product design rather than an experimentally established result.
+
 ```bash
 .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default
 open "http://127.0.0.1:8765/?context_id=default"

@@ -113,6 +113,12 @@ SURFACE_DETAIL_STOP_WORDS = {
 }
 MAX_SURFACE_RECALL_SOURCE_CHARS = 4096
 SURFACE_RECALL_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]{1,63}")
+NAMESPACE_DETAIL_LEVELS = {"cortex", "ganglion", "neurons"}
+NAMESPACE_DETAIL_ENTRY_SCAN_LIMIT = 10_000
+NAMESPACE_DETAIL_RELATIONSHIP_SCAN_LIMIT = 20_000
+NAMESPACE_DETAIL_MAX_RETURNED_NODES = 500
+NAMESPACE_DETAIL_MAX_RETURNED_CLUSTERS = 500
+NAMESPACE_DETAIL_MAX_RETURNED_EDGES = 2_000
 
 
 class BackendUnavailable(RuntimeError):
@@ -149,6 +155,15 @@ def sanitize_agent_id(agent_id: str) -> str:
     raw = str(agent_id or "").strip()
     cleaned = AGENT_ID_RE.sub("_", raw).strip("._-:@")
     return (cleaned or "unknown-agent")[:128]
+
+
+def sanitize_recall_scope(recall_scope: str) -> str:
+    normalized = str(recall_scope or "local").strip().lower()
+    if normalized == "broad":
+        normalized = "all"
+    if normalized not in {"local", "connected", "all"}:
+        raise ValueError("recall_scope must be local, connected, or all")
+    return normalized
 
 
 def _array_to_int_list(array: Any) -> list[int]:
@@ -945,6 +960,7 @@ class SpikingAttentionBackend:
         *,
         context_id: str = "default",
         steps: int = 12,
+        recall_scope: str = "local",
     ) -> str:
         prompt_text = str(prompt or "").strip()
         if not prompt_text:
@@ -954,6 +970,7 @@ class SpikingAttentionBackend:
             context_id=context_id,
             steps=steps,
             prompt_text=prompt_text,
+            recall_scope=recall_scope,
         )
 
     def query(
@@ -963,8 +980,10 @@ class SpikingAttentionBackend:
         context_id: str = "default",
         steps: int = 12,
         prompt_text: str = "",
+        recall_scope: str = "local",
     ) -> str:
         context = sanitize_context_id(context_id)
+        normalized_scope = sanitize_recall_scope(recall_scope)
         if not self.is_enabled(context):
             self._mark_activity()
             return (
@@ -980,11 +999,16 @@ class SpikingAttentionBackend:
                 sensory_spikes=sensory_spikes,
                 firing_signature=firing_signature,
                 prompt_text=prompt_text,
+                recall_scope=normalized_scope,
             )
             if registered:
                 return " / ".join(registered)
             active_indices = self._recall_indices(firing_signature, sensory_spikes)
-            tags = self._tags_for_indices(active_indices, context)
+            tags = self._tags_for_indices(
+                active_indices,
+                context,
+                recall_scope=normalized_scope,
+            )
             if not tags:
                 return self._raw_activation_summary(active_indices)
             return " / ".join(tags)
@@ -1017,31 +1041,41 @@ class SpikingAttentionBackend:
         sensory_spikes: Any,
         firing_signature: Any,
         prompt_text: str = "",
+        recall_scope: str = "local",
     ) -> list[str]:
         query_spikes = set(self._active_indices_from_spikes(sensory_spikes))
         if not query_spikes:
             return []
         firing_values = firing_signature.tolist()
+        scope_records = self.memory_store.resolve_recall_contexts(
+            context_id=context,
+            scope=recall_scope,
+        )
         candidates = self.memory_store.recall_candidates(
             context_id=context,
             query_spikes=query_spikes,
             firing_values=firing_values,
             limit=self.recall_count,
+            recall_scope=recall_scope,
+            recall_contexts=scope_records,
         )
         candidates = self._merge_surface_text_recall_candidates(
             context=context,
             prompt_text=prompt_text,
             candidates=candidates,
+            recall_scope=recall_scope,
+            recall_contexts=scope_records,
         )
         rendered = [
             self._format_recall_entry(candidate, score=float(candidate["score"]))
             for candidate in candidates
         ]
         rendered.extend(
-            self._related_trace_contexts(
-                context=context,
-                candidates=candidates,
-            )
+                self._related_trace_contexts(
+                    context=context,
+                    candidates=candidates,
+                    recall_scope=recall_scope,
+                )
         )
         return rendered
 
@@ -1050,19 +1084,23 @@ class SpikingAttentionBackend:
         *,
         context: str,
         candidates: list[dict[str, Any]],
+        recall_scope: str = "local",
     ) -> list[str]:
         seen_ids = {str(candidate["memory_id"]) for candidate in candidates}
         related: list[str] = []
         for candidate in candidates:
             memory_id = str(candidate["memory_id"])
+            candidate_context = sanitize_context_id(
+                str(candidate.get("context_id") or context)
+            )
             relationships = (
                 self.memory_store.list_relationships(
-                    context_id=context,
+                    context_id=candidate_context,
                     source_memory_id=memory_id,
                     limit=max(1, self.recall_count),
                 )
                 + self.memory_store.list_relationships(
-                    context_id=context,
+                    context_id=candidate_context,
                     target_memory_id=memory_id,
                     limit=max(1, self.recall_count),
                 )
@@ -1082,7 +1120,23 @@ class SpikingAttentionBackend:
                 entry = self.memory_store.get_entry(str(neighbor_id))
                 if entry is None:
                     continue
+                entry_context = sanitize_context_id(
+                    str(entry.get("context_id") or "")
+                )
+                if entry_context != candidate_context:
+                    continue
                 seen_ids.add(neighbor_id)
+                entry = dict(entry)
+                for key in (
+                    "recall_scope",
+                    "recall_provenance",
+                    "via_context_link_id",
+                    "via_relation_type",
+                    "via_direction",
+                ):
+                    if key in candidate:
+                        entry[key] = candidate[key]
+                entry.setdefault("recall_scope", recall_scope)
                 related.append(
                     self._format_recall_entry(
                         entry,
@@ -1134,6 +1188,16 @@ class SpikingAttentionBackend:
             if matched:
                 details.append(f"matched={clean_value(matched, 96)}")
         details.append(f"context={entry.get('context_id', '')}")
+        recall_scope = str(entry.get("recall_scope") or "local")
+        provenance = str(entry.get("recall_provenance") or "local")
+        details.append(f"scope={recall_scope}")
+        details.append(f"provenance={provenance}")
+        via_context_link_id = str(entry.get("via_context_link_id") or "")
+        if via_context_link_id:
+            details.append(f"via_context_link={via_context_link_id}")
+        via_relation_type = str(entry.get("via_relation_type") or "")
+        if via_relation_type:
+            details.append(f"via_relation={via_relation_type}")
         details.append(f"id={entry.get('memory_id', '')}")
         return f"{tag} ({', '.join(details)})"
 
@@ -1143,6 +1207,8 @@ class SpikingAttentionBackend:
         context: str,
         prompt_text: str,
         candidates: list[dict[str, Any]],
+        recall_scope: str = "local",
+        recall_contexts: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {
             str(candidate["memory_id"]): {
@@ -1154,6 +1220,8 @@ class SpikingAttentionBackend:
         for candidate in self._surface_text_recall_candidates(
             context=context,
             prompt_text=prompt_text,
+            recall_scope=recall_scope,
+            recall_contexts=recall_contexts,
         ):
             memory_id = str(candidate["memory_id"])
             surface_score = float(candidate.get("score", 0.0) or 0.0)
@@ -1213,18 +1281,33 @@ class SpikingAttentionBackend:
         *,
         context: str,
         prompt_text: str,
+        recall_scope: str = "local",
+        recall_contexts: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         query_terms = set(self._surface_recall_terms(prompt_text))
         if not query_terms:
             return []
+        scope_records = list(
+            recall_contexts
+            if recall_contexts is not None
+            else self.memory_store.resolve_recall_contexts(
+                context_id=context,
+                scope=recall_scope,
+            )
+        )
+        scope_context_ids = [
+            str(record.get("context_id") or "")
+            for record in scope_records
+            if str(record.get("context_id") or "")
+        ]
         revision = self.memory_store.entries_revision(
-            context_id=context,
-            include_global=True,
+            context_ids=scope_context_ids,
         )
         query_hash = hashlib.sha256(
             "\x1f".join(sorted(query_terms)).encode("utf-8")
         ).hexdigest()[:16]
-        cache_key = f"{context}|surface-query|{query_hash}"
+        scope_key = ",".join(scope_context_ids)
+        cache_key = f"{context}|{recall_scope}|{scope_key}|surface-query|{query_hash}"
         cached = self._surface_recall_cache.get(cache_key)
         if cached and cached.get("revision") == revision["revision"]:
             return [dict(candidate) for candidate in cached.get("candidates", [])]
@@ -1235,6 +1318,8 @@ class SpikingAttentionBackend:
             context_id=context,
             query_terms=query_terms,
             limit=max(self.recall_count * 8, 64),
+            recall_scope=recall_scope,
+            recall_contexts=scope_records,
         )
         for entry in indexed_entries:
             metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
@@ -1323,12 +1408,39 @@ class SpikingAttentionBackend:
         }
         return sorted(projected, reverse=True)[: self.recall_count]
 
-    def _tags_for_indices(self, active_indices: list[int], context: str) -> list[str]:
+    def _tags_for_indices(
+        self,
+        active_indices: list[int],
+        context: str,
+        *,
+        recall_scope: str = "local",
+    ) -> list[str]:
+        scope_records = self.memory_store.resolve_recall_contexts(
+            context_id=context,
+            scope=recall_scope,
+        )
+        scope_by_context = {
+            str(record["context_id"]): record
+            for record in scope_records
+        }
         tags: list[str] = []
+        seen_memory_ids: set[str] = set()
         for idx in active_indices[: self.recall_count]:
-            tag = self.memory_mapping.get(idx)
-            if tag is not None:
-                tags.append(tag)
+            for trace in self.registered_traces:
+                trace_context = str(trace.get("context_id") or "")
+                if trace_context not in scope_by_context:
+                    continue
+                if int(idx) not in trace.get("neuron_indices", []):
+                    continue
+                memory_id = str(trace.get("memory_id") or "")
+                if memory_id in seen_memory_ids:
+                    continue
+                seen_memory_ids.add(memory_id)
+                rendered_trace = dict(trace)
+                rendered_trace.update(scope_by_context[trace_context])
+                tags.append(self._format_recall_entry(rendered_trace))
+                if len(tags) >= self.recall_count:
+                    return tags
         return tags
 
     def _raw_activation_summary(self, active_indices: list[int]) -> str:
@@ -1383,6 +1495,8 @@ class SpikingAttentionBackend:
             "memory_event_count": int(total_stats["event_count"]),
             "memory_relationship_count": int(total_stats["relationship_count"]),
             "memory_context_relationship_count": int(context_stats["relationship_count"]),
+            "memory_context_link_count": int(total_stats["context_link_count"]),
+            "memory_selected_context_link_count": int(context_stats["context_link_count"]),
             "memory_contexts": total_stats["contexts"],
             "active_cortex_session_count": len(
                 [
@@ -1429,13 +1543,40 @@ class SpikingAttentionBackend:
         limit: int = 50,
         include_global: bool = True,
         include_vectors: bool = False,
+        recall_scope: str = "local",
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
-        entries = self.memory_store.list_entries(
+        normalized_scope = sanitize_recall_scope(recall_scope)
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        scope_records = self.memory_store.resolve_recall_contexts(
             context_id=context,
-            limit=limit,
-            include_global=include_global,
+            scope=normalized_scope,
         )
+        if not include_global:
+            scope_records = [
+                record
+                for record in scope_records
+                if str(record.get("context_id") or "") != "global"
+            ]
+        entries: list[dict[str, Any]] = []
+        for record in scope_records:
+            context_entries = self.memory_store.list_entries(
+                context_id=str(record["context_id"]),
+                limit=bounded_limit,
+                include_global=False,
+            )
+            for entry in context_entries:
+                annotated = dict(entry)
+                annotated.update(record)
+                entries.append(annotated)
+        entries.sort(
+            key=lambda entry: (
+                float(entry.get("updated_at", 0.0)),
+                float(entry.get("created_at", 0.0)),
+            ),
+            reverse=True,
+        )
+        entries = entries[:bounded_limit]
         rendered_entries = [
             self._render_memory_entry(entry, include_vectors=include_vectors)
             for entry in entries
@@ -1446,6 +1587,9 @@ class SpikingAttentionBackend:
             "entry_count": len(rendered_entries),
             "entries": rendered_entries,
             "include_vectors": bool(include_vectors),
+            "recall_scope": normalized_scope,
+            "recall_contexts": scope_records,
+            "one_hop_only": normalized_scope == "connected",
         }
 
     def publish_context_event(
@@ -4094,6 +4238,984 @@ class SpikingAttentionBackend:
                 )
         return relationships
 
+    def approve_namespace_link(
+        self,
+        *,
+        source_context_id: str,
+        target_context_id: str,
+        relation_type: str = "related",
+        weight: float = 1.0,
+        evidence: dict[str, Any] | None = None,
+        direction: str = "bidirectional",
+        approved_by: str = "operator",
+        enabled: bool = True,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Persist an operator-approved namespace link; never auto-approve."""
+        if not confirm:
+            raise ValueError("confirm=true is required to approve a namespace link")
+        source = sanitize_context_id(source_context_id)
+        target = sanitize_context_id(target_context_id)
+        if source == target:
+            raise ValueError("source and target namespaces must be distinct")
+        relation = sanitize_tag(relation_type or "related").lower().replace(" ", "_")
+        similarity = self.memory_store.context_similarity(
+            source_context_id=source,
+            target_context_id=target,
+            max_phase_delay_ticks=4,
+        )
+        supplied_evidence = evidence if isinstance(evidence, dict) else {}
+        safe_supplied, _redaction_count = redact_sensitive_value(supplied_evidence)
+        safe_supplied = safe_supplied if isinstance(safe_supplied, dict) else {}
+        approval_evidence = {
+            **safe_supplied,
+            **dict(similarity["evidence"]),
+            "approval_source": "explicit-operator-confirmation",
+            "automatic_cross_namespace_write": False,
+            "connected_recall_only": True,
+        }
+        link = self.memory_store.upsert_context_link(
+            source_context_id=source,
+            target_context_id=target,
+            relation_type=relation,
+            confidence=weight,
+            evidence=self._json_safe_metadata(approval_evidence),
+            direction=direction,
+            approved_by=sanitize_agent_id(approved_by),
+            enabled=enabled,
+        )
+        self._surface_recall_cache.clear()
+        self._mark_activity()
+        return {
+            "action": "approve-namespace-link",
+            "approved": True,
+            "confirmed": True,
+            "link": self._decorate_namespace_link(link),
+            "automatic_cross_namespace_write": False,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def delete_namespace_link(
+        self,
+        *,
+        context_link_id: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if not confirm:
+            raise ValueError("confirm=true is required to delete a namespace link")
+        result = self.memory_store.delete_context_link(
+            context_link_id=str(context_link_id or "").strip()
+        )
+        self._surface_recall_cache.clear()
+        self._mark_activity()
+        return {
+            "action": "delete-namespace-link",
+            **result,
+            "automatic_cross_namespace_write": False,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def suggest_namespace_links(
+        self,
+        *,
+        context_id: str = "",
+        limit: int = 50,
+        min_score: float = 0.05,
+        include_linked: bool = False,
+        max_visual_phase_delay_ticks: int = 4,
+    ) -> dict[str, Any]:
+        selected_context = (
+            sanitize_context_id(context_id)
+            if str(context_id or "").strip()
+            else ""
+        )
+        suggestions = self.memory_store.suggest_context_links(
+            context_id=selected_context or None,
+            limit=limit,
+            min_score=min_score,
+            include_linked=include_linked,
+            max_phase_delay_ticks=max_visual_phase_delay_ticks,
+        )
+        return {
+            "action": "suggest-namespace-links",
+            "selected_context_id": selected_context,
+            "suggestion_count": len(suggestions),
+            "suggestions": suggestions,
+            "method": "density-normalized-dice-v1",
+            "read_only": True,
+            "requires_approval": True,
+            "automatic_cross_namespace_write": False,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def list_namespace_map(
+        self,
+        *,
+        context_id: str = "",
+        limit: int = 500,
+        include_suggestions: bool = True,
+        suggestion_limit: int = 50,
+        min_suggestion_score: float = 0.05,
+        max_visual_phase_delay_ticks: int = 4,
+    ) -> dict[str, Any]:
+        """Build a graph across every durable context id and approved link."""
+        selected_context = (
+            sanitize_context_id(context_id)
+            if str(context_id or "").strip()
+            else ""
+        )
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        raw_nodes = self.memory_store.list_context_summaries(limit=bounded_limit)
+        raw_links = self.memory_store.list_context_links(
+            limit=min(max(bounded_limit * 8, 1000), 10_000)
+        )
+        links = [self._decorate_namespace_link(link) for link in raw_links]
+        adjacency: dict[str, set[str]] = {
+            str(node["context_id"]): set()
+            for node in raw_nodes
+        }
+        for link in links:
+            if not bool(link.get("enabled")):
+                continue
+            source = str(link["source_context_id"])
+            target = str(link["target_context_id"])
+            adjacency.setdefault(source, set()).add(target)
+            if str(link.get("direction") or "bidirectional") == "bidirectional":
+                adjacency.setdefault(target, set()).add(source)
+        nodes: list[dict[str, Any]] = []
+        for raw_node in raw_nodes:
+            node = dict(raw_node)
+            node_context = str(node["context_id"])
+            connected_context_ids = sorted(adjacency.get(node_context, set()))
+            node.update(
+                {
+                    "selected": node_context == selected_context,
+                    "connected_to_selected": bool(
+                        selected_context
+                        and node_context in adjacency.get(selected_context, set())
+                    ),
+                    "connected_context_ids": connected_context_ids,
+                    "connected_context_count": len(connected_context_ids),
+                    "visual_size": round(1.0 + math.log1p(int(node["entry_count"])), 6),
+                }
+            )
+            nodes.append(node)
+        nodes.sort(
+            key=lambda node: (
+                bool(node.get("selected")),
+                int(node.get("entry_count", 0)),
+                float(node.get("last_activity_at", 0.0)),
+            ),
+            reverse=True,
+        )
+        suggestions_payload = (
+            self.suggest_namespace_links(
+                context_id=selected_context,
+                limit=suggestion_limit,
+                min_score=min_suggestion_score,
+                include_linked=False,
+                max_visual_phase_delay_ticks=max_visual_phase_delay_ticks,
+            )
+            if include_suggestions
+            else {"suggestions": []}
+        )
+        suggestions = list(suggestions_payload.get("suggestions", []))
+        return {
+            "action": "list-namespace-map",
+            "scope": "all",
+            "selected_context_id": selected_context,
+            "node_count": len(nodes),
+            "link_count": len(links),
+            "suggestion_count": len(suggestions),
+            "nodes": nodes,
+            "links": links,
+            "suggestions": suggestions,
+            "recall_scopes": ["local", "connected", "all"],
+            "default_recall_scope": "local",
+            "connected_scope_hops": 1,
+            "automatic_cross_namespace_write": False,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def list_namespace_detail(
+        self,
+        *,
+        context_id: str = "default",
+        level: str = "cortex",
+        cluster_id: str = "",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return a bounded, deterministic projection of one stored namespace."""
+        context = sanitize_context_id(context_id)
+        normalized_level = str(level or "cortex").strip().lower()
+        if normalized_level not in NAMESPACE_DETAIL_LEVELS:
+            raise ValueError("level must be cortex, ganglion, or neurons")
+        selected_cluster_id = str(cluster_id or "").strip()
+        if normalized_level == "cortex" and selected_cluster_id:
+            raise ValueError("cluster_id is only valid for ganglion or neurons level")
+        bounded_limit = min(
+            max(int(limit), 1),
+            NAMESPACE_DETAIL_MAX_RETURNED_NODES,
+        )
+        snapshot = self.memory_store.namespace_graph_snapshot(
+            context_id=context,
+            entry_scan_limit=NAMESPACE_DETAIL_ENTRY_SCAN_LIMIT,
+            relationship_scan_limit=NAMESPACE_DETAIL_RELATIONSHIP_SCAN_LIMIT,
+        )
+        entries = sorted(
+            (dict(entry) for entry in snapshot["entries"]),
+            key=lambda entry: str(entry["memory_id"]),
+        )
+        relationships = sorted(
+            (dict(relationship) for relationship in snapshot["relationships"]),
+            key=lambda relationship: str(relationship["relationship_id"]),
+        )
+        clusters, cluster_by_memory_id = self._namespace_detail_clusters(
+            context=context,
+            entries=entries,
+            relationships=relationships,
+            entry_scan_truncated=bool(snapshot["entry_scan_truncated"]),
+        )
+        clusters_by_id = {
+            str(cluster["cluster_id"]): cluster
+            for cluster in clusters
+        }
+        if selected_cluster_id and selected_cluster_id not in clusters_by_id:
+            raise ValueError(
+                f"unknown cluster_id for context {context}: {selected_cluster_id}"
+            )
+
+        namespace_node_id = self._stable_namespace_detail_id(
+            prefix="s2ctx",
+            values=(context,),
+        )
+        namespace = {
+            "node_id": namespace_node_id,
+            "entity_kind": "namespace",
+            "node_type": "context",
+            "context_id": context,
+            "display_label": self._namespace_detail_safe_text(context, 128),
+            "stored": int(snapshot["entry_total"]) > 0,
+            "entry_total": int(snapshot["entry_total"]),
+            "relationship_total": int(snapshot["relationship_total"]),
+            "cluster_total": len(clusters),
+            "cluster_total_exact": not bool(snapshot["entry_scan_truncated"]),
+            "first_created_at": float(snapshot["first_created_at"]),
+            "last_updated_at": float(snapshot["last_updated_at"]),
+            "provenance": {
+                "source": "memory_entries.context_id",
+                "storage_table": "memory_entries",
+                "context_isolation": True,
+            },
+        }
+
+        returned_clusters: list[dict[str, Any]] = []
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        eligible_node_total = 0
+        eligible_edge_total = 0
+        eligible_cluster_total = 0
+        raw_relationships_supporting_edges = 0
+
+        if normalized_level == "cortex":
+            eligible_node_total = 1 if namespace["stored"] else 0
+            nodes = [dict(namespace)] if namespace["stored"] else []
+        elif normalized_level == "ganglion":
+            eligible_clusters = (
+                [clusters_by_id[selected_cluster_id]]
+                if selected_cluster_id
+                else clusters
+            )
+            eligible_cluster_total = len(eligible_clusters)
+            returned_clusters = [
+                dict(cluster)
+                for cluster in eligible_clusters[:bounded_limit]
+            ]
+            nodes = [dict(cluster) for cluster in returned_clusters]
+            eligible_cluster_ids = {
+                str(cluster["cluster_id"])
+                for cluster in eligible_clusters
+            }
+            returned_cluster_ids = {
+                str(cluster["cluster_id"])
+                for cluster in returned_clusters
+            }
+            aggregate_edges = self._namespace_detail_ganglion_edges(
+                context=context,
+                relationships=relationships,
+                cluster_by_memory_id=cluster_by_memory_id,
+                eligible_cluster_ids=eligible_cluster_ids,
+            )
+            eligible_edge_total = len(aggregate_edges)
+            returned_edge_candidates = [
+                edge
+                for edge in aggregate_edges
+                if str(edge["source_id"]) in returned_cluster_ids
+                and str(edge["target_id"]) in returned_cluster_ids
+            ]
+            edge_limit = min(
+                max(bounded_limit * 4, bounded_limit),
+                NAMESPACE_DETAIL_MAX_RETURNED_EDGES,
+            )
+            edges = returned_edge_candidates[:edge_limit]
+            raw_relationships_supporting_edges = sum(
+                int(edge["stored_relationship_count"])
+                for edge in edges
+            )
+            eligible_node_total = eligible_cluster_total
+        else:
+            eligible_entries = [
+                entry
+                for entry in entries
+                if not selected_cluster_id
+                or cluster_by_memory_id.get(str(entry["memory_id"]))
+                == selected_cluster_id
+            ]
+            eligible_node_total = (
+                len(eligible_entries)
+                if selected_cluster_id
+                else int(snapshot["entry_total"])
+            )
+            returned_entries = eligible_entries[:bounded_limit]
+            returned_memory_ids = {
+                str(entry["memory_id"])
+                for entry in returned_entries
+            }
+            eligible_memory_ids = {
+                str(entry["memory_id"])
+                for entry in eligible_entries
+            }
+            nodes = [
+                self._namespace_detail_memory_node(
+                    entry,
+                    cluster_id=str(cluster_by_memory_id[str(entry["memory_id"])]),
+                )
+                for entry in returned_entries
+            ]
+            # At the neuron level the ganglion map describes the namespace as a
+            # whole.  Do not hide clusters merely because their first neuron is
+            # outside the bounded node sample.
+            eligible_clusters = (
+                [clusters_by_id[selected_cluster_id]]
+                if selected_cluster_id
+                else clusters
+            )
+            eligible_cluster_total = len(eligible_clusters)
+            returned_clusters = [
+                dict(cluster)
+                for cluster in eligible_clusters[:NAMESPACE_DETAIL_MAX_RETURNED_CLUSTERS]
+            ]
+            eligible_relationships = [
+                relationship
+                for relationship in relationships
+                if str(relationship["source_memory_id"]) in eligible_memory_ids
+                and str(relationship["target_memory_id"]) in eligible_memory_ids
+            ]
+            # The unfiltered stored total is exact even if the bounded entry
+            # sample cannot render every edge. A selected cluster is a bounded
+            # projection and is explicitly labelled as a lower bound below.
+            eligible_edge_total = (
+                len(eligible_relationships)
+                if selected_cluster_id
+                else int(snapshot["relationship_total"])
+            )
+            returned_relationships = [
+                relationship
+                for relationship in eligible_relationships
+                if str(relationship["source_memory_id"]) in returned_memory_ids
+                and str(relationship["target_memory_id"]) in returned_memory_ids
+            ]
+            edge_limit = min(
+                max(bounded_limit * 4, bounded_limit),
+                NAMESPACE_DETAIL_MAX_RETURNED_EDGES,
+            )
+            edges = [
+                self._namespace_detail_memory_edge(relationship)
+                for relationship in returned_relationships[:edge_limit]
+            ]
+            raw_relationships_supporting_edges = len(edges)
+
+        counts = {
+            "memory_total": int(snapshot["entry_total"]),
+            "relationship_total": int(snapshot["relationship_total"]),
+            "cluster_total": len(clusters),
+            "cluster_total_exact": not bool(snapshot["entry_scan_truncated"]),
+            "eligible_nodes": eligible_node_total,
+            "returned_nodes": len(nodes),
+            "eligible_edges": eligible_edge_total,
+            "returned_edges": len(edges),
+            "eligible_clusters": eligible_cluster_total,
+            "returned_clusters": len(returned_clusters),
+            "raw_relationships_supporting_returned_edges": (
+                raw_relationships_supporting_edges
+            ),
+            "eligible_nodes_is_lower_bound": bool(
+                snapshot["entry_scan_truncated"]
+                and normalized_level == "neurons"
+                and bool(selected_cluster_id)
+            ),
+            "eligible_edges_is_lower_bound": bool(
+                snapshot["relationship_scan_truncated"]
+                and (normalized_level == "ganglion" or bool(selected_cluster_id))
+            ),
+            "eligible_clusters_is_lower_bound": bool(
+                snapshot["entry_scan_truncated"]
+            ),
+        }
+        truncation = {
+            "truncated": bool(
+                snapshot["entry_scan_truncated"]
+                or snapshot["relationship_scan_truncated"]
+                or eligible_node_total > len(nodes)
+                or eligible_edge_total > len(edges)
+                or eligible_cluster_total > len(returned_clusters)
+            ),
+            "limit": bounded_limit,
+            "sampling": "deterministic",
+            "scan_limits": {
+                "entries": int(snapshot["entry_scan_limit"]),
+                "relationships": int(snapshot["relationship_scan_limit"]),
+            },
+            "source_scan": {
+                "entries_truncated": bool(snapshot["entry_scan_truncated"]),
+                "relationships_truncated": bool(
+                    snapshot["relationship_scan_truncated"]
+                ),
+            },
+            "nodes": {
+                "total": eligible_node_total,
+                "returned": len(nodes),
+                "truncated": eligible_node_total > len(nodes),
+            },
+            "edges": {
+                "total": eligible_edge_total,
+                "returned": len(edges),
+                "truncated": eligible_edge_total > len(edges),
+            },
+            "clusters": {
+                "total": eligible_cluster_total,
+                "returned": len(returned_clusters),
+                "truncated": eligible_cluster_total > len(returned_clusters),
+                "limit": NAMESPACE_DETAIL_MAX_RETURNED_CLUSTERS,
+            },
+            "selection_order": {
+                **dict(snapshot["selection_order"]),
+                "clusters": "cluster_id ascending",
+                "rendered_edges": "edge_id ascending",
+            },
+        }
+        return {
+            "action": "namespace-detail",
+            "read_only": True,
+            "automatic_cross_namespace_write": False,
+            "context_id": context,
+            "level": normalized_level,
+            "selected_cluster_id": selected_cluster_id,
+            "empty": int(snapshot["entry_total"]) == 0,
+            "namespace": namespace,
+            "counts": counts,
+            "truncation": truncation,
+            "pagination": {
+                "supported": False,
+                "strategy": "bounded-deterministic-sample",
+                "limit": bounded_limit,
+                "next_cursor": None,
+            },
+            "clusters": returned_clusters,
+            "nodes": nodes,
+            "edges": edges,
+            "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def _namespace_detail_clusters(
+        self,
+        *,
+        context: str,
+        entries: list[dict[str, Any]],
+        relationships: list[dict[str, Any]],
+        entry_scan_truncated: bool,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        entries_by_id = {
+            str(entry["memory_id"]): entry
+            for entry in entries
+        }
+        node_types = {
+            memory_id: self._namespace_detail_node_type(entry)
+            for memory_id, entry in entries_by_id.items()
+        }
+        namespace_anchor_ids = {
+            memory_id
+            for memory_id, node_type in node_types.items()
+            if node_type == "namespace"
+        }
+        anchors_by_namespace_token: dict[str, str] = {}
+        for memory_id in sorted(namespace_anchor_ids):
+            metadata = entries_by_id[memory_id].get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            token = str(metadata.get("context_namespace") or "").strip()
+            if token:
+                anchors_by_namespace_token.setdefault(token, memory_id)
+
+        containment_by_target: dict[str, list[dict[str, Any]]] = {}
+        for relationship in relationships:
+            if str(relationship.get("relation_type") or "") != "namespace_contains":
+                continue
+            source_id = str(relationship.get("source_memory_id") or "")
+            target_id = str(relationship.get("target_memory_id") or "")
+            if source_id not in namespace_anchor_ids or target_id not in entries_by_id:
+                continue
+            containment_by_target.setdefault(target_id, []).append(relationship)
+        for candidates in containment_by_target.values():
+            candidates.sort(
+                key=lambda relationship: (
+                    -float(relationship.get("weight", 0.0)),
+                    str(relationship.get("relationship_id") or ""),
+                )
+            )
+
+        cluster_builders: dict[str, dict[str, Any]] = {}
+        cluster_by_memory_id: dict[str, str] = {}
+        for memory_id, entry in sorted(entries_by_id.items()):
+            metadata = entry.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            node_type = node_types[memory_id]
+            relationship_ids: list[str] = []
+            anchor_memory_id = ""
+            if memory_id in namespace_anchor_ids:
+                anchor_memory_id = memory_id
+                cluster_key = f"namespace:{memory_id}"
+                basis = "namespace_contains"
+                label = self._namespace_detail_entry_label(entry)
+                provenance_source = "memory_entries.metadata.context_memory_type"
+            elif containment_by_target.get(memory_id):
+                membership_relationship = containment_by_target[memory_id][0]
+                anchor_memory_id = str(membership_relationship["source_memory_id"])
+                cluster_key = f"namespace:{anchor_memory_id}"
+                basis = "namespace_contains"
+                label = self._namespace_detail_entry_label(
+                    entries_by_id[anchor_memory_id]
+                )
+                relationship_ids = [
+                    str(membership_relationship["relationship_id"])
+                ]
+                provenance_source = "memory_relationships.namespace_contains"
+            else:
+                namespace_token = str(metadata.get("context_namespace") or "").strip()
+                if namespace_token:
+                    anchor_memory_id = anchors_by_namespace_token.get(namespace_token, "")
+                    cluster_key = (
+                        f"namespace:{anchor_memory_id}"
+                        if anchor_memory_id
+                        else f"metadata-namespace:{namespace_token}"
+                    )
+                    basis = "metadata_context_namespace"
+                    label = self._namespace_detail_safe_text(
+                        str(metadata.get("context_namespace_title") or namespace_token),
+                        96,
+                    )
+                    provenance_source = "memory_entries.metadata.context_namespace"
+                elif node_type != "memory":
+                    cluster_key = f"stored-type:{node_type}"
+                    basis = "stored_type"
+                    label = self._namespace_detail_safe_text(
+                        f"Stored type: {node_type}",
+                        96,
+                    )
+                    provenance_source = "memory_entries.metadata.context_memory_type"
+                else:
+                    cluster_key = "fallback:untyped"
+                    basis = "fallback_untyped"
+                    label = "Stored memories without a typed namespace"
+                    provenance_source = "memory_entries fallback for untyped rows"
+
+            cluster_id = self._stable_namespace_detail_id(
+                prefix="s2g",
+                values=(context, cluster_key),
+            )
+            cluster_by_memory_id[memory_id] = cluster_id
+            builder = cluster_builders.setdefault(
+                cluster_id,
+                {
+                    "cluster_id": cluster_id,
+                    "node_id": cluster_id,
+                    "entity_kind": "ganglion",
+                    "node_type": "semantic_cluster",
+                    "context_id": context,
+                    "display_label": label,
+                    "basis": basis,
+                    "anchor_memory_id": anchor_memory_id,
+                    "member_memory_ids": [],
+                    "node_type_counts": {},
+                    "first_created_at": float(entry.get("created_at", 0.0)),
+                    "last_updated_at": float(entry.get("updated_at", 0.0)),
+                    "semantic_facets": set(),
+                    "membership_relationship_ids": [],
+                    "provenance": {
+                        "source": provenance_source,
+                        "stored_data_only": True,
+                    },
+                },
+            )
+            builder["member_memory_ids"].append(memory_id)
+            builder["node_type_counts"][node_type] = (
+                int(builder["node_type_counts"].get(node_type, 0)) + 1
+            )
+            builder["first_created_at"] = min(
+                float(builder["first_created_at"]),
+                float(entry.get("created_at", 0.0)),
+            )
+            builder["last_updated_at"] = max(
+                float(builder["last_updated_at"]),
+                float(entry.get("updated_at", 0.0)),
+            )
+            builder["membership_relationship_ids"].extend(relationship_ids)
+            for facet in self._namespace_detail_stored_strings(
+                metadata.get("semantic_facets"),
+                limit=12,
+                item_limit=72,
+            ):
+                builder["semantic_facets"].add(facet)
+
+        clusters: list[dict[str, Any]] = []
+        for cluster_id, builder in sorted(cluster_builders.items()):
+            member_ids = sorted(set(builder.pop("member_memory_ids")))
+            relationship_ids = sorted(
+                set(builder.pop("membership_relationship_ids"))
+            )
+            semantic_facets = sorted(builder.pop("semantic_facets"))[:12]
+            clusters.append(
+                {
+                    **builder,
+                    "cluster_id": cluster_id,
+                    "node_id": cluster_id,
+                    "memory_total": len(member_ids),
+                    "memory_total_is_lower_bound": bool(entry_scan_truncated),
+                    "member_memory_id_sample": member_ids[:16],
+                    "member_sample_truncated": len(member_ids) > 16,
+                    "node_type_counts": dict(
+                        sorted(builder["node_type_counts"].items())
+                    ),
+                    "semantic_facets": semantic_facets,
+                    "membership_relationship_id_sample": relationship_ids[:16],
+                    "provenance": {
+                        **dict(builder["provenance"]),
+                        "relationship_ids": relationship_ids[:16],
+                    },
+                }
+            )
+        return clusters, cluster_by_memory_id
+
+    def _namespace_detail_ganglion_edges(
+        self,
+        *,
+        context: str,
+        relationships: list[dict[str, Any]],
+        cluster_by_memory_id: dict[str, str],
+        eligible_cluster_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        aggregates: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for relationship in relationships:
+            source_cluster_id = cluster_by_memory_id.get(
+                str(relationship.get("source_memory_id") or "")
+            )
+            target_cluster_id = cluster_by_memory_id.get(
+                str(relationship.get("target_memory_id") or "")
+            )
+            if (
+                not source_cluster_id
+                or not target_cluster_id
+                or source_cluster_id == target_cluster_id
+                or source_cluster_id not in eligible_cluster_ids
+                or target_cluster_id not in eligible_cluster_ids
+            ):
+                continue
+            edge_type = str(relationship.get("relation_type") or "unknown")
+            key = (source_cluster_id, target_cluster_id, edge_type)
+            aggregate = aggregates.setdefault(
+                key,
+                {
+                    "weights": [],
+                    "relationship_ids": [],
+                    "first_created_at": float(relationship.get("created_at", 0.0)),
+                    "last_updated_at": float(relationship.get("updated_at", 0.0)),
+                },
+            )
+            aggregate["weights"].append(float(relationship.get("weight", 0.0)))
+            aggregate["relationship_ids"].append(
+                str(relationship.get("relationship_id") or "")
+            )
+            aggregate["first_created_at"] = min(
+                float(aggregate["first_created_at"]),
+                float(relationship.get("created_at", 0.0)),
+            )
+            aggregate["last_updated_at"] = max(
+                float(aggregate["last_updated_at"]),
+                float(relationship.get("updated_at", 0.0)),
+            )
+
+        edges: list[dict[str, Any]] = []
+        for (source_id, target_id, edge_type), aggregate in sorted(aggregates.items()):
+            relationship_ids = sorted(set(aggregate["relationship_ids"]))
+            weights = [float(weight) for weight in aggregate["weights"]]
+            edge_id = self._stable_namespace_detail_id(
+                prefix="s2ge",
+                values=(context, source_id, target_id, edge_type),
+            )
+            edges.append(
+                {
+                    "edge_id": edge_id,
+                    "entity_kind": "relationship_aggregate",
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "edge_type": edge_type,
+                    "direction": "directed",
+                    "weight": round(max(weights), 6) if weights else 0.0,
+                    "average_weight": round(
+                        sum(weights) / max(1, len(weights)),
+                        6,
+                    ),
+                    "stored_relationship_count": len(relationship_ids),
+                    "relationship_id_sample": relationship_ids[:16],
+                    "first_created_at": float(aggregate["first_created_at"]),
+                    "last_updated_at": float(aggregate["last_updated_at"]),
+                    "provenance": {
+                        "source": "memory_relationships",
+                        "relationship_ids": relationship_ids[:16],
+                        "stored_relationship_count": len(relationship_ids),
+                        "aggregation": "same directed cluster pair and edge type",
+                    },
+                }
+            )
+        return sorted(edges, key=lambda edge: str(edge["edge_id"]))
+
+    def _namespace_detail_memory_node(
+        self,
+        entry: dict[str, Any],
+        *,
+        cluster_id: str,
+    ) -> dict[str, Any]:
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        provenance = self._namespace_detail_entry_provenance(entry)
+        return {
+            "node_id": str(entry["memory_id"]),
+            "memory_id": str(entry["memory_id"]),
+            "entity_kind": "memory",
+            "node_type": self._namespace_detail_node_type(entry),
+            "cluster_id": cluster_id,
+            "context_id": str(entry["context_id"]),
+            "tag": self._namespace_detail_safe_text(str(entry["tag"]), 200),
+            "display_label": self._namespace_detail_entry_label(entry),
+            "excerpt": self._namespace_detail_entry_excerpt(entry),
+            "created_at": float(entry.get("created_at", 0.0)),
+            "updated_at": float(entry.get("updated_at", 0.0)),
+            "source": str(provenance.get("source") or "memory_entries"),
+            "provenance": provenance,
+            "semantic_facets": self._namespace_detail_stored_strings(
+                metadata.get("semantic_facets"),
+                limit=12,
+                item_limit=72,
+            ),
+            "detail_badges": self._namespace_detail_stored_strings(
+                metadata.get("detail_badges"),
+                limit=12,
+                item_limit=72,
+            ),
+        }
+
+    def _namespace_detail_memory_edge(
+        self,
+        relationship: dict[str, Any],
+    ) -> dict[str, Any]:
+        evidence = relationship.get("evidence")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        provenance: dict[str, Any] = {
+            "source": "memory_relationships",
+            "relationship_id": str(relationship["relationship_id"]),
+            "evidence_keys": sorted(
+                self._namespace_detail_safe_text(str(key), 96)
+                for key in evidence
+            )[:24],
+        }
+        for key in (
+            "namespace_id",
+            "source_tag",
+            "source_type",
+            "target_type",
+            "sequence_id",
+            "surprise_mode",
+        ):
+            if key in evidence:
+                provenance[key] = self._namespace_detail_safe_text(
+                    str(evidence[key]),
+                    128,
+                )
+        return {
+            "edge_id": str(relationship["relationship_id"]),
+            "entity_kind": "relationship",
+            "source_id": str(relationship["source_memory_id"]),
+            "target_id": str(relationship["target_memory_id"]),
+            "edge_type": self._namespace_detail_safe_text(
+                str(relationship.get("relation_type") or "unknown"),
+                96,
+            ),
+            "direction": "directed",
+            "weight": round(float(relationship.get("weight", 0.0)), 6),
+            "created_at": float(relationship.get("created_at", 0.0)),
+            "updated_at": float(relationship.get("updated_at", 0.0)),
+            "provenance": provenance,
+        }
+
+    def _namespace_detail_node_type(self, entry: dict[str, Any]) -> str:
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        raw_type = self._namespace_detail_safe_text(
+            str(metadata.get("context_memory_type") or ""),
+            64,
+        ).strip().lower()
+        if not raw_type and metadata.get("event_segment"):
+            raw_type = "event"
+        if not raw_type and str(metadata.get("cortex_trace_type") or "").strip():
+            raw_type = "cortex_trace"
+        cleaned = re.sub(r"[^a-z0-9_.:-]+", "_", raw_type).strip("._-:")
+        return (cleaned or "memory")[:64]
+
+    def _namespace_detail_entry_label(self, entry: dict[str, Any]) -> str:
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        stored_label = str(
+            metadata.get("display_label")
+            or metadata.get("context_label")
+            or entry.get("tag")
+            or entry.get("source_text")
+            or entry.get("memory_id")
+        )
+        return self._namespace_detail_safe_text(stored_label, 96)
+
+    def _namespace_detail_entry_excerpt(self, entry: dict[str, Any]) -> str:
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        stored_excerpt = str(
+            metadata.get("display_summary")
+            or entry.get("source_text")
+            or entry.get("tag")
+            or ""
+        )
+        return self._namespace_detail_safe_text(stored_excerpt, 240)
+
+    def _namespace_detail_entry_provenance(
+        self,
+        entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        provenance: dict[str, Any] = {
+            "source": self._namespace_detail_safe_text(
+                str(metadata.get("source") or metadata.get("source_tag") or "memory_entries"),
+                128,
+            ),
+            "storage_table": "memory_entries",
+            "memory_id": str(entry.get("memory_id") or ""),
+        }
+        for key in (
+            "source_tag",
+            "speaker",
+            "sequence_id",
+            "context_namespace",
+            "context_namespace_source",
+            "truth_posture",
+            "trace_type",
+        ):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                provenance[key] = self._namespace_detail_safe_text(value, 128)
+        embedding_provider = metadata.get("embedding_provider")
+        if isinstance(embedding_provider, dict):
+            provider_summary = {
+                key: embedding_provider.get(key)
+                for key in (
+                    "provider",
+                    "provider_type",
+                    "model_id",
+                    "local_only",
+                    "semantic",
+                )
+                if key in embedding_provider
+            }
+            if provider_summary:
+                provenance["embedding_provider"] = {
+                    str(key): self._namespace_detail_safe_value(value, 128)
+                    for key, value in sorted(provider_summary.items())
+                }
+        return provenance
+
+    def _namespace_detail_stored_strings(
+        self,
+        values: Any,
+        *,
+        limit: int,
+        item_limit: int,
+    ) -> list[str]:
+        raw_values = values if isinstance(values, (list, tuple, set)) else []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw_value in raw_values:
+            value = self._namespace_detail_safe_text(str(raw_value), item_limit)
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            cleaned.append(value)
+            if len(cleaned) >= max(0, int(limit)):
+                break
+        return sorted(cleaned)[: max(0, int(limit))]
+
+    def _namespace_detail_safe_text(self, value: str, limit: int) -> str:
+        redacted, _redaction_count = redact_capture_text(str(value or ""))
+        return self._compact_text(redacted, max(1, int(limit)))
+
+    def _namespace_detail_safe_value(self, value: Any, limit: int) -> Any:
+        """Render scalar provenance without leaking legacy secret-bearing text."""
+        if isinstance(value, str):
+            return self._namespace_detail_safe_text(value, limit)
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, (int, float)):
+            return value
+        return self._namespace_detail_safe_text(str(value), limit)
+
+    def _stable_namespace_detail_id(
+        self,
+        *,
+        prefix: str,
+        values: tuple[str, ...],
+    ) -> str:
+        seed = "\x1f".join(str(value) for value in values).encode("utf-8")
+        return f"{prefix}_" + hashlib.sha256(seed).hexdigest()[:32]
+
+    def _decorate_namespace_link(self, link: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(link)
+        evidence = (
+            dict(enriched.get("evidence"))
+            if isinstance(enriched.get("evidence"), dict)
+            else {}
+        )
+        if "dice_score" not in evidence:
+            similarity = self.memory_store.context_similarity(
+                source_context_id=str(enriched["source_context_id"]),
+                target_context_id=str(enriched["target_context_id"]),
+                max_phase_delay_ticks=4,
+            )
+            evidence = {**dict(similarity["evidence"]), **evidence}
+        enriched["evidence"] = evidence
+        enriched["dice_score"] = round(float(evidence.get("dice_score", 0.0) or 0.0), 6)
+        enriched["suggested_phase_delay_ticks"] = int(
+            evidence.get("suggested_phase_delay_ticks", 0) or 0
+        )
+        enriched["delay_semantics"] = "visualization-only"
+        enriched["recall_hops"] = 1
+        enriched["automatic_cross_namespace_write"] = False
+        return self._json_safe_metadata(enriched)
+
     def list_memory_graph(
         self,
         *,
@@ -4456,7 +5578,7 @@ class SpikingAttentionBackend:
             return dict(entry)
         spike_indices = [int(value) for value in entry.get("spike_indices", [])]
         neuron_indices = [int(value) for value in entry.get("neuron_indices", [])]
-        return {
+        rendered = {
             "memory_id": entry["memory_id"],
             "tag": entry["tag"],
             "context_id": entry["context_id"],
@@ -4470,6 +5592,16 @@ class SpikingAttentionBackend:
             "created_at": entry["created_at"],
             "updated_at": entry["updated_at"],
         }
+        for key in (
+            "recall_scope",
+            "recall_provenance",
+            "via_context_link_id",
+            "via_relation_type",
+            "via_direction",
+        ):
+            if key in entry:
+                rendered[key] = entry[key]
+        return rendered
 
     def _decorate_context_event(self, event: dict[str, Any]) -> dict[str, Any]:
         targets = [
@@ -4862,12 +5994,28 @@ def get_backend() -> SpikingAttentionBackend:
     return _ENGINE_INSTANCE
 
 
-def simulate_spiking_retrieval(embedding: Any, context_id: str = "default") -> str:
-    return get_backend().query(embedding, context_id=context_id)
+def simulate_spiking_retrieval(
+    embedding: Any,
+    context_id: str = "default",
+    recall_scope: str = "local",
+) -> str:
+    return get_backend().query(
+        embedding,
+        context_id=context_id,
+        recall_scope=recall_scope,
+    )
 
 
-def simulate_spiking_text_retrieval(prompt: str, context_id: str = "default") -> str:
-    return get_backend().query_text(prompt, context_id=context_id)
+def simulate_spiking_text_retrieval(
+    prompt: str,
+    context_id: str = "default",
+    recall_scope: str = "local",
+) -> str:
+    return get_backend().query_text(
+        prompt,
+        context_id=context_id,
+        recall_scope=recall_scope,
+    )
 
 
 def register_trace(
@@ -4914,11 +6062,13 @@ def list_memory(
     context_id: str = "default",
     limit: int = 50,
     include_vectors: bool = False,
+    recall_scope: str = "local",
 ) -> dict[str, Any]:
     return get_backend().list_memory(
         context_id=context_id,
         limit=limit,
         include_vectors=include_vectors,
+        recall_scope=recall_scope,
     )
 
 
@@ -5228,6 +6378,78 @@ def list_memory_graph(
     limit: int = 100,
 ) -> dict[str, Any]:
     return get_backend().list_memory_graph(context_id=context_id, limit=limit)
+
+
+def approve_namespace_link(
+    *,
+    source_context_id: str,
+    target_context_id: str,
+    relation_type: str = "related",
+    weight: float = 1.0,
+    evidence: dict[str, Any] | None = None,
+    direction: str = "bidirectional",
+    approved_by: str = "operator",
+    enabled: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return get_backend().approve_namespace_link(
+        source_context_id=source_context_id,
+        target_context_id=target_context_id,
+        relation_type=relation_type,
+        weight=weight,
+        evidence=evidence,
+        direction=direction,
+        approved_by=approved_by,
+        enabled=enabled,
+        confirm=confirm,
+    )
+
+
+def delete_namespace_link(
+    *,
+    context_link_id: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return get_backend().delete_namespace_link(
+        context_link_id=context_link_id,
+        confirm=confirm,
+    )
+
+
+def suggest_namespace_links(
+    *,
+    context_id: str = "",
+    limit: int = 50,
+    min_score: float = 0.05,
+    include_linked: bool = False,
+    max_visual_phase_delay_ticks: int = 4,
+) -> dict[str, Any]:
+    return get_backend().suggest_namespace_links(
+        context_id=context_id,
+        limit=limit,
+        min_score=min_score,
+        include_linked=include_linked,
+        max_visual_phase_delay_ticks=max_visual_phase_delay_ticks,
+    )
+
+
+def list_namespace_map(
+    *,
+    context_id: str = "",
+    limit: int = 500,
+    include_suggestions: bool = True,
+    suggestion_limit: int = 50,
+    min_suggestion_score: float = 0.05,
+    max_visual_phase_delay_ticks: int = 4,
+) -> dict[str, Any]:
+    return get_backend().list_namespace_map(
+        context_id=context_id,
+        limit=limit,
+        include_suggestions=include_suggestions,
+        suggestion_limit=suggestion_limit,
+        min_suggestion_score=min_suggestion_score,
+        max_visual_phase_delay_ticks=max_visual_phase_delay_ticks,
+    )
 
 
 def resource_profile(

@@ -5,6 +5,14 @@ const GRAPH_WIDTH = 760;
 const GRAPH_HEIGHT = 420;
 const GRAPH_MIN_SCALE = 0.45;
 const GRAPH_MAX_SCALE = 3.2;
+const NAMESPACE_GALAXY_MIN_ZOOM = 0.48;
+const NAMESPACE_GALAXY_MAX_ZOOM = 3.6;
+const NAMESPACE_GALAXY_DEFAULT_ROTATION = Object.freeze({ x: -0.22, y: 0.48 });
+const NAMESPACE_DETAIL_LIMIT = 500;
+const NAMESPACE_DETAIL_GANGLION_ZOOM = 0.72;
+const NAMESPACE_DETAIL_NEURON_ZOOM = 1.42;
+const NAMESPACE_GALAXY_CONTEXT_PARAM = "galaxy_context";
+const NAMESPACE_GALAXY_CLUSTER_PARAM = "galaxy_cluster";
 const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
 const WIZARD_FLOWS = {
   intro: {
@@ -356,7 +364,10 @@ const WIZARD_FLOWS = {
 const WIZARD_STEPS = WIZARD_FLOWS.intro.steps;
 
 const state = {
-  context: new URLSearchParams(window.location.search).get("context_id")?.trim() || DEFAULT_CONTEXT,
+  context: (
+    new URLSearchParams(window.location.search).get(NAMESPACE_GALAXY_CONTEXT_PARAM)
+    || new URLSearchParams(window.location.search).get("context_id")
+  )?.trim() || DEFAULT_CONTEXT,
   snapshot: null,
   lastQueryPayload: null,
   neuralInspector: false,
@@ -365,6 +376,40 @@ const state = {
     transform: { x: 0, y: 0, scale: 1 },
     visibleIds: new Set(),
     interaction: null,
+  },
+  namespaceGalaxy: {
+    status: "idle",
+    view: "galaxy",
+    data: { nodes: [], links: [], suggestions: [], stats: {} },
+    detail: null,
+    focusedDetail: null,
+    detailContextId: "",
+    focusedClusterId: "",
+    detailPositions: new Map(),
+    detailLayoutSignature: "",
+    projectedGanglia: [],
+    projectedMemories: [],
+    projectedDetailEdges: [],
+    detailSelection: null,
+    detailHover: null,
+    keyboardDetailId: "",
+    detailRequestToken: 0,
+    positions: new Map(),
+    projectedNodes: [],
+    projectedLinks: [],
+    rotation: { ...NAMESPACE_GALAXY_DEFAULT_ROTATION },
+    pan: { x: 0, y: 0 },
+    zoom: 1,
+    selection: null,
+    hover: null,
+    keyboardContextId: "",
+    interaction: null,
+    requestToken: 0,
+    navigationToken: 0,
+    pendingUrlRestore: Boolean(new URLSearchParams(window.location.search).get(NAMESPACE_GALAXY_CONTEXT_PARAM)),
+    framePending: false,
+    resizeObserver: null,
+    reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false,
   },
   nav: {
     lockedSection: null,
@@ -519,6 +564,39 @@ const elements = collectElements([
   "nativeCertifyButton",
   "neuralInspectorToggle",
   "neuralMathPanel",
+  "namespaceGalaxyCanvas",
+  "namespaceGalaxyAccessibleHelp",
+  "namespaceGalaxyAccessibleSummary",
+  "namespaceGalaxyBack",
+  "namespaceGalaxyBreadcrumbAll",
+  "namespaceGalaxyBreadcrumbGanglion",
+  "namespaceGalaxyBreadcrumbGanglionWrap",
+  "namespaceGalaxyBreadcrumbNamespace",
+  "namespaceGalaxyBreadcrumbNamespaceWrap",
+  "namespaceGalaxyDepthCortex",
+  "namespaceGalaxyDepthGanglia",
+  "namespaceGalaxyDepthNeurons",
+  "namespaceGalaxyDepthValue",
+  "namespaceGalaxyFit",
+  "namespaceGalaxyHelp",
+  "namespaceGalaxyInspector",
+  "namespaceGalaxyInspectorActions",
+  "namespaceGalaxyInspectorBody",
+  "namespaceGalaxyInspectorFacts",
+  "namespaceGalaxyInspectorTitle",
+  "namespaceGalaxyLinkCount",
+  "namespaceGalaxyLegend",
+  "namespaceGalaxyList",
+  "namespaceGalaxyNodeCount",
+  "namespaceGalaxyOrbitLeft",
+  "namespaceGalaxyOrbitRight",
+  "namespaceGalaxyReset",
+  "namespaceGalaxyState",
+  "namespaceGalaxySuggestionCount",
+  "namespaceGalaxySuggestionList",
+  "namespaceGalaxyTooltip",
+  "namespaceGalaxyZoomIn",
+  "namespaceGalaxyZoomOut",
   "modelUri",
   "operationLog",
   "operatorReceipts",
@@ -546,6 +624,10 @@ const elements = collectElements([
   "queryResults",
   "quickPruneButton",
   "recallLimit",
+  "recallScopeAll",
+  "recallScopeConnected",
+  "recallScopeHelp",
+  "recallScopeLocal",
   "recipeChecklist",
   "recipeDrawer",
   "recipesCloseButton",
@@ -613,6 +695,7 @@ elements.contextInput.value = state.context;
 elements.endpointLabel.textContent = window.location.host || "127.0.0.1:8765";
 applyTheme(loadTheme());
 initializeGraphInteractions();
+initializeNamespaceGalaxy();
 initializeSectionNavigation();
 initializeWizard();
 renderOperatorRecipes(defaultOperatorRecipes());
@@ -684,6 +767,7 @@ function applyTheme(theme) {
   elements.themeButton.setAttribute("aria-pressed", String(dark));
   elements.themeButton.setAttribute("aria-label", dark ? "Use light mode" : "Use dark mode");
   elements.themeButton.setAttribute("title", dark ? "Use light mode" : "Use dark mode");
+  requestNamespaceGalaxyDraw();
 }
 
 async function refreshSnapshot() {
@@ -695,6 +779,7 @@ async function refreshSnapshot() {
   state.snapshot = withGraph(shellSnapshot, shellSnapshot.graph);
   const shellElapsedMs = elapsedMs(started);
   renderSnapshot(state.snapshot, shellElapsedMs);
+  const namespaceMapPromise = refreshNamespaceGalaxy();
   if (operationLogIsIdle()) {
     logSnapshotResponse(state.snapshot, shellElapsedMs);
   }
@@ -712,6 +797,7 @@ async function refreshSnapshot() {
   } catch (error) {
     logOperation("Graph refresh failed", error.message);
   }
+  await namespaceMapPromise;
   return state.snapshot;
 }
 
@@ -857,15 +943,2247 @@ function formatContextOption(row) {
 
 async function applySelectedContext(context, busyElement = elements.contextApply) {
   const nextContext = String(context || "").trim() || DEFAULT_CONTEXT;
+  const galaxy = state.namespaceGalaxy;
+  const switchingOpenNamespace = galaxy.view === "namespace"
+    && Boolean(galaxy.detailContextId)
+    && galaxy.detailContextId !== nextContext;
+  if (switchingOpenNamespace) {
+    galaxy.navigationToken += 1;
+    galaxy.detailRequestToken += 1;
+    galaxy.detailContextId = nextContext;
+    galaxy.focusedClusterId = "";
+    galaxy.detail = null;
+    galaxy.focusedDetail = null;
+    galaxy.detailSelection = null;
+    galaxy.detailHover = null;
+    updateNamespaceGalaxyUrl({ contextId: nextContext, replace: true });
+    updateNamespaceGalaxyChrome();
+  }
   state.context = nextContext;
+  const galaxyNode = state.namespaceGalaxy.data.nodes.find((item) => item.contextId === nextContext);
+  if (galaxyNode && state.namespaceGalaxy.view === "galaxy") {
+    selectNamespaceGalaxyItem(galaxyNode, { focusCanvas: false });
+  }
   elements.contextInput.value = nextContext;
   if ([...elements.contextSelect.options].some((option) => option.value === nextContext)) {
     elements.contextSelect.value = nextContext;
   }
   const url = new URL(window.location.href);
   url.searchParams.set("context_id", nextContext);
-  history.replaceState(null, "", url);
+  // Context selection is also part of the drill-down route. Preserve its
+  // history marker so browser Back/Escape still returns through the depth.
+  history.replaceState(history.state, "", url);
   await withBusy(busyElement, "Context", refreshSnapshot, { refresh: false });
+  if (switchingOpenNamespace && galaxy.view === "namespace" && galaxy.detailContextId === nextContext) {
+    await refreshNamespaceDetail({ contextId: nextContext });
+  }
+}
+
+function initializeNamespaceGalaxy() {
+  const canvas = elements.namespaceGalaxyCanvas;
+  const reducedMotionQuery = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+  const updateReducedMotion = (event) => {
+    state.namespaceGalaxy.reducedMotion = Boolean(event.matches);
+    requestNamespaceGalaxyDraw();
+  };
+  reducedMotionQuery?.addEventListener?.("change", updateReducedMotion);
+
+  const resize = () => {
+    resizeNamespaceGalaxyCanvas();
+    requestNamespaceGalaxyDraw();
+  };
+  if (typeof ResizeObserver === "function") {
+    state.namespaceGalaxy.resizeObserver = new ResizeObserver(resize);
+    state.namespaceGalaxy.resizeObserver.observe(canvas);
+  } else {
+    window.addEventListener("resize", resize);
+  }
+
+  canvas.addEventListener("pointerdown", (event) => {
+    const point = namespaceGalaxyPointerPoint(event);
+    state.namespaceGalaxy.interaction = {
+      pointerId: event.pointerId,
+      startX: point.x,
+      startY: point.y,
+      lastX: point.x,
+      lastY: point.y,
+      mode: event.shiftKey || event.button === 1 ? "pan" : "orbit",
+      moved: false,
+    };
+    canvas.setPointerCapture?.(event.pointerId);
+    canvas.classList.add("is-interacting");
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    const point = namespaceGalaxyPointerPoint(event);
+    const interaction = state.namespaceGalaxy.interaction;
+    if (interaction && interaction.pointerId === event.pointerId) {
+      const dx = point.x - interaction.lastX;
+      const dy = point.y - interaction.lastY;
+      if (Math.hypot(point.x - interaction.startX, point.y - interaction.startY) > 4) {
+        interaction.moved = true;
+      }
+      if (interaction.mode === "pan") {
+        state.namespaceGalaxy.pan.x += dx;
+        state.namespaceGalaxy.pan.y += dy;
+      } else {
+        state.namespaceGalaxy.rotation.y += dx * 0.008;
+        state.namespaceGalaxy.rotation.x = clamp(
+          state.namespaceGalaxy.rotation.x + dy * 0.008,
+          -Math.PI * 0.48,
+          Math.PI * 0.48,
+        );
+      }
+      interaction.lastX = point.x;
+      interaction.lastY = point.y;
+      hideNamespaceGalaxyTooltip();
+      requestNamespaceGalaxyDraw();
+      return;
+    }
+    if (state.namespaceGalaxy.view === "namespace") updateNamespaceDetailHover(point.x, point.y);
+    else updateNamespaceGalaxyHover(point.x, point.y);
+  });
+
+  const finishPointer = (event) => {
+    const interaction = state.namespaceGalaxy.interaction;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    const point = namespaceGalaxyPointerPoint(event);
+    state.namespaceGalaxy.interaction = null;
+    canvas.classList.remove("is-interacting");
+    canvas.releasePointerCapture?.(event.pointerId);
+    if (!interaction.moved) {
+      const hit = state.namespaceGalaxy.view === "namespace"
+        ? hitNamespaceDetail(point.x, point.y)
+        : hitNamespaceGalaxy(point.x, point.y);
+      if (hit) {
+        if (state.namespaceGalaxy.view === "namespace") {
+          selectNamespaceDetailItem(hit.item, { focusCanvas: false });
+          if (hit.item.kind === "ganglion") {
+            void focusNamespaceGanglion(hit.item.clusterId, { pushHistory: true });
+          }
+        } else {
+          if (hit.item.kind === "node") {
+            void enterNamespaceGalaxy(hit.item.contextId, { pushHistory: true });
+          } else {
+            selectNamespaceGalaxyItem(hit.item, { focusCanvas: false });
+          }
+        }
+      }
+    }
+  };
+  canvas.addEventListener("pointerup", finishPointer);
+  canvas.addEventListener("pointercancel", finishPointer);
+  canvas.addEventListener("pointerleave", () => {
+    if (!state.namespaceGalaxy.interaction) {
+      if (state.namespaceGalaxy.view === "namespace") state.namespaceGalaxy.detailHover = null;
+      else state.namespaceGalaxy.hover = null;
+      hideNamespaceGalaxyTooltip();
+      requestNamespaceGalaxyDraw();
+    }
+  });
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
+    setNamespaceGalaxyZoom(state.namespaceGalaxy.zoom * factor);
+  }, { passive: false });
+  canvas.addEventListener("keydown", handleNamespaceGalaxyKeydown);
+  canvas.addEventListener("focus", () => {
+    if (state.namespaceGalaxy.view === "namespace") {
+      ensureNamespaceDetailKeyboardSelection();
+      requestNamespaceGalaxyDraw();
+      return;
+    }
+    const nodes = state.namespaceGalaxy.data.nodes;
+    if (!state.namespaceGalaxy.keyboardContextId && nodes.length) {
+      state.namespaceGalaxy.keyboardContextId = nodes.find((node) => node.contextId === state.context)?.contextId
+        || nodes[0].contextId;
+      const node = nodes.find((candidate) => candidate.contextId === state.namespaceGalaxy.keyboardContextId);
+      if (node) selectNamespaceGalaxyItem(node, { focusCanvas: false });
+    }
+    requestNamespaceGalaxyDraw();
+  });
+  canvas.addEventListener("blur", requestNamespaceGalaxyDraw);
+
+  elements.namespaceGalaxyOrbitLeft.addEventListener("click", () => orbitNamespaceGalaxy(-0.24));
+  elements.namespaceGalaxyOrbitRight.addEventListener("click", () => orbitNamespaceGalaxy(0.24));
+  elements.namespaceGalaxyZoomOut.addEventListener("click", () => setNamespaceGalaxyZoom(state.namespaceGalaxy.zoom / 1.18));
+  elements.namespaceGalaxyZoomIn.addEventListener("click", () => setNamespaceGalaxyZoom(state.namespaceGalaxy.zoom * 1.18));
+  elements.namespaceGalaxyFit.addEventListener("click", fitNamespaceGalaxy);
+  elements.namespaceGalaxyReset.addEventListener("click", resetNamespaceGalaxyView);
+  elements.namespaceGalaxyBack.addEventListener("click", () => {
+    if (state.namespaceGalaxy.focusedClusterId) clearNamespaceGanglionFocus({ useHistory: true });
+    else exitNamespaceGalaxy({ useHistory: true });
+  });
+  elements.namespaceGalaxyBreadcrumbAll.addEventListener("click", () => {
+    exitNamespaceGalaxy({ useHistory: true });
+  });
+  elements.namespaceGalaxyBreadcrumbNamespace.addEventListener("click", () => {
+    clearNamespaceGanglionFocus({ useHistory: true });
+  });
+
+  elements.namespaceGalaxyList.addEventListener("click", (event) => {
+    const button = event.target.closest?.("[data-galaxy-action], [data-galaxy-context]");
+    if (!button) return;
+    event.preventDefault();
+    handleNamespaceGalaxyListAction(button);
+  });
+  elements.namespaceGalaxyInspector.addEventListener("click", handleNamespaceGalaxyInspectorClick);
+  window.addEventListener("popstate", restoreNamespaceGalaxyFromUrl);
+  resizeNamespaceGalaxyCanvas();
+  updateRecallScopeHelp();
+  updateNamespaceGalaxyChrome();
+}
+
+async function refreshNamespaceGalaxy() {
+  const requestToken = ++state.namespaceGalaxy.requestToken;
+  const contextId = state.context;
+  const hasData = state.namespaceGalaxy.data.nodes.length > 0;
+  if (!hasData) {
+    setNamespaceGalaxyState("loading", "Loading Namespace Galaxy", "Reading contexts and approved bridges.");
+  }
+  try {
+    const payload = await requestJson("/api/namespace-map", {
+      params: { context_id: contextId },
+    });
+    if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
+    const data = normalizeNamespaceMap(payload);
+    renderNamespaceGalaxy(data);
+    if (data.nodes.length && state.namespaceGalaxy.view === "galaxy") {
+      setNamespaceGalaxyState("ready", "Namespace Galaxy ready", "");
+    } else if (state.namespaceGalaxy.view === "galaxy") {
+      setNamespaceGalaxyState("empty", "No saved namespaces", "Capture memory in a context to place it in the galaxy.");
+    }
+    if (state.namespaceGalaxy.pendingUrlRestore) {
+      state.namespaceGalaxy.pendingUrlRestore = false;
+      restoreNamespaceGalaxyFromUrl();
+    }
+    return data;
+  } catch (error) {
+    if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
+    const fallback = namespaceMapFallbackFromSnapshot();
+    if (fallback.nodes.length) {
+      renderNamespaceGalaxy(fallback);
+      if (state.namespaceGalaxy.view === "galaxy") {
+        setNamespaceGalaxyState(
+          "warning",
+          "Bridge map unavailable",
+          "Showing saved contexts from runtime status; relationship data could not be loaded.",
+        );
+      }
+    } else {
+      renderNamespaceGalaxy({ nodes: [], links: [], suggestions: [], stats: {} });
+      setNamespaceGalaxyState("error", "Namespace Galaxy unavailable", error.message || "The namespace map could not be loaded.");
+    }
+    logOperation("Namespace Galaxy refresh failed", error.message);
+    return fallback;
+  }
+}
+
+async function enterNamespaceGalaxy(contextId, { pushHistory = false, clusterId = "" } = {}) {
+  const nextContextId = String(contextId || "").trim();
+  if (!nextContextId) return null;
+  const galaxy = state.namespaceGalaxy;
+  const navigationToken = ++galaxy.navigationToken;
+  galaxy.view = "namespace";
+  galaxy.detailContextId = nextContextId;
+  galaxy.focusedClusterId = "";
+  galaxy.focusedDetail = null;
+  galaxy.detailSelection = null;
+  galaxy.detailHover = null;
+  galaxy.keyboardDetailId = "";
+  galaxy.rotation = { x: -0.1, y: 0.12 };
+  galaxy.pan = { x: 0, y: 0 };
+  galaxy.zoom = 1;
+  updateNamespaceGalaxyChrome();
+  setNamespaceGalaxyState("loading", `Opening ${nextContextId}`, "Reading stored ganglia, neurons, and relationships.");
+  if (pushHistory) updateNamespaceGalaxyUrl({ contextId: nextContextId, push: true });
+  if (state.context !== nextContextId) {
+    await applySelectedContext(nextContextId, elements.contextApply);
+  }
+  if (navigationToken !== galaxy.navigationToken || galaxy.view !== "namespace" || galaxy.detailContextId !== nextContextId) {
+    return null;
+  }
+  const detail = await refreshNamespaceDetail({ contextId: nextContextId });
+  if (detail && clusterId) {
+    await focusNamespaceGanglion(clusterId, { pushHistory: false });
+  }
+  elements.namespaceGalaxyCanvas.focus({ preventScroll: true });
+  return detail;
+}
+
+async function refreshNamespaceDetail({ contextId, clusterId = "" } = {}) {
+  const galaxy = state.namespaceGalaxy;
+  const nextContextId = String(contextId || galaxy.detailContextId || state.context).trim();
+  const nextClusterId = String(clusterId || "").trim();
+  const requestToken = ++galaxy.detailRequestToken;
+  try {
+    const payload = await requestJson("/api/namespace-detail", {
+      params: {
+        context_id: nextContextId,
+        level: "neurons",
+        ...(nextClusterId ? { cluster_id: nextClusterId } : {}),
+        limit: NAMESPACE_DETAIL_LIMIT,
+      },
+    });
+    if (requestToken !== galaxy.detailRequestToken || galaxy.view !== "namespace") return null;
+    if (nextContextId !== galaxy.detailContextId) return null;
+    if (nextClusterId !== galaxy.focusedClusterId) return null;
+    const detail = normalizeNamespaceDetail(payload);
+    if (nextClusterId) {
+      galaxy.focusedDetail = detail;
+    } else {
+      galaxy.detail = detail;
+    }
+    renderNamespaceDetail();
+    if (detail.empty || (!detail.clusters.length && !detail.nodes.length)) {
+      setNamespaceGalaxyState("empty", `${nextContextId} has no stored neurons`, "This read-only namespace has no graph detail to display yet.");
+    } else {
+      setNamespaceGalaxyState("ready", `${nextContextId} detail ready`, "");
+    }
+    return detail;
+  } catch (error) {
+    if (requestToken !== galaxy.detailRequestToken || galaxy.view !== "namespace") return null;
+    setNamespaceGalaxyState("error", "Namespace detail unavailable", error.message || "The read-only namespace detail could not be loaded.");
+    renderNamespaceDetail();
+    logOperation("Namespace detail refresh failed", error.message);
+    return null;
+  }
+}
+
+function normalizeNamespaceDetail(payload = {}) {
+  const rawNamespace = payload.namespace && typeof payload.namespace === "object" ? payload.namespace : {};
+  const contextId = String(payload.context_id ?? rawNamespace.context_id ?? state.namespaceGalaxy.detailContextId ?? "").trim();
+  const namespace = {
+    kind: "namespace-detail",
+    id: String(rawNamespace.node_id || `s2ctx:${contextId}`),
+    contextId,
+    label: String(rawNamespace.display_label || contextId || "Unnamed namespace"),
+    stored: rawNamespace.stored !== false,
+    entryTotal: galaxyNumber(rawNamespace.entry_total ?? payload.counts?.memory_total, 0),
+    relationshipTotal: galaxyNumber(rawNamespace.relationship_total ?? payload.counts?.relationship_total, 0),
+    firstCreatedAt: rawNamespace.first_created_at ?? null,
+    lastUpdatedAt: rawNamespace.last_updated_at ?? null,
+    provenance: rawNamespace.provenance ?? null,
+    raw: rawNamespace,
+  };
+  const clusters = (Array.isArray(payload.clusters) ? payload.clusters : [])
+    .map((rawCluster) => {
+      const clusterId = String(rawCluster?.cluster_id ?? "").trim();
+      if (!clusterId) return null;
+      return {
+        kind: "ganglion",
+        id: String(rawCluster?.node_id || `ganglion:${contextId}:${clusterId}`),
+        clusterId,
+        contextId,
+        label: String(rawCluster?.display_label || clusterId),
+        basis: String(rawCluster?.basis || "stored_type"),
+        anchorMemoryId: rawCluster?.anchor_memory_id ?? null,
+        memoryTotal: galaxyNumber(rawCluster?.memory_total, 0),
+        memberMemoryIds: Array.isArray(rawCluster?.member_memory_id_sample) ? rawCluster.member_memory_id_sample.map(String) : [],
+        nodeTypeCounts: rawCluster?.node_type_counts && typeof rawCluster.node_type_counts === "object" ? rawCluster.node_type_counts : {},
+        firstCreatedAt: rawCluster?.first_created_at ?? null,
+        lastUpdatedAt: rawCluster?.last_updated_at ?? null,
+        semanticFacets: rawCluster?.semantic_facets ?? null,
+        raw: rawCluster,
+      };
+    })
+    .filter(Boolean);
+  const nodes = (Array.isArray(payload.nodes) ? payload.nodes : [])
+    .map((rawNode) => {
+      const memoryId = String(rawNode?.memory_id ?? "").trim();
+      if (!memoryId) return null;
+      return {
+        kind: "memory",
+        id: String(rawNode?.node_id || memoryId),
+        memoryId,
+        contextId: String(rawNode?.context_id || contextId),
+        clusterId: String(rawNode?.cluster_id || "").trim(),
+        nodeType: String(rawNode?.node_type || "memory"),
+        tag: String(rawNode?.tag || ""),
+        label: String(rawNode?.display_label || rawNode?.excerpt || rawNode?.tag || memoryId),
+        excerpt: String(rawNode?.excerpt || ""),
+        createdAt: rawNode?.created_at ?? null,
+        updatedAt: rawNode?.updated_at ?? null,
+        source: rawNode?.source ?? null,
+        provenance: rawNode?.provenance ?? null,
+        semanticFacets: rawNode?.semantic_facets ?? null,
+        detailBadges: Array.isArray(rawNode?.detail_badges) ? rawNode.detail_badges.map(String) : [],
+        raw: rawNode,
+      };
+    })
+    .filter(Boolean);
+  const edges = (Array.isArray(payload.edges) ? payload.edges : [])
+    .map((rawEdge, index) => {
+      const sourceId = String(rawEdge?.source_id ?? rawEdge?.source ?? "").trim();
+      const targetId = String(rawEdge?.target_id ?? rawEdge?.target ?? "").trim();
+      if (!sourceId || !targetId || sourceId === targetId) return null;
+      return {
+        kind: "detail-edge",
+        id: String(rawEdge?.edge_id || `detail-edge:${sourceId}:${targetId}:${index}`),
+        sourceId,
+        targetId,
+        edgeType: String(rawEdge?.edge_type || "relationship"),
+        direction: String(rawEdge?.direction || "directed"),
+        weight: clamp(galaxyNumber(rawEdge?.weight, 0.5), 0, 1),
+        createdAt: rawEdge?.created_at ?? null,
+        updatedAt: rawEdge?.updated_at ?? null,
+        provenance: rawEdge?.provenance ?? null,
+        raw: rawEdge,
+      };
+    })
+    .filter(Boolean);
+  return {
+    action: String(payload.action || "namespace-detail"),
+    readOnly: payload.read_only !== false,
+    contextId,
+    level: String(payload.level || "neurons"),
+    selectedClusterId: String(payload.selected_cluster_id || ""),
+    empty: Boolean(payload.empty),
+    namespace,
+    counts: payload.counts && typeof payload.counts === "object" ? payload.counts : {},
+    truncation: payload.truncation && typeof payload.truncation === "object" ? payload.truncation : {},
+    clusters,
+    nodes,
+    edges,
+  };
+}
+
+function combinedNamespaceDetail() {
+  const base = state.namespaceGalaxy.detail;
+  if (!base) return null;
+  const focused = state.namespaceGalaxy.focusedDetail;
+  if (!focused || !state.namespaceGalaxy.focusedClusterId) return base;
+  const clusterId = state.namespaceGalaxy.focusedClusterId;
+  const nodes = new Map(base.nodes.filter((node) => node.clusterId !== clusterId).map((node) => [node.id, node]));
+  focused.nodes.forEach((node) => nodes.set(node.id, node));
+  const edges = new Map(base.edges.map((edge) => [edge.id, edge]));
+  focused.edges.forEach((edge) => edges.set(edge.id, edge));
+  const clusters = new Map(base.clusters.map((cluster) => [cluster.clusterId, cluster]));
+  focused.clusters.forEach((cluster) => clusters.set(cluster.clusterId, cluster));
+  return { ...base, nodes: [...nodes.values()], edges: [...edges.values()], clusters: [...clusters.values()] };
+}
+
+async function focusNamespaceGanglion(clusterId, { pushHistory = false } = {}) {
+  const galaxy = state.namespaceGalaxy;
+  const nextClusterId = String(clusterId || "").trim();
+  if (galaxy.view !== "namespace" || !nextClusterId) return null;
+  const cluster = galaxy.detail?.clusters.find((item) => item.clusterId === nextClusterId);
+  if (!cluster) return null;
+  galaxy.focusedClusterId = nextClusterId;
+  galaxy.detailSelection = cluster;
+  galaxy.keyboardDetailId = cluster.id;
+  galaxy.detailHover = null;
+  galaxy.zoom = Math.max(galaxy.zoom, 1.58);
+  galaxy.pan = { x: 0, y: 0 };
+  rebuildNamespaceDetailLayout();
+  renderNamespaceDetailInspector(cluster);
+  updateNamespaceGalaxyChrome();
+  renderNamespaceDetailList();
+  requestNamespaceGalaxyDraw();
+  if (pushHistory) updateNamespaceGalaxyUrl({ contextId: galaxy.detailContextId, clusterId: nextClusterId, push: true });
+  setNamespaceGalaxyState("loading", `Expanding ${cluster.label}`, "Loading the bounded exact neurons and relationships for this ganglion.");
+  return refreshNamespaceDetail({ contextId: galaxy.detailContextId, clusterId: nextClusterId });
+}
+
+function clearNamespaceGanglionFocus({ useHistory = false } = {}) {
+  const galaxy = state.namespaceGalaxy;
+  if (galaxy.view !== "namespace") return;
+  if (useHistory && history.state?.namespaceGalaxyView === "ganglion") {
+    history.back();
+    return;
+  }
+  galaxy.focusedClusterId = "";
+  galaxy.detailRequestToken += 1;
+  galaxy.focusedDetail = null;
+  galaxy.detailSelection = galaxy.detail?.namespace || null;
+  galaxy.keyboardDetailId = galaxy.detail?.clusters[0]?.id || "";
+  galaxy.zoom = 1;
+  galaxy.pan = { x: 0, y: 0 };
+  rebuildNamespaceDetailLayout();
+  renderNamespaceDetailInspector(galaxy.detailSelection);
+  renderNamespaceDetailList();
+  updateNamespaceGalaxyChrome();
+  requestNamespaceGalaxyDraw();
+  updateNamespaceGalaxyUrl({ contextId: galaxy.detailContextId, replace: true });
+}
+
+function exitNamespaceGalaxy({ useHistory = false } = {}) {
+  const galaxy = state.namespaceGalaxy;
+  if (galaxy.view === "galaxy") return;
+  if (useHistory && history.state?.namespaceGalaxyView && !history.state?.namespaceGalaxyDeepLink) {
+    const steps = history.state.namespaceGalaxyView === "ganglion" ? -2 : -1;
+    history.go(steps);
+    return;
+  }
+  galaxy.view = "galaxy";
+  galaxy.navigationToken += 1;
+  galaxy.detailRequestToken += 1;
+  galaxy.detailContextId = "";
+  galaxy.focusedClusterId = "";
+  galaxy.focusedDetail = null;
+  galaxy.detailSelection = null;
+  galaxy.detailHover = null;
+  galaxy.zoom = 1;
+  galaxy.pan = { x: 0, y: 0 };
+  galaxy.rotation = { ...NAMESPACE_GALAXY_DEFAULT_ROTATION };
+  updateNamespaceGalaxyUrl({ replace: true });
+  updateNamespaceGalaxyChrome();
+  const selection = galaxy.data.nodes.find((node) => node.contextId === state.context) || galaxy.data.nodes[0] || null;
+  galaxy.selection = selection;
+  renderNamespaceGalaxyInspector(selection);
+  renderNamespaceGalaxyList(galaxy.data.nodes);
+  setNamespaceGalaxyState(galaxy.data.nodes.length ? "ready" : "empty", galaxy.data.nodes.length ? "Namespace Galaxy ready" : "No saved namespaces", "");
+  requestNamespaceGalaxyDraw();
+}
+
+function updateNamespaceGalaxyUrl({ contextId = "", clusterId = "", push = false, replace = false } = {}) {
+  const url = new URL(window.location.href);
+  if (contextId) {
+    url.searchParams.set("context_id", contextId);
+    url.searchParams.set(NAMESPACE_GALAXY_CONTEXT_PARAM, contextId);
+    if (clusterId) url.searchParams.set(NAMESPACE_GALAXY_CLUSTER_PARAM, clusterId);
+    else url.searchParams.delete(NAMESPACE_GALAXY_CLUSTER_PARAM);
+  } else {
+    url.searchParams.delete(NAMESPACE_GALAXY_CONTEXT_PARAM);
+    url.searchParams.delete(NAMESPACE_GALAXY_CLUSTER_PARAM);
+  }
+  url.hash = "namespaceGalaxy";
+  const marker = contextId ? (clusterId ? "ganglion" : "namespace") : "galaxy";
+  const historyState = { namespaceGalaxyView: marker };
+  if (push) history.pushState(historyState, "", url);
+  else if (replace) history.replaceState(historyState, "", url);
+}
+
+async function restoreNamespaceGalaxyFromUrl() {
+  const url = new URL(window.location.href);
+  const contextId = String(url.searchParams.get(NAMESPACE_GALAXY_CONTEXT_PARAM) || "").trim();
+  const clusterId = String(url.searchParams.get(NAMESPACE_GALAXY_CLUSTER_PARAM) || "").trim();
+  if (!contextId) {
+    const poppedContextId = String(url.searchParams.get("context_id") || DEFAULT_CONTEXT).trim()
+      || DEFAULT_CONTEXT;
+    state.namespaceGalaxy.pendingUrlRestore = false;
+    exitNamespaceGalaxy({ useHistory: false });
+    if (poppedContextId !== state.context) {
+      try {
+        await applySelectedContext(poppedContextId, elements.contextApply);
+      } catch (error) {
+        logOperation("Namespace context restore failed", error.message);
+      }
+    }
+    return;
+  }
+  if (!state.namespaceGalaxy.data.nodes.length) {
+    state.namespaceGalaxy.pendingUrlRestore = true;
+    return;
+  }
+  if (!state.namespaceGalaxy.data.nodes.some((node) => node.contextId === contextId)) {
+    setNamespaceGalaxyState("warning", "Namespace is not available", `The saved namespace “${contextId}” is not present in this map.`);
+    return;
+  }
+  state.namespaceGalaxy.pendingUrlRestore = false;
+  void enterNamespaceGalaxy(contextId, { pushHistory: false, clusterId });
+}
+
+function normalizeNamespaceMap(payload = {}) {
+  const nodeMap = new Map();
+  const sourceNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  sourceNodes.forEach((rawNode) => {
+    const contextId = String(rawNode?.context_id ?? rawNode?.contextId ?? rawNode?.id ?? "").trim();
+    if (!contextId) return;
+    nodeMap.set(contextId, {
+      kind: "node",
+      id: `node:${contextId}`,
+      contextId,
+      entryCount: galaxyNumber(rawNode.entry_count ?? rawNode.memory_count ?? rawNode.count, 0),
+      relationshipCount: galaxyOptionalNumber(rawNode.relationship_count ?? rawNode.edge_count),
+      eventCount: galaxyOptionalNumber(rawNode.event_count ?? rawNode.context_event_count),
+      updatedAt: rawNode.updated_at
+        ?? rawNode.last_updated_at
+        ?? rawNode.last_event_at
+        ?? rawNode.last_activity_at
+        ?? null,
+      raw: rawNode,
+    });
+  });
+
+  const selectedContextId = String(payload.selected_context_id || state.context || DEFAULT_CONTEXT).trim();
+
+  const normalizeBridge = (rawLink, kind, index) => {
+    const sourceContextId = String(
+      rawLink?.source_context_id ?? rawLink?.source_context ?? rawLink?.source ?? "",
+    ).trim();
+    const targetContextId = String(
+      rawLink?.target_context_id ?? rawLink?.target_context ?? rawLink?.target ?? "",
+    ).trim();
+    if (!sourceContextId || !targetContextId || sourceContextId === targetContextId) return null;
+    const relationType = String(rawLink?.relation_type ?? rawLink?.relationship_type ?? "related_to").trim() || "related_to";
+    const rawWeight = rawLink?.weight
+      ?? rawLink?.score
+      ?? rawLink?.dice_score
+      ?? rawLink?.similarity
+      ?? rawLink?.confidence;
+    const weight = clamp(galaxyNumber(rawWeight, kind === "suggestion" ? 0 : 0.5), 0, 1);
+    const directionValue = String(rawLink?.direction || "bidirectional").trim().toLowerCase();
+    const direction = directionValue === "directed" ? "directed" : "bidirectional";
+    const suggestedPhaseDelayTicks = Math.max(0, Math.trunc(galaxyNumber(
+      rawLink?.suggested_phase_delay_ticks
+        ?? rawLink?.evidence?.suggested_phase_delay_ticks,
+      0,
+    )));
+    const suppliedId = rawLink?.context_link_id ?? rawLink?.relationship_id ?? rawLink?.suggestion_id;
+    return {
+      kind,
+      id: String(suppliedId || `${kind}:${sourceContextId}:${targetContextId}:${relationType}:${index}`),
+      sourceContextId,
+      targetContextId,
+      relationType,
+      weight,
+      direction,
+      suggestedPhaseDelayTicks,
+      enabled: kind === "suggestion" ? false : rawLink?.enabled !== false,
+      approved: kind === "suggestion" ? false : rawLink?.approved !== false,
+      evidence: namespaceEvidenceText(rawLink?.evidence ?? rawLink?.reason ?? rawLink?.provenance),
+      verifiedAt: rawLink?.verified_at ?? rawLink?.updated_at ?? null,
+      raw: rawLink,
+    };
+  };
+
+  const links = (Array.isArray(payload.links) ? payload.links : [])
+    .map((rawLink, index) => normalizeBridge(rawLink, "link", index))
+    .filter(Boolean);
+  const suggestions = (Array.isArray(payload.suggestions) ? payload.suggestions : [])
+    .map((rawLink, index) => normalizeBridge(rawLink, "suggestion", index))
+    .filter(Boolean)
+    .sort((left, right) => right.weight - left.weight);
+
+  // Links are meaningful only when both ends are actual stored contexts. Do not
+  // manufacture planets for a stale link or a currently selected empty context.
+  const hasStoredEndpoint = (link) => (
+    nodeMap.has(link.sourceContextId) && nodeMap.has(link.targetContextId)
+  );
+
+  return {
+    scope: String(payload.scope || "all"),
+    selectedContextId,
+    nodes: [...nodeMap.values()].sort((left, right) => (
+      right.entryCount - left.entryCount
+      || left.contextId.localeCompare(right.contextId, undefined, { sensitivity: "base" })
+    )),
+    links: links.filter(hasStoredEndpoint),
+    suggestions: suggestions.filter(hasStoredEndpoint),
+    stats: payload.stats && typeof payload.stats === "object" ? payload.stats : {},
+  };
+}
+
+function namespaceMapFallbackFromSnapshot() {
+  const contexts = state.snapshot?.status?.memory_contexts || {};
+  return normalizeNamespaceMap({
+    selected_context_id: state.context,
+    nodes: Object.entries(contexts).map(([contextId, entryCount]) => ({
+      context_id: contextId,
+      entry_count: entryCount,
+    })),
+    links: [],
+    suggestions: [],
+    stats: { fallback: true },
+  });
+}
+
+function galaxyNumber(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function galaxyOptionalNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function namespaceEvidenceText(value) {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "string") return compactNamespaceEvidence(value);
+  if (Array.isArray(value)) {
+    return compactNamespaceEvidence(value.slice(0, 6).map(namespaceEvidenceText).filter(Boolean).join("; "));
+  }
+  if (typeof value === "object") {
+    const preferredKeys = [
+      "summary",
+      "reason",
+      "source",
+      "method",
+      "dice_score",
+      "surface_overlap_count",
+      "spike_overlap_count",
+      "delay_semantics",
+    ];
+    const rows = preferredKeys
+      .filter((key) => value[key] !== undefined && value[key] !== null && value[key] !== "")
+      .map((key) => `${key.replaceAll("_", " ")}: ${String(value[key])}`);
+    if (!rows.length) {
+      rows.push(...Object.entries(value)
+        .filter(([, item]) => ["string", "number", "boolean"].includes(typeof item))
+        .slice(0, 6)
+        .map(([key, item]) => `${key.replaceAll("_", " ")}: ${String(item)}`));
+    }
+    return compactNamespaceEvidence(rows.join("; "));
+  }
+  return compactNamespaceEvidence(String(value));
+}
+
+function compactNamespaceEvidence(value, maxLength = 520) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function renderNamespaceGalaxy(data) {
+  const galaxy = state.namespaceGalaxy;
+  const previousSelection = galaxy.selection;
+  galaxy.data = data;
+  const layoutSignature = namespaceGalaxyLayoutSignature(data);
+  if (galaxy.layoutSignature !== layoutSignature) {
+    galaxy.layoutSignature = layoutSignature;
+    galaxy.positions = buildNamespaceGalaxyLayout(data.nodes, data.links);
+  }
+
+  elements.namespaceGalaxyNodeCount.textContent = formatNumber(data.nodes.length);
+  elements.namespaceGalaxyLinkCount.textContent = formatNumber(data.links.length);
+  elements.namespaceGalaxySuggestionCount.textContent = formatNumber(data.suggestions.length);
+  if (galaxy.view === "namespace") {
+    updateNamespaceGalaxyChrome();
+    if (galaxy.detail) renderNamespaceDetailList();
+    resizeNamespaceGalaxyCanvas();
+    requestNamespaceGalaxyDraw();
+    return;
+  }
+  renderNamespaceGalaxyList(data.nodes);
+
+  let selection = findNamespaceGalaxyItem(previousSelection?.kind, previousSelection?.id);
+  if (!selection) {
+    selection = data.nodes.find((node) => node.contextId === state.context) || data.nodes[0] || null;
+  }
+  galaxy.selection = selection;
+  galaxy.keyboardContextId = selection?.kind === "node" ? selection.contextId : galaxy.keyboardContextId;
+  renderNamespaceGalaxyInspector(selection);
+  resizeNamespaceGalaxyCanvas();
+  requestNamespaceGalaxyDraw();
+}
+
+function namespaceGalaxyLayoutSignature(data) {
+  const nodes = data.nodes.map((node) => node.contextId).sort().join("|");
+  const links = data.links
+    .map((link) => `${link.sourceContextId}>${link.targetContextId}:${link.weight.toFixed(3)}`)
+    .sort()
+    .join("|");
+  return `${nodes}::${links}`;
+}
+
+function buildNamespaceGalaxyLayout(nodes, links) {
+  const positions = new Map();
+  nodes.forEach((node, index) => {
+    const vector = namespaceHashVector(node.contextId, index, nodes.length);
+    positions.set(node.contextId, vector);
+  });
+  if (nodes.length <= 1) {
+    const only = nodes[0];
+    if (only) positions.set(only.contextId, { x: 0, y: 0, z: 0 });
+    return positions;
+  }
+
+  const linkRows = links
+    .map((link) => ({
+      source: positions.get(link.sourceContextId),
+      target: positions.get(link.targetContextId),
+      weight: clamp(link.weight, 0.08, 1),
+    }))
+    .filter((link) => link.source && link.target && link.source !== link.target);
+  const vectors = [...positions.values()];
+  const iterations = Math.min(84, Math.max(36, nodes.length * 2));
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const cooling = 1 - iteration / iterations;
+    const deltas = new Map(vectors.map((vector) => [vector, { x: 0, y: 0, z: 0 }]));
+    for (let leftIndex = 0; leftIndex < vectors.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < vectors.length; rightIndex += 1) {
+        const left = vectors[leftIndex];
+        const right = vectors[rightIndex];
+        const dx = left.x - right.x;
+        const dy = left.y - right.y;
+        const dz = left.z - right.z;
+        const distanceSquared = dx * dx + dy * dy + dz * dz + 0.025;
+        const force = Math.min(0.045, 0.0048 / distanceSquared) * cooling;
+        const length = Math.sqrt(distanceSquared);
+        const fx = (dx / length) * force;
+        const fy = (dy / length) * force;
+        const fz = (dz / length) * force;
+        deltas.get(left).x += fx;
+        deltas.get(left).y += fy;
+        deltas.get(left).z += fz;
+        deltas.get(right).x -= fx;
+        deltas.get(right).y -= fy;
+        deltas.get(right).z -= fz;
+      }
+    }
+    linkRows.forEach((link) => {
+      const dx = link.target.x - link.source.x;
+      const dy = link.target.y - link.source.y;
+      const dz = link.target.z - link.source.z;
+      const distance = Math.max(0.001, Math.hypot(dx, dy, dz));
+      const idealDistance = 0.46 + (1 - link.weight) * 0.26;
+      const force = (distance - idealDistance) * 0.032 * link.weight * cooling;
+      const fx = (dx / distance) * force;
+      const fy = (dy / distance) * force;
+      const fz = (dz / distance) * force;
+      deltas.get(link.source).x += fx;
+      deltas.get(link.source).y += fy;
+      deltas.get(link.source).z += fz;
+      deltas.get(link.target).x -= fx;
+      deltas.get(link.target).y -= fy;
+      deltas.get(link.target).z -= fz;
+    });
+    vectors.forEach((vector) => {
+      const delta = deltas.get(vector);
+      vector.x = clamp(vector.x + delta.x - vector.x * 0.005, -1.12, 1.12);
+      vector.y = clamp(vector.y + delta.y - vector.y * 0.005, -1.12, 1.12);
+      vector.z = clamp(vector.z + delta.z - vector.z * 0.005, -1.12, 1.12);
+    });
+  }
+  return positions;
+}
+
+function namespaceHashVector(contextId, index, count) {
+  let hash = 2166136261;
+  for (const character of String(contextId)) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  const unit = (shift) => ((hash >>> shift) & 1023) / 1023;
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  const angle = index * goldenAngle + unit(2) * 0.82;
+  const z = count > 1 ? 1 - (2 * index) / (count - 1) : 0;
+  const radial = Math.sqrt(Math.max(0, 1 - z * z));
+  const shell = 0.48 + unit(12) * 0.5;
+  return {
+    x: Math.cos(angle) * radial * shell,
+    y: Math.sin(angle) * radial * shell,
+    z: z * shell + (unit(20) - 0.5) * 0.18,
+  };
+}
+
+function renderNamespaceDetail() {
+  const galaxy = state.namespaceGalaxy;
+  const detail = combinedNamespaceDetail();
+  updateNamespaceGalaxyChrome();
+  if (!detail) {
+    renderNamespaceDetailInspector(null);
+    renderNamespaceDetailList();
+    requestNamespaceGalaxyDraw();
+    return;
+  }
+  rebuildNamespaceDetailLayout();
+  let selection = findNamespaceDetailItem(galaxy.detailSelection?.kind, galaxy.detailSelection?.id);
+  if (!selection && galaxy.focusedClusterId) {
+    selection = detail.clusters.find((cluster) => cluster.clusterId === galaxy.focusedClusterId) || null;
+  }
+  if (!selection) selection = detail.namespace;
+  galaxy.detailSelection = selection;
+  galaxy.keyboardDetailId = selection?.kind === "namespace-detail"
+    ? (detail.clusters[0]?.id || "")
+    : selection?.id || galaxy.keyboardDetailId;
+  renderNamespaceDetailInspector(selection);
+  renderNamespaceDetailList();
+  resizeNamespaceGalaxyCanvas();
+  requestNamespaceGalaxyDraw();
+}
+
+function rebuildNamespaceDetailLayout() {
+  const galaxy = state.namespaceGalaxy;
+  const detail = combinedNamespaceDetail();
+  if (!detail) {
+    galaxy.detailPositions = new Map();
+    galaxy.detailLayoutSignature = "";
+    return;
+  }
+  const signature = [
+    detail.contextId,
+    galaxy.focusedClusterId,
+    detail.clusters.map((cluster) => `${cluster.clusterId}:${cluster.memoryTotal}`).sort().join("|"),
+    detail.nodes.map((node) => node.id).sort().join("|"),
+  ].join("::");
+  if (signature === galaxy.detailLayoutSignature) return;
+  galaxy.detailLayoutSignature = signature;
+  galaxy.detailPositions = buildNamespaceDetailLayout(detail, galaxy.focusedClusterId);
+}
+
+function buildNamespaceDetailLayout(detail, focusedClusterId = "") {
+  const positions = new Map();
+  const clusters = [...detail.clusters].sort((left, right) => (
+    right.memoryTotal - left.memoryTotal
+    || left.label.localeCompare(right.label, undefined, { sensitivity: "base" })
+  ));
+  const focusIndex = clusters.findIndex((cluster) => cluster.clusterId === focusedClusterId);
+  const centerCluster = focusIndex >= 0 ? clusters.splice(focusIndex, 1)[0] : clusters.shift();
+  if (centerCluster) positions.set(centerCluster.id, { x: 0, y: 0, z: 0.16 });
+  const orbitCount = clusters.length;
+  clusters.forEach((cluster, index) => {
+    const hash = stableNamespaceHash(cluster.clusterId);
+    const angle = orbitCount > 0 ? (index / orbitCount) * Math.PI * 2 - Math.PI * 0.62 : 0;
+    const ring = focusedClusterId ? 0.88 : 0.76 + ((hash >>> 8) % 11) / 100;
+    positions.set(cluster.id, {
+      x: Math.cos(angle) * ring,
+      y: Math.sin(angle) * ring * (focusedClusterId ? 0.72 : 0.64),
+      z: (((hash >>> 18) & 255) / 255 - 0.5) * 0.42,
+    });
+  });
+
+  const clusterById = new Map(detail.clusters.map((cluster) => [cluster.clusterId, cluster]));
+  const grouped = new Map();
+  detail.nodes.forEach((node) => {
+    if (!grouped.has(node.clusterId)) grouped.set(node.clusterId, []);
+    grouped.get(node.clusterId).push(node);
+  });
+  grouped.forEach((nodes, clusterId) => {
+    const cluster = clusterById.get(clusterId);
+    const center = positions.get(cluster?.id) || { x: 0, y: 0, z: -0.05 };
+    const ordered = [...nodes].sort((left, right) => left.id.localeCompare(right.id));
+    ordered.forEach((node, index) => {
+      const hash = stableNamespaceHash(node.id);
+      const angle = index * Math.PI * (3 - Math.sqrt(5)) + ((hash & 1023) / 1023) * 0.7;
+      const expanded = clusterId === focusedClusterId;
+      const radius = (expanded ? 0.045 : 0.032) + Math.sqrt(index + 1) * (expanded ? 0.022 : 0.0155);
+      positions.set(node.id, {
+        x: center.x + Math.cos(angle) * Math.min(radius, expanded ? 0.48 : 0.3),
+        y: center.y + Math.sin(angle) * Math.min(radius, expanded ? 0.4 : 0.25) * 0.72,
+        z: center.z + ((((hash >>> 12) & 255) / 255) - 0.5) * (expanded ? 0.34 : 0.2),
+      });
+    });
+  });
+  return positions;
+}
+
+function stableNamespaceHash(value) {
+  let hash = 2166136261;
+  for (const character of String(value || "")) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function currentNamespaceDetailLod() {
+  if (state.namespaceGalaxy.zoom < NAMESPACE_DETAIL_GANGLION_ZOOM) return "cortex";
+  if (state.namespaceGalaxy.zoom < NAMESPACE_DETAIL_NEURON_ZOOM) return "ganglia";
+  return "neurons";
+}
+
+function drawNamespaceDetail(context, width, height, palette) {
+  const galaxy = state.namespaceGalaxy;
+  const detail = combinedNamespaceDetail();
+  galaxy.projectedGanglia = [];
+  galaxy.projectedMemories = [];
+  galaxy.projectedDetailEdges = [];
+  updateNamespaceDetailDepthChrome();
+  if (!detail) return;
+  const lod = currentNamespaceDetailLod();
+  drawNamespaceDetailField(context, width, height, palette, lod);
+  if (lod === "cortex") {
+    drawNamespaceCortex(context, detail, width, height, palette);
+    return;
+  }
+
+  const ganglia = detail.clusters
+    .map((cluster) => projectNamespaceDetailItem(cluster, width, height))
+    .filter(Boolean)
+    .sort((left, right) => left.depth - right.depth);
+  const visibleNodes = visibleNamespaceDetailNodes(detail, lod);
+  const memories = visibleNodes
+    .map((node) => projectNamespaceDetailItem(node, width, height))
+    .filter(Boolean)
+    .sort((left, right) => left.depth - right.depth);
+  const ganglionByCluster = new Map(ganglia.map((item) => [item.item.clusterId, item]));
+  const memoryById = new Map(memories.map((item) => [item.item.id, item]));
+
+  drawNamespaceMembershipTendrils(context, memories, ganglionByCluster, palette, lod);
+  const projectedEdges = lod === "neurons"
+    ? projectExactNamespaceDetailEdges(detail.edges, memoryById, ganglionByCluster)
+    : projectAggregateNamespaceDetailEdges(detail, ganglionByCluster);
+  projectedEdges.sort((left, right) => left.depth - right.depth)
+    .forEach((edge) => drawNamespaceDetailEdge(context, edge, palette, lod));
+  memories.forEach((node) => drawNamespaceMemoryNode(context, node, palette, lod));
+  ganglia.forEach((cluster) => drawNamespaceGanglion(context, cluster, palette));
+  drawNamespaceDetailLabels(context, ganglia, memories, palette, width, height, lod);
+
+  galaxy.projectedGanglia = ganglia;
+  galaxy.projectedMemories = memories;
+  galaxy.projectedDetailEdges = projectedEdges;
+}
+
+function drawNamespaceDetailField(context, width, height, palette, lod) {
+  const centerX = width / 2 + state.namespaceGalaxy.pan.x;
+  const centerY = height / 2 + state.namespaceGalaxy.pan.y;
+  context.save();
+  context.globalAlpha = lod === "neurons" ? 0.16 : 0.24;
+  context.strokeStyle = palette.depth;
+  context.lineWidth = 1;
+  [0.34, 0.58, 0.82].forEach((amount) => {
+    context.beginPath();
+    context.ellipse(centerX, centerY, width * amount * 0.5, height * amount * 0.38, state.namespaceGalaxy.rotation.x * 0.2, 0, Math.PI * 2);
+    context.stroke();
+  });
+  context.restore();
+}
+
+function drawNamespaceCortex(context, detail, width, height, palette) {
+  const selected = state.namespaceGalaxy.detailSelection?.kind === "namespace-detail";
+  const radius = clamp(30 + Math.log1p(detail.namespace.entryTotal) * 3.2, 34, 72);
+  const x = width / 2 + state.namespaceGalaxy.pan.x;
+  const y = height / 2 + state.namespaceGalaxy.pan.y;
+  const gradient = context.createRadialGradient(x - radius * 0.28, y - radius * 0.28, 2, x, y, radius);
+  gradient.addColorStop(0, palette.nodeHighlight);
+  gradient.addColorStop(0.35, palette.node);
+  gradient.addColorStop(1, palette.nodeShadow);
+  context.save();
+  context.shadowColor = selected ? palette.selected : palette.nodeHighlight;
+  context.shadowBlur = selected ? 28 : 18;
+  context.fillStyle = gradient;
+  context.beginPath();
+  context.arc(x, y, radius, 0, Math.PI * 2);
+  context.fill();
+  context.strokeStyle = selected ? palette.selected : palette.nodeHighlight;
+  context.lineWidth = selected ? 3 : 1.5;
+  context.stroke();
+  context.shadowBlur = 0;
+  context.fillStyle = palette.text;
+  context.font = "600 13px ui-monospace, SFMono-Regular, Menlo, monospace";
+  context.textAlign = "center";
+  context.fillText(truncateCanvasLabel(detail.namespace.label, 34), x, y + radius + 23);
+  context.fillStyle = palette.muted;
+  context.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  context.fillText(`${formatNumber(detail.namespace.entryTotal)} stored memories`, x, y + radius + 40);
+  context.restore();
+}
+
+function visibleNamespaceDetailNodes(detail, lod) {
+  const focusId = state.namespaceGalaxy.focusedClusterId;
+  if (lod === "neurons") {
+    if (!focusId) return detail.nodes;
+    const focused = detail.nodes.filter((node) => node.clusterId === focusId);
+    const context = detail.nodes.filter((node) => node.clusterId !== focusId)
+      .filter((node, index) => index % Math.max(1, Math.ceil(detail.nodes.length / 80)) === 0)
+      .slice(0, 80);
+    return [...focused, ...context];
+  }
+  const counts = new Map();
+  return detail.nodes.filter((node) => {
+    const count = counts.get(node.clusterId) || 0;
+    const limit = node.clusterId === focusId ? 24 : 12;
+    counts.set(node.clusterId, count + 1);
+    return count < limit;
+  });
+}
+
+function projectNamespaceDetailItem(item, width, height) {
+  const position = state.namespaceGalaxy.detailPositions.get(item.id);
+  if (!position) return null;
+  const rotated = rotateNamespacePoint(position, state.namespaceGalaxy.rotation);
+  const perspective = 2.7 / Math.max(1.35, 2.95 - rotated.z);
+  const xScale = width * 0.43 * state.namespaceGalaxy.zoom;
+  const yScale = height * 0.43 * state.namespaceGalaxy.zoom;
+  const isGanglion = item.kind === "ganglion";
+  const radius = isGanglion
+    ? clamp((8 + Math.log1p(Math.max(0, item.memoryTotal)) * 1.45) * perspective, 8, 25)
+    : clamp((1.45 + state.namespaceGalaxy.zoom * 0.72) * perspective, 1.5, 5.2);
+  return {
+    item,
+    x: width / 2 + state.namespaceGalaxy.pan.x + rotated.x * xScale * perspective,
+    y: height / 2 + state.namespaceGalaxy.pan.y + rotated.y * yScale * perspective,
+    radius,
+    depth: rotated.z,
+    perspective,
+  };
+}
+
+function drawNamespaceMembershipTendrils(context, memories, ganglionByCluster, palette, lod) {
+  context.save();
+  context.strokeStyle = palette.strong;
+  context.lineWidth = lod === "neurons" ? 0.7 : 0.8;
+  context.globalAlpha = lod === "neurons" ? 0.18 : 0.3;
+  memories.forEach((memory) => {
+    const ganglion = ganglionByCluster.get(memory.item.clusterId);
+    if (!ganglion) return;
+    const midX = (ganglion.x + memory.x) / 2 + (memory.y - ganglion.y) * 0.08;
+    const midY = (ganglion.y + memory.y) / 2 - (memory.x - ganglion.x) * 0.04;
+    context.beginPath();
+    context.moveTo(ganglion.x, ganglion.y);
+    context.quadraticCurveTo(midX, midY, memory.x, memory.y);
+    context.stroke();
+  });
+  context.restore();
+}
+
+function projectExactNamespaceDetailEdges(edges, memoryById, ganglionByCluster) {
+  return edges.map((edge) => {
+    const source = memoryById.get(edge.sourceId)
+      || [...ganglionByCluster.values()].find((item) => item.item.id === edge.sourceId);
+    const target = memoryById.get(edge.targetId)
+      || [...ganglionByCluster.values()].find((item) => item.item.id === edge.targetId);
+    if (!source || !target) return null;
+    return { item: edge, source, target, depth: (source.depth + target.depth) / 2, aggregateCount: 1 };
+  }).filter(Boolean);
+}
+
+function projectAggregateNamespaceDetailEdges(detail, ganglionByCluster) {
+  const clusterByNode = new Map(detail.nodes.map((node) => [node.id, node.clusterId]));
+  const aggregate = new Map();
+  detail.edges.forEach((edge) => {
+    const sourceCluster = clusterByNode.get(edge.sourceId);
+    const targetCluster = clusterByNode.get(edge.targetId);
+    if (!sourceCluster || !targetCluster || sourceCluster === targetCluster) return;
+    const key = [sourceCluster, targetCluster].sort().join("::");
+    const row = aggregate.get(key) || {
+      kind: "detail-edge",
+      id: `aggregate:${key}`,
+      sourceCluster,
+      targetCluster,
+      edgeType: edge.edgeType,
+      direction: edge.direction,
+      weight: 0,
+      count: 0,
+    };
+    row.weight = Math.max(row.weight, edge.weight);
+    row.count += 1;
+    aggregate.set(key, row);
+  });
+  return [...aggregate.values()].map((edge) => {
+    const source = ganglionByCluster.get(edge.sourceCluster);
+    const target = ganglionByCluster.get(edge.targetCluster);
+    if (!source || !target) return null;
+    return { item: edge, source, target, depth: (source.depth + target.depth) / 2, aggregateCount: edge.count };
+  }).filter(Boolean);
+}
+
+function drawNamespaceDetailEdge(context, projected, palette, lod) {
+  const associative = /associative|semantic|overlap/i.test(projected.item.edgeType);
+  context.save();
+  context.strokeStyle = associative ? palette.associative : palette.strong;
+  context.globalAlpha = associative ? 0.38 : 0.46;
+  context.lineWidth = clamp(0.55 + projected.item.weight * 1.3 + Math.log1p(projected.aggregateCount) * 0.2, 0.6, 2.6);
+  if (associative) context.setLineDash(lod === "neurons" ? [3, 4] : [2, 5]);
+  const curve = (projected.target.x - projected.source.x) * 0.04;
+  context.beginPath();
+  context.moveTo(projected.source.x, projected.source.y);
+  context.quadraticCurveTo(
+    (projected.source.x + projected.target.x) / 2,
+    (projected.source.y + projected.target.y) / 2 - curve,
+    projected.target.x,
+    projected.target.y,
+  );
+  context.stroke();
+  context.restore();
+}
+
+function drawNamespaceGanglion(context, projected, palette) {
+  const selected = state.namespaceGalaxy.detailSelection?.kind === "ganglion"
+    && state.namespaceGalaxy.detailSelection.id === projected.item.id;
+  const focused = state.namespaceGalaxy.focusedClusterId === projected.item.clusterId;
+  const hovered = state.namespaceGalaxy.detailHover?.kind === "ganglion"
+    && state.namespaceGalaxy.detailHover.id === projected.item.id;
+  const active = selected || focused || hovered;
+  const glow = active ? palette.selected : palette.nodeHighlight;
+  const gradient = context.createRadialGradient(
+    projected.x - projected.radius * 0.28,
+    projected.y - projected.radius * 0.28,
+    1,
+    projected.x,
+    projected.y,
+    projected.radius,
+  );
+  gradient.addColorStop(0, active ? palette.selected : palette.nodeHighlight);
+  gradient.addColorStop(0.42, palette.node);
+  gradient.addColorStop(1, palette.nodeShadow);
+  context.save();
+  context.shadowColor = glow;
+  context.shadowBlur = active ? 24 : 14;
+  context.fillStyle = gradient;
+  context.beginPath();
+  context.arc(projected.x, projected.y, projected.radius, 0, Math.PI * 2);
+  context.fill();
+  context.shadowBlur = 0;
+  context.strokeStyle = glow;
+  context.globalAlpha = active ? 0.96 : 0.72;
+  context.lineWidth = active ? 2.4 : 1.1;
+  context.stroke();
+  if (active) {
+    context.globalAlpha = 0.45;
+    context.beginPath();
+    context.arc(projected.x, projected.y, projected.radius + 5, 0, Math.PI * 2);
+    context.stroke();
+  }
+  context.restore();
+}
+
+function drawNamespaceMemoryNode(context, projected, palette, lod) {
+  const selected = state.namespaceGalaxy.detailSelection?.kind === "memory"
+    && state.namespaceGalaxy.detailSelection.id === projected.item.id;
+  const hovered = state.namespaceGalaxy.detailHover?.kind === "memory"
+    && state.namespaceGalaxy.detailHover.id === projected.item.id;
+  context.save();
+  context.fillStyle = selected ? palette.selected : palette.neuron;
+  context.globalAlpha = selected || hovered ? 1 : lod === "neurons" ? 0.82 : 0.68;
+  context.shadowColor = selected ? palette.selected : palette.neuron;
+  context.shadowBlur = selected || hovered ? 10 : 4;
+  context.beginPath();
+  context.arc(projected.x, projected.y, projected.radius + (selected ? 1.3 : 0), 0, Math.PI * 2);
+  context.fill();
+  context.restore();
+}
+
+function drawNamespaceDetailLabels(context, ganglia, memories, palette, width, height, lod) {
+  const occupied = [];
+  const sorted = [...ganglia].sort((left, right) => {
+    const leftPriority = left.item.clusterId === state.namespaceGalaxy.focusedClusterId ? 10_000 : left.item.memoryTotal;
+    const rightPriority = right.item.clusterId === state.namespaceGalaxy.focusedClusterId ? 10_000 : right.item.memoryTotal;
+    return rightPriority - leftPriority;
+  });
+  context.save();
+  context.textBaseline = "middle";
+  sorted.forEach((cluster, index) => {
+    const focused = cluster.item.clusterId === state.namespaceGalaxy.focusedClusterId;
+    const labelLimit = width < 540 ? 6 : width < 900 ? 12 : 18;
+    if (!focused && index >= labelLimit) return;
+    const label = truncateCanvasLabel(cluster.item.label, width < 620 ? 22 : 30);
+    context.font = "600 11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    const labelWidth = context.measureText(label).width + 10;
+    const labelHeight = 18;
+    const preferredX = clamp(cluster.x + cluster.radius + 7, 5, width - labelWidth - 5);
+    const preferredY = clamp(cluster.y - 9, 5, height - labelHeight - 5);
+    const box = { x: preferredX, y: preferredY, width: labelWidth, height: labelHeight };
+    const collisionBox = { ...box, height: width > 660 ? 30 : labelHeight };
+    if (!focused && occupied.some((row) => rectanglesOverlap(row, collisionBox))) return;
+    occupied.push(collisionBox);
+    context.globalAlpha = 0.9;
+    context.fillStyle = palette.labelBackground;
+    context.fillRect(box.x, box.y, box.width, box.height);
+    context.fillStyle = focused ? palette.selected : palette.text;
+    context.fillText(label, box.x + 5, box.y + box.height / 2);
+    if (width > 660) {
+      context.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      context.fillStyle = palette.muted;
+      context.fillText(`${formatNumber(cluster.item.memoryTotal)} neurons`, box.x + 5, box.y + box.height + 10);
+    }
+  });
+  if (lod === "neurons") {
+    const selected = memories.find((memory) => memory.item.id === state.namespaceGalaxy.detailSelection?.id)
+      || memories.find((memory) => memory.item.id === state.namespaceGalaxy.detailHover?.id);
+    if (selected) {
+      const label = truncateCanvasLabel(selected.item.label, 36);
+      context.font = "500 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      const labelWidth = Math.min(width - 16, context.measureText(label).width + 10);
+      const x = clamp(selected.x + 8, 6, width - labelWidth - 6);
+      const y = clamp(selected.y - 20, 6, height - 24);
+      context.fillStyle = palette.labelBackground;
+      context.fillRect(x, y, labelWidth, 18);
+      context.fillStyle = palette.selected;
+      context.fillText(label, x + 5, y + 9);
+    }
+  }
+  context.restore();
+}
+
+function truncateCanvasLabel(value, maxLength) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function resizeNamespaceGalaxyCanvas() {
+  const canvas = elements.namespaceGalaxyCanvas;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const dpr = clamp(window.devicePixelRatio || 1, 1, 2.5);
+  const nextWidth = Math.round(rect.width * dpr);
+  const nextHeight = Math.round(rect.height * dpr);
+  if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+    canvas.width = nextWidth;
+    canvas.height = nextHeight;
+  }
+}
+
+function requestNamespaceGalaxyDraw() {
+  if (state.namespaceGalaxy.framePending) return;
+  state.namespaceGalaxy.framePending = true;
+  window.requestAnimationFrame(() => {
+    state.namespaceGalaxy.framePending = false;
+    drawNamespaceGalaxy();
+  });
+}
+
+function drawNamespaceGalaxy() {
+  const canvas = elements.namespaceGalaxyCanvas;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  resizeNamespaceGalaxyCanvas();
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const dpr = canvas.width / rect.width;
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const width = rect.width;
+  const height = rect.height;
+  const palette = namespaceGalaxyPalette();
+  context.clearRect(0, 0, width, height);
+  context.fillStyle = palette.background;
+  context.fillRect(0, 0, width, height);
+
+  if (state.namespaceGalaxy.view === "namespace") {
+    drawNamespaceDetail(context, width, height, palette);
+    return;
+  }
+
+  drawNamespaceGalaxyDepthField(context, width, height, palette);
+  const data = state.namespaceGalaxy.data;
+  const maxEntries = Math.max(1, ...data.nodes.map((node) => node.entryCount));
+  const projectedNodes = data.nodes
+    .map((node) => projectNamespaceNode(node, maxEntries, width, height))
+    .filter(Boolean)
+    .sort((left, right) => left.depth - right.depth);
+  const projectedById = new Map(projectedNodes.map((node) => [node.item.contextId, node]));
+  const visibleSuggestions = visibleNamespaceSuggestions(data.suggestions);
+  const projectedLinks = [...data.links, ...visibleSuggestions]
+    .map((link) => projectNamespaceBridge(link, projectedById))
+    .filter(Boolean)
+    .sort((left, right) => left.depth - right.depth);
+
+  projectedLinks.forEach((link) => drawNamespaceBridge(context, link, palette));
+  projectedNodes.forEach((node) => drawNamespaceSphere(context, node, palette));
+  drawNamespaceLabels(context, projectedNodes, palette, width, height);
+
+  state.namespaceGalaxy.projectedNodes = projectedNodes;
+  state.namespaceGalaxy.projectedLinks = projectedLinks;
+}
+
+function namespaceGalaxyPalette() {
+  const styles = getComputedStyle(document.documentElement);
+  const value = (name, fallback) => styles.getPropertyValue(name).trim() || fallback;
+  return {
+    background: value("--galaxy-bg", "#03080c"),
+    depth: value("--galaxy-depth", "#123238"),
+    bridge: value("--galaxy-bridge", "#00e6c7"),
+    bridgeDisabled: value("--galaxy-bridge-disabled", "#65786e"),
+    suggestion: value("--galaxy-suggestion", "#b88cff"),
+    strong: value("--galaxy-strong", "#58dbc2"),
+    associative: value("--galaxy-associative", "#955ae5"),
+    node: value("--galaxy-node", "#1ca8a2"),
+    nodeHighlight: value("--galaxy-node-highlight", "#8affdf"),
+    nodeShadow: value("--galaxy-node-shadow", "#07383a"),
+    nodeEmpty: value("--galaxy-node-empty", "#d38b2c"),
+    selected: value("--galaxy-selected", "#9dff4f"),
+    text: value("--galaxy-text", "#f0ffe8"),
+    muted: value("--galaxy-muted", "#93aa9c"),
+    labelBackground: value("--galaxy-label-bg", "rgba(3, 8, 12, 0.82)"),
+    neuron: value("--galaxy-neuron", "#79f6ee"),
+    neuronMuted: value("--galaxy-neuron-muted", "#2b6f70"),
+  };
+}
+
+function drawNamespaceGalaxyDepthField(context, width, height, palette) {
+  const centerX = width / 2 + state.namespaceGalaxy.pan.x;
+  const centerY = height / 2 + state.namespaceGalaxy.pan.y;
+  const base = Math.min(width, height) * 0.27 * state.namespaceGalaxy.zoom;
+  context.save();
+  context.strokeStyle = palette.depth;
+  context.lineWidth = 1;
+  context.globalAlpha = 0.38;
+  [0.7, 1.08, 1.46].forEach((scale) => {
+    context.beginPath();
+    context.ellipse(centerX, centerY, base * scale, base * scale * 0.46, state.namespaceGalaxy.rotation.x * 0.42, 0, Math.PI * 2);
+    context.stroke();
+  });
+  context.globalAlpha = 0.22;
+  context.beginPath();
+  context.moveTo(centerX - base * 1.6, centerY);
+  context.lineTo(centerX + base * 1.6, centerY);
+  context.moveTo(centerX, centerY - base * 0.95);
+  context.lineTo(centerX, centerY + base * 0.95);
+  context.stroke();
+  context.restore();
+}
+
+function projectNamespaceNode(node, maxEntries, width, height) {
+  const position = state.namespaceGalaxy.positions.get(node.contextId);
+  if (!position) return null;
+  const rotated = rotateNamespacePoint(position, state.namespaceGalaxy.rotation);
+  const perspective = 2.65 / Math.max(1.25, 2.85 - rotated.z);
+  const scale = Math.min(width, height) * 0.38 * state.namespaceGalaxy.zoom;
+  const volume = Math.log1p(Math.max(0, node.entryCount)) / Math.log1p(maxEntries);
+  const baseRadius = 7 + Math.sqrt(volume) * 18;
+  return {
+    item: node,
+    x: width / 2 + state.namespaceGalaxy.pan.x + rotated.x * scale * perspective,
+    y: height / 2 + state.namespaceGalaxy.pan.y + rotated.y * scale * perspective,
+    radius: clamp(baseRadius * perspective, 5.5, 34),
+    depth: rotated.z,
+    perspective,
+  };
+}
+
+function rotateNamespacePoint(position, rotation) {
+  const cosY = Math.cos(rotation.y);
+  const sinY = Math.sin(rotation.y);
+  const xY = position.x * cosY + position.z * sinY;
+  const zY = -position.x * sinY + position.z * cosY;
+  const cosX = Math.cos(rotation.x);
+  const sinX = Math.sin(rotation.x);
+  return {
+    x: xY,
+    y: position.y * cosX - zY * sinX,
+    z: position.y * sinX + zY * cosX,
+  };
+}
+
+function visibleNamespaceSuggestions(suggestions) {
+  const activeContext = state.namespaceGalaxy.selection?.kind === "node"
+    ? state.namespaceGalaxy.selection.contextId
+    : state.context;
+  const related = suggestions.filter((suggestion) => (
+    suggestion.sourceContextId === activeContext || suggestion.targetContextId === activeContext
+  ));
+  const chosen = (related.length ? related : suggestions).slice(0, 12);
+  const selected = state.namespaceGalaxy.selection;
+  if (selected?.kind === "suggestion" && !chosen.some((item) => item.id === selected.id)) {
+    chosen.push(selected);
+  }
+  return chosen;
+}
+
+function projectNamespaceBridge(link, projectedById) {
+  const source = projectedById.get(link.sourceContextId);
+  const target = projectedById.get(link.targetContextId);
+  if (!source || !target) return null;
+  return {
+    item: link,
+    source,
+    target,
+    x1: source.x,
+    y1: source.y,
+    x2: target.x,
+    y2: target.y,
+    depth: (source.depth + target.depth) / 2,
+    lineWidth: 0.8 + link.weight * 2.4,
+  };
+}
+
+function drawNamespaceBridge(context, bridge, palette) {
+  const { item } = bridge;
+  const selected = state.namespaceGalaxy.selection?.id === item.id
+    && state.namespaceGalaxy.selection?.kind === item.kind;
+  const hovered = state.namespaceGalaxy.hover?.id === item.id
+    && state.namespaceGalaxy.hover?.kind === item.kind;
+  const isSuggestion = item.kind === "suggestion";
+  context.save();
+  context.strokeStyle = isSuggestion
+    ? palette.suggestion
+    : item.enabled
+      ? palette.bridge
+      : palette.bridgeDisabled;
+  context.lineWidth = bridge.lineWidth + (selected || hovered ? 1.8 : 0);
+  context.globalAlpha = selected || hovered
+    ? 0.94
+    : isSuggestion
+      ? 0.42
+      : item.enabled
+        ? 0.28 + item.weight * 0.42
+        : 0.34;
+  const visualDelay = Math.max(0, Number(item.suggestedPhaseDelayTicks || 0));
+  context.setLineDash(
+    isSuggestion
+      ? [2 + Math.min(visualDelay, 4), 7 + Math.min(visualDelay * 1.5, 6)]
+      : item.enabled
+        ? []
+        : [8, 7],
+  );
+  context.beginPath();
+  context.moveTo(bridge.x1, bridge.y1);
+  context.lineTo(bridge.x2, bridge.y2);
+  context.stroke();
+  if (!isSuggestion && item.enabled) {
+    drawNamespaceBridgeDirection(context, bridge);
+    if (item.direction === "bidirectional") {
+      drawNamespaceBridgeDirection(context, bridge, true);
+    }
+  }
+  context.restore();
+}
+
+function drawNamespaceBridgeDirection(context, bridge, reverse = false) {
+  const startX = reverse ? bridge.x2 : bridge.x1;
+  const startY = reverse ? bridge.y2 : bridge.y1;
+  const endX = reverse ? bridge.x1 : bridge.x2;
+  const endY = reverse ? bridge.y1 : bridge.y2;
+  const target = reverse ? bridge.source : bridge.target;
+  const dx = endX - startX;
+  const dy = endY - startY;
+  const length = Math.hypot(dx, dy);
+  if (length < 34) return;
+  const unitX = dx / length;
+  const unitY = dy / length;
+  const targetDistance = Math.max(10, target.radius + 5);
+  const x = endX - unitX * targetDistance;
+  const y = endY - unitY * targetDistance;
+  const size = 4.2;
+  context.setLineDash([]);
+  context.beginPath();
+  context.moveTo(x, y);
+  context.lineTo(x - unitX * size - unitY * size, y - unitY * size + unitX * size);
+  context.moveTo(x, y);
+  context.lineTo(x - unitX * size + unitY * size, y - unitY * size - unitX * size);
+  context.stroke();
+}
+
+function drawNamespaceSphere(context, projected, palette) {
+  const { item, x, y, radius, depth } = projected;
+  const selected = state.namespaceGalaxy.selection?.kind === "node"
+    && state.namespaceGalaxy.selection?.contextId === item.contextId;
+  const hovered = state.namespaceGalaxy.hover?.kind === "node"
+    && state.namespaceGalaxy.hover?.contextId === item.contextId;
+  const keyboardFocused = document.activeElement === elements.namespaceGalaxyCanvas
+    && state.namespaceGalaxy.keyboardContextId === item.contextId;
+  const current = item.contextId === state.context;
+  const baseColor = item.entryCount > 0 ? palette.node : palette.nodeEmpty;
+  const gradient = context.createRadialGradient(
+    x - radius * 0.34,
+    y - radius * 0.38,
+    Math.max(1, radius * 0.08),
+    x,
+    y,
+    radius,
+  );
+  gradient.addColorStop(0, selected || current ? palette.selected : palette.nodeHighlight);
+  gradient.addColorStop(0.36, baseColor);
+  gradient.addColorStop(1, palette.nodeShadow);
+  context.save();
+  context.globalAlpha = clamp(0.55 + (depth + 1) * 0.2, 0.42, 1);
+  context.shadowColor = selected || current ? palette.selected : baseColor;
+  context.shadowBlur = selected || hovered || keyboardFocused ? 18 : 7;
+  context.fillStyle = gradient;
+  context.beginPath();
+  context.arc(x, y, radius, 0, Math.PI * 2);
+  context.fill();
+  context.lineWidth = current ? 2.4 : 1.2;
+  context.strokeStyle = current ? palette.selected : palette.nodeHighlight;
+  context.globalAlpha = current ? 0.9 : 0.48;
+  context.stroke();
+  if (selected || hovered || keyboardFocused) {
+    context.shadowBlur = 0;
+    context.globalAlpha = 0.9;
+    context.lineWidth = keyboardFocused ? 2.4 : 1.5;
+    context.strokeStyle = selected ? palette.selected : palette.text;
+    context.beginPath();
+    context.arc(x, y, radius + 5, 0, Math.PI * 2);
+    context.stroke();
+  }
+  context.restore();
+}
+
+function drawNamespaceLabels(context, projectedNodes, palette, width, height) {
+  const occupied = [];
+  const priorities = [...projectedNodes].sort((left, right) => {
+    const leftPriority = namespaceLabelPriority(left);
+    const rightPriority = namespaceLabelPriority(right);
+    return rightPriority - leftPriority || right.item.entryCount - left.item.entryCount;
+  });
+  context.save();
+  const terminalFont = getComputedStyle(document.documentElement).getPropertyValue("--terminal-font").trim()
+    || "ui-monospace, monospace";
+  context.font = `700 11px ${terminalFont}`;
+  context.textBaseline = "middle";
+  priorities.forEach((node, index) => {
+    const forced = namespaceLabelPriority(node) >= 1000;
+    if (!forced && projectedNodes.length > 34 && index > 27) return;
+    const label = compactTag(node.item.contextId, 27);
+    const textWidth = Math.ceil(context.measureText(label).width);
+    const labelWidth = textWidth + 10;
+    const labelHeight = 18;
+    const candidates = [
+      { x: node.x + node.radius + 5, y: node.y - labelHeight / 2 },
+      { x: node.x - node.radius - labelWidth - 5, y: node.y - labelHeight / 2 },
+      { x: node.x - labelWidth / 2, y: node.y + node.radius + 5 },
+    ];
+    let box = candidates.find((candidate) => (
+      candidate.x >= 4
+      && candidate.y >= 4
+      && candidate.x + labelWidth <= width - 4
+      && candidate.y + labelHeight <= height - 4
+      && !occupied.some((existing) => rectanglesOverlap(
+        { ...candidate, width: labelWidth, height: labelHeight },
+        existing,
+      ))
+    ));
+    if (!box && forced) {
+      box = {
+        x: clamp(candidates[0].x, 4, Math.max(4, width - labelWidth - 4)),
+        y: clamp(candidates[0].y, 4, Math.max(4, height - labelHeight - 4)),
+      };
+    }
+    if (!box) return;
+    const rectangle = { ...box, width: labelWidth, height: labelHeight };
+    occupied.push(rectangle);
+    context.globalAlpha = forced ? 0.98 : 0.82;
+    context.fillStyle = palette.labelBackground;
+    context.fillRect(box.x, box.y, labelWidth, labelHeight);
+    context.fillStyle = node.item.contextId === state.context ? palette.selected : palette.text;
+    context.fillText(label, box.x + 5, box.y + labelHeight / 2 + 0.5);
+  });
+  context.restore();
+}
+
+function namespaceLabelPriority(projected) {
+  if (projected.item.contextId === state.context) return 1400;
+  if (state.namespaceGalaxy.hover?.kind === "node" && state.namespaceGalaxy.hover.contextId === projected.item.contextId) return 1300;
+  if (state.namespaceGalaxy.selection?.kind === "node" && state.namespaceGalaxy.selection.contextId === projected.item.contextId) return 1200;
+  if (state.namespaceGalaxy.keyboardContextId === projected.item.contextId) return 1100;
+  return projected.item.entryCount + projected.depth * 0.1;
+}
+
+function rectanglesOverlap(left, right) {
+  return !(
+    left.x + left.width + 3 < right.x
+    || right.x + right.width + 3 < left.x
+    || left.y + left.height + 2 < right.y
+    || right.y + right.height + 2 < left.y
+  );
+}
+
+function namespaceGalaxyPointerPoint(event) {
+  const rect = elements.namespaceGalaxyCanvas.getBoundingClientRect();
+  return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+}
+
+function hitNamespaceGalaxy(x, y) {
+  const nodes = [...state.namespaceGalaxy.projectedNodes].sort((left, right) => right.depth - left.depth);
+  const node = nodes.find((candidate) => Math.hypot(x - candidate.x, y - candidate.y) <= candidate.radius + 6);
+  if (node) return node;
+  const links = [...state.namespaceGalaxy.projectedLinks].sort((left, right) => right.depth - left.depth);
+  return links.find((candidate) => (
+    distanceToNamespaceSegment(x, y, candidate.x1, candidate.y1, candidate.x2, candidate.y2)
+      <= Math.max(5, candidate.lineWidth + 3)
+  )) || null;
+}
+
+function distanceToNamespaceSegment(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared <= 0.0001) return Math.hypot(px - x1, py - y1);
+  const amount = clamp(((px - x1) * dx + (py - y1) * dy) / lengthSquared, 0, 1);
+  return Math.hypot(px - (x1 + amount * dx), py - (y1 + amount * dy));
+}
+
+function updateNamespaceGalaxyHover(x, y) {
+  const hit = hitNamespaceGalaxy(x, y);
+  const next = hit?.item || null;
+  const previousKey = namespaceGalaxyItemKey(state.namespaceGalaxy.hover);
+  const nextKey = namespaceGalaxyItemKey(next);
+  if (previousKey !== nextKey) {
+    state.namespaceGalaxy.hover = next;
+    requestNamespaceGalaxyDraw();
+  }
+  if (next) {
+    showNamespaceGalaxyTooltip(next, x, y);
+  } else {
+    hideNamespaceGalaxyTooltip();
+  }
+}
+
+function namespaceGalaxyItemKey(item) {
+  return item ? `${item.kind}:${item.id}` : "";
+}
+
+function showNamespaceGalaxyTooltip(item, x, y) {
+  const tooltip = elements.namespaceGalaxyTooltip;
+  if (item.kind === "node") {
+    tooltip.innerHTML = `<strong>${escapeHtml(item.contextId)}</strong><span>${escapeHtml(formatNumber(item.entryCount))} memories</span>`;
+  } else {
+    const status = item.kind === "suggestion" ? "suggested" : item.enabled ? "approved" : "disabled";
+    tooltip.innerHTML = `<strong>${escapeHtml(item.sourceContextId)} → ${escapeHtml(item.targetContextId)}</strong><span>${escapeHtml(item.relationType)} · ${escapeHtml(formatNumber(item.weight, 2))} · ${escapeHtml(status)}</span>`;
+  }
+  const stage = elements.namespaceGalaxyCanvas.parentElement;
+  const maxX = Math.max(8, stage.clientWidth - 230);
+  const maxY = Math.max(8, stage.clientHeight - 68);
+  tooltip.style.left = `${clamp(x + 14, 8, maxX)}px`;
+  tooltip.style.top = `${clamp(y + 14, 8, maxY)}px`;
+  tooltip.hidden = false;
+}
+
+function hideNamespaceGalaxyTooltip() {
+  elements.namespaceGalaxyTooltip.hidden = true;
+}
+
+function selectNamespaceGalaxyItem(item, { focusCanvas = false } = {}) {
+  if (!item) return;
+  state.namespaceGalaxy.selection = item;
+  if (item.kind === "node") state.namespaceGalaxy.keyboardContextId = item.contextId;
+  renderNamespaceGalaxyInspector(item);
+  requestNamespaceGalaxyDraw();
+  if (focusCanvas) elements.namespaceGalaxyCanvas.focus();
+}
+
+function findNamespaceGalaxyItem(kind, id) {
+  if (!kind || !id) return null;
+  if (kind === "node") return state.namespaceGalaxy.data.nodes.find((item) => item.id === id) || null;
+  if (kind === "suggestion") return state.namespaceGalaxy.data.suggestions.find((item) => item.id === id) || null;
+  return state.namespaceGalaxy.data.links.find((item) => item.id === id) || null;
+}
+
+function renderNamespaceGalaxyInspector(item) {
+  const title = elements.namespaceGalaxyInspectorTitle;
+  const body = elements.namespaceGalaxyInspectorBody;
+  const facts = elements.namespaceGalaxyInspectorFacts;
+  const actions = elements.namespaceGalaxyInspectorActions;
+  if (!item) {
+    title.textContent = "No namespace selected";
+    body.textContent = "The namespace map is empty. Capture memory in a context to begin.";
+    facts.replaceChildren();
+    actions.replaceChildren();
+    elements.namespaceGalaxySuggestionList.replaceChildren();
+    return;
+  }
+
+  if (item.kind === "node") {
+    const approvedLinks = state.namespaceGalaxy.data.links.filter((link) => (
+      link.sourceContextId === item.contextId || link.targetContextId === item.contextId
+    ));
+    const activeLinks = approvedLinks.filter((link) => (
+      link.enabled
+      && link.approved
+      && namespaceLinkIsRecallableFrom(link, item.contextId)
+    ));
+    title.textContent = item.contextId;
+    body.textContent = item.contextId === state.context
+      ? "This is the active sidebar namespace. Local recall stays here, with only explicitly global memory inherited."
+      : "Load this namespace to make it the active context without removing the current approved bridges.";
+    renderNamespaceGalaxyFacts([
+      ["Memories", formatNumber(item.entryCount)],
+      ["Active bridges", formatNumber(activeLinks.length)],
+      ["Relationships", item.relationshipCount === null ? "Not reported" : formatNumber(item.relationshipCount)],
+      ["Events", item.eventCount === null ? "Not reported" : formatNumber(item.eventCount)],
+      ["Last update", formatNamespaceUpdatedAt(item.updatedAt)],
+    ]);
+    actions.innerHTML = [
+      `<button type="button" class="primary-button" data-galaxy-action="enter" data-galaxy-context="${escapeHtml(item.contextId)}">Enter namespace</button>`,
+      item.contextId === state.context
+        ? '<span class="namespace-galaxy-current">Current sidebar context</span>'
+        : `<button type="button" class="secondary-button" data-galaxy-action="load" data-galaxy-context="${escapeHtml(item.contextId)}">Load sidebar context</button>`,
+    ].join("");
+    renderNamespaceSuggestionList(item.contextId);
+    return;
+  }
+
+  const isSuggestion = item.kind === "suggestion";
+  title.textContent = isSuggestion ? "Suggested bridge" : "Approved bridge";
+  body.textContent = isSuggestion
+    ? (item.evidence || "Evidence-only density-normalized similarity candidate. It is not active until an operator connects it.")
+    : (item.evidence || "This operator-approved bridge can participate in one-hop connected recall when enabled.");
+  renderNamespaceGalaxyFacts([
+    ["Source", item.sourceContextId],
+    ["Target", item.targetContextId],
+    ["Relationship", item.relationType],
+    [isSuggestion ? "Similarity" : "Weight", formatNumber(item.weight, 2)],
+    ["Direction", isSuggestion ? "Suggested only" : item.direction === "directed" ? "Source to target" : "Bidirectional"],
+    [
+      "Visual delay",
+      item.suggestedPhaseDelayTicks > 0
+        ? `${formatNumber(item.suggestedPhaseDelayTicks)} ticks (display only)`
+        : "None",
+    ],
+    ["Status", isSuggestion ? "Suggested only" : item.enabled ? "Approved and enabled" : "Approved but disabled"],
+    ["Verified", formatNamespaceUpdatedAt(item.verifiedAt)],
+  ]);
+  actions.innerHTML = [
+    isSuggestion
+      ? '<button type="button" class="primary-button" data-galaxy-action="connect">Connect</button>'
+      : "",
+    `<button type="button" class="secondary-button" data-galaxy-action="load" data-galaxy-context="${escapeHtml(item.sourceContextId)}">Load source</button>`,
+    `<button type="button" class="secondary-button" data-galaxy-action="load" data-galaxy-context="${escapeHtml(item.targetContextId)}">Load target</button>`,
+  ].join("");
+  renderNamespaceSuggestionList(state.context);
+}
+
+function namespaceLinkIsRecallableFrom(link, contextId) {
+  return link.sourceContextId === contextId
+    || (link.direction === "bidirectional" && link.targetContextId === contextId);
+}
+
+function renderNamespaceGalaxyFacts(rows) {
+  elements.namespaceGalaxyInspectorFacts.innerHTML = rows
+    .filter(([, value]) => value !== null && value !== undefined && value !== "")
+    .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`)
+    .join("");
+}
+
+function renderNamespaceSuggestionList(contextId) {
+  const suggestions = state.namespaceGalaxy.data.suggestions
+    .filter((suggestion) => (
+      suggestion.sourceContextId === contextId || suggestion.targetContextId === contextId
+    ))
+    .slice(0, 4);
+  if (!suggestions.length) {
+    elements.namespaceGalaxySuggestionList.innerHTML = '<p>No evidence-only bridge suggestions for this namespace.</p>';
+    return;
+  }
+  elements.namespaceGalaxySuggestionList.innerHTML = [
+    "<strong>Evidence-only suggestions</strong>",
+    "<p>Review first; suggestions never expand recall automatically.</p>",
+    ...suggestions.map((suggestion) => {
+      const peer = suggestion.sourceContextId === contextId
+        ? suggestion.targetContextId
+        : suggestion.sourceContextId;
+      return `<button type="button" data-galaxy-suggestion-id="${escapeHtml(suggestion.id)}"><span>${escapeHtml(peer)}</span><small>${escapeHtml(suggestion.relationType)} · ${escapeHtml(formatNumber(suggestion.weight, 2))}</small></button>`;
+    }),
+  ].join("");
+}
+
+function renderNamespaceGalaxyList(nodes) {
+  if (!nodes.length) {
+    elements.namespaceGalaxyList.innerHTML = '<div class="namespace-galaxy-list-empty">No saved namespaces returned.</div>';
+    return;
+  }
+  elements.namespaceGalaxyList.innerHTML = nodes
+    .map((node) => {
+      const current = node.contextId === state.context ? "true" : "false";
+      return `<div role="listitem"><button type="button" data-galaxy-context="${escapeHtml(node.contextId)}" aria-current="${current}"><span>${escapeHtml(node.contextId)}</span><small>${escapeHtml(formatNumber(node.entryCount))} memories</small></button></div>`;
+    })
+    .join("");
+}
+
+function handleNamespaceGalaxyInspectorClick(event) {
+  const suggestionButton = event.target.closest?.("[data-galaxy-suggestion-id]");
+  if (suggestionButton) {
+    event.preventDefault();
+    const suggestion = state.namespaceGalaxy.data.suggestions.find((item) => item.id === suggestionButton.dataset.galaxySuggestionId);
+    if (suggestion) selectNamespaceGalaxyItem(suggestion, { focusCanvas: false });
+    return;
+  }
+  const button = event.target.closest?.("[data-galaxy-action]");
+  if (!button) return;
+  event.preventDefault();
+  if (button.dataset.galaxyAction === "load") {
+    void applySelectedContext(button.dataset.galaxyContext, button);
+    return;
+  }
+  if (button.dataset.galaxyAction === "enter") {
+    void enterNamespaceGalaxy(button.dataset.galaxyContext, { pushHistory: true });
+    return;
+  }
+  if (button.dataset.galaxyAction === "focus-ganglion") {
+    const clusterId = button.dataset.galaxyCluster;
+    const cluster = combinedNamespaceDetail()?.clusters.find((item) => item.clusterId === clusterId);
+    if (cluster) {
+      selectNamespaceDetailItem(cluster, { focusCanvas: false });
+      void focusNamespaceGanglion(clusterId, { pushHistory: true });
+    }
+    return;
+  }
+  if (button.dataset.galaxyAction === "connect") {
+    void connectSelectedNamespaceSuggestion(button);
+  }
+}
+
+async function connectSelectedNamespaceSuggestion(button) {
+  const suggestion = state.namespaceGalaxy.selection;
+  if (!suggestion || suggestion.kind !== "suggestion") return null;
+  try {
+    return await withBusy(button, "Connect namespace bridge", async () => {
+      const payload = await requestJson("/api/namespace-links", {
+        method: "POST",
+        body: {
+          source_context_id: suggestion.sourceContextId,
+          target_context_id: suggestion.targetContextId,
+          relation_type: suggestion.relationType,
+          weight: suggestion.weight,
+          confirm: true,
+        },
+      });
+      state.namespaceGalaxy.selection = null;
+      await refreshNamespaceGalaxy();
+      return payload;
+    }, { refresh: false });
+  } catch {
+    return null;
+  }
+}
+
+function formatNamespaceUpdatedAt(value) {
+  if (value === null || value === undefined || value === "") return "Not reported";
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 10_000_000_000 ? numeric : numeric * 1000)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function setNamespaceGalaxyState(mode, headline, detail) {
+  state.namespaceGalaxy.status = mode;
+  const element = elements.namespaceGalaxyState;
+  element.className = `namespace-galaxy-state ${mode}`;
+  element.innerHTML = `<strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}`;
+  element.hidden = mode === "ready";
+}
+
+function updateNamespaceGalaxyChrome() {
+  const galaxy = state.namespaceGalaxy;
+  const inNamespace = galaxy.view === "namespace";
+  const detail = combinedNamespaceDetail();
+  elements.namespaceGalaxyBreadcrumbNamespaceWrap.hidden = !inNamespace;
+  elements.namespaceGalaxyBreadcrumbGanglionWrap.hidden = !inNamespace || !galaxy.focusedClusterId;
+  elements.namespaceGalaxyBack.hidden = !inNamespace;
+  elements.namespaceGalaxyBreadcrumbNamespace.textContent = detail?.namespace?.label || galaxy.detailContextId || "Namespace";
+  const focused = detail?.clusters?.find((cluster) => cluster.clusterId === galaxy.focusedClusterId);
+  elements.namespaceGalaxyBreadcrumbGanglion.textContent = focused?.label || galaxy.focusedClusterId;
+  elements.namespaceGalaxyBack.textContent = galaxy.focusedClusterId ? "Back to namespace" : "Back to galaxy";
+  elements.namespaceGalaxyFit.setAttribute("aria-label", inNamespace ? "Fit namespace view" : "Fit all namespaces");
+  elements.namespaceGalaxyReset.setAttribute("aria-label", inNamespace ? "Reset namespace view" : "Reset galaxy view");
+  elements.namespaceGalaxyAccessibleSummary.textContent = inNamespace
+    ? `Browse ${detail?.namespace?.label || galaxy.detailContextId || "namespace"} as a list`
+    : "Browse all namespaces as a list";
+  elements.namespaceGalaxyAccessibleHelp.textContent = inNamespace
+    ? "This list follows the current semantic zoom: cortex summary, ganglia, or exact returned neurons."
+    : "Each saved namespace is listed from the backend map. Activate one to enter its read-only internal map.";
+  elements.namespaceGalaxyHelp.textContent = inNamespace
+    ? "Click a ganglion to focus it. Click a neuron to inspect it. Drag to orbit; Shift-drag to pan; scroll to change semantic zoom."
+    : "Click a namespace sphere to enter it. Drag to orbit; Shift-drag to pan; scroll to zoom.";
+  updateNamespaceDetailDepthChrome();
+}
+
+function updateNamespaceDetailDepthChrome() {
+  const inNamespace = state.namespaceGalaxy.view === "namespace";
+  const lod = inNamespace ? currentNamespaceDetailLod() : "cortex";
+  const depth = lod === "neurons" ? 3 : lod === "ganglia" ? 2 : 1;
+  const labels = [
+    [elements.namespaceGalaxyDepthCortex, "cortex", 1],
+    [elements.namespaceGalaxyDepthGanglia, "ganglia", 2],
+    [elements.namespaceGalaxyDepthNeurons, "neurons", 3],
+  ];
+  labels.forEach(([element, name, value]) => {
+    const active = name === lod;
+    element.toggleAttribute("aria-current", active);
+    element.classList.toggle("is-active", active);
+    element.classList.toggle("is-reached", inNamespace && value <= depth);
+  });
+  elements.namespaceGalaxyDepthValue.textContent = inNamespace
+    ? `Depth ${depth} / 3 · ${lod}`
+    : "Galaxy overview";
+}
+
+function findNamespaceDetailItem(kind, id) {
+  const detail = combinedNamespaceDetail();
+  if (!detail || !kind || !id) return null;
+  if (kind === "namespace-detail") return detail.namespace?.id === id ? detail.namespace : null;
+  if (kind === "ganglion") return detail.clusters.find((item) => item.id === id) || null;
+  if (kind === "memory") return detail.nodes.find((item) => item.id === id) || null;
+  return null;
+}
+
+function selectNamespaceDetailItem(item, { focusCanvas = false } = {}) {
+  if (!item) return;
+  const galaxy = state.namespaceGalaxy;
+  galaxy.detailSelection = item;
+  galaxy.keyboardDetailId = item.kind === "namespace-detail"
+    ? (combinedNamespaceDetail()?.clusters[0]?.id || "")
+    : item.id;
+  renderNamespaceDetailInspector(item);
+  renderNamespaceDetailList();
+  requestNamespaceGalaxyDraw();
+  if (focusCanvas) elements.namespaceGalaxyCanvas.focus({ preventScroll: true });
+}
+
+function detailFactsFor(item) {
+  if (!item) return [];
+  if (item.kind === "namespace-detail") {
+    return [
+      ["Stored memories", formatNumber(item.entryTotal)],
+      ["Relationships", formatNumber(item.relationshipTotal)],
+      ["Stored", item.stored ? "Yes" : "No"],
+      ["Last updated", formatNamespaceUpdatedAt(item.lastUpdatedAt)],
+    ];
+  }
+  if (item.kind === "ganglion") {
+    const types = Object.entries(item.nodeTypeCounts || {}).map(([type, count]) => `${type}: ${count}`).join(", ");
+    return [
+      ["Neurons (memories)", formatNumber(item.memoryTotal)],
+      ["Cluster basis", item.basis],
+      ["Stored types", types || "Not reported"],
+      ["Last updated", formatNamespaceUpdatedAt(item.lastUpdatedAt)],
+    ];
+  }
+  return [
+    ["Type", item.nodeType],
+    ["Tag", item.tag || "Not reported"],
+    ["Source", typeof item.source === "string" ? item.source : namespaceEvidenceText(item.provenance) || "Not reported"],
+    ["Created", formatNamespaceUpdatedAt(item.createdAt)],
+  ];
+}
+
+function renderNamespaceDetailInspector(item) {
+  const title = elements.namespaceGalaxyInspectorTitle;
+  const body = elements.namespaceGalaxyInspectorBody;
+  const actions = elements.namespaceGalaxyInspectorActions;
+  elements.namespaceGalaxySuggestionList.replaceChildren();
+  if (!item) {
+    title.textContent = "No stored detail selected";
+    body.textContent = "Open a saved namespace to inspect its stored ganglia and neurons.";
+    elements.namespaceGalaxyInspectorFacts.replaceChildren();
+    actions.replaceChildren();
+    return;
+  }
+  title.textContent = item.label || item.contextId || "Stored detail";
+  if (item.kind === "namespace-detail") {
+    body.textContent = "Cortex overview. Zoom in to reveal backend-returned ganglia, then exact returned neurons.";
+  } else if (item.kind === "ganglion") {
+    body.textContent = "Stored semantic cluster. Focusing loads the bounded exact neuron and relationship projection for this ganglion.";
+  } else {
+    body.textContent = item.excerpt || "Stored memory node. This inspector reports only metadata returned by the namespace detail endpoint.";
+  }
+  renderNamespaceGalaxyFacts(detailFactsFor(item));
+  actions.innerHTML = item.kind === "ganglion"
+    ? `<button type="button" class="primary-button" data-galaxy-action="focus-ganglion" data-galaxy-cluster="${escapeHtml(item.clusterId)}">Focus this ganglion</button>`
+    : item.kind === "memory"
+      ? `<span class="namespace-galaxy-current">Read-only neuron inspection</span>`
+      : "";
+}
+
+function renderNamespaceDetailList() {
+  const detail = combinedNamespaceDetail();
+  if (!detail) {
+    elements.namespaceGalaxyList.innerHTML = '<div class="namespace-galaxy-list-empty">No stored namespace detail returned.</div>';
+    return;
+  }
+  const lod = currentNamespaceDetailLod();
+  if (lod === "cortex") {
+    elements.namespaceGalaxyList.innerHTML = `<div role="listitem"><button type="button" data-galaxy-action="inspect-cortex" aria-current="${state.namespaceGalaxy.detailSelection?.kind === "namespace-detail"}"><span>${escapeHtml(detail.namespace.label)}</span><small>${escapeHtml(formatNumber(detail.namespace.entryTotal))} stored memories</small></button></div>`;
+    return;
+  }
+  const clusters = [...detail.clusters].sort((left, right) => right.memoryTotal - left.memoryTotal || left.label.localeCompare(right.label));
+  const rows = clusters.map((cluster) => {
+    const current = state.namespaceGalaxy.detailSelection?.id === cluster.id ? "true" : "false";
+    return `<div role="listitem"><button type="button" data-galaxy-action="focus-ganglion" data-galaxy-cluster="${escapeHtml(cluster.clusterId)}" aria-current="${current}"><span>${escapeHtml(cluster.label)}</span><small>${escapeHtml(formatNumber(cluster.memoryTotal))} neurons</small></button></div>`;
+  });
+  if (lod === "neurons") {
+    const visible = visibleNamespaceDetailNodes(detail, lod);
+    rows.push(...visible.map((node) => {
+      const current = state.namespaceGalaxy.detailSelection?.id === node.id ? "true" : "false";
+      return `<div role="listitem"><button type="button" data-galaxy-action="inspect-neuron" data-galaxy-neuron="${escapeHtml(node.id)}" aria-current="${current}"><span>${escapeHtml(node.label)}</span><small>${escapeHtml(node.nodeType)}</small></button></div>`;
+    }));
+  }
+  elements.namespaceGalaxyList.innerHTML = rows.length
+    ? rows.join("")
+    : '<div class="namespace-galaxy-list-empty">No stored ganglia or neurons were returned.</div>';
+}
+
+function handleNamespaceGalaxyListAction(button) {
+  const action = button.dataset.galaxyAction;
+  if (!action && button.dataset.galaxyContext) {
+    void enterNamespaceGalaxy(button.dataset.galaxyContext, { pushHistory: true });
+    return;
+  }
+  if (action === "focus-ganglion") {
+    const clusterId = button.dataset.galaxyCluster;
+    const cluster = combinedNamespaceDetail()?.clusters.find((item) => item.clusterId === clusterId);
+    if (cluster) {
+      selectNamespaceDetailItem(cluster, { focusCanvas: false });
+      void focusNamespaceGanglion(clusterId, { pushHistory: true });
+    }
+    return;
+  }
+  if (action === "inspect-neuron") {
+    const node = combinedNamespaceDetail()?.nodes.find((item) => item.id === button.dataset.galaxyNeuron);
+    if (node) selectNamespaceDetailItem(node, { focusCanvas: false });
+    return;
+  }
+  if (action === "inspect-cortex") {
+    const namespace = combinedNamespaceDetail()?.namespace;
+    if (namespace) selectNamespaceDetailItem(namespace, { focusCanvas: false });
+  }
+}
+
+function hitNamespaceDetail(x, y) {
+  const candidates = [
+    ...state.namespaceGalaxy.projectedMemories,
+    ...state.namespaceGalaxy.projectedGanglia,
+  ].sort((left, right) => right.depth - left.depth || right.radius - left.radius);
+  return candidates.find((candidate) => Math.hypot(x - candidate.x, y - candidate.y) <= candidate.radius + 6) || null;
+}
+
+function updateNamespaceDetailHover(x, y) {
+  const hit = hitNamespaceDetail(x, y);
+  const next = hit?.item || null;
+  if (namespaceGalaxyItemKey(next) !== namespaceGalaxyItemKey(state.namespaceGalaxy.detailHover)) {
+    state.namespaceGalaxy.detailHover = next;
+    requestNamespaceGalaxyDraw();
+  }
+  if (next) showNamespaceDetailTooltip(next, x, y);
+  else hideNamespaceGalaxyTooltip();
+}
+
+function showNamespaceDetailTooltip(item, x, y) {
+  const tooltip = elements.namespaceGalaxyTooltip;
+  const subline = item.kind === "ganglion"
+    ? `${formatNumber(item.memoryTotal)} stored neurons`
+    : item.nodeType || "stored neuron";
+  tooltip.innerHTML = `<strong>${escapeHtml(item.label)}</strong><span>${escapeHtml(subline)}</span>`;
+  const stage = elements.namespaceGalaxyCanvas.parentElement;
+  tooltip.style.left = `${clamp(x + 14, 8, Math.max(8, stage.clientWidth - 230))}px`;
+  tooltip.style.top = `${clamp(y + 14, 8, Math.max(8, stage.clientHeight - 68))}px`;
+  tooltip.hidden = false;
+}
+
+function ensureNamespaceDetailKeyboardSelection() {
+  const detail = combinedNamespaceDetail();
+  if (!detail) return;
+  const selectable = namespaceDetailKeyboardItems(detail);
+  if (!selectable.length) return;
+  if (!selectable.some((item) => item.id === state.namespaceGalaxy.keyboardDetailId)) {
+    state.namespaceGalaxy.keyboardDetailId = selectable[0].id;
+  }
+}
+
+function namespaceDetailKeyboardItems(detail) {
+  const lod = currentNamespaceDetailLod();
+  if (lod === "cortex") return [detail.namespace];
+  const clusters = [...detail.clusters];
+  return lod === "neurons" ? [...clusters, ...visibleNamespaceDetailNodes(detail, lod)] : clusters;
+}
+
+function handleNamespaceGalaxyKeydown(event) {
+  if (state.namespaceGalaxy.view === "namespace") {
+    handleNamespaceDetailKeydown(event);
+    return;
+  }
+  const nodes = [...state.namespaceGalaxy.data.nodes].sort((left, right) => (
+    left.contextId.localeCompare(right.contextId, undefined, { sensitivity: "base" })
+  ));
+  if (!nodes.length) return;
+  const currentIndex = Math.max(0, nodes.findIndex((node) => node.contextId === state.namespaceGalaxy.keyboardContextId));
+  let nextIndex = currentIndex;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (currentIndex + 1) % nodes.length;
+  if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (currentIndex - 1 + nodes.length) % nodes.length;
+  if (event.key === "Home") nextIndex = 0;
+  if (event.key === "End") nextIndex = nodes.length - 1;
+  if (nextIndex !== currentIndex || ["Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    const node = nodes[nextIndex];
+    state.namespaceGalaxy.keyboardContextId = node.contextId;
+    selectNamespaceGalaxyItem(node, { focusCanvas: false });
+    return;
+  }
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    const node = nodes[currentIndex];
+    void enterNamespaceGalaxy(node.contextId, { pushHistory: true });
+    return;
+  }
+  if (event.key === "+" || event.key === "=") {
+    event.preventDefault();
+    setNamespaceGalaxyZoom(state.namespaceGalaxy.zoom * 1.14);
+  } else if (event.key === "-" || event.key === "_") {
+    event.preventDefault();
+    setNamespaceGalaxyZoom(state.namespaceGalaxy.zoom / 1.14);
+  } else if (event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    fitNamespaceGalaxy();
+  } else if (event.key.toLowerCase() === "r") {
+    event.preventDefault();
+    resetNamespaceGalaxyView();
+  }
+}
+
+function handleNamespaceDetailKeydown(event) {
+  const galaxy = state.namespaceGalaxy;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (galaxy.focusedClusterId) clearNamespaceGanglionFocus({ useHistory: true });
+    else exitNamespaceGalaxy({ useHistory: true });
+    return;
+  }
+  const detail = combinedNamespaceDetail();
+  if (!detail) return;
+  const items = namespaceDetailKeyboardItems(detail);
+  if (!items.length) return;
+  const currentIndex = Math.max(0, items.findIndex((item) => item.id === galaxy.keyboardDetailId));
+  let nextIndex = currentIndex;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (currentIndex + 1) % items.length;
+  if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (currentIndex - 1 + items.length) % items.length;
+  if (event.key === "Home") nextIndex = 0;
+  if (event.key === "End") nextIndex = items.length - 1;
+  if (nextIndex !== currentIndex || event.key === "Home" || event.key === "End") {
+    event.preventDefault();
+    selectNamespaceDetailItem(items[nextIndex], { focusCanvas: false });
+    return;
+  }
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    const item = items[currentIndex];
+    selectNamespaceDetailItem(item, { focusCanvas: false });
+    if (item.kind === "ganglion") void focusNamespaceGanglion(item.clusterId, { pushHistory: true });
+    return;
+  }
+  if (event.key === "+" || event.key === "=") {
+    event.preventDefault();
+    setNamespaceGalaxyZoom(galaxy.zoom * 1.14);
+  } else if (event.key === "-" || event.key === "_") {
+    event.preventDefault();
+    setNamespaceGalaxyZoom(galaxy.zoom / 1.14);
+  } else if (event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    fitNamespaceGalaxy();
+  } else if (event.key.toLowerCase() === "r") {
+    event.preventDefault();
+    resetNamespaceGalaxyView();
+  }
+}
+
+function orbitNamespaceGalaxy(delta) {
+  state.namespaceGalaxy.rotation.y += delta;
+  requestNamespaceGalaxyDraw();
+}
+
+function setNamespaceGalaxyZoom(value) {
+  state.namespaceGalaxy.zoom = clamp(value, NAMESPACE_GALAXY_MIN_ZOOM, NAMESPACE_GALAXY_MAX_ZOOM);
+  if (state.namespaceGalaxy.view === "namespace") {
+    updateNamespaceGalaxyChrome();
+    renderNamespaceDetailList();
+  }
+  requestNamespaceGalaxyDraw();
+}
+
+function fitNamespaceGalaxy() {
+  state.namespaceGalaxy.pan = { x: 0, y: 0 };
+  setNamespaceGalaxyZoom(state.namespaceGalaxy.view === "namespace"
+    ? 1
+    : state.namespaceGalaxy.data.nodes.length > 60 ? 0.72 : 0.9);
+}
+
+function resetNamespaceGalaxyView() {
+  state.namespaceGalaxy.rotation = { ...NAMESPACE_GALAXY_DEFAULT_ROTATION };
+  state.namespaceGalaxy.pan = { x: 0, y: 0 };
+  setNamespaceGalaxyZoom(1);
+}
+
+function currentRecallScope() {
+  const selected = document.querySelector('input[name="recallScope"]:checked');
+  return ["local", "connected", "all"].includes(selected?.value) ? selected.value : "local";
+}
+
+function updateRecallScopeHelp() {
+  const messages = {
+    local: "Local searches the active namespace plus explicitly global memory. This is the safe default.",
+    connected: "Connected adds approved, enabled one-hop bridges to Local. Suggestions remain excluded.",
+    all: "All searches every saved namespace plus global memory. Use it deliberately when project boundaries are not useful.",
+  };
+  elements.recallScopeHelp.textContent = messages[currentRecallScope()];
 }
 
 function renderContextBus(status, deployment = null) {
@@ -2637,9 +4955,12 @@ function renderQueryResult(payload) {
     : parseResultString(payload.result);
   const limit = Math.max(1, Math.trunc(Number(elements.recallLimit.value || 8)));
   const visible = items.slice(0, limit);
+  const recallScope = ["local", "connected", "all"].includes(payload.recall_scope)
+    ? payload.recall_scope
+    : currentRecallScope();
 
   elements.resultCount.textContent = `(${formatNumber(items.length)})`;
-  elements.latencyLabel.textContent = `Latency: ${formatNumber(payload.latency_ms, 1)} ms`;
+  elements.latencyLabel.textContent = `Latency: ${formatNumber(payload.latency_ms, 1)} ms · ${recallScope} scope`;
   elements.queryResults.innerHTML = visible.length
     ? visible.map((item) => resultCard(item)).join("")
     : '<div class="empty-result">No high-salience results returned.</div>';
@@ -2659,9 +4980,21 @@ function resultCard(item) {
   const title = item.label || item.tag || item.raw || "--";
   const identity = item.tag && item.tag !== title ? `${item.tag}${facets}` : facets.replace(/^ \/ /, "");
   const memoryId = String(item.memory_id || "");
+  const memoryContext = String(item.context_id || state.context || DEFAULT_CONTEXT);
+  const recallScope = String(item.recall_scope || "local");
+  const recallProvenance = String(item.recall_provenance || "local");
+  const viaRelation = String(item.via_relation_type || "");
+  const viaContextLinkId = String(item.via_context_link_id || "");
+  const pinActionLabel = memoryContext === state.context
+    ? "Use this memory now"
+    : `Pin in ${memoryContext}`;
   const provenance = [
     item.tag ? `source ${item.tag}` : "",
-    item.context_id ? `context ${item.context_id}` : "",
+    `context ${memoryContext}`,
+    `scope ${recallScope}`,
+    `provenance ${recallProvenance}`,
+    viaRelation ? `via ${viaRelation}` : "",
+    viaContextLinkId ? `link ${compactMemoryId(viaContextLinkId)}` : "",
     memoryId ? `id ${compactMemoryId(memoryId)}` : "",
   ].filter(Boolean).join(" / ");
   const whyMatched = [
@@ -2669,7 +5002,8 @@ function resultCard(item) {
     Number.isFinite(Number(item.weight)) ? "graph relationship weight" : "",
     item.relation_type ? `related by ${item.relation_type}` : "",
     Array.isArray(item.facets) && item.facets.length ? "facet overlap" : "",
-    item.context_id ? "same context namespace" : "",
+    item.context_id ? "namespace provenance" : "",
+    recallProvenance === "connected" ? "approved one-hop bridge" : "",
   ].filter(Boolean).join(" / ") || "status result";
   const recallAction = memoryId
     ? `<div class="result-actions">
@@ -2677,13 +5011,15 @@ function resultCard(item) {
           class="secondary-button recall-pin-button"
           data-recall-action="pin"
           data-memory-id="${escapeHtml(memoryId)}"
+          data-memory-context="${escapeHtml(memoryContext)}"
           data-recall-label="${escapeHtml(title)}">
-          Use this memory now
+          ${escapeHtml(pinActionLabel)}
         </button>
         <button type="button"
           class="recall-moderate-button"
           data-recall-action="promote"
           data-memory-id="${escapeHtml(memoryId)}"
+          data-memory-context="${escapeHtml(memoryContext)}"
           data-recall-label="${escapeHtml(title)}">
           Promote
         </button>
@@ -2691,6 +5027,7 @@ function resultCard(item) {
           class="recall-moderate-button"
           data-recall-action="demote"
           data-memory-id="${escapeHtml(memoryId)}"
+          data-memory-context="${escapeHtml(memoryContext)}"
           data-recall-label="${escapeHtml(title)}">
           Demote
         </button>
@@ -2698,6 +5035,7 @@ function resultCard(item) {
           class="recall-moderate-button danger-button"
           data-recall-action="prune"
           data-memory-id="${escapeHtml(memoryId)}"
+          data-memory-context="${escapeHtml(memoryContext)}"
           data-recall-label="${escapeHtml(title)}">
           Prune
         </button>
@@ -2720,6 +5058,7 @@ function resultCard(item) {
 
 async function pinRecallMemory(button) {
   const memoryId = button.dataset.memoryId || "";
+  const memoryContext = button.dataset.memoryContext || state.context;
   const label = button.dataset.recallLabel || compactMemoryId(memoryId);
   if (!memoryId) {
     logOperation("Pin recall rejected", "recall result is missing a memory id");
@@ -2730,7 +5069,7 @@ async function pinRecallMemory(button) {
     const payload = await requestJson("/api/pin-memory", {
       method: "POST",
       body: {
-        context_id: state.context,
+        context_id: memoryContext,
         memory_id: memoryId,
         agent_id: "dashboard-ui",
         note: prompt
@@ -2748,6 +5087,7 @@ async function pinRecallMemory(button) {
 
 async function moderateRecallMemory(button) {
   const memoryId = button.dataset.memoryId || "";
+  const memoryContext = button.dataset.memoryContext || state.context;
   const action = button.dataset.recallAction || "";
   const label = button.dataset.recallLabel || compactMemoryId(memoryId);
   if (!memoryId || !["promote", "demote", "prune"].includes(action)) return null;
@@ -2759,7 +5099,7 @@ async function moderateRecallMemory(button) {
     const payload = await requestJson("/api/cortex/moderate", {
       method: "POST",
       body: {
-        context_id: state.context,
+        context_id: memoryContext,
         memory_id: memoryId,
         action,
         reason: `dashboard ${action} from Recall Console`,
@@ -3886,7 +6226,11 @@ elements.queryForm.addEventListener("submit", async (event) => {
   await withBusy(elements.queryForm.querySelector("button"), "Recall", async () => {
     const payload = await requestJson("/api/query", {
       method: "POST",
-      body: { context_id: state.context, prompt },
+      body: {
+        context_id: state.context,
+        prompt,
+        recall_scope: currentRecallScope(),
+      },
     });
     state.lastQueryPayload = payload;
     renderQueryResult(payload);
@@ -3909,6 +6253,10 @@ elements.recallLimit.addEventListener("change", () => {
   if (state.lastQueryPayload) {
     renderQueryResult(state.lastQueryPayload);
   }
+});
+
+[elements.recallScopeLocal, elements.recallScopeConnected, elements.recallScopeAll].forEach((control) => {
+  control.addEventListener("change", updateRecallScopeHelp);
 });
 
 elements.clearRecallButton.addEventListener("click", () => {

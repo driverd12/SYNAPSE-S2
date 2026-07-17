@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -150,6 +151,38 @@ ON memory_relationships(context_id, source_memory_id, weight DESC, updated_at DE
 CREATE INDEX IF NOT EXISTS ix_memory_relationships_context_target_weight
 ON memory_relationships(context_id, target_memory_id, weight DESC, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS context_relationships (
+    context_link_id TEXT PRIMARY KEY,
+    source_context_id TEXT NOT NULL,
+    target_context_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'bidirectional',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    approved_by TEXT NOT NULL,
+    approved_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    CHECK(source_context_id <> target_context_id),
+    CHECK(direction IN ('directed', 'bidirectional')),
+    CHECK(enabled IN (0, 1))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_context_relationships_edge
+ON context_relationships(
+    source_context_id,
+    target_context_id,
+    relation_type,
+    direction
+);
+
+CREATE INDEX IF NOT EXISTS ix_context_relationships_source_enabled
+ON context_relationships(source_context_id, enabled, confidence DESC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_context_relationships_target_enabled
+ON context_relationships(target_context_id, enabled, confidence DESC, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS store_migrations (
     key TEXT PRIMARY KEY,
     applied_at REAL NOT NULL
@@ -158,6 +191,22 @@ CREATE TABLE IF NOT EXISTS store_migrations (
 
 SURFACE_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]{1,63}")
 MAX_SURFACE_INDEX_SOURCE_CHARS = 4096
+CONTEXT_SUGGESTION_STOP_TERMS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "has",
+    "have",
+    "into",
+    "not",
+    "that",
+    "the",
+    "this",
+    "was",
+    "were",
+    "with",
+}
 
 
 def _json_safe(value: Any, fallback: Any) -> Any:
@@ -335,6 +384,45 @@ class DurableMemoryStore:
             f"{target_memory_id}\x1f{relation_type}"
         ).encode("utf-8")
         return "s2r_" + hashlib.sha256(key).hexdigest()[:32]
+
+    def stable_context_link_id(
+        self,
+        *,
+        source_context_id: str,
+        target_context_id: str,
+        relation_type: str,
+        direction: str = "bidirectional",
+    ) -> str:
+        normalized_direction = self._normalize_context_link_direction(direction)
+        source = str(source_context_id).strip()
+        target = str(target_context_id).strip()
+        if normalized_direction == "bidirectional" and target < source:
+            source, target = target, source
+        key = (
+            f"{source}\x1f{target}\x1f{str(relation_type).strip()}\x1f"
+            f"{normalized_direction}"
+        ).encode("utf-8")
+        return "s2cl_" + hashlib.sha256(key).hexdigest()[:32]
+
+    @staticmethod
+    def _normalize_recall_scope(scope: str) -> str:
+        normalized = str(scope or "local").strip().lower()
+        if normalized == "broad":
+            normalized = "all"
+        if normalized not in {"local", "connected", "all"}:
+            raise ValueError("recall scope must be local, connected, or all")
+        return normalized
+
+    @staticmethod
+    def _normalize_context_link_direction(direction: str) -> str:
+        normalized = str(direction or "bidirectional").strip().lower()
+        if normalized in {"both", "two-way", "two_way", "undirected"}:
+            normalized = "bidirectional"
+        if normalized in {"one-way", "one_way", "outbound"}:
+            normalized = "directed"
+        if normalized not in {"directed", "bidirectional"}:
+            raise ValueError("direction must be directed or bidirectional")
+        return normalized
 
     def upsert_entry(
         self,
@@ -579,16 +667,148 @@ class DurableMemoryStore:
             LOGGER.exception("failed to batch-list memory entries")
             raise
 
+    def namespace_graph_snapshot(
+        self,
+        *,
+        context_id: str,
+        entry_scan_limit: int = 10_000,
+        relationship_scan_limit: int = 20_000,
+    ) -> dict[str, Any]:
+        """Read a stable, context-isolated graph snapshot for UI drill-down.
+
+        Rows are selected by primary-key order so repeated calls over unchanged
+        data return the same bounded sample. Deleted/pruned rows cannot appear
+        because those operations remove the durable rows and cascading edges.
+        """
+        context = str(context_id or "").strip()
+        if not context:
+            raise ValueError("context_id is required")
+        bounded_entry_limit = min(max(int(entry_scan_limit), 1), 10_000)
+        bounded_relationship_limit = min(
+            max(int(relationship_scan_limit), 1),
+            50_000,
+        )
+        try:
+            with closing(self._connect()) as conn:
+                entry_stats = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS entry_total,
+                        COALESCE(MIN(created_at), 0.0) AS first_created_at,
+                        COALESCE(MAX(updated_at), 0.0) AS last_updated_at
+                    FROM memory_entries
+                    WHERE context_id = ?
+                    """,
+                    (context,),
+                ).fetchone()
+                entry_rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM memory_entries
+                    WHERE context_id = ?
+                    ORDER BY memory_id
+                    LIMIT ?
+                    """,
+                    (context, bounded_entry_limit),
+                ).fetchall()
+                # Count only edges whose two durable endpoints are still in the
+                # requested context.  Foreign keys keep new data consistent, but
+                # older databases can contain rows written before that guarantee
+                # (or manually repaired rows).  A drill-down must never report an
+                # edge that it cannot safely render.
+                relationship_total = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM memory_relationships AS r
+                        JOIN memory_entries AS source
+                            ON source.memory_id = r.source_memory_id
+                            AND source.context_id = r.context_id
+                        JOIN memory_entries AS target
+                            ON target.memory_id = r.target_memory_id
+                            AND target.context_id = r.context_id
+                        WHERE r.context_id = ?
+                        """,
+                        (context,),
+                    ).fetchone()[0]
+                )
+                relationship_rows = conn.execute(
+                    """
+                    SELECT
+                        r.*,
+                        source.tag AS source_tag,
+                        target.tag AS target_tag
+                    FROM memory_relationships AS r
+                    JOIN memory_entries AS source
+                        ON source.memory_id = r.source_memory_id
+                        AND source.context_id = r.context_id
+                    JOIN memory_entries AS target
+                        ON target.memory_id = r.target_memory_id
+                        AND target.context_id = r.context_id
+                    WHERE r.context_id = ?
+                    ORDER BY r.relationship_id
+                    LIMIT ?
+                    """,
+                    (context, bounded_relationship_limit),
+                ).fetchall()
+            entry_total = int(entry_stats["entry_total"] if entry_stats else 0)
+            return {
+                "context_id": context,
+                "entry_total": entry_total,
+                "relationship_total": relationship_total,
+                "first_created_at": float(
+                    entry_stats["first_created_at"] if entry_stats else 0.0
+                ),
+                "last_updated_at": float(
+                    entry_stats["last_updated_at"] if entry_stats else 0.0
+                ),
+                "entries": [self._row_to_entry(row) for row in entry_rows],
+                "relationships": [
+                    self._row_to_relationship(row)
+                    for row in relationship_rows
+                ],
+                "entry_scan_limit": bounded_entry_limit,
+                "relationship_scan_limit": bounded_relationship_limit,
+                "entry_scan_truncated": entry_total > len(entry_rows),
+                "relationship_scan_truncated": relationship_total
+                > len(relationship_rows),
+                "selection_order": {
+                    "entries": "memory_id ascending",
+                    "relationships": "relationship_id ascending",
+                },
+                "read_only": True,
+            }
+        except Exception:
+            LOGGER.exception(
+                "failed to read namespace graph snapshot context_id=%s",
+                context,
+            )
+            raise
+
     def entries_revision(
         self,
         *,
         context_id: str | None = None,
         include_global: bool = False,
+        context_ids: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """Return a cheap revision fingerprint for entry-list caches."""
         clauses: list[str] = []
         params: list[Any] = []
-        if context_id is not None:
+        clean_context_ids: list[str] = []
+        if context_ids is not None:
+            clean_context_ids = list(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in context_ids
+                    if str(value).strip()
+                )
+            )
+            if clean_context_ids:
+                placeholders = ",".join("?" for _ in clean_context_ids)
+                clauses.append(f"context_id IN ({placeholders})")
+                params.extend(clean_context_ids)
+        elif context_id is not None:
             if include_global and context_id != "global":
                 clauses.append("context_id IN (?, 'global')")
                 params.append(str(context_id))
@@ -614,10 +834,12 @@ class DurableMemoryStore:
             max_created_at = float(row["max_created_at"] if row is not None else 0.0)
             revision_seed = (
                 f"{context_id or '*'}\x1f{include_global}\x1f"
+                f"{','.join(clean_context_ids)}\x1f"
                 f"{entry_count}\x1f{max_updated_at:.9f}\x1f{max_created_at:.9f}"
             )
             return {
                 "context_id": str(context_id or ""),
+                "context_ids": clean_context_ids,
                 "include_global": bool(include_global),
                 "entry_count": entry_count,
                 "max_updated_at": max_updated_at,
@@ -635,14 +857,36 @@ class DurableMemoryStore:
         query_spikes: set[int],
         firing_values: list[float],
         limit: int,
+        recall_scope: str = "local",
+        recall_contexts: Iterable[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         if not query_spikes:
             return []
+        scope_records = list(
+            recall_contexts
+            if recall_contexts is not None
+            else self.resolve_recall_contexts(
+                context_id=context_id,
+                scope=recall_scope,
+            )
+        )
+        scope_by_context = {
+            str(record.get("context_id") or ""): dict(record)
+            for record in scope_records
+            if str(record.get("context_id") or "")
+        }
+        if not scope_by_context:
+            return []
+        context_placeholders = ",".join("?" for _ in scope_by_context)
         clean_query_spikes = sorted({int(value) for value in query_spikes})
         placeholders = ",".join("?" for _ in clean_query_spikes)
         bounded_limit = min(max(int(limit), 1), 1000)
         candidate_limit = min(max(bounded_limit * 16, 128), 10_000)
-        params: list[Any] = [str(context_id), *clean_query_spikes, candidate_limit]
+        params: list[Any] = [
+            *scope_by_context.keys(),
+            *clean_query_spikes,
+            candidate_limit,
+        ]
         candidates: list[dict[str, Any]] = []
         try:
             with closing(self._connect()) as conn:
@@ -655,7 +899,7 @@ class DurableMemoryStore:
                     JOIN memory_entries AS e
                         ON e.memory_id = s.memory_id
                     WHERE
-                        s.context_id IN (?, 'global')
+                        s.context_id IN ({context_placeholders})
                         AND s.spike_index IN ({placeholders})
                     GROUP BY e.memory_id
                     ORDER BY overlap_count DESC, e.updated_at DESC
@@ -688,6 +932,7 @@ class DurableMemoryStore:
             )
             candidate = dict(entry)
             candidate["score"] = round(float(jaccard + 0.05 * activity_bonus), 6)
+            candidate.update(scope_by_context.get(str(entry["context_id"]), {}))
             candidates.append(candidate)
         candidates.sort(
             key=lambda item: (float(item["score"]), float(item["updated_at"])),
@@ -701,6 +946,8 @@ class DurableMemoryStore:
         context_id: str,
         query_terms: Iterable[str],
         limit: int,
+        recall_scope: str = "local",
+        recall_contexts: Iterable[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         clean_terms: list[str] = []
         seen_terms: set[str] = set()
@@ -712,9 +959,25 @@ class DurableMemoryStore:
                 clean_terms.append(term)
         if not clean_terms:
             return []
+        scope_records = list(
+            recall_contexts
+            if recall_contexts is not None
+            else self.resolve_recall_contexts(
+                context_id=context_id,
+                scope=recall_scope,
+            )
+        )
+        scope_by_context = {
+            str(record.get("context_id") or ""): dict(record)
+            for record in scope_records
+            if str(record.get("context_id") or "")
+        }
+        if not scope_by_context:
+            return []
         bounded_limit = min(max(int(limit), 1), 1000)
         placeholders = ",".join("?" for _ in clean_terms)
-        params: list[Any] = [str(context_id), *clean_terms, bounded_limit]
+        context_placeholders = ",".join("?" for _ in scope_by_context)
+        params: list[Any] = [*scope_by_context.keys(), *clean_terms, bounded_limit]
         try:
             with closing(self._connect()) as conn:
                 rows = conn.execute(
@@ -726,7 +989,7 @@ class DurableMemoryStore:
                             SUM(weight) AS term_weight
                         FROM memory_surface_terms
                         WHERE
-                            context_id IN (?, 'global')
+                            context_id IN ({context_placeholders})
                             AND term IN ({placeholders})
                         GROUP BY memory_id
                         ORDER BY overlap_count DESC, term_weight DESC
@@ -751,6 +1014,7 @@ class DurableMemoryStore:
                 entry = self._row_to_entry(row)
                 entry["surface_overlap_count"] = int(row["overlap_count"] or 0)
                 entry["surface_term_weight"] = round(float(row["term_weight"] or 0.0), 6)
+                entry.update(scope_by_context.get(str(entry["context_id"]), {}))
                 candidates.append(entry)
             return candidates
         except Exception:
@@ -808,6 +1072,569 @@ class DurableMemoryStore:
             seen.add(term)
             terms.append(term)
         return terms
+
+    def upsert_context_link(
+        self,
+        *,
+        source_context_id: str,
+        target_context_id: str,
+        relation_type: str,
+        confidence: float = 1.0,
+        evidence: dict[str, Any] | None = None,
+        direction: str = "bidirectional",
+        approved_by: str = "operator",
+        approved_at: float | None = None,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Persist one explicitly approved context-to-context connection.
+
+        Similarity suggestions intentionally use a separate read-only path and
+        never call this method. Bidirectional links are stored canonically so
+        approving A<->B and B<->A updates the same durable record.
+        """
+        source = str(source_context_id or "").strip()
+        target = str(target_context_id or "").strip()
+        relation = str(relation_type or "related").strip() or "related"
+        approver = str(approved_by or "").strip()
+        normalized_direction = self._normalize_context_link_direction(direction)
+        if not source or not target:
+            raise ValueError("source_context_id and target_context_id are required")
+        if source == target:
+            raise ValueError("a context cannot be linked to itself")
+        if not approver:
+            raise ValueError("approved_by is required for a durable context link")
+        if normalized_direction == "bidirectional" and target < source:
+            source, target = target, source
+        context_link_id = self.stable_context_link_id(
+            source_context_id=source,
+            target_context_id=target,
+            relation_type=relation,
+            direction=normalized_direction,
+        )
+        now = time.time()
+        approval_time = float(approved_at or now)
+        raw_confidence = float(confidence)
+        if not math.isfinite(raw_confidence):
+            raise ValueError("confidence must be a finite number")
+        bounded_confidence = min(max(raw_confidence, 0.0), 1.0)
+        safe_evidence = dict(evidence) if isinstance(evidence, dict) else {}
+        safe_evidence.setdefault("automatic_cross_namespace_write", False)
+        safe_evidence.setdefault("approval_required_for_creation", True)
+        safe_evidence.setdefault("approval_confirmed", True)
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO context_relationships (
+                        context_link_id,
+                        source_context_id,
+                        target_context_id,
+                        relation_type,
+                        direction,
+                        confidence,
+                        evidence_json,
+                        enabled,
+                        approved_by,
+                        approved_at,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(context_link_id) DO UPDATE SET
+                        confidence = excluded.confidence,
+                        evidence_json = excluded.evidence_json,
+                        enabled = excluded.enabled,
+                        approved_by = excluded.approved_by,
+                        approved_at = excluded.approved_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        context_link_id,
+                        source,
+                        target,
+                        relation,
+                        normalized_direction,
+                        bounded_confidence,
+                        _json_dumps(safe_evidence),
+                        1 if enabled else 0,
+                        approver,
+                        approval_time,
+                        now,
+                        now,
+                    ),
+                )
+            links = self.list_context_links(context_link_id=context_link_id, limit=1)
+            if not links:
+                raise RuntimeError(
+                    f"context link {context_link_id} was not readable after upsert"
+                )
+            return links[0]
+        except Exception:
+            LOGGER.exception(
+                "failed to upsert context link source=%s target=%s",
+                source,
+                target,
+            )
+            raise
+
+    def list_context_links(
+        self,
+        *,
+        context_id: str | None = None,
+        context_link_id: str | None = None,
+        source_context_id: str | None = None,
+        target_context_id: str | None = None,
+        relation_type: str | None = None,
+        enabled_only: bool = False,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            clauses.append("(source_context_id = ? OR target_context_id = ?)")
+            params.extend([str(context_id), str(context_id)])
+        if context_link_id is not None:
+            clauses.append("context_link_id = ?")
+            params.append(str(context_link_id))
+        if source_context_id is not None:
+            clauses.append("source_context_id = ?")
+            params.append(str(source_context_id))
+        if target_context_id is not None:
+            clauses.append("target_context_id = ?")
+            params.append(str(target_context_id))
+        if relation_type is not None:
+            clauses.append("relation_type = ?")
+            params.append(str(relation_type))
+        if enabled_only:
+            clauses.append("enabled = 1")
+        where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        params.append(bounded_limit)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM context_relationships
+                    {where_sql}
+                    ORDER BY confidence DESC, updated_at DESC, context_link_id
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+            return [self._row_to_context_link(row) for row in rows]
+        except Exception:
+            LOGGER.exception("failed to list context links")
+            raise
+
+    def delete_context_link(self, *, context_link_id: str) -> dict[str, Any]:
+        link_id = str(context_link_id or "").strip()
+        if not link_id:
+            raise ValueError("context_link_id is required")
+        links = self.list_context_links(context_link_id=link_id, limit=1)
+        link = links[0] if links else None
+        if link is None:
+            return {"deleted": False, "context_link_id": link_id, "link": None}
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(
+                    "DELETE FROM context_relationships WHERE context_link_id = ?",
+                    (link_id,),
+                )
+            return {"deleted": True, "context_link_id": link_id, "link": link}
+        except Exception:
+            LOGGER.exception("failed to delete context link %s", link_id)
+            raise
+
+    def list_context_summaries(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        """Return graph-ready summaries for every durable context id."""
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    WITH contexts AS (
+                        SELECT context_id FROM memory_entries
+                        UNION SELECT context_id FROM agent_context_events
+                        UNION SELECT source_context_id FROM context_relationships
+                        UNION SELECT target_context_id FROM context_relationships
+                    ),
+                    entry_stats AS (
+                        SELECT
+                            context_id,
+                            COUNT(*) AS entry_count,
+                            MAX(updated_at) AS last_entry_at
+                        FROM memory_entries
+                        GROUP BY context_id
+                    ),
+                    relationship_stats AS (
+                        SELECT context_id, COUNT(*) AS relationship_count
+                        FROM memory_relationships
+                        GROUP BY context_id
+                    ),
+                    spike_stats AS (
+                        SELECT context_id, COUNT(*) AS spike_index_count
+                        FROM memory_spikes
+                        GROUP BY context_id
+                    ),
+                    surface_stats AS (
+                        SELECT context_id, COUNT(*) AS surface_term_count
+                        FROM memory_surface_terms
+                        GROUP BY context_id
+                    ),
+                    event_stats AS (
+                        SELECT
+                            context_id,
+                            COUNT(*) AS context_event_count,
+                            MAX(created_at) AS last_event_at
+                        FROM agent_context_events
+                        GROUP BY context_id
+                    ),
+                    link_events AS (
+                        SELECT source_context_id AS context_id, updated_at
+                        FROM context_relationships
+                        UNION ALL
+                        SELECT target_context_id AS context_id, updated_at
+                        FROM context_relationships
+                    ),
+                    link_stats AS (
+                        SELECT
+                            context_id,
+                            COUNT(*) AS context_link_count,
+                            MAX(updated_at) AS last_link_at
+                        FROM link_events
+                        GROUP BY context_id
+                    )
+                    SELECT
+                        contexts.context_id,
+                        COALESCE(entry_stats.entry_count, 0) AS entry_count,
+                        COALESCE(relationship_stats.relationship_count, 0)
+                            AS relationship_count,
+                        COALESCE(spike_stats.spike_index_count, 0) AS spike_index_count,
+                        COALESCE(surface_stats.surface_term_count, 0) AS surface_term_count,
+                        COALESCE(event_stats.context_event_count, 0) AS context_event_count,
+                        COALESCE(link_stats.context_link_count, 0) AS context_link_count,
+                        MAX(
+                            COALESCE(entry_stats.last_entry_at, 0.0),
+                            COALESCE(event_stats.last_event_at, 0.0),
+                            COALESCE(link_stats.last_link_at, 0.0)
+                        ) AS last_activity_at
+                    FROM contexts
+                    LEFT JOIN entry_stats USING (context_id)
+                    LEFT JOIN relationship_stats USING (context_id)
+                    LEFT JOIN spike_stats USING (context_id)
+                    LEFT JOIN surface_stats USING (context_id)
+                    LEFT JOIN event_stats USING (context_id)
+                    LEFT JOIN link_stats USING (context_id)
+                    ORDER BY entry_count DESC, last_activity_at DESC, contexts.context_id
+                    LIMIT ?
+                    """,
+                    (bounded_limit,),
+                ).fetchall()
+            return [
+                {
+                    "context_id": str(row["context_id"]),
+                    "entry_count": int(row["entry_count"]),
+                    "relationship_count": int(row["relationship_count"]),
+                    "spike_index_count": int(row["spike_index_count"]),
+                    "surface_term_count": int(row["surface_term_count"]),
+                    "context_event_count": int(row["context_event_count"]),
+                    "context_link_count": int(row["context_link_count"]),
+                    "last_activity_at": float(row["last_activity_at"]),
+                    "size": int(row["entry_count"]),
+                }
+                for row in rows
+            ]
+        except Exception:
+            LOGGER.exception("failed to list durable context summaries")
+            raise
+
+    def resolve_recall_contexts(
+        self,
+        *,
+        context_id: str,
+        scope: str = "local",
+    ) -> list[dict[str, Any]]:
+        """Resolve an explicit, one-hop bounded recall scope with provenance."""
+        context = str(context_id or "default").strip() or "default"
+        normalized_scope = self._normalize_recall_scope(scope)
+        records: list[dict[str, Any]] = [
+            {
+                "context_id": context,
+                "recall_scope": normalized_scope,
+                "recall_provenance": "local",
+                "via_context_link_id": "",
+                "via_relation_type": "",
+            }
+        ]
+        seen = {context}
+        if normalized_scope == "connected":
+            for link in self.list_context_links(
+                context_id=context,
+                enabled_only=True,
+                limit=10_000,
+            ):
+                source = str(link["source_context_id"])
+                target = str(link["target_context_id"])
+                direction = str(link["direction"])
+                neighbor = ""
+                if source == context:
+                    neighbor = target
+                elif target == context and direction == "bidirectional":
+                    neighbor = source
+                if not neighbor or neighbor in seen or neighbor == "global":
+                    continue
+                seen.add(neighbor)
+                records.append(
+                    {
+                        "context_id": neighbor,
+                        "recall_scope": normalized_scope,
+                        "recall_provenance": "connected",
+                        "via_context_link_id": str(link["context_link_id"]),
+                        "via_relation_type": str(link["relation_type"]),
+                        "via_direction": direction,
+                    }
+                )
+        elif normalized_scope == "all":
+            for summary in self.list_context_summaries(limit=10_000):
+                candidate = str(summary["context_id"])
+                if candidate in seen or candidate == "global":
+                    continue
+                seen.add(candidate)
+                records.append(
+                    {
+                        "context_id": candidate,
+                        "recall_scope": normalized_scope,
+                        "recall_provenance": "all",
+                        "via_context_link_id": "",
+                        "via_relation_type": "",
+                    }
+                )
+        if "global" not in seen:
+            records.append(
+                {
+                    "context_id": "global",
+                    "recall_scope": normalized_scope,
+                    "recall_provenance": "global",
+                    "via_context_link_id": "",
+                    "via_relation_type": "",
+                }
+            )
+        return records
+
+    def context_similarity(
+        self,
+        *,
+        source_context_id: str,
+        target_context_id: str,
+        max_phase_delay_ticks: int = 4,
+    ) -> dict[str, Any]:
+        source = str(source_context_id or "").strip()
+        target = str(target_context_id or "").strip()
+        if not source or not target or source == target:
+            raise ValueError("two distinct context ids are required")
+        profiles = self._context_similarity_profiles({source, target})
+        return self._build_context_similarity(
+            source_context_id=source,
+            target_context_id=target,
+            profiles=profiles,
+            max_phase_delay_ticks=max_phase_delay_ticks,
+        )
+
+    def suggest_context_links(
+        self,
+        *,
+        context_id: str | None = None,
+        limit: int = 50,
+        min_score: float = 0.05,
+        include_linked: bool = False,
+        max_phase_delay_ticks: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Return read-only density-normalized context-link suggestions."""
+        if int(limit) <= 0:
+            return []
+        selected = str(context_id or "").strip()
+        summaries = self.list_context_summaries(limit=10_000)
+        context_ids = [
+            str(summary["context_id"])
+            for summary in summaries
+            if str(summary["context_id"]) != "global"
+            and int(summary["entry_count"]) > 0
+        ]
+        if selected and selected not in context_ids:
+            return []
+        profiles = self._context_similarity_profiles(set(context_ids))
+        existing_pairs = {
+            frozenset(
+                (str(link["source_context_id"]), str(link["target_context_id"]))
+            )
+            for link in self.list_context_links(enabled_only=True, limit=10_000)
+        }
+        suggestions: list[dict[str, Any]] = []
+        for left_index, source in enumerate(context_ids):
+            for target in context_ids[left_index + 1 :]:
+                if selected and selected not in {source, target}:
+                    continue
+                already_linked = frozenset((source, target)) in existing_pairs
+                if already_linked and not include_linked:
+                    continue
+                suggestion = self._build_context_similarity(
+                    source_context_id=source,
+                    target_context_id=target,
+                    profiles=profiles,
+                    max_phase_delay_ticks=max_phase_delay_ticks,
+                )
+                if float(suggestion["dice_score"]) < float(min_score):
+                    continue
+                suggestion["already_linked"] = already_linked
+                suggestions.append(suggestion)
+        suggestions.sort(
+            key=lambda item: (
+                float(item["dice_score"]),
+                int(item["surface_overlap_count"]),
+                int(item["spike_overlap_count"]),
+                str(item["source_context_id"]),
+                str(item["target_context_id"]),
+            ),
+            reverse=True,
+        )
+        bounded_limit = min(max(int(limit), 1), 1000)
+        return suggestions[:bounded_limit]
+
+    def _context_similarity_profiles(
+        self,
+        context_ids: set[str],
+    ) -> dict[str, dict[str, set[Any]]]:
+        profiles: dict[str, dict[str, set[Any]]] = {
+            context_id: {"surface_terms": set(), "spike_indices": set()}
+            for context_id in context_ids
+        }
+        if not context_ids:
+            return profiles
+        placeholders = ",".join("?" for _ in context_ids)
+        ordered = sorted(context_ids)
+        try:
+            with closing(self._connect()) as conn:
+                term_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT context_id, term
+                    FROM memory_surface_terms
+                    WHERE context_id IN ({placeholders})
+                    """,
+                    tuple(ordered),
+                ).fetchall()
+                spike_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT context_id, spike_index
+                    FROM memory_spikes
+                    WHERE context_id IN ({placeholders})
+                    """,
+                    tuple(ordered),
+                ).fetchall()
+            for row in term_rows:
+                term = str(row["term"])
+                if len(term) < 3 or term in CONTEXT_SUGGESTION_STOP_TERMS:
+                    continue
+                profiles[str(row["context_id"])]["surface_terms"].add(term)
+            for row in spike_rows:
+                profiles[str(row["context_id"])]["spike_indices"].add(
+                    int(row["spike_index"])
+                )
+            return profiles
+        except Exception:
+            LOGGER.exception("failed to build context similarity profiles")
+            raise
+
+    def _build_context_similarity(
+        self,
+        *,
+        source_context_id: str,
+        target_context_id: str,
+        profiles: dict[str, dict[str, set[Any]]],
+        max_phase_delay_ticks: int,
+    ) -> dict[str, Any]:
+        source_profile = profiles.get(
+            source_context_id,
+            {"surface_terms": set(), "spike_indices": set()},
+        )
+        target_profile = profiles.get(
+            target_context_id,
+            {"surface_terms": set(), "spike_indices": set()},
+        )
+        source_terms = set(source_profile["surface_terms"])
+        target_terms = set(target_profile["surface_terms"])
+        source_spikes = {int(value) for value in source_profile["spike_indices"]}
+        target_spikes = {int(value) for value in target_profile["spike_indices"]}
+        shared_terms = source_terms & target_terms
+        shared_spikes = source_spikes & target_spikes
+        surface_denominator = len(source_terms) + len(target_terms)
+        spike_denominator = len(source_spikes) + len(target_spikes)
+        surface_dice = (
+            (2.0 * len(shared_terms)) / surface_denominator
+            if surface_denominator
+            else 0.0
+        )
+        spike_dice = (
+            (2.0 * len(shared_spikes)) / spike_denominator
+            if spike_denominator
+            else 0.0
+        )
+        available_scores: list[tuple[float, float]] = []
+        if surface_denominator:
+            available_scores.append((surface_dice, 0.7))
+        if spike_denominator:
+            available_scores.append((spike_dice, 0.3))
+        total_weight = sum(weight for _score, weight in available_scores)
+        dice_score = (
+            sum(score * weight for score, weight in available_scores) / total_weight
+            if total_weight
+            else 0.0
+        )
+        bounded_max_delay = min(max(int(max_phase_delay_ticks), 0), 64)
+        suggested_phase_delay_ticks = min(
+            bounded_max_delay,
+            max(0, int(round(bounded_max_delay * (1.0 - dice_score)))),
+        )
+        pair = sorted((source_context_id, target_context_id))
+        suggestion_seed = f"{pair[0]}\x1f{pair[1]}\x1fdensity-dice-v1".encode("utf-8")
+        evidence = {
+            "method": "density-normalized-dice-v1",
+            "surface_dice": round(surface_dice, 6),
+            "spike_dice": round(spike_dice, 6),
+            "dice_score": round(dice_score, 6),
+            "surface_overlap_count": len(shared_terms),
+            "surface_source_count": len(source_terms),
+            "surface_target_count": len(target_terms),
+            "spike_overlap_count": len(shared_spikes),
+            "spike_source_count": len(source_spikes),
+            "spike_target_count": len(target_spikes),
+            "shared_surface_terms": sorted(shared_terms)[:20],
+            "shared_spike_indices": sorted(shared_spikes)[:20],
+            "suggested_phase_delay_ticks": suggested_phase_delay_ticks,
+            "max_visual_phase_delay_ticks": bounded_max_delay,
+            "delay_semantics": "visualization-only",
+            "automatic_cross_namespace_write": False,
+        }
+        return {
+            "suggestion_id": "s2cs_" + hashlib.sha256(suggestion_seed).hexdigest()[:32],
+            "source_context_id": source_context_id,
+            "target_context_id": target_context_id,
+            "score": round(dice_score, 6),
+            "weight": round(dice_score, 6),
+            "confidence": round(dice_score, 6),
+            "dice_score": round(dice_score, 6),
+            "surface_dice": round(surface_dice, 6),
+            "spike_dice": round(spike_dice, 6),
+            "surface_overlap_count": len(shared_terms),
+            "spike_overlap_count": len(shared_spikes),
+            "suggested_phase_delay_ticks": suggested_phase_delay_ticks,
+            "max_visual_phase_delay_ticks": bounded_max_delay,
+            "delay_semantics": "visualization-only",
+            "evidence": evidence,
+            "persisted": False,
+            "requires_approval": True,
+            "automatic_cross_namespace_write": False,
+        }
 
     def upsert_relationship(
         self,
@@ -1389,6 +2216,9 @@ class DurableMemoryStore:
                     context_bus_ack_cursor_count = conn.execute(
                         "SELECT COUNT(*) FROM agent_context_cursors"
                     ).fetchone()[0]
+                    context_link_count = conn.execute(
+                        "SELECT COUNT(*) FROM context_relationships"
+                    ).fetchone()[0]
                 else:
                     entry_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_entries WHERE context_id = ?",
@@ -1418,6 +2248,14 @@ class DurableMemoryStore:
                         "SELECT COUNT(*) FROM agent_context_cursors WHERE context_id = ?",
                         (context_id,),
                     ).fetchone()[0]
+                    context_link_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM context_relationships
+                        WHERE source_context_id = ? OR target_context_id = ?
+                        """,
+                        (context_id, context_id),
+                    ).fetchone()[0]
                 event_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
                 context_rows = conn.execute(
                     """
@@ -1437,6 +2275,7 @@ class DurableMemoryStore:
                 "context_bus_event_count": int(context_bus_event_count),
                 "context_bus_latest_event_id": int(latest_context_event_row[0] or 0),
                 "context_bus_ack_cursor_count": int(context_bus_ack_cursor_count),
+                "context_link_count": int(context_link_count),
                 "contexts": {str(row["context_id"]): int(row["count"]) for row in context_rows},
             }
         except Exception:
@@ -1458,6 +2297,10 @@ class DurableMemoryStore:
             "stats": self.stats(context_id=context_id),
             "entries": self.list_entries(context_id=context_id, limit=limit),
             "relationships": self.list_relationships(
+                context_id=context_id,
+                limit=limit,
+            ),
+            "context_links": self.list_context_links(
                 context_id=context_id,
                 limit=limit,
             ),
@@ -1546,6 +2389,27 @@ class DurableMemoryStore:
             "evidence": _decode_json(str(row["evidence_json"]), {}),
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
+        }
+
+    def _row_to_context_link(self, row: sqlite3.Row) -> dict[str, Any]:
+        confidence = round(float(row["confidence"]), 6)
+        evidence = _decode_json(str(row["evidence_json"]), {})
+        return {
+            "context_link_id": str(row["context_link_id"]),
+            "source_context_id": str(row["source_context_id"]),
+            "target_context_id": str(row["target_context_id"]),
+            "relation_type": str(row["relation_type"]),
+            "direction": str(row["direction"]),
+            "confidence": confidence,
+            "weight": confidence,
+            "evidence": evidence if isinstance(evidence, dict) else {},
+            "enabled": bool(row["enabled"]),
+            "approved": True,
+            "approved_by": str(row["approved_by"]),
+            "approved_at": float(row["approved_at"]),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+            "automatic_cross_namespace_write": False,
         }
 
     def _row_to_context_event(self, row: sqlite3.Row) -> dict[str, Any]:

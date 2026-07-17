@@ -106,6 +106,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7l3 8"/><path d="M16 7l-3 8"/><path d="M8 6h8"/></svg>
             Memory Graph
           </a>
+          <a href="#namespaceGalaxy" class="nav-item" data-section-target="namespaceGalaxy">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="7" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><circle cx="6" cy="18" r="2"/><path d="m7 8 3 3"/><path d="m14 10 3-3"/><path d="m14 14 3 3"/><path d="m10 14-3 3"/></svg>
+            Namespace Galaxy
+          </a>
           <a href="#write" class="nav-item" data-section-target="write">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
             Memory Write
@@ -281,6 +285,109 @@
               </section>
             </div>
           </article>
+        </section>
+
+        <section class="panel namespace-galaxy-panel" id="namespaceGalaxy" aria-labelledby="namespaceGalaxyTitle">
+          <div class="panel-header namespace-galaxy-header">
+            <div>
+              <p class="section-label">Connected Memory</p>
+              <h2 id="namespaceGalaxyTitle">Namespace Galaxy</h2>
+              <p class="namespace-galaxy-subtitle">Every saved context remains isolated until an approved bridge deliberately connects it.</p>
+            </div>
+            <div class="namespace-galaxy-summary" aria-label="Namespace map summary">
+              <span><strong id="namespaceGalaxyNodeCount">--</strong> namespaces</span>
+              <span><strong id="namespaceGalaxyLinkCount">--</strong> bridges</span>
+              <span><strong id="namespaceGalaxySuggestionCount">--</strong> suggestions</span>
+            </div>
+          </div>
+
+          <div class="namespace-galaxy-layout">
+            <div class="namespace-galaxy-stage">
+              <div id="namespaceGalaxyNavigation" class="namespace-galaxy-navigation">
+                <nav id="namespaceGalaxyBreadcrumb" class="namespace-galaxy-breadcrumb" aria-label="Namespace Galaxy location">
+                  <button id="namespaceGalaxyBreadcrumbAll" type="button">All namespaces</button>
+                  <span id="namespaceGalaxyBreadcrumbNamespaceWrap" hidden>
+                    <span aria-hidden="true">/</span>
+                    <button id="namespaceGalaxyBreadcrumbNamespace" type="button"></button>
+                  </span>
+                  <span id="namespaceGalaxyBreadcrumbGanglionWrap" hidden>
+                    <span aria-hidden="true">/</span>
+                    <span id="namespaceGalaxyBreadcrumbGanglion" aria-current="location"></span>
+                  </span>
+                </nav>
+                <div class="namespace-galaxy-depth-row">
+                  <div id="namespaceGalaxyDepth" class="namespace-galaxy-depth" role="status" aria-live="polite" aria-label="Semantic zoom depth">
+                    <span id="namespaceGalaxyDepthCortex" aria-current="step">Cortex</span>
+                    <i aria-hidden="true"></i>
+                    <span id="namespaceGalaxyDepthGanglia">Ganglia</span>
+                    <i aria-hidden="true"></i>
+                    <span id="namespaceGalaxyDepthNeurons">Neurons</span>
+                    <strong id="namespaceGalaxyDepthValue">Depth 1 / 3</strong>
+                  </div>
+                  <button id="namespaceGalaxyBack" class="secondary-button namespace-galaxy-back" type="button" hidden>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/><path d="M9 12h11"/></svg>
+                    Back to galaxy
+                  </button>
+                </div>
+              </div>
+              <canvas
+                id="namespaceGalaxyCanvas"
+                class="namespace-galaxy-canvas"
+                tabindex="0"
+                role="region"
+                aria-label="Interactive three-dimensional map of all SYNAPSE-S2 memory namespaces"
+                aria-describedby="namespaceGalaxyHelp"
+              >Interactive namespace map. Use the accessible namespace list below for equivalent controls.</canvas>
+              <div id="namespaceGalaxyState" class="namespace-galaxy-state loading" role="status" aria-live="polite">
+                <strong>Loading Namespace Galaxy</strong>
+                <span>Reading contexts and approved bridges.</span>
+              </div>
+              <div id="namespaceGalaxyTooltip" class="namespace-galaxy-tooltip" role="status" hidden></div>
+              <div class="namespace-galaxy-controls" aria-label="Namespace Galaxy viewport controls">
+                <button id="namespaceGalaxyOrbitLeft" class="icon-button compact" type="button" title="Orbit left" aria-label="Orbit left">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/><path d="M8 12h12"/></svg>
+                </button>
+                <button id="namespaceGalaxyOrbitRight" class="icon-button compact" type="button" title="Orbit right" aria-label="Orbit right">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6"/><path d="M4 12h12"/></svg>
+                </button>
+                <button id="namespaceGalaxyZoomOut" class="icon-button compact" type="button" title="Zoom out" aria-label="Zoom out">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M8 11h6"/><path d="m20 20-4-4"/></svg>
+                </button>
+                <button id="namespaceGalaxyZoomIn" class="icon-button compact" type="button" title="Zoom in" aria-label="Zoom in">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M8 11h6"/><path d="M11 8v6"/><path d="m20 20-4-4"/></svg>
+                </button>
+                <button id="namespaceGalaxyFit" class="icon-button compact" type="button" title="Fit all namespaces" aria-label="Fit all namespaces">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+                </button>
+                <button id="namespaceGalaxyReset" class="icon-button compact" type="button" title="Reset galaxy view" aria-label="Reset galaxy view">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v6h6"/></svg>
+                </button>
+              </div>
+              <p id="namespaceGalaxyHelp" class="namespace-galaxy-help">Click a namespace sphere to enter it. Drag to orbit; Shift-drag to pan; scroll to zoom.</p>
+            </div>
+
+            <aside id="namespaceGalaxyInspector" class="namespace-galaxy-inspector" aria-label="Selected namespace or bridge" aria-live="polite">
+              <p class="section-label">Selection</p>
+              <h3 id="namespaceGalaxyInspectorTitle">Waiting for namespace map</h3>
+              <p id="namespaceGalaxyInspectorBody">Choose a sphere or bridge to inspect its volume, status, and provenance.</p>
+              <dl id="namespaceGalaxyInspectorFacts" class="namespace-galaxy-facts"></dl>
+              <div id="namespaceGalaxyInspectorActions" class="namespace-galaxy-inspector-actions"></div>
+              <div id="namespaceGalaxySuggestionList" class="namespace-galaxy-suggestions" aria-label="Suggested bridges"></div>
+            </aside>
+          </div>
+
+          <div id="namespaceGalaxyLegend" class="namespace-galaxy-legend" aria-label="Namespace Galaxy legend">
+            <span><i class="namespace-key namespace-key-volume" aria-hidden="true"></i>Sphere size = memory volume</span>
+            <span><i class="namespace-key namespace-key-approved" aria-hidden="true"></i>Approved bridge</span>
+            <span><i class="namespace-key namespace-key-disabled" aria-hidden="true"></i>Disabled bridge</span>
+            <span><i class="namespace-key namespace-key-suggested" aria-hidden="true"></i>Evidence-only suggestion</span>
+          </div>
+
+          <details class="namespace-galaxy-accessible">
+            <summary id="namespaceGalaxyAccessibleSummary">Browse all namespaces as a list</summary>
+            <p id="namespaceGalaxyAccessibleHelp">Each saved namespace is listed from the backend map. Activate one to enter its read-only internal map.</p>
+            <div id="namespaceGalaxyList" class="namespace-galaxy-list" role="list"></div>
+          </details>
         </section>
 
         <section class="control-grid" aria-label="Primary controls">
@@ -860,19 +967,35 @@
             <div id="recallGuide" class="recall-guide" aria-label="Recall console guidance">
               <div>
                 <strong>What this does</strong>
-                <span>Embeds your text locally, gates the spiking memory graph, and returns matching traces from this context.</span>
+                <span>Embeds your text locally, gates the spiking memory graph, and returns matching traces from the selected recall scope.</span>
               </div>
               <div>
                 <strong>Where it goes</strong>
-                <span title="MCP tool: query_spiking_attention_text">Local recall only here; MCP-connected clients pull the same context through the MCP recall tool.</span>
+                <span title="MCP tool: query_spiking_attention_text">Local uses this namespace plus global memory; Connected adds approved one-hop bridges; All searches every namespace.</span>
               </div>
               <div>
                 <strong>Good prompts</strong>
                 <span>Ask for prior decisions, incidents, people, project state, or temporal context you have already captured.</span>
               </div>
             </div>
+            <fieldset class="recall-scope" aria-describedby="recallScopeHelp">
+              <legend>Recall scope</legend>
+              <label>
+                <input id="recallScopeLocal" type="radio" name="recallScope" value="local" checked />
+                <span><strong>Local</strong><small>Current + global memory</small></span>
+              </label>
+              <label>
+                <input id="recallScopeConnected" type="radio" name="recallScope" value="connected" />
+                <span><strong>Connected</strong><small>Approved one-hop bridges</small></span>
+              </label>
+              <label>
+                <input id="recallScopeAll" type="radio" name="recallScope" value="all" />
+                <span><strong>All</strong><small>Every namespace</small></span>
+              </label>
+            </fieldset>
+            <p id="recallScopeHelp" class="recall-scope-help">Local is the safe default. Suggested bridges do not expand recall until you explicitly connect them.</p>
             <form id="queryForm" class="query-form">
-              <input id="queryInput" autocomplete="off" placeholder="Ask local memory: decision, incident, project state..." aria-describedby="recallGuide" />
+              <input id="queryInput" autocomplete="off" placeholder="Ask memory: decision, incident, project state..." aria-describedby="recallGuide" />
               <label class="k-control">
                 <span>K=</span>
                 <select id="recallLimit" aria-label="Displayed recall result count">

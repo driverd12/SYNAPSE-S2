@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -85,6 +86,247 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(registration["tag"], "wing-load-analysis")
         self.assertIn("wing-load-analysis", result)
         self.assertNotIn("demo::neuron-", result)
+
+    def test_namespace_map_suggestions_require_explicit_link_approval(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=16,
+            default_top_k=2,
+            recall_count=5,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend.register_trace(
+            tag="casp-camera-network",
+            embedding=mx.array([9.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            context_id="CASP-Control-Room",
+            source_text="PTZ camera presets share the control room network.",
+            metadata={"semantic_facets": ["ptz camera", "control room network"]},
+        )
+        backend.register_trace(
+            tag="ptz-camera-presets",
+            embedding=mx.array([8.8, 8.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            context_id="PTZ-Camera-Work",
+            source_text="PTZ camera network presets and framing.",
+            metadata={"semantic_facets": ["ptz camera", "network presets"]},
+        )
+        backend.register_trace(
+            tag="supplier-budget",
+            embedding=mx.array([0.0, 0.0, 0.0, 0.0, 9.0, 8.0, 0.0, 0.0]),
+            context_id="Procurement",
+            source_text="Supplier renewal budget and contract risk.",
+        )
+
+        suggestions = backend.suggest_namespace_links(min_score=0.01)
+        map_before = backend.list_namespace_map(
+            context_id="CASP-Control-Room",
+            min_suggestion_score=0.01,
+        )
+        with self.assertRaisesRegex(ValueError, "confirm=true"):
+            backend.approve_namespace_link(
+                source_context_id="CASP-Control-Room",
+                target_context_id="PTZ-Camera-Work",
+                relation_type="shares_network",
+            )
+        approval = backend.approve_namespace_link(
+            source_context_id="CASP-Control-Room",
+            target_context_id="PTZ-Camera-Work",
+            relation_type="shares_network",
+            weight=0.93,
+            evidence={"reason": "operator-verified shared control-room network"},
+            confirm=True,
+        )
+        map_after = backend.list_namespace_map(
+            context_id="CASP-Control-Room",
+            min_suggestion_score=0.01,
+        )
+
+        self.assertGreaterEqual(suggestions["suggestion_count"], 1)
+        self.assertTrue(suggestions["read_only"])
+        self.assertEqual(map_before["link_count"], 0)
+        self.assertEqual(map_before["node_count"], 3)
+        self.assertEqual(map_after["link_count"], 1)
+        self.assertEqual(map_after["default_recall_scope"], "local")
+        self.assertEqual(map_after["connected_scope_hops"], 1)
+        self.assertFalse(map_after["automatic_cross_namespace_write"])
+        link = approval["link"]
+        self.assertEqual(link["direction"], "bidirectional")
+        self.assertEqual(link["weight"], 0.93)
+        self.assertGreater(link["dice_score"], 0.0)
+        self.assertEqual(link["delay_semantics"], "visualization-only")
+        self.assertIn("suggested_phase_delay_ticks", link)
+        selected_node = next(node for node in map_after["nodes"] if node["selected"])
+        self.assertIn("PTZ-Camera-Work", selected_node["connected_context_ids"])
+
+        backend.approve_namespace_link(
+            source_context_id="Procurement",
+            target_context_id="CASP-Control-Room",
+            relation_type="feeds",
+            direction="directed",
+            confirm=True,
+        )
+        procurement_map = backend.list_namespace_map(context_id="Procurement")
+        casp_map = backend.list_namespace_map(context_id="CASP-Control-Room")
+        procurement_node = next(
+            node for node in procurement_map["nodes"] if node["selected"]
+        )
+        casp_node = next(node for node in casp_map["nodes"] if node["selected"])
+        self.assertIn("CASP-Control-Room", procurement_node["connected_context_ids"])
+        self.assertNotIn("Procurement", casp_node["connected_context_ids"])
+        self.assertTrue(
+            next(
+                node
+                for node in procurement_map["nodes"]
+                if node["context_id"] == "CASP-Control-Room"
+            )["connected_to_selected"]
+        )
+        self.assertFalse(
+            next(
+                node
+                for node in casp_map["nodes"]
+                if node["context_id"] == "Procurement"
+            )["connected_to_selected"]
+        )
+
+    def test_query_recall_scope_is_local_then_approved_one_hop_then_all(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=16,
+            default_top_k=2,
+            recall_count=5,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        alpha_vector = mx.array([0.0, 0.0, 0.0, 0.0, 9.0, 8.0, 0.0, 0.0])
+        beta_vector = mx.array([9.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        gamma_vector = mx.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 8.0])
+        backend.register_trace(
+            tag="alpha-local",
+            embedding=alpha_vector,
+            context_id="alpha",
+            source_text="Alpha local memory.",
+        )
+        backend.register_trace(
+            tag="beta-connected",
+            embedding=beta_vector,
+            context_id="beta",
+            source_text="Beta connected camera memory.",
+        )
+        backend.register_trace(
+            tag="gamma-two-hops",
+            embedding=gamma_vector,
+            context_id="gamma",
+            source_text="Gamma remote camera memory.",
+        )
+
+        local_result = backend.query(beta_vector, context_id="alpha")
+        backend.approve_namespace_link(
+            source_context_id="alpha",
+            target_context_id="beta",
+            relation_type="related",
+            confirm=True,
+        )
+        backend.approve_namespace_link(
+            source_context_id="beta",
+            target_context_id="gamma",
+            relation_type="related",
+            confirm=True,
+        )
+        connected_result = backend.query(
+            beta_vector,
+            context_id="alpha",
+            recall_scope="connected",
+        )
+        two_hop_result = backend.query(
+            gamma_vector,
+            context_id="alpha",
+            recall_scope="connected",
+        )
+        all_result = backend.query(
+            gamma_vector,
+            context_id="alpha",
+            recall_scope="all",
+        )
+        connected_memory = backend.list_memory(
+            context_id="alpha",
+            recall_scope="connected",
+        )
+
+        self.assertNotIn("beta-connected", local_result)
+        self.assertIn("beta-connected", connected_result)
+        self.assertIn("scope=connected", connected_result)
+        self.assertIn("provenance=connected", connected_result)
+        self.assertNotIn("gamma-two-hops", two_hop_result)
+        self.assertIn("gamma-two-hops", all_result)
+        self.assertIn("scope=all", all_result)
+        self.assertIn("provenance=all", all_result)
+        self.assertEqual(
+            {entry["context_id"] for entry in connected_memory["entries"]},
+            {"alpha", "beta"},
+        )
+        beta_entry = next(
+            entry
+            for entry in connected_memory["entries"]
+            if entry["context_id"] == "beta"
+        )
+        self.assertEqual(beta_entry["recall_provenance"], "connected")
+        self.assertTrue(beta_entry["via_context_link_id"])
+
+    def test_local_recall_ignores_legacy_cross_context_memory_relationship(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=16,
+            default_top_k=2,
+            recall_count=1,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        alpha_vector = mx.array([9.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        beta_vector = mx.array([0.0, 0.0, 9.0, 8.0, 0.0, 0.0, 0.0, 0.0])
+        alpha = backend.register_trace(
+            tag="alpha-local",
+            embedding=alpha_vector,
+            context_id="alpha",
+            source_text="Alpha local memory.",
+        )
+        beta = backend.register_trace(
+            tag="beta-isolated",
+            embedding=beta_vector,
+            context_id="beta",
+            source_text="Beta must remain isolated.",
+        )
+        # Legacy databases can contain relationship rows whose endpoint belongs
+        # to another context. Local recall must not follow such an edge.
+        with sqlite3.connect(backend.memory_store.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO memory_relationships (
+                    relationship_id, context_id, source_memory_id, target_memory_id,
+                    relation_type, weight, evidence_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy-cross-context",
+                    "alpha",
+                    alpha["memory_id"],
+                    beta["memory_id"],
+                    "legacy",
+                    0.9,
+                    "{}",
+                    12.0,
+                    12.0,
+                ),
+            )
+            connection.commit()
+
+        local_result = backend.query(
+            alpha_vector,
+            context_id="alpha",
+            recall_scope="local",
+        )
+
+        self.assertIn("alpha-local", local_result)
+        self.assertNotIn("beta-isolated", local_result)
 
     def test_registered_trace_persists_to_state_file(self):
         with TemporaryDirectory() as tmp:
@@ -1895,6 +2137,156 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             backend.semantic_hierarchy["board-demo"]["relationship_count"],
             1,
         )
+
+    def test_namespace_detail_is_deterministic_isolated_and_keeps_all_ganglia_visible(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        namespace = backend.register_text_trace(
+            tag="alpha-namespace",
+            text="Namespace anchor password=alpha-drill-secret.",
+            context_id="alpha",
+            metadata={
+                "context_memory_type": "namespace",
+                "display_label": "Alpha api_key=sk-alpha-drill-secret",
+                "embedding_provider": {"model_id": "token=alpha-model-secret"},
+            },
+        )
+        member = backend.register_text_trace(
+            tag="alpha-member",
+            text="Member text api_key=sk-member-drill-secret.",
+            context_id="alpha",
+            metadata={
+                "context_memory_type": "event",
+                "context_namespace": "alpha-topic",
+                "semantic_facets": ["zeta", "alpha", "zeta"],
+            },
+        )
+        other_cluster = backend.register_text_trace(
+            tag="alpha-objective",
+            text="Objective password=objective-drill-secret.",
+            context_id="alpha",
+            metadata={"context_memory_type": "objective"},
+        )
+        fallback = backend.register_text_trace(
+            tag="alpha-fallback",
+            text="Fallback isolated stored memory.",
+            context_id="alpha",
+            metadata={},
+        )
+        backend.memory_store.upsert_relationship(
+            context_id="alpha",
+            source_memory_id=namespace["memory_id"],
+            target_memory_id=member["memory_id"],
+            relation_type="namespace_contains",
+            weight=1.0,
+            evidence={"api_key=sk-evidence-key-secret": "password=evidence-secret"},
+        )
+        backend.memory_store.upsert_relationship(
+            context_id="alpha",
+            source_memory_id=member["memory_id"],
+            target_memory_id=other_cluster["memory_id"],
+            relation_type="temporal_next",
+            weight=0.8,
+        )
+        backend.register_text_trace(
+            tag="beta-secret",
+            text="Other context password=beta-drill-secret.",
+            context_id="beta",
+            metadata={"context_memory_type": "event"},
+        )
+        before_alpha = backend.memory_store.stats(context_id="alpha")
+        before_beta = backend.memory_store.stats(context_id="beta")
+
+        first = backend.list_namespace_detail(
+            context_id="alpha",
+            level="neurons",
+            limit=1,
+        )
+        repeated = backend.list_namespace_detail(
+            context_id="alpha",
+            level="neurons",
+            limit=1,
+        )
+        complete = backend.list_namespace_detail(
+            context_id="alpha",
+            level="neurons",
+            limit=20,
+        )
+        selected_cluster_id = next(
+            cluster["cluster_id"]
+            for cluster in complete["clusters"]
+            if other_cluster["memory_id"] in cluster["member_memory_id_sample"]
+        )
+        selected = backend.list_namespace_detail(
+            context_id="alpha",
+            level="neurons",
+            cluster_id=selected_cluster_id,
+            limit=20,
+        )
+        after_alpha = backend.memory_store.stats(context_id="alpha")
+        after_beta = backend.memory_store.stats(context_id="beta")
+        rendered = json.dumps(complete, sort_keys=True)
+
+        self.assertEqual(first, repeated)
+        self.assertTrue(first["read_only"])
+        self.assertFalse(first["automatic_cross_namespace_write"])
+        self.assertEqual(first["counts"]["memory_total"], 4)
+        self.assertEqual(first["counts"]["eligible_nodes"], 4)
+        self.assertEqual(first["counts"]["returned_nodes"], 1)
+        self.assertGreaterEqual(first["counts"]["returned_clusters"], 3)
+        self.assertTrue(first["truncation"]["nodes"]["truncated"])
+        self.assertEqual(first["truncation"]["clusters"]["returned"], 3)
+        self.assertEqual(first["truncation"]["clusters"]["limit"], 500)
+        self.assertEqual({node["context_id"] for node in complete["nodes"]}, {"alpha"})
+        self.assertEqual(
+            {node["memory_id"] for node in complete["nodes"]},
+            {
+                namespace["memory_id"],
+                member["memory_id"],
+                other_cluster["memory_id"],
+                fallback["memory_id"],
+            },
+        )
+        assigned_memory_ids = [
+            memory_id
+            for cluster in complete["clusters"]
+            for memory_id in cluster["member_memory_id_sample"]
+        ]
+        self.assertEqual(len(assigned_memory_ids), len(set(assigned_memory_ids)))
+        self.assertEqual(set(assigned_memory_ids), {node["memory_id"] for node in complete["nodes"]})
+        self.assertEqual(selected["selected_cluster_id"], selected_cluster_id)
+        self.assertEqual(selected["counts"]["eligible_clusters"], 1)
+        self.assertEqual({node["cluster_id"] for node in selected["nodes"]}, {selected_cluster_id})
+        self.assertEqual({cluster["cluster_id"] for cluster in selected["clusters"]}, {selected_cluster_id})
+        self.assertNotIn("alpha-drill-secret", rendered)
+        self.assertNotIn("member-drill-secret", rendered)
+        self.assertNotIn("objective-drill-secret", rendered)
+        self.assertNotIn("evidence-secret", rendered)
+        self.assertNotIn("evidence-key-secret", rendered)
+        self.assertNotIn("alpha-model-secret", rendered)
+        self.assertNotIn("beta-drill-secret", rendered)
+        self.assertEqual(before_alpha, after_alpha)
+        self.assertEqual(before_beta, after_beta)
+        with self.assertRaisesRegex(ValueError, "level must"):
+            backend.list_namespace_detail(context_id="alpha", level="unknown")
+        with self.assertRaisesRegex(ValueError, "cluster_id is only valid"):
+            backend.list_namespace_detail(
+                context_id="alpha",
+                level="cortex",
+                cluster_id=selected_cluster_id,
+            )
+        with self.assertRaisesRegex(ValueError, "unknown cluster_id"):
+            backend.list_namespace_detail(
+                context_id="alpha",
+                level="neurons",
+                cluster_id="s2g_not-in-alpha",
+            )
 
     def test_idle_maintenance_runs_deep_sleep_after_idle_threshold(self):
         backend = SpikingAttentionBackend(

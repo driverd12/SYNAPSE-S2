@@ -341,6 +341,184 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(stats["relationship_count"], 1)
         self.assertEqual(exported["relationships"][0]["weight"], 0.87)
 
+    def test_context_link_suggestions_are_density_normalized_and_read_only(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            store.upsert_entry(
+                tag="control-room-camera",
+                context_id="CASP-Control-Room",
+                source_text="PTZ camera presets use the control room network.",
+                metadata={"semantic_facets": ["ptz camera", "control room network"]},
+                embedding_dimensions=12,
+                spike_indices=[1, 2, 3, 4],
+                neuron_indices=[1, 2],
+            )
+            store.upsert_entry(
+                tag="ptz-camera-work",
+                context_id="PTZ-Camera-Work",
+                source_text="PTZ camera network presets and operator framing.",
+                metadata={"semantic_facets": ["ptz camera", "network presets"]},
+                embedding_dimensions=12,
+                spike_indices=[2, 3, 8],
+                neuron_indices=[2, 3],
+            )
+            store.upsert_entry(
+                tag="finance-note",
+                context_id="Procurement",
+                source_text="Supplier budget renewal and contract risk.",
+                metadata={},
+                embedding_dimensions=12,
+                spike_indices=[10, 11],
+                neuron_indices=[4, 5],
+            )
+
+            suggestions = store.suggest_context_links(min_score=0.01, limit=10)
+            camera_suggestion = next(
+                suggestion
+                for suggestion in suggestions
+                if {
+                    suggestion["source_context_id"],
+                    suggestion["target_context_id"],
+                }
+                == {"CASP-Control-Room", "PTZ-Camera-Work"}
+            )
+
+            self.assertEqual(store.list_context_links(), [])
+            self.assertFalse(camera_suggestion["persisted"])
+            self.assertTrue(camera_suggestion["requires_approval"])
+            self.assertFalse(camera_suggestion["automatic_cross_namespace_write"])
+            self.assertEqual(
+                camera_suggestion["surface_dice"],
+                round(
+                    2.0 * camera_suggestion["surface_overlap_count"]
+                    / (
+                        camera_suggestion["evidence"]["surface_source_count"]
+                        + camera_suggestion["evidence"]["surface_target_count"]
+                    ),
+                    6,
+                ),
+            )
+            self.assertEqual(camera_suggestion["evidence"]["method"], "density-normalized-dice-v1")
+            self.assertEqual(camera_suggestion["delay_semantics"], "visualization-only")
+            self.assertGreaterEqual(camera_suggestion["suggested_phase_delay_ticks"], 0)
+            self.assertLessEqual(camera_suggestion["suggested_phase_delay_ticks"], 4)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                table_exists = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'context_relationships'
+                    """
+                ).fetchone()[0]
+            self.assertEqual(table_exists, 1)
+
+    def test_approved_context_links_enable_only_one_hop_connected_recall(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            export_path = Path(tmp) / "memory-export.json"
+            store = DurableMemoryStore(db_path)
+            alpha = store.upsert_entry(
+                tag="alpha-local",
+                context_id="alpha",
+                source_text="Control room camera overview.",
+                metadata={},
+                embedding_dimensions=12,
+                spike_indices=[1, 2],
+                neuron_indices=[1, 2],
+            )
+            beta = store.upsert_entry(
+                tag="beta-connected",
+                context_id="beta",
+                source_text="Control room camera network detail.",
+                metadata={},
+                embedding_dimensions=12,
+                spike_indices=[2, 3],
+                neuron_indices=[2, 3],
+            )
+            gamma = store.upsert_entry(
+                tag="gamma-two-hops",
+                context_id="gamma",
+                source_text="Remote camera maintenance detail.",
+                metadata={},
+                embedding_dimensions=12,
+                spike_indices=[8, 9],
+                neuron_indices=[8, 9],
+            )
+            alpha_beta = store.upsert_context_link(
+                source_context_id="beta",
+                target_context_id="alpha",
+                relation_type="shares_network",
+                confidence=0.91,
+                approved_by="unit-test",
+            )
+            store.upsert_context_link(
+                source_context_id="beta",
+                target_context_id="gamma",
+                relation_type="depends_on",
+                confidence=0.8,
+                approved_by="unit-test",
+            )
+
+            restored = DurableMemoryStore(db_path)
+            local_contexts = restored.resolve_recall_contexts(
+                context_id="alpha",
+                scope="local",
+            )
+            connected_contexts = restored.resolve_recall_contexts(
+                context_id="alpha",
+                scope="connected",
+            )
+            all_contexts = restored.resolve_recall_contexts(
+                context_id="alpha",
+                scope="all",
+            )
+            local_recall = restored.recall_candidates(
+                context_id="alpha",
+                query_spikes={2, 3},
+                firing_values=[0.0] * 12,
+                limit=10,
+            )
+            connected_recall = restored.recall_candidates(
+                context_id="alpha",
+                query_spikes={2, 3},
+                firing_values=[0.0] * 12,
+                limit=10,
+                recall_scope="connected",
+            )
+            all_recall = restored.recall_candidates(
+                context_id="alpha",
+                query_spikes={8, 9},
+                firing_values=[0.0] * 12,
+                limit=10,
+                recall_scope="all",
+            )
+            exported = restored.export_json(export_path)
+            stats = restored.stats()
+
+        self.assertEqual(
+            [record["context_id"] for record in local_contexts],
+            ["alpha", "global"],
+        )
+        self.assertEqual(
+            {record["context_id"] for record in connected_contexts},
+            {"alpha", "beta", "global"},
+        )
+        self.assertNotIn("gamma", {record["context_id"] for record in connected_contexts})
+        self.assertEqual(
+            {record["context_id"] for record in all_contexts},
+            {"alpha", "beta", "gamma", "global"},
+        )
+        self.assertNotIn(beta["memory_id"], {item["memory_id"] for item in local_recall})
+        beta_hit = next(item for item in connected_recall if item["memory_id"] == beta["memory_id"])
+        self.assertEqual(beta_hit["recall_provenance"], "connected")
+        self.assertEqual(beta_hit["via_context_link_id"], alpha_beta["context_link_id"])
+        gamma_hit = next(item for item in all_recall if item["memory_id"] == gamma["memory_id"])
+        self.assertEqual(gamma_hit["recall_provenance"], "all")
+        self.assertEqual(exported["context_links"][0]["approved_by"], "unit-test")
+        self.assertEqual(stats["context_link_count"], 2)
+        self.assertEqual(alpha["context_id"], "alpha")
+
     def test_context_bus_events_are_persisted_listed_and_exported(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "synapse-memory.sqlite3"
@@ -506,6 +684,128 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertTrue(deletion["deleted"])
         self.assertEqual(deletion["event_id"], first["event_id"])
         self.assertEqual([event["event_id"] for event in remaining], [second["event_id"]])
+
+    def test_namespace_graph_snapshot_is_context_isolated_and_excludes_legacy_bad_edges(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            first = store.upsert_entry(
+                tag="alpha-first",
+                context_id="alpha",
+                source_text="First alpha node.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[1],
+                neuron_indices=[1],
+                registered_at=10.0,
+            )
+            second = store.upsert_entry(
+                tag="alpha-second",
+                context_id="alpha",
+                source_text="Second alpha node.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[2],
+                neuron_indices=[2],
+                registered_at=11.0,
+            )
+            other = store.upsert_entry(
+                tag="beta-only",
+                context_id="beta",
+                source_text="Must remain isolated.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[3],
+                neuron_indices=[3],
+                registered_at=12.0,
+            )
+            valid = store.upsert_relationship(
+                context_id="alpha",
+                source_memory_id=first["memory_id"],
+                target_memory_id=second["memory_id"],
+                relation_type="temporal_next",
+                weight=0.9,
+            )
+            # Legacy files can have been edited while foreign keys were off.
+            # The snapshot must omit those rows rather than expose a cross-context
+            # or missing endpoint through the drill-down API.
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO memory_relationships (
+                        relationship_id, context_id, source_memory_id, target_memory_id,
+                        relation_type, weight, evidence_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-cross-context",
+                        "alpha",
+                        first["memory_id"],
+                        other["memory_id"],
+                        "legacy",
+                        0.1,
+                        "{}",
+                        13.0,
+                        13.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO memory_relationships (
+                        relationship_id, context_id, source_memory_id, target_memory_id,
+                        relation_type, weight, evidence_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-missing-endpoint",
+                        "alpha",
+                        first["memory_id"],
+                        "missing-memory-id",
+                        "legacy",
+                        0.1,
+                        "{}",
+                        14.0,
+                        14.0,
+                    ),
+                )
+                conn.commit()
+
+            first_snapshot = store.namespace_graph_snapshot(
+                context_id="alpha",
+                entry_scan_limit=10,
+                relationship_scan_limit=10,
+            )
+            second_snapshot = store.namespace_graph_snapshot(
+                context_id="alpha",
+                entry_scan_limit=10,
+                relationship_scan_limit=10,
+            )
+            deletion = store.delete_entry(
+                context_id="alpha",
+                memory_id=second["memory_id"],
+            )
+            after_prune = store.namespace_graph_snapshot(
+                context_id="alpha",
+                entry_scan_limit=10,
+                relationship_scan_limit=10,
+            )
+
+        self.assertEqual(first_snapshot, second_snapshot)
+        self.assertEqual(first_snapshot["entry_total"], 2)
+        self.assertEqual(first_snapshot["relationship_total"], 1)
+        self.assertEqual(
+            [entry["memory_id"] for entry in first_snapshot["entries"]],
+            sorted([first["memory_id"], second["memory_id"]]),
+        )
+        self.assertEqual(
+            [edge["relationship_id"] for edge in first_snapshot["relationships"]],
+            [valid["relationship_id"]],
+        )
+        self.assertTrue(first_snapshot["read_only"])
+        self.assertTrue(deletion["deleted"])
+        self.assertEqual(after_prune["entry_total"], 1)
+        self.assertEqual(after_prune["relationship_total"], 0)
+        self.assertEqual(after_prune["relationships"], [])
 
 
 if __name__ == "__main__":
