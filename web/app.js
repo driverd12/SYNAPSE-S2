@@ -385,6 +385,9 @@ const state = {
     focusedDetail: null,
     detailContextId: "",
     focusedClusterId: "",
+    detailRevision: 0,
+    detailMetricsCacheKey: "",
+    detailMetricsCache: null,
     detailPositions: new Map(),
     detailLayoutSignature: "",
     projectedGanglia: [],
@@ -1143,7 +1146,7 @@ async function refreshNamespaceGalaxy() {
   }
   try {
     const payload = await requestJson("/api/namespace-map", {
-      params: { context_id: contextId },
+      params: { context_id: contextId, limit: 2000 },
     });
     if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
     const data = normalizeNamespaceMap(payload);
@@ -1217,7 +1220,7 @@ async function refreshNamespaceDetail({ contextId, clusterId = "" } = {}) {
   const nextClusterId = String(clusterId || "").trim();
   const requestToken = ++galaxy.detailRequestToken;
   try {
-    const payload = await requestJson("/api/namespace-detail", {
+    const neuronRequest = requestJson("/api/namespace-detail", {
       params: {
         context_id: nextContextId,
         level: "neurons",
@@ -1225,15 +1228,38 @@ async function refreshNamespaceDetail({ contextId, clusterId = "" } = {}) {
         limit: NAMESPACE_DETAIL_LIMIT,
       },
     });
+    const ganglionRequest = nextClusterId
+      ? Promise.resolve(null)
+      : requestJson("/api/namespace-detail", {
+        params: {
+          context_id: nextContextId,
+          level: "ganglion",
+          limit: NAMESPACE_DETAIL_LIMIT,
+        },
+      }).catch((error) => {
+        logOperation("Namespace ganglion aggregate unavailable", error.message);
+        return null;
+      });
+    const [payload, ganglionPayload] = await Promise.all([neuronRequest, ganglionRequest]);
     if (requestToken !== galaxy.detailRequestToken || galaxy.view !== "namespace") return null;
     if (nextContextId !== galaxy.detailContextId) return null;
     if (nextClusterId !== galaxy.focusedClusterId) return null;
     const detail = normalizeNamespaceDetail(payload);
+    if (ganglionPayload) {
+      const ganglionDetail = normalizeNamespaceDetail(ganglionPayload);
+      detail.aggregateEdges = ganglionDetail.edges;
+      detail.aggregateCounts = ganglionDetail.counts;
+      detail.aggregateTruncation = ganglionDetail.truncation;
+      detail.aggregateAvailable = true;
+    }
     if (nextClusterId) {
       galaxy.focusedDetail = detail;
     } else {
       galaxy.detail = detail;
     }
+    galaxy.detailRevision += 1;
+    galaxy.detailMetricsCacheKey = "";
+    galaxy.detailMetricsCache = null;
     renderNamespaceDetail();
     if (detail.empty || (!detail.clusters.length && !detail.nodes.length)) {
       setNamespaceGalaxyState("empty", `${nextContextId} has no stored neurons`, "This read-only namespace has no graph detail to display yet.");
@@ -1279,6 +1305,7 @@ function normalizeNamespaceDetail(payload = {}) {
         basis: String(rawCluster?.basis || "stored_type"),
         anchorMemoryId: rawCluster?.anchor_memory_id ?? null,
         memoryTotal: galaxyNumber(rawCluster?.memory_total, 0),
+        memoryTotalIsLowerBound: Boolean(rawCluster?.memory_total_is_lower_bound),
         memberMemoryIds: Array.isArray(rawCluster?.member_memory_id_sample) ? rawCluster.member_memory_id_sample.map(String) : [],
         nodeTypeCounts: rawCluster?.node_type_counts && typeof rawCluster.node_type_counts === "object" ? rawCluster.node_type_counts : {},
         firstCreatedAt: rawCluster?.first_created_at ?? null,
@@ -1317,6 +1344,7 @@ function normalizeNamespaceDetail(payload = {}) {
       const sourceId = String(rawEdge?.source_id ?? rawEdge?.source ?? "").trim();
       const targetId = String(rawEdge?.target_id ?? rawEdge?.target ?? "").trim();
       if (!sourceId || !targetId || sourceId === targetId) return null;
+      const weight = clamp(galaxyNumber(rawEdge?.weight, 0.5), 0, 1);
       return {
         kind: "detail-edge",
         id: String(rawEdge?.edge_id || `detail-edge:${sourceId}:${targetId}:${index}`),
@@ -1324,7 +1352,9 @@ function normalizeNamespaceDetail(payload = {}) {
         targetId,
         edgeType: String(rawEdge?.edge_type || "relationship"),
         direction: String(rawEdge?.direction || "directed"),
-        weight: clamp(galaxyNumber(rawEdge?.weight, 0.5), 0, 1),
+        weight,
+        averageWeight: clamp(galaxyNumber(rawEdge?.average_weight, weight), 0, 1),
+        storedRelationshipCount: Math.max(1, Math.trunc(galaxyNumber(rawEdge?.stored_relationship_count, 1))),
         createdAt: rawEdge?.created_at ?? null,
         updatedAt: rawEdge?.updated_at ?? null,
         provenance: rawEdge?.provenance ?? null,
@@ -1345,29 +1375,187 @@ function normalizeNamespaceDetail(payload = {}) {
     clusters,
     nodes,
     edges,
+    aggregateEdges: [],
+    aggregateCounts: {},
+    aggregateTruncation: {},
+    aggregateAvailable: false,
   };
 }
 
 function combinedNamespaceDetail() {
-  const base = state.namespaceGalaxy.detail;
+  const galaxy = state.namespaceGalaxy;
+  const base = galaxy.detail;
   if (!base) return null;
-  const focused = state.namespaceGalaxy.focusedDetail;
-  if (!focused || !state.namespaceGalaxy.focusedClusterId) return base;
-  const clusterId = state.namespaceGalaxy.focusedClusterId;
+  const focused = galaxy.focusedDetail;
+  const cacheKey = `${galaxy.detailRevision}:${galaxy.focusedClusterId}:${focused ? "focused" : "base"}`;
+  if (galaxy.detailMetricsCacheKey === cacheKey && galaxy.detailMetricsCache) {
+    return galaxy.detailMetricsCache;
+  }
+  if (!focused || !galaxy.focusedClusterId) {
+    galaxy.detailMetricsCache = applyNamespaceDetailMetrics(base);
+    galaxy.detailMetricsCacheKey = cacheKey;
+    return galaxy.detailMetricsCache;
+  }
+  const clusterId = galaxy.focusedClusterId;
   const nodes = new Map(base.nodes.filter((node) => node.clusterId !== clusterId).map((node) => [node.id, node]));
   focused.nodes.forEach((node) => nodes.set(node.id, node));
   const edges = new Map(base.edges.map((edge) => [edge.id, edge]));
   focused.edges.forEach((edge) => edges.set(edge.id, edge));
   const clusters = new Map(base.clusters.map((cluster) => [cluster.clusterId, cluster]));
   focused.clusters.forEach((cluster) => clusters.set(cluster.clusterId, cluster));
-  return { ...base, nodes: [...nodes.values()], edges: [...edges.values()], clusters: [...clusters.values()] };
+  galaxy.detailMetricsCache = applyNamespaceDetailMetrics({
+    ...base,
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    clusters: [...clusters.values()],
+  });
+  galaxy.detailMetricsCacheKey = cacheKey;
+  return galaxy.detailMetricsCache;
+}
+
+function applyNamespaceDetailMetrics(detail) {
+  const nodes = detail.nodes.map((node) => ({ ...node }));
+  const clusters = detail.clusters.map((cluster) => ({ ...cluster }));
+  const nodeClusterById = new Map(nodes.map((node) => [node.id, node.clusterId]));
+  const clusterIds = new Set(clusters.map((cluster) => cluster.clusterId));
+  const clusterMetrics = new Map(clusters.map((cluster) => [cluster.clusterId, {
+    relationshipCount: 0,
+    aggregateEdgeWeight: 0,
+  }]));
+  const neuronMetrics = new Map(nodes.map((node) => [node.id, {
+    relationshipCount: 0,
+    weightedDegree: 0,
+  }]));
+  const neuronNeighborhoods = new Map(nodes.map((node) => [node.id, new Set([node.id])]));
+  const clusterNeighborhoods = new Map(clusters.map((cluster) => [
+    cluster.clusterId,
+    new Set([cluster.id, cluster.clusterId]),
+  ]));
+  nodes.forEach((node) => clusterNeighborhoods.get(node.clusterId)?.add(node.id));
+
+  detail.edges.forEach((edge) => {
+    const relationshipCount = Math.max(1, edge.storedRelationshipCount || 1);
+    const aggregateWeight = clamp(edge.averageWeight ?? edge.weight, 0, 1) * relationshipCount;
+    const sourceNeuron = neuronMetrics.get(edge.sourceId);
+    const targetNeuron = neuronMetrics.get(edge.targetId);
+    if (sourceNeuron) {
+      sourceNeuron.relationshipCount += relationshipCount;
+      sourceNeuron.weightedDegree += aggregateWeight;
+    }
+    if (targetNeuron) {
+      targetNeuron.relationshipCount += relationshipCount;
+      targetNeuron.weightedDegree += aggregateWeight;
+    }
+    if (sourceNeuron && targetNeuron) {
+      neuronNeighborhoods.get(edge.sourceId)?.add(edge.targetId);
+      neuronNeighborhoods.get(edge.targetId)?.add(edge.sourceId);
+    }
+  });
+
+  const clusterMetricEdges = detail.aggregateAvailable ? detail.aggregateEdges : detail.edges;
+  clusterMetricEdges.forEach((edge) => {
+    const relationshipCount = Math.max(1, edge.storedRelationshipCount || 1);
+    const aggregateWeight = clamp(edge.averageWeight ?? edge.weight, 0, 1) * relationshipCount;
+    const sourceCluster = nodeClusterById.get(edge.sourceId)
+      || (clusterIds.has(edge.sourceId) ? edge.sourceId : "");
+    const targetCluster = nodeClusterById.get(edge.targetId)
+      || (clusterIds.has(edge.targetId) ? edge.targetId : "");
+    new Set([sourceCluster, targetCluster].filter(Boolean)).forEach((clusterId) => {
+      const metric = clusterMetrics.get(clusterId);
+      if (!metric) return;
+      metric.relationshipCount += relationshipCount;
+      metric.aggregateEdgeWeight += aggregateWeight;
+    });
+    if (sourceCluster && targetCluster) {
+      clusterNeighborhoods.get(sourceCluster)?.add(targetCluster);
+      clusterNeighborhoods.get(targetCluster)?.add(sourceCluster);
+    }
+  });
+
+  const aggregateScopeIsBounded = Boolean(
+    detail.aggregateCounts?.eligible_edges_is_lower_bound
+    || detail.aggregateCounts?.eligible_clusters_is_lower_bound
+    || detail.aggregateTruncation?.truncated
+    || detail.aggregateTruncation?.edges?.truncated
+    || detail.aggregateTruncation?.clusters?.truncated
+    || detail.aggregateTruncation?.source_scan?.entries_truncated
+    || detail.aggregateTruncation?.source_scan?.relationships_truncated,
+  );
+  const clusterMetricScope = detail.aggregateAvailable
+    ? aggregateScopeIsBounded
+      ? "bounded stored aggregate"
+      : "stored aggregate"
+    : "visible sample";
+
+  const clusterRows = clusters.map((cluster) => {
+    const metric = clusterMetrics.get(cluster.clusterId) || {
+      relationshipCount: 0,
+      aggregateEdgeWeight: 0,
+    };
+    return {
+      ...cluster,
+      ...metric,
+      weightedRelationshipDensity: metric.aggregateEdgeWeight / Math.max(1, cluster.memoryTotal),
+      relationshipMetricScope: clusterMetricScope,
+    };
+  });
+  const maxClusterMemory = Math.max(0, ...clusterRows.map((cluster) => cluster.memoryTotal));
+  const maxClusterDensity = Math.max(0, ...clusterRows.map((cluster) => cluster.weightedRelationshipDensity));
+  const decoratedClusters = clusterRows.map((cluster) => {
+    const memoryScore = relativeLogScore(cluster.memoryTotal, maxClusterMemory);
+    const relationshipDensityScore = relativeLogScore(cluster.weightedRelationshipDensity, maxClusterDensity);
+    return {
+      ...cluster,
+      memoryScore,
+      relationshipDensityScore,
+      visualMassScore: weightedAvailableScore([
+        [memoryScore, 0.68],
+        [relationshipDensityScore, 0.32],
+      ]),
+    };
+  });
+
+  const neuronRows = nodes.map((node) => ({
+    ...node,
+    ...(neuronMetrics.get(node.id) || { relationshipCount: 0, weightedDegree: 0 }),
+  }));
+  const maxWeightedDegree = Math.max(0, ...neuronRows.map((node) => node.weightedDegree));
+  const decoratedNodes = neuronRows.map((node) => ({
+    ...node,
+    visualMassScore: relativeLogScore(node.weightedDegree, maxWeightedDegree),
+  }));
+
+  const relationshipDensity = detail.namespace.relationshipTotal / Math.max(1, detail.namespace.entryTotal);
+  const cortexVolumeScore = saturatingLogScore(detail.namespace.entryTotal, 64);
+  const cortexRelationshipDensityScore = saturatingLogScore(relationshipDensity, 1);
+  const namespace = {
+    ...detail.namespace,
+    relationshipDensity,
+    volumeScore: cortexVolumeScore,
+    relationshipDensityScore: cortexRelationshipDensityScore,
+    visualMassScore: weightedAvailableScore([
+      [cortexVolumeScore, 0.72],
+      [cortexRelationshipDensityScore, 0.28],
+    ]),
+  };
+
+  return {
+    ...detail,
+    namespace,
+    clusters: decoratedClusters,
+    nodes: decoratedNodes,
+    neighborhoodIndex: {
+      clusters: clusterNeighborhoods,
+      neurons: neuronNeighborhoods,
+    },
+  };
 }
 
 async function focusNamespaceGanglion(clusterId, { pushHistory = false } = {}) {
   const galaxy = state.namespaceGalaxy;
   const nextClusterId = String(clusterId || "").trim();
   if (galaxy.view !== "namespace" || !nextClusterId) return null;
-  const cluster = galaxy.detail?.clusters.find((item) => item.clusterId === nextClusterId);
+  const cluster = combinedNamespaceDetail()?.clusters.find((item) => item.clusterId === nextClusterId);
   if (!cluster) return null;
   galaxy.focusedClusterId = nextClusterId;
   galaxy.detailSelection = cluster;
@@ -1381,7 +1569,7 @@ async function focusNamespaceGanglion(clusterId, { pushHistory = false } = {}) {
   renderNamespaceDetailList();
   requestNamespaceGalaxyDraw();
   if (pushHistory) updateNamespaceGalaxyUrl({ contextId: galaxy.detailContextId, clusterId: nextClusterId, push: true });
-  setNamespaceGalaxyState("loading", `Expanding ${cluster.label}`, "Loading the bounded exact neurons and relationships for this ganglion.");
+  setNamespaceGalaxyState("loading", `Expanding ${cluster.label}`, "Loading the bounded returned neurons and relationships for this ganglion.");
   return refreshNamespaceDetail({ contextId: galaxy.detailContextId, clusterId: nextClusterId });
 }
 
@@ -1395,8 +1583,11 @@ function clearNamespaceGanglionFocus({ useHistory = false } = {}) {
   galaxy.focusedClusterId = "";
   galaxy.detailRequestToken += 1;
   galaxy.focusedDetail = null;
-  galaxy.detailSelection = galaxy.detail?.namespace || null;
-  galaxy.keyboardDetailId = galaxy.detail?.clusters[0]?.id || "";
+  galaxy.detailMetricsCacheKey = "";
+  galaxy.detailMetricsCache = null;
+  const detail = combinedNamespaceDetail();
+  galaxy.detailSelection = detail?.namespace || null;
+  galaxy.keyboardDetailId = detail?.clusters[0]?.id || "";
   galaxy.zoom = 1;
   galaxy.pan = { x: 0, y: 0 };
   rebuildNamespaceDetailLayout();
@@ -1496,6 +1687,7 @@ function normalizeNamespaceMap(payload = {}) {
       contextId,
       entryCount: galaxyNumber(rawNode.entry_count ?? rawNode.memory_count ?? rawNode.count, 0),
       relationshipCount: galaxyOptionalNumber(rawNode.relationship_count ?? rawNode.edge_count),
+      surfaceTermCount: galaxyOptionalNumber(rawNode.surface_term_count ?? rawNode.surfaceTermCount),
       eventCount: galaxyOptionalNumber(rawNode.event_count ?? rawNode.context_event_count),
       updatedAt: rawNode.updated_at
         ?? rawNode.last_updated_at
@@ -1562,17 +1754,118 @@ function normalizeNamespaceMap(payload = {}) {
     nodeMap.has(link.sourceContextId) && nodeMap.has(link.targetContextId)
   );
 
+  const storedLinks = links.filter(hasStoredEndpoint);
+  const nodes = applyNamespaceGalaxyMetrics([...nodeMap.values()], storedLinks);
+
   return {
     scope: String(payload.scope || "all"),
     selectedContextId,
-    nodes: [...nodeMap.values()].sort((left, right) => (
+    nodes: nodes.sort((left, right) => (
       right.entryCount - left.entryCount
       || left.contextId.localeCompare(right.contextId, undefined, { sensitivity: "base" })
     )),
-    links: links.filter(hasStoredEndpoint),
+    links: storedLinks,
     suggestions: suggestions.filter(hasStoredEndpoint),
     stats: payload.stats && typeof payload.stats === "object" ? payload.stats : {},
   };
+}
+
+function applyNamespaceGalaxyMetrics(nodes, links) {
+  const enabledApprovedLinks = links.filter((link) => link.enabled && link.approved);
+  const bridgeWeightByContext = new Map(nodes.map((node) => [node.contextId, 0]));
+  enabledApprovedLinks.forEach((link) => {
+    bridgeWeightByContext.set(
+      link.sourceContextId,
+      (bridgeWeightByContext.get(link.sourceContextId) || 0) + link.weight,
+    );
+    bridgeWeightByContext.set(
+      link.targetContextId,
+      (bridgeWeightByContext.get(link.targetContextId) || 0) + link.weight,
+    );
+  });
+  const maxEntries = Math.max(0, ...nodes.map((node) => node.entryCount));
+  const relationshipDensities = nodes
+    .filter((node) => node.relationshipCount !== null)
+    .map((node) => node.relationshipCount / Math.max(1, node.entryCount));
+  const surfaceDensities = nodes
+    .filter((node) => node.surfaceTermCount !== null)
+    .map((node) => node.surfaceTermCount / Math.max(1, node.entryCount));
+  const maxRelationshipDensity = Math.max(0, ...relationshipDensities);
+  const maxSurfaceDensity = Math.max(0, ...surfaceDensities);
+  const maxBridgeWeight = Math.max(0, ...bridgeWeightByContext.values());
+
+  return nodes.map((node) => {
+    const relationshipDensity = node.relationshipCount === null
+      ? null
+      : node.relationshipCount / Math.max(1, node.entryCount);
+    const surfaceDensity = node.surfaceTermCount === null
+      ? null
+      : node.surfaceTermCount / Math.max(1, node.entryCount);
+    const volumeScore = relativeLogScore(node.entryCount, maxEntries);
+    const relationshipDensityScore = relationshipDensity === null
+      ? null
+      : relativeLogScore(relationshipDensity, maxRelationshipDensity);
+    const surfaceDensityScore = surfaceDensity === null
+      ? null
+      : relativeLogScore(surfaceDensity, maxSurfaceDensity);
+    const densityScore = Number.isFinite(surfaceDensityScore) || Number.isFinite(relationshipDensityScore)
+      ? weightedAvailableScore([
+        [surfaceDensityScore, 0.55],
+        [relationshipDensityScore, 0.45],
+      ])
+      : null;
+    const bridgeCentrality = bridgeWeightByContext.get(node.contextId) || 0;
+    const bridgeScore = relativeLogScore(bridgeCentrality, maxBridgeWeight);
+    const visualMassScore = weightedAvailableScore([
+      [volumeScore, 0.58],
+      [densityScore, 0.27],
+      [bridgeScore, 0.15],
+    ]);
+    return {
+      ...node,
+      relationshipDensity,
+      surfaceDensity,
+      bridgeCentrality,
+      volumeScore,
+      densityScore,
+      relationshipDensityScore,
+      surfaceDensityScore,
+      bridgeScore,
+      visualMassScore,
+    };
+  });
+}
+
+function relativeLogScore(value, maximum) {
+  const safeValue = Math.max(0, galaxyNumber(value, 0));
+  const safeMaximum = Math.max(0, galaxyNumber(maximum, 0));
+  if (safeMaximum <= 0) return 0;
+  return clamp(Math.log1p(safeValue) / Math.log1p(safeMaximum), 0, 1);
+}
+
+function saturatingLogScore(value, pivot) {
+  const safeValue = Math.max(0, galaxyNumber(value, 0));
+  if (safeValue <= 0) return 0;
+  const numerator = Math.log1p(safeValue);
+  return clamp(numerator / (numerator + Math.log1p(Math.max(0.001, pivot))), 0, 1);
+}
+
+function weightedAvailableScore(parts) {
+  const available = parts.filter(([value, weight]) => Number.isFinite(value) && weight > 0);
+  const weightTotal = available.reduce((sum, [, weight]) => sum + weight, 0);
+  if (weightTotal <= 0) return 0;
+  return clamp(
+    available.reduce((sum, [value, weight]) => sum + clamp(value, 0, 1) * weight, 0) / weightTotal,
+    0,
+    1,
+  );
+}
+
+function boundedAreaRadius(score, minimumRadius, maximumRadius) {
+  const normalized = clamp(galaxyNumber(score, 0), 0, 1);
+  const minimumArea = minimumRadius * minimumRadius;
+  const maximumArea = maximumRadius * maximumRadius;
+  return Math.sqrt(minimumArea + normalized * (maximumArea - minimumArea));
 }
 
 function namespaceMapFallbackFromSnapshot() {
@@ -1669,9 +1962,26 @@ function renderNamespaceGalaxy(data) {
 }
 
 function namespaceGalaxyLayoutSignature(data) {
-  const nodes = data.nodes.map((node) => node.contextId).sort().join("|");
+  const nodes = data.nodes
+    .map((node) => [
+      node.contextId,
+      node.entryCount,
+      node.relationshipCount ?? "missing",
+      node.surfaceTermCount ?? "missing",
+      node.bridgeCentrality.toFixed(3),
+      node.visualMassScore.toFixed(3),
+    ].join(":"))
+    .sort()
+    .join("|");
   const links = data.links
-    .map((link) => `${link.sourceContextId}>${link.targetContextId}:${link.weight.toFixed(3)}`)
+    .map((link) => [
+      `${link.sourceContextId}>${link.targetContextId}`,
+      link.relationType,
+      link.direction,
+      link.approved ? "approved" : "unapproved",
+      link.enabled ? "enabled" : "disabled",
+      link.weight.toFixed(3),
+    ].join(":"))
     .sort()
     .join("|");
   return `${nodes}::${links}`;
@@ -1679,9 +1989,11 @@ function namespaceGalaxyLayoutSignature(data) {
 
 function buildNamespaceGalaxyLayout(nodes, links) {
   const positions = new Map();
+  const massByPosition = new Map();
   nodes.forEach((node, index) => {
     const vector = namespaceHashVector(node.contextId, index, nodes.length);
     positions.set(node.contextId, vector);
+    massByPosition.set(vector, clamp(node.visualMassScore, 0, 1));
   });
   if (nodes.length <= 1) {
     const only = nodes[0];
@@ -1690,6 +2002,7 @@ function buildNamespaceGalaxyLayout(nodes, links) {
   }
 
   const linkRows = links
+    .filter((link) => link.enabled && link.approved)
     .map((link) => ({
       source: positions.get(link.sourceContextId),
       target: positions.get(link.targetContextId),
@@ -1697,30 +2010,65 @@ function buildNamespaceGalaxyLayout(nodes, links) {
     }))
     .filter((link) => link.source && link.target && link.source !== link.target);
   const vectors = [...positions.values()];
-  const iterations = Math.min(84, Math.max(36, nodes.length * 2));
+  const iterations = nodes.length > 500
+    ? 28
+    : nodes.length > 180
+      ? 42
+      : Math.min(84, Math.max(36, nodes.length * 2));
   for (let iteration = 0; iteration < iterations; iteration += 1) {
     const cooling = 1 - iteration / iterations;
     const deltas = new Map(vectors.map((vector) => [vector, { x: 0, y: 0, z: 0 }]));
-    for (let leftIndex = 0; leftIndex < vectors.length; leftIndex += 1) {
-      for (let rightIndex = leftIndex + 1; rightIndex < vectors.length; rightIndex += 1) {
-        const left = vectors[leftIndex];
-        const right = vectors[rightIndex];
-        const dx = left.x - right.x;
-        const dy = left.y - right.y;
-        const dz = left.z - right.z;
-        const distanceSquared = dx * dx + dy * dy + dz * dz + 0.025;
-        const force = Math.min(0.045, 0.0048 / distanceSquared) * cooling;
-        const length = Math.sqrt(distanceSquared);
-        const fx = (dx / length) * force;
-        const fy = (dy / length) * force;
-        const fz = (dz / length) * force;
-        deltas.get(left).x += fx;
-        deltas.get(left).y += fy;
-        deltas.get(left).z += fz;
-        deltas.get(right).x -= fx;
-        deltas.get(right).y -= fy;
-        deltas.get(right).z -= fz;
+    const applyRepulsion = (left, right) => {
+      const dx = left.x - right.x;
+      const dy = left.y - right.y;
+      const dz = left.z - right.z;
+      const distanceSquared = dx * dx + dy * dy + dz * dz + 0.025;
+      const leftMass = massByPosition.get(left) || 0;
+      const rightMass = massByPosition.get(right) || 0;
+      const clearance = 0.16 + 0.16 * (Math.sqrt(leftMass) + Math.sqrt(rightMass));
+      const distance = Math.sqrt(distanceSquared);
+      const collision = Math.max(0, clearance - distance) * 0.085;
+      const force = (Math.min(0.052, 0.0048 * (1 + leftMass + rightMass) / distanceSquared) + collision) * cooling;
+      const fx = (dx / distance) * force;
+      const fy = (dy / distance) * force;
+      const fz = (dz / distance) * force;
+      deltas.get(left).x += fx;
+      deltas.get(left).y += fy;
+      deltas.get(left).z += fz;
+      deltas.get(right).x -= fx;
+      deltas.get(right).y -= fy;
+      deltas.get(right).z -= fz;
+    };
+    if (vectors.length <= 180) {
+      for (let leftIndex = 0; leftIndex < vectors.length; leftIndex += 1) {
+        for (let rightIndex = leftIndex + 1; rightIndex < vectors.length; rightIndex += 1) {
+          applyRepulsion(vectors[leftIndex], vectors[rightIndex]);
+        }
       }
+    } else {
+      const cellSize = 0.5;
+      const cells = new Map();
+      const cellCoordinate = (value) => Math.floor((value + 1.2) / cellSize);
+      vectors.forEach((vector, index) => {
+        const key = `${cellCoordinate(vector.x)}:${cellCoordinate(vector.y)}:${cellCoordinate(vector.z)}`;
+        if (!cells.has(key)) cells.set(key, []);
+        cells.get(key).push({ vector, index });
+      });
+      vectors.forEach((left, leftIndex) => {
+        const cellX = cellCoordinate(left.x);
+        const cellY = cellCoordinate(left.y);
+        const cellZ = cellCoordinate(left.z);
+        for (let xOffset = -1; xOffset <= 1; xOffset += 1) {
+          for (let yOffset = -1; yOffset <= 1; yOffset += 1) {
+            for (let zOffset = -1; zOffset <= 1; zOffset += 1) {
+              const rows = cells.get(`${cellX + xOffset}:${cellY + yOffset}:${cellZ + zOffset}`) || [];
+              rows.forEach(({ vector: right, index: rightIndex }) => {
+                if (rightIndex > leftIndex) applyRepulsion(left, right);
+              });
+            }
+          }
+        }
+      });
     }
     linkRows.forEach((link) => {
       const dx = link.target.x - link.source.x;
@@ -1900,15 +2248,16 @@ function drawNamespaceDetail(context, width, height, palette) {
     .sort((left, right) => left.depth - right.depth);
   const ganglionByCluster = new Map(ganglia.map((item) => [item.item.clusterId, item]));
   const memoryById = new Map(memories.map((item) => [item.item.id, item]));
+  const neighborhood = namespaceDetailNeighborhood(detail);
 
-  drawNamespaceMembershipTendrils(context, memories, ganglionByCluster, palette, lod);
+  drawNamespaceMembershipTendrils(context, memories, ganglionByCluster, palette, lod, neighborhood);
   const projectedEdges = lod === "neurons"
     ? projectExactNamespaceDetailEdges(detail.edges, memoryById, ganglionByCluster)
     : projectAggregateNamespaceDetailEdges(detail, ganglionByCluster);
   projectedEdges.sort((left, right) => left.depth - right.depth)
-    .forEach((edge) => drawNamespaceDetailEdge(context, edge, palette, lod));
-  memories.forEach((node) => drawNamespaceMemoryNode(context, node, palette, lod));
-  ganglia.forEach((cluster) => drawNamespaceGanglion(context, cluster, palette));
+    .forEach((edge) => drawNamespaceDetailEdge(context, edge, palette, lod, neighborhood));
+  memories.forEach((node) => drawNamespaceMemoryNode(context, node, palette, lod, neighborhood));
+  ganglia.forEach((cluster) => drawNamespaceGanglion(context, cluster, palette, neighborhood));
   drawNamespaceDetailLabels(context, ganglia, memories, palette, width, height, lod);
 
   galaxy.projectedGanglia = ganglia;
@@ -1933,7 +2282,7 @@ function drawNamespaceDetailField(context, width, height, palette, lod) {
 
 function drawNamespaceCortex(context, detail, width, height, palette) {
   const selected = state.namespaceGalaxy.detailSelection?.kind === "namespace-detail";
-  const radius = clamp(30 + Math.log1p(detail.namespace.entryTotal) * 3.2, 34, 72);
+  const radius = boundedAreaRadius(detail.namespace.visualMassScore, 38, 78);
   const x = width / 2 + state.namespaceGalaxy.pan.x;
   const y = height / 2 + state.namespaceGalaxy.pan.y;
   const gradient = context.createRadialGradient(x - radius * 0.28, y - radius * 0.28, 2, x, y, radius);
@@ -1989,8 +2338,14 @@ function projectNamespaceDetailItem(item, width, height) {
   const yScale = height * 0.43 * state.namespaceGalaxy.zoom;
   const isGanglion = item.kind === "ganglion";
   const radius = isGanglion
-    ? clamp((8 + Math.log1p(Math.max(0, item.memoryTotal)) * 1.45) * perspective, 8, 25)
-    : clamp((1.45 + state.namespaceGalaxy.zoom * 0.72) * perspective, 1.5, 5.2);
+    ? clamp(boundedAreaRadius(item.visualMassScore, 9, 30) * perspective, 8, 35)
+    : clamp(
+      boundedAreaRadius(item.visualMassScore, 1.8, 6.2)
+        * perspective
+        * clamp(0.9 + state.namespaceGalaxy.zoom * 0.15, 1, 1.42),
+      1.6,
+      8.8,
+    );
   return {
     item,
     x: width / 2 + state.namespaceGalaxy.pan.x + rotated.x * xScale * perspective,
@@ -2001,14 +2356,31 @@ function projectNamespaceDetailItem(item, width, height) {
   };
 }
 
-function drawNamespaceMembershipTendrils(context, memories, ganglionByCluster, palette, lod) {
+function namespaceDetailNeighborhood(detail) {
+  const focal = state.namespaceGalaxy.detailHover || state.namespaceGalaxy.detailSelection;
+  if (!focal || focal.kind === "namespace-detail") return null;
+  const indexed = focal.kind === "ganglion"
+    ? detail.neighborhoodIndex?.clusters?.get(focal.clusterId)
+    : detail.neighborhoodIndex?.neurons?.get(focal.id);
+  const ids = new Set(indexed || [focal.id]);
+  if (focal.clusterId) ids.add(focal.clusterId);
+  return { focal, ids };
+}
+
+function drawNamespaceMembershipTendrils(context, memories, ganglionByCluster, palette, lod, neighborhood) {
   context.save();
   context.strokeStyle = palette.strong;
   context.lineWidth = lod === "neurons" ? 0.7 : 0.8;
-  context.globalAlpha = lod === "neurons" ? 0.18 : 0.3;
   memories.forEach((memory) => {
     const ganglion = ganglionByCluster.get(memory.item.clusterId);
     if (!ganglion) return;
+    const local = !neighborhood
+      || neighborhood.ids.has(memory.item.id)
+      || neighborhood.ids.has(ganglion.item.id)
+      || neighborhood.ids.has(ganglion.item.clusterId);
+    context.globalAlpha = local
+      ? lod === "neurons" ? 0.24 : 0.34
+      : 0.075;
     const midX = (ganglion.x + memory.x) / 2 + (memory.y - ganglion.y) * 0.08;
     const midY = (ganglion.y + memory.y) / 2 - (memory.x - ganglion.x) * 0.04;
     context.beginPath();
@@ -2031,13 +2403,27 @@ function projectExactNamespaceDetailEdges(edges, memoryById, ganglionByCluster) 
 }
 
 function projectAggregateNamespaceDetailEdges(detail, ganglionByCluster) {
+  if (detail.aggregateAvailable) {
+    return detail.aggregateEdges.map((edge) => {
+      const source = ganglionByCluster.get(edge.sourceId);
+      const target = ganglionByCluster.get(edge.targetId);
+      if (!source || !target) return null;
+      return {
+        item: edge,
+        source,
+        target,
+        depth: (source.depth + target.depth) / 2,
+        aggregateCount: Math.max(1, edge.storedRelationshipCount || 1),
+      };
+    }).filter(Boolean);
+  }
   const clusterByNode = new Map(detail.nodes.map((node) => [node.id, node.clusterId]));
   const aggregate = new Map();
   detail.edges.forEach((edge) => {
     const sourceCluster = clusterByNode.get(edge.sourceId);
     const targetCluster = clusterByNode.get(edge.targetId);
     if (!sourceCluster || !targetCluster || sourceCluster === targetCluster) return;
-    const key = [sourceCluster, targetCluster].sort().join("::");
+    const key = [sourceCluster, targetCluster, edge.edgeType, edge.direction].join("::");
     const row = aggregate.get(key) || {
       kind: "detail-edge",
       id: `aggregate:${key}`,
@@ -2046,26 +2432,49 @@ function projectAggregateNamespaceDetailEdges(detail, ganglionByCluster) {
       edgeType: edge.edgeType,
       direction: edge.direction,
       weight: 0,
+      weightSum: 0,
       count: 0,
     };
     row.weight = Math.max(row.weight, edge.weight);
-    row.count += 1;
+    row.weightSum += (edge.averageWeight ?? edge.weight) * Math.max(1, edge.storedRelationshipCount || 1);
+    row.count += Math.max(1, edge.storedRelationshipCount || 1);
     aggregate.set(key, row);
   });
   return [...aggregate.values()].map((edge) => {
     const source = ganglionByCluster.get(edge.sourceCluster);
     const target = ganglionByCluster.get(edge.targetCluster);
     if (!source || !target) return null;
-    return { item: edge, source, target, depth: (source.depth + target.depth) / 2, aggregateCount: edge.count };
+    return {
+      item: { ...edge, averageWeight: edge.weightSum / Math.max(1, edge.count) },
+      source,
+      target,
+      depth: (source.depth + target.depth) / 2,
+      aggregateCount: edge.count,
+    };
   }).filter(Boolean);
 }
 
-function drawNamespaceDetailEdge(context, projected, palette, lod) {
+function drawNamespaceDetailEdge(context, projected, palette, lod, neighborhood) {
   const associative = /associative|semantic|overlap/i.test(projected.item.edgeType);
+  const focal = neighborhood?.focal;
+  const local = !focal
+    || projected.source.item.id === focal.id
+    || projected.target.item.id === focal.id
+    || (focal.kind === "ganglion" && (
+      projected.source.item.clusterId === focal.clusterId
+      || projected.target.item.clusterId === focal.clusterId
+    ));
   context.save();
   context.strokeStyle = associative ? palette.associative : palette.strong;
-  context.globalAlpha = associative ? 0.38 : 0.46;
-  context.lineWidth = clamp(0.55 + projected.item.weight * 1.3 + Math.log1p(projected.aggregateCount) * 0.2, 0.6, 2.6);
+  context.globalAlpha = local
+    ? associative ? 0.52 : 0.64
+    : associative ? 0.14 : 0.18;
+  context.lineWidth = clamp(
+    0.55 + (projected.item.averageWeight ?? projected.item.weight) * 1.45
+      + Math.log1p(projected.aggregateCount) * 0.24,
+    0.6,
+    3.1,
+  );
   if (associative) context.setLineDash(lod === "neurons" ? [3, 4] : [2, 5]);
   const curve = (projected.target.x - projected.source.x) * 0.04;
   context.beginPath();
@@ -2080,13 +2489,16 @@ function drawNamespaceDetailEdge(context, projected, palette, lod) {
   context.restore();
 }
 
-function drawNamespaceGanglion(context, projected, palette) {
+function drawNamespaceGanglion(context, projected, palette, neighborhood) {
   const selected = state.namespaceGalaxy.detailSelection?.kind === "ganglion"
     && state.namespaceGalaxy.detailSelection.id === projected.item.id;
   const focused = state.namespaceGalaxy.focusedClusterId === projected.item.clusterId;
   const hovered = state.namespaceGalaxy.detailHover?.kind === "ganglion"
     && state.namespaceGalaxy.detailHover.id === projected.item.id;
   const active = selected || focused || hovered;
+  const local = !neighborhood
+    || neighborhood.ids.has(projected.item.id)
+    || neighborhood.ids.has(projected.item.clusterId);
   const glow = active ? palette.selected : palette.nodeHighlight;
   const gradient = context.createRadialGradient(
     projected.x - projected.radius * 0.28,
@@ -2100,6 +2512,7 @@ function drawNamespaceGanglion(context, projected, palette) {
   gradient.addColorStop(0.42, palette.node);
   gradient.addColorStop(1, palette.nodeShadow);
   context.save();
+  context.globalAlpha = local ? 1 : 0.38;
   context.shadowColor = glow;
   context.shadowBlur = active ? 24 : 14;
   context.fillStyle = gradient;
@@ -2120,14 +2533,19 @@ function drawNamespaceGanglion(context, projected, palette) {
   context.restore();
 }
 
-function drawNamespaceMemoryNode(context, projected, palette, lod) {
+function drawNamespaceMemoryNode(context, projected, palette, lod, neighborhood) {
   const selected = state.namespaceGalaxy.detailSelection?.kind === "memory"
     && state.namespaceGalaxy.detailSelection.id === projected.item.id;
   const hovered = state.namespaceGalaxy.detailHover?.kind === "memory"
     && state.namespaceGalaxy.detailHover.id === projected.item.id;
+  const local = !neighborhood || neighborhood.ids.has(projected.item.id);
   context.save();
   context.fillStyle = selected ? palette.selected : palette.neuron;
-  context.globalAlpha = selected || hovered ? 1 : lod === "neurons" ? 0.82 : 0.68;
+  context.globalAlpha = selected || hovered
+    ? 1
+    : local
+      ? lod === "neurons" ? 0.84 : 0.7
+      : 0.22;
   context.shadowColor = selected ? palette.selected : palette.neuron;
   context.shadowBlur = selected || hovered ? 10 : 4;
   context.beginPath();
@@ -2238,9 +2656,9 @@ function drawNamespaceGalaxy() {
 
   drawNamespaceGalaxyDepthField(context, width, height, palette);
   const data = state.namespaceGalaxy.data;
-  const maxEntries = Math.max(1, ...data.nodes.map((node) => node.entryCount));
+  const neighborhood = namespaceGalaxyNeighborhood(data);
   const projectedNodes = data.nodes
-    .map((node) => projectNamespaceNode(node, maxEntries, width, height))
+    .map((node) => projectNamespaceNode(node, width, height))
     .filter(Boolean)
     .sort((left, right) => left.depth - right.depth);
   const projectedById = new Map(projectedNodes.map((node) => [node.item.contextId, node]));
@@ -2250,9 +2668,9 @@ function drawNamespaceGalaxy() {
     .filter(Boolean)
     .sort((left, right) => left.depth - right.depth);
 
-  projectedLinks.forEach((link) => drawNamespaceBridge(context, link, palette));
-  projectedNodes.forEach((node) => drawNamespaceSphere(context, node, palette));
-  drawNamespaceLabels(context, projectedNodes, palette, width, height);
+  projectedLinks.forEach((link) => drawNamespaceBridge(context, link, palette, neighborhood));
+  projectedNodes.forEach((node) => drawNamespaceSphere(context, node, palette, neighborhood));
+  drawNamespaceLabels(context, projectedNodes, palette, width, height, neighborhood);
 
   state.namespaceGalaxy.projectedNodes = projectedNodes;
   state.namespaceGalaxy.projectedLinks = projectedLinks;
@@ -2305,19 +2723,18 @@ function drawNamespaceGalaxyDepthField(context, width, height, palette) {
   context.restore();
 }
 
-function projectNamespaceNode(node, maxEntries, width, height) {
+function projectNamespaceNode(node, width, height) {
   const position = state.namespaceGalaxy.positions.get(node.contextId);
   if (!position) return null;
   const rotated = rotateNamespacePoint(position, state.namespaceGalaxy.rotation);
   const perspective = 2.65 / Math.max(1.25, 2.85 - rotated.z);
   const scale = Math.min(width, height) * 0.38 * state.namespaceGalaxy.zoom;
-  const volume = Math.log1p(Math.max(0, node.entryCount)) / Math.log1p(maxEntries);
-  const baseRadius = 7 + Math.sqrt(volume) * 18;
+  const baseRadius = boundedAreaRadius(node.visualMassScore, 8, 28);
   return {
     item: node,
     x: width / 2 + state.namespaceGalaxy.pan.x + rotated.x * scale * perspective,
     y: height / 2 + state.namespaceGalaxy.pan.y + rotated.y * scale * perspective,
-    radius: clamp(baseRadius * perspective, 5.5, 34),
+    radius: clamp(baseRadius * perspective, 5.5, 38),
     depth: rotated.z,
     perspective,
   };
@@ -2352,6 +2769,32 @@ function visibleNamespaceSuggestions(suggestions) {
   return chosen;
 }
 
+function namespaceGalaxyNeighborhood(data) {
+  const focal = state.namespaceGalaxy.hover || state.namespaceGalaxy.selection;
+  if (!focal) return null;
+  if (!state.namespaceGalaxy.hover && focal.kind === "node" && focal.contextId === state.context) {
+    return null;
+  }
+  const contextIds = new Set();
+  if (focal.kind === "node") {
+    contextIds.add(focal.contextId);
+    data.links
+      .filter((link) => link.enabled && link.approved)
+      .forEach((link) => {
+        if (link.sourceContextId === focal.contextId) contextIds.add(link.targetContextId);
+        if (link.targetContextId === focal.contextId) contextIds.add(link.sourceContextId);
+      });
+    data.suggestions.forEach((suggestion) => {
+      if (suggestion.sourceContextId === focal.contextId) contextIds.add(suggestion.targetContextId);
+      if (suggestion.targetContextId === focal.contextId) contextIds.add(suggestion.sourceContextId);
+    });
+  } else {
+    contextIds.add(focal.sourceContextId);
+    contextIds.add(focal.targetContextId);
+  }
+  return { focal, contextIds };
+}
+
 function projectNamespaceBridge(link, projectedById) {
   const source = projectedById.get(link.sourceContextId);
   const target = projectedById.get(link.targetContextId);
@@ -2365,36 +2808,53 @@ function projectNamespaceBridge(link, projectedById) {
     x2: target.x,
     y2: target.y,
     depth: (source.depth + target.depth) / 2,
-    lineWidth: 0.8 + link.weight * 2.4,
+    lineWidth: link.kind === "link" && link.enabled && link.approved
+      ? 0.85 + link.weight * 3.35
+      : 0.9,
   };
 }
 
-function drawNamespaceBridge(context, bridge, palette) {
+function namespaceBridgeIsLocal(item, neighborhood) {
+  const focal = neighborhood?.focal;
+  if (!focal) return true;
+  if (focal.kind === "node") {
+    return item.sourceContextId === focal.contextId || item.targetContextId === focal.contextId;
+  }
+  return item.id === focal.id
+    || item.sourceContextId === focal.sourceContextId
+    || item.sourceContextId === focal.targetContextId
+    || item.targetContextId === focal.sourceContextId
+    || item.targetContextId === focal.targetContextId;
+}
+
+function drawNamespaceBridge(context, bridge, palette, neighborhood) {
   const { item } = bridge;
   const selected = state.namespaceGalaxy.selection?.id === item.id
     && state.namespaceGalaxy.selection?.kind === item.kind;
   const hovered = state.namespaceGalaxy.hover?.id === item.id
     && state.namespaceGalaxy.hover?.kind === item.kind;
   const isSuggestion = item.kind === "suggestion";
+  const isApprovedEnabled = !isSuggestion && item.enabled && item.approved;
+  const local = namespaceBridgeIsLocal(item, neighborhood);
   context.save();
   context.strokeStyle = isSuggestion
     ? palette.suggestion
-    : item.enabled
+    : isApprovedEnabled
       ? palette.bridge
       : palette.bridgeDisabled;
   context.lineWidth = bridge.lineWidth + (selected || hovered ? 1.8 : 0);
   context.globalAlpha = selected || hovered
     ? 0.94
     : isSuggestion
-      ? 0.42
-      : item.enabled
-        ? 0.28 + item.weight * 0.42
-        : 0.34;
+      ? local ? 0.28 : 0.13
+      : isApprovedEnabled
+        ? local ? 0.3 + item.weight * 0.56 : 0.12 + item.weight * 0.22
+        : local ? 0.25 : 0.12;
   const visualDelay = Math.max(0, Number(item.suggestedPhaseDelayTicks || 0));
   context.setLineDash(
     isSuggestion
       ? [2 + Math.min(visualDelay, 4), 7 + Math.min(visualDelay * 1.5, 6)]
-      : item.enabled
+      : isApprovedEnabled
         ? []
         : [8, 7],
   );
@@ -2402,7 +2862,7 @@ function drawNamespaceBridge(context, bridge, palette) {
   context.moveTo(bridge.x1, bridge.y1);
   context.lineTo(bridge.x2, bridge.y2);
   context.stroke();
-  if (!isSuggestion && item.enabled) {
+  if (isApprovedEnabled) {
     drawNamespaceBridgeDirection(context, bridge);
     if (item.direction === "bidirectional") {
       drawNamespaceBridgeDirection(context, bridge, true);
@@ -2436,7 +2896,7 @@ function drawNamespaceBridgeDirection(context, bridge, reverse = false) {
   context.stroke();
 }
 
-function drawNamespaceSphere(context, projected, palette) {
+function drawNamespaceSphere(context, projected, palette, neighborhood) {
   const { item, x, y, radius, depth } = projected;
   const selected = state.namespaceGalaxy.selection?.kind === "node"
     && state.namespaceGalaxy.selection?.contextId === item.contextId;
@@ -2445,6 +2905,7 @@ function drawNamespaceSphere(context, projected, palette) {
   const keyboardFocused = document.activeElement === elements.namespaceGalaxyCanvas
     && state.namespaceGalaxy.keyboardContextId === item.contextId;
   const current = item.contextId === state.context;
+  const local = !neighborhood || neighborhood.contextIds.has(item.contextId);
   const baseColor = item.entryCount > 0 ? palette.node : palette.nodeEmpty;
   const gradient = context.createRadialGradient(
     x - radius * 0.34,
@@ -2458,7 +2919,7 @@ function drawNamespaceSphere(context, projected, palette) {
   gradient.addColorStop(0.36, baseColor);
   gradient.addColorStop(1, palette.nodeShadow);
   context.save();
-  context.globalAlpha = clamp(0.55 + (depth + 1) * 0.2, 0.42, 1);
+  context.globalAlpha = clamp(0.55 + (depth + 1) * 0.2, 0.42, 1) * (local ? 1 : 0.43);
   context.shadowColor = selected || current ? palette.selected : baseColor;
   context.shadowBlur = selected || hovered || keyboardFocused ? 18 : 7;
   context.fillStyle = gradient;
@@ -2467,7 +2928,7 @@ function drawNamespaceSphere(context, projected, palette) {
   context.fill();
   context.lineWidth = current ? 2.4 : 1.2;
   context.strokeStyle = current ? palette.selected : palette.nodeHighlight;
-  context.globalAlpha = current ? 0.9 : 0.48;
+  context.globalAlpha = (current ? 0.9 : 0.48) * (local ? 1 : 0.48);
   context.stroke();
   if (selected || hovered || keyboardFocused) {
     context.shadowBlur = 0;
@@ -2481,7 +2942,7 @@ function drawNamespaceSphere(context, projected, palette) {
   context.restore();
 }
 
-function drawNamespaceLabels(context, projectedNodes, palette, width, height) {
+function drawNamespaceLabels(context, projectedNodes, palette, width, height, neighborhood) {
   const occupied = [];
   const priorities = [...projectedNodes].sort((left, right) => {
     const leftPriority = namespaceLabelPriority(left);
@@ -2524,7 +2985,8 @@ function drawNamespaceLabels(context, projectedNodes, palette, width, height) {
     if (!box) return;
     const rectangle = { ...box, width: labelWidth, height: labelHeight };
     occupied.push(rectangle);
-    context.globalAlpha = forced ? 0.98 : 0.82;
+    const local = !neighborhood || neighborhood.contextIds.has(node.item.contextId);
+    context.globalAlpha = forced ? 0.98 : local ? 0.82 : 0.48;
     context.fillStyle = palette.labelBackground;
     context.fillRect(box.x, box.y, labelWidth, labelHeight);
     context.fillStyle = node.item.contextId === state.context ? palette.selected : palette.text;
@@ -2598,7 +3060,7 @@ function namespaceGalaxyItemKey(item) {
 function showNamespaceGalaxyTooltip(item, x, y) {
   const tooltip = elements.namespaceGalaxyTooltip;
   if (item.kind === "node") {
-    tooltip.innerHTML = `<strong>${escapeHtml(item.contextId)}</strong><span>${escapeHtml(formatNumber(item.entryCount))} memories</span>`;
+    tooltip.innerHTML = `<strong>${escapeHtml(item.contextId)}</strong><span>${escapeHtml(formatNumber(item.entryCount))} memories · ${escapeHtml(formatNumber(item.visualMassScore * 100))}% relative size</span>`;
   } else {
     const status = item.kind === "suggestion" ? "suggested" : item.enabled ? "approved" : "disabled";
     tooltip.innerHTML = `<strong>${escapeHtml(item.sourceContextId)} → ${escapeHtml(item.targetContextId)}</strong><span>${escapeHtml(item.relationType)} · ${escapeHtml(formatNumber(item.weight, 2))} · ${escapeHtml(status)}</span>`;
@@ -2660,8 +3122,14 @@ function renderNamespaceGalaxyInspector(item) {
       : "Load this namespace to make it the active context without removing the current approved bridges.";
     renderNamespaceGalaxyFacts([
       ["Memories", formatNumber(item.entryCount)],
+      ["Indexed surface terms", item.surfaceTermCount === null ? "Not reported" : formatNumber(item.surfaceTermCount)],
+      ["Indexed term density", item.surfaceDensity === null ? "Not reported" : `${formatNumber(item.surfaceDensity, 2)} terms / memory`],
       ["Active bridges", formatNumber(activeLinks.length)],
+      ["Incident enabled bridge weight", formatNumber(item.bridgeCentrality, 2)],
       ["Relationships", item.relationshipCount === null ? "Not reported" : formatNumber(item.relationshipCount)],
+      ["Relationship density", item.relationshipDensity === null ? "Not reported" : `${formatNumber(item.relationshipDensity, 2)} / memory`],
+      ["Relative size score", `${formatNumber(item.visualMassScore * 100)}%`],
+      ["Size formula", "58% relative log memory · 27% relative log indexed density · 15% relative log bridges"],
       ["Events", item.eventCount === null ? "Not reported" : formatNumber(item.eventCount)],
       ["Last update", formatNamespaceUpdatedAt(item.updatedAt)],
     ]);
@@ -2693,6 +3161,7 @@ function renderNamespaceGalaxyInspector(item) {
         : "None",
     ],
     ["Status", isSuggestion ? "Suggested only" : item.enabled ? "Approved and enabled" : "Approved but disabled"],
+    ["Visual encoding", isSuggestion ? "Does not affect node size" : "Width and opacity scale with weight"],
     ["Verified", formatNamespaceUpdatedAt(item.verifiedAt)],
   ]);
   actions.innerHTML = [
@@ -2747,7 +3216,11 @@ function renderNamespaceGalaxyList(nodes) {
   elements.namespaceGalaxyList.innerHTML = nodes
     .map((node) => {
       const current = node.contextId === state.context ? "true" : "false";
-      return `<div role="listitem"><button type="button" data-galaxy-context="${escapeHtml(node.contextId)}" aria-current="${current}"><span>${escapeHtml(node.contextId)}</span><small>${escapeHtml(formatNumber(node.entryCount))} memories</small></button></div>`;
+      const density = node.surfaceDensity === null
+        ? node.relationshipDensity === null ? "density unavailable" : `${formatNumber(node.relationshipDensity, 2)} rel./memory`
+        : `${formatNumber(node.surfaceDensity, 2)} indexed terms/memory`;
+      const accessibleLabel = `${node.contextId}: ${formatNumber(node.entryCount)} memories, ${density}, ${formatNumber(node.bridgeCentrality, 2)} enabled bridge weight, ${formatNumber(node.visualMassScore * 100)} percent relative size`;
+      return `<div role="listitem"><button type="button" data-galaxy-context="${escapeHtml(node.contextId)}" aria-label="${escapeHtml(accessibleLabel)}" aria-current="${current}"><span>${escapeHtml(node.contextId)}</span><small>${escapeHtml(formatNumber(node.entryCount))} memories · ${escapeHtml(formatNumber(node.visualMassScore * 100))}% size</small></button></div>`;
     })
     .join("");
 }
@@ -2850,11 +3323,17 @@ function updateNamespaceGalaxyChrome() {
     ? `Browse ${detail?.namespace?.label || galaxy.detailContextId || "namespace"} as a list`
     : "Browse all namespaces as a list";
   elements.namespaceGalaxyAccessibleHelp.textContent = inNamespace
-    ? "This list follows the current semantic zoom: cortex summary, ganglia, or exact returned neurons."
+    ? "This list follows the current semantic zoom: cortex summary, ganglia, or returned neurons."
     : "Each saved namespace is listed from the backend map. Activate one to enter its read-only internal map.";
+  const lod = inNamespace ? currentNamespaceDetailLod() : "galaxy";
+  const helpByDepth = {
+    cortex: "Cortex area = 72% bounded log memories + 28% relationships per memory. Scroll in for ganglia.",
+    ganglia: "Ganglion area = 68% relative log memories + 32% relative log stored relationship weight per memory. Click to focus.",
+    neurons: "Neuron area = relative log visible weighted degree in the returned relationship sample. Click a neuron to inspect it.",
+  };
   elements.namespaceGalaxyHelp.textContent = inNamespace
-    ? "Click a ganglion to focus it. Click a neuron to inspect it. Drag to orbit; Shift-drag to pan; scroll to change semantic zoom."
-    : "Click a namespace sphere to enter it. Drag to orbit; Shift-drag to pan; scroll to zoom.";
+    ? `${helpByDepth[lod]} Drag to orbit; Shift-drag to pan; scroll to change depth.`
+    : "Sphere area combines memory volume, indexed term/relationship density, and enabled approved bridge weight. Suggestions never affect size.";
   updateNamespaceDetailDepthChrome();
 }
 
@@ -2906,6 +3385,9 @@ function detailFactsFor(item) {
     return [
       ["Stored memories", formatNumber(item.entryTotal)],
       ["Relationships", formatNumber(item.relationshipTotal)],
+      ["Relationship density", `${formatNumber(item.relationshipDensity, 2)} / memory`],
+      ["Bounded size score", `${formatNumber(item.visualMassScore * 100)}%`],
+      ["Size formula", "72% bounded log memories · 28% relationship density"],
       ["Stored", item.stored ? "Yes" : "No"],
       ["Last updated", formatNamespaceUpdatedAt(item.lastUpdatedAt)],
     ];
@@ -2914,6 +3396,13 @@ function detailFactsFor(item) {
     const types = Object.entries(item.nodeTypeCounts || {}).map(([type, count]) => `${type}: ${count}`).join(", ");
     return [
       ["Neurons (memories)", formatNumber(item.memoryTotal)],
+      ["Memory total scope", item.memoryTotalIsLowerBound ? "Stored lower bound" : "Stored total"],
+      ["Inter-ganglion relationships", formatNumber(item.relationshipCount)],
+      ["Aggregate edge weight", formatNumber(item.aggregateEdgeWeight, 2)],
+      ["Weighted relationship density", `${formatNumber(item.weightedRelationshipDensity, 2)} / memory`],
+      ["Relationship metric scope", item.relationshipMetricScope],
+      ["Relative size score", `${formatNumber(item.visualMassScore * 100)}%`],
+      ["Size formula", "68% relative log memories · 32% relative log weighted density"],
       ["Cluster basis", item.basis],
       ["Stored types", types || "Not reported"],
       ["Last updated", formatNamespaceUpdatedAt(item.lastUpdatedAt)],
@@ -2921,6 +3410,10 @@ function detailFactsFor(item) {
   }
   return [
     ["Type", item.nodeType],
+    ["Visible connected edges", formatNumber(item.relationshipCount)],
+    ["Visible weighted degree", formatNumber(item.weightedDegree, 2)],
+    ["Relative size score", `${formatNumber(item.visualMassScore * 100)}%`],
+    ["Size formula", "Relative log visible weighted degree"],
     ["Tag", item.tag || "Not reported"],
     ["Source", typeof item.source === "string" ? item.source : namespaceEvidenceText(item.provenance) || "Not reported"],
     ["Created", formatNamespaceUpdatedAt(item.createdAt)],
@@ -2941,11 +3434,11 @@ function renderNamespaceDetailInspector(item) {
   }
   title.textContent = item.label || item.contextId || "Stored detail";
   if (item.kind === "namespace-detail") {
-    body.textContent = "Cortex overview. Zoom in to reveal backend-returned ganglia, then exact returned neurons.";
+    body.textContent = "Cortex overview. Its bounded area combines memory total with stored relationships per memory. Zoom in for ganglia and neurons.";
   } else if (item.kind === "ganglion") {
-    body.textContent = "Stored semantic cluster. Focusing loads the bounded exact neuron and relationship projection for this ganglion.";
+    body.textContent = "Stored semantic cluster. Area combines its reported memory total with server aggregate inter-ganglion weight; the inspector names lower-bound or visible-sample scope.";
   } else {
-    body.textContent = item.excerpt || "Stored memory node. This inspector reports only metadata returned by the namespace detail endpoint.";
+    body.textContent = item.excerpt || "Stored memory node. Area reflects visible weighted degree in the bounded relationship sample returned by the namespace detail endpoint.";
   }
   renderNamespaceGalaxyFacts(detailFactsFor(item));
   actions.innerHTML = item.kind === "ganglion"
@@ -2963,19 +3456,23 @@ function renderNamespaceDetailList() {
   }
   const lod = currentNamespaceDetailLod();
   if (lod === "cortex") {
-    elements.namespaceGalaxyList.innerHTML = `<div role="listitem"><button type="button" data-galaxy-action="inspect-cortex" aria-current="${state.namespaceGalaxy.detailSelection?.kind === "namespace-detail"}"><span>${escapeHtml(detail.namespace.label)}</span><small>${escapeHtml(formatNumber(detail.namespace.entryTotal))} stored memories</small></button></div>`;
+    const label = `${detail.namespace.label}: ${formatNumber(detail.namespace.entryTotal)} stored memories, ${formatNumber(detail.namespace.relationshipDensity, 2)} relationships per memory, ${formatNumber(detail.namespace.visualMassScore * 100)} percent bounded size`;
+    elements.namespaceGalaxyList.innerHTML = `<div role="listitem"><button type="button" data-galaxy-action="inspect-cortex" aria-label="${escapeHtml(label)}" aria-current="${state.namespaceGalaxy.detailSelection?.kind === "namespace-detail"}"><span>${escapeHtml(detail.namespace.label)}</span><small>${escapeHtml(formatNumber(detail.namespace.entryTotal))} memories · ${escapeHtml(formatNumber(detail.namespace.visualMassScore * 100))}% size</small></button></div>`;
     return;
   }
   const clusters = [...detail.clusters].sort((left, right) => right.memoryTotal - left.memoryTotal || left.label.localeCompare(right.label));
   const rows = clusters.map((cluster) => {
     const current = state.namespaceGalaxy.detailSelection?.id === cluster.id ? "true" : "false";
-    return `<div role="listitem"><button type="button" data-galaxy-action="focus-ganglion" data-galaxy-cluster="${escapeHtml(cluster.clusterId)}" aria-current="${current}"><span>${escapeHtml(cluster.label)}</span><small>${escapeHtml(formatNumber(cluster.memoryTotal))} neurons</small></button></div>`;
+    const memoryScope = cluster.memoryTotalIsLowerBound ? "stored lower bound" : "stored total";
+    const label = `${cluster.label}: ${formatNumber(cluster.memoryTotal)} memories ${memoryScope}, ${formatNumber(cluster.weightedRelationshipDensity, 2)} weighted inter-ganglion relationships per memory, ${cluster.relationshipMetricScope}, ${formatNumber(cluster.visualMassScore * 100)} percent relative size`;
+    return `<div role="listitem"><button type="button" data-galaxy-action="focus-ganglion" data-galaxy-cluster="${escapeHtml(cluster.clusterId)}" aria-label="${escapeHtml(label)}" aria-current="${current}"><span>${escapeHtml(cluster.label)}</span><small>${escapeHtml(formatNumber(cluster.memoryTotal))} memories · ${escapeHtml(formatNumber(cluster.weightedRelationshipDensity, 2))} weighted density</small></button></div>`;
   });
   if (lod === "neurons") {
     const visible = visibleNamespaceDetailNodes(detail, lod);
     rows.push(...visible.map((node) => {
       const current = state.namespaceGalaxy.detailSelection?.id === node.id ? "true" : "false";
-      return `<div role="listitem"><button type="button" data-galaxy-action="inspect-neuron" data-galaxy-neuron="${escapeHtml(node.id)}" aria-current="${current}"><span>${escapeHtml(node.label)}</span><small>${escapeHtml(node.nodeType)}</small></button></div>`;
+      const label = `${node.label}: ${node.nodeType}, ${formatNumber(node.relationshipCount)} visible connected edges, ${formatNumber(node.weightedDegree, 2)} visible weighted degree, ${formatNumber(node.visualMassScore * 100)} percent relative size`;
+      return `<div role="listitem"><button type="button" data-galaxy-action="inspect-neuron" data-galaxy-neuron="${escapeHtml(node.id)}" aria-label="${escapeHtml(label)}" aria-current="${current}"><span>${escapeHtml(node.label)}</span><small>${escapeHtml(node.nodeType)} · degree ${escapeHtml(formatNumber(node.weightedDegree, 2))}</small></button></div>`;
     }));
   }
   elements.namespaceGalaxyList.innerHTML = rows.length
@@ -3031,8 +3528,8 @@ function updateNamespaceDetailHover(x, y) {
 function showNamespaceDetailTooltip(item, x, y) {
   const tooltip = elements.namespaceGalaxyTooltip;
   const subline = item.kind === "ganglion"
-    ? `${formatNumber(item.memoryTotal)} stored neurons`
-    : item.nodeType || "stored neuron";
+    ? `${formatNumber(item.memoryTotal)} memories · ${formatNumber(item.weightedRelationshipDensity, 2)} weighted density`
+    : `${item.nodeType || "stored neuron"} · visible degree ${formatNumber(item.weightedDegree, 2)}`;
   tooltip.innerHTML = `<strong>${escapeHtml(item.label)}</strong><span>${escapeHtml(subline)}</span>`;
   const stage = elements.namespaceGalaxyCanvas.parentElement;
   tooltip.style.left = `${clamp(x + 14, 8, Math.max(8, stage.clientWidth - 230))}px`;

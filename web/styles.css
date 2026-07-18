@@ -2666,6 +2666,18 @@ textarea {
   background: var(--teal-soft);
 }
 
+.namespace-key-approved-weak {
+  border-top-width: 1px;
+  border-color: var(--galaxy-bridge);
+  opacity: 0.48;
+}
+
+.namespace-key-approved-strong {
+  border-top-width: 4px;
+  border-color: var(--galaxy-bridge);
+  opacity: 0.92;
+}
+
 .namespace-key-disabled {
   border-color: var(--faint);
   border-style: dashed;
@@ -2674,6 +2686,16 @@ textarea {
 .namespace-key-suggested {
   border-color: var(--purple);
   border-style: dotted;
+}
+
+.namespace-galaxy-encoding-note {
+  flex-basis: 100%;
+  max-width: 1040px;
+  border-left: 2px solid color-mix(in srgb, var(--teal) 54%, transparent);
+  padding-left: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 .namespace-galaxy-accessible {

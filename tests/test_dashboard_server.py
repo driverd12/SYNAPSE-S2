@@ -284,6 +284,33 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(linked_status, 200)
         self.assertEqual(linked_payload["link_count"], 1)
         self.assertIn("camera-work", linked_payload["nodes"][0]["connected_context_ids"])
+        linked_nodes = {
+            node["context_id"]: node for node in linked_payload["nodes"]
+        }
+        self.assertEqual(linked_nodes["demo"]["entry_count"], 4)
+        self.assertEqual(linked_nodes["demo"]["relationship_count"], 2)
+        self.assertGreater(
+            linked_nodes["demo"]["surface_term_count"],
+            linked_nodes["demo"]["entry_count"],
+        )
+        self.assertEqual(linked_nodes["camera-work"]["entry_count"], 1)
+        self.assertEqual(linked_nodes["camera-work"]["relationship_count"], 0)
+        self.assertGreater(
+            linked_nodes["camera-work"]["surface_term_count"],
+            linked_nodes["camera-work"]["entry_count"],
+        )
+        linked_bridge = linked_payload["links"][0]
+        self.assertEqual(
+            {
+                linked_bridge["source_context_id"],
+                linked_bridge["target_context_id"],
+            },
+            {"demo", "camera-work"},
+        )
+        self.assertEqual(linked_bridge["weight"], 0.8)
+        self.assertTrue(linked_bridge["approved"])
+        self.assertTrue(linked_bridge["enabled"])
+        self.assertEqual(linked_bridge["direction"], "bidirectional")
 
     def test_api_errors_hide_internal_details_by_default(self):
         with TemporaryDirectory() as tmp:
@@ -992,6 +1019,150 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)
         self.assertNotIn('dispatchEvent(new Event("submit"', app)
+
+    def test_namespace_galaxy_assets_explain_weighted_visual_mass(self):
+        root = Path(__file__).resolve().parents[1]
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+        styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
+
+        for token in (
+            "surfaceTermCount",
+            "applyNamespaceGalaxyMetrics",
+            "enabledApprovedLinks",
+            "relationshipDensity",
+            "surfaceDensity",
+            "bridgeCentrality",
+            "visualMassScore",
+            "boundedAreaRadius",
+            "applyNamespaceDetailMetrics",
+            'level: "ganglion"',
+            "aggregateEdges",
+            "averageWeight",
+            "storedRelationshipCount",
+            "weightedRelationshipDensity",
+            "weightedDegree",
+            "namespaceGalaxyNeighborhood",
+            "namespaceDetailNeighborhood",
+        ):
+            self.assertIn(token, app)
+
+        for weighted_part in (
+            "[volumeScore, 0.58]",
+            "[densityScore, 0.27]",
+            "[bridgeScore, 0.15]",
+            "[surfaceDensityScore, 0.55]",
+            "[relationshipDensityScore, 0.45]",
+            "[memoryScore, 0.68]",
+            "[relationshipDensityScore, 0.32]",
+        ):
+            self.assertIn(weighted_part, app)
+        self.assertIn(
+            "links.filter((link) => link.enabled && link.approved)", app
+        )
+        self.assertIn(
+            "applyNamespaceGalaxyMetrics([...nodeMap.values()], storedLinks)",
+            app,
+        )
+        self.assertIn(
+            "Math.sqrt(minimumArea + normalized * (maximumArea - minimumArea))",
+            app,
+        )
+        self.assertIn(
+            "const [payload, ganglionPayload] = await Promise.all([neuronRequest, ganglionRequest])",
+            app,
+        )
+        self.assertIn("detail.aggregateAvailable = true", app)
+        self.assertIn(
+            "const clusterMetricEdges = detail.aggregateAvailable ? detail.aggregateEdges : detail.edges",
+            app,
+        )
+        self.assertIn("0.85 + link.weight * 3.35", app)
+        self.assertIn("0.3 + item.weight * 0.56", app)
+        self.assertIn("0.12 + item.weight * 0.22", app)
+
+        self.assertIn("Sphere area = weighted memory mass", index)
+        self.assertIn("Bridge width = approved weight", index)
+        self.assertIn("Higher approved weight", index)
+        self.assertIn("Suggestions never affect size or recall", index)
+        self.assertIn("58% relative log memory volume", index)
+        self.assertIn("27% relative log indexed term/relationship density", index)
+        self.assertIn("Indexed term density", app)
+        self.assertIn("Incident enabled bridge weight", app)
+        self.assertIn("Relative size score", app)
+        self.assertIn("Aggregate edge weight", app)
+        self.assertIn("Weighted relationship density", app)
+        self.assertIn("Relationship metric scope", app)
+        for metric_scope in (
+            '"stored aggregate"',
+            '"bounded stored aggregate"',
+            '"visible sample"',
+        ):
+            self.assertIn(metric_scope, app)
+        self.assertIn("Visible weighted degree", app)
+        self.assertIn("@media (max-width: 720px)", styles)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", styles)
+
+    def test_namespace_galaxy_review_regressions_stay_fixed(self):
+        root = Path(__file__).resolve().parents[1]
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+
+        for truncation_signal in (
+            "aggregateTruncation?.truncated",
+            "aggregateTruncation?.edges?.truncated",
+            "aggregateTruncation?.clusters?.truncated",
+            "aggregateTruncation?.source_scan?.entries_truncated",
+            "aggregateTruncation?.source_scan?.relationships_truncated",
+        ):
+            self.assertIn(truncation_signal, app)
+
+        clear_focus_start = app.index("function clearNamespaceGanglionFocus")
+        clear_focus_end = app.index("function exitNamespaceGalaxy", clear_focus_start)
+        clear_focus = app[clear_focus_start:clear_focus_end]
+        self.assertIn("combinedNamespaceDetail()", clear_focus)
+        self.assertNotIn("galaxy.detail?.namespace", clear_focus)
+        self.assertNotIn("galaxy.detail?.clusters", clear_focus)
+
+        fallback_start = app.index("function projectAggregateNamespaceDetailEdges")
+        fallback_end = app.index("function drawNamespaceDetailEdge", fallback_start)
+        fallback = app[fallback_start:fallback_end]
+        key_start = fallback.index("const key = ")
+        key_end = fallback.index(";", key_start)
+        key_expression = fallback[key_start:key_end]
+        for key_part in (
+            "sourceCluster",
+            "targetCluster",
+            "edge.edgeType",
+            "edge.direction",
+        ):
+            self.assertIn(key_part, key_expression)
+        self.assertNotIn(".sort(", key_expression)
+
+        self.assertIn("indexed term/relationship density", index.lower())
+        self.assertIn("relative log", index.lower())
+        self.assertIn("Indexed term density", app)
+        self.assertIn("Relative size score", app)
+        self.assertIn("Relative log", app)
+        self.assertNotIn('["Content density"', app)
+        self.assertEqual(app.count('["Bounded size score"'), 1)
+        detail_facts_start = app.index("function detailFactsFor")
+        detail_facts_end = app.index(
+            "function renderNamespaceDetailInspector", detail_facts_start
+        )
+        self.assertIn(
+            '["Bounded size score"',
+            app[detail_facts_start:detail_facts_end],
+        )
+        self.assertEqual(app.count("percent bounded size"), 1)
+        self.assertGreaterEqual(app.count("percent relative size"), 3)
+        detail_list_start = app.index("function renderNamespaceDetailList")
+        detail_list_end = app.index(
+            "function handleNamespaceGalaxyListAction", detail_list_start
+        )
+        detail_list = app[detail_list_start:detail_list_end]
+        self.assertEqual(detail_list.count("percent bounded size"), 1)
+        self.assertEqual(detail_list.count("percent relative size"), 2)
 
     def test_self_test_endpoint_reports_operator_readiness(self):
         with TemporaryDirectory() as tmp:

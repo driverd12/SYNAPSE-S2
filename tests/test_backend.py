@@ -2229,6 +2229,16 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             cluster_id=selected_cluster_id,
             limit=20,
         )
+        ganglion = backend.list_namespace_detail(
+            context_id="alpha",
+            level="ganglion",
+            limit=20,
+        )
+        bounded_ganglion = backend.list_namespace_detail(
+            context_id="alpha",
+            level="ganglion",
+            limit=1,
+        )
         after_alpha = backend.memory_store.stats(context_id="alpha")
         after_beta = backend.memory_store.stats(context_id="beta")
         rendered = json.dumps(complete, sort_keys=True)
@@ -2264,6 +2274,28 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(selected["counts"]["eligible_clusters"], 1)
         self.assertEqual({node["cluster_id"] for node in selected["nodes"]}, {selected_cluster_id})
         self.assertEqual({cluster["cluster_id"] for cluster in selected["clusters"]}, {selected_cluster_id})
+        self.assertEqual(ganglion["level"], "ganglion")
+        self.assertTrue(ganglion["read_only"])
+        self.assertFalse(ganglion["automatic_cross_namespace_write"])
+        self.assertEqual(ganglion["counts"]["eligible_edges"], 1)
+        self.assertEqual(ganglion["counts"]["returned_edges"], 1)
+        aggregate = ganglion["edges"][0]
+        self.assertEqual(aggregate["edge_type"], "temporal_next")
+        self.assertEqual(aggregate["weight"], 0.8)
+        self.assertEqual(aggregate["average_weight"], 0.8)
+        self.assertEqual(aggregate["stored_relationship_count"], 1)
+        self.assertFalse(ganglion["counts"]["eligible_edges_is_lower_bound"])
+        self.assertTrue(bounded_ganglion["truncation"]["truncated"])
+        self.assertTrue(bounded_ganglion["truncation"]["clusters"]["truncated"])
+        self.assertTrue(bounded_ganglion["truncation"]["edges"]["truncated"])
+        self.assertFalse(
+            bounded_ganglion["truncation"]["source_scan"]["entries_truncated"]
+        )
+        self.assertFalse(
+            bounded_ganglion["truncation"]["source_scan"][
+                "relationships_truncated"
+            ]
+        )
         self.assertNotIn("alpha-drill-secret", rendered)
         self.assertNotIn("member-drill-secret", rendered)
         self.assertNotIn("objective-drill-secret", rendered)
