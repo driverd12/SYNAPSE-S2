@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 import mlx_backend
 import mcp_server
@@ -26,10 +27,15 @@ class McpServerTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(mlx_backend, "_ENGINE_INSTANCE", None))
         self.previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
         self.previous_capture_root = os.environ.get("SYNAPSE_S2_CAPTURE_ROOT")
+        self.previous_client_agent_id = os.environ.get(
+            "SYNAPSE_S2_CLIENT_AGENT_ID"
+        )
         os.environ["SYNAPSE_S2_EXPORT_DIR"] = self.tmpdir.name
         os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = str(Path(self.tmpdir.name) / "capture-root")
+        os.environ["SYNAPSE_S2_CLIENT_AGENT_ID"] = "codex-desktop"
         self.addCleanup(self._restore_export_dir)
         self.addCleanup(self._restore_capture_root)
+        self.addCleanup(self._restore_client_agent_id)
 
     def _restore_export_dir(self):
         if self.previous_export_dir is None:
@@ -42,6 +48,14 @@ class McpServerTests(unittest.TestCase):
             os.environ.pop("SYNAPSE_S2_CAPTURE_ROOT", None)
         else:
             os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = self.previous_capture_root
+
+    def _restore_client_agent_id(self):
+        if self.previous_client_agent_id is None:
+            os.environ.pop("SYNAPSE_S2_CLIENT_AGENT_ID", None)
+        else:
+            os.environ["SYNAPSE_S2_CLIENT_AGENT_ID"] = (
+                self.previous_client_agent_id
+            )
 
     def test_query_rejects_empty_embedding(self):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -375,7 +389,12 @@ class McpServerTests(unittest.TestCase):
             )
         )
         graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
-        deployments = json.loads(mcp_server.pull_spiking_context_deployments(context_id="demo"))
+        deployments = json.loads(
+            mcp_server.pull_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+            )
+        )
         combined = json.dumps(
             {"capture": capture, "graph": graph, "deployments": deployments},
             sort_keys=True,
@@ -493,21 +512,30 @@ class McpServerTests(unittest.TestCase):
 
         deployments = json.loads(
             mcp_server.pull_spiking_context_deployments(
+                agent_id="codex-desktop",
                 context_id="demo",
-                since_event_id=0,
                 limit=10,
+            )
+        )
+        receipt_id = deployments["deliveries"][0]["receipt_id"]
+        acknowledged = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                receipt_id=receipt_id,
             )
         )
         after_registration = json.loads(
             mcp_server.pull_spiking_context_deployments(
+                agent_id="codex-desktop",
                 context_id="demo",
-                since_event_id=registration["agent_deployment"]["event_id"],
                 limit=10,
             )
         )
 
-        self.assertEqual(deployments["delivery_mode"], "durable-mcp-pull")
+        self.assertEqual(deployments["delivery_mode"], "leased-at-least-once")
         self.assertEqual(deployments["events"][0]["payload"]["tag"], "agent-visible-memory")
+        self.assertEqual(acknowledged["acknowledged_count"], 1)
         self.assertEqual(after_registration["events"], [])
 
     def test_context_deployment_ack_tool_records_agent_cursor(self):
@@ -520,11 +548,18 @@ class McpServerTests(unittest.TestCase):
             )
         )
 
+        leased = json.loads(
+            mcp_server.pull_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                limit=10,
+            )
+        )
         ack = json.loads(
             mcp_server.ack_spiking_context_deployments(
                 agent_id="codex-desktop",
                 context_id="demo",
-                last_event_id=registration["agent_deployment"]["event_id"],
+                receipt_id=leased["deliveries"][0]["receipt_id"],
             )
         )
         cursors = json.loads(
@@ -532,10 +567,14 @@ class McpServerTests(unittest.TestCase):
         )
 
         self.assertEqual(ack["agent_id"], "codex-desktop")
-        self.assertEqual(ack["pending_event_count"], 0)
+        self.assertEqual(ack["cursor"]["pending_event_count"], 0)
+        self.assertEqual(
+            ack["cursor"]["last_event_id"],
+            registration["agent_deployment"]["event_id"],
+        )
         self.assertEqual(cursors["cursors"][0]["agent_id"], "codex-desktop")
 
-    def test_agent_context_hydration_tool_briefs_and_acknowledges(self):
+    def test_agent_context_hydration_tool_requires_explicit_receipt_ack(self):
         registration = json.loads(
             mcp_server.remember_spiking_context(
                 tag="mcp-agent-brief-memory",
@@ -547,14 +586,21 @@ class McpServerTests(unittest.TestCase):
 
         first = json.loads(
             mcp_server.hydrate_spiking_agent_context(
-                agent_id="mcp-agent",
+                agent_id="codex-desktop",
                 context_id="demo",
                 prompt="deployment context",
             )
         )
+        ack = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                receipt_id=first["deliveries"][0]["receipt_id"],
+            )
+        )
         second = json.loads(
             mcp_server.hydrate_spiking_agent_context(
-                agent_id="mcp-agent",
+                agent_id="codex-desktop",
                 context_id="demo",
                 prompt="deployment context",
             )
@@ -566,8 +612,10 @@ class McpServerTests(unittest.TestCase):
             registration["agent_deployment"]["event_id"],
         )
         self.assertEqual(first["new_event_count"], 1)
-        self.assertEqual(first["ack"]["agent_id"], "mcp-agent")
-        self.assertTrue(first["ack"]["caught_up"])
+        self.assertIsNone(first["ack"])
+        self.assertFalse(first["acknowledged"])
+        self.assertTrue(first["ack_required"])
+        self.assertEqual(ack["acknowledged_count"], 1)
         self.assertIn("mcp-agent-brief-memory", first["briefing_markdown"])
         self.assertIn("mcp-agent-brief-memory", first["recall_result"])
         self.assertIn("payload_summary", first["events"][0])
@@ -752,6 +800,175 @@ class McpServerTests(unittest.TestCase):
 
         self.assertIn("error", result)
         self.assertIn("export root", result["error"])
+
+    def test_delivery_tools_fail_closed_without_configured_identity(self):
+        configured = os.environ.pop("SYNAPSE_S2_CLIENT_AGENT_ID", None)
+        override = os.environ.pop(
+            "SYNAPSE_S2_ALLOW_UNCONFIGURED_DELIVERY_IDENTITY",
+            None,
+        )
+        try:
+            hydration = json.loads(
+                mcp_server.hydrate_spiking_agent_context(
+                    agent_id="codex-desktop",
+                    context_id="demo",
+                )
+            )
+            pull = json.loads(
+                mcp_server.pull_spiking_context_deployments(
+                    agent_id="codex-desktop",
+                    context_id="demo",
+                )
+            )
+        finally:
+            if configured is not None:
+                os.environ["SYNAPSE_S2_CLIENT_AGENT_ID"] = configured
+            if override is not None:
+                os.environ[
+                    "SYNAPSE_S2_ALLOW_UNCONFIGURED_DELIVERY_IDENTITY"
+                ] = override
+
+        self.assertIn("error", hydration)
+        self.assertIn("SYNAPSE_S2_CLIENT_AGENT_ID", hydration["error"])
+        self.assertIn("error", pull)
+        self.assertNotIn("UnboundLocalError", json.dumps(hydration))
+
+    def test_delivery_identity_alias_and_atomic_batch_ack(self):
+        for ordinal in (1, 2):
+            mlx_backend.get_backend().publish_context_event(
+                context_id="demo",
+                source_surface="mcp-batch-test",
+                event_type="batch-ack",
+                summary=f"batch event {ordinal}",
+                agent_targets=["codex-desktop"],
+            )
+        leased = json.loads(
+            mcp_server.pull_spiking_context_deployments(
+                agent_id="Codex-Desktop",
+                context_id="demo",
+                limit=10,
+            )
+        )
+        receipts = [row["receipt_id"] for row in leased["deliveries"]]
+        ack = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="CODEX-DESKTOP",
+                context_id="demo",
+                receipt_ids=receipts,
+            )
+        )
+
+        self.assertEqual(leased["agent_id"], "codex-desktop")
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(ack["acknowledged_count"], 2)
+        self.assertEqual(
+            {row["receipt_id"] for row in ack["acknowledged"]},
+            set(receipts),
+        )
+
+    def test_mcp_delivery_instance_id_has_process_nonce(self):
+        parts = mcp_server.MCP_DELIVERY_INSTANCE_ID.split("-")
+        self.assertEqual(parts[0], "mcp")
+        self.assertEqual(int(parts[1]), os.getpid())
+        self.assertEqual(len(parts[2]), 32)
+
+    def test_release_tool_rejects_unbounded_receipt_batches(self):
+        empty = json.loads(
+            mcp_server.release_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                receipt_ids=[],
+            )
+        )
+        oversized = json.loads(
+            mcp_server.release_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                receipt_ids=[f"receipt-{index}" for index in range(501)],
+            )
+        )
+
+        self.assertIn("non-empty", empty["error"])
+        self.assertIn("at most 500", oversized["error"])
+
+    def test_ack_and_release_tool_errors_never_echo_bearer_receipts(self):
+        forged_receipt = "ctxrcpt_" + ("A" * 43)
+        mcp_server.pull_spiking_context_deployments(
+            agent_id="codex-desktop",
+            context_id="demo",
+            limit=1,
+        )
+        ack = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                receipt_id=forged_receipt,
+            )
+        )
+        release = json.loads(
+            mcp_server.release_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="demo",
+                receipt_ids=[forged_receipt],
+            )
+        )
+
+        self.assertIn("error", ack)
+        self.assertIn("error", release)
+        self.assertNotIn(forged_receipt, json.dumps(ack, sort_keys=True))
+        self.assertNotIn(forged_receipt, json.dumps(release, sort_keys=True))
+
+    def test_dead_letter_tool_requires_confirmation_and_records_governance(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SYNAPSE_S2_CONTEXT_MAX_DELIVERY_ATTEMPTS": "2"},
+        ):
+            backend = mlx_backend.get_backend()
+            event = backend.publish_context_event(
+                context_id="dead-letter-tool",
+                source_surface="mcp-test",
+                event_type="poison",
+                summary="retry exhaustion test",
+                agent_targets=["codex-desktop"],
+            )
+            first = backend.memory_store.lease_context_events(
+                context_id="dead-letter-tool",
+                agent_id="codex-desktop",
+                consumer_instance_id="mcp-attempt-one",
+                limit=1,
+                lease_seconds=1.0,
+                now=100.0,
+            )["deliveries"][0]
+            backend.memory_store.lease_context_events(
+                context_id="dead-letter-tool",
+                agent_id="codex-desktop",
+                consumer_instance_id="mcp-attempt-two",
+                limit=1,
+                lease_seconds=1.0,
+                now=102.0,
+            )
+            rejected = json.loads(
+                mcp_server.dead_letter_spiking_context_delivery(
+                    agent_id="codex-desktop",
+                    context_id="dead-letter-tool",
+                    delivery_id=first["delivery_id"],
+                    reason="test consumer cannot decode event",
+                )
+            )
+            accepted = json.loads(
+                mcp_server.dead_letter_spiking_context_delivery(
+                    agent_id="codex-desktop",
+                    context_id="dead-letter-tool",
+                    delivery_id=first["delivery_id"],
+                    reason="test consumer cannot decode event",
+                    confirm=True,
+                )
+            )
+
+        self.assertIn("confirm=True", rejected["error"])
+        self.assertEqual(accepted["action"], "context-delivery-dead-letter")
+        self.assertEqual(accepted["event_id"], event["event_id"])
+        self.assertTrue(accepted["operation_id"].startswith("s2maint_"))
 
 
 if __name__ == "__main__":

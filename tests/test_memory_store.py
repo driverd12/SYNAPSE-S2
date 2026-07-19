@@ -548,10 +548,20 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 since_event_id=first["event_id"],
                 limit=10,
             )
-            ack = restored.ack_context_events(
+            leased = restored.lease_context_events(
                 context_id="demo",
                 agent_id="codex-desktop",
-                last_event_id=second["event_id"],
+                consumer_instance_id="memory-store-test",
+                consumer_groups=["mcp-clients", "local-ide-adapters"],
+                limit=10,
+            )
+            ack = restored.acknowledge_context_deliveries(
+                context_id="demo",
+                agent_id="codex-desktop",
+                acknowledgements=[
+                    {"receipt_id": delivery["receipt_id"]}
+                    for delivery in leased["deliveries"]
+                ],
             )
             cursors = restored.list_context_cursors(context_id="demo")
             stats = restored.stats(context_id="demo")
@@ -564,14 +574,16 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual([event["event_id"] for event in events], [first["event_id"], second["event_id"]])
         self.assertEqual([event["event_id"] for event in since_first], [second["event_id"]])
         self.assertEqual(ack["agent_id"], "codex-desktop")
-        self.assertEqual(ack["last_event_id"], second["event_id"])
-        self.assertEqual(ack["pending_event_count"], 0)
+        self.assertEqual(ack["cursor"]["last_event_id"], second["event_id"])
+        self.assertEqual(ack["cursor"]["pending_event_count"], 0)
         self.assertEqual(cursors[0]["agent_id"], "codex-desktop")
         self.assertEqual(stats["context_bus_event_count"], 2)
         self.assertEqual(stats["context_bus_latest_event_id"], second["event_id"])
         self.assertEqual(stats["context_bus_ack_cursor_count"], 1)
         self.assertEqual(exported["context_events"][0]["summary"], "operator-note captured and published")
         self.assertEqual(exported["context_cursors"][0]["agent_id"], "codex-desktop")
+        self.assertEqual(len(exported["context_deliveries"]), 2)
+        self.assertEqual(len(exported["context_delivery_receipts"]), 2)
 
     def test_delete_entry_cascades_relationships_and_memory_events(self):
         with TemporaryDirectory() as tmp:

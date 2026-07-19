@@ -9,6 +9,7 @@ import platform
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,17 @@ CONSOLIDATION_PHASES = (
     "neurogenesis",
 )
 DEFAULT_AGENT_TARGETS = ("mcp-clients", "codex-desktop", "local-ide-adapters")
-CONTEXT_BUS_DELIVERY_MODE = "durable-mcp-pull"
+CONTEXT_BUS_DELIVERY_MODE = "leased-at-least-once"
+CONTEXT_BUS_PROTOCOL_VERSION = "context-delivery.v2"
+CONSUMER_GROUPS_BY_AGENT = {
+    "codex-desktop": ("mcp-clients", "local-ide-adapters"),
+    "claude-desktop": ("mcp-clients", "local-ide-adapters"),
+    "claude-code": ("mcp-clients", "local-ide-adapters"),
+    "project-mcp": ("mcp-clients", "local-ide-adapters"),
+    "local-mcp-client": ("mcp-clients",),
+    "mcp-client": ("mcp-clients",),
+    "dashboard-ui": ("mcp-clients", "local-ide-adapters"),
+}
 CORTEX_TRACE_TYPES = {
     "goal",
     "objective",
@@ -155,6 +166,14 @@ def sanitize_agent_id(agent_id: str) -> str:
     raw = str(agent_id or "").strip()
     cleaned = AGENT_ID_RE.sub("_", raw).strip("._-:@")
     return (cleaned or "unknown-agent")[:128]
+
+
+def context_consumer_groups(agent_id: str) -> tuple[str, ...]:
+    """Resolve only explicitly registered local consumer group memberships."""
+
+    return tuple(
+        CONSUMER_GROUPS_BY_AGENT.get(sanitize_agent_id(agent_id).casefold(), ())
+    )
 
 
 def sanitize_recall_scope(recall_scope: str) -> str:
@@ -260,6 +279,7 @@ class SpikingAttentionBackend:
         else:
             resolved_memory_path = self._resolve_memory_path(memory_path)
         self.memory_store = DurableMemoryStore(resolved_memory_path)
+        self.delivery_instance_id = f"backend-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.global_enabled = True
         self.context_overrides: dict[str, bool] = {}
         self.cortex_sessions: dict[str, dict[str, Any]] = {}
@@ -1513,7 +1533,41 @@ class SpikingAttentionBackend:
             "context_bus_ack_cursor_count": int(
                 context_stats["context_bus_ack_cursor_count"]
             ),
+            "context_bus_verified_cursor_count": int(
+                context_stats.get("context_bus_verified_cursor_count", 0)
+            ),
+            "context_bus_legacy_unverified_cursor_count": int(
+                context_stats.get("context_bus_legacy_unverified_cursor_count", 0)
+            ),
+            "context_bus_delivery_count": int(
+                context_stats.get("context_bus_delivery_count", 0)
+            ),
+            "context_bus_active_lease_count": int(
+                context_stats.get("context_bus_active_lease_count", 0)
+            ),
+            "context_bus_expired_retryable_lease_count": int(
+                context_stats.get(
+                    "context_bus_expired_retryable_lease_count",
+                    0,
+                )
+            ),
+            "context_bus_ack_receipt_count": int(
+                context_stats.get("context_bus_ack_receipt_count", 0)
+            ),
+            "context_bus_ack_tombstone_count": int(
+                context_stats.get("context_bus_ack_tombstone_count", 0)
+            ),
+            "context_bus_retry_exhausted_count": int(
+                context_stats.get("context_bus_retry_exhausted_count", 0)
+            ),
+            "context_bus_dead_letter_count": int(
+                context_stats.get("context_bus_dead_letter_count", 0)
+            ),
+            "context_bus_max_delivery_attempts": int(
+                context_stats.get("context_bus_max_delivery_attempts", 5)
+            ),
             "context_bus_delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "context_bus_protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
             "context_bus_agent_targets": list(DEFAULT_AGENT_TARGETS),
             "semantic_group_count": len(self.semantic_hierarchy),
             "mlx_available": mx is not None,
@@ -1640,42 +1694,129 @@ class SpikingAttentionBackend:
         *,
         context_id: str = "default",
         since_event_id: int = 0,
+        before_event_id: int | None = None,
+        agent_id: str | None = None,
+        order: str = "asc",
         limit: int = 100,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         bounded_limit = min(max(int(limit), 1), 500)
-        events = self.memory_store.list_context_events(
+        agent = sanitize_agent_id(agent_id) if agent_id is not None else None
+        normalized_order = str(order or "asc").strip().lower()
+        if normalized_order not in {"asc", "desc"}:
+            raise ValueError("context event order must be asc or desc")
+        bounded_before_event_id = (
+            None
+            if before_event_id is None
+            else max(1, int(before_event_id))
+        )
+        rows = self.memory_store.list_context_events(
             context_id=context,
             since_event_id=max(0, int(since_event_id)),
-            limit=bounded_limit,
+            before_event_id=bounded_before_event_id,
+            agent_id=agent,
+            consumer_groups=(context_consumer_groups(agent) if agent else None),
+            order=normalized_order,
+            limit=bounded_limit + 1,
         )
+        has_more = len(rows) > bounded_limit
+        events = rows[:bounded_limit]
         return {
+            "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
             "context_id": context,
             "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
-            "agent_targets": list(DEFAULT_AGENT_TARGETS),
+            "observation_only": True,
+            "inspection_scope": "agent-eligible" if agent is not None else "admin-ledger",
+            "agent_id": agent,
             "since_event_id": max(0, int(since_event_id)),
+            "order": normalized_order,
             "event_count": len(events),
+            "has_more": has_more,
+            "next_event_id": (
+                int(events[-1]["event_id"])
+                if events and normalized_order == "asc"
+                else max(0, int(since_event_id))
+            ),
+            "before_event_id": bounded_before_event_id,
+            "next_before_event_id": (
+                int(events[-1]["event_id"])
+                if events and normalized_order == "desc"
+                else None
+            ),
             "events": [self._decorate_context_event(event) for event in events],
             "memory_db_path": str(self.memory_store.db_path),
         }
+
+    def lease_context_events(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        consumer_instance_id: str = "",
+        limit: int = 20,
+        lease_seconds: float = 60.0,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        instance = sanitize_agent_id(
+            consumer_instance_id or self.delivery_instance_id
+        )
+        leased = self.memory_store.lease_context_events(
+            context_id=context,
+            agent_id=agent,
+            consumer_instance_id=instance,
+            consumer_groups=context_consumer_groups(agent),
+            limit=min(max(int(limit), 1), 500),
+            lease_seconds=lease_seconds,
+        )
+        leased["events"] = [
+            self._decorate_context_event(event)
+            for event in leased.get("events", [])
+        ]
+        for delivery in leased.get("deliveries", []):
+            if isinstance(delivery, dict) and isinstance(delivery.get("event"), dict):
+                delivery["event"] = self._decorate_context_event(delivery["event"])
+        self._mark_activity()
+        return leased
 
     def ack_context_events(
         self,
         *,
         context_id: str = "default",
         agent_id: str = "mcp-client",
-        last_event_id: int = 0,
+        acknowledgements: list[dict[str, Any]] | None = None,
+        receipt_id: str = "",
+        last_event_id: int | None = None,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
         try:
-            cursor = self.memory_store.ack_context_events(
-                context_id=context,
-                agent_id=agent,
-                last_event_id=max(0, int(last_event_id)),
-            )
+            requested = list(acknowledgements or [])
+            if str(receipt_id or "").strip():
+                requested.append({"receipt_id": str(receipt_id).strip()})
+            if requested:
+                result = self.memory_store.acknowledge_context_deliveries(
+                    context_id=context,
+                    agent_id=agent,
+                    acknowledgements=requested,
+                )
+                result["cursor"] = self._decorate_context_cursor(result["cursor"])
+            else:
+                result = self.memory_store.ack_context_events(
+                    context_id=context,
+                    agent_id=agent,
+                    last_event_id=max(0, int(last_event_id or 0)),
+                )
+                result = self._decorate_context_cursor(result)
             self._mark_activity()
-            return self._decorate_context_cursor(cursor)
+            return result
+        except ValueError:
+            LOGGER.warning(
+                "context event ack refused for context_id=%s agent_id=%s",
+                context,
+                agent,
+            )
+            raise
         except Exception:
             LOGGER.exception(
                 "context event ack failed for context_id=%s agent_id=%s",
@@ -1683,6 +1824,49 @@ class SpikingAttentionBackend:
                 agent,
             )
             raise
+
+    def release_context_events(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        consumer_instance_id: str = "",
+        receipt_ids: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        instance = sanitize_agent_id(
+            consumer_instance_id or self.delivery_instance_id
+        )
+        result = self.memory_store.release_context_deliveries(
+            context_id=context,
+            agent_id=agent,
+            consumer_instance_id=instance,
+            receipt_ids=receipt_ids,
+        )
+        self._mark_activity()
+        return result
+
+    def dead_letter_context_delivery(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        delivery_id: str,
+        reason: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id).casefold()
+        result = self.memory_store.dead_letter_context_delivery(
+            context_id=context,
+            agent_id=agent,
+            delivery_id=str(delivery_id),
+            reason=reason,
+            confirm=bool(confirm),
+        )
+        self._mark_activity()
+        return result
 
     def list_context_cursors(
         self,
@@ -1707,6 +1891,14 @@ class SpikingAttentionBackend:
             "cursors": [self._decorate_context_cursor(cursor) for cursor in cursors],
             "memory_db_path": str(self.memory_store.db_path),
         }
+
+    def context_delivery_health(
+        self,
+        *,
+        context_id: str | None = None,
+    ) -> dict[str, Any]:
+        context = sanitize_context_id(context_id) if context_id is not None else None
+        return self.memory_store.context_delivery_health(context_id=context)
 
     def enter_spiking_cortex(
         self,
@@ -3108,11 +3300,22 @@ class SpikingAttentionBackend:
         since_event_id: int | None = None,
         event_limit: int = 20,
         graph_limit: int = 30,
-        acknowledge: bool = True,
+        acknowledge: bool = False,
+        claim_events: bool = True,
+        consumer_instance_id: str = "",
+        lease_seconds: float = 60.0,
     ) -> dict[str, Any]:
         """Compose the durable S2 context bus into an agent-ready briefing."""
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
+        if acknowledge:
+            raise ValueError(
+                "inline acknowledgement is disabled; consume the returned events, then acknowledge their receipt_id values"
+            )
+        if claim_events and since_event_id is not None:
+            raise ValueError(
+                "since_event_id is observation-only and cannot be combined with leased delivery"
+            )
         bounded_event_limit = min(max(int(event_limit), 1), 100)
         bounded_graph_limit = min(max(int(graph_limit), 1), 200)
         start_event_id = (
@@ -3120,12 +3323,29 @@ class SpikingAttentionBackend:
             if since_event_id is None
             else max(0, int(since_event_id))
         )
-
-        deployments = self.list_context_events(
-            context_id=context,
-            since_event_id=start_event_id,
-            limit=bounded_event_limit,
-        )
+        if claim_events:
+            deployments = self.lease_context_events(
+                context_id=context,
+                agent_id=agent,
+                consumer_instance_id=(
+                    consumer_instance_id or self.delivery_instance_id
+                ),
+                limit=bounded_event_limit,
+                lease_seconds=lease_seconds,
+            )
+            start_event_id = int(
+                deployments.get("cursor", {}).get("last_event_id", start_event_id)
+            )
+        else:
+            deployments = {
+                "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
+                "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+                "events": [],
+                "deliveries": [],
+                "has_more": False,
+                "ack_required": False,
+                "observation_only": True,
+            }
         raw_events = deployments["events"]
         events = [
             self._summarize_agent_context_event(event)
@@ -3145,14 +3365,6 @@ class SpikingAttentionBackend:
                 context_id=context,
             )
             recall_items = self._split_recall_result(recall_result)
-
-        ack_payload = None
-        if acknowledge:
-            ack_payload = self.ack_context_events(
-                context_id=context,
-                agent_id=agent,
-                last_event_id=latest_event_id,
-            )
 
         graph_entries = [
             self._summarize_agent_graph_entry(entry)
@@ -3180,8 +3392,24 @@ class SpikingAttentionBackend:
             "latest_event_id": latest_event_id,
             "new_event_count": len(events),
             "events": events,
-            "ack": ack_payload,
-            "acknowledged": bool(ack_payload),
+            "deliveries": [
+                {
+                    key: value
+                    for key, value in delivery.items()
+                    if key != "event"
+                }
+                for delivery in deployments.get("deliveries", [])
+            ],
+            "ack": None,
+            "acknowledged": False,
+            "ack_required": bool(deployments.get("ack_required", False)),
+            "acknowledgement_instruction": (
+                "After successfully consuming this briefing, acknowledge every receipt_id."
+                if deployments.get("ack_required")
+                else "No delivery acknowledgement is required."
+            ),
+            "has_more_events": bool(deployments.get("has_more", False)),
+            "claim_events": bool(claim_events),
             "recall_prompt": prompt_text,
             "recall_result": recall_result,
             "recall_items": recall_items,
@@ -3190,6 +3418,7 @@ class SpikingAttentionBackend:
             "graph_relationships": graph_relationships,
             "cortex_state": cortex_state,
             "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
             "memory_db_path": str(self.memory_store.db_path),
         }
         payload["briefing_markdown"] = self._render_agent_context_briefing(payload)
@@ -3219,7 +3448,7 @@ class SpikingAttentionBackend:
         ]
 
     def _summarize_agent_context_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        return {
+        summary = {
             "event_id": event.get("event_id", 0),
             "context_id": event.get("context_id", ""),
             "source_surface": event.get("source_surface", ""),
@@ -3234,6 +3463,23 @@ class SpikingAttentionBackend:
                 event.get("payload", {})
             ),
         }
+        delivery = event.get("delivery")
+        if isinstance(delivery, dict):
+            summary["delivery"] = {
+                key: delivery.get(key)
+                for key in (
+                    "delivery_id",
+                    "receipt_id",
+                    "lease_token",
+                    "consumer_instance_id",
+                    "attempt_count",
+                    "lease_expires_at",
+                    "redelivered",
+                    "ack_required",
+                )
+                if key in delivery
+            }
+        return summary
 
     def _summarize_agent_event_payload(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -3335,7 +3581,10 @@ class SpikingAttentionBackend:
                 f"Events: {payload['new_event_count']} new since "
                 f"{payload['since_event_id']} -> {payload['latest_event_id']}"
             ),
-            f"- Delivery: {payload['delivery_mode']} | Ack: {'yes' if payload['acknowledged'] else 'no'}",
+            (
+                f"- Delivery: {payload['delivery_mode']} | Ack: "
+                f"{'required after consumption' if payload.get('ack_required') else 'none'}"
+            ),
         ]
         events = payload.get("events", [])
         if events:
@@ -5608,12 +5857,13 @@ class SpikingAttentionBackend:
             str(target)
             for target in event.get("agent_targets", [])
             if str(target).strip()
-        ] or list(DEFAULT_AGENT_TARGETS)
+        ]
         return {
             **event,
             "agent_targets": targets,
             "target_count": len(targets),
             "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+            "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
             "published": True,
         }
 
@@ -5621,7 +5871,7 @@ class SpikingAttentionBackend:
         return {
             **cursor,
             "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
-            "acknowledged": True,
+            "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
         }
 
     def export_memory(
@@ -6094,24 +6344,83 @@ def publish_context_event(
 def list_context_events(
     context_id: str = "default",
     since_event_id: int = 0,
+    before_event_id: int | None = None,
+    agent_id: str | None = None,
+    order: str = "asc",
     limit: int = 100,
 ) -> dict[str, Any]:
     return get_backend().list_context_events(
         context_id=context_id,
         since_event_id=since_event_id,
+        before_event_id=before_event_id,
+        agent_id=agent_id,
+        order=order,
         limit=limit,
+    )
+
+
+def lease_context_events(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    consumer_instance_id: str = "",
+    limit: int = 20,
+    lease_seconds: float = 60.0,
+) -> dict[str, Any]:
+    return get_backend().lease_context_events(
+        context_id=context_id,
+        agent_id=agent_id,
+        consumer_instance_id=consumer_instance_id,
+        limit=limit,
+        lease_seconds=lease_seconds,
     )
 
 
 def ack_context_events(
     context_id: str = "default",
     agent_id: str = "mcp-client",
-    last_event_id: int = 0,
+    receipt_id: str = "",
+    acknowledgements: list[dict[str, Any]] | None = None,
+    last_event_id: int | None = None,
 ) -> dict[str, Any]:
     return get_backend().ack_context_events(
         context_id=context_id,
         agent_id=agent_id,
+        receipt_id=receipt_id,
+        acknowledgements=acknowledgements,
         last_event_id=last_event_id,
+    )
+
+
+def release_context_events(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    consumer_instance_id: str = "",
+    receipt_ids: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    return get_backend().release_context_events(
+        context_id=context_id,
+        agent_id=agent_id,
+        consumer_instance_id=consumer_instance_id,
+        receipt_ids=receipt_ids,
+    )
+
+
+def dead_letter_context_delivery(
+    *,
+    context_id: str = "default",
+    agent_id: str = "mcp-client",
+    delivery_id: str,
+    reason: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return get_backend().dead_letter_context_delivery(
+        context_id=context_id,
+        agent_id=agent_id,
+        delivery_id=delivery_id,
+        reason=reason,
+        confirm=confirm,
     )
 
 
@@ -6133,7 +6442,10 @@ def hydrate_agent_context(
     since_event_id: int | None = None,
     event_limit: int = 20,
     graph_limit: int = 30,
-    acknowledge: bool = True,
+    acknowledge: bool = False,
+    claim_events: bool = True,
+    consumer_instance_id: str = "",
+    lease_seconds: float = 60.0,
 ) -> dict[str, Any]:
     return get_backend().hydrate_agent_context(
         context_id=context_id,
@@ -6143,6 +6455,9 @@ def hydrate_agent_context(
         event_limit=event_limit,
         graph_limit=graph_limit,
         acknowledge=acknowledge,
+        claim_events=claim_events,
+        consumer_instance_id=consumer_instance_id,
+        lease_seconds=lease_seconds,
     )
 
 

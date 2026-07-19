@@ -110,7 +110,9 @@ class ClientSessionBridge:
                 prompt=self.config.startup_prompt,
                 event_limit=self.config.event_limit,
                 graph_limit=self.config.graph_limit,
-                acknowledge=True,
+                acknowledge=False,
+                claim_events=False,
+                consumer_instance_id=f"bridge-{self.session_id}",
             )
             LOGGER.info(
                 "hydrated SYNAPSE-S2 client session agent_id=%s context_id=%s new_events=%s latest_event_id=%s",

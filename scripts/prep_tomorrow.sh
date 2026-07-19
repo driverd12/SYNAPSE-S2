@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCHER="/Users/dan.driver/.local/bin/synapse-s2-mcp"
 CONTEXT="${SYNAPSE_S2_PREFLIGHT_CONTEXT:-default}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -94,7 +94,7 @@ echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json ingest-text \
   --context "$CONTEXT" \
   --tag "production-preflight-brief" \
-  --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients can pull and acknowledge with delivery cursors." \
+  --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients pull with fenced receipts, acknowledge exactly after consumption, and track through derived delivery cursors." \
   --surprise-threshold 0.58 \
   --min-segment-sentences 1 \
   --metadata '{"source":"prep_tomorrow","event_graph":true,"factual_preflight":true}'
@@ -185,28 +185,89 @@ echo "=== mcp native certification smoke ==="
   --json --timeout 15
 
 echo "=== mcp context deployment smoke ==="
-.venv/bin/fastmcp call --command "$LAUNCHER" \
-  --target pull_spiking_context_deployments \
-  --input-json "{\"context_id\":\"$CONTEXT\",\"since_event_id\":0,\"limit\":5}" \
-  --json --timeout 15
-
-echo "=== mcp context deployment ack smoke ==="
-LATEST_EVENT_ID="$(
-  CONTEXT="$CONTEXT" \
+PREFLIGHT_AGENT="prep-tomorrow-smoke"
+SMOKE_CONTEXT="${CONTEXT}--system-delivery-smoke"
+export SYNAPSE_S2_CLIENT_AGENT_ID="$PREFLIGHT_AGENT"
+SMOKE_EVENT_ID="$(
+  SMOKE_CONTEXT="$SMOKE_CONTEXT" PREFLIGHT_AGENT="$PREFLIGHT_AGENT" \
   .venv/bin/python - <<'PY'
 import os
 import mlx_backend
-context = os.environ.get("CONTEXT", "default")
-print(mlx_backend.get_status(context_id=context).get("context_bus_latest_event_id", 0))
+event = mlx_backend.get_backend().publish_context_event(
+    context_id=os.environ["SMOKE_CONTEXT"],
+    source_surface="prep-tomorrow",
+    event_type="delivery-receipt-smoke",
+    summary="Dedicated receipt-driven delivery smoke event.",
+    payload={"purpose": "production-readiness", "contains_secret": False},
+    agent_targets=[os.environ["PREFLIGHT_AGENT"]],
+)
+print(event["event_id"])
 PY
 )"
+PULL_OUTPUT="$(.venv/bin/fastmcp call --command "$LAUNCHER" \
+  --target pull_spiking_context_deployments \
+  --input-json "{\"context_id\":\"$SMOKE_CONTEXT\",\"agent_id\":\"$PREFLIGHT_AGENT\",\"limit\":10}" \
+  --json --timeout 15)"
+printf '%s\n' "$PULL_OUTPUT"
+RECEIPT_IDS_JSON="$(
+  PULL_OUTPUT="$PULL_OUTPUT" SMOKE_EVENT_ID="$SMOKE_EVENT_ID" \
+  .venv/bin/python - <<'PY'
+import json
+import os
+
+def decoded(value):
+    if isinstance(value, str):
+        try:
+            return decoded(json.loads(value))
+        except json.JSONDecodeError:
+            return None
+    if isinstance(value, dict):
+        if isinstance(value.get("deliveries"), list):
+            return value
+        for key in ("result", "data", "structuredContent", "text"):
+            found = decoded(value.get(key))
+            if found is not None:
+                return found
+        for item in value.get("content", []) if isinstance(value.get("content"), list) else []:
+            found = decoded(item)
+            if found is not None:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = decoded(item)
+            if found is not None:
+                return found
+    return None
+
+root = json.loads(os.environ["PULL_OUTPUT"])
+payload = decoded(root)
+if payload is None:
+    raise SystemExit("could not decode FastMCP delivery payload")
+smoke_event_id = int(os.environ["SMOKE_EVENT_ID"])
+deliveries = list(payload.get("deliveries") or [])
+matches = [
+    item for item in deliveries
+    if int(item.get("event_id", -1)) == smoke_event_id
+]
+if len(matches) != 1:
+    raise SystemExit("dedicated delivery smoke event was not leased")
+if len(deliveries) != 1:
+    raise SystemExit("unexpected delivery was leased with the dedicated smoke event")
+receipts = [str(matches[0].get("receipt_id") or "")]
+if not receipts[0]:
+    raise SystemExit("delivery smoke returned no durable receipt ids")
+print(json.dumps(receipts, separators=(",", ":")))
+PY
+)"
+
+echo "=== mcp context deployment ack smoke ==="
 .venv/bin/fastmcp call --command "$LAUNCHER" \
   --target ack_spiking_context_deployments \
-  --input-json "{\"context_id\":\"$CONTEXT\",\"agent_id\":\"prep-tomorrow\",\"last_event_id\":$LATEST_EVENT_ID}" \
+  --input-json "{\"context_id\":\"$SMOKE_CONTEXT\",\"agent_id\":\"$PREFLIGHT_AGENT\",\"receipt_ids\":$RECEIPT_IDS_JSON}" \
   --json --timeout 15
 .venv/bin/fastmcp call --command "$LAUNCHER" \
   --target list_spiking_context_cursors \
-  --input-json "{\"context_id\":\"$CONTEXT\",\"limit\":5}" \
+  --input-json "{\"context_id\":\"$SMOKE_CONTEXT\",\"limit\":5}" \
   --json --timeout 15
 
 echo "=== mcp capture inbox status smoke ==="

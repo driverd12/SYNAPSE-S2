@@ -2,19 +2,24 @@
 
 Use SYNAPSE-S2 as the durable local memory substrate for this repository.
 
-SYNAPSE-S2 MCP clients launched through `/Users/dan.driver/.local/bin/synapse-s2-mcp` hydrate their own cursor at process startup, enter a strict Cortex Governor session, and drop a sanitized session-boundary note plus typed `follow_up` cortical trace on exit. At the start of substantive repo work, run a manual hydrate as well when you need the briefing visible in the terminal or thread context:
+SYNAPSE-S2 MCP clients launched through `/Users/dan.driver/.local/bin/synapse-s2-mcp` hydrate recall and graph state without claiming unseen events at process startup, enter a strict Cortex Governor session, and drop a sanitized session-boundary note plus typed `follow_up` cortical trace on exit. At the start of substantive repo work, run a manual hydrate when you need the briefing visible in the terminal or thread context. It leases events but does not acknowledge them before output; acknowledge the returned `receipt_id` values only after use:
 
 ```bash
 .venv/bin/python synapse_cli.py --json agent-brief \
   --context default \
   --agent-id codex-desktop \
   --prompt "<current task or user request>"
+# After actually consuming each deployment, acknowledge its exact receipt:
+.venv/bin/python synapse_cli.py --json ack-context \
+  --context default \
+  --agent-id codex-desktop \
+  --receipt-id '<receipt_id from agent-brief>'
 ```
 
 If you need lower-level diagnostics, inspect the raw context bus and graph:
 
 ```bash
-.venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 20
+.venv/bin/python synapse_cli.py --json observe-context --context default --since-event-id 0 --order asc --limit 20
 .venv/bin/python synapse_cli.py --json graph --context default --limit 30
 ```
 

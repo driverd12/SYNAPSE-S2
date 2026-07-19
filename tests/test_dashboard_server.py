@@ -119,6 +119,44 @@ class DashboardRuntimeTests(unittest.TestCase):
             self.assertEqual(second_semantic["status"], "ready")
             self.assertIn("pending False", second_semantic["detail"])
 
+    def test_dashboard_doctor_surfaces_ack_tombstone_count(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            event = runtime.backend.publish_context_event(
+                context_id="demo",
+                source_surface="dashboard-test",
+                event_type="tombstone-doctor",
+                summary="doctor retains acknowledgement evidence after pruning",
+                agent_targets=["dashboard-ui"],
+            )
+            delivery = runtime.backend.lease_context_events(
+                context_id="demo",
+                agent_id="dashboard-ui",
+                consumer_instance_id="dashboard-doctor-test",
+                limit=1,
+            )["deliveries"][0]
+            runtime.backend.ack_context_events(
+                context_id="demo",
+                agent_id="dashboard-ui",
+                receipt_id=delivery["receipt_id"],
+            )
+            runtime.backend.memory_store.delete_context_event(
+                context_id="demo",
+                event_id=event["event_id"],
+            )
+
+            payload = runtime.doctor_report(
+                context_id="demo",
+                include_apps=False,
+                wait_for_semantic_audit=True,
+            )
+
+        delivery_check = next(
+            check for check in payload["checks"] if check["id"] == "context_delivery"
+        )
+        self.assertEqual(delivery_check["status"], "ready")
+        self.assertIn("1 ACK tombstones", delivery_check["detail"])
+
     def make_runtime(self, tmp: str) -> DashboardRuntime:
         backend = SpikingAttentionBackend(
             dimension=32,
@@ -986,6 +1024,32 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Required tick field: observation", app)
         self.assertIn("Required tick field: proposed action", app)
         self.assertIn("runStartWork", app)
+        self.assertIn("function renderStartWorkDurableEvents(agentBrief)", app)
+        self.assertIn('eventRow.dataset.startWorkEventId = String(eventId || "unknown")', app)
+        self.assertIn("event?.event_type", app)
+        self.assertIn("event?.source_surface", app)
+        self.assertIn("event?.summary", app)
+        self.assertIn("deliveryReceiptId === eventReceiptId", app)
+        self.assertIn(
+            "const isMeaningful = Boolean(eventId > 0 && eventType && sourceSurface && summary)",
+            app,
+        )
+        self.assertIn("More durable events remain", app)
+        self.assertIn("const renderedReceiptIds = renderStartWork(payload)", app)
+        self.assertIn("await waitForStartWorkPaint()", app)
+        self.assertIn(
+            "requestAnimationFrame(() => requestAnimationFrame(resolve))",
+            app,
+        )
+        self.assertIn(
+            '"dashboard-ui",\n        payload.context_id,',
+            app,
+        )
+        self.assertIn("context_id: contextId", app)
+        self.assertNotIn(
+            "const receiptIds = (payload.agent_brief?.deliveries || [])",
+            app,
+        )
         self.assertIn("runWrapSession", app)
         self.assertIn("runDoctorReport", app)
         self.assertIn("runContextHealth", app)
@@ -1374,8 +1438,15 @@ class DashboardRuntimeTests(unittest.TestCase):
             )
             start_status, start_payload = self.decode(
                 runtime.handle(
-                    "GET",
-                    "/api/start-work?context_id=demo&agent_id=codex-desktop&prompt=Monday%20operator%20brief",
+                    "POST",
+                    "/api/start-work",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-ui",
+                            "prompt": "Monday operator brief",
+                        }
+                    ).encode(),
                 )
             )
             preview_status, preview_payload = self.decode(
@@ -1578,7 +1649,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(remember_payload["embedding_provider"]["provider"], "semantic-hash-v1")
         self.assertTrue(remember_payload["agent_deployment"]["published"])
         self.assertEqual(remember_payload["agent_deployment"]["event_type"], "remember-trace")
-        self.assertEqual(remember_payload["agent_deployment"]["delivery_mode"], "durable-mcp-pull")
+        self.assertEqual(remember_payload["agent_deployment"]["delivery_mode"], "leased-at-least-once")
         self.assertIn("operator-note", recall)
 
     def test_ingest_endpoint_persists_events_and_relationships(self):
@@ -2144,6 +2215,20 @@ class DashboardRuntimeTests(unittest.TestCase):
                     f"/api/context-events?context_id=demo&since_event_id={event_id}&limit=5",
                 )
             )
+            delivery_status, delivery_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/context-deliveries",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-ui",
+                            "consumer_instance_id": "dashboard-test",
+                            "limit": 5,
+                        }
+                    ).encode(),
+                )
+            )
             ack_status, ack_payload = self.decode(
                 runtime.handle(
                     "POST",
@@ -2152,7 +2237,7 @@ class DashboardRuntimeTests(unittest.TestCase):
                         {
                             "context_id": "demo",
                             "agent_id": "dashboard-ui",
-                            "last_event_id": event_id,
+                            "receipt_id": delivery_payload["deliveries"][0]["receipt_id"],
                         }
                     ).encode(),
                 )
@@ -2167,11 +2252,190 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(list_payload["events"][-1]["payload"]["tag"], "operator-note")
         self.assertEqual(since_status, 200)
         self.assertEqual(since_payload["events"], [])
+        self.assertEqual(delivery_status, 200)
         self.assertEqual(ack_status, 200)
         self.assertEqual(ack_payload["agent_id"], "dashboard-ui")
-        self.assertEqual(ack_payload["pending_event_count"], 0)
+        self.assertEqual(ack_payload["cursor"]["pending_event_count"], 0)
         self.assertEqual(cursor_status, 200)
         self.assertEqual(cursor_payload["cursors"][0]["agent_id"], "dashboard-ui")
+
+    def test_start_work_identity_and_method_contract_fail_closed(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            get_status, get_payload = self.decode(
+                runtime.handle("GET", "/api/start-work?context_id=demo")
+            )
+            forbidden_status, forbidden_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/start-work",
+                    json.dumps(
+                        {"context_id": "demo", "agent_id": "codex-desktop"}
+                    ).encode(),
+                )
+            )
+            default_status, default_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/start-work",
+                    json.dumps({"context_id": "demo"}).encode(),
+                )
+            )
+
+        self.assertEqual(get_status, 405)
+        self.assertIn("requires POST", get_payload["error"])
+        self.assertEqual(forbidden_status, 403)
+        self.assertIn("dashboard-ui", forbidden_payload["error"])
+        self.assertEqual(default_status, 200)
+        self.assertEqual(default_payload["agent_id"], "dashboard-ui")
+
+    def test_context_release_rejects_empty_and_unbounded_batches(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            base_payload = {
+                "context_id": "demo",
+                "agent_id": "dashboard-ui",
+                "consumer_instance_id": "dashboard-release-test",
+            }
+            empty_status, empty_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/context-release",
+                    json.dumps({**base_payload, "receipt_ids": []}).encode(),
+                )
+            )
+            oversized_status, oversized_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/context-release",
+                    json.dumps(
+                        {
+                            **base_payload,
+                            "receipt_ids": [
+                                f"receipt-{index}" for index in range(501)
+                            ],
+                        }
+                    ).encode(),
+                )
+            )
+            ack_oversized_status, ack_oversized_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/context-ack",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "agent_id": "dashboard-ui",
+                            "receipt_ids": [
+                                f"receipt-{index}" for index in range(501)
+                            ],
+                        }
+                    ).encode(),
+                )
+            )
+
+        self.assertEqual(empty_status, 400)
+        self.assertIn("receipt_ids", empty_payload["error"])
+        self.assertEqual(oversized_status, 400)
+        self.assertIn("between 1 and 500", oversized_payload["error"])
+        self.assertEqual(ack_oversized_status, 400)
+        self.assertIn("at most 500", ack_oversized_payload["error"])
+
+    def test_context_delivery_rejects_non_finite_lease_seconds_at_transport(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            with mock.patch.object(
+                runtime.backend,
+                "lease_context_events",
+                wraps=runtime.backend.lease_context_events,
+            ) as lease_context_events:
+                for lease_seconds in (
+                    float("inf"),
+                    float("-inf"),
+                    float("nan"),
+                ):
+                    with self.subTest(lease_seconds=lease_seconds):
+                        status, payload = self.decode(
+                            runtime.handle(
+                                "POST",
+                                "/api/context-deliveries",
+                                json.dumps(
+                                    {
+                                        "context_id": "demo",
+                                        "agent_id": "dashboard-ui",
+                                        "consumer_instance_id": "dashboard-non-finite-test",
+                                        "limit": 1,
+                                        "lease_seconds": lease_seconds,
+                                    }
+                                ).encode(),
+                            )
+                        )
+                        self.assertEqual(status, 400)
+                        self.assertEqual(
+                            payload["error"],
+                            "lease_seconds must be finite",
+                        )
+
+            lease_context_events.assert_not_called()
+
+    def test_context_dead_letter_endpoint_is_confirmed_and_audited(self):
+        with TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {"SYNAPSE_S2_CONTEXT_MAX_DELIVERY_ATTEMPTS": "2"},
+        ):
+            runtime = self.make_runtime(tmp)
+            runtime.backend.publish_context_event(
+                context_id="dead-letter-dashboard",
+                source_surface="dashboard-test",
+                event_type="poison",
+                summary="dashboard retry exhaustion",
+                agent_targets=["dashboard-ui"],
+            )
+            first = runtime.backend.memory_store.lease_context_events(
+                context_id="dead-letter-dashboard",
+                agent_id="dashboard-ui",
+                consumer_instance_id="dashboard-attempt-one",
+                limit=1,
+                lease_seconds=1.0,
+                now=100.0,
+            )["deliveries"][0]
+            runtime.backend.memory_store.lease_context_events(
+                context_id="dead-letter-dashboard",
+                agent_id="dashboard-ui",
+                consumer_instance_id="dashboard-attempt-two",
+                limit=1,
+                lease_seconds=1.0,
+                now=102.0,
+            )
+            base = {
+                "context_id": "dead-letter-dashboard",
+                "agent_id": "dashboard-ui",
+                "delivery_id": first["delivery_id"],
+                "reason": "dashboard test consumer cannot decode event",
+            }
+            rejected_status, rejected_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/context-dead-letter",
+                    json.dumps(base).encode(),
+                )
+            )
+            accepted_status, accepted_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/context-dead-letter",
+                    json.dumps({**base, "confirm": True}).encode(),
+                )
+            )
+
+        self.assertEqual(rejected_status, 400)
+        self.assertIn("confirm=true", rejected_payload["error"])
+        self.assertEqual(accepted_status, 200)
+        self.assertEqual(
+            accepted_payload["action"],
+            "context-delivery-dead-letter",
+        )
+        self.assertTrue(accepted_payload["operation_id"].startswith("s2maint_"))
 
 
 if __name__ == "__main__":

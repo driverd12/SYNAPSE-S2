@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import sys
@@ -26,6 +27,11 @@ if not LOGGER.handlers:
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
+
+
+CONTEXT_EVENT_TARGET_GROUPS = frozenset(
+    {"mcp-clients", "local-ide-adapters"}
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS memory_entries (
@@ -108,6 +114,9 @@ CREATE TABLE IF NOT EXISTS agent_context_events (
 CREATE INDEX IF NOT EXISTS ix_agent_context_events_context_event
 ON agent_context_events(context_id, event_id);
 
+CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_context_events_context_event
+ON agent_context_events(context_id, event_id);
+
 CREATE TABLE IF NOT EXISTS agent_context_cursors (
     context_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
@@ -118,6 +127,57 @@ CREATE TABLE IF NOT EXISTS agent_context_cursors (
 
 CREATE INDEX IF NOT EXISTS ix_agent_context_cursors_context
 ON agent_context_cursors(context_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_context_consumers (
+    agent_id TEXT PRIMARY KEY,
+    consumer_kind TEXT NOT NULL DEFAULT 'local-mcp',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    CHECK(enabled IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS agent_context_consumer_groups (
+    agent_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(agent_id, group_id),
+    FOREIGN KEY(agent_id)
+        REFERENCES agent_context_consumers(agent_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_agent_context_consumer_groups_group_agent
+ON agent_context_consumer_groups(group_id, agent_id);
+
+CREATE TABLE IF NOT EXISTS agent_context_event_targets (
+    event_id INTEGER NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(event_id, target_kind, target_id),
+    CHECK(target_kind IN ('agent', 'group', 'broadcast')),
+    FOREIGN KEY(event_id)
+        REFERENCES agent_context_events(event_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_agent_context_event_targets_route
+ON agent_context_event_targets(target_kind, target_id, event_id);
+
+CREATE TABLE IF NOT EXISTS agent_context_delivery_cursors (
+    context_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    last_contiguous_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(context_id, agent_id),
+    FOREIGN KEY(agent_id)
+        REFERENCES agent_context_consumers(agent_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_agent_context_delivery_cursors_context
+ON agent_context_delivery_cursors(context_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS memory_relationships (
     relationship_id TEXT PRIMARY KEY,
@@ -210,6 +270,470 @@ CREATE TABLE IF NOT EXISTS store_maintenance_receipts (
 CREATE INDEX IF NOT EXISTS ix_store_maintenance_receipts_type_created
 ON store_maintenance_receipts(operation_type, created_at DESC);
 """
+
+# Context delivery is intentionally installed by a versioned migration rather
+# than the general ``CREATE TABLE IF NOT EXISTS`` bootstrap above.  An early v2
+# prototype used ``status``/``lease_token`` columns under the final table name;
+# creating final indexes before rebuilding that table made existing stores
+# impossible to open.  Keeping these statements separate lets the migration
+# inspect, validate, and atomically replace the prototype schema first.
+CONTEXT_DELIVERY_V2_TABLE_STATEMENTS = (
+    """
+    CREATE TABLE agent_context_deliveries (
+        delivery_id TEXT PRIMARY KEY NOT NULL,
+        context_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        event_id INTEGER NOT NULL,
+        state TEXT NOT NULL DEFAULT 'leased',
+        attempt_count INTEGER NOT NULL DEFAULT 1,
+        current_receipt_id TEXT NOT NULL,
+        lease_owner TEXT NOT NULL,
+        first_delivered_at REAL NOT NULL,
+        last_delivered_at REAL NOT NULL,
+        lease_expires_at REAL NOT NULL,
+        acknowledged_at REAL,
+        cancelled_at REAL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(context_id, agent_id, event_id),
+        CHECK(state IN ('leased', 'acknowledged', 'dead_letter')),
+        CHECK(attempt_count >= 1),
+        CHECK(length(delivery_id) BETWEEN 1 AND 160),
+        CHECK(delivery_id = trim(delivery_id)),
+        CHECK(delivery_id NOT GLOB '*[^A-Za-z0-9_.:@-]*'),
+        CHECK(length(context_id) BETWEEN 1 AND 128),
+        CHECK(context_id = trim(context_id)),
+        CHECK(length(agent_id) BETWEEN 1 AND 128),
+        CHECK(agent_id = trim(agent_id)),
+        CHECK(agent_id = lower(agent_id)),
+        CHECK(agent_id NOT GLOB '*[^a-z0-9_.:@-]*'),
+        CHECK(length(current_receipt_id) = 51),
+        CHECK(substr(current_receipt_id, 1, 8) = 'ctxrcpt_'),
+        CHECK(substr(current_receipt_id, 9) NOT GLOB '*[^A-Za-z0-9_-]*'),
+        CHECK(length(lease_owner) BETWEEN 1 AND 256),
+        CHECK(lease_owner = trim(lease_owner)),
+        CHECK(lease_owner NOT GLOB '*[^ -~]*'),
+        CHECK(typeof(first_delivered_at) IN ('integer', 'real')),
+        CHECK(typeof(last_delivered_at) IN ('integer', 'real')),
+        CHECK(typeof(lease_expires_at) IN ('integer', 'real')),
+        CHECK(typeof(created_at) IN ('integer', 'real')),
+        CHECK(typeof(updated_at) IN ('integer', 'real')),
+        CHECK(abs(first_delivered_at) < 1.0e308),
+        CHECK(abs(last_delivered_at) < 1.0e308),
+        CHECK(abs(lease_expires_at) < 1.0e308),
+        CHECK(abs(created_at) < 1.0e308),
+        CHECK(abs(updated_at) < 1.0e308),
+        CHECK(created_at <= first_delivered_at),
+        CHECK(first_delivered_at <= last_delivered_at),
+        CHECK(last_delivered_at <= updated_at),
+        CHECK(last_delivered_at <= lease_expires_at),
+        CHECK(
+            (
+                state = 'leased'
+                AND acknowledged_at IS NULL
+                AND cancelled_at IS NULL
+            )
+            OR (
+                state = 'acknowledged'
+                AND typeof(acknowledged_at) IN ('integer', 'real')
+                AND abs(acknowledged_at) < 1.0e308
+                AND acknowledged_at >= last_delivered_at
+                AND acknowledged_at <= lease_expires_at
+                AND acknowledged_at <= updated_at
+                AND cancelled_at IS NULL
+            )
+            OR (
+                state = 'dead_letter'
+                AND acknowledged_at IS NULL
+                AND typeof(cancelled_at) IN ('integer', 'real')
+                AND abs(cancelled_at) < 1.0e308
+                AND cancelled_at >= last_delivered_at
+                AND cancelled_at <= updated_at
+            )
+        ),
+        FOREIGN KEY(agent_id)
+            REFERENCES agent_context_consumers(agent_id)
+            ON DELETE CASCADE,
+        FOREIGN KEY(context_id, event_id)
+            REFERENCES agent_context_events(context_id, event_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE agent_context_delivery_receipts (
+        receipt_id TEXT PRIMARY KEY NOT NULL,
+        delivery_id TEXT NOT NULL,
+        attempt_number INTEGER NOT NULL,
+        consumer_instance_id TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'leased',
+        leased_at REAL NOT NULL,
+        lease_expires_at REAL NOT NULL,
+        acknowledged_at REAL,
+        released_at REAL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(delivery_id, attempt_number),
+        CHECK(state IN ('leased', 'acknowledged', 'expired', 'released', 'cancelled')),
+        CHECK(attempt_number >= 1),
+        CHECK(length(receipt_id) = 51),
+        CHECK(substr(receipt_id, 1, 8) = 'ctxrcpt_'),
+        CHECK(substr(receipt_id, 9) NOT GLOB '*[^A-Za-z0-9_-]*'),
+        CHECK(length(delivery_id) BETWEEN 1 AND 160),
+        CHECK(delivery_id = trim(delivery_id)),
+        CHECK(delivery_id NOT GLOB '*[^A-Za-z0-9_.:@-]*'),
+        CHECK(length(consumer_instance_id) BETWEEN 1 AND 256),
+        CHECK(consumer_instance_id = trim(consumer_instance_id)),
+        CHECK(consumer_instance_id NOT GLOB '*[^ -~]*'),
+        CHECK(typeof(leased_at) IN ('integer', 'real')),
+        CHECK(typeof(lease_expires_at) IN ('integer', 'real')),
+        CHECK(typeof(created_at) IN ('integer', 'real')),
+        CHECK(typeof(updated_at) IN ('integer', 'real')),
+        CHECK(abs(leased_at) < 1.0e308),
+        CHECK(abs(lease_expires_at) < 1.0e308),
+        CHECK(abs(created_at) < 1.0e308),
+        CHECK(abs(updated_at) < 1.0e308),
+        CHECK(created_at <= leased_at),
+        CHECK(leased_at <= lease_expires_at),
+        CHECK(created_at <= updated_at),
+        CHECK(
+            (
+                state = 'leased'
+                AND acknowledged_at IS NULL
+                AND released_at IS NULL
+            )
+            OR (
+                state = 'expired'
+                AND acknowledged_at IS NULL
+                AND released_at IS NULL
+                AND lease_expires_at <= updated_at
+            )
+            OR (
+                state = 'acknowledged'
+                AND typeof(acknowledged_at) IN ('integer', 'real')
+                AND abs(acknowledged_at) < 1.0e308
+                AND acknowledged_at >= leased_at
+                AND acknowledged_at <= lease_expires_at
+                AND acknowledged_at <= updated_at
+                AND released_at IS NULL
+            )
+            OR (
+                state = 'released'
+                AND acknowledged_at IS NULL
+                AND typeof(released_at) IN ('integer', 'real')
+                AND abs(released_at) < 1.0e308
+                AND released_at >= leased_at
+                AND released_at <= lease_expires_at
+                AND released_at <= updated_at
+            )
+            OR (
+                state = 'cancelled'
+                AND acknowledged_at IS NULL
+                AND (
+                    released_at IS NULL
+                    OR (
+                        typeof(released_at) IN ('integer', 'real')
+                        AND abs(released_at) < 1.0e308
+                        AND released_at >= leased_at
+                        AND released_at <= lease_expires_at
+                        AND released_at <= updated_at
+                    )
+                )
+            )
+        ),
+        FOREIGN KEY(delivery_id)
+            REFERENCES agent_context_deliveries(delivery_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS agent_context_delivery_ack_tombstones (
+        receipt_digest TEXT PRIMARY KEY NOT NULL,
+        delivery_id TEXT NOT NULL,
+        context_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        event_id INTEGER NOT NULL,
+        attempt_number INTEGER NOT NULL,
+        acknowledged_at REAL NOT NULL,
+        deleted_at REAL NOT NULL,
+        UNIQUE(delivery_id, attempt_number),
+        CHECK(length(receipt_digest) = 64),
+        CHECK(receipt_digest NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(delivery_id) BETWEEN 1 AND 160),
+        CHECK(delivery_id = trim(delivery_id)),
+        CHECK(delivery_id NOT GLOB '*[^A-Za-z0-9_.:@-]*'),
+        CHECK(length(context_id) BETWEEN 1 AND 128),
+        CHECK(context_id = trim(context_id)),
+        CHECK(trim(agent_id) <> ''),
+        CHECK(agent_id = lower(agent_id)),
+        CHECK(event_id >= 1),
+        CHECK(attempt_number >= 1),
+        CHECK(abs(acknowledged_at) < 1.0e308),
+        CHECK(abs(deleted_at) < 1.0e308),
+        CHECK(deleted_at >= acknowledged_at)
+    )
+    """,
+)
+CONTEXT_DELIVERY_V2_INDEX_STATEMENTS = (
+    """
+    CREATE INDEX IF NOT EXISTS ix_agent_context_deliveries_agent_state_event
+    ON agent_context_deliveries(context_id, agent_id, state, event_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_agent_context_deliveries_lease_expiry
+    ON agent_context_deliveries(state, lease_expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_agent_context_delivery_receipts_delivery_attempt
+    ON agent_context_delivery_receipts(delivery_id, attempt_number)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_agent_context_delivery_receipts_state_expiry
+    ON agent_context_delivery_receipts(state, lease_expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_agent_context_delivery_ack_tombstones_owner
+    ON agent_context_delivery_ack_tombstones(context_id, agent_id, deleted_at DESC)
+    """,
+)
+CONTEXT_DELIVERY_V2_DELIVERY_COLUMNS = (
+    "delivery_id",
+    "context_id",
+    "agent_id",
+    "event_id",
+    "state",
+    "attempt_count",
+    "current_receipt_id",
+    "lease_owner",
+    "first_delivered_at",
+    "last_delivered_at",
+    "lease_expires_at",
+    "acknowledged_at",
+    "cancelled_at",
+    "created_at",
+    "updated_at",
+)
+CONTEXT_DELIVERY_V2_RECEIPT_COLUMNS = (
+    "receipt_id",
+    "delivery_id",
+    "attempt_number",
+    "consumer_instance_id",
+    "state",
+    "leased_at",
+    "lease_expires_at",
+    "acknowledged_at",
+    "released_at",
+    "created_at",
+    "updated_at",
+)
+CONTEXT_DELIVERY_V2_TOMBSTONE_COLUMNS = (
+    "receipt_digest",
+    "delivery_id",
+    "context_id",
+    "agent_id",
+    "event_id",
+    "attempt_number",
+    "acknowledged_at",
+    "deleted_at",
+)
+CONTEXT_DELIVERY_V1_DELIVERY_COLUMNS = (
+    "delivery_id",
+    "context_id",
+    "agent_id",
+    "event_id",
+    "status",
+    "lease_token",
+    "attempt_count",
+    "first_delivered_at",
+    "last_delivered_at",
+    "lease_expires_at",
+    "acknowledged_at",
+    "created_at",
+    "updated_at",
+)
+CONTEXT_DELIVERY_V2_COLUMN_SIGNATURES = {
+    "agent_context_deliveries": (
+        ("delivery_id", "TEXT", 1, None, 1),
+        ("context_id", "TEXT", 1, None, 0),
+        ("agent_id", "TEXT", 1, None, 0),
+        ("event_id", "INTEGER", 1, None, 0),
+        ("state", "TEXT", 1, "'leased'", 0),
+        ("attempt_count", "INTEGER", 1, "1", 0),
+        ("current_receipt_id", "TEXT", 1, None, 0),
+        ("lease_owner", "TEXT", 1, None, 0),
+        ("first_delivered_at", "REAL", 1, None, 0),
+        ("last_delivered_at", "REAL", 1, None, 0),
+        ("lease_expires_at", "REAL", 1, None, 0),
+        ("acknowledged_at", "REAL", 0, None, 0),
+        ("cancelled_at", "REAL", 0, None, 0),
+        ("created_at", "REAL", 1, None, 0),
+        ("updated_at", "REAL", 1, None, 0),
+    ),
+    "agent_context_delivery_receipts": (
+        ("receipt_id", "TEXT", 1, None, 1),
+        ("delivery_id", "TEXT", 1, None, 0),
+        ("attempt_number", "INTEGER", 1, None, 0),
+        ("consumer_instance_id", "TEXT", 1, None, 0),
+        ("state", "TEXT", 1, "'leased'", 0),
+        ("leased_at", "REAL", 1, None, 0),
+        ("lease_expires_at", "REAL", 1, None, 0),
+        ("acknowledged_at", "REAL", 0, None, 0),
+        ("released_at", "REAL", 0, None, 0),
+        ("created_at", "REAL", 1, None, 0),
+        ("updated_at", "REAL", 1, None, 0),
+    ),
+    "agent_context_delivery_ack_tombstones": (
+        ("receipt_digest", "TEXT", 1, None, 1),
+        ("delivery_id", "TEXT", 1, None, 0),
+        ("context_id", "TEXT", 1, None, 0),
+        ("agent_id", "TEXT", 1, None, 0),
+        ("event_id", "INTEGER", 1, None, 0),
+        ("attempt_number", "INTEGER", 1, None, 0),
+        ("acknowledged_at", "REAL", 1, None, 0),
+        ("deleted_at", "REAL", 1, None, 0),
+    ),
+}
+CONTEXT_DELIVERY_V2_FOREIGN_KEYS = {
+    "agent_context_deliveries": {
+        ("agent_context_consumers", "agent_id", "agent_id", "CASCADE"),
+        ("agent_context_events", "context_id", "context_id", "CASCADE"),
+        ("agent_context_events", "event_id", "event_id", "CASCADE"),
+    },
+    "agent_context_delivery_receipts": {
+        ("agent_context_deliveries", "delivery_id", "delivery_id", "CASCADE"),
+    },
+    "agent_context_delivery_ack_tombstones": set(),
+}
+CONTEXT_DELIVERY_V2_UNIQUE_KEYS = {
+    "agent_context_deliveries": {
+        ("delivery_id",),
+        ("context_id", "agent_id", "event_id"),
+    },
+    "agent_context_delivery_receipts": {
+        ("receipt_id",),
+        ("delivery_id", "attempt_number"),
+    },
+    "agent_context_delivery_ack_tombstones": {
+        ("receipt_digest",),
+        ("delivery_id", "attempt_number"),
+    },
+}
+CONTEXT_DELIVERY_V2_CHECK_FRAGMENTS = {
+    "agent_context_deliveries": (
+        "check(state in ('leased', 'acknowledged', 'dead_letter'))",
+        "check(attempt_count >= 1)",
+        "check(length(delivery_id) between 1 and 160)",
+        "check(delivery_id = trim(delivery_id))",
+        "check(delivery_id not glob '*[^a-za-z0-9_.:@-]*')",
+        "check(length(context_id) between 1 and 128)",
+        "check(context_id = trim(context_id))",
+        "check(length(agent_id) between 1 and 128)",
+        "check(agent_id = trim(agent_id))",
+        "check(agent_id = lower(agent_id))",
+        "check(agent_id not glob '*[^a-z0-9_.:@-]*')",
+        "check(length(current_receipt_id) = 51)",
+        "check(substr(current_receipt_id, 1, 8) = 'ctxrcpt_')",
+        "check(substr(current_receipt_id, 9) not glob '*[^a-za-z0-9_-]*')",
+        "check(length(lease_owner) between 1 and 256)",
+        "check(lease_owner = trim(lease_owner))",
+        "check(lease_owner not glob '*[^ -~]*')",
+        "check(typeof(first_delivered_at) in ('integer', 'real'))",
+        "check(typeof(last_delivered_at) in ('integer', 'real'))",
+        "check(typeof(lease_expires_at) in ('integer', 'real'))",
+        "check(typeof(created_at) in ('integer', 'real'))",
+        "check(typeof(updated_at) in ('integer', 'real'))",
+        "check(abs(first_delivered_at) < 1.0e308)",
+        "check(abs(last_delivered_at) < 1.0e308)",
+        "check(abs(lease_expires_at) < 1.0e308)",
+        "check(abs(created_at) < 1.0e308)",
+        "check(abs(updated_at) < 1.0e308)",
+        "check(created_at <= first_delivered_at)",
+        "check(first_delivered_at <= last_delivered_at)",
+        "check(last_delivered_at <= updated_at)",
+        "check(last_delivered_at <= lease_expires_at)",
+        "state = 'leased' and acknowledged_at is null and cancelled_at is null",
+        "state = 'acknowledged' and typeof(acknowledged_at) in ('integer', 'real')",
+        "and abs(acknowledged_at) < 1.0e308 and acknowledged_at >= last_delivered_at",
+        "state = 'dead_letter' and acknowledged_at is null",
+        "and abs(cancelled_at) < 1.0e308 and cancelled_at >= last_delivered_at",
+        "foreign key(context_id, event_id) references agent_context_events(context_id, event_id)",
+    ),
+    "agent_context_delivery_receipts": (
+        "check(state in ('leased', 'acknowledged', 'expired', 'released', 'cancelled'))",
+        "check(attempt_number >= 1)",
+        "check(length(receipt_id) = 51)",
+        "check(substr(receipt_id, 1, 8) = 'ctxrcpt_')",
+        "check(substr(receipt_id, 9) not glob '*[^a-za-z0-9_-]*')",
+        "check(length(delivery_id) between 1 and 160)",
+        "check(delivery_id = trim(delivery_id))",
+        "check(delivery_id not glob '*[^a-za-z0-9_.:@-]*')",
+        "check(length(consumer_instance_id) between 1 and 256)",
+        "check(consumer_instance_id = trim(consumer_instance_id))",
+        "check(consumer_instance_id not glob '*[^ -~]*')",
+        "check(typeof(leased_at) in ('integer', 'real'))",
+        "check(typeof(lease_expires_at) in ('integer', 'real'))",
+        "check(typeof(created_at) in ('integer', 'real'))",
+        "check(typeof(updated_at) in ('integer', 'real'))",
+        "check(abs(leased_at) < 1.0e308)",
+        "check(abs(lease_expires_at) < 1.0e308)",
+        "check(abs(created_at) < 1.0e308)",
+        "check(abs(updated_at) < 1.0e308)",
+        "check(created_at <= leased_at)",
+        "check(leased_at <= lease_expires_at)",
+        "check(created_at <= updated_at)",
+        "state = 'leased' and acknowledged_at is null and released_at is null",
+        "state = 'expired' and acknowledged_at is null and released_at is null",
+        "and lease_expires_at <= updated_at",
+        "state = 'acknowledged' and typeof(acknowledged_at) in ('integer', 'real')",
+        "and abs(acknowledged_at) < 1.0e308 and acknowledged_at >= leased_at",
+        "state = 'released' and acknowledged_at is null",
+        "and abs(released_at) < 1.0e308 and released_at >= leased_at",
+        "state = 'cancelled' and acknowledged_at is null",
+        "foreign key(delivery_id) references agent_context_deliveries(delivery_id)",
+    ),
+    "agent_context_delivery_ack_tombstones": (
+        "check(length(receipt_digest) = 64)",
+        "check(receipt_digest not glob '*[^0-9a-f]*')",
+        "check(length(delivery_id) between 1 and 160)",
+        "check(delivery_id = trim(delivery_id))",
+        "check(delivery_id not glob '*[^a-za-z0-9_.:@-]*')",
+        "check(length(context_id) between 1 and 128)",
+        "check(context_id = trim(context_id))",
+        "check(trim(agent_id) <> '')",
+        "check(agent_id = lower(agent_id))",
+        "check(event_id >= 1)",
+        "check(attempt_number >= 1)",
+        "check(abs(acknowledged_at) < 1.0e308)",
+        "check(abs(deleted_at) < 1.0e308)",
+        "check(deleted_at >= acknowledged_at)",
+    ),
+}
+CONTEXT_DELIVERY_V2_INDEX_COLUMNS = {
+    "ix_agent_context_deliveries_agent_state_event": (
+        "agent_context_deliveries",
+        ("context_id", "agent_id", "state", "event_id"),
+    ),
+    "ix_agent_context_deliveries_lease_expiry": (
+        "agent_context_deliveries",
+        ("state", "lease_expires_at"),
+    ),
+    "ix_agent_context_delivery_receipts_delivery_attempt": (
+        "agent_context_delivery_receipts",
+        ("delivery_id", "attempt_number"),
+    ),
+    "ix_agent_context_delivery_receipts_state_expiry": (
+        "agent_context_delivery_receipts",
+        ("state", "lease_expires_at"),
+    ),
+    "ix_agent_context_delivery_ack_tombstones_owner": (
+        "agent_context_delivery_ack_tombstones",
+        ("context_id", "agent_id", "deleted_at"),
+    ),
+}
+CONTEXT_DELIVERY_V2_PARENT_INDEX = (
+    "ux_agent_context_events_context_event",
+    "agent_context_events",
+    ("context_id", "event_id"),
+)
 
 SEMANTIC_INDEX_SCHEMA_STATEMENTS = (
     """
@@ -414,6 +938,7 @@ class DurableMemoryStore:
 
     def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
         self.db_path = self._resolve_db_path(db_path)
+        self._target_integrity_verified = False
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._protect_path(self.db_path.parent, directory=True)
         self._initialize()
@@ -427,6 +952,7 @@ class DurableMemoryStore:
 
         store = cls.__new__(cls)
         store.db_path = store._resolve_db_path(db_path)
+        store._target_integrity_verified = False
         if not store.db_path.is_file():
             raise FileNotFoundError(
                 f"SYNAPSE-S2 memory store does not exist: {store.db_path}"
@@ -532,6 +1058,19 @@ class DurableMemoryStore:
             raise
 
     @contextmanager
+    def _read_connection_scope(
+        self,
+        existing: sqlite3.Connection | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Borrow a snapshot connection or open the normal migrated reader."""
+
+        if existing is not None:
+            yield existing
+            return
+        with closing(self._connect()) as conn:
+            yield conn
+
+    @contextmanager
     def _transaction(
         self,
         conn: sqlite3.Connection,
@@ -565,22 +1104,2874 @@ class DurableMemoryStore:
             if writer_gate_fd is not None:
                 self._release_file_lock(writer_gate_fd)
 
+    @staticmethod
+    def _schema_column_names(
+        conn: sqlite3.Connection,
+        table_name: str,
+    ) -> tuple[str, ...]:
+        allowed_tables = {
+            "agent_context_deliveries",
+            "agent_context_delivery_receipts",
+            "agent_context_deliveries_v1_legacy",
+            "agent_context_delivery_receipts_v1_legacy",
+            "agent_context_deliveries_v2_legacy",
+            "agent_context_delivery_receipts_v2_legacy",
+            "agent_context_delivery_ack_tombstones",
+            "agent_context_delivery_ack_tombstones_v2_legacy",
+        }
+        if table_name not in allowed_tables:
+            raise ValueError(f"unsupported schema inspection table: {table_name}")
+        return tuple(
+            str(row["name"])
+            for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        )
+
+    @staticmethod
+    def _normalized_schema_sql(raw_sql: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(raw_sql or "").strip().casefold())
+        return normalized.replace(" if not exists ", " ")
+
+    def _context_delivery_v2_table_errors(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        table_names: Iterable[str] | None = None,
+    ) -> list[str]:
+        requested = tuple(
+            table_names
+            or (
+                "agent_context_deliveries",
+                "agent_context_delivery_receipts",
+                "agent_context_delivery_ack_tombstones",
+            )
+        )
+        errors: list[str] = []
+        for table_name in requested:
+            expected_columns = CONTEXT_DELIVERY_V2_COLUMN_SIGNATURES[table_name]
+            schema_row = conn.execute(
+                "SELECT type, sql FROM sqlite_master WHERE name = ?",
+                (table_name,),
+            ).fetchone()
+            if schema_row is None or str(schema_row["type"]) != "table":
+                errors.append(f"{table_name}:missing-table")
+                continue
+            actual_columns = tuple(
+                (
+                    str(row["name"]),
+                    str(row["type"]).upper(),
+                    int(row["notnull"]),
+                    None if row["dflt_value"] is None else str(row["dflt_value"]),
+                    int(row["pk"]),
+                )
+                for row in conn.execute(
+                    f'PRAGMA table_info("{table_name}")'
+                ).fetchall()
+            )
+            if actual_columns != expected_columns:
+                errors.append(f"{table_name}:column-signature")
+
+            actual_foreign_keys = {
+                (
+                    str(row["table"]),
+                    str(row["from"]),
+                    str(row["to"]),
+                    str(row["on_delete"]).upper(),
+                )
+                for row in conn.execute(
+                    f'PRAGMA foreign_key_list("{table_name}")'
+                ).fetchall()
+            }
+            if actual_foreign_keys != CONTEXT_DELIVERY_V2_FOREIGN_KEYS[table_name]:
+                errors.append(f"{table_name}:foreign-key-signature")
+
+            actual_unique_keys: set[tuple[str, ...]] = set()
+            for index_row in conn.execute(
+                f'PRAGMA index_list("{table_name}")'
+            ).fetchall():
+                if int(index_row["unique"]) != 1:
+                    continue
+                index_name = str(index_row["name"])
+                actual_unique_keys.add(
+                    tuple(
+                        str(column_row["name"])
+                        for column_row in conn.execute(
+                            f'PRAGMA index_info("{index_name}")'
+                        ).fetchall()
+                    )
+                )
+            if actual_unique_keys != CONTEXT_DELIVERY_V2_UNIQUE_KEYS[table_name]:
+                errors.append(f"{table_name}:unique-key-signature")
+
+            normalized_sql = self._normalized_schema_sql(str(schema_row["sql"] or ""))
+            for fragment in CONTEXT_DELIVERY_V2_CHECK_FRAGMENTS[table_name]:
+                if self._normalized_schema_sql(fragment) not in normalized_sql:
+                    errors.append(f"{table_name}:constraint-sql")
+                    break
+        return errors
+
+    def _context_delivery_v2_index_errors(
+        self,
+        conn: sqlite3.Connection,
+    ) -> list[str]:
+        errors: list[str] = []
+        for index_name, (parent_table, expected_columns) in (
+            CONTEXT_DELIVERY_V2_INDEX_COLUMNS.items()
+        ):
+            schema_row = conn.execute(
+                "SELECT type, tbl_name FROM sqlite_master WHERE name = ?",
+                (index_name,),
+            ).fetchone()
+            if (
+                schema_row is None
+                or str(schema_row["type"]) != "index"
+                or str(schema_row["tbl_name"]) != parent_table
+            ):
+                errors.append(f"{index_name}:missing-or-wrong-parent")
+                continue
+            actual_columns = tuple(
+                str(row["name"])
+                for row in conn.execute(
+                    f'PRAGMA index_info("{index_name}")'
+                ).fetchall()
+            )
+            list_row = next(
+                (
+                    row
+                    for row in conn.execute(
+                        f'PRAGMA index_list("{parent_table}")'
+                    ).fetchall()
+                    if str(row["name"]) == index_name
+                ),
+                None,
+            )
+            if (
+                actual_columns != expected_columns
+                or list_row is None
+                or int(list_row["unique"]) != 0
+                or int(list_row["partial"]) != 0
+            ):
+                errors.append(f"{index_name}:index-signature")
+        parent_index_name, parent_table, parent_columns = (
+            CONTEXT_DELIVERY_V2_PARENT_INDEX
+        )
+        parent_schema_row = conn.execute(
+            "SELECT type, tbl_name FROM sqlite_master WHERE name = ?",
+            (parent_index_name,),
+        ).fetchone()
+        parent_list_row = next(
+            (
+                row
+                for row in conn.execute(
+                    f'PRAGMA index_list("{parent_table}")'
+                ).fetchall()
+                if str(row["name"]) == parent_index_name
+            ),
+            None,
+        )
+        parent_actual_columns = tuple(
+            str(row["name"])
+            for row in conn.execute(
+                f'PRAGMA index_info("{parent_index_name}")'
+            ).fetchall()
+        )
+        if (
+            parent_schema_row is None
+            or str(parent_schema_row["type"]) != "index"
+            or str(parent_schema_row["tbl_name"]) != parent_table
+            or parent_actual_columns != parent_columns
+            or parent_list_row is None
+            or int(parent_list_row["unique"]) != 1
+            or int(parent_list_row["partial"]) != 0
+        ):
+            errors.append(f"{parent_index_name}:index-signature")
+        return errors
+
+    @staticmethod
+    def _context_delivery_identifier_is_valid(value: Any) -> bool:
+        text = value if isinstance(value, str) else ""
+        return bool(
+            1 <= len(text) <= 160
+            and text == text.strip()
+            and re.fullmatch(r"[A-Za-z0-9_.:@-]+", text)
+        )
+
+    @staticmethod
+    def _context_event_context_id_is_valid(value: Any) -> bool:
+        text = value if isinstance(value, str) else ""
+        return bool(1 <= len(text) <= 128 and text == text.strip())
+
+    @staticmethod
+    def _context_delivery_receipt_id_is_valid(value: Any) -> bool:
+        text = value if isinstance(value, str) else ""
+        return bool(re.fullmatch(r"ctxrcpt_[A-Za-z0-9_-]{43}", text))
+
+    @staticmethod
+    def _context_delivery_owner_is_valid(value: Any) -> bool:
+        text = value if isinstance(value, str) else ""
+        return bool(
+            1 <= len(text) <= 256
+            and text == text.strip()
+            and all(0x20 <= ord(character) <= 0x7E for character in text)
+        )
+
+    @staticmethod
+    def _context_delivery_timestamp_is_valid(value: Any) -> bool:
+        return bool(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and abs(float(value)) < 1.0e308
+        )
+
+    @staticmethod
+    def _context_delivery_integer_is_valid(value: Any, *, minimum: int = 1) -> bool:
+        return bool(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and int(value) >= int(minimum)
+        )
+
+    def _context_delivery_live_data_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+        sample_limit: int = 10,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Audit live delivery and receipt rows without trusting their schema.
+
+        SQLite CHECK constraints protect normal writers, but maintenance tools
+        and old schema versions can bypass them.  This read-time audit is the
+        fail-closed boundary used by both startup migration and health.  It
+        deliberately hashes receipt identifiers in samples because they are
+        bearer acknowledgement capabilities.
+        """
+
+        context = None if context_id is None else str(context_id)
+        deliveries = conn.execute(
+            """
+            SELECT *
+            FROM agent_context_deliveries
+            WHERE (? IS NULL OR context_id = ?)
+            ORDER BY context_id, agent_id, event_id, delivery_id
+            """,
+            (context, context),
+        ).fetchall()
+        if context is None:
+            receipts = conn.execute(
+                """
+                SELECT *
+                FROM agent_context_delivery_receipts
+                ORDER BY delivery_id, attempt_number, receipt_id
+                """
+            ).fetchall()
+        else:
+            receipts = conn.execute(
+                """
+                SELECT receipt.*
+                FROM agent_context_delivery_receipts AS receipt
+                JOIN agent_context_deliveries AS delivery
+                  ON delivery.delivery_id = receipt.delivery_id
+                WHERE delivery.context_id = ?
+                ORDER BY receipt.delivery_id, receipt.attempt_number,
+                         receipt.receipt_id
+                """,
+                (context,),
+            ).fetchall()
+
+        findings: list[dict[str, Any]] = []
+        bounded_sample_limit = min(max(int(sample_limit), 1), 100)
+
+        def add_finding(payload: dict[str, Any]) -> None:
+            findings.append(payload)
+
+        def receipt_digest(value: Any) -> str:
+            return self._context_delivery_receipt_digest(
+                value if isinstance(value, str) else ""
+            )
+
+        receipts_by_delivery: dict[str, list[sqlite3.Row]] = {}
+        receipts_by_id: dict[str, list[sqlite3.Row]] = {}
+        for receipt in receipts:
+            delivery_key = (
+                receipt["delivery_id"]
+                if isinstance(receipt["delivery_id"], str)
+                else ""
+            )
+            receipt_key = (
+                receipt["receipt_id"]
+                if isinstance(receipt["receipt_id"], str)
+                else ""
+            )
+            receipts_by_delivery.setdefault(delivery_key, []).append(receipt)
+            receipts_by_id.setdefault(receipt_key, []).append(receipt)
+
+            errors: list[str] = []
+            if not self._context_delivery_receipt_id_is_valid(receipt["receipt_id"]):
+                errors.append("receipt-id-format")
+            if not self._context_delivery_identifier_is_valid(receipt["delivery_id"]):
+                errors.append("delivery-id-format")
+            if not self._context_delivery_integer_is_valid(
+                receipt["attempt_number"]
+            ):
+                errors.append("attempt-number")
+            if not self._context_delivery_owner_is_valid(
+                receipt["consumer_instance_id"]
+            ):
+                errors.append("consumer-instance-id")
+
+            state = receipt["state"] if isinstance(receipt["state"], str) else ""
+            if state not in {
+                "leased",
+                "acknowledged",
+                "expired",
+                "released",
+                "cancelled",
+            }:
+                errors.append("state")
+            required_timestamps = {
+                "leased-at": receipt["leased_at"],
+                "lease-expires-at": receipt["lease_expires_at"],
+                "created-at": receipt["created_at"],
+                "updated-at": receipt["updated_at"],
+            }
+            invalid_required = {
+                label
+                for label, value in required_timestamps.items()
+                if not self._context_delivery_timestamp_is_valid(value)
+            }
+            errors.extend(sorted(invalid_required))
+            if not invalid_required:
+                created_at = float(receipt["created_at"])
+                leased_at = float(receipt["leased_at"])
+                lease_expires_at = float(receipt["lease_expires_at"])
+                updated_at = float(receipt["updated_at"])
+                if created_at > leased_at:
+                    errors.append("created-after-leased")
+                if leased_at > lease_expires_at:
+                    errors.append("leased-after-expiry")
+                if created_at > updated_at:
+                    errors.append("created-after-updated")
+
+            acknowledged_at = receipt["acknowledged_at"]
+            released_at = receipt["released_at"]
+            if acknowledged_at is not None and not (
+                self._context_delivery_timestamp_is_valid(acknowledged_at)
+            ):
+                errors.append("acknowledged-at")
+            if released_at is not None and not (
+                self._context_delivery_timestamp_is_valid(released_at)
+            ):
+                errors.append("released-at")
+            if state in {"leased", "expired"}:
+                if acknowledged_at is not None or released_at is not None:
+                    errors.append("nonterminal-state-timestamps")
+                if (
+                    state == "expired"
+                    and not invalid_required
+                    and float(receipt["lease_expires_at"])
+                    > float(receipt["updated_at"])
+                ):
+                    errors.append("expired-before-lease-expiry")
+            elif state == "acknowledged":
+                if acknowledged_at is None or released_at is not None:
+                    errors.append("acknowledged-state-timestamps")
+            elif state == "released":
+                if acknowledged_at is not None or released_at is None:
+                    errors.append("released-state-timestamps")
+            elif state == "cancelled" and acknowledged_at is not None:
+                errors.append("cancelled-state-timestamps")
+
+            if not invalid_required:
+                leased_at = float(receipt["leased_at"])
+                lease_expires_at = float(receipt["lease_expires_at"])
+                updated_at = float(receipt["updated_at"])
+                if self._context_delivery_timestamp_is_valid(acknowledged_at):
+                    acknowledgement = float(acknowledged_at)
+                    if not leased_at <= acknowledgement <= lease_expires_at:
+                        errors.append("acknowledgement-outside-lease")
+                    if acknowledgement > updated_at:
+                        errors.append("acknowledged-after-updated")
+                if self._context_delivery_timestamp_is_valid(released_at):
+                    release = float(released_at)
+                    if not leased_at <= release <= lease_expires_at:
+                        errors.append("release-outside-lease")
+                    if release > updated_at:
+                        errors.append("released-after-updated")
+
+            if errors:
+                add_finding(
+                    {
+                        "kind": "receipt-row",
+                        "delivery_id": delivery_key,
+                        "attempt_number": (
+                            int(receipt["attempt_number"])
+                            if self._context_delivery_integer_is_valid(
+                                receipt["attempt_number"]
+                            )
+                            else 0
+                        ),
+                        "receipt_digest": receipt_digest(receipt["receipt_id"]),
+                        "errors": sorted(set(errors)),
+                    }
+                )
+
+        delivery_ids = {
+            row["delivery_id"] if isinstance(row["delivery_id"], str) else ""
+            for row in deliveries
+        }
+        if context is None:
+            for delivery_key, grouped_receipts in receipts_by_delivery.items():
+                if delivery_key not in delivery_ids:
+                    for receipt in grouped_receipts:
+                        add_finding(
+                            {
+                                "kind": "orphan-receipt",
+                                "delivery_id": delivery_key,
+                                "attempt_number": (
+                                    int(receipt["attempt_number"])
+                                    if self._context_delivery_integer_is_valid(
+                                        receipt["attempt_number"]
+                                    )
+                                    else 0
+                                ),
+                                "receipt_digest": receipt_digest(
+                                    receipt["receipt_id"]
+                                ),
+                                "errors": ["missing-delivery"],
+                            }
+                        )
+
+        for delivery in deliveries:
+            errors: list[str] = []
+            delivery_key = (
+                delivery["delivery_id"]
+                if isinstance(delivery["delivery_id"], str)
+                else ""
+            )
+            current_receipt_id = (
+                delivery["current_receipt_id"]
+                if isinstance(delivery["current_receipt_id"], str)
+                else ""
+            )
+            if not self._context_delivery_identifier_is_valid(delivery["delivery_id"]):
+                errors.append("delivery-id-format")
+            raw_context_id = (
+                delivery["context_id"]
+                if isinstance(delivery["context_id"], str)
+                else ""
+            )
+            if not (
+                1 <= len(raw_context_id) <= 128
+                and raw_context_id == raw_context_id.strip()
+            ):
+                errors.append("context-id")
+            raw_agent_id = (
+                delivery["agent_id"]
+                if isinstance(delivery["agent_id"], str)
+                else ""
+            )
+            if not (
+                1 <= len(raw_agent_id) <= 128
+                and raw_agent_id == self._normalize_delivery_agent_id(raw_agent_id)
+            ):
+                errors.append("agent-id")
+            if not self._context_delivery_integer_is_valid(delivery["event_id"]):
+                errors.append("event-id")
+            if not self._context_delivery_integer_is_valid(
+                delivery["attempt_count"]
+            ):
+                errors.append("attempt-count")
+            if not self._context_delivery_receipt_id_is_valid(current_receipt_id):
+                errors.append("current-receipt-id-format")
+            if not self._context_delivery_owner_is_valid(delivery["lease_owner"]):
+                errors.append("lease-owner")
+
+            state = delivery["state"] if isinstance(delivery["state"], str) else ""
+            if state not in {"leased", "acknowledged", "dead_letter"}:
+                errors.append("state")
+            required_timestamps = {
+                "first-delivered-at": delivery["first_delivered_at"],
+                "last-delivered-at": delivery["last_delivered_at"],
+                "lease-expires-at": delivery["lease_expires_at"],
+                "created-at": delivery["created_at"],
+                "updated-at": delivery["updated_at"],
+            }
+            invalid_required = {
+                label
+                for label, value in required_timestamps.items()
+                if not self._context_delivery_timestamp_is_valid(value)
+            }
+            errors.extend(sorted(invalid_required))
+            if not invalid_required:
+                created_at = float(delivery["created_at"])
+                first_delivered_at = float(delivery["first_delivered_at"])
+                last_delivered_at = float(delivery["last_delivered_at"])
+                lease_expires_at = float(delivery["lease_expires_at"])
+                updated_at = float(delivery["updated_at"])
+                if created_at > first_delivered_at:
+                    errors.append("created-after-first-delivery")
+                if first_delivered_at > last_delivered_at:
+                    errors.append("first-after-last-delivery")
+                if last_delivered_at > updated_at:
+                    errors.append("last-delivery-after-updated")
+                if last_delivered_at > lease_expires_at:
+                    errors.append("last-delivery-after-expiry")
+
+            acknowledged_at = delivery["acknowledged_at"]
+            cancelled_at = delivery["cancelled_at"]
+            if acknowledged_at is not None and not (
+                self._context_delivery_timestamp_is_valid(acknowledged_at)
+            ):
+                errors.append("acknowledged-at")
+            if cancelled_at is not None and not (
+                self._context_delivery_timestamp_is_valid(cancelled_at)
+            ):
+                errors.append("cancelled-at")
+            if state == "leased":
+                if acknowledged_at is not None or cancelled_at is not None:
+                    errors.append("leased-state-timestamps")
+            elif state == "acknowledged":
+                if acknowledged_at is None or cancelled_at is not None:
+                    errors.append("acknowledged-state-timestamps")
+            elif state == "dead_letter":
+                if acknowledged_at is not None or cancelled_at is None:
+                    errors.append("cancelled-state-timestamps")
+
+            if not invalid_required:
+                last_delivered_at = float(delivery["last_delivered_at"])
+                lease_expires_at = float(delivery["lease_expires_at"])
+                updated_at = float(delivery["updated_at"])
+                if self._context_delivery_timestamp_is_valid(acknowledged_at):
+                    acknowledgement = float(acknowledged_at)
+                    if not last_delivered_at <= acknowledgement <= lease_expires_at:
+                        errors.append("acknowledgement-outside-lease")
+                    if acknowledgement > updated_at:
+                        errors.append("acknowledged-after-updated")
+                if self._context_delivery_timestamp_is_valid(cancelled_at):
+                    cancellation = float(cancelled_at)
+                    if cancellation < last_delivered_at:
+                        errors.append("cancelled-before-last-delivery")
+                    if cancellation > updated_at:
+                        errors.append("cancelled-after-updated")
+
+            current_matches = receipts_by_id.get(current_receipt_id, [])
+            current_receipt = current_matches[0] if len(current_matches) == 1 else None
+            if current_receipt is None:
+                errors.append(
+                    "current-receipt-missing"
+                    if not current_matches
+                    else "current-receipt-ambiguous"
+                )
+            else:
+                if current_receipt["delivery_id"] != delivery["delivery_id"]:
+                    errors.append("current-receipt-wrong-delivery")
+                if current_receipt["attempt_number"] != delivery["attempt_count"]:
+                    errors.append("current-receipt-wrong-attempt")
+                if current_receipt["consumer_instance_id"] != delivery["lease_owner"]:
+                    errors.append("current-receipt-owner-mismatch")
+
+                current_receipt_state = (
+                    current_receipt["state"]
+                    if isinstance(current_receipt["state"], str)
+                    else ""
+                )
+                if state == "acknowledged":
+                    if current_receipt_state != "acknowledged":
+                        errors.append("current-receipt-state")
+                    elif (
+                        self._context_delivery_timestamp_is_valid(acknowledged_at)
+                        and self._context_delivery_timestamp_is_valid(
+                            current_receipt["acknowledged_at"]
+                        )
+                        and not math.isclose(
+                            float(acknowledged_at),
+                            float(current_receipt["acknowledged_at"]),
+                            rel_tol=0.0,
+                            abs_tol=0.000001,
+                        )
+                    ):
+                        errors.append("acknowledged-time-mismatch")
+                elif state == "leased":
+                    if current_receipt_state not in {
+                        "leased",
+                        "expired",
+                        "released",
+                    }:
+                        errors.append("current-receipt-state")
+                    elif current_receipt_state == "released":
+                        if (
+                            self._context_delivery_timestamp_is_valid(
+                                current_receipt["released_at"]
+                            )
+                            and self._context_delivery_timestamp_is_valid(
+                                delivery["lease_expires_at"]
+                            )
+                            and not math.isclose(
+                                float(current_receipt["released_at"]),
+                                float(delivery["lease_expires_at"]),
+                                rel_tol=0.0,
+                                abs_tol=0.000001,
+                            )
+                        ):
+                            errors.append("release-time-mismatch")
+                    elif (
+                        self._context_delivery_timestamp_is_valid(
+                            current_receipt["lease_expires_at"]
+                        )
+                        and self._context_delivery_timestamp_is_valid(
+                            delivery["lease_expires_at"]
+                        )
+                        and not math.isclose(
+                            float(current_receipt["lease_expires_at"]),
+                            float(delivery["lease_expires_at"]),
+                            rel_tol=0.0,
+                            abs_tol=0.000001,
+                        )
+                    ):
+                        errors.append("lease-expiry-mismatch")
+                elif state == "dead_letter":
+                    if current_receipt_state != "cancelled":
+                        errors.append("current-receipt-state")
+
+                if (
+                    self._context_delivery_timestamp_is_valid(
+                        current_receipt["leased_at"]
+                    )
+                    and self._context_delivery_timestamp_is_valid(
+                        delivery["last_delivered_at"]
+                    )
+                    and not math.isclose(
+                        float(current_receipt["leased_at"]),
+                        float(delivery["last_delivered_at"]),
+                        rel_tol=0.0,
+                        abs_tol=0.000001,
+                    )
+                ):
+                    errors.append("last-delivery-time-mismatch")
+
+            if errors:
+                add_finding(
+                    {
+                        "kind": "delivery-row",
+                        "delivery_id": delivery_key,
+                        "context_id": raw_context_id,
+                        "agent_id": raw_agent_id,
+                        "event_id": (
+                            int(delivery["event_id"])
+                            if self._context_delivery_integer_is_valid(
+                                delivery["event_id"]
+                            )
+                            else 0
+                        ),
+                        "attempt_count": (
+                            int(delivery["attempt_count"])
+                            if self._context_delivery_integer_is_valid(
+                                delivery["attempt_count"]
+                            )
+                            else 0
+                        ),
+                        "current_receipt_digest": receipt_digest(
+                            current_receipt_id
+                        ),
+                        "errors": sorted(set(errors)),
+                    }
+                )
+
+        return len(findings), findings[:bounded_sample_limit]
+
+    def _context_delivery_data_errors(
+        self,
+        conn: sqlite3.Connection,
+    ) -> list[str]:
+        errors: list[str] = []
+        live_integrity_error_count, _ = self._context_delivery_live_data_audit(conn)
+        if live_integrity_error_count:
+            errors.append(
+                f"live-delivery-integrity-error:{live_integrity_error_count}"
+            )
+        context_mismatch_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries AS delivery
+                LEFT JOIN agent_context_events AS event
+                  ON event.event_id = delivery.event_id
+                 AND event.context_id = delivery.context_id
+                WHERE event.event_id IS NULL
+                """
+            ).fetchone()[0]
+        )
+        current_receipt_mismatch_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries AS delivery
+                LEFT JOIN agent_context_delivery_receipts AS receipt
+                  ON receipt.receipt_id = delivery.current_receipt_id
+                 AND receipt.delivery_id = delivery.delivery_id
+                 AND receipt.attempt_number = delivery.attempt_count
+                WHERE receipt.receipt_id IS NULL
+                """
+            ).fetchone()[0]
+        )
+        delivery_receipt_state_mismatch_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries AS delivery
+                JOIN agent_context_delivery_receipts AS receipt
+                  ON receipt.receipt_id = delivery.current_receipt_id
+                WHERE NOT (
+                    (
+                        delivery.state = 'acknowledged'
+                        AND receipt.state = 'acknowledged'
+                        AND delivery.acknowledged_at IS NOT NULL
+                        AND receipt.acknowledged_at IS NOT NULL
+                    )
+                    OR (
+                        delivery.state = 'leased'
+                        AND (
+                            (
+                                receipt.state = 'leased'
+                                AND receipt.consumer_instance_id = delivery.lease_owner
+                                AND ABS(
+                                    receipt.lease_expires_at - delivery.lease_expires_at
+                                ) < 0.000001
+                            )
+                            OR (
+                                receipt.state IN ('expired', 'released')
+                                AND delivery.lease_expires_at <= receipt.lease_expires_at
+                            )
+                        )
+                    )
+                    OR (
+                        delivery.state = 'dead_letter'
+                        AND receipt.state = 'cancelled'
+                    )
+                )
+                """
+            ).fetchone()[0]
+        )
+        if context_mismatch_count:
+            errors.append(f"delivery-event-context-mismatch:{context_mismatch_count}")
+        if current_receipt_mismatch_count:
+            errors.append(f"current-receipt-mismatch:{current_receipt_mismatch_count}")
+        if delivery_receipt_state_mismatch_count:
+            errors.append(
+                "delivery-receipt-state-mismatch:"
+                f"{delivery_receipt_state_mismatch_count}"
+            )
+        receipt_history_mismatch_count, _ = (
+            self._context_delivery_receipt_history_audit(conn)
+        )
+        if receipt_history_mismatch_count:
+            errors.append(
+                f"receipt-history-mismatch:{receipt_history_mismatch_count}"
+            )
+        cursor_mismatch_count = len(self._context_delivery_cursor_mismatches(conn))
+        if cursor_mismatch_count:
+            errors.append(f"receipt-derived-cursor-mismatch:{cursor_mismatch_count}")
+        identity_rows = conn.execute(
+            """
+            SELECT agent_id FROM agent_context_consumers
+            UNION ALL
+            SELECT agent_id FROM agent_context_deliveries
+            UNION ALL
+            SELECT agent_id FROM agent_context_delivery_cursors
+            UNION ALL
+            SELECT agent_id FROM agent_context_delivery_ack_tombstones
+            """
+        ).fetchall()
+        noncanonical_identity_count = sum(
+            1
+            for row in identity_rows
+            if str(row["agent_id"])
+            != self._normalize_delivery_agent_id(str(row["agent_id"]))
+        )
+        if noncanonical_identity_count:
+            errors.append(
+                f"noncanonical-delivery-agent-id:{noncanonical_identity_count}"
+            )
+        consumer_group_integrity_error_count, _ = (
+            self._context_consumer_group_integrity_audit(conn)
+        )
+        if consumer_group_integrity_error_count:
+            errors.append(
+                "consumer-group-integrity-error:"
+                f"{consumer_group_integrity_error_count}"
+            )
+        tombstone_integrity_error_count, _ = (
+            self._context_delivery_tombstone_data_audit(conn)
+        )
+        if tombstone_integrity_error_count:
+            errors.append(
+                "ack-tombstone-integrity-error:"
+                f"{tombstone_integrity_error_count}"
+            )
+        unaudited_dead_letter_count, _ = (
+            self._context_delivery_dead_letter_audit(conn)
+        )
+        if unaudited_dead_letter_count:
+            errors.append(
+                f"unaudited-dead-letter:{unaudited_dead_letter_count}"
+            )
+        return errors
+
+    def _context_delivery_dead_letter_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+        sample_limit: int = 10,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        context = None if context_id is None else str(context_id)
+        rows = conn.execute(
+            """
+            SELECT delivery.delivery_id, delivery.context_id,
+                   delivery.agent_id, delivery.event_id,
+                   delivery.attempt_count, delivery.current_receipt_id,
+                   delivery.cancelled_at
+            FROM agent_context_deliveries AS delivery
+            WHERE delivery.state = 'dead_letter'
+              AND (? IS NULL OR delivery.context_id = ?)
+            ORDER BY delivery.context_id, delivery.agent_id, delivery.event_id
+            """,
+            (context, context),
+        ).fetchall()
+        findings: list[dict[str, Any]] = []
+        for row in rows:
+            delivery_id = str(row["delivery_id"])
+            audits = conn.execute(
+                """
+                SELECT operation_id, payload_json, created_at
+                FROM store_maintenance_receipts
+                WHERE operation_type = 'context-delivery-dead-letter'
+                  AND context_id = ?
+                  AND before_revision = ?
+                  AND after_revision = 'dead_letter'
+                ORDER BY created_at, operation_id
+                """,
+                (str(row["context_id"]), delivery_id),
+            ).fetchall()
+            issues: list[str] = []
+            if len(audits) != 1:
+                issues.append(
+                    "missing-audit" if not audits else "ambiguous-audit-history"
+                )
+            if len(audits) == 1:
+                audit = audits[0]
+                payload = _decode_json(str(audit["payload_json"]), None)
+                if not isinstance(payload, dict):
+                    issues.append("invalid-audit-payload")
+                    payload = {}
+                expected_digest = self._context_delivery_receipt_digest(
+                    str(row["current_receipt_id"])
+                )
+                if str(payload.get("agent_id") or "") != str(row["agent_id"]):
+                    issues.append("agent-id-mismatch")
+                try:
+                    payload_event_id = int(payload.get("event_id"))
+                except (TypeError, ValueError, OverflowError):
+                    payload_event_id = 0
+                if payload_event_id != int(row["event_id"]):
+                    issues.append("event-id-mismatch")
+                try:
+                    payload_attempt_count = int(payload.get("attempt_count"))
+                except (TypeError, ValueError, OverflowError):
+                    payload_attempt_count = 0
+                if payload_attempt_count != int(row["attempt_count"]):
+                    issues.append("attempt-count-mismatch")
+                try:
+                    recorded_max_attempts = int(
+                        payload.get("max_delivery_attempts")
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    recorded_max_attempts = 0
+                if recorded_max_attempts < int(row["attempt_count"]):
+                    issues.append("invalid-recorded-retry-budget")
+                if not str(payload.get("reason") or "").strip():
+                    issues.append("missing-reason")
+                if str(payload.get("receipt_digest") or "") != expected_digest:
+                    issues.append("receipt-digest-mismatch")
+                if not str(audit["operation_id"] or "").strip():
+                    issues.append("missing-operation-id")
+                audit_created_at = audit["created_at"]
+                dead_lettered_at = row["cancelled_at"]
+                try:
+                    audit_timestamp = float(audit_created_at)
+                    delivery_timestamp = float(dead_lettered_at)
+                except (TypeError, ValueError, OverflowError):
+                    issues.append("invalid-audit-timestamp")
+                else:
+                    if (
+                        not math.isfinite(audit_timestamp)
+                        or not math.isfinite(delivery_timestamp)
+                        or abs(audit_timestamp - delivery_timestamp) >= 0.000001
+                    ):
+                        issues.append("audit-timestamp-mismatch")
+            if issues:
+                findings.append(
+                    {
+                        "delivery_id": delivery_id,
+                        "context_id": str(row["context_id"]),
+                        "agent_id": str(row["agent_id"]),
+                        "event_id": int(row["event_id"]),
+                        "attempt_count": int(row["attempt_count"]),
+                        "dead_lettered_at": row["cancelled_at"],
+                        "issues": issues,
+                    }
+                )
+        bounded_sample_limit = min(max(int(sample_limit), 1), 100)
+        return len(findings), findings[:bounded_sample_limit]
+
+    def _context_delivery_tombstone_data_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+        sample_limit: int = 10,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        context = None if context_id is None else str(context_id)
+        invalid_where = """
+            (? IS NULL OR context_id = ?)
+            AND (
+                receipt_digest IS NULL
+                OR length(receipt_digest) <> 64
+                OR receipt_digest <> lower(receipt_digest)
+                OR receipt_digest GLOB '*[^0-9a-f]*'
+                OR typeof(delivery_id) <> 'text'
+                OR length(delivery_id) NOT BETWEEN 1 AND 160
+                OR delivery_id <> trim(delivery_id)
+                OR delivery_id GLOB '*[^A-Za-z0-9_.:@-]*'
+                OR typeof(context_id) <> 'text'
+                OR length(context_id) NOT BETWEEN 1 AND 128
+                OR context_id <> trim(context_id)
+                OR trim(agent_id) = ''
+                OR agent_id <> lower(agent_id)
+                OR length(agent_id) > 128
+                OR event_id < 1
+                OR attempt_number < 1
+                OR typeof(acknowledged_at) NOT IN ('integer', 'real')
+                OR typeof(deleted_at) NOT IN ('integer', 'real')
+                OR abs(acknowledged_at) >= 1.0e308
+                OR abs(deleted_at) >= 1.0e308
+                OR deleted_at < acknowledged_at
+            )
+        """
+        params = (context, context)
+        invalid_count = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM agent_context_delivery_ack_tombstones
+                WHERE {invalid_where}
+                """,
+                params,
+            ).fetchone()[0]
+        )
+        duplicate_digest_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT receipt_digest
+                    FROM agent_context_delivery_ack_tombstones
+                    WHERE (? IS NULL OR context_id = ?)
+                    GROUP BY receipt_digest
+                    HAVING COUNT(*) > 1
+                )
+                """,
+                params,
+            ).fetchone()[0]
+        )
+        duplicate_delivery_attempt_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT delivery_id, attempt_number
+                    FROM agent_context_delivery_ack_tombstones
+                    WHERE (? IS NULL OR context_id = ?)
+                    GROUP BY delivery_id, attempt_number
+                    HAVING COUNT(*) > 1
+                )
+                """,
+                params,
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            f"""
+            SELECT receipt_digest, delivery_id, context_id, agent_id,
+                   event_id, attempt_number, acknowledged_at, deleted_at
+            FROM agent_context_delivery_ack_tombstones
+            WHERE {invalid_where}
+            ORDER BY deleted_at, receipt_digest
+            LIMIT ?
+            """,
+            (*params, min(max(int(sample_limit), 1), 100)),
+        ).fetchall()
+        samples = [
+            {
+                "receipt_digest": str(row["receipt_digest"] or ""),
+                "delivery_id": str(row["delivery_id"] or ""),
+                "context_id": str(row["context_id"] or ""),
+                "agent_id": str(row["agent_id"] or ""),
+                "event_id": int(row["event_id"] or 0),
+                "attempt_number": int(row["attempt_number"] or 0),
+                "acknowledged_at": row["acknowledged_at"],
+                "deleted_at": row["deleted_at"],
+            }
+            for row in rows
+        ]
+        if duplicate_digest_count:
+            samples.append({"duplicate_receipt_digest_groups": duplicate_digest_count})
+        if duplicate_delivery_attempt_count:
+            samples.append(
+                {
+                    "duplicate_delivery_attempt_groups": (
+                        duplicate_delivery_attempt_count
+                    )
+                }
+            )
+        return (
+            invalid_count
+            + duplicate_digest_count
+            + duplicate_delivery_attempt_count,
+            samples[: min(max(int(sample_limit), 1), 100)],
+        )
+
+    def _canonicalize_context_delivery_identities(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        updated_at: float,
+    ) -> int:
+        consumer_rows = conn.execute(
+            """
+            SELECT agent_id, consumer_kind, enabled, created_at, updated_at
+            FROM agent_context_consumers
+            ORDER BY agent_id
+            """
+        ).fetchall()
+        delivery_rows = conn.execute(
+            """
+            SELECT delivery_id, context_id, agent_id, event_id
+            FROM agent_context_deliveries
+            ORDER BY delivery_id
+            """
+        ).fetchall()
+        canonical_delivery_keys: dict[tuple[str, str, int], str] = {}
+        for row in delivery_rows:
+            canonical_agent = self._normalize_delivery_agent_id(str(row["agent_id"]))
+            if not canonical_agent:
+                raise RuntimeError("context delivery contains an empty canonical agent id")
+            key = (
+                str(row["context_id"]),
+                canonical_agent,
+                int(row["event_id"]),
+            )
+            prior_delivery_id = canonical_delivery_keys.get(key)
+            if prior_delivery_id is not None and prior_delivery_id != str(
+                row["delivery_id"]
+            ):
+                raise RuntimeError(
+                    "context delivery agent canonicalization would merge conflicting histories"
+                )
+            canonical_delivery_keys[key] = str(row["delivery_id"])
+
+        mappings = {
+            str(row["agent_id"]): self._normalize_delivery_agent_id(
+                str(row["agent_id"])
+            )
+            for row in consumer_rows
+        }
+        for row in delivery_rows:
+            raw_agent = str(row["agent_id"])
+            mappings.setdefault(
+                raw_agent,
+                self._normalize_delivery_agent_id(raw_agent),
+            )
+        tombstone_agents = [
+            str(row["agent_id"])
+            for row in conn.execute(
+                "SELECT DISTINCT agent_id FROM agent_context_delivery_ack_tombstones"
+            ).fetchall()
+        ]
+        for raw_agent in tombstone_agents:
+            mappings.setdefault(
+                raw_agent,
+                self._normalize_delivery_agent_id(raw_agent),
+            )
+        changed = {raw: canonical for raw, canonical in mappings.items() if raw != canonical}
+        if not changed:
+            return 0
+
+        consumer_by_agent = {str(row["agent_id"]): row for row in consumer_rows}
+        groups_by_agent: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT agent_id, group_id FROM agent_context_consumer_groups"
+        ).fetchall():
+            canonical = self._normalize_delivery_agent_id(str(row["agent_id"]))
+            groups_by_agent.setdefault(canonical, set()).add(str(row["group_id"]))
+
+        canonical_agents = sorted(set(mappings.values()))
+        for canonical_agent in canonical_agents:
+            if not canonical_agent:
+                raise RuntimeError("context delivery contains an empty canonical agent id")
+            source_rows = [
+                row
+                for raw_agent, row in consumer_by_agent.items()
+                if self._normalize_delivery_agent_id(raw_agent) == canonical_agent
+            ]
+            enabled = min((int(row["enabled"]) for row in source_rows), default=1)
+            created_at = min(
+                (float(row["created_at"]) for row in source_rows),
+                default=updated_at,
+            )
+            consumer_kind = (
+                str(source_rows[0]["consumer_kind"])
+                if source_rows
+                else "migrated-v1"
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_context_consumers (
+                    agent_id, consumer_kind, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    enabled = MIN(agent_context_consumers.enabled, excluded.enabled),
+                    updated_at = MAX(agent_context_consumers.updated_at, excluded.updated_at)
+                """,
+                (
+                    canonical_agent,
+                    consumer_kind,
+                    enabled,
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+        # Receipt history is authoritative, so derived cursors are disposable
+        # during identity normalization and will be recreated on the next claim.
+        conn.execute("DELETE FROM agent_context_delivery_cursors")
+        for raw_agent, canonical_agent in sorted(changed.items()):
+            conn.execute(
+                "UPDATE agent_context_deliveries SET agent_id = ? WHERE agent_id = ?",
+                (canonical_agent, raw_agent),
+            )
+            conn.execute(
+                """
+                UPDATE agent_context_delivery_ack_tombstones
+                SET agent_id = ? WHERE agent_id = ?
+                """,
+                (canonical_agent, raw_agent),
+            )
+        for canonical_agent, groups in groups_by_agent.items():
+            for group_id in sorted(groups):
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO agent_context_consumer_groups (
+                        agent_id, group_id, created_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (canonical_agent, group_id, updated_at),
+                )
+        for raw_agent in sorted(changed):
+            conn.execute(
+                "DELETE FROM agent_context_consumer_groups WHERE agent_id = ?",
+                (raw_agent,),
+            )
+            conn.execute(
+                "DELETE FROM agent_context_consumers WHERE agent_id = ?",
+                (raw_agent,),
+            )
+        return len(changed)
+
+    def _derived_context_cursor_event_id(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str,
+        agent_id: str,
+    ) -> int:
+        target_clause, target_params = self._event_target_clause(
+            event_alias="event",
+            agent_id=agent_id,
+        )
+        first_unacknowledged = conn.execute(
+            f"""
+            SELECT MIN(event.event_id)
+            FROM agent_context_events AS event
+            WHERE event.context_id = ?
+              AND {target_clause}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM agent_context_deliveries AS delivery
+                  WHERE delivery.context_id = event.context_id
+                    AND delivery.agent_id = ?
+                    AND delivery.event_id = event.event_id
+                    AND delivery.state IN ('acknowledged', 'dead_letter')
+              )
+            """,
+            (str(context_id), *target_params, str(agent_id)),
+        ).fetchone()[0]
+        if first_unacknowledged is None:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COALESCE(MAX(event_id), 0)
+                    FROM agent_context_events
+                    WHERE context_id = ?
+                    """,
+                    (str(context_id),),
+                ).fetchone()[0]
+                or 0
+            )
+        return int(
+            conn.execute(
+                """
+                SELECT COALESCE(MAX(event_id), 0)
+                FROM agent_context_events
+                WHERE context_id = ? AND event_id < ?
+                """,
+                (str(context_id), int(first_unacknowledged)),
+            ).fetchone()[0]
+            or 0
+        )
+
+    def _context_delivery_cursor_mismatches(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if context_id is None:
+            rows = conn.execute(
+                """
+                SELECT context_id, agent_id, last_contiguous_event_id, updated_at
+                FROM agent_context_delivery_cursors
+                ORDER BY context_id, agent_id
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT context_id, agent_id, last_contiguous_event_id, updated_at
+                FROM agent_context_delivery_cursors
+                WHERE context_id = ?
+                ORDER BY agent_id
+                """,
+                (str(context_id),),
+            ).fetchall()
+        mismatches: list[dict[str, Any]] = []
+        for row in rows:
+            raw_context = row["context_id"]
+            raw_agent = row["agent_id"]
+            raw_event_id = row["last_contiguous_event_id"]
+            context = raw_context if isinstance(raw_context, str) else ""
+            agent = raw_agent if isinstance(raw_agent, str) else ""
+            errors: list[str] = []
+            if not (
+                1 <= len(context) <= 128
+                and context == context.strip()
+            ):
+                errors.append("context-id")
+            if not (
+                1 <= len(agent) <= 128
+                and agent == self._normalize_delivery_agent_id(agent)
+            ):
+                errors.append("agent-id")
+            if not (
+                isinstance(raw_event_id, int)
+                and not isinstance(raw_event_id, bool)
+                and raw_event_id >= 0
+            ):
+                errors.append("last-contiguous-event-id")
+                stored: int | None = None
+            else:
+                stored = int(raw_event_id)
+            if not self._context_delivery_timestamp_is_valid(row["updated_at"]):
+                errors.append("updated-at")
+            derived: int | None = None
+            if "context-id" not in errors and "agent-id" not in errors:
+                derived = self._derived_context_cursor_event_id(
+                    conn,
+                    context_id=context,
+                    agent_id=agent,
+                )
+            if errors or stored != derived:
+                mismatches.append(
+                    {
+                        "context_id": context,
+                        "agent_id": agent,
+                        "stored_event_id": stored,
+                        "derived_event_id": derived,
+                        "integrity_errors": sorted(errors),
+                    }
+                )
+        return mismatches
+
+    def _context_delivery_receipt_history_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+        sample_limit: int = 10,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Validate that retry receipts form the delivery's fenced history."""
+
+        context = None if context_id is None else str(context_id)
+        params: tuple[Any, ...] = (context, context)
+        bounded_sample_limit = min(max(int(sample_limit), 1), 100)
+        cte = """
+            WITH scoped_deliveries AS (
+                SELECT *
+                FROM agent_context_deliveries
+                WHERE (? IS NULL OR context_id = ?)
+            ),
+            history AS (
+                SELECT
+                    delivery.delivery_id,
+                    MIN(receipt.attempt_number) AS min_attempt,
+                    MAX(receipt.attempt_number) AS max_attempt,
+                    COUNT(receipt.receipt_id) AS receipt_count,
+                    MAX(
+                        CASE
+                            WHEN receipt.attempt_number = 1
+                            THEN receipt.leased_at
+                            ELSE NULL
+                        END
+                    ) AS first_receipt_leased_at,
+                    SUM(
+                        CASE
+                            WHEN receipt.attempt_number = 1
+                             AND receipt.consumer_instance_id =
+                                 'migration-v1-unclaimed'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS first_attempt_migration_count,
+                    SUM(
+                        CASE
+                            WHEN receipt.attempt_number < delivery.attempt_count
+                             AND receipt.state NOT IN (
+                                 'expired', 'released'
+                             )
+                            THEN 1 ELSE 0
+                        END
+                    ) AS invalid_historical_state_count
+                FROM scoped_deliveries AS delivery
+                LEFT JOIN agent_context_delivery_receipts AS receipt
+                  ON receipt.delivery_id = delivery.delivery_id
+                GROUP BY delivery.delivery_id
+            ),
+            mismatches AS (
+                SELECT
+                    delivery.delivery_id,
+                    delivery.context_id,
+                    delivery.agent_id,
+                    delivery.event_id,
+                    delivery.attempt_count,
+                    delivery.first_delivered_at,
+                    history.min_attempt,
+                    history.max_attempt,
+                    history.receipt_count,
+                    history.first_receipt_leased_at,
+                    history.first_attempt_migration_count,
+                    CASE
+                        WHEN history.min_attempt = 1
+                         AND history.first_attempt_migration_count = 0
+                         AND (
+                             history.first_receipt_leased_at IS NULL
+                             OR history.first_receipt_leased_at <>
+                                delivery.first_delivered_at
+                         )
+                        THEN 1 ELSE 0
+                    END AS first_receipt_anchor_mismatch,
+                    history.invalid_historical_state_count
+                FROM scoped_deliveries AS delivery
+                JOIN history ON history.delivery_id = delivery.delivery_id
+                WHERE history.receipt_count < 1
+                   OR history.min_attempt < 1
+                   OR history.max_attempt <> delivery.attempt_count
+                   OR history.receipt_count <>
+                      (history.max_attempt - history.min_attempt + 1)
+                   OR COALESCE(history.invalid_historical_state_count, 0) > 0
+                   OR (
+                       history.min_attempt = 1
+                       AND history.first_attempt_migration_count = 0
+                       AND (
+                           history.first_receipt_leased_at IS NULL
+                           OR history.first_receipt_leased_at <>
+                              delivery.first_delivered_at
+                       )
+                   )
+                   OR (
+                       history.min_attempt > 1
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM agent_context_delivery_receipts AS first_receipt
+                           WHERE first_receipt.delivery_id = delivery.delivery_id
+                             AND first_receipt.attempt_number = history.min_attempt
+                             AND first_receipt.consumer_instance_id =
+                                 'migration-v1-unclaimed'
+                       )
+                   )
+            )
+        """
+        structural_count = int(
+            conn.execute(
+                cte + "SELECT COUNT(*) FROM mismatches",
+                params,
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            cte
+            + """
+              SELECT * FROM mismatches
+              ORDER BY context_id, agent_id, event_id
+              LIMIT ?
+              """,
+            (*params, bounded_sample_limit),
+        ).fetchall()
+        structural_samples = [
+            {
+                "delivery_id": str(row["delivery_id"]),
+                "context_id": str(row["context_id"]),
+                "agent_id": str(row["agent_id"]),
+                "event_id": int(row["event_id"]),
+                "attempt_count": int(row["attempt_count"]),
+                "min_receipt_attempt": (
+                    None
+                    if row["min_attempt"] is None
+                    else int(row["min_attempt"])
+                ),
+                "max_receipt_attempt": (
+                    None
+                    if row["max_attempt"] is None
+                    else int(row["max_attempt"])
+                ),
+                "receipt_count": int(row["receipt_count"]),
+                "first_delivered_at": float(row["first_delivered_at"]),
+                "first_receipt_leased_at": (
+                    None
+                    if row["first_receipt_leased_at"] is None
+                    else float(row["first_receipt_leased_at"])
+                ),
+                "first_receipt_anchor_mismatch": bool(
+                    row["first_receipt_anchor_mismatch"]
+                ),
+                "invalid_historical_state_count": int(
+                    row["invalid_historical_state_count"] or 0
+                ),
+            }
+            for row in rows
+        ]
+        adjacent_rows = conn.execute(
+            """
+            SELECT
+                delivery.delivery_id,
+                delivery.context_id,
+                delivery.agent_id,
+                delivery.event_id,
+                prior.attempt_number AS prior_attempt_number,
+                prior.consumer_instance_id AS prior_consumer_instance_id,
+                prior.state AS prior_state,
+                prior.created_at AS prior_created_at,
+                prior.leased_at AS prior_leased_at,
+                prior.lease_expires_at AS prior_lease_expires_at,
+                prior.released_at AS prior_released_at,
+                prior.updated_at AS prior_updated_at,
+                next.attempt_number AS next_attempt_number,
+                next.consumer_instance_id AS next_consumer_instance_id,
+                next.created_at AS next_created_at,
+                next.leased_at AS next_leased_at
+            FROM agent_context_deliveries AS delivery
+            JOIN agent_context_delivery_receipts AS prior
+              ON prior.delivery_id = delivery.delivery_id
+            JOIN agent_context_delivery_receipts AS next
+              ON next.delivery_id = prior.delivery_id
+             AND next.attempt_number = prior.attempt_number + 1
+            WHERE (? IS NULL OR delivery.context_id = ?)
+            ORDER BY delivery.context_id, delivery.agent_id, delivery.event_id,
+                     prior.attempt_number
+            """,
+            params,
+        ).fetchall()
+        chronology_samples: list[dict[str, Any]] = []
+        chronology_count = 0
+        for row in adjacent_rows:
+            reasons: list[str] = []
+            timestamp_fields = {
+                "prior-created-at": row["prior_created_at"],
+                "prior-leased-at": row["prior_leased_at"],
+                "prior-lease-expires-at": row["prior_lease_expires_at"],
+                "prior-updated-at": row["prior_updated_at"],
+                "next-created-at": row["next_created_at"],
+                "next-leased-at": row["next_leased_at"],
+            }
+            invalid_fields = {
+                label
+                for label, value in timestamp_fields.items()
+                if not self._context_delivery_timestamp_is_valid(value)
+            }
+            if invalid_fields:
+                reasons.extend(sorted(invalid_fields))
+            else:
+                next_leased_at = float(row["next_leased_at"])
+                if float(row["prior_created_at"]) > next_leased_at:
+                    reasons.append("prior-created-after-next-lease")
+                if float(row["prior_leased_at"]) > next_leased_at:
+                    reasons.append("prior-leased-after-next-lease")
+                if float(row["prior_updated_at"]) > next_leased_at:
+                    reasons.append("prior-updated-after-next-lease")
+                prior_state = str(row["prior_state"])
+                if (
+                    prior_state == "expired"
+                    and float(row["prior_lease_expires_at"]) > next_leased_at
+                ):
+                    reasons.append("prior-expiry-after-next-lease")
+                if prior_state == "released":
+                    if not self._context_delivery_timestamp_is_valid(
+                        row["prior_released_at"]
+                    ):
+                        reasons.append("prior-release-time-missing")
+                    elif float(row["prior_released_at"]) > next_leased_at:
+                        reasons.append("prior-release-after-next-lease")
+
+            if not reasons:
+                continue
+            chronology_count += 1
+            if len(chronology_samples) < bounded_sample_limit:
+                chronology_samples.append(
+                    {
+                        "kind": "attempt-chronology",
+                        "delivery_id": str(row["delivery_id"]),
+                        "context_id": str(row["context_id"]),
+                        "agent_id": str(row["agent_id"]),
+                        "event_id": int(row["event_id"]),
+                        "prior_attempt_number": int(
+                            row["prior_attempt_number"]
+                        ),
+                        "next_attempt_number": int(row["next_attempt_number"]),
+                        "prior_is_explicit_v1_migration": (
+                            str(row["prior_consumer_instance_id"])
+                            == "migration-v1-unclaimed"
+                        ),
+                        "next_is_explicit_v1_migration": (
+                            str(row["next_consumer_instance_id"])
+                            == "migration-v1-unclaimed"
+                        ),
+                        "errors": sorted(set(reasons)),
+                    }
+                )
+
+        return (
+            structural_count + chronology_count,
+            (structural_samples + chronology_samples)[:bounded_sample_limit],
+        )
+
+    def _repair_context_delivery_cursors(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        repaired_at: float,
+    ) -> int:
+        mismatches = self._context_delivery_cursor_mismatches(conn)
+        for mismatch in mismatches:
+            if mismatch["derived_event_id"] is None:
+                raise RuntimeError(
+                    "context delivery cursor identity failed integrity validation"
+                )
+            conn.execute(
+                """
+                UPDATE agent_context_delivery_cursors
+                SET last_contiguous_event_id = ?, updated_at = ?
+                WHERE context_id = ? AND agent_id = ?
+                """,
+                (
+                    int(mismatch["derived_event_id"]),
+                    repaired_at,
+                    str(mismatch["context_id"]),
+                    str(mismatch["agent_id"]),
+                ),
+            )
+        return len(mismatches)
+
+    def _context_delivery_schema_is_v2(self, conn: sqlite3.Connection) -> bool:
+        return not self._context_delivery_v2_table_errors(conn) and not (
+            self._context_delivery_v2_index_errors(conn)
+        )
+
+    def _context_delivery_data_is_v2(self, conn: sqlite3.Connection) -> bool:
+        if not self._context_delivery_schema_is_v2(conn):
+            return False
+        return not self._context_delivery_data_errors(conn)
+
+    @staticmethod
+    def _create_context_delivery_v2_indexes(conn: sqlite3.Connection) -> None:
+        for statement in CONTEXT_DELIVERY_V2_INDEX_STATEMENTS:
+            conn.execute(statement)
+
+    def _normalize_context_delivery_v2_indexes(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        for index_name in CONTEXT_DELIVERY_V2_INDEX_COLUMNS:
+            schema_row = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name = ?",
+                (index_name,),
+            ).fetchone()
+            if schema_row is not None:
+                if str(schema_row["type"]) != "index":
+                    raise RuntimeError(
+                        f"reserved context delivery index name {index_name} is not an index"
+                    )
+                if f"{index_name}:" in "|".join(
+                    self._context_delivery_v2_index_errors(conn)
+                ):
+                    conn.execute(f'DROP INDEX "{index_name}"')
+        parent_index_name, _, _ = CONTEXT_DELIVERY_V2_PARENT_INDEX
+        parent_errors = self._context_delivery_v2_index_errors(conn)
+        parent_row = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = ?",
+            (parent_index_name,),
+        ).fetchone()
+        if parent_row is not None and any(
+            error.startswith(f"{parent_index_name}:") for error in parent_errors
+        ):
+            if str(parent_row["type"]) != "index":
+                raise RuntimeError(
+                    f"reserved context delivery parent index {parent_index_name} is not an index"
+                )
+            conn.execute(f'DROP INDEX "{parent_index_name}"')
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_context_events_context_event
+            ON agent_context_events(context_id, event_id)
+            """
+        )
+        self._create_context_delivery_v2_indexes(conn)
+
+    @staticmethod
+    def _create_context_delivery_v2_tables(conn: sqlite3.Connection) -> None:
+        for statement in CONTEXT_DELIVERY_V2_TABLE_STATEMENTS:
+            conn.execute(statement)
+
+    def _ensure_context_delivery_tombstone_schema(
+        self,
+        conn: sqlite3.Connection,
+    ) -> int:
+        """Install or safely rebuild the receipt-digest tombstone ledger.
+
+        Tombstones are the only acknowledgement proof retained after an event
+        is pruned.  A shape-compatible but constraint-free table must therefore
+        never be accepted as healthy.  Existing rows are preserved only when
+        every digest and ownership field satisfies the final contract.
+        """
+
+        table_name = "agent_context_delivery_ack_tombstones"
+        schema_row = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = ?",
+            (table_name,),
+        ).fetchone()
+        if schema_row is None:
+            conn.execute(CONTEXT_DELIVERY_V2_TABLE_STATEMENTS[2])
+            return 0
+        if str(schema_row["type"]) != "table":
+            raise RuntimeError(
+                f"reserved context delivery tombstone name {table_name} is not a table"
+            )
+
+        columns = self._schema_column_names(conn, table_name)
+        if columns != CONTEXT_DELIVERY_V2_TOMBSTONE_COLUMNS:
+            raise RuntimeError(
+                "context delivery acknowledgement tombstones have an unknown schema; "
+                "refusing a lossy migration"
+            )
+        table_errors = self._context_delivery_v2_table_errors(
+            conn,
+            table_names=(table_name,),
+        )
+        if not table_errors:
+            return 0
+
+        invalid_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_delivery_ack_tombstones
+                WHERE receipt_digest IS NULL
+                   OR length(receipt_digest) <> 64
+                   OR receipt_digest <> lower(receipt_digest)
+                   OR receipt_digest GLOB '*[^0-9a-f]*'
+                   OR delivery_id IS NULL
+                   OR typeof(delivery_id) <> 'text'
+                   OR length(delivery_id) NOT BETWEEN 1 AND 160
+                   OR delivery_id <> trim(delivery_id)
+                   OR delivery_id GLOB '*[^A-Za-z0-9_.:@-]*'
+                   OR context_id IS NULL
+                   OR typeof(context_id) <> 'text'
+                   OR length(context_id) NOT BETWEEN 1 AND 128
+                   OR context_id <> trim(context_id)
+                   OR agent_id IS NULL OR trim(agent_id) = ''
+                   OR event_id IS NULL OR event_id < 1
+                   OR attempt_number IS NULL OR attempt_number < 1
+                   OR acknowledged_at IS NULL
+                   OR deleted_at IS NULL
+                   OR abs(acknowledged_at) >= 1.0e308
+                   OR abs(deleted_at) >= 1.0e308
+                   OR deleted_at < acknowledged_at
+                """
+            ).fetchone()[0]
+        )
+        duplicate_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT receipt_digest
+                    FROM agent_context_delivery_ack_tombstones
+                    GROUP BY receipt_digest
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()[0]
+        )
+        duplicate_delivery_attempt_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT delivery_id, attempt_number
+                    FROM agent_context_delivery_ack_tombstones
+                    GROUP BY delivery_id, attempt_number
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()[0]
+        )
+        if invalid_count or duplicate_count or duplicate_delivery_attempt_count:
+            raise RuntimeError(
+                "context delivery acknowledgement tombstones failed integrity "
+                "validation "
+                f"(invalid={invalid_count}, digest_duplicate={duplicate_count}, "
+                "delivery_attempt_duplicate="
+                f"{duplicate_delivery_attempt_count})"
+            )
+
+        legacy_name = "agent_context_delivery_ack_tombstones_v2_legacy"
+        if self._schema_column_names(conn, legacy_name):
+            raise RuntimeError("stale tombstone rebuild table already exists")
+        index_name = "ix_agent_context_delivery_ack_tombstones_owner"
+        index_row = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = ?",
+            (index_name,),
+        ).fetchone()
+        if index_row is not None:
+            if str(index_row["type"]) != "index":
+                raise RuntimeError(
+                    f"reserved context delivery index name {index_name} is not an index"
+                )
+            conn.execute(f'DROP INDEX "{index_name}"')
+
+        rows = conn.execute(
+            """
+            SELECT receipt_digest, delivery_id, context_id, agent_id, event_id,
+                   attempt_number, acknowledged_at, deleted_at
+            FROM agent_context_delivery_ack_tombstones
+            ORDER BY receipt_digest
+            """
+        ).fetchall()
+        conn.execute(
+            """
+            ALTER TABLE agent_context_delivery_ack_tombstones
+            RENAME TO agent_context_delivery_ack_tombstones_v2_legacy
+            """
+        )
+        conn.execute(CONTEXT_DELIVERY_V2_TABLE_STATEMENTS[2])
+        conn.executemany(
+            """
+            INSERT INTO agent_context_delivery_ack_tombstones (
+                receipt_digest, delivery_id, context_id, agent_id, event_id,
+                attempt_number, acknowledged_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(row["receipt_digest"]),
+                    str(row["delivery_id"]),
+                    str(row["context_id"]),
+                    self._normalize_delivery_agent_id(str(row["agent_id"])),
+                    int(row["event_id"]),
+                    int(row["attempt_number"]),
+                    float(row["acknowledged_at"]),
+                    float(row["deleted_at"]),
+                )
+                for row in rows
+            ],
+        )
+        conn.execute(
+            "DROP TABLE agent_context_delivery_ack_tombstones_v2_legacy"
+        )
+        return len(rows)
+
+    def _rebuild_context_delivery_v2_tables(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        rebuilt_at: float,
+    ) -> int:
+        """Rebuild a same-column pre-final v2 schema without losing receipts."""
+
+        delivery_rows = conn.execute(
+            "SELECT * FROM agent_context_deliveries ORDER BY delivery_id"
+        ).fetchall()
+        receipt_rows = conn.execute(
+            """
+            SELECT * FROM agent_context_delivery_receipts
+            ORDER BY delivery_id, attempt_number
+            """
+        ).fetchall()
+        live_integrity_error_count, _ = self._context_delivery_live_data_audit(conn)
+        if live_integrity_error_count:
+            raise RuntimeError(
+                "pre-final context delivery v2 rows failed live integrity "
+                f"validation (errors={live_integrity_error_count})"
+            )
+        invalid_delivery_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries AS delivery
+                LEFT JOIN agent_context_events AS event
+                  ON event.context_id = delivery.context_id
+                 AND event.event_id = delivery.event_id
+                WHERE event.event_id IS NULL
+                   OR delivery.state NOT IN (
+                       'leased', 'acknowledged', 'dead_letter'
+                   )
+                   OR delivery.attempt_count < 1
+                """
+            ).fetchone()[0]
+        )
+        invalid_receipt_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_delivery_receipts AS receipt
+                LEFT JOIN agent_context_deliveries AS delivery
+                  ON delivery.delivery_id = receipt.delivery_id
+                WHERE delivery.delivery_id IS NULL
+                   OR receipt.state NOT IN (
+                       'leased', 'acknowledged', 'expired', 'released', 'cancelled'
+                   )
+                   OR receipt.attempt_number < 1
+                """
+            ).fetchone()[0]
+        )
+        if invalid_delivery_count or invalid_receipt_count:
+            raise RuntimeError(
+                "pre-final context delivery v2 rows failed integrity validation "
+                f"(deliveries={invalid_delivery_count}, receipts={invalid_receipt_count})"
+            )
+        if self._schema_column_names(conn, "agent_context_deliveries_v2_legacy"):
+            raise RuntimeError("stale v2 delivery rebuild table already exists")
+        if self._schema_column_names(
+            conn,
+            "agent_context_delivery_receipts_v2_legacy",
+        ):
+            raise RuntimeError("stale v2 receipt rebuild table already exists")
+
+        # Repair/establish the composite parent key before creating the new FK.
+        parent_index_name, _, _ = CONTEXT_DELIVERY_V2_PARENT_INDEX
+        parent_errors = self._context_delivery_v2_index_errors(conn)
+        parent_row = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = ?",
+            (parent_index_name,),
+        ).fetchone()
+        if parent_row is not None and any(
+            error.startswith(f"{parent_index_name}:") for error in parent_errors
+        ):
+            if str(parent_row["type"]) != "index":
+                raise RuntimeError(
+                    f"reserved context delivery parent index {parent_index_name} is not an index"
+                )
+            conn.execute(f'DROP INDEX "{parent_index_name}"')
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_context_events_context_event
+            ON agent_context_events(context_id, event_id)
+            """
+        )
+        for index_name in (
+            *CONTEXT_DELIVERY_V2_INDEX_COLUMNS.keys(),
+            "ix_agent_context_deliveries_agent_status_event",
+        ):
+            schema_row = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name = ?",
+                (index_name,),
+            ).fetchone()
+            if schema_row is not None:
+                if str(schema_row["type"]) != "index":
+                    raise RuntimeError(
+                        f"reserved context delivery index name {index_name} is not an index"
+                    )
+                conn.execute(f'DROP INDEX "{index_name}"')
+        conn.execute(
+            """
+            ALTER TABLE agent_context_delivery_receipts
+            RENAME TO agent_context_delivery_receipts_v2_legacy
+            """
+        )
+        conn.execute(
+            """
+            ALTER TABLE agent_context_deliveries
+            RENAME TO agent_context_deliveries_v2_legacy
+            """
+        )
+        self._create_context_delivery_v2_tables(conn)
+        conn.executemany(
+            """
+            INSERT INTO agent_context_deliveries (
+                delivery_id, context_id, agent_id, event_id, state,
+                attempt_count, current_receipt_id, lease_owner,
+                first_delivered_at, last_delivered_at, lease_expires_at,
+                acknowledged_at, cancelled_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                tuple(row[column] for column in CONTEXT_DELIVERY_V2_DELIVERY_COLUMNS)
+                for row in delivery_rows
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO agent_context_delivery_receipts (
+                receipt_id, delivery_id, attempt_number, consumer_instance_id,
+                state, leased_at, lease_expires_at, acknowledged_at,
+                released_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                tuple(row[column] for column in CONTEXT_DELIVERY_V2_RECEIPT_COLUMNS)
+                for row in receipt_rows
+            ],
+        )
+        conn.execute("DROP TABLE agent_context_delivery_receipts_v2_legacy")
+        conn.execute("DROP TABLE agent_context_deliveries_v2_legacy")
+        self._normalize_context_delivery_v2_indexes(conn)
+        self._canonicalize_context_delivery_identities(
+            conn,
+            updated_at=rebuilt_at,
+        )
+        self._repair_context_delivery_cursors(conn, repaired_at=rebuilt_at)
+        return len(delivery_rows)
+
+    def _ensure_context_delivery_schema_v2(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        migrated_at: float,
+    ) -> dict[str, int | bool]:
+        """Install or atomically rebuild the receipt-driven delivery schema.
+
+        The prototype schema used the final delivery table name but only had a
+        reusable ``lease_token``.  Acknowledged rows are preserved with a new
+        append-only receipt.  Outstanding prototype leases are preserved as
+        expired attempts so the next claimant safely retries them with a newly
+        fenced receipt; the reusable prototype token is never copied.
+        """
+
+        self._ensure_context_delivery_tombstone_schema(conn)
+        delivery_columns = self._schema_column_names(
+            conn,
+            "agent_context_deliveries",
+        )
+        receipt_columns = self._schema_column_names(
+            conn,
+            "agent_context_delivery_receipts",
+        )
+        if (
+            delivery_columns == CONTEXT_DELIVERY_V2_DELIVERY_COLUMNS
+            and receipt_columns == CONTEXT_DELIVERY_V2_RECEIPT_COLUMNS
+        ):
+            table_errors = self._context_delivery_v2_table_errors(conn)
+            if table_errors:
+                self._rebuild_context_delivery_v2_tables(
+                    conn,
+                    rebuilt_at=migrated_at,
+                )
+            else:
+                self._normalize_context_delivery_v2_indexes(conn)
+                self._canonicalize_context_delivery_identities(
+                    conn,
+                    updated_at=migrated_at,
+                )
+            self._repair_context_delivery_cursors(
+                conn,
+                repaired_at=migrated_at,
+            )
+            data_errors = self._context_delivery_data_errors(conn)
+            if data_errors:
+                raise RuntimeError(
+                    "context delivery v2 data failed integrity validation: "
+                    + ", ".join(data_errors)
+                )
+            return {"rebuilt": False, "migrated_delivery_count": 0}
+
+        if not delivery_columns:
+            if receipt_columns:
+                raise RuntimeError(
+                    "context delivery receipts exist without a delivery table"
+                )
+            self._create_context_delivery_v2_tables(conn)
+            self._create_context_delivery_v2_indexes(conn)
+            return {"rebuilt": False, "migrated_delivery_count": 0}
+
+        if delivery_columns == CONTEXT_DELIVERY_V2_DELIVERY_COLUMNS:
+            if receipt_columns:
+                raise RuntimeError(
+                    "context delivery receipt schema is not compatible with v2"
+                )
+            table_errors = self._context_delivery_v2_table_errors(
+                conn,
+                table_names=("agent_context_deliveries",),
+            )
+            if table_errors:
+                raise RuntimeError(
+                    "context delivery v2 table signature mismatch: "
+                    + ", ".join(table_errors)
+                )
+            delivery_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM agent_context_deliveries"
+                ).fetchone()[0]
+            )
+            if delivery_count:
+                raise RuntimeError(
+                    "context delivery receipts are missing for existing v2 deliveries; "
+                    "refusing to invent acknowledgement evidence"
+                )
+            conn.execute(CONTEXT_DELIVERY_V2_TABLE_STATEMENTS[1])
+            self._normalize_context_delivery_v2_indexes(conn)
+            return {"rebuilt": False, "migrated_delivery_count": 0}
+
+        if delivery_columns != CONTEXT_DELIVERY_V1_DELIVERY_COLUMNS:
+            raise RuntimeError(
+                "agent_context_deliveries has an unknown schema; refusing a lossy migration"
+            )
+
+        if receipt_columns:
+            legacy_receipt_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM agent_context_delivery_receipts"
+                ).fetchone()[0]
+            )
+            if legacy_receipt_count:
+                raise RuntimeError(
+                    "prototype deliveries have receipt rows of unknown provenance; refusing migration"
+                )
+
+        invalid_status_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries
+                WHERE status NOT IN ('leased', 'acknowledged')
+                   OR attempt_count < 1
+                """
+            ).fetchone()[0]
+        )
+        invalid_event_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries AS delivery
+                LEFT JOIN agent_context_events AS event
+                  ON event.event_id = delivery.event_id
+                 AND event.context_id = delivery.context_id
+                WHERE event.event_id IS NULL
+                """
+            ).fetchone()[0]
+        )
+        if invalid_status_count or invalid_event_count:
+            raise RuntimeError(
+                "prototype context delivery rows failed integrity validation "
+                f"(invalid_status={invalid_status_count}, invalid_event={invalid_event_count})"
+            )
+
+        legacy_rows = conn.execute(
+            """
+            SELECT *
+            FROM agent_context_deliveries
+            ORDER BY context_id, agent_id, event_id
+            """
+        ).fetchall()
+        canonical_legacy_keys: set[tuple[str, str, int]] = set()
+        for row in legacy_rows:
+            canonical_key = (
+                str(row["context_id"]),
+                self._normalize_delivery_agent_id(str(row["agent_id"])),
+                int(row["event_id"]),
+            )
+            if canonical_key in canonical_legacy_keys:
+                raise RuntimeError(
+                    "prototype delivery agent canonicalization would merge conflicting histories"
+                )
+            canonical_legacy_keys.add(canonical_key)
+        if self._schema_column_names(conn, "agent_context_deliveries_v1_legacy"):
+            raise RuntimeError("stale prototype delivery migration table already exists")
+        if self._schema_column_names(
+            conn,
+            "agent_context_delivery_receipts_v1_legacy",
+        ):
+            raise RuntimeError("stale prototype receipt migration table already exists")
+
+        # Index names are database-global and remain attached when a table is
+        # renamed, so remove both prototype and final names before rebuilding.
+        for index_name in (
+            "ix_agent_context_deliveries_agent_status_event",
+            "ix_agent_context_deliveries_agent_state_event",
+            "ix_agent_context_deliveries_lease_expiry",
+            "ix_agent_context_delivery_receipts_delivery_attempt",
+            "ix_agent_context_delivery_receipts_state_expiry",
+        ):
+            conn.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+        if receipt_columns:
+            conn.execute(
+                """
+                ALTER TABLE agent_context_delivery_receipts
+                RENAME TO agent_context_delivery_receipts_v1_legacy
+                """
+            )
+        conn.execute(
+            """
+            ALTER TABLE agent_context_deliveries
+            RENAME TO agent_context_deliveries_v1_legacy
+            """
+        )
+        self._create_context_delivery_v2_tables(conn)
+
+        for row in legacy_rows:
+            agent_id = self._normalize_delivery_agent_id(str(row["agent_id"]))
+            if not agent_id:
+                raise RuntimeError("prototype delivery contains an empty agent id")
+            state = str(row["status"])
+            attempt_count = int(row["attempt_count"])
+            acknowledged_at = (
+                None
+                if row["acknowledged_at"] is None
+                else float(row["acknowledged_at"])
+            )
+            if state == "acknowledged" and acknowledged_at is None:
+                acknowledged_at = float(row["updated_at"])
+            lease_expires_at = float(row["lease_expires_at"])
+            receipt_state = "acknowledged"
+            receipt_updated_at = float(row["updated_at"])
+            if state == "leased":
+                # Force a retry after upgrade. The prototype token and unknown
+                # process owner must never remain capable of acknowledgement.
+                lease_expires_at = min(lease_expires_at, migrated_at - 0.001)
+                receipt_state = "expired"
+                receipt_updated_at = max(
+                    receipt_updated_at,
+                    lease_expires_at,
+                )
+            receipt_id = "ctxrcpt_" + secrets.token_urlsafe(32)
+            conn.execute(
+                """
+                INSERT INTO agent_context_consumers (
+                    agent_id,
+                    consumer_kind,
+                    enabled,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, 'migrated-v1', 1, ?, ?)
+                ON CONFLICT(agent_id) DO NOTHING
+                """,
+                (agent_id, migrated_at, migrated_at),
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_context_deliveries (
+                    delivery_id,
+                    context_id,
+                    agent_id,
+                    event_id,
+                    state,
+                    attempt_count,
+                    current_receipt_id,
+                    lease_owner,
+                    first_delivered_at,
+                    last_delivered_at,
+                    lease_expires_at,
+                    acknowledged_at,
+                    cancelled_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'migration-v1-unclaimed', ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    str(row["delivery_id"]),
+                    str(row["context_id"]),
+                    agent_id,
+                    int(row["event_id"]),
+                    state,
+                    attempt_count,
+                    receipt_id,
+                    float(row["first_delivered_at"]),
+                    float(row["last_delivered_at"]),
+                    lease_expires_at,
+                    acknowledged_at,
+                    float(row["created_at"]),
+                    float(row["updated_at"]),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_context_delivery_receipts (
+                    receipt_id,
+                    delivery_id,
+                    attempt_number,
+                    consumer_instance_id,
+                    state,
+                    leased_at,
+                    lease_expires_at,
+                    acknowledged_at,
+                    released_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 'migration-v1-unclaimed', ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    receipt_id,
+                    str(row["delivery_id"]),
+                    attempt_count,
+                    receipt_state,
+                    float(row["last_delivered_at"]),
+                    lease_expires_at,
+                    acknowledged_at,
+                    float(row["created_at"]),
+                    receipt_updated_at,
+                ),
+            )
+
+        # Prototype cursor values were watermark based rather than proven by
+        # receipts. Rebuild them lazily from the preserved acknowledgements.
+        conn.execute("DELETE FROM agent_context_delivery_cursors")
+        if receipt_columns:
+            conn.execute("DROP TABLE agent_context_delivery_receipts_v1_legacy")
+        conn.execute("DROP TABLE agent_context_deliveries_v1_legacy")
+        self._normalize_context_delivery_v2_indexes(conn)
+        self._canonicalize_context_delivery_identities(
+            conn,
+            updated_at=migrated_at,
+        )
+        schema_errors = self._context_delivery_v2_table_errors(conn) + (
+            self._context_delivery_v2_index_errors(conn)
+        )
+        data_errors = self._context_delivery_data_errors(conn)
+        if schema_errors or data_errors:
+            raise RuntimeError(
+                "context delivery migration verification failed: "
+                + ", ".join(schema_errors + data_errors)
+            )
+        return {
+            "rebuilt": True,
+            "migrated_delivery_count": len(legacy_rows),
+        }
+
+    def _context_event_target_reconciliation_needed(
+        self,
+        conn: sqlite3.Connection,
+    ) -> bool:
+        highwater_row = conn.execute(
+            "SELECT value_json FROM store_metadata WHERE key = ?",
+            ("context_event_targets_reconciled_through",),
+        ).fetchone()
+        try:
+            highwater = int(
+                _decode_json(str(highwater_row["value_json"]), 0)
+                if highwater_row is not None
+                else 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            highwater = 0
+        latest_event_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
+            ).fetchone()[0]
+            or 0
+        )
+        return latest_event_id > max(0, highwater)
+
+    def _context_event_target_canonicalization_needed(
+        self,
+        conn: sqlite3.Connection,
+    ) -> bool:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT target_id
+            FROM agent_context_event_targets
+            WHERE target_kind = 'agent'
+            """
+        ).fetchall()
+        return any(
+            str(row["target_id"])
+            != self._normalize_delivery_agent_id(str(row["target_id"]))
+            for row in rows
+        )
+
+    def _context_event_target_integrity_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+        after_event_id: int = 0,
+        missing_targets_only: bool = False,
+        sample_limit: int = 10,
+    ) -> tuple[
+        int,
+        list[dict[str, Any]],
+        int,
+        list[dict[str, Any]],
+    ]:
+        """Validate every routed event's normalized target contract.
+
+        Old writers may have persisted a malformed or empty
+        ``agent_targets_json`` envelope which reconciliation intentionally
+        leaves unrouted; delivery health reports those separately.  A valid
+        nonempty envelope with no rows is lost routing evidence and fails this
+        audit.  Once any normalized row is present, the route is authoritative
+        and must be sanctioned, canonical, and semantically identical to the
+        event envelope.
+        """
+
+        context = None if context_id is None else str(context_id)
+        missing_target_filter = (
+            "AND target.event_id IS NULL" if missing_targets_only else ""
+        )
+        rows = conn.execute(
+            f"""
+            SELECT event.event_id,
+                   event.context_id,
+                   event.agent_targets_json,
+                   target.target_kind,
+                   target.target_id
+            FROM agent_context_events AS event
+            LEFT JOIN agent_context_event_targets AS target
+              ON target.event_id = event.event_id
+            WHERE (? IS NULL OR event.context_id = ?)
+              AND event.event_id > ?
+              {missing_target_filter}
+            ORDER BY event.event_id, target.target_kind, target.target_id
+            """,
+            (context, context, max(0, int(after_event_id))),
+        ).fetchall()
+        bounded_sample_limit = min(max(int(sample_limit), 1), 100)
+        error_count = 0
+        error_samples: list[dict[str, Any]] = []
+        noncanonical_agent_target_count = 0
+        noncanonical_agent_target_samples: list[dict[str, Any]] = []
+
+        event_id: int | None = None
+        event_context = ""
+        targets_json = ""
+        target_records: list[tuple[str, str]] = []
+        target_reasons: set[str] = set()
+
+        def finish_event() -> None:
+            nonlocal error_count
+            if event_id is None:
+                return
+            reasons = set(target_reasons)
+            try:
+                raw_targets = json.loads(targets_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_targets = None
+            has_target_records = bool(target_records)
+            if not isinstance(raw_targets, list):
+                expected_records: list[tuple[str, str]] | None = None
+                if has_target_records:
+                    reasons.add("agent-targets-json-not-list")
+            else:
+                normalized_targets = self._normalize_event_targets(raw_targets)
+                if raw_targets != normalized_targets and (
+                    has_target_records or normalized_targets
+                ):
+                    reasons.add("agent-targets-envelope-noncanonical")
+                expected_records = sorted(
+                    self._normalized_event_target_records(
+                        normalized_targets
+                    )
+                )
+                if not has_target_records and expected_records:
+                    reasons.add("missing-target-rows")
+                elif has_target_records and sorted(target_records) != expected_records:
+                    reasons.add("target-row-envelope-mismatch")
+            if not reasons:
+                return
+            error_count += 1
+            if len(error_samples) >= bounded_sample_limit:
+                return
+            error_samples.append(
+                {
+                    "event_id": event_id,
+                    "context_id": event_context,
+                    "reasons": sorted(reasons),
+                    "target_records": [
+                        {"target_kind": kind, "target_id": target}
+                        for kind, target in target_records[:64]
+                    ],
+                    "expected_target_records": (
+                        None
+                        if expected_records is None
+                        else [
+                            {"target_kind": kind, "target_id": target}
+                            for kind, target in expected_records[:64]
+                        ]
+                    ),
+                }
+            )
+
+        for row in rows:
+            row_event_id = int(row["event_id"])
+            if event_id is not None and row_event_id != event_id:
+                finish_event()
+                target_records = []
+                target_reasons = set()
+            if event_id != row_event_id:
+                event_id = row_event_id
+                event_context = str(row["context_id"])
+                targets_json = str(row["agent_targets_json"])
+
+            if row["target_kind"] is None:
+                continue
+            target_kind = str(row["target_kind"])
+            target_id = str(row["target_id"])
+            target_records.append((target_kind, target_id))
+            if target_kind == "agent":
+                canonical_target = self._normalize_delivery_agent_id(target_id)
+                if not target_id.strip() or not canonical_target:
+                    target_reasons.add("agent-target-empty")
+                elif target_id != canonical_target:
+                    target_reasons.add("agent-target-noncanonical")
+                    noncanonical_agent_target_count += 1
+                    if (
+                        len(noncanonical_agent_target_samples)
+                        < bounded_sample_limit
+                    ):
+                        noncanonical_agent_target_samples.append(
+                            {
+                                "event_id": row_event_id,
+                                "target_id": target_id,
+                                "canonical_target_id": canonical_target,
+                            }
+                        )
+            elif target_kind == "group":
+                if target_id not in CONTEXT_EVENT_TARGET_GROUPS:
+                    target_reasons.add("group-target-not-allowed")
+            elif target_kind == "broadcast":
+                if target_id != "*":
+                    target_reasons.add("broadcast-target-not-star")
+            else:
+                target_reasons.add("target-kind-not-allowed")
+        finish_event()
+        return (
+            error_count,
+            error_samples,
+            noncanonical_agent_target_count,
+            noncanonical_agent_target_samples,
+        )
+
+    def _context_event_ledger_integrity_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+        after_event_id: int = 0,
+        sample_limit: int = 10,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Validate immutable event addressing without exposing event content."""
+
+        context = None if context_id is None else str(context_id)
+        rows = conn.execute(
+            """
+            SELECT event_id, context_id, created_at
+            FROM agent_context_events
+            WHERE (? IS NULL OR context_id = ?)
+              AND event_id > ?
+            ORDER BY event_id
+            """,
+            (context, context, max(0, int(after_event_id))),
+        ).fetchall()
+        bounded_sample_limit = min(max(int(sample_limit), 1), 100)
+        error_count = 0
+        samples: list[dict[str, Any]] = []
+        for row in rows:
+            reasons: list[str] = []
+            raw_context_id = row["context_id"]
+            if not self._context_event_context_id_is_valid(raw_context_id):
+                reasons.append("context-id-invalid")
+            if not self._context_delivery_timestamp_is_valid(row["created_at"]):
+                reasons.append("created-at-invalid")
+            if not reasons:
+                continue
+            error_count += 1
+            if len(samples) >= bounded_sample_limit:
+                continue
+            samples.append(
+                {
+                    "event_id": int(row["event_id"]),
+                    "reasons": reasons,
+                    "context_id_length": (
+                        len(raw_context_id)
+                        if isinstance(raw_context_id, str)
+                        else 0
+                    ),
+                }
+            )
+        return error_count, samples
+
+    @staticmethod
+    def _context_consumer_group_integrity_audit(
+        conn: sqlite3.Connection,
+        *,
+        sample_limit: int = 10,
+    ) -> tuple[int, list[dict[str, str]]]:
+        allowed_groups = tuple(sorted(CONTEXT_EVENT_TARGET_GROUPS))
+        placeholders = ", ".join("?" for _ in allowed_groups)
+        rows = conn.execute(
+            f"""
+            SELECT agent_id, group_id
+            FROM agent_context_consumer_groups
+            WHERE group_id NOT IN ({placeholders})
+            ORDER BY agent_id, group_id
+            """,
+            allowed_groups,
+        ).fetchall()
+        bounded_sample_limit = min(max(int(sample_limit), 1), 100)
+        return len(rows), [
+            {
+                "agent_id": str(row["agent_id"]),
+                "group_id": str(row["group_id"]),
+                "reason": "consumer-group-not-allowed",
+            }
+            for row in rows[:bounded_sample_limit]
+        ]
+
+    @staticmethod
+    def _context_event_target_highwater_audit(
+        conn: sqlite3.Connection,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        latest_event_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
+            ).fetchone()[0]
+            or 0
+        )
+        highwater_row = conn.execute(
+            "SELECT value_json FROM store_metadata WHERE key = ?",
+            ("context_event_targets_reconciled_through",),
+        ).fetchone()
+        if highwater_row is None:
+            return 0, []
+        try:
+            highwater = int(json.loads(str(highwater_row["value_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0, []
+        if highwater <= latest_event_id:
+            return 0, []
+        return 1, [
+            {
+                "reconciled_through_event_id": highwater,
+                "latest_event_id": latest_event_id,
+                "reason": "target-reconciliation-highwater-ahead-of-ledger",
+            }
+        ]
+
+    def _canonicalize_context_event_targets(
+        self,
+        conn: sqlite3.Connection,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT event_id, target_id, created_at
+            FROM agent_context_event_targets
+            WHERE target_kind = 'agent'
+            ORDER BY event_id, target_id
+            """
+        ).fetchall()
+        changed_event_ids: set[int] = set()
+        for row in rows:
+            raw_target = str(row["target_id"])
+            canonical_target = self._normalize_delivery_agent_id(raw_target)
+            if not canonical_target:
+                raise RuntimeError(
+                    "context event contains an empty canonical agent target"
+                )
+            if canonical_target == raw_target:
+                continue
+            event_id = int(row["event_id"])
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO agent_context_event_targets (
+                    event_id, target_kind, target_id, created_at
+                ) VALUES (?, 'agent', ?, ?)
+                """,
+                (event_id, canonical_target, float(row["created_at"])),
+            )
+            conn.execute(
+                """
+                DELETE FROM agent_context_event_targets
+                WHERE event_id = ? AND target_kind = 'agent' AND target_id = ?
+                """,
+                (event_id, raw_target),
+            )
+            changed_event_ids.add(event_id)
+
+        for event_id in sorted(changed_event_ids):
+            target_rows = conn.execute(
+                """
+                SELECT target_kind, target_id
+                FROM agent_context_event_targets
+                WHERE event_id = ?
+                ORDER BY target_kind, target_id
+                """,
+                (event_id,),
+            ).fetchall()
+            targets = [
+                "broadcast"
+                if str(target["target_kind"]) == "broadcast"
+                else str(target["target_id"])
+                for target in target_rows
+            ]
+            conn.execute(
+                """
+                UPDATE agent_context_events
+                SET agent_targets_json = ?
+                WHERE event_id = ?
+                """,
+                (_json_dumps(targets), event_id),
+            )
+        return len(changed_event_ids)
+
+    def _reconcile_context_event_targets(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        reconciled_at: float,
+    ) -> int:
+        highwater_row = conn.execute(
+            "SELECT value_json FROM store_metadata WHERE key = ?",
+            ("context_event_targets_reconciled_through",),
+        ).fetchone()
+        try:
+            highwater = int(
+                _decode_json(str(highwater_row["value_json"]), 0)
+                if highwater_row is not None
+                else 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            highwater = 0
+        rows = conn.execute(
+            """
+            SELECT event_id, agent_targets_json, created_at
+            FROM agent_context_events
+            WHERE event_id > ?
+            ORDER BY event_id ASC
+            """,
+            (max(0, highwater),),
+        ).fetchall()
+        inserted_count = 0
+        for row in rows:
+            raw_targets = _decode_json(str(row["agent_targets_json"]), None)
+            if not isinstance(raw_targets, list):
+                # Invalid envelopes remain deliberately unrouted and visible in
+                # delivery health. Advancing the scan highwater avoids turning
+                # every connection into a writer while still failing closed.
+                continue
+            targets = self._normalize_event_targets(raw_targets)
+            target_records = self._normalized_event_target_records(targets)
+            if not target_records:
+                continue
+            if raw_targets != targets:
+                conn.execute(
+                    """
+                    UPDATE agent_context_events
+                    SET agent_targets_json = ?
+                    WHERE event_id = ?
+                    """,
+                    (_json_dumps(targets), int(row["event_id"])),
+                )
+            cursor = conn.executemany(
+                """
+                INSERT OR IGNORE INTO agent_context_event_targets (
+                    event_id,
+                    target_kind,
+                    target_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (
+                        int(row["event_id"]),
+                        target_kind,
+                        target_id,
+                        float(row["created_at"]),
+                    )
+                    for target_kind, target_id in target_records
+                ],
+            )
+            inserted_count += max(0, int(cursor.rowcount))
+        if rows:
+            highwater = int(rows[-1]["event_id"])
+        latest_event_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
+            ).fetchone()[0]
+            or 0
+        )
+        highwater = min(max(0, highwater), latest_event_id)
+        conn.execute(
+            """
+            INSERT INTO store_metadata (key, value_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                "context_event_targets_reconciled_through",
+                json.dumps(max(0, highwater)),
+                reconciled_at,
+            ),
+        )
+        return inserted_count
+
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
-        required_migrations = {"memory_spikes_v1", "memory_surface_terms_v1"}
+        required_migrations = {
+            "memory_spikes_v1",
+            "memory_surface_terms_v1",
+            "context_event_targets_v2",
+            "context_deliveries_v2",
+        }
+        migration_placeholders = ", ".join("?" for _ in required_migrations)
         applied_migrations = {
             str(row["key"])
             for row in conn.execute(
-                "SELECT key FROM store_migrations WHERE key IN (?, ?)",
+                f"SELECT key FROM store_migrations WHERE key IN ({migration_placeholders})",
                 tuple(sorted(required_migrations)),
             ).fetchall()
         }
-        if applied_migrations == required_migrations:
+        delivery_schema_ready = self._context_delivery_schema_is_v2(conn)
+        delivery_data_ready = (
+            self._context_delivery_data_is_v2(conn)
+            if delivery_schema_ready
+            else False
+        )
+        target_reconciliation_needed = (
+            self._context_event_target_reconciliation_needed(conn)
+        )
+        startup_target_integrity_required = not bool(
+            getattr(self, "_target_integrity_verified", False)
+        )
+        target_canonicalization_needed = bool(
+            startup_target_integrity_required
+            and self._context_event_target_canonicalization_needed(conn)
+        )
+        target_integrity_error_count = 0
+        if startup_target_integrity_required:
+            target_integrity_error_count, _, _, _ = (
+                self._context_event_target_integrity_audit(conn)
+            )
+        else:
+            # A valid envelope losing all normalized rows is a cheap, indexed
+            # invariant to check on every connection.  This prevents a live
+            # store instance from silently returning an empty lease forever,
+            # while the expensive full parity scan remains startup-gated.
+            target_integrity_error_count, _, _, _ = (
+                self._context_event_target_integrity_audit(
+                    conn,
+                    missing_targets_only=True,
+                )
+            )
+        event_ledger_integrity_error_count = 0
+        if startup_target_integrity_required:
+            event_ledger_integrity_error_count, _ = (
+                self._context_event_ledger_integrity_audit(conn)
+            )
+        target_highwater_error_count, _ = (
+            self._context_event_target_highwater_audit(conn)
+        )
+        if (
+            applied_migrations == required_migrations
+            and delivery_schema_ready
+            and delivery_data_ready
+            and not target_reconciliation_needed
+            and not target_canonicalization_needed
+            and target_integrity_error_count == 0
+            and event_ledger_integrity_error_count == 0
+            and target_highwater_error_count == 0
+        ):
+            self._target_integrity_verified = True
             return
 
         # Recheck after acquiring the writer lock. Another process may have
         # completed the migration between the optimistic read and this point.
         with self._transaction(conn, immediate=True):
             index_rows_changed = 0
+            target_integrity_after_event_id = 0
+            if not startup_target_integrity_required:
+                prior_highwater_row = conn.execute(
+                    "SELECT value_json FROM store_metadata WHERE key = ?",
+                    ("context_event_targets_reconciled_through",),
+                ).fetchone()
+                try:
+                    target_integrity_after_event_id = max(
+                        0,
+                        int(
+                            _decode_json(
+                                str(prior_highwater_row["value_json"]),
+                                0,
+                            )
+                            if prior_highwater_row is not None
+                            else 0
+                        ),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    target_integrity_after_event_id = 0
+            target_migration_was_applied = bool(
+                conn.execute(
+                    "SELECT 1 FROM store_migrations WHERE key = ?",
+                    ("context_event_targets_v2",),
+                ).fetchone()
+            )
+            if (
+                not conn.execute(
+                    "SELECT 1 FROM store_migrations WHERE key = ?",
+                    ("context_deliveries_v2",),
+                ).fetchone()
+                or not self._context_delivery_schema_is_v2(conn)
+                or not self._context_delivery_data_is_v2(conn)
+            ):
+                self._ensure_context_delivery_schema_v2(
+                    conn,
+                    migrated_at=time.time(),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("context_deliveries_v2", time.time()),
+                )
+
             if not conn.execute(
                 "SELECT 1 FROM store_migrations WHERE key = ?",
                 ("memory_spikes_v1",),
@@ -669,6 +4060,83 @@ class DurableMemoryStore:
                     ("memory_surface_terms_v1", time.time()),
                 )
 
+            if (
+                not conn.execute(
+                    "SELECT 1 FROM store_migrations WHERE key = ?",
+                    ("context_event_targets_v2",),
+                ).fetchone()
+                or self._context_event_target_reconciliation_needed(conn)
+            ):
+                self._reconcile_context_event_targets(
+                    conn,
+                    reconciled_at=time.time(),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("context_event_targets_v2", time.time()),
+                )
+            # Canonicalization is a one-time legacy migration.  Once the v2
+            # marker exists, changing routed target evidence would hide
+            # corruption; the integrity gate below must fail closed instead.
+            if (
+                not target_migration_was_applied
+                and self._context_event_target_canonicalization_needed(conn)
+            ):
+                self._canonicalize_context_event_targets(conn)
+
+            (
+                target_integrity_error_count,
+                target_integrity_samples,
+                _,
+                _,
+            ) = self._context_event_target_integrity_audit(
+                conn,
+                after_event_id=target_integrity_after_event_id,
+            )
+            if not startup_target_integrity_required:
+                (
+                    missing_target_error_count,
+                    missing_target_samples,
+                    _,
+                    _,
+                ) = self._context_event_target_integrity_audit(
+                    conn,
+                    missing_targets_only=True,
+                )
+                if missing_target_error_count:
+                    target_integrity_error_count += missing_target_error_count
+                    target_integrity_samples.extend(missing_target_samples)
+            if target_integrity_error_count:
+                raise RuntimeError(
+                    "context event targets failed integrity validation "
+                    f"(routed_events={target_integrity_error_count}, "
+                    f"samples={target_integrity_samples[:3]!r})"
+                )
+            (
+                event_ledger_integrity_error_count,
+                event_ledger_integrity_samples,
+            ) = self._context_event_ledger_integrity_audit(
+                conn,
+                after_event_id=target_integrity_after_event_id,
+            )
+            if event_ledger_integrity_error_count:
+                raise RuntimeError(
+                    "context event ledger failed integrity validation "
+                    f"(events={event_ledger_integrity_error_count}, "
+                    f"samples={event_ledger_integrity_samples[:3]!r})"
+                )
+            target_highwater_error_count, target_highwater_samples = (
+                self._context_event_target_highwater_audit(conn)
+            )
+            if target_highwater_error_count:
+                raise RuntimeError(
+                    "context event target reconciliation highwater failed "
+                    f"integrity validation (samples={target_highwater_samples!r})"
+                )
+
             if index_rows_changed:
                 generation_row = conn.execute(
                     "SELECT value_json FROM store_metadata WHERE key = ?",
@@ -696,6 +4164,7 @@ class DurableMemoryStore:
                         time.time(),
                     ),
                 )
+        self._target_integrity_verified = True
 
     def _protect_path(self, path: Path, *, directory: bool) -> None:
         try:
@@ -939,10 +4408,11 @@ class DurableMemoryStore:
         context_id: str | None = None,
         limit: int = 50,
         include_global: bool = False,
+        _conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         bounded_limit = min(max(int(limit), 1), 10_000)
         try:
-            with closing(self._connect()) as conn:
+            with self._read_connection_scope(_conn) as conn:
                 if context_id is None:
                     rows = conn.execute(
                         """
@@ -1258,7 +4728,7 @@ class DurableMemoryStore:
         context_placeholders = ",".join("?" for _ in scope_by_context)
         clean_query_spikes = sorted({int(value) for value in query_spikes})
         placeholders = ",".join("?" for _ in clean_query_spikes)
-        bounded_limit = min(max(int(limit), 1), 1000)
+        bounded_limit = min(max(int(limit), 1), 10_000)
         candidate_limit = min(max(bounded_limit * 16, 128), 10_000)
         params: list[Any] = [
             *scope_by_context.keys(),
@@ -1352,7 +4822,7 @@ class DurableMemoryStore:
         }
         if not scope_by_context:
             return []
-        bounded_limit = min(max(int(limit), 1), 1000)
+        bounded_limit = min(max(int(limit), 1), 10_000)
         placeholders = ",".join("?" for _ in clean_terms)
         context_placeholders = ",".join("?" for _ in scope_by_context)
         params: list[Any] = [*scope_by_context.keys(), *clean_terms, bounded_limit]
@@ -1569,6 +5039,7 @@ class DurableMemoryStore:
         relation_type: str | None = None,
         enabled_only: bool = False,
         limit: int = 1000,
+        _conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -1593,7 +5064,7 @@ class DurableMemoryStore:
         bounded_limit = min(max(int(limit), 1), 10_000)
         params.append(bounded_limit)
         try:
-            with closing(self._connect()) as conn:
+            with self._read_connection_scope(_conn) as conn:
                 rows = conn.execute(
                     f"""
                     SELECT *
@@ -2120,6 +5591,7 @@ class DurableMemoryStore:
         target_memory_id: str | None = None,
         relation_type: str | None = None,
         limit: int = 100,
+        _conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -2142,7 +5614,7 @@ class DurableMemoryStore:
         bounded_limit = min(max(int(limit), 1), 10_000)
         params.append(bounded_limit)
         try:
-            with closing(self._connect()) as conn:
+            with self._read_connection_scope(_conn) as conn:
                 rows = conn.execute(
                     f"""
                     SELECT
@@ -2379,14 +5851,17 @@ class DurableMemoryStore:
         agent_targets: Iterable[str] | None = None,
         created_at: float | None = None,
     ) -> dict[str, Any]:
-        targets = [
-            str(target).strip()
-            for target in (agent_targets or [])
-            if str(target).strip()
-        ]
+        context = str(context_id if context_id is not None else "")
+        if not self._context_event_context_id_is_valid(context):
+            raise ValueError(
+                "context_id must be stripped, nonempty, and at most 128 characters"
+            )
+        targets = self._normalize_event_targets(agent_targets)
         if not targets:
             targets = ["mcp-clients"]
-        now = float(created_at or time.time())
+        now = time.time() if created_at is None else float(created_at)
+        if not self._context_delivery_timestamp_is_valid(now):
+            raise ValueError("created_at must be a finite timestamp")
         try:
             with closing(self._connect()) as conn:
                 with self._transaction(conn, immediate=True):
@@ -2404,7 +5879,7 @@ class DurableMemoryStore:
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            str(context_id),
+                            context,
                             str(source_surface or "unknown"),
                             str(event_type or "context-update"),
                             str(summary or ""),
@@ -2414,6 +5889,22 @@ class DurableMemoryStore:
                         ),
                     )
                     event_id = int(cursor.lastrowid)
+                    target_records = self._normalized_event_target_records(targets)
+                    conn.executemany(
+                        """
+                        INSERT INTO agent_context_event_targets (
+                            event_id,
+                            target_kind,
+                            target_id,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        [
+                            (event_id, target_kind, target_id, now)
+                            for target_kind, target_id in target_records
+                        ],
+                    )
                     event_row = conn.execute(
                         "SELECT * FROM agent_context_events WHERE event_id = ?",
                         (event_id,),
@@ -2429,41 +5920,427 @@ class DurableMemoryStore:
             )
             raise
 
+    @classmethod
+    def _normalize_event_targets(
+        cls,
+        agent_targets: Iterable[str] | None,
+    ) -> list[str]:
+        targets: list[str] = []
+        seen: set[str] = set()
+        for value in agent_targets or ():
+            raw_target = str(value or "").strip()[:128]
+            folded = raw_target.casefold()
+            if folded in {"*", "all", "all-agents", "broadcast"}:
+                target = "broadcast"
+            elif folded in CONTEXT_EVENT_TARGET_GROUPS:
+                target = folded
+            else:
+                target = cls._normalize_delivery_agent_id(raw_target)
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+            if len(targets) >= 64:
+                break
+        return targets
+
+    @classmethod
+    def _normalized_event_target_records(
+        cls,
+        agent_targets: Iterable[str],
+    ) -> list[tuple[str, str]]:
+        records: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw_target in agent_targets:
+            target = str(raw_target or "").strip()[:128]
+            folded = target.casefold()
+            if not folded:
+                continue
+            if folded in {"*", "all", "all-agents", "broadcast"}:
+                record = ("broadcast", "*")
+            elif folded in CONTEXT_EVENT_TARGET_GROUPS:
+                record = ("group", folded)
+            else:
+                canonical_agent = cls._normalize_delivery_agent_id(target)
+                if not canonical_agent:
+                    continue
+                record = ("agent", canonical_agent)
+            if record in seen:
+                continue
+            seen.add(record)
+            records.append(record)
+        return records
+
+    @staticmethod
+    def _normalize_delivery_agent_id(agent_id: str) -> str:
+        raw = str(agent_id or "").strip()
+        cleaned = re.sub(r"[^A-Za-z0-9_.:@-]+", "_", raw).strip("._-:@")
+        return cleaned.casefold()[:128]
+
+    @staticmethod
+    def _context_delivery_max_attempts() -> int:
+        raw = os.getenv("SYNAPSE_S2_CONTEXT_MAX_DELIVERY_ATTEMPTS", "5")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SYNAPSE_S2_CONTEXT_MAX_DELIVERY_ATTEMPTS must be an integer"
+            ) from exc
+        return min(max(value, 2), 100)
+
+    @staticmethod
+    def _context_delivery_receipt_digest(receipt_id: str) -> str:
+        return hashlib.sha256(
+            b"context-delivery-ack-tombstone:v1\x00"
+            + str(receipt_id).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _normalize_consumer_groups(
+        consumer_groups: Iterable[str] | None,
+    ) -> tuple[str, ...]:
+        groups: list[str] = []
+        seen: set[str] = set()
+        for value in consumer_groups or ():
+            group = str(value or "").strip().casefold()[:128]
+            if group not in CONTEXT_EVENT_TARGET_GROUPS or group in seen:
+                continue
+            seen.add(group)
+            groups.append(group)
+        return tuple(groups)
+
+    @classmethod
+    def _event_target_clause(
+        cls,
+        *,
+        event_alias: str,
+        agent_id: str,
+        consumer_groups: Iterable[str] | None = None,
+    ) -> tuple[str, tuple[str, ...]]:
+        agent = cls._normalize_delivery_agent_id(agent_id)
+        groups = cls._normalize_consumer_groups(consumer_groups)
+        use_persisted_groups = consumer_groups is None
+        declared_group_clause = "0"
+        declared_group_params: tuple[str, ...] = ()
+        if groups:
+            placeholders = ", ".join("?" for _ in groups)
+            declared_group_clause = f"target.target_id IN ({placeholders})"
+            declared_group_params = tuple(groups)
+        persisted_group_clause = "0"
+        persisted_group_params: tuple[str, ...] = ()
+        if use_persisted_groups:
+            persisted_group_clause = """
+                EXISTS (
+                    SELECT 1
+                    FROM agent_context_consumer_groups AS membership
+                    WHERE membership.agent_id = ?
+                      AND membership.group_id = target.target_id
+                )
+            """
+            persisted_group_params = (agent,)
+        clause = f"""
+            EXISTS (
+                SELECT 1
+                FROM agent_context_event_targets AS target
+                WHERE target.event_id = {event_alias}.event_id
+                  AND (
+                      target.target_kind = 'broadcast'
+                      OR (
+                          target.target_kind = 'agent'
+                          AND target.target_id = ? COLLATE NOCASE
+                      )
+                      OR (
+                          target.target_kind = 'group'
+                          AND (
+                              {declared_group_clause}
+                              OR {persisted_group_clause}
+                          )
+                      )
+                  )
+            )
+        """
+        return clause, (agent, *declared_group_params, *persisted_group_params)
+
+    def _register_context_consumer(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        consumer_instance_id: str,
+        consumer_groups: Iterable[str] | None,
+        now: float,
+    ) -> None:
+        agent = self._normalize_delivery_agent_id(agent_id)
+        if not agent:
+            raise ValueError("agent_id is required for context delivery")
+        instance = str(consumer_instance_id or "").strip()
+        if not instance:
+            raise ValueError("consumer_instance_id is required for context delivery")
+        groups = self._normalize_consumer_groups(consumer_groups)
+        conn.execute(
+            """
+            INSERT INTO agent_context_consumers (
+                agent_id,
+                consumer_kind,
+                enabled,
+                created_at,
+                updated_at
+            )
+            VALUES (?, 'local-mcp', 1, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (agent, now, now),
+        )
+        enabled_row = conn.execute(
+            "SELECT enabled FROM agent_context_consumers WHERE agent_id = ?",
+            (agent,),
+        ).fetchone()
+        if enabled_row is None or not bool(enabled_row["enabled"]):
+            raise ValueError(f"context consumer {agent!r} is disabled")
+        # Membership is an authoritative declaration from the trusted caller,
+        # not an additive cache. Removing a group from policy revokes it on the
+        # next claim instead of leaving stale delivery access behind.
+        conn.execute(
+            "DELETE FROM agent_context_consumer_groups WHERE agent_id = ?",
+            (agent,),
+        )
+        for group in groups:
+            conn.execute(
+                """
+                INSERT INTO agent_context_consumer_groups (
+                    agent_id,
+                    group_id,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(agent_id, group_id) DO NOTHING
+                """,
+                (agent, group, now),
+            )
+
+    def _context_delivery_metrics(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str,
+        agent_id: str,
+        cursor_event_id: int,
+    ) -> dict[str, int]:
+        target_clause, target_params = self._event_target_clause(
+            event_alias="event",
+            agent_id=agent_id,
+        )
+        latest_event_id = int(
+            conn.execute(
+                """
+                SELECT COALESCE(MAX(event_id), 0)
+                FROM agent_context_events
+                WHERE context_id = ?
+                """,
+                (context_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        latest_eligible_event_id = int(
+            conn.execute(
+                f"""
+                SELECT COALESCE(MAX(event.event_id), 0)
+                FROM agent_context_events AS event
+                WHERE event.context_id = ? AND {target_clause}
+                """,
+                (context_id, *target_params),
+            ).fetchone()[0]
+            or 0
+        )
+        pending_event_count = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM agent_context_events AS event
+                WHERE event.context_id = ?
+                  AND event.event_id > ?
+                  AND {target_clause}
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agent_context_deliveries AS delivery
+                      WHERE delivery.context_id = event.context_id
+                        AND delivery.agent_id = ?
+                        AND delivery.event_id = event.event_id
+                        AND delivery.state IN ('acknowledged', 'dead_letter')
+                  )
+                """,
+                (
+                    context_id,
+                    max(0, int(cursor_event_id)),
+                    *target_params,
+                    agent_id,
+                ),
+            ).fetchone()[0]
+        )
+        acknowledged_delivery_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries
+                WHERE context_id = ?
+                  AND agent_id = ?
+                  AND state = 'acknowledged'
+                """,
+                (context_id, agent_id),
+            ).fetchone()[0]
+        )
+        terminal_delivery_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM agent_context_deliveries
+                WHERE context_id = ?
+                  AND agent_id = ?
+                  AND state IN ('acknowledged', 'dead_letter')
+                """,
+                (context_id, agent_id),
+            ).fetchone()[0]
+        )
+        return {
+            "latest_event_id": latest_event_id,
+            "latest_eligible_event_id": latest_eligible_event_id,
+            "pending_event_count": pending_event_count,
+            "acknowledged_delivery_count": acknowledged_delivery_count,
+            "terminal_delivery_count": terminal_delivery_count,
+        }
+
+    def _ensure_context_cursor(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str,
+        agent_id: str,
+        now: float,
+    ) -> sqlite3.Row:
+        conn.execute(
+            """
+            INSERT INTO agent_context_delivery_cursors (
+                context_id,
+                agent_id,
+                last_contiguous_event_id,
+                updated_at
+            )
+            VALUES (?, ?, 0, ?)
+            ON CONFLICT(context_id, agent_id) DO NOTHING
+            """,
+            (context_id, agent_id, now),
+        )
+        row = conn.execute(
+            """
+            SELECT *
+            FROM agent_context_delivery_cursors
+            WHERE context_id = ? AND agent_id = ?
+            """,
+            (context_id, agent_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"context cursor for {agent_id} was not readable after creation"
+            )
+        return row
+
+    def _advance_context_cursor(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str,
+        agent_id: str,
+        now: float,
+    ) -> dict[str, Any]:
+        cursor_row = self._ensure_context_cursor(
+            conn,
+            context_id=context_id,
+            agent_id=agent_id,
+            now=now,
+        )
+        current_event_id = max(0, int(cursor_row["last_contiguous_event_id"]))
+        next_event_id = self._derived_context_cursor_event_id(
+            conn,
+            context_id=context_id,
+            agent_id=agent_id,
+        )
+        if next_event_id != current_event_id:
+            conn.execute(
+                """
+                UPDATE agent_context_delivery_cursors
+                SET last_contiguous_event_id = ?, updated_at = ?
+                WHERE context_id = ? AND agent_id = ?
+                """,
+                (next_event_id, now, context_id, agent_id),
+            )
+        cursor_row = conn.execute(
+            """
+            SELECT *
+            FROM agent_context_delivery_cursors
+            WHERE context_id = ? AND agent_id = ?
+            """,
+            (context_id, agent_id),
+        ).fetchone()
+        if cursor_row is None:
+            raise RuntimeError(f"context cursor for {agent_id} disappeared")
+        metrics = self._context_delivery_metrics(
+            conn,
+            context_id=context_id,
+            agent_id=agent_id,
+            cursor_event_id=int(cursor_row["last_contiguous_event_id"]),
+        )
+        return self._row_to_context_cursor(cursor_row, **metrics)
+
     def list_context_events(
         self,
         *,
         context_id: str | None = None,
         event_id: int | None = None,
         since_event_id: int = 0,
+        before_event_id: int | None = None,
+        agent_id: str | None = None,
+        consumer_groups: Iterable[str] | None = None,
+        order: str = "asc",
         limit: int = 100,
+        _conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if context_id is not None:
             clauses.append("context_id = ?")
             params.append(str(context_id))
+        normalized_order = str(order or "asc").strip().lower()
+        if normalized_order not in {"asc", "desc"}:
+            raise ValueError("context event order must be asc or desc")
         if event_id is not None:
             clauses.append("event_id = ?")
             params.append(int(event_id))
         else:
             clauses.append("event_id > ?")
             params.append(max(0, int(since_event_id)))
+            if normalized_order == "desc" and before_event_id is not None:
+                clauses.append("event_id < ?")
+                params.append(max(1, int(before_event_id)))
+        if agent_id is not None:
+            target_clause, target_params = self._event_target_clause(
+                event_alias="agent_context_events",
+                agent_id=str(agent_id),
+                consumer_groups=consumer_groups,
+            )
+            clauses.append(target_clause)
+            params.extend(target_params)
         where_sql = "WHERE " + " AND ".join(clauses)
-        bounded_limit = min(max(int(limit), 1), 1000)
+        bounded_limit = min(max(int(limit), 1), 10_000)
         params.append(bounded_limit)
         try:
-            with closing(self._connect()) as conn:
+            with self._read_connection_scope(_conn) as conn:
                 rows = conn.execute(
                     f"""
                     SELECT *
-                    FROM (
-                        SELECT *
-                        FROM agent_context_events
-                        {where_sql}
-                        ORDER BY event_id DESC
-                        LIMIT ?
-                    )
-                    ORDER BY event_id ASC
+                    FROM agent_context_events
+                    {where_sql}
+                    ORDER BY event_id {normalized_order.upper()}
+                    LIMIT ?
                     """,
                     tuple(params),
                 ).fetchall()
@@ -2492,6 +6369,83 @@ class DurableMemoryStore:
                     ).fetchone()
                     event = self._row_to_context_event(row) if row is not None else None
                     if row is not None:
+                        affected_cursor_agents = [
+                            str(cursor_row["agent_id"])
+                            for cursor_row in conn.execute(
+                                """
+                                SELECT agent_id
+                                FROM agent_context_delivery_cursors
+                                WHERE context_id = ?
+                                ORDER BY agent_id
+                                """,
+                                (str(context_id),),
+                            ).fetchall()
+                        ]
+                        active_lease_count = int(
+                            conn.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM agent_context_deliveries
+                                WHERE context_id = ?
+                                  AND event_id = ?
+                                  AND state = 'leased'
+                                  AND lease_expires_at > ?
+                                """,
+                                (str(context_id), bounded_event_id, time.time()),
+                            ).fetchone()[0]
+                        )
+                        if active_lease_count:
+                            raise ValueError(
+                                "context event has active delivery leases; release or wait for expiry before pruning"
+                            )
+                        acknowledged_receipts = conn.execute(
+                            """
+                            SELECT
+                                receipt.receipt_id,
+                                receipt.delivery_id,
+                                receipt.attempt_number,
+                                receipt.acknowledged_at,
+                                delivery.context_id,
+                                delivery.agent_id,
+                                delivery.event_id
+                            FROM agent_context_delivery_receipts AS receipt
+                            JOIN agent_context_deliveries AS delivery
+                              ON delivery.delivery_id = receipt.delivery_id
+                            WHERE delivery.context_id = ?
+                              AND delivery.event_id = ?
+                              AND receipt.state = 'acknowledged'
+                            """,
+                            (str(context_id), bounded_event_id),
+                        ).fetchall()
+                        deleted_at = time.time()
+                        for receipt in acknowledged_receipts:
+                            conn.execute(
+                                """
+                                INSERT OR IGNORE INTO agent_context_delivery_ack_tombstones (
+                                    receipt_digest,
+                                    delivery_id,
+                                    context_id,
+                                    agent_id,
+                                    event_id,
+                                    attempt_number,
+                                    acknowledged_at,
+                                    deleted_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    self._context_delivery_receipt_digest(
+                                        str(receipt["receipt_id"])
+                                    ),
+                                    str(receipt["delivery_id"]),
+                                    str(receipt["context_id"]),
+                                    str(receipt["agent_id"]),
+                                    int(receipt["event_id"]),
+                                    int(receipt["attempt_number"]),
+                                    float(receipt["acknowledged_at"]),
+                                    deleted_at,
+                                ),
+                            )
                         conn.execute(
                             """
                             DELETE FROM agent_context_events
@@ -2499,6 +6453,52 @@ class DurableMemoryStore:
                             """,
                             (str(context_id), bounded_event_id),
                         )
+                        highwater_row = conn.execute(
+                            """
+                            SELECT value_json
+                            FROM store_metadata
+                            WHERE key = 'context_event_targets_reconciled_through'
+                            """
+                        ).fetchone()
+                        try:
+                            target_highwater = int(
+                                json.loads(str(highwater_row["value_json"]))
+                                if highwater_row is not None
+                                else 0
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            target_highwater = 0
+                        latest_event_id = int(
+                            conn.execute(
+                                """
+                                SELECT COALESCE(MAX(event_id), 0)
+                                FROM agent_context_events
+                                """
+                            ).fetchone()[0]
+                            or 0
+                        )
+                        if target_highwater > latest_event_id:
+                            conn.execute(
+                                """
+                                UPDATE store_metadata
+                                SET value_json = ?, updated_at = ?
+                                WHERE key = 'context_event_targets_reconciled_through'
+                                """,
+                                (json.dumps(latest_event_id), deleted_at),
+                            )
+                        # Cursor values are derived from the retained ledger,
+                        # not monotonic external watermarks.  Deleting any
+                        # event can change that derivation even for a consumer
+                        # that never had a delivery row for the pruned event,
+                        # so repair every cursor in the affected namespace in
+                        # the same transaction as the delete.
+                        for cursor_agent_id in affected_cursor_agents:
+                            self._advance_context_cursor(
+                                conn,
+                                context_id=str(context_id),
+                                agent_id=cursor_agent_id,
+                                now=deleted_at,
+                            )
             if event is None:
                 return {
                     "deleted": False,
@@ -2510,11 +6510,860 @@ class DurableMemoryStore:
                 "event_id": bounded_event_id,
                 "event": event,
             }
+        except ValueError:
+            LOGGER.warning(
+                "refused context event deletion context_id=%s event_id=%s",
+                context_id,
+                event_id,
+            )
+            raise
         except Exception:
             LOGGER.exception(
                 "failed to delete context event context_id=%s event_id=%s",
                 context_id,
                 event_id,
+            )
+            raise
+
+    def lease_context_events(
+        self,
+        *,
+        context_id: str,
+        agent_id: str,
+        consumer_instance_id: str,
+        consumer_groups: Iterable[str] | None = None,
+        limit: int = 20,
+        lease_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Lease the oldest eligible context events with durable attempt receipts.
+
+        Delivery is intentionally at-least-once.  A stable ``delivery_id`` is
+        the consumer deduplication key; each retry receives a new opaque
+        ``receipt_id`` that fences acknowledgements from expired attempts.
+        """
+
+        context = str(context_id or "").strip()
+        agent = self._normalize_delivery_agent_id(agent_id)
+        instance = str(consumer_instance_id or "").strip()
+        if not context:
+            raise ValueError("context_id is required for context delivery")
+        if len(context) > 128:
+            raise ValueError("context_id exceeds 128 characters")
+        if not agent:
+            raise ValueError("agent_id is required for context delivery")
+        if not instance:
+            raise ValueError("consumer_instance_id is required for context delivery")
+        if not self._context_delivery_owner_is_valid(instance):
+            raise ValueError(
+                "consumer_instance_id must be 1-256 printable ASCII characters"
+            )
+        bounded_limit = min(max(int(limit), 1), 500)
+        raw_lease_seconds = float(lease_seconds)
+        if not math.isfinite(raw_lease_seconds):
+            raise ValueError("lease_seconds must be finite")
+        bounded_lease_seconds = min(max(raw_lease_seconds, 1.0), 3600.0)
+        current_time = time.time() if now is None else float(now)
+        if not math.isfinite(current_time):
+            raise ValueError("now must be finite")
+        max_delivery_attempts = self._context_delivery_max_attempts()
+
+        try:
+            with closing(self._connect()) as conn:
+                with self._transaction(conn, immediate=True):
+                    self._register_context_consumer(
+                        conn,
+                        agent_id=agent,
+                        consumer_instance_id=instance,
+                        consumer_groups=consumer_groups,
+                        now=current_time,
+                    )
+                    cursor = self._advance_context_cursor(
+                        conn,
+                        context_id=context,
+                        agent_id=agent,
+                        now=current_time,
+                    )
+                    cursor_event_id = int(cursor["last_event_id"])
+                    target_clause, target_params = self._event_target_clause(
+                        event_alias="event",
+                        agent_id=agent,
+                    )
+                    candidate_rows = conn.execute(
+                        f"""
+                        SELECT event.*
+                        FROM agent_context_events AS event
+                        WHERE event.context_id = ?
+                          AND event.event_id > ?
+                          AND {target_clause}
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM agent_context_deliveries AS delivery
+                              WHERE delivery.context_id = event.context_id
+                                AND delivery.agent_id = ?
+                                AND delivery.event_id = event.event_id
+                                AND delivery.state IN (
+                                    'acknowledged',
+                                    'dead_letter'
+                                )
+                          )
+                        ORDER BY event.event_id ASC
+                        LIMIT ?
+                        """,
+                        (
+                            context,
+                            cursor_event_id,
+                            *target_params,
+                            agent,
+                            bounded_limit + 1,
+                        ),
+                    ).fetchall()
+                    has_more = len(candidate_rows) > bounded_limit
+                    deliveries: list[dict[str, Any]] = []
+                    blocking_delivery: dict[str, Any] | None = None
+                    for event_row in candidate_rows[:bounded_limit]:
+                        event_id = int(event_row["event_id"])
+                        delivery_row = conn.execute(
+                            """
+                            SELECT *
+                            FROM agent_context_deliveries
+                            WHERE context_id = ?
+                              AND agent_id = ?
+                              AND event_id = ?
+                            """,
+                            (context, agent, event_id),
+                        ).fetchone()
+                        redelivered = False
+                        if delivery_row is not None:
+                            lease_expires_at = float(delivery_row["lease_expires_at"])
+                            lease_owner = str(delivery_row["lease_owner"])
+                            if lease_expires_at > current_time:
+                                if lease_owner != instance:
+                                    blocking_delivery = {
+                                        "delivery_id": str(delivery_row["delivery_id"]),
+                                        "event_id": event_id,
+                                        "lease_owner": lease_owner,
+                                        "lease_expires_at": lease_expires_at,
+                                    }
+                                    break
+                                receipt_row = conn.execute(
+                                    """
+                                    SELECT *
+                                    FROM agent_context_delivery_receipts
+                                    WHERE receipt_id = ?
+                                    """,
+                                    (str(delivery_row["current_receipt_id"]),),
+                                ).fetchone()
+                                if (
+                                    receipt_row is None
+                                    or str(receipt_row["state"]) != "leased"
+                                    or str(receipt_row["delivery_id"])
+                                    != str(delivery_row["delivery_id"])
+                                    or int(receipt_row["attempt_number"])
+                                    != int(delivery_row["attempt_count"])
+                                    or str(receipt_row["consumer_instance_id"])
+                                    != lease_owner
+                                    or not math.isclose(
+                                        float(receipt_row["lease_expires_at"]),
+                                        lease_expires_at,
+                                        rel_tol=0.0,
+                                        abs_tol=0.000001,
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "active context delivery receipt failed "
+                                        "integrity validation"
+                                    )
+                                deliveries.append(
+                                    self._context_delivery_payload(
+                                        delivery_row,
+                                        receipt_row,
+                                        event_row,
+                                        redelivered=False,
+                                    )
+                                )
+                                continue
+                            conn.execute(
+                                """
+                                UPDATE agent_context_delivery_receipts
+                                SET state = 'expired', updated_at = ?
+                                WHERE receipt_id = ? AND state = 'leased'
+                                """,
+                                (current_time, str(delivery_row["current_receipt_id"])),
+                            )
+                            delivery_id = str(delivery_row["delivery_id"])
+                            prior_attempt_count = int(delivery_row["attempt_count"])
+                            if prior_attempt_count >= max_delivery_attempts:
+                                blocking_delivery = {
+                                    "delivery_id": delivery_id,
+                                    "event_id": event_id,
+                                    "attempt_count": prior_attempt_count,
+                                    "max_delivery_attempts": max_delivery_attempts,
+                                    "reason": "retry-exhausted",
+                                    "requires_governed_dead_letter": True,
+                                }
+                                break
+                            attempt_count = prior_attempt_count + 1
+                            redelivered = True
+                        else:
+                            delivery_id = "ctxdel_" + uuid.uuid4().hex
+                            attempt_count = 1
+
+                        receipt_id = "ctxrcpt_" + secrets.token_urlsafe(32)
+                        lease_expires_at = current_time + bounded_lease_seconds
+                        if delivery_row is None:
+                            conn.execute(
+                                """
+                                INSERT INTO agent_context_deliveries (
+                                    delivery_id,
+                                    context_id,
+                                    agent_id,
+                                    event_id,
+                                    state,
+                                    attempt_count,
+                                    current_receipt_id,
+                                    lease_owner,
+                                    first_delivered_at,
+                                    last_delivered_at,
+                                    lease_expires_at,
+                                    acknowledged_at,
+                                    cancelled_at,
+                                    created_at,
+                                    updated_at
+                                )
+                                VALUES (?, ?, ?, ?, 'leased', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                                """,
+                                (
+                                    delivery_id,
+                                    context,
+                                    agent,
+                                    event_id,
+                                    attempt_count,
+                                    receipt_id,
+                                    instance,
+                                    current_time,
+                                    current_time,
+                                    lease_expires_at,
+                                    current_time,
+                                    current_time,
+                                ),
+                            )
+                        else:
+                            conn.execute(
+                                """
+                                UPDATE agent_context_deliveries
+                                SET state = 'leased',
+                                    attempt_count = ?,
+                                    current_receipt_id = ?,
+                                    lease_owner = ?,
+                                    last_delivered_at = ?,
+                                    lease_expires_at = ?,
+                                    acknowledged_at = NULL,
+                                    updated_at = ?
+                                WHERE delivery_id = ?
+                                """,
+                                (
+                                    attempt_count,
+                                    receipt_id,
+                                    instance,
+                                    current_time,
+                                    lease_expires_at,
+                                    current_time,
+                                    delivery_id,
+                                ),
+                            )
+                        conn.execute(
+                            """
+                            INSERT INTO agent_context_delivery_receipts (
+                                receipt_id,
+                                delivery_id,
+                                attempt_number,
+                                consumer_instance_id,
+                                state,
+                                leased_at,
+                                lease_expires_at,
+                                acknowledged_at,
+                                released_at,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES (?, ?, ?, ?, 'leased', ?, ?, NULL, NULL, ?, ?)
+                            """,
+                            (
+                                receipt_id,
+                                delivery_id,
+                                attempt_count,
+                                instance,
+                                current_time,
+                                lease_expires_at,
+                                current_time,
+                                current_time,
+                            ),
+                        )
+                        delivery_row = conn.execute(
+                            "SELECT * FROM agent_context_deliveries WHERE delivery_id = ?",
+                            (delivery_id,),
+                        ).fetchone()
+                        receipt_row = conn.execute(
+                            """
+                            SELECT * FROM agent_context_delivery_receipts
+                            WHERE receipt_id = ?
+                            """,
+                            (receipt_id,),
+                        ).fetchone()
+                        if delivery_row is None or receipt_row is None:
+                            raise RuntimeError("context delivery was not readable after lease")
+                        deliveries.append(
+                            self._context_delivery_payload(
+                                delivery_row,
+                                receipt_row,
+                                event_row,
+                                redelivered=redelivered,
+                            )
+                        )
+                    cursor = self._advance_context_cursor(
+                        conn,
+                        context_id=context,
+                        agent_id=agent,
+                        now=current_time,
+                    )
+
+            events: list[dict[str, Any]] = []
+            for delivery in deliveries:
+                event_payload = dict(delivery["event"])
+                event_payload["delivery"] = {
+                    key: value
+                    for key, value in delivery.items()
+                    if key != "event"
+                }
+                events.append(event_payload)
+            return {
+                "protocol_version": "context-delivery.v2",
+                "delivery_mode": "leased-at-least-once",
+                "context_id": context,
+                "agent_id": agent,
+                "consumer_instance_id": instance,
+                "lease_seconds": bounded_lease_seconds,
+                "max_delivery_attempts": max_delivery_attempts,
+                "delivery_count": len(deliveries),
+                "deliveries": deliveries,
+                "events": events,
+                "ack_required": bool(deliveries),
+                "has_more": bool(has_more or blocking_delivery),
+                "blocking_delivery": blocking_delivery,
+                "cursor": cursor,
+                "remaining_pending_count": int(cursor["pending_event_count"]),
+            }
+        except Exception:
+            LOGGER.exception(
+                "failed to lease context events context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
+            )
+            raise
+
+    def acknowledge_context_deliveries(
+        self,
+        *,
+        context_id: str,
+        agent_id: str,
+        acknowledgements: Iterable[dict[str, Any]],
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        context = str(context_id or "").strip()
+        agent = self._normalize_delivery_agent_id(agent_id)
+        if not context or not agent:
+            raise ValueError("context_id and agent_id are required for acknowledgement")
+        current_time = time.time() if now is None else float(now)
+        if not math.isfinite(current_time):
+            raise ValueError("now must be finite")
+        requested: list[str] = []
+        seen: set[str] = set()
+        for raw_ack in acknowledgements:
+            if not isinstance(raw_ack, dict):
+                raise ValueError("each acknowledgement must be an object")
+            receipt_id = str(
+                raw_ack.get("receipt_id")
+                or raw_ack.get("lease_token")
+                or ""
+            ).strip()
+            if not receipt_id:
+                raise ValueError("receipt_id is required for acknowledgement")
+            if receipt_id in seen:
+                continue
+            seen.add(receipt_id)
+            requested.append(receipt_id)
+            if len(requested) > 500:
+                raise ValueError("at most 500 delivery receipts may be acknowledged")
+        if any(
+            not self._context_delivery_receipt_id_is_valid(receipt_id)
+            for receipt_id in requested
+        ):
+            raise ValueError("receipt_id has an invalid context delivery format")
+
+        try:
+            with closing(self._connect()) as conn:
+                with self._transaction(conn, immediate=True):
+                    consumer_row = conn.execute(
+                        "SELECT enabled FROM agent_context_consumers WHERE agent_id = ?",
+                        (agent,),
+                    ).fetchone()
+                    if consumer_row is None or not bool(consumer_row["enabled"]):
+                        raise ValueError(f"unknown or disabled context consumer {agent!r}")
+                    acknowledged: list[dict[str, Any]] = []
+                    for receipt_id in requested:
+                        row = conn.execute(
+                            """
+                            SELECT
+                                receipt.*,
+                                delivery.context_id,
+                                delivery.agent_id,
+                                delivery.event_id,
+                                delivery.state AS delivery_state,
+                                delivery.current_receipt_id
+                            FROM agent_context_delivery_receipts AS receipt
+                            JOIN agent_context_deliveries AS delivery
+                              ON delivery.delivery_id = receipt.delivery_id
+                            WHERE receipt.receipt_id = ?
+                            """,
+                            (receipt_id,),
+                        ).fetchone()
+                        if row is None:
+                            tombstone = conn.execute(
+                                """
+                                SELECT *
+                                FROM agent_context_delivery_ack_tombstones
+                                WHERE receipt_digest = ?
+                                """,
+                                (self._context_delivery_receipt_digest(receipt_id),),
+                            ).fetchone()
+                            if tombstone is None:
+                                raise ValueError("unknown context delivery receipt")
+                            if (
+                                str(tombstone["context_id"]) != context
+                                or str(tombstone["agent_id"]) != agent
+                            ):
+                                raise ValueError(
+                                    "delivery receipt does not belong to the supplied context and agent"
+                                )
+                            acknowledged.append(
+                                {
+                                    "receipt_id": receipt_id,
+                                    "delivery_id": str(tombstone["delivery_id"]),
+                                    "event_id": int(tombstone["event_id"]),
+                                    "attempt_count": int(tombstone["attempt_number"]),
+                                    "acknowledged_at": float(
+                                        tombstone["acknowledged_at"]
+                                    ),
+                                    "idempotent": True,
+                                    "event_deleted": True,
+                                }
+                            )
+                            continue
+                        if str(row["context_id"]) != context or str(row["agent_id"]) != agent:
+                            raise ValueError(
+                                "delivery receipt does not belong to the supplied context and agent"
+                            )
+                        receipt_state = str(row["state"])
+                        delivery_state = str(row["delivery_state"])
+                        if receipt_state == "acknowledged" and delivery_state == "acknowledged":
+                            acknowledged.append(
+                                {
+                                    "receipt_id": receipt_id,
+                                    "delivery_id": str(row["delivery_id"]),
+                                    "event_id": int(row["event_id"]),
+                                    "attempt_count": int(row["attempt_number"]),
+                                    "acknowledged_at": float(row["acknowledged_at"]),
+                                    "idempotent": True,
+                                }
+                            )
+                            continue
+                        if receipt_state != "leased" or delivery_state != "leased":
+                            raise ValueError(
+                                "context delivery receipt is stale, expired, or no longer acknowledgeable"
+                            )
+                        if float(row["lease_expires_at"]) <= current_time:
+                            conn.execute(
+                                """
+                                UPDATE agent_context_delivery_receipts
+                                SET state = 'expired', updated_at = ?
+                                WHERE receipt_id = ? AND state = 'leased'
+                                """,
+                                (current_time, receipt_id),
+                            )
+                            raise ValueError(
+                                "context delivery receipt lease has expired"
+                            )
+                        if str(row["current_receipt_id"]) != receipt_id:
+                            raise ValueError(
+                                "context delivery receipt was superseded by a retry"
+                            )
+                        conn.execute(
+                            """
+                            UPDATE agent_context_delivery_receipts
+                            SET state = 'acknowledged',
+                                acknowledged_at = ?,
+                                updated_at = ?
+                            WHERE receipt_id = ?
+                            """,
+                            (current_time, current_time, receipt_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE agent_context_deliveries
+                            SET state = 'acknowledged',
+                                acknowledged_at = ?,
+                                updated_at = ?
+                            WHERE delivery_id = ?
+                            """,
+                            (current_time, current_time, str(row["delivery_id"])),
+                        )
+                        acknowledged.append(
+                            {
+                                "receipt_id": receipt_id,
+                                "delivery_id": str(row["delivery_id"]),
+                                "event_id": int(row["event_id"]),
+                                "attempt_count": int(row["attempt_number"]),
+                                "acknowledged_at": current_time,
+                                "idempotent": False,
+                            }
+                        )
+                    cursor = self._advance_context_cursor(
+                        conn,
+                        context_id=context,
+                        agent_id=agent,
+                        now=current_time,
+                    )
+            return {
+                "protocol_version": "context-delivery.v2",
+                "delivery_mode": "leased-at-least-once",
+                "context_id": context,
+                "agent_id": agent,
+                "acknowledged_count": len(acknowledged),
+                "acknowledged": acknowledged,
+                "rejected": [],
+                "cursor": cursor,
+            }
+        except ValueError:
+            LOGGER.warning(
+                "refused context delivery acknowledgement context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "failed to acknowledge context deliveries context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
+            )
+            raise
+
+    def release_context_deliveries(
+        self,
+        *,
+        context_id: str,
+        agent_id: str,
+        consumer_instance_id: str,
+        receipt_ids: Iterable[str],
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        context = str(context_id or "").strip()
+        agent = self._normalize_delivery_agent_id(agent_id)
+        instance = str(consumer_instance_id or "").strip()
+        current_time = time.time() if now is None else float(now)
+        if not math.isfinite(current_time):
+            raise ValueError("now must be finite")
+        requested: list[str] = []
+        seen: set[str] = set()
+        for raw_receipt_id in receipt_ids:
+            receipt_id = str(raw_receipt_id or "").strip()
+            if not receipt_id:
+                raise ValueError("receipt_ids must not contain empty values")
+            if receipt_id in seen:
+                continue
+            seen.add(receipt_id)
+            requested.append(receipt_id)
+            if len(requested) > 500:
+                raise ValueError("at most 500 delivery receipts may be released")
+        if not context or not agent or not instance or not requested:
+            raise ValueError(
+                "context_id, agent_id, consumer_instance_id, and receipt_ids are required"
+            )
+        if len(context) > 128:
+            raise ValueError("context_id exceeds 128 characters")
+        if not self._context_delivery_owner_is_valid(instance):
+            raise ValueError(
+                "consumer_instance_id must be 1-256 printable ASCII characters"
+            )
+        if any(
+            not self._context_delivery_receipt_id_is_valid(receipt_id)
+            for receipt_id in requested
+        ):
+            raise ValueError("receipt_id has an invalid context delivery format")
+        try:
+            with closing(self._connect()) as conn:
+                with self._transaction(conn, immediate=True):
+                    released: list[str] = []
+                    for receipt_id in requested:
+                        row = conn.execute(
+                            """
+                            SELECT receipt.*, delivery.context_id, delivery.agent_id,
+                                   delivery.current_receipt_id, delivery.state AS delivery_state
+                            FROM agent_context_delivery_receipts AS receipt
+                            JOIN agent_context_deliveries AS delivery
+                              ON delivery.delivery_id = receipt.delivery_id
+                            WHERE receipt.receipt_id = ?
+                            """,
+                            (receipt_id,),
+                        ).fetchone()
+                        if row is None:
+                            raise ValueError("unknown context delivery receipt")
+                        if (
+                            str(row["context_id"]) != context
+                            or str(row["agent_id"]) != agent
+                            or str(row["consumer_instance_id"]) != instance
+                            or str(row["current_receipt_id"]) != receipt_id
+                            or str(row["state"]) != "leased"
+                            or str(row["delivery_state"]) != "leased"
+                            or float(row["lease_expires_at"]) <= current_time
+                        ):
+                            raise ValueError(
+                                "context delivery receipt is not releasable by this consumer"
+                            )
+                        conn.execute(
+                            """
+                            UPDATE agent_context_delivery_receipts
+                            SET state = 'released', released_at = ?, updated_at = ?
+                            WHERE receipt_id = ?
+                            """,
+                            (current_time, current_time, receipt_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE agent_context_deliveries
+                            SET lease_expires_at = ?, updated_at = ?
+                            WHERE delivery_id = ?
+                            """,
+                            (current_time, current_time, str(row["delivery_id"])),
+                        )
+                        released.append(receipt_id)
+            return {
+                "protocol_version": "context-delivery.v2",
+                "context_id": context,
+                "agent_id": agent,
+                "released_count": len(released),
+                "released_receipt_ids": released,
+            }
+        except ValueError:
+            LOGGER.warning(
+                "refused context delivery release context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "failed to release context deliveries context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
+            )
+            raise
+
+    def dead_letter_context_delivery(
+        self,
+        *,
+        context_id: str,
+        agent_id: str,
+        delivery_id: str,
+        reason: str,
+        confirm: bool = False,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Governedly quarantine a retry-exhausted delivery with an audit receipt."""
+
+        context = str(context_id or "").strip()
+        agent = self._normalize_delivery_agent_id(agent_id)
+        delivery_key = str(delivery_id or "").strip()
+        rationale = str(reason or "").strip()[:2000]
+        if not confirm:
+            raise ValueError("dead-letter quarantine requires confirm=True")
+        if not context or not agent or not delivery_key or not rationale:
+            raise ValueError(
+                "context_id, agent_id, delivery_id, and reason are required"
+            )
+        current_time = time.time() if now is None else float(now)
+        if not math.isfinite(current_time):
+            raise ValueError("now must be finite")
+        max_delivery_attempts = self._context_delivery_max_attempts()
+        try:
+            with closing(self._connect()) as conn:
+                with self._transaction(conn, immediate=True):
+                    row = conn.execute(
+                        """
+                        SELECT delivery.*, receipt.state AS receipt_state,
+                               receipt.lease_expires_at AS receipt_lease_expires_at
+                        FROM agent_context_deliveries AS delivery
+                        JOIN agent_context_delivery_receipts AS receipt
+                          ON receipt.receipt_id = delivery.current_receipt_id
+                         AND receipt.delivery_id = delivery.delivery_id
+                        WHERE delivery.delivery_id = ?
+                        """,
+                        (delivery_key,),
+                    ).fetchone()
+                    if row is None:
+                        raise ValueError(
+                            f"unknown context delivery {delivery_key!r}"
+                        )
+                    if (
+                        str(row["context_id"]) != context
+                        or str(row["agent_id"]) != agent
+                    ):
+                        raise ValueError(
+                            "delivery does not belong to the supplied context and agent"
+                        )
+                    if str(row["state"]) == "dead_letter":
+                        audit = conn.execute(
+                            """
+                            SELECT operation_id, created_at
+                            FROM store_maintenance_receipts
+                            WHERE operation_type = 'context-delivery-dead-letter'
+                              AND context_id = ?
+                              AND before_revision = ?
+                              AND after_revision = 'dead_letter'
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            (context, delivery_key),
+                        ).fetchone()
+                        if audit is None:
+                            raise RuntimeError(
+                                "dead-letter delivery is missing its governance audit"
+                            )
+                        cursor = self._advance_context_cursor(
+                            conn,
+                            context_id=context,
+                            agent_id=agent,
+                            now=current_time,
+                        )
+                        return {
+                            "protocol_version": "context-delivery.v2",
+                            "action": "context-delivery-dead-letter",
+                            "context_id": context,
+                            "agent_id": agent,
+                            "delivery_id": delivery_key,
+                            "event_id": int(row["event_id"]),
+                            "attempt_count": int(row["attempt_count"]),
+                            "operation_id": str(audit["operation_id"]),
+                            "dead_lettered_at": float(audit["created_at"]),
+                            "idempotent": True,
+                            "cursor": cursor,
+                        }
+                    if str(row["state"]) != "leased":
+                        raise ValueError("only a leased retry history can be dead-lettered")
+                    attempt_count = int(row["attempt_count"])
+                    if attempt_count < max_delivery_attempts:
+                        raise ValueError(
+                            "delivery has not exhausted the configured retry budget "
+                            f"({attempt_count}/{max_delivery_attempts})"
+                        )
+                    if (
+                        str(row["receipt_state"]) == "leased"
+                        and float(row["receipt_lease_expires_at"]) > current_time
+                    ):
+                        raise ValueError(
+                            "delivery still has an active lease; release it or wait for expiry"
+                        )
+                    if str(row["receipt_state"]) not in {
+                        "leased",
+                        "expired",
+                        "released",
+                    }:
+                        raise ValueError(
+                            "current delivery receipt is not quarantineable"
+                        )
+
+                    receipt_id = str(row["current_receipt_id"])
+                    conn.execute(
+                        """
+                        UPDATE agent_context_delivery_receipts
+                        SET state = 'cancelled', updated_at = ?
+                        WHERE receipt_id = ?
+                        """,
+                        (current_time, receipt_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE agent_context_deliveries
+                        SET state = 'dead_letter', cancelled_at = ?, updated_at = ?
+                        WHERE delivery_id = ?
+                        """,
+                        (current_time, current_time, delivery_key),
+                    )
+                    operation_id = "s2maint_" + uuid.uuid4().hex
+                    conn.execute(
+                        """
+                        INSERT INTO store_maintenance_receipts (
+                            operation_id, operation_type, context_id,
+                            before_revision, after_revision, payload_json,
+                            created_at
+                        ) VALUES (?, 'context-delivery-dead-letter', ?, ?,
+                                  'dead_letter', ?, ?)
+                        """,
+                        (
+                            operation_id,
+                            context,
+                            delivery_key,
+                            _json_dumps(
+                                {
+                                    "agent_id": agent,
+                                    "event_id": int(row["event_id"]),
+                                    "attempt_count": attempt_count,
+                                    "max_delivery_attempts": max_delivery_attempts,
+                                    "reason": rationale,
+                                    "receipt_digest": (
+                                        self._context_delivery_receipt_digest(
+                                            receipt_id
+                                        )
+                                    ),
+                                }
+                            ),
+                            current_time,
+                        ),
+                    )
+                    cursor = self._advance_context_cursor(
+                        conn,
+                        context_id=context,
+                        agent_id=agent,
+                        now=current_time,
+                    )
+            return {
+                "protocol_version": "context-delivery.v2",
+                "action": "context-delivery-dead-letter",
+                "context_id": context,
+                "agent_id": agent,
+                "delivery_id": delivery_key,
+                "event_id": int(row["event_id"]),
+                "attempt_count": attempt_count,
+                "max_delivery_attempts": max_delivery_attempts,
+                "operation_id": operation_id,
+                "dead_lettered_at": current_time,
+                "reason": rationale,
+                "idempotent": False,
+                "cursor": cursor,
+            }
+        except ValueError:
+            LOGGER.warning(
+                "refused context delivery dead-letter context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "failed to dead-letter context delivery context_id=%s agent_id=%s",
+                context_id,
+                agent_id,
             )
             raise
 
@@ -2525,78 +7374,21 @@ class DurableMemoryStore:
         agent_id: str,
         last_event_id: int,
     ) -> dict[str, Any]:
-        context = str(context_id)
-        agent = str(agent_id or "").strip() or "unknown-agent"
-        requested_event_id = max(0, int(last_event_id))
-        try:
-            with closing(self._connect()) as conn:
-                with self._transaction(conn, immediate=True):
-                    latest_event_id = int(
-                        conn.execute(
-                            """
-                            SELECT COALESCE(MAX(event_id), 0)
-                            FROM agent_context_events
-                            WHERE context_id = ?
-                            """,
-                            (context,),
-                        ).fetchone()[0]
-                        or 0
-                    )
-                    bounded_event_id = min(requested_event_id, latest_event_id)
-                    now = time.time()
-                    conn.execute(
-                        """
-                        INSERT INTO agent_context_cursors (
-                            context_id,
-                            agent_id,
-                            last_event_id,
-                            updated_at
-                        )
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(context_id, agent_id) DO UPDATE SET
-                            last_event_id = MAX(
-                                agent_context_cursors.last_event_id,
-                                excluded.last_event_id
-                            ),
-                            updated_at = excluded.updated_at
-                        """,
-                        (context, agent, bounded_event_id, now),
-                    )
-                    cursor_row = conn.execute(
-                        """
-                        SELECT *
-                        FROM agent_context_cursors
-                        WHERE context_id = ? AND agent_id = ?
-                        """,
-                        (context, agent),
-                    ).fetchone()
-                    cursor_event_id = int(
-                        cursor_row["last_event_id"] if cursor_row is not None else 0
-                    )
-                    pending_event_count = int(
-                        conn.execute(
-                            """
-                            SELECT COUNT(*)
-                            FROM agent_context_events
-                            WHERE context_id = ? AND event_id > ?
-                            """,
-                            (context, cursor_event_id),
-                        ).fetchone()[0]
-                    )
-            if cursor_row is None:
-                raise RuntimeError(f"context cursor for {agent} was not readable after ack")
-            return self._row_to_context_cursor(
-                cursor_row,
-                latest_event_id=latest_event_id,
-                pending_event_count=pending_event_count,
-            )
-        except Exception:
-            LOGGER.exception(
-                "failed to acknowledge context events context_id=%s agent_id=%s",
-                context_id,
-                agent_id,
-            )
-            raise
+        # Deliberately reject every cursor-only acknowledgement, including zero
+        # and already-advanced watermarks.  Returning an idempotent success here
+        # would let callers mistake observation state for proof that an exact
+        # leased delivery was durably processed.
+        str(context_id)
+        self._normalize_delivery_agent_id(agent_id)
+        int(last_event_id)
+        LOGGER.warning(
+            "refused legacy context watermark acknowledgement context_id=%s agent_id=%s",
+            context_id,
+            agent_id,
+        )
+        raise ValueError(
+            "legacy watermark acknowledgement is disabled; lease events and acknowledge exact receipt_id values"
+        )
 
     def list_context_cursors(
         self,
@@ -2604,6 +7396,7 @@ class DurableMemoryStore:
         context_id: str | None = None,
         agent_id: str | None = None,
         limit: int = 100,
+        _conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -2612,17 +7405,19 @@ class DurableMemoryStore:
             params.append(str(context_id))
         if agent_id is not None:
             clauses.append("agent_id = ?")
-            params.append(str(agent_id))
+            params.append(self._normalize_delivery_agent_id(agent_id))
         where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
-        bounded_limit = min(max(int(limit), 1), 1000)
+        bounded_limit = min(max(int(limit), 1), 10_000)
         params.append(bounded_limit)
         try:
-            with closing(self._connect()) as conn:
-                conn.execute("BEGIN")
+            owns_transaction = _conn is None
+            with self._read_connection_scope(_conn) as conn:
+                if owns_transaction:
+                    conn.execute("BEGIN")
                 rows = conn.execute(
                     f"""
                     SELECT *
-                    FROM agent_context_cursors
+                    FROM agent_context_delivery_cursors
                     {where_sql}
                     ORDER BY updated_at DESC, context_id ASC, agent_id ASC
                     LIMIT ?
@@ -2632,48 +7427,562 @@ class DurableMemoryStore:
                 cursors = []
                 for row in rows:
                     context = str(row["context_id"])
-                    latest_event_id = int(
-                        conn.execute(
-                            """
-                            SELECT COALESCE(MAX(event_id), 0)
-                            FROM agent_context_events
-                            WHERE context_id = ?
-                            """,
-                            (context,),
-                        ).fetchone()[0]
-                        or 0
-                    )
-                    pending_event_count = int(
-                        conn.execute(
-                            """
-                            SELECT COUNT(*)
-                            FROM agent_context_events
-                            WHERE context_id = ? AND event_id > ?
-                            """,
-                            (context, int(row["last_event_id"])),
-                        ).fetchone()[0]
+                    metrics = self._context_delivery_metrics(
+                        conn,
+                        context_id=context,
+                        agent_id=str(row["agent_id"]),
+                        cursor_event_id=int(row["last_contiguous_event_id"]),
                     )
                     cursors.append(
                         self._row_to_context_cursor(
                             row,
-                            latest_event_id=latest_event_id,
-                            pending_event_count=pending_event_count,
+                            **metrics,
                         )
                     )
-                conn.commit()
+                if owns_transaction:
+                    conn.commit()
             return cursors
         except Exception:
             LOGGER.exception("failed to list context cursors")
             raise
 
-    def stats(self, *, context_id: str | None = None) -> dict[str, Any]:
+    def list_context_deliveries(
+        self,
+        *,
+        context_id: str | None = None,
+        agent_id: str | None = None,
+        limit: int = 1000,
+        _conn: sqlite3.Connection | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            clauses.append("context_id = ?")
+            params.append(str(context_id))
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(self._normalize_delivery_agent_id(agent_id))
+        where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(min(max(int(limit), 1), 10_000))
+        with self._read_connection_scope(_conn) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM agent_context_deliveries
+                {where_sql}
+                ORDER BY event_id ASC, agent_id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "delivery_id": str(row["delivery_id"]),
+                "context_id": str(row["context_id"]),
+                "agent_id": str(row["agent_id"]),
+                "event_id": int(row["event_id"]),
+                "state": str(row["state"]),
+                "attempt_count": int(row["attempt_count"]),
+                "current_receipt_id": str(row["current_receipt_id"]),
+                "lease_owner": str(row["lease_owner"]),
+                "first_delivered_at": float(row["first_delivered_at"]),
+                "last_delivered_at": float(row["last_delivered_at"]),
+                "lease_expires_at": float(row["lease_expires_at"]),
+                "acknowledged_at": (
+                    None
+                    if row["acknowledged_at"] is None
+                    else float(row["acknowledged_at"])
+                ),
+                "cancelled_at": (
+                    None
+                    if row["cancelled_at"] is None
+                    else float(row["cancelled_at"])
+                ),
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def list_context_delivery_receipts(
+        self,
+        *,
+        context_id: str | None = None,
+        agent_id: str | None = None,
+        limit: int = 1000,
+        _conn: sqlite3.Connection | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            clauses.append("delivery.context_id = ?")
+            params.append(str(context_id))
+        if agent_id is not None:
+            clauses.append("delivery.agent_id = ?")
+            params.append(self._normalize_delivery_agent_id(agent_id))
+        where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(min(max(int(limit), 1), 10_000))
+        with self._read_connection_scope(_conn) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT receipt.*, delivery.context_id, delivery.agent_id,
+                       delivery.event_id
+                FROM agent_context_delivery_receipts AS receipt
+                JOIN agent_context_deliveries AS delivery
+                  ON delivery.delivery_id = receipt.delivery_id
+                {where_sql}
+                ORDER BY delivery.event_id ASC, receipt.attempt_number ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "receipt_id": str(row["receipt_id"]),
+                "delivery_id": str(row["delivery_id"]),
+                "context_id": str(row["context_id"]),
+                "agent_id": str(row["agent_id"]),
+                "event_id": int(row["event_id"]),
+                "attempt_number": int(row["attempt_number"]),
+                "consumer_instance_id": str(row["consumer_instance_id"]),
+                "state": str(row["state"]),
+                "leased_at": float(row["leased_at"]),
+                "lease_expires_at": float(row["lease_expires_at"]),
+                "acknowledged_at": (
+                    None
+                    if row["acknowledged_at"] is None
+                    else float(row["acknowledged_at"])
+                ),
+                "released_at": (
+                    None
+                    if row["released_at"] is None
+                    else float(row["released_at"])
+                ),
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def list_context_delivery_ack_tombstones(
+        self,
+        *,
+        context_id: str | None = None,
+        agent_id: str | None = None,
+        limit: int = 1000,
+        _conn: sqlite3.Connection | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return deletion-safe ACK evidence without exposing receipt secrets."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context_id is not None:
+            clauses.append("context_id = ?")
+            params.append(str(context_id))
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(self._normalize_delivery_agent_id(agent_id))
+        where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(min(max(int(limit), 1), 10_000))
+        with self._read_connection_scope(_conn) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT receipt_digest, delivery_id, context_id, agent_id,
+                       event_id, attempt_number, acknowledged_at, deleted_at
+                FROM agent_context_delivery_ack_tombstones
+                {where_sql}
+                ORDER BY deleted_at ASC, receipt_digest ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "receipt_digest": str(row["receipt_digest"]),
+                "digest_algorithm": "sha256-domain-separated-v1",
+                "delivery_id": str(row["delivery_id"]),
+                "context_id": str(row["context_id"]),
+                "agent_id": str(row["agent_id"]),
+                "event_id": int(row["event_id"]),
+                "attempt_number": int(row["attempt_number"]),
+                "acknowledged_at": float(row["acknowledged_at"]),
+                "deleted_at": float(row["deleted_at"]),
+            }
+            for row in rows
+        ]
+
+    def context_delivery_health(
+        self,
+        *,
+        context_id: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        current_time = time.time() if now is None else float(now)
+        if not math.isfinite(current_time):
+            raise ValueError("now must be finite")
+        event_filter = "" if context_id is None else "WHERE event.context_id = ?"
+        delivery_filter = "" if context_id is None else "WHERE delivery.context_id = ?"
+        event_params: tuple[Any, ...] = () if context_id is None else (str(context_id),)
+        delivery_params: tuple[Any, ...] = (
+            () if context_id is None else (str(context_id),)
+        )
+        with closing(self._connect_read_only()) as conn:
+            conn.execute("BEGIN")
+            unrouted_event_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_events AS event
+                    {event_filter}
+                    {"AND" if event_filter else "WHERE"} NOT EXISTS (
+                        SELECT 1
+                        FROM agent_context_event_targets AS target
+                        WHERE target.event_id = event.event_id
+                    )
+                    """,
+                    event_params,
+                ).fetchone()[0]
+            )
+            (
+                target_integrity_error_count,
+                target_integrity_error_samples,
+                noncanonical_target_count,
+                noncanonical_target_samples,
+            ) = self._context_event_target_integrity_audit(
+                conn,
+                context_id=context_id,
+            )
+            (
+                event_ledger_integrity_error_count,
+                event_ledger_integrity_error_samples,
+            ) = self._context_event_ledger_integrity_audit(
+                conn,
+                context_id=context_id,
+            )
+            (
+                consumer_group_integrity_error_count,
+                consumer_group_integrity_error_samples,
+            ) = self._context_consumer_group_integrity_audit(conn)
+            (
+                target_reconciliation_highwater_error_count,
+                target_reconciliation_highwater_error_samples,
+            ) = self._context_event_target_highwater_audit(conn)
+            missing_current_receipt_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    {delivery_filter}
+                    {"AND" if delivery_filter else "WHERE"} NOT EXISTS (
+                        SELECT 1
+                        FROM agent_context_delivery_receipts AS receipt
+                        WHERE receipt.receipt_id = delivery.current_receipt_id
+                          AND receipt.delivery_id = delivery.delivery_id
+                          AND receipt.attempt_number = delivery.attempt_count
+                    )
+                    """,
+                    delivery_params,
+                ).fetchone()[0]
+            )
+            acknowledgement_mismatch_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    {delivery_filter}
+                    {"AND" if delivery_filter else "WHERE"} delivery.state = 'acknowledged'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM agent_context_delivery_receipts AS receipt
+                          WHERE receipt.receipt_id = delivery.current_receipt_id
+                            AND receipt.delivery_id = delivery.delivery_id
+                            AND receipt.state = 'acknowledged'
+                      )
+                    """,
+                    delivery_params,
+                ).fetchone()[0]
+            )
+            delivery_receipt_state_mismatch_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    JOIN agent_context_delivery_receipts AS receipt
+                      ON receipt.receipt_id = delivery.current_receipt_id
+                    {delivery_filter}
+                    {"AND" if delivery_filter else "WHERE"} NOT (
+                        (
+                            delivery.state = 'acknowledged'
+                            AND receipt.state = 'acknowledged'
+                            AND delivery.acknowledged_at IS NOT NULL
+                            AND receipt.acknowledged_at IS NOT NULL
+                        )
+                        OR (
+                            delivery.state = 'leased'
+                            AND (
+                                (
+                                    receipt.state = 'leased'
+                                    AND receipt.consumer_instance_id = delivery.lease_owner
+                                    AND ABS(
+                                        receipt.lease_expires_at - delivery.lease_expires_at
+                                    ) < 0.000001
+                                )
+                                OR (
+                                    receipt.state IN ('expired', 'released')
+                                    AND delivery.lease_expires_at <= receipt.lease_expires_at
+                                )
+                            )
+                        )
+                        OR (
+                            delivery.state = 'dead_letter'
+                            AND receipt.state = 'cancelled'
+                        )
+                    )
+                    """,
+                    delivery_params,
+                ).fetchone()[0]
+            )
+            event_context_mismatch_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    LEFT JOIN agent_context_events AS event
+                      ON event.event_id = delivery.event_id
+                     AND event.context_id = delivery.context_id
+                    {delivery_filter}
+                    {"AND" if delivery_filter else "WHERE"} event.event_id IS NULL
+                    """,
+                    delivery_params,
+                ).fetchone()[0]
+            )
+            expired_active_lease_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    {delivery_filter}
+                    {"AND" if delivery_filter else "WHERE"} delivery.state = 'leased'
+                      AND delivery.attempt_count < ?
+                      AND delivery.lease_expires_at <= ?
+                    """,
+                    (
+                        *delivery_params,
+                        self._context_delivery_max_attempts(),
+                        current_time,
+                    ),
+                ).fetchone()[0]
+            )
+            max_delivery_attempts = self._context_delivery_max_attempts()
+            retry_exhausted_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    {delivery_filter}
+                    {"AND" if delivery_filter else "WHERE"}
+                        delivery.state = 'leased'
+                      AND delivery.attempt_count >= ?
+                      AND delivery.lease_expires_at <= ?
+                    """,
+                    (*delivery_params, max_delivery_attempts, current_time),
+                ).fetchone()[0]
+            )
+            dead_letter_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    {delivery_filter}
+                    {"AND" if delivery_filter else "WHERE"}
+                        delivery.state = 'dead_letter'
+                    """,
+                    delivery_params,
+                ).fetchone()[0]
+            )
+            if context_id is None:
+                legacy_unverified_cursor_count = int(
+                    conn.execute("SELECT COUNT(*) FROM agent_context_cursors").fetchone()[0]
+                )
+            else:
+                legacy_unverified_cursor_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_cursors WHERE context_id = ?",
+                        (str(context_id),),
+                    ).fetchone()[0]
+                )
+            delivery_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_deliveries AS delivery
+                    {delivery_filter}
+                    """,
+                    delivery_params,
+                ).fetchone()[0]
+            )
+            receipt_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_delivery_receipts AS receipt
+                    JOIN agent_context_deliveries AS delivery
+                      ON delivery.delivery_id = receipt.delivery_id
+                    {delivery_filter}
+                    """,
+                    delivery_params,
+                ).fetchone()[0]
+            )
+            tombstone_filter = (
+                "" if context_id is None else "WHERE context_id = ?"
+            )
+            tombstone_params: tuple[Any, ...] = (
+                () if context_id is None else (str(context_id),)
+            )
+            tombstone_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM agent_context_delivery_ack_tombstones
+                    {tombstone_filter}
+                    """,
+                    tombstone_params,
+                ).fetchone()[0]
+            )
+            schema_errors = self._context_delivery_v2_table_errors(conn) + (
+                self._context_delivery_v2_index_errors(conn)
+            )
+            receipt_history_mismatch_count, receipt_history_samples = (
+                self._context_delivery_receipt_history_audit(
+                    conn,
+                    context_id=context_id,
+                )
+            )
+            live_integrity_error_count, live_integrity_samples = (
+                self._context_delivery_live_data_audit(
+                    conn,
+                    context_id=context_id,
+                )
+            )
+            tombstone_integrity_error_count, tombstone_integrity_samples = (
+                self._context_delivery_tombstone_data_audit(
+                    conn,
+                    context_id=context_id,
+                )
+            )
+            unaudited_dead_letter_count, unaudited_dead_letter_samples = (
+                self._context_delivery_dead_letter_audit(
+                    conn,
+                    context_id=context_id,
+                )
+            )
+            foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+            cursor_mismatches = self._context_delivery_cursor_mismatches(
+                conn,
+                context_id=context_id,
+            )
+            conn.commit()
+        structural_error_count = (
+            unrouted_event_count
+            + target_integrity_error_count
+            + event_ledger_integrity_error_count
+            + consumer_group_integrity_error_count
+            + target_reconciliation_highwater_error_count
+            + missing_current_receipt_count
+            + acknowledgement_mismatch_count
+            + delivery_receipt_state_mismatch_count
+            + event_context_mismatch_count
+            + receipt_history_mismatch_count
+            + live_integrity_error_count
+            + tombstone_integrity_error_count
+            + unaudited_dead_letter_count
+            + len(cursor_mismatches)
+            + len(schema_errors)
+            + len(foreign_key_errors)
+        )
+        return {
+            "protocol_version": "context-delivery.v2",
+            "delivery_mode": "leased-at-least-once",
+            "context_id": context_id,
+            "status": (
+                "ready"
+                if structural_error_count == 0 and retry_exhausted_count == 0
+                else "degraded"
+            ),
+            "structural_error_count": structural_error_count,
+            "unrouted_event_count": unrouted_event_count,
+            "target_integrity_error_count": target_integrity_error_count,
+            "target_integrity_error_samples": target_integrity_error_samples,
+            "event_ledger_integrity_error_count": (
+                event_ledger_integrity_error_count
+            ),
+            "event_ledger_integrity_error_samples": (
+                event_ledger_integrity_error_samples
+            ),
+            "consumer_group_integrity_error_count": (
+                consumer_group_integrity_error_count
+            ),
+            "consumer_group_integrity_error_samples": (
+                consumer_group_integrity_error_samples
+            ),
+            "target_reconciliation_highwater_error_count": (
+                target_reconciliation_highwater_error_count
+            ),
+            "target_reconciliation_highwater_error_samples": (
+                target_reconciliation_highwater_error_samples
+            ),
+            "noncanonical_target_count": noncanonical_target_count,
+            "noncanonical_target_samples": noncanonical_target_samples,
+            "missing_current_receipt_count": missing_current_receipt_count,
+            "acknowledgement_mismatch_count": acknowledgement_mismatch_count,
+            "delivery_receipt_state_mismatch_count": (
+                delivery_receipt_state_mismatch_count
+            ),
+            "event_context_mismatch_count": event_context_mismatch_count,
+            "receipt_history_mismatch_count": receipt_history_mismatch_count,
+            "receipt_history_mismatch_samples": receipt_history_samples,
+            "live_delivery_integrity_error_count": live_integrity_error_count,
+            "live_delivery_integrity_error_samples": live_integrity_samples,
+            "ack_tombstone_integrity_error_count": (
+                tombstone_integrity_error_count
+            ),
+            "ack_tombstone_integrity_error_samples": tombstone_integrity_samples,
+            "unaudited_dead_letter_count": unaudited_dead_letter_count,
+            "unaudited_dead_letter_samples": unaudited_dead_letter_samples,
+            "receipt_derived_cursor_mismatch_count": len(cursor_mismatches),
+            "receipt_derived_cursor_mismatch_samples": cursor_mismatches[:10],
+            "schema_error_count": len(schema_errors),
+            "schema_error_samples": schema_errors[:10],
+            "foreign_key_error_count": len(foreign_key_errors),
+            "foreign_key_error_samples": [list(row) for row in foreign_key_errors[:10]],
+            "expired_active_lease_count": expired_active_lease_count,
+            "max_delivery_attempts": max_delivery_attempts,
+            "retry_exhausted_count": retry_exhausted_count,
+            "dead_letter_count": dead_letter_count,
+            "legacy_unverified_cursor_count": legacy_unverified_cursor_count,
+            "delivery_count": delivery_count,
+            "receipt_count": receipt_count,
+            "ack_tombstone_count": tombstone_count,
+            "checked_at": current_time,
+        }
+
+    def stats(
+        self,
+        *,
+        context_id: str | None = None,
+        _conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
         try:
-            with closing(self._connect()) as conn:
-                conn.execute("BEGIN")
+            owns_transaction = _conn is None
+            with self._read_connection_scope(_conn) as conn:
+                if owns_transaction:
+                    conn.execute("BEGIN")
                 journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
                 synchronous_level = int(
                     conn.execute("PRAGMA synchronous").fetchone()[0]
                 )
+                stats_now = time.time()
+                max_delivery_attempts = self._context_delivery_max_attempts()
                 if context_id is None:
                     entry_count = conn.execute(
                         "SELECT COUNT(*) FROM memory_entries"
@@ -2694,7 +8003,59 @@ class DurableMemoryStore:
                         "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
                     ).fetchone()
                     context_bus_ack_cursor_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_delivery_cursors"
+                    ).fetchone()[0]
+                    context_bus_legacy_cursor_count = conn.execute(
                         "SELECT COUNT(*) FROM agent_context_cursors"
+                    ).fetchone()[0]
+                    context_bus_delivery_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_deliveries"
+                    ).fetchone()[0]
+                    context_bus_active_lease_count = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM agent_context_deliveries
+                        WHERE state = 'leased' AND lease_expires_at > ?
+                        """,
+                        (stats_now,),
+                    ).fetchone()[0]
+                    context_bus_expired_retryable_lease_count = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM agent_context_deliveries
+                        WHERE state = 'leased'
+                          AND attempt_count < ?
+                          AND lease_expires_at <= ?
+                        """,
+                        (max_delivery_attempts, stats_now),
+                    ).fetchone()[0]
+                    context_bus_ack_receipt_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_delivery_receipts
+                        WHERE state = 'acknowledged'
+                        """
+                    ).fetchone()[0]
+                    context_bus_ack_tombstone_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_delivery_ack_tombstones
+                        """
+                    ).fetchone()[0]
+                    context_bus_retry_exhausted_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_deliveries
+                        WHERE state = 'leased'
+                          AND attempt_count >= ?
+                          AND lease_expires_at <= ?
+                        """,
+                        (max_delivery_attempts, stats_now),
+                    ).fetchone()[0]
+                    context_bus_dead_letter_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_deliveries
+                        WHERE state = 'dead_letter'
+                        """
                     ).fetchone()[0]
                     context_link_count = conn.execute(
                         "SELECT COUNT(*) FROM context_relationships"
@@ -2725,7 +8086,74 @@ class DurableMemoryStore:
                         (context_id,),
                     ).fetchone()
                     context_bus_ack_cursor_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_delivery_cursors WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
+                    context_bus_legacy_cursor_count = conn.execute(
                         "SELECT COUNT(*) FROM agent_context_cursors WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
+                    context_bus_delivery_count = conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_deliveries WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()[0]
+                    context_bus_active_lease_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_deliveries
+                        WHERE context_id = ?
+                          AND state = 'leased'
+                          AND lease_expires_at > ?
+                        """,
+                        (context_id, stats_now),
+                    ).fetchone()[0]
+                    context_bus_expired_retryable_lease_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_deliveries
+                        WHERE context_id = ?
+                          AND state = 'leased'
+                          AND attempt_count < ?
+                          AND lease_expires_at <= ?
+                        """,
+                        (context_id, max_delivery_attempts, stats_now),
+                    ).fetchone()[0]
+                    context_bus_ack_receipt_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_delivery_receipts AS receipt
+                        JOIN agent_context_deliveries AS delivery
+                          ON delivery.delivery_id = receipt.delivery_id
+                        WHERE delivery.context_id = ?
+                          AND receipt.state = 'acknowledged'
+                        """,
+                        (context_id,),
+                    ).fetchone()[0]
+                    context_bus_ack_tombstone_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_delivery_ack_tombstones
+                        WHERE context_id = ?
+                        """,
+                        (context_id,),
+                    ).fetchone()[0]
+                    context_bus_retry_exhausted_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_deliveries
+                        WHERE context_id = ?
+                          AND state = 'leased'
+                          AND attempt_count >= ?
+                          AND lease_expires_at <= ?
+                        """,
+                        (context_id, max_delivery_attempts, stats_now),
+                    ).fetchone()[0]
+                    context_bus_dead_letter_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_deliveries
+                        WHERE context_id = ? AND state = 'dead_letter'
+                        """,
                         (context_id,),
                     ).fetchone()[0]
                     context_link_count = conn.execute(
@@ -2745,7 +8173,8 @@ class DurableMemoryStore:
                     ORDER BY context_id
                     """
                 ).fetchall()
-                conn.commit()
+                if owns_transaction:
+                    conn.commit()
             return {
                 "memory_db_path": str(self.db_path),
                 "journal_mode": journal_mode,
@@ -2761,6 +8190,26 @@ class DurableMemoryStore:
                 "context_bus_event_count": int(context_bus_event_count),
                 "context_bus_latest_event_id": int(latest_context_event_row[0] or 0),
                 "context_bus_ack_cursor_count": int(context_bus_ack_cursor_count),
+                "context_bus_verified_cursor_count": int(context_bus_ack_cursor_count),
+                "context_bus_legacy_unverified_cursor_count": int(
+                    context_bus_legacy_cursor_count
+                ),
+                "context_bus_delivery_count": int(context_bus_delivery_count),
+                "context_bus_active_lease_count": int(context_bus_active_lease_count),
+                "context_bus_expired_retryable_lease_count": int(
+                    context_bus_expired_retryable_lease_count
+                ),
+                "context_bus_ack_receipt_count": int(context_bus_ack_receipt_count),
+                "context_bus_ack_tombstone_count": int(
+                    context_bus_ack_tombstone_count
+                ),
+                "context_bus_retry_exhausted_count": int(
+                    context_bus_retry_exhausted_count
+                ),
+                "context_bus_dead_letter_count": int(
+                    context_bus_dead_letter_count
+                ),
+                "context_bus_max_delivery_attempts": max_delivery_attempts,
                 "context_link_count": int(context_link_count),
                 "contexts": {str(row["context_id"]): int(row["count"]) for row in context_rows},
             }
@@ -4209,30 +9658,183 @@ class DurableMemoryStore:
         context_id: str | None = None,
         limit: int = 10_000,
     ) -> dict[str, Any]:
-        payload = {
-            "version": 1,
-            "exported_at": time.time(),
-            "memory_db_path": str(self.db_path),
-            "context_id": context_id,
-            "stats": self.stats(context_id=context_id),
-            "entries": self.list_entries(context_id=context_id, limit=limit),
-            "relationships": self.list_relationships(
-                context_id=context_id,
-                limit=limit,
-            ),
-            "context_links": self.list_context_links(
-                context_id=context_id,
-                limit=limit,
-            ),
-            "context_events": self.list_context_events(
-                context_id=context_id,
-                limit=limit,
-            ),
-            "context_cursors": self.list_context_cursors(
-                context_id=context_id,
-                limit=limit,
-            ),
-        }
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        with closing(self._connect_read_only()) as conn:
+            conn.execute("BEGIN")
+            payload = {
+                "version": 2,
+                "exported_at": time.time(),
+                "memory_db_path": str(self.db_path),
+                "context_id": context_id,
+                "stats": self.stats(context_id=context_id, _conn=conn),
+                "entries": self.list_entries(
+                    context_id=context_id,
+                    limit=bounded_limit,
+                    _conn=conn,
+                ),
+                "relationships": self.list_relationships(
+                    context_id=context_id,
+                    limit=bounded_limit,
+                    _conn=conn,
+                ),
+                "context_links": self.list_context_links(
+                    context_id=context_id,
+                    limit=bounded_limit,
+                    _conn=conn,
+                ),
+                "context_events": self.list_context_events(
+                    context_id=context_id,
+                    limit=bounded_limit,
+                    _conn=conn,
+                ),
+                "context_cursors": self.list_context_cursors(
+                    context_id=context_id,
+                    limit=bounded_limit,
+                    _conn=conn,
+                ),
+                "context_deliveries": self.list_context_deliveries(
+                    context_id=context_id,
+                    limit=bounded_limit,
+                    _conn=conn,
+                ),
+                "context_delivery_receipts": (
+                    self.list_context_delivery_receipts(
+                        context_id=context_id,
+                        limit=bounded_limit,
+                        _conn=conn,
+                    )
+                ),
+                "context_delivery_ack_tombstones": (
+                    self.list_context_delivery_ack_tombstones(
+                        context_id=context_id,
+                        limit=bounded_limit,
+                        _conn=conn,
+                    )
+                ),
+            }
+            if context_id is None:
+                count_queries: dict[str, tuple[str, tuple[Any, ...]]] = {
+                    "entries": ("SELECT COUNT(*) FROM memory_entries", ()),
+                    "relationships": (
+                        "SELECT COUNT(*) FROM memory_relationships",
+                        (),
+                    ),
+                    "context_links": (
+                        "SELECT COUNT(*) FROM context_relationships",
+                        (),
+                    ),
+                    "context_events": (
+                        "SELECT COUNT(*) FROM agent_context_events",
+                        (),
+                    ),
+                    "context_cursors": (
+                        "SELECT COUNT(*) FROM agent_context_delivery_cursors",
+                        (),
+                    ),
+                    "context_deliveries": (
+                        "SELECT COUNT(*) FROM agent_context_deliveries",
+                        (),
+                    ),
+                    "context_delivery_receipts": (
+                        "SELECT COUNT(*) FROM agent_context_delivery_receipts",
+                        (),
+                    ),
+                    "context_delivery_ack_tombstones": (
+                        "SELECT COUNT(*) FROM agent_context_delivery_ack_tombstones",
+                        (),
+                    ),
+                }
+            else:
+                context = str(context_id)
+                count_queries = {
+                    "entries": (
+                        "SELECT COUNT(*) FROM memory_entries WHERE context_id = ?",
+                        (context,),
+                    ),
+                    "relationships": (
+                        "SELECT COUNT(*) FROM memory_relationships WHERE context_id = ?",
+                        (context,),
+                    ),
+                    "context_links": (
+                        """
+                        SELECT COUNT(*) FROM context_relationships
+                        WHERE source_context_id = ? OR target_context_id = ?
+                        """,
+                        (context, context),
+                    ),
+                    "context_events": (
+                        "SELECT COUNT(*) FROM agent_context_events WHERE context_id = ?",
+                        (context,),
+                    ),
+                    "context_cursors": (
+                        """
+                        SELECT COUNT(*) FROM agent_context_delivery_cursors
+                        WHERE context_id = ?
+                        """,
+                        (context,),
+                    ),
+                    "context_deliveries": (
+                        "SELECT COUNT(*) FROM agent_context_deliveries WHERE context_id = ?",
+                        (context,),
+                    ),
+                    "context_delivery_receipts": (
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_delivery_receipts AS receipt
+                        JOIN agent_context_deliveries AS delivery
+                          ON delivery.delivery_id = receipt.delivery_id
+                        WHERE delivery.context_id = ?
+                        """,
+                        (context,),
+                    ),
+                    "context_delivery_ack_tombstones": (
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_context_delivery_ack_tombstones
+                        WHERE context_id = ?
+                        """,
+                        (context,),
+                    ),
+                }
+            available_counts = {
+                key: int(conn.execute(query, params).fetchone()[0])
+                for key, (query, params) in count_queries.items()
+            }
+            # Receipt ids are bearer capabilities. Exports retain audit linkage
+            # through domain-separated digests, never the live ACK credential.
+            for delivery in payload["context_deliveries"]:
+                receipt_id = str(delivery.pop("current_receipt_id", ""))
+                delivery["current_receipt_digest"] = (
+                    self._context_delivery_receipt_digest(receipt_id)
+                    if receipt_id
+                    else ""
+                )
+            for receipt in payload["context_delivery_receipts"]:
+                receipt_id = str(receipt.pop("receipt_id", ""))
+                receipt["receipt_digest"] = (
+                    self._context_delivery_receipt_digest(receipt_id)
+                    if receipt_id
+                    else ""
+                )
+            surface_counts = {
+                key: {
+                    "available_count": available_counts[key],
+                    "exported_count": len(payload[key]),
+                    "truncated": available_counts[key] > len(payload[key]),
+                }
+                for key in available_counts
+            }
+            payload["export_contract"] = {
+                "requested_limit": int(limit),
+                "applied_limit_per_surface": bounded_limit,
+                "snapshot_consistency": "sqlite-read-transaction",
+                "credential_policy": "receipt-identifiers-redacted-to-digests",
+                "complete": not any(
+                    item["truncated"] for item in surface_counts.values()
+                ),
+                "surfaces": surface_counts,
+            }
+            conn.commit()
         if path is not None:
             output_path = Path(path).expanduser()
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4347,20 +9949,68 @@ class DurableMemoryStore:
             "created_at": float(row["created_at"]),
         }
 
+    def _context_delivery_payload(
+        self,
+        delivery_row: sqlite3.Row,
+        receipt_row: sqlite3.Row,
+        event_row: sqlite3.Row,
+        *,
+        redelivered: bool,
+    ) -> dict[str, Any]:
+        return {
+            "delivery_id": str(delivery_row["delivery_id"]),
+            "receipt_id": str(receipt_row["receipt_id"]),
+            # Compatibility alias for clients upgraded from the initial v2
+            # prototype. It is an opaque receipt, never a reusable secret.
+            "lease_token": str(receipt_row["receipt_id"]),
+            "context_id": str(delivery_row["context_id"]),
+            "agent_id": str(delivery_row["agent_id"]),
+            "consumer_instance_id": str(receipt_row["consumer_instance_id"]),
+            "event_id": int(delivery_row["event_id"]),
+            "state": str(delivery_row["state"]),
+            "attempt_count": int(delivery_row["attempt_count"]),
+            "lease_expires_at": float(delivery_row["lease_expires_at"]),
+            "redelivered": bool(redelivered),
+            "ack_required": str(delivery_row["state"]) == "leased",
+            "event": self._row_to_context_event(event_row),
+        }
+
     def _row_to_context_cursor(
         self,
         row: sqlite3.Row,
         *,
         latest_event_id: int,
+        latest_eligible_event_id: int | None = None,
         pending_event_count: int,
+        acknowledged_delivery_count: int = 0,
+        terminal_delivery_count: int = 0,
     ) -> dict[str, Any]:
-        last_event_id = int(row["last_event_id"])
+        keys = set(row.keys())
+        last_event_id = int(
+            row["last_contiguous_event_id"]
+            if "last_contiguous_event_id" in keys
+            else row["last_event_id"]
+        )
         return {
             "context_id": str(row["context_id"]),
             "agent_id": str(row["agent_id"]),
             "last_event_id": last_event_id,
+            "last_contiguous_event_id": last_event_id,
             "latest_event_id": int(latest_event_id),
+            "latest_eligible_event_id": int(
+                latest_event_id
+                if latest_eligible_event_id is None
+                else latest_eligible_event_id
+            ),
             "pending_event_count": int(pending_event_count),
             "caught_up": int(pending_event_count) == 0,
             "updated_at": float(row["updated_at"]),
+            "cursor_basis": (
+                "durable-disposition-derived"
+                if "last_contiguous_event_id" in keys
+                else "legacy-unverified-watermark"
+            ),
+            "acknowledged_delivery_count": int(acknowledged_delivery_count),
+            "has_acknowledged_deliveries": int(acknowledged_delivery_count) > 0,
+            "terminal_delivery_count": int(terminal_delivery_count),
         }

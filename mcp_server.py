@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ logging.basicConfig(
 )
 
 MAX_TOOL_EMBEDDING_DIMS = 32_768
+MCP_DELIVERY_INSTANCE_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex}"
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
 
@@ -74,6 +76,34 @@ def _sanitize_agent_id(agent_id: str) -> str:
     raw = str(agent_id or "").strip()
     cleaned = AGENT_ID_RE.sub("_", raw).strip("._-:@")
     return (cleaned or "unknown-agent")[:128]
+
+
+def _sanitize_delivery_agent_id(agent_id: str) -> str:
+    return _sanitize_agent_id(agent_id).casefold()
+
+
+def _delivery_agent_id(requested_agent_id: str) -> str:
+    configured = str(os.getenv("SYNAPSE_S2_CLIENT_AGENT_ID", "") or "").strip()
+    requested = str(requested_agent_id or "").strip()
+    if configured:
+        configured_agent = _sanitize_delivery_agent_id(configured)
+        if requested and _sanitize_delivery_agent_id(requested) != configured_agent:
+            raise ValueError(
+                "agent_id must match the MCP server's configured delivery identity"
+            )
+        return configured_agent
+    if not requested:
+        raise ValueError(
+            "agent_id is required when SYNAPSE_S2_CLIENT_AGENT_ID is not configured"
+        )
+    if str(
+        os.getenv("SYNAPSE_S2_ALLOW_UNCONFIGURED_DELIVERY_IDENTITY", "") or ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            "delivery tools require SYNAPSE_S2_CLIENT_AGENT_ID; "
+            "set SYNAPSE_S2_ALLOW_UNCONFIGURED_DELIVERY_IDENTITY=1 only for isolated development"
+        )
+    return _sanitize_delivery_agent_id(requested)
 
 
 def _validate_embedding(prompt_embedding: list[float]) -> list[float]:
@@ -934,23 +964,27 @@ def list_spiking_memory_graph(context_id: str = "default", limit: int = 100) -> 
 @mcp.tool(
     annotations={
         "title": "Pull SYNAPSE-S2 Context Deployments",
-        "readOnlyHint": True,
+        "readOnlyHint": False,
     }
 )
 def pull_spiking_context_deployments(
+    agent_id: str = "",
     context_id: str = "default",
-    since_event_id: int = 0,
     limit: int = 50,
+    lease_seconds: float = 60.0,
 ) -> str:
-    """Pull durable context-bus events published for connected local agents."""
+    """Lease the oldest eligible context events for the configured local agent."""
     context = _sanitize_context_id(context_id)
     try:
         bounded_limit = _validate_limit(limit)
+        agent = _delivery_agent_id(agent_id)
         _, mlx_backend = _load_backend()
-        payload = mlx_backend.list_context_events(
+        payload = mlx_backend.lease_context_events(
             context_id=context,
-            since_event_id=max(0, int(since_event_id)),
+            agent_id=agent,
+            consumer_instance_id=MCP_DELIVERY_INSTANCE_ID,
             limit=bounded_limit,
+            lease_seconds=float(lease_seconds),
         )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
@@ -965,17 +999,33 @@ def pull_spiking_context_deployments(
 def ack_spiking_context_deployments(
     agent_id: str,
     context_id: str = "default",
-    last_event_id: int = 0,
+    receipt_id: str = "",
+    receipt_ids: list[str] | None = None,
 ) -> str:
-    """Record that a local agent consumed context-bus events through last_event_id."""
+    """Atomically acknowledge one or more durable receipts after consumption."""
     context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
     try:
+        agent = _delivery_agent_id(agent_id)
+        requested_receipts: list[str] = []
+        if receipt_ids is not None:
+            if not isinstance(receipt_ids, list):
+                raise ValueError("receipt_ids must be a list")
+            requested_receipts.extend(str(value or "").strip() for value in receipt_ids)
+        if str(receipt_id or "").strip():
+            requested_receipts.append(str(receipt_id).strip())
+        requested_receipts = list(dict.fromkeys(value for value in requested_receipts if value))
+        if not requested_receipts:
+            raise ValueError("receipt_id or receipt_ids is required")
+        if len(requested_receipts) > 500:
+            raise ValueError("at most 500 receipt_ids may be acknowledged")
         _, mlx_backend = _load_backend()
         payload = mlx_backend.ack_context_events(
             context_id=context,
             agent_id=agent,
-            last_event_id=max(0, int(last_event_id)),
+            acknowledgements=[
+                {"receipt_id": receipt}
+                for receipt in requested_receipts
+            ],
         )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
@@ -984,6 +1034,84 @@ def ack_spiking_context_deployments(
     except Exception as exc:
         LOGGER.exception("context deployment ack failed for context_id=%s", context)
         return json.dumps({"error": f"context deployment ack failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def release_spiking_context_deployments(
+    agent_id: str,
+    receipt_ids: list[str],
+    context_id: str = "default",
+) -> str:
+    """Release unconsumed leases so another attempt can retry immediately."""
+    context = _sanitize_context_id(context_id)
+    try:
+        agent = _delivery_agent_id(agent_id)
+        if not isinstance(receipt_ids, list) or not receipt_ids:
+            raise ValueError("receipt_ids must be a non-empty list")
+        requested_receipts = list(
+            dict.fromkeys(str(value or "").strip() for value in receipt_ids)
+        )
+        if any(not value for value in requested_receipts):
+            raise ValueError("receipt_ids must not contain empty values")
+        if len(requested_receipts) > 500:
+            raise ValueError("at most 500 receipt_ids may be released")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.release_context_events(
+            context_id=context,
+            agent_id=agent,
+            consumer_instance_id=MCP_DELIVERY_INSTANCE_ID,
+            receipt_ids=requested_receipts,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid context deployment release for context_id=%s: %s", context, exc)
+        return json.dumps({"error": f"invalid context deployment release: {exc}"}, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("context deployment release failed for context_id=%s", context)
+        return json.dumps({"error": f"context deployment release failed: {exc}"}, sort_keys=True)
+
+
+@mcp.tool()
+def dead_letter_spiking_context_delivery(
+    agent_id: str,
+    delivery_id: str,
+    reason: str,
+    context_id: str = "default",
+    confirm: bool = False,
+) -> str:
+    """Governedly quarantine one retry-exhausted delivery after lease expiry."""
+
+    context = _sanitize_context_id(context_id)
+    try:
+        agent = _delivery_agent_id(agent_id)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.dead_letter_context_delivery(
+            context_id=context,
+            agent_id=agent,
+            delivery_id=str(delivery_id or "").strip(),
+            reason=str(reason or "").strip(),
+            confirm=bool(confirm),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid context delivery dead-letter for context_id=%s: %s",
+            context,
+            exc,
+        )
+        return json.dumps(
+            {"error": f"invalid context delivery dead-letter: {exc}"},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception(
+            "context delivery dead-letter failed for context_id=%s",
+            context,
+        )
+        return json.dumps(
+            {"error": f"context delivery dead-letter failed: {exc}"},
+            sort_keys=True,
+        )
 
 
 @mcp.tool(
@@ -1013,6 +1141,28 @@ def list_spiking_context_cursors(context_id: str = "default", limit: int = 50) -
 
 @mcp.tool(
     annotations={
+        "title": "Audit SYNAPSE-S2 Context Delivery",
+        "readOnlyHint": True,
+    }
+)
+def inspect_spiking_context_delivery_health() -> str:
+    """Verify normalized routes, delivery rows, receipts, and foreign keys."""
+    try:
+        _, mlx_backend = _load_backend()
+        return json.dumps(
+            mlx_backend.get_backend().context_delivery_health(context_id=None),
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("context delivery health inspection failed")
+        return json.dumps(
+            {"error": f"context delivery health inspection failed: {exc}"},
+            sort_keys=True,
+        )
+
+
+@mcp.tool(
+    annotations={
         "title": "Hydrate Agent Context From SYNAPSE-S2",
         "readOnlyHint": False,
     }
@@ -1021,30 +1171,30 @@ def hydrate_spiking_agent_context(
     agent_id: str,
     context_id: str = "default",
     prompt: str = "",
-    since_event_id: int = -1,
     limit: int = 20,
     graph_limit: int = 30,
-    acknowledge: bool = True,
 ) -> str:
-    """Return an agent-ready context brief, recall hits, and optional delivery ack."""
+    """Lease an agent-ready context brief; acknowledge returned receipts separately."""
     context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
+    agent = str(agent_id or "").strip() or "<missing>"
     try:
+        agent = _delivery_agent_id(agent_id)
         prompt_text = str(prompt or "").strip()
         if len(prompt_text) > 20_000:
             raise ValueError("prompt exceeds 20000 characters")
         bounded_limit = _validate_limit(limit)
         bounded_graph_limit = _validate_limit(graph_limit)
-        starting_event_id = None if int(since_event_id) < 0 else max(0, int(since_event_id))
         _, mlx_backend = _load_backend()
         payload = mlx_backend.hydrate_agent_context(
             context_id=context,
             agent_id=agent,
             prompt=prompt_text,
-            since_event_id=starting_event_id,
+            since_event_id=None,
             event_limit=bounded_limit,
             graph_limit=bounded_graph_limit,
-            acknowledge=bool(acknowledge),
+            acknowledge=False,
+            claim_events=True,
+            consumer_instance_id=MCP_DELIVERY_INSTANCE_ID,
         )
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:

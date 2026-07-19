@@ -7,8 +7,8 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 | Gap | Risk | Shorthand solution | Disposition |
 | :--- | :--- | :--- | :--- |
 | No-memory recall fabricated `context::neuron-*` labels | Could look like historical memory when no memory existed | Return transparent raw activation summary instead of fake tags | Fixed in `mlx_backend.py`; covered by `tests/test_backend.py` |
-| Context bus published events without consumption receipts | Could claim "deployed to agents" when no connected client had pulled anything | Add durable per-agent cursors with pull plus ack semantics | Fixed in `memory_store.py`, `mlx_backend.py`, `mcp_server.py`, `dashboard_server.py`, `web/app.js` |
-| GUI published context events but did not acknowledge its own pulls | Operator could not tell whether the dashboard consumed the event it displayed | Dashboard calls `/api/context-ack` after pulling deployments | Fixed in `web/app.js`; covered by dashboard route tests |
+| Context bus published events without consumption receipts | Could claim "deployed to agents" when no connected client had pulled anything | Add normalized targets, leased at-least-once delivery, fenced attempt receipts, and explicit batch acknowledgement | Fixed in `memory_store.py`, `mlx_backend.py`, `mcp_server.py`, `dashboard_server.py`, `web/app.js` |
+| GUI published context events but did not acknowledge its own pulls | Operator could not tell whether the dashboard consumed the event it displayed | Dashboard leases only as `dashboard-ui`, renders the result, then acknowledges the exact returned receipt ids | Fixed in `web/app.js`; covered by dashboard route tests |
 | Canned demo-memory path remained available from ops surfaces | Polluted real memory with static content and could undermine trust in recall | Remove production CLI `seed-demo`; default prep to `default` context and factual preflight evidence | Fixed in `synapse_cli.py` and `scripts/prep_tomorrow.sh`; guarded by CLI and operational tests |
 | CLI writes were not published to the context bus | CLI-captured thoughts would not appear in agent deployment pulls | Publish CLI remember/ingest writes and add CLI pull/ack cursor commands | Fixed in `synapse_cli.py`; covered by `tests/test_cli.py` |
 | Agent/operator conversation notes had no first-class capture path | Future sessions would not naturally appear in the event relationship visualizer | Add `capture-session`, `capture_spiking_conversation`, `/api/capture-conversation`, and GUI capture form | Fixed in backend, MCP, CLI, dashboard, and GUI tests |
@@ -16,7 +16,7 @@ This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fix
 | README/runbook still taught `board-demo` and `seed-demo` | IT operators could accidentally present synthetic state | Rewrite examples around `default` and real operator captures | Fixed in `README.md` and `docs/TOMORROW_RUNBOOK.md` |
 | Compliance matrix under-described client registration and delivery receipts | Proposal mapping lagged implementation | Add explicit rows for config installer and context cursors | Fixed in `docs/PROPOSAL_COMPLIANCE.md` |
 | Capture required an active user-facing tool call | Useful session notes could be missed if the dashboard or agent forgot the synchronous capture form | Add a launchd-backed local capture inbox with CLI, MCP, dashboard status/process controls, redaction, processed/error queues, and tests | Fixed in `capture_daemon.py`, `synapse_cli.py`, `mcp_server.py`, `dashboard_server.py`, `web/app.js`, and `scripts/install_capture_daemon.sh` |
-| Restarted agents had to manually compose raw pull, recall, graph, and ack calls | Codex/Claude could miss relevant memory or fail to acknowledge consumed deployments | Add one context-hydration command/tool that returns an agent-ready brief and updates the cursor | Fixed in `mlx_backend.py`, `synapse_cli.py`, `mcp_server.py`, `AGENTS.md`, and tests |
+| Restarted agents had to manually compose raw pull, recall, graph, and ack calls | Codex/Claude could miss relevant memory or acknowledge context before actually using it | Add one context-hydration command/tool that returns an agent-ready brief plus leased receipts; require a separate receipt acknowledgement after successful consumption | Fixed in `mlx_backend.py`, `synapse_cli.py`, `mcp_server.py`, `AGENTS.md`, and tests |
 | Client startup and shutdown had no repeatable SYNAPSE-S2 habit | Clients could reconnect without hydrating or recording a useful session boundary | Wrap the local MCP launcher with startup hydration and sanitized exit capture; install per-client agent ids | Fixed in `client_session_bridge.py`, `mcp_client_wrapper.py`, `client_config.py`, launcher script, and tests |
 | Text projection had no provider boundary or semantic provenance | Recall quality and claims were hard to audit because text embedding looked like fixed lexical hashing | Add local pluggable embedding providers, neural/hash/callable modes, and stored provider metadata | Fixed in `embedding_providers.py`, `mlx_backend.py`, CLI/MCP/dashboard surfaces, and tests |
 | No bundled large neural embedding provider was wired into clients | "Semantic memory" could be dismissed as concept hashing instead of model-backed meaning | Add `mlx-neural-v1` using `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`, local model cache, CLI/MCP provider benchmarks, and neural-native certification visibility | Fixed in `embedding_providers.py`, `client_config.py`, launcher/prep/capture scripts, `synapse_cli.py`, `mcp_server.py`, docs, and tests |
@@ -63,16 +63,17 @@ The current bar for calling a local build presentable is:
 
 1. `scripts/prep_tomorrow.sh` exits zero.
 2. `get_spiking_attention_status` reports runtime ready, enabled, and shared `.synapse_s2` paths.
-3. `pull_spiking_context_deployments` returns durable write events.
-4. `ack_spiking_context_deployments` records a local client cursor.
-5. No-memory recall returns a transparent raw activation summary, never a fake historical tag.
-6. Conversation capture creates visible event nodes in the graph and a durable context-bus deployment.
-7. Confirmed pruning can remove a single node, edge, deployment event, temporal edge set, or associative edge set.
-8. The capture inbox sidecar is installed or confirmed `capture-inbox-process --confirm` / `process_spiking_capture_inbox(confirm=true)` proves pending drops become graph events with secret redaction.
-9. Redaction regression tests prove raw secret shapes do not survive pending inbox files, direct capture memory, context-bus deployments, or returned MCP/API payloads.
-10. MCP prune calls fail without `confirm=true`, CLI prune calls require `--confirm`, dashboard destructive graph actions require explicit confirmation, Cortex trace prune follows the same confirm contract on all surfaces, and dashboard App Connect/Magic Capture writes require preflight confirmation tokens.
-11. The dashboard refuses non-loopback bind attempts unless a controlled demo override is set.
-12. `scripts/prep_tomorrow.sh --verify-only` exits zero before the full mutating preflight is run.
+3. `pull_spiking_context_deployments` leases the oldest eligible durable events and returns fenced receipt ids without advancing acknowledgement state.
+4. `ack_spiking_context_deployments` atomically acknowledges the exact consumed receipt ids; the durable-disposition cursor advances only across contiguous acknowledged or governed terminal events.
+5. Retry attempts stop at `SYNAPSE_S2_CONTEXT_MAX_DELIVERY_ATTEMPTS`; an exhausted event remains visibly blocked until an operator uses the confirmed, reason-bearing dead-letter action, which writes a governance audit before later events advance.
+6. No-memory recall returns a transparent raw activation summary, never a fake historical tag.
+7. Conversation capture creates visible event nodes in the graph and a durable context-bus deployment.
+8. Confirmed pruning can remove a single node, edge, deployment event, temporal edge set, or associative edge set.
+9. The capture inbox sidecar is installed or confirmed `capture-inbox-process --confirm` / `process_spiking_capture_inbox(confirm=true)` proves pending drops become graph events with secret redaction.
+10. Redaction regression tests prove raw secret shapes do not survive pending inbox files, direct capture memory, context-bus deployments, or returned MCP/API payloads.
+11. MCP prune calls fail without `confirm=true`, CLI prune calls require `--confirm`, dashboard destructive graph actions require explicit confirmation, Cortex trace prune follows the same confirm contract on all surfaces, and dashboard App Connect/Magic Capture writes require preflight confirmation tokens.
+12. The dashboard refuses non-loopback bind attempts unless a controlled demo override is set.
+13. `scripts/prep_tomorrow.sh --verify-only` exits zero before the full mutating preflight is run.
 13. The local MCP launcher enters through the startup/session-boundary bridge and client configs declare distinct agent ids.
 14. Text memories show `embedding_provider` provenance from the active local provider, event memories show `surprise_model`, `surprise_mode`, `semantic_surprise_score`, and `lexical_surprise_score`, and `provider-benchmark`/`benchmark_spiking_embedding_provider` reports `mlx-neural-v1` plus `native_mlx: true` for installed client defaults.
 15. `certify-runtime` or `certify_spiking_runtime` produces a native evidence payload and reports strict-native failures instead of silently downgrading.

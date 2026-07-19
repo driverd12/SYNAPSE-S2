@@ -437,10 +437,14 @@ def _publish_cli_deployment(
 
 def command_pull_context(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
-    return backend.list_context_events(
+    return backend.lease_context_events(
         context_id=args.context,
-        since_event_id=args.since_event_id,
+        agent_id=args.agent_id,
+        consumer_instance_id=(
+            args.consumer_instance_id or backend.delivery_instance_id
+        ),
         limit=args.limit,
+        lease_seconds=args.lease_seconds,
     )
 
 
@@ -449,7 +453,43 @@ def command_ack_context(args: argparse.Namespace) -> dict[str, Any]:
     return backend.ack_context_events(
         context_id=args.context,
         agent_id=args.agent_id,
-        last_event_id=args.last_event_id,
+        acknowledgements=[
+            {"receipt_id": receipt_id}
+            for receipt_id in args.receipt_id
+        ],
+    )
+
+
+def command_release_context(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.release_context_events(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        consumer_instance_id=args.consumer_instance_id,
+        receipt_ids=args.receipt_id,
+    )
+
+
+def command_dead_letter_context(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.dead_letter_context_delivery(
+        context_id=args.context,
+        agent_id=args.agent_id,
+        delivery_id=args.delivery_id,
+        reason=args.reason,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_observe_context(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_context_events(
+        context_id=args.context,
+        since_event_id=args.since_event_id,
+        before_event_id=args.before_event_id,
+        agent_id=args.agent_id,
+        order=args.order,
+        limit=args.limit,
     )
 
 
@@ -458,12 +498,28 @@ def command_list_context_cursors(args: argparse.Namespace) -> dict[str, Any]:
     return backend.list_context_cursors(context_id=args.context, limit=args.limit)
 
 
+def command_context_delivery_health(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.context_delivery_health(
+        context_id=args.context if args.context_only else None
+    )
+
+
 def command_agent_brief(args: argparse.Namespace) -> dict[str, Any]:
     if args.mode == "morning":
-        payload = _dashboard_runtime_from_args(args).start_work(
+        runtime = _dashboard_runtime_from_args(args)
+        payload = runtime.start_work(
             context_id=args.context,
             agent_id=args.agent_id,
             prompt=args.prompt,
+            since_event_id=args.since_event_id,
+            event_limit=args.limit,
+            graph_limit=args.graph_limit,
+            claim_events=not args.observe_only,
+            consumer_instance_id=(
+                args.consumer_instance_id or runtime.backend.delivery_instance_id
+            ),
+            lease_seconds=args.lease_seconds,
         )
         payload["action"] = "agent-brief-morning"
         payload["mode"] = "morning"
@@ -479,7 +535,12 @@ def command_agent_brief(args: argparse.Namespace) -> dict[str, Any]:
         since_event_id=args.since_event_id,
         event_limit=args.limit,
         graph_limit=args.graph_limit,
-        acknowledge=not args.no_ack,
+        acknowledge=False,
+        claim_events=not args.observe_only,
+        consumer_instance_id=(
+            args.consumer_instance_id or backend.delivery_instance_id
+        ),
+        lease_seconds=args.lease_seconds,
     )
 
 
@@ -603,6 +664,7 @@ def command_start_work(args: argparse.Namespace) -> dict[str, Any]:
         context_id=args.context,
         agent_id=args.agent_id,
         prompt=args.prompt,
+        claim_events=False,
     )
 
 
@@ -1092,20 +1154,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     pull_context = subparsers.add_parser("pull-context")
     add_context(pull_context)
-    pull_context.add_argument("--since-event-id", type=int, default=0)
+    pull_context.add_argument("--agent-id", required=True)
+    pull_context.add_argument("--consumer-instance-id", default="")
     pull_context.add_argument("--limit", type=int, default=50)
+    pull_context.add_argument("--lease-seconds", type=float, default=60.0)
     pull_context.set_defaults(func=command_pull_context)
+
+    observe_context = subparsers.add_parser("observe-context")
+    add_context(observe_context)
+    observe_context.add_argument("--since-event-id", type=int, default=0)
+    observe_context.add_argument("--before-event-id", type=int)
+    observe_context.add_argument("--agent-id", default=None)
+    observe_context.add_argument("--order", choices=("asc", "desc"), default="asc")
+    observe_context.add_argument("--limit", type=int, default=50)
+    observe_context.set_defaults(func=command_observe_context)
 
     ack_context = subparsers.add_parser("ack-context")
     add_context(ack_context)
     ack_context.add_argument("--agent-id", required=True)
-    ack_context.add_argument("--last-event-id", type=int, required=True)
+    ack_context.add_argument("--receipt-id", action="append", required=True)
     ack_context.set_defaults(func=command_ack_context)
+
+    release_context = subparsers.add_parser("release-context")
+    add_context(release_context)
+    release_context.add_argument("--agent-id", required=True)
+    release_context.add_argument("--consumer-instance-id", required=True)
+    release_context.add_argument("--receipt-id", action="append", required=True)
+    release_context.set_defaults(func=command_release_context)
+
+    dead_letter_context = subparsers.add_parser("dead-letter-context")
+    add_context(dead_letter_context)
+    dead_letter_context.add_argument("--agent-id", required=True)
+    dead_letter_context.add_argument("--delivery-id", required=True)
+    dead_letter_context.add_argument("--reason", required=True)
+    dead_letter_context.add_argument("--confirm", action="store_true")
+    dead_letter_context.set_defaults(func=command_dead_letter_context)
 
     list_context_cursors = subparsers.add_parser("list-context-cursors")
     add_context(list_context_cursors)
     list_context_cursors.add_argument("--limit", type=int, default=50)
     list_context_cursors.set_defaults(func=command_list_context_cursors)
+
+    delivery_health = subparsers.add_parser("context-delivery-health")
+    add_context(delivery_health)
+    delivery_health.add_argument("--context-only", action="store_true")
+    delivery_health.set_defaults(func=command_context_delivery_health)
 
     agent_brief = subparsers.add_parser("agent-brief")
     add_context(agent_brief)
@@ -1120,7 +1213,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_brief.add_argument("--since-event-id", type=int, default=None)
     agent_brief.add_argument("--limit", type=int, default=20)
     agent_brief.add_argument("--graph-limit", type=int, default=30)
-    agent_brief.add_argument("--no-ack", action="store_true")
+    agent_brief.add_argument("--consumer-instance-id", default="")
+    agent_brief.add_argument("--lease-seconds", type=float, default=60.0)
+    agent_brief.add_argument(
+        "--observe-only",
+        action="store_true",
+        help="Hydrate recall and graph without leasing context events.",
+    )
     agent_brief.set_defaults(func=command_agent_brief)
 
     enter_cortex = subparsers.add_parser("enter-cortex")

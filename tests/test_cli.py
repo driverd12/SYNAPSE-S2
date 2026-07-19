@@ -6,8 +6,10 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 from memory_store import DurableMemoryStore
+from mlx_backend import SpikingAttentionBackend
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -540,6 +542,9 @@ class SynapseCliTests(unittest.TestCase):
         self.assertLessEqual(start_payload["score"], 100)
         self.assertTrue(start_payload["brief_sections"])
         self.assertEqual(start_payload["receipt"]["action"], "start-work")
+        self.assertFalse(start_payload["agent_brief"]["claim_events"])
+        self.assertEqual(start_payload["agent_brief"]["deliveries"], [])
+        self.assertFalse(start_payload["agent_brief"]["ack_required"])
         self.assertEqual(health_payload["action"], "context-health")
         self.assertEqual(health_payload["receipt"]["action"], "context-health")
         self.assertEqual(hygiene_payload["action"], "memory-hygiene")
@@ -1068,18 +1073,21 @@ class SynapseCliTests(unittest.TestCase):
                 "pull-context",
                 "--context",
                 "demo",
-                "--since-event-id",
-                "0",
+                "--agent-id",
+                "codex-desktop",
+                "--consumer-instance-id",
+                "cli-test-instance",
                 state_path=state_path,
             )
+            receipt_id = json.loads(pull.stdout)["deliveries"][0]["receipt_id"]
             ack = self.run_cli(
                 "ack-context",
                 "--context",
                 "demo",
                 "--agent-id",
-                "cli-test",
-                "--last-event-id",
-                str(event_id),
+                "codex-desktop",
+                "--receipt-id",
+                receipt_id,
                 state_path=state_path,
             )
             cursors = self.run_cli(
@@ -1097,8 +1105,70 @@ class SynapseCliTests(unittest.TestCase):
             json.loads(pull.stdout)["events"][0]["payload"]["tag"],
             "cli-published-memory",
         )
-        self.assertEqual(json.loads(ack.stdout)["agent_id"], "cli-test")
-        self.assertEqual(json.loads(cursors.stdout)["cursors"][0]["agent_id"], "cli-test")
+        self.assertEqual(json.loads(ack.stdout)["agent_id"], "codex-desktop")
+        self.assertEqual(
+            json.loads(ack.stdout)["cursor"]["last_event_id"],
+            event_id,
+        )
+        self.assertEqual(
+            json.loads(cursors.stdout)["cursors"][0]["agent_id"],
+            "codex-desktop",
+        )
+
+    def test_implicit_cli_consumers_are_nonce_fenced_per_backend_instance(self):
+        import synapse_cli
+
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            first_backend = SpikingAttentionBackend(
+                dimension=8,
+                num_neurons=8,
+                default_top_k=2,
+                compile_graph=False,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            second_backend = SpikingAttentionBackend(
+                dimension=8,
+                num_neurons=8,
+                default_top_k=2,
+                compile_graph=False,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            first_backend.publish_context_event(
+                context_id="demo",
+                source_surface="cli-test",
+                event_type="nonce-fencing",
+                summary="Do not share an active receipt across CLI instances.",
+                agent_targets=["codex-desktop"],
+            )
+            args = mock.Mock(
+                context="demo",
+                agent_id="codex-desktop",
+                consumer_instance_id="",
+                limit=1,
+                lease_seconds=60.0,
+            )
+            with mock.patch(
+                "synapse_cli.build_backend",
+                side_effect=[first_backend, second_backend],
+            ):
+                first = synapse_cli.command_pull_context(args)
+                second = synapse_cli.command_pull_context(args)
+
+        self.assertNotEqual(
+            first["consumer_instance_id"],
+            second["consumer_instance_id"],
+        )
+        self.assertRegex(
+            first["consumer_instance_id"],
+            r"^backend-\d+-[0-9a-f]{12}$",
+        )
+        self.assertEqual(first["delivery_count"], 1)
+        self.assertEqual(second["delivery_count"], 0)
+        self.assertIsNotNone(second["blocking_delivery"])
 
     def test_cli_agent_brief_hydrates_context_and_advances_cursor(self):
         with TemporaryDirectory() as tmp:
@@ -1122,9 +1192,23 @@ class SynapseCliTests(unittest.TestCase):
                 "--context",
                 "demo",
                 "--agent-id",
-                "cli-agent",
+                "codex-desktop",
+                "--consumer-instance-id",
+                "cli-agent-instance",
                 "--prompt",
                 "CLI context deployments",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            first_payload = json.loads(first.stdout)
+            ack = self.run_cli(
+                "ack-context",
+                "--context",
+                "demo",
+                "--agent-id",
+                "codex-desktop",
+                "--receipt-id",
+                first_payload["deliveries"][0]["receipt_id"],
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1133,7 +1217,9 @@ class SynapseCliTests(unittest.TestCase):
                 "--context",
                 "demo",
                 "--agent-id",
-                "cli-agent",
+                "codex-desktop",
+                "--consumer-instance-id",
+                "cli-agent-instance",
                 "--prompt",
                 "CLI context deployments",
                 state_path=state_path,
@@ -1142,13 +1228,15 @@ class SynapseCliTests(unittest.TestCase):
 
         self.assertEqual(remember.returncode, 0, remember.stderr)
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(ack.returncode, 0, ack.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
-        first_payload = json.loads(first.stdout)
         second_payload = json.loads(second.stdout)
         self.assertEqual(first_payload["action"], "agent-context-hydrate")
         self.assertEqual(first_payload["new_event_count"], 1)
         self.assertEqual(first_payload["latest_event_id"], event_id)
-        self.assertEqual(first_payload["ack"]["agent_id"], "cli-agent")
+        self.assertIsNone(first_payload["ack"])
+        self.assertTrue(first_payload["ack_required"])
+        self.assertEqual(json.loads(ack.stdout)["acknowledged_count"], 1)
         self.assertIn("cli-agent-brief-memory", first_payload["briefing_markdown"])
         self.assertIn("cli-agent-brief-memory", first_payload["recall_result"])
         self.assertIn("payload_summary", first_payload["events"][0])

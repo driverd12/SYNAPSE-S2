@@ -949,7 +949,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         status = backend.status(context_id="demo")
 
         self.assertTrue(event["published"])
-        self.assertEqual(event["delivery_mode"], "durable-mcp-pull")
+        self.assertEqual(event["delivery_mode"], "leased-at-least-once")
         self.assertEqual(event["agent_targets"], ["mcp-clients", "codex-desktop", "local-ide-adapters"])
         self.assertEqual(listing["events"][0]["summary"], "operator-note deployed")
         self.assertEqual(status["context_bus_context_event_count"], 1)
@@ -979,21 +979,80 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             payload={"tag": "second"},
         )
 
+        leased = backend.lease_context_events(
+            context_id="demo",
+            agent_id="codex-desktop",
+            consumer_instance_id="backend-test",
+            limit=1,
+        )
         ack = backend.ack_context_events(
             context_id="demo",
             agent_id="codex-desktop",
-            last_event_id=first["event_id"],
+            receipt_id=leased["deliveries"][0]["receipt_id"],
         )
         cursors = backend.list_context_cursors(context_id="demo")
         status = backend.status(context_id="demo")
 
         self.assertEqual(ack["agent_id"], "codex-desktop")
-        self.assertEqual(ack["last_event_id"], first["event_id"])
-        self.assertEqual(ack["latest_event_id"], second["event_id"])
-        self.assertEqual(ack["pending_event_count"], 1)
+        self.assertEqual(ack["cursor"]["last_event_id"], first["event_id"])
+        self.assertEqual(ack["cursor"]["latest_event_id"], second["event_id"])
+        self.assertEqual(ack["cursor"]["pending_event_count"], 1)
         self.assertEqual(cursors["cursor_count"], 1)
         self.assertEqual(cursors["cursors"][0]["agent_id"], "codex-desktop")
         self.assertEqual(status["context_bus_ack_cursor_count"], 1)
+
+    def test_backend_rejects_cursor_only_context_ack_even_at_zero(self):
+        backend = SpikingAttentionBackend(
+            dimension=6,
+            num_neurons=10,
+            default_top_k=2,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        with self.assertRaisesRegex(ValueError, "exact receipt_id"):
+            backend.ack_context_events(
+                context_id="demo",
+                agent_id="codex-desktop",
+                last_event_id=0,
+            )
+
+    def test_backend_status_reports_ack_tombstones_after_safe_prune(self):
+        backend = SpikingAttentionBackend(
+            dimension=6,
+            num_neurons=10,
+            default_top_k=2,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        event = backend.publish_context_event(
+            context_id="demo",
+            source_surface="unit-test",
+            event_type="tombstone-status",
+            summary="status preserves acknowledged deletion evidence",
+            agent_targets=["codex-desktop"],
+        )
+        delivery = backend.lease_context_events(
+            context_id="demo",
+            agent_id="codex-desktop",
+            consumer_instance_id="backend-tombstone-test",
+            limit=1,
+        )["deliveries"][0]
+        backend.ack_context_events(
+            context_id="demo",
+            agent_id="codex-desktop",
+            receipt_id=delivery["receipt_id"],
+        )
+        backend.memory_store.delete_context_event(
+            context_id="demo",
+            event_id=event["event_id"],
+        )
+
+        status = backend.status(context_id="demo")
+
+        self.assertEqual(status["context_bus_ack_tombstone_count"], 1)
 
     def test_agent_context_hydration_briefs_recalls_and_advances_cursor(self):
         backend = SpikingAttentionBackend(
@@ -1017,12 +1076,18 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             event_type="remember-trace",
             summary="agent-brief-memory captured and published",
             payload={"tag": registration["tag"], "memory_id": registration["memory_id"]},
+            agent_targets=["codex-hydrator"],
         )
 
         first = backend.hydrate_agent_context(
             context_id="demo",
             agent_id="codex-hydrator",
             prompt="sidecar context recall",
+        )
+        ack = backend.ack_context_events(
+            context_id="demo",
+            agent_id="codex-hydrator",
+            receipt_id=first["deliveries"][0]["receipt_id"],
         )
         second = backend.hydrate_agent_context(
             context_id="demo",
@@ -1035,14 +1100,16 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(first["agent_id"], "codex-hydrator")
         self.assertEqual(first["new_event_count"], 1)
         self.assertEqual(first["latest_event_id"], event["event_id"])
-        self.assertEqual(first["ack"]["last_event_id"], event["event_id"])
-        self.assertTrue(first["ack"]["caught_up"])
+        self.assertIsNone(first["ack"])
+        self.assertFalse(first["acknowledged"])
+        self.assertTrue(first["ack_required"])
+        self.assertEqual(ack["cursor"]["last_event_id"], event["event_id"])
         self.assertIn("agent-brief-memory captured and published", first["briefing_markdown"])
         self.assertIn("agent-brief-memory", first["recall_result"])
         self.assertEqual(first["graph_summary"]["entry_count"], 1)
         self.assertEqual(second["new_event_count"], 0)
         self.assertEqual(second["since_event_id"], event["event_id"])
-        self.assertEqual(second["ack"]["last_event_id"], event["event_id"])
+        self.assertFalse(second["ack_required"])
 
     def test_cortex_governor_enters_ticks_and_commits_typed_trace(self):
         backend = SpikingAttentionBackend(

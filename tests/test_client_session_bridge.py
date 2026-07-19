@@ -10,7 +10,7 @@ from client_session_bridge import ClientSessionBridge, ClientSessionBridgeConfig
 
 
 class ClientSessionBridgeTests(unittest.TestCase):
-    def test_start_hydrates_context_and_advances_agent_cursor_without_stdout(self):
+    def test_start_hydrates_without_claiming_or_acknowledging_hidden_events(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             memory_path = Path(tmp) / "memory.sqlite3"
@@ -54,13 +54,18 @@ class ClientSessionBridgeTests(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 hydration = bridge.start()
 
-            cursor = backend.list_context_cursors(context_id="demo")["cursors"][0]
+            cursors = backend.list_context_cursors(context_id="demo")["cursors"]
             self.assertEqual(stdout.getvalue(), "")
             self.assertEqual(hydration["action"], "agent-context-hydrate")
-            self.assertEqual(hydration["new_event_count"], 1)
-            self.assertEqual(hydration["latest_event_id"], event["event_id"])
-            self.assertEqual(cursor["agent_id"], "codex-desktop")
-            self.assertEqual(cursor["last_event_id"], event["event_id"])
+            self.assertEqual(hydration["new_event_count"], 0)
+            self.assertFalse(hydration["claim_events"])
+            self.assertFalse(hydration["acknowledged"])
+            self.assertFalse(hydration["ack_required"])
+            self.assertEqual(cursors, [])
+            self.assertEqual(
+                backend.list_context_events(context_id="demo")["events"][0]["event_id"],
+                event["event_id"],
+            )
 
     def test_start_enters_cortex_and_finish_commits_cortical_boundary_trace(self):
         with TemporaryDirectory() as tmp:

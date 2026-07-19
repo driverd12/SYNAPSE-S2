@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -346,10 +347,27 @@ class DashboardRuntime:
                 minimum=0,
                 maximum=9_999_999_999,
             )
+            before_event_id = None
+            if "before_event_id" in params:
+                before_event_id = self._int_param(
+                    params,
+                    "before_event_id",
+                    1,
+                    minimum=1,
+                    maximum=9_999_999_999,
+                )
+            order = str(params.get("order", ["asc"])[0] or "asc").strip().lower()
+            if order not in {"asc", "desc"}:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "order must be asc or desc",
+                )
             return self._json_response(
                 self.backend.list_context_events(
                     context_id=context,
                     since_event_id=since_event_id,
+                    before_event_id=before_event_id,
+                    order=order,
                     limit=limit,
                 )
             )
@@ -361,6 +379,10 @@ class DashboardRuntime:
                     context_id=context,
                     limit=limit,
                 )
+            )
+        if method == "GET" and path == "/api/context-delivery-health":
+            return self._json_response(
+                self.backend.context_delivery_health(context_id=None)
             )
         if method == "GET" and path == "/api/capture-inbox":
             return self._json_response(self.capture_daemon().status())
@@ -399,13 +421,25 @@ class DashboardRuntime:
                 )
             )
         if method == "GET" and path == "/api/start-work":
-            context = self._context_from_params(params)
-            agent_raw = str(params.get("agent_id", ["codex-desktop"])[0] or "codex-desktop")
-            prompt = str(params.get("prompt", [""])[0] or "")
+            raise DashboardError(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                "start-work leases context deliveries and now requires POST as dashboard-ui; use GET /api/context-events for observation-only reads",
+            )
+        if method == "POST" and path == "/api/start-work":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            agent_raw = str(payload.get("agent_id", "dashboard-ui") or "dashboard-ui")
+            agent_id = mlx_backend.sanitize_agent_id(agent_raw).casefold()
+            if agent_id != "dashboard-ui":
+                raise DashboardError(
+                    HTTPStatus.FORBIDDEN,
+                    "dashboard start-work may only lease the dashboard-ui delivery identity",
+                )
+            prompt = str(payload.get("prompt", "") or "")
             return self._json_response(
                 self.start_work(
                     context_id=context,
-                    agent_id=mlx_backend.sanitize_agent_id(agent_raw),
+                    agent_id=agent_id,
                     prompt=prompt,
                 )
             )
@@ -909,19 +943,155 @@ class DashboardRuntime:
         if method == "POST" and path == "/api/context-ack":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
-            agent_id = mlx_backend.sanitize_agent_id(str(payload.get("agent_id", "")))
-            try:
-                last_event_id = int(payload.get("last_event_id", 0))
-            except (TypeError, ValueError) as exc:
+            raw_agent_id = str(payload.get("agent_id", "")).strip()
+            if not raw_agent_id:
                 raise DashboardError(
                     HTTPStatus.BAD_REQUEST,
-                    "last_event_id must be an integer",
-                ) from exc
+                    "agent_id is required",
+                )
+            agent_id = mlx_backend.sanitize_agent_id(raw_agent_id).casefold()
+            if agent_id != "dashboard-ui":
+                raise DashboardError(
+                    HTTPStatus.FORBIDDEN,
+                    "dashboard context acknowledgement is restricted to dashboard-ui",
+                )
+            raw_receipts = payload.get("receipt_ids", [])
+            if isinstance(raw_receipts, str):
+                raw_receipts = [raw_receipts]
+            if not isinstance(raw_receipts, list):
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "receipt_ids must be an array",
+                )
+            receipt_ids = [
+                str(value or "").strip()
+                for value in raw_receipts
+                if str(value or "").strip()
+            ]
+            single_receipt = str(payload.get("receipt_id", "") or "").strip()
+            if single_receipt:
+                receipt_ids.append(single_receipt)
+            if not receipt_ids:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "at least one receipt_id is required",
+                )
+            receipt_ids = list(dict.fromkeys(receipt_ids))
+            if len(receipt_ids) > 500:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "at most 500 receipt_ids may be acknowledged",
+                )
             return self._json_response(
                 self.backend.ack_context_events(
                     context_id=context,
                     agent_id=agent_id,
-                    last_event_id=max(0, last_event_id),
+                    acknowledgements=[
+                        {"receipt_id": receipt_id}
+                        for receipt_id in receipt_ids
+                    ],
+                )
+            )
+        if method == "POST" and path == "/api/context-deliveries":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            raw_agent_id = str(payload.get("agent_id", "")).strip()
+            if not raw_agent_id:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "agent_id is required")
+            agent_id = mlx_backend.sanitize_agent_id(raw_agent_id).casefold()
+            if agent_id != "dashboard-ui":
+                raise DashboardError(
+                    HTTPStatus.FORBIDDEN,
+                    "dashboard context delivery is restricted to dashboard-ui",
+                )
+            try:
+                limit = min(max(int(payload.get("limit", 20)), 1), 500)
+                raw_lease_seconds = float(payload.get("lease_seconds", 60.0))
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "limit and lease_seconds must be numeric",
+                ) from exc
+            if not math.isfinite(raw_lease_seconds):
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "lease_seconds must be finite",
+                )
+            lease_seconds = min(max(raw_lease_seconds, 1.0), 3600.0)
+            return self._json_response(
+                self.backend.lease_context_events(
+                    context_id=context,
+                    agent_id=agent_id,
+                    consumer_instance_id=str(
+                        payload.get("consumer_instance_id", "") or ""
+                    ),
+                    limit=limit,
+                    lease_seconds=lease_seconds,
+                )
+            )
+        if method == "POST" and path == "/api/context-release":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            raw_agent_id = str(payload.get("agent_id", "")).strip()
+            raw_instance = str(payload.get("consumer_instance_id", "")).strip()
+            raw_receipts = payload.get("receipt_ids", [])
+            if (
+                not raw_agent_id
+                or not raw_instance
+                or not isinstance(raw_receipts, list)
+                or not raw_receipts
+            ):
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "agent_id, consumer_instance_id, and receipt_ids are required",
+                )
+            receipt_ids = list(
+                dict.fromkeys(str(value or "").strip() for value in raw_receipts)
+            )
+            if any(not value for value in receipt_ids) or len(receipt_ids) > 500:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "receipt_ids must contain between 1 and 500 non-empty values",
+                )
+            agent_id = mlx_backend.sanitize_agent_id(raw_agent_id).casefold()
+            if agent_id != "dashboard-ui":
+                raise DashboardError(
+                    HTTPStatus.FORBIDDEN,
+                    "dashboard context release is restricted to dashboard-ui",
+                )
+            return self._json_response(
+                self.backend.release_context_events(
+                    context_id=context,
+                    agent_id=agent_id,
+                    consumer_instance_id=raw_instance,
+                    receipt_ids=receipt_ids,
+                )
+            )
+        if method == "POST" and path == "/api/context-dead-letter":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            agent_id = mlx_backend.sanitize_agent_id(
+                str(payload.get("agent_id", "") or "")
+            ).casefold()
+            if agent_id != "dashboard-ui":
+                raise DashboardError(
+                    HTTPStatus.FORBIDDEN,
+                    "dashboard dead-letter quarantine is restricted to dashboard-ui",
+                )
+            delivery_id = str(payload.get("delivery_id", "") or "").strip()
+            reason = str(payload.get("reason", "") or "").strip()
+            if not delivery_id or not reason or payload.get("confirm") is not True:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "delivery_id, reason, and confirm=true are required",
+                )
+            return self._json_response(
+                self.backend.dead_letter_context_delivery(
+                    context_id=context,
+                    agent_id=agent_id,
+                    delivery_id=delivery_id,
+                    reason=reason,
+                    confirm=True,
                 )
             )
         if method == "POST" and path == "/api/quick-prune":
@@ -1629,6 +1799,36 @@ class DashboardRuntime:
                 detail=str(exc),
                 repair="Run memory-integrity from the project virtualenv and inspect SQLite.",
             )
+        try:
+            delivery_health = self.backend.context_delivery_health(context_id=None)
+            add_check(
+                "context_delivery",
+                label="Context delivery receipts",
+                status=str(delivery_health.get("status") or "blocked"),
+                detail=(
+                    f"{delivery_health.get('delivery_count', 0)} deliveries, "
+                    f"{delivery_health.get('receipt_count', 0)} attempt receipts, "
+                    f"{delivery_health.get('ack_tombstone_count', 0)} ACK tombstones, "
+                    f"{delivery_health.get('retry_exhausted_count', 0)} retry-exhausted, "
+                    f"{delivery_health.get('dead_letter_count', 0)} dead-lettered, "
+                    f"{delivery_health.get('structural_error_count', 0)} structural errors, "
+                    f"{delivery_health.get('expired_active_lease_count', 0)} retryable expired leases; "
+                    f"{delivery_health.get('legacy_unverified_cursor_count', 0)} legacy cursors ignored"
+                ),
+                repair=(
+                    "Inspect context delivery health, routing targets, and receipt rows; "
+                    "dead-letter only retry-exhausted deliveries with a reason and explicit "
+                    "confirmation; never replace a missing receipt with a watermark acknowledgement."
+                ),
+            )
+        except Exception as exc:
+            add_check(
+                "context_delivery",
+                label="Context delivery receipts",
+                status="blocked",
+                detail=str(exc),
+                repair="Inspect the context-delivery v2 tables and SQLite foreign keys.",
+            )
         provider_error = str(provider.get("error") or "")
         provider_type = str(provider.get("provider_type") or "")
         add_check(
@@ -1740,9 +1940,15 @@ class DashboardRuntime:
         context_id: str,
         agent_id: str,
         prompt: str = "",
+        since_event_id: int | None = None,
+        event_limit: int = 20,
+        graph_limit: int = 30,
+        claim_events: bool = True,
+        consumer_instance_id: str = "",
+        lease_seconds: float = 60.0,
     ) -> dict[str, Any]:
         context = mlx_backend.sanitize_context_id(context_id)
-        agent = mlx_backend.sanitize_agent_id(agent_id or "codex-desktop")
+        agent = mlx_backend.sanitize_agent_id(agent_id or "dashboard-ui").casefold()
         started = time.perf_counter()
         health = self.context_health(context_id=context)
         hygiene = self.memory_hygiene(context_id=context, limit=8)
@@ -1750,9 +1956,13 @@ class DashboardRuntime:
             context_id=context,
             agent_id=agent,
             prompt=prompt,
-            event_limit=20,
-            graph_limit=30,
-            acknowledge=True,
+            since_event_id=since_event_id,
+            event_limit=min(max(int(event_limit), 1), 500),
+            graph_limit=min(max(int(graph_limit), 1), 500),
+            acknowledge=False,
+            claim_events=bool(claim_events),
+            consumer_instance_id=consumer_instance_id,
+            lease_seconds=lease_seconds,
         )
         recipes = self.operator_recipes()
         cortex_state = hydrate.get("cortex_state") if isinstance(hydrate.get("cortex_state"), dict) else {}

@@ -43,7 +43,7 @@ scripts/install_client_configs.py
 scripts/install_capture_daemon.sh
 ```
 
-Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions. New SYNAPSE-S2 MCP server processes hydrate their own cursor at startup, enter a strict Cortex Governor session, and drop a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the process exits. The exit path also commits a typed `follow_up` cortical trace so the lifecycle is visible in Cortex state.
+Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions. New SYNAPSE-S2 MCP server processes perform observation-only startup hydration, enter a strict Cortex Governor session, and drop a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the process exits. Startup never leases or acknowledges unseen events. A client leases events only through an explicit hydrate/pull call and acknowledges the returned receipt ids only after successful use. The exit path also commits a typed `follow_up` cortical trace so the lifecycle is visible in Cortex state.
 
 ## Hardened local contract
 
@@ -93,11 +93,22 @@ Start Work:
   --context default \
   --agent-id codex-desktop \
   --prompt "Prepare SYNAPSE-S2 for today's operator work."
+```
+
+`start-work` is an observation-only operator overview and never leases a
+deployment. When the local agent is ready to consume durable events, run the
+receipt-bearing alternative and ACK only after consumption:
+
+```bash
 .venv/bin/python synapse_cli.py --json agent-brief \
   --mode morning \
   --context default \
   --agent-id codex-desktop \
   --prompt "Prepare SYNAPSE-S2 for today's operator work."
+.venv/bin/python synapse_cli.py --json ack-context \
+  --context default \
+  --agent-id codex-desktop \
+  --receipt-id '<receipt_id from agent-brief>'
 ```
 
 This returns a morning brief, current objective, relevant memories, open risks, recent app/session traces, recommended next actions, source memory references, current health score, memory quality score, recommended recipes, goal ledger state, and an operation receipt. If the health score is degraded or blocked, run the next two commands before trusting recall.
@@ -200,7 +211,7 @@ Event graph ingestion:
 .venv/bin/python synapse_cli.py --json ingest-text \
   --context default \
   --tag production-preflight-brief \
-  --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients can pull and acknowledge with delivery cursors." \
+  --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients pull with fenced receipts, acknowledge exactly after consumption, and track through derived delivery cursors." \
   --surprise-threshold 0.58 \
   --min-segment-sentences 1
 .venv/bin/python synapse_cli.py --json graph --context default --limit 10
@@ -217,12 +228,19 @@ Agent context hydration:
   --prompt "Prepare SYNAPSE-S2 for the next live operator session."
 ```
 
-This returns a compact Markdown briefing plus structured JSON for new deployments, recall hits, graph highlights, and an ack cursor. The client wrapper runs the same hydration automatically on MCP server startup; this command remains useful for manual diagnostics. Use raw receipts when validating the delivery protocol directly:
+This returns a compact Markdown briefing plus structured JSON for recall hits, graph highlights, and leased deployments. It does not acknowledge them. The client wrapper performs a separate observation-only hydration at MCP startup; this command remains useful for manual diagnostics. Use receipt-driven delivery directly when validating the protocol:
 
 ```bash
-.venv/bin/python synapse_cli.py --json pull-context --context default --since-event-id 0 --limit 10
-LATEST_EVENT_ID=$(.venv/bin/python synapse_cli.py --json status --context default | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["context_bus_latest_event_id"])')
-.venv/bin/python synapse_cli.py --json ack-context --context default --agent-id cli-operator --last-event-id "$LATEST_EVENT_ID"
+.venv/bin/python synapse_cli.py --json pull-context \
+  --context default \
+  --agent-id cli-operator \
+  --consumer-instance-id cli-operator-manual \
+  --limit 10
+# After the output has been consumed successfully, repeat --receipt-id for each returned receipt.
+.venv/bin/python synapse_cli.py --json ack-context \
+  --context default \
+  --agent-id cli-operator \
+  --receipt-id 'ctxrcpt_...'
 .venv/bin/python synapse_cli.py --json list-context-cursors --context default
 ```
 
@@ -435,9 +453,10 @@ Useful tool calls:
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
 | `prune_spiking_memory` | Removes a node, relationship edge, deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pulls context-bus events published by GUI and MCP write actions. |
-| `ack_spiking_context_deployments` | Records the last deployment event consumed by a local client. |
+| `ack_spiking_context_deployments` | Atomically acknowledges exact receipt ids after their deployments were consumed. |
+| `dead_letter_spiking_context_delivery` | Quarantines a retry-exhausted delivery with explicit confirmation, reason, and audit receipt. |
 | `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |
-| `hydrate_spiking_agent_context` | Hydrates a restarted client with new deployments, prompt recall, graph highlights, and an optional ack cursor update. |
+| `hydrate_spiking_agent_context` | Leases new deployments and returns prompt recall plus graph highlights; acknowledgement is a separate exact-receipt call. |
 | `enter_spiking_cortex` | Starts a governed agent session with recall and policy. |
 | `tick_spiking_cortex` | Checks the current observation, proposed action, intended files, intended tools, mutation, confidence, and sensitive-data scope before acting. |
 | `close_spiking_cortex` | Ends an active governed session after validation or handoff and publishes a lifecycle event. |

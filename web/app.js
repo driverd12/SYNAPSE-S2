@@ -3686,7 +3686,8 @@ function updateRecallScopeHelp() {
 function renderContextBus(status, deployment = null) {
   const eventCount = Number(status.context_bus_context_event_count ?? status.context_bus_event_count ?? 0);
   const latestEventId = Number(deployment?.event_id ?? status.context_bus_latest_event_id ?? 0);
-  const receiptCount = Number(status.context_bus_ack_cursor_count ?? 0);
+  const receiptCount = Number(status.context_bus_ack_receipt_count ?? 0);
+  const activeLeaseCount = Number(status.context_bus_active_lease_count ?? 0);
   const targets = Array.isArray(deployment?.agent_targets)
     ? deployment.agent_targets
     : Array.isArray(status.context_bus_agent_targets)
@@ -3695,14 +3696,14 @@ function renderContextBus(status, deployment = null) {
   const targetText = targets.length ? targets.join(", ") : "mcp-clients";
   const ack = deployment?.ack;
   const receiptText = ack
-    ? `${ack.agent_id || "agent"} acknowledged #${formatNumber(ack.last_event_id)}`
-    : `${formatNumber(receiptCount)} delivery receipts`;
+    ? `${formatNumber(ack.acknowledged_count || 0)} receipts acknowledged`
+    : `${formatNumber(receiptCount)} acknowledged / ${formatNumber(activeLeaseCount)} leased`;
   const stateText = deployment
     ? `Published event #${formatNumber(latestEventId)}`
     : `${formatNumber(eventCount)} published context updates`;
   const detailText = deployment
-    ? `${deployment.event_type || "context-update"} via ${deployment.delivery_mode || "durable-mcp-pull"} to ${targetText}; ${receiptText}`
-    : `Ready for Remember/Ingest handoffs via ${status.context_bus_delivery_mode || "durable-mcp-pull"}; ${receiptText}`;
+    ? `${deployment.event_type || "context-update"} via ${deployment.delivery_mode || "leased-at-least-once"} to ${targetText}; ${receiptText}`
+    : `Ready for Remember/Ingest handoffs via ${status.context_bus_delivery_mode || "leased-at-least-once"}; ${receiptText}`;
   elements.contextBusState.innerHTML = `
     <strong>${escapeHtml(stateText)}</strong>
     <span>${escapeHtml(detailText)}</span>
@@ -3892,13 +3893,22 @@ function runStartWork(button) {
   return withBusy(button, "Start Work", async () => {
     elements.startWorkOutput.textContent = "Generating Start Work brief...";
     const payload = await requestJson("/api/start-work", {
-      params: {
+      method: "POST",
+      body: {
         context_id: state.context,
         agent_id: "dashboard-ui",
         prompt: elements.queryInput.value.trim() || "Daily SYNAPSE-S2 operator brief",
       },
     });
-    renderStartWork(payload);
+    const renderedReceiptIds = renderStartWork(payload);
+    if (renderedReceiptIds.length) {
+      await waitForStartWorkPaint();
+      payload.context_ack = await ackContextReceipts(
+        renderedReceiptIds,
+        "dashboard-ui",
+        payload.context_id,
+      );
+    }
     return payload;
   }, { refresh: false }).catch((error) => {
     elements.startWorkOutput.textContent = `Start Work failed: ${error.message}`;
@@ -4017,6 +4027,92 @@ function renderStartWork(payload) {
       <p>${escapeHtml(section.body || "")}</p>
     </article>
   `).join("") || "No Start Work sections returned";
+  return renderStartWorkDurableEvents(payload.agent_brief || {});
+}
+
+function renderStartWorkDurableEvents(agentBrief) {
+  const deliveriesByEventId = new Map();
+  for (const delivery of Array.isArray(agentBrief.deliveries) ? agentBrief.deliveries : []) {
+    const eventId = Math.trunc(Number(delivery?.event_id) || 0);
+    const receiptId = String(delivery?.receipt_id || "").trim();
+    if (eventId > 0 && receiptId && delivery?.ack_required !== false) {
+      deliveriesByEventId.set(eventId, receiptId);
+    }
+  }
+
+  const renderedReceiptIds = [];
+  const seenReceiptIds = new Set();
+  const eventList = document.createElement("section");
+  eventList.className = "start-work-durable-events operator-output";
+  eventList.setAttribute("aria-label", "Leased durable events");
+
+  const events = Array.isArray(agentBrief.events) ? agentBrief.events : [];
+  const hiddenDeliveryCount = Math.max(0, deliveriesByEventId.size - events.length);
+  const hasMore = Boolean(agentBrief.has_more_events) || hiddenDeliveryCount > 0;
+  const heading = document.createElement("article");
+  heading.className = `brief-section ${events.length ? "ready" : "degraded"}`;
+  heading.innerHTML = `
+    <span>Durable events</span>
+    <strong>${escapeHtml(`${events.length} leased event${events.length === 1 ? "" : "s"} rendered`)}</strong>
+    <small class="brief-meta">
+      <b>${escapeHtml(hasMore ? "More remain after this page" : "Lease page complete")}</b>
+    </small>
+    <p>${escapeHtml(
+      hasMore
+        ? "More durable events remain. Consume this visible page, then run Start Work again."
+        : "Only receipts attached to the visible event rows below are acknowledged.",
+    )}</p>
+  `;
+  eventList.appendChild(heading);
+  elements.startWorkOutput.appendChild(eventList);
+
+  for (const event of events) {
+    const eventId = Math.trunc(Number(event?.event_id) || 0);
+    const eventType = String(event?.event_type || "").trim();
+    const sourceSurface = String(event?.source_surface || "").trim();
+    const summary = String(event?.summary || "").trim();
+    const deliveryReceiptId = deliveriesByEventId.get(eventId) || "";
+    const eventReceiptId = String(event?.delivery?.receipt_id || "").trim();
+    const receiptMatches = Boolean(
+      deliveryReceiptId
+      && eventReceiptId
+      && deliveryReceiptId === eventReceiptId
+    );
+    const isMeaningful = Boolean(eventId > 0 && eventType && sourceSurface && summary);
+    const receiptId = receiptMatches && isMeaningful ? deliveryReceiptId : "";
+
+    const eventRow = document.createElement("article");
+    eventRow.className = `brief-section ${receiptId ? "ready" : "degraded"}`;
+    eventRow.dataset.startWorkEventId = String(eventId || "unknown");
+    eventRow.innerHTML = `
+      <span>${escapeHtml(receiptId ? "Durable event" : "Durable event / ACK held")}</span>
+      <strong>${escapeHtml(`#${eventId || "unknown"} · ${eventType || "unknown type"} / ${sourceSurface || "unknown source"}`)}</strong>
+      <small class="brief-meta">
+        <b>${escapeHtml(receiptId ? "Visible / ACK eligible" : "Incomplete delivery metadata")}</b>
+      </small>
+      <p>${escapeHtml(summary || "No event summary was supplied; acknowledgement is being held.")}</p>
+    `;
+    eventList.appendChild(eventRow);
+
+    // A receipt becomes ACK-eligible only after its complete event row has
+    // been appended to the visible Start Work output.
+    if (receiptId && !seenReceiptIds.has(receiptId)) {
+      seenReceiptIds.add(receiptId);
+      renderedReceiptIds.push(receiptId);
+    }
+  }
+
+  return renderedReceiptIds;
+}
+
+function waitForStartWorkPaint() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame !== "function") {
+      setTimeout(resolve, 0);
+      return;
+    }
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
 }
 
 function renderContextHealth(payload) {
@@ -5388,7 +5484,7 @@ function renderContextEventLedger(deployments) {
         <div class="context-event-ledger-row">
           <div>
             <strong>#${escapeHtml(formatNumber(event.event_id))} ${escapeHtml(event.event_type || "context-update")}</strong>
-            <small>${escapeHtml(event.source_surface || "surface")} / ${escapeHtml(event.delivery_mode || deployments.delivery_mode || "durable-mcp-pull")}</small>
+            <small>${escapeHtml(event.source_surface || "surface")} / ${escapeHtml(event.delivery_mode || deployments.delivery_mode || "leased-at-least-once")}</small>
             <p>${escapeHtml(event.summary || "")}</p>
           </div>
           <span>${escapeHtml(formatNumber((event.agent_targets || []).length))} targets</span>
@@ -5855,13 +5951,17 @@ async function pullContextDeployments(sinceEventId = 0, limit = 10) {
   });
 }
 
-async function ackContextDeployment(lastEventId, agentId = "dashboard-ui") {
+async function ackContextReceipts(
+  receiptIds,
+  agentId = "dashboard-ui",
+  contextId = state.context,
+) {
   return requestJson("/api/context-ack", {
     method: "POST",
     body: {
-      context_id: state.context,
+      context_id: contextId,
       agent_id: agentId,
-      last_event_id: Math.max(0, Math.trunc(Number(lastEventId) || 0)),
+      receipt_ids: receiptIds,
     },
   });
 }
@@ -5871,9 +5971,6 @@ async function publishAwareResult(payload) {
     payload.context_bus = await pullContextDeployments(
       payload.agent_deployment.event_id - 1,
       5,
-    );
-    payload.context_ack = await ackContextDeployment(
-      payload.agent_deployment.event_id,
     );
   }
   return payload;
