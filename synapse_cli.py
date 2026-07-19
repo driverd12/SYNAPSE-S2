@@ -16,6 +16,7 @@ from mlx_backend import (
     DEFAULT_RESOURCE_TARGET_MIN_MB,
 )
 from transcript_capture import TranscriptCaptureManager
+from memory_store import DurableMemoryStore
 
 
 def _json_default(value: Any) -> str:
@@ -725,6 +726,22 @@ def command_backup_memory(args: argparse.Namespace) -> dict[str, Any]:
     return backend.backup_memory(path=args.output)
 
 
+def command_memory_integrity(args: argparse.Namespace) -> dict[str, Any]:
+    context_id = str(args.context).strip() if args.context is not None else None
+    store = DurableMemoryStore.open_existing_for_audit(args.memory_db)
+    if args.repair:
+        return store.repair_semantic_indexes(
+            context_id=context_id,
+            confirm=bool(args.confirm),
+            expected_revision=args.expected_revision,
+            sample_limit=args.sample_limit,
+        )
+    return store.audit_semantic_indexes(
+        context_id=context_id,
+        sample_limit=args.sample_limit,
+    )
+
+
 def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     status = backend.status(context_id=args.context)
@@ -827,6 +844,7 @@ def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
         context_id=args.context,
         include_apps=bool(args.include_apps),
         repair_plan=bool(args.repair_plan),
+        wait_for_semantic_audit=True,
     )
     payload["python"] = sys.version.split()[0]
     payload["executable"] = sys.executable
@@ -1295,6 +1313,41 @@ def build_parser() -> argparse.ArgumentParser:
     backup_memory = subparsers.add_parser("backup-memory")
     backup_memory.add_argument("--output", default=None)
     backup_memory.set_defaults(func=command_backup_memory)
+
+    memory_integrity = subparsers.add_parser(
+        "memory-integrity",
+        help="Audit or transactionally repair durable spike and surface-term indexes.",
+    )
+    memory_integrity.add_argument(
+        "--context",
+        default=None,
+        help="Optional context to audit; omit to verify the entire memory store.",
+    )
+    memory_integrity.add_argument(
+        "--sample-limit",
+        type=int,
+        default=20,
+        help="Maximum mismatch samples and repaired IDs to include in the receipt.",
+    )
+    memory_integrity.add_argument(
+        "--repair",
+        action="store_true",
+        help="Repair only mismatched durable index rows in one verified transaction.",
+    )
+    memory_integrity.add_argument(
+        "--confirm",
+        action="store_true",
+        help=(
+            "Required together with --repair; audit mode does not change memory "
+            "or semantic-index rows."
+        ),
+    )
+    memory_integrity.add_argument(
+        "--expected-revision",
+        default=None,
+        help="Required with --repair; copy audit_revision from the reviewed audit.",
+    )
+    memory_integrity.set_defaults(func=command_memory_integrity)
 
     preflight = subparsers.add_parser("preflight")
     add_context(preflight)

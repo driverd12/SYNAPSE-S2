@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 import time
 import subprocess
+from contextlib import closing
 
 import mlx.core as mx
 
@@ -297,7 +298,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
         # Legacy databases can contain relationship rows whose endpoint belongs
         # to another context. Local recall must not follow such an edge.
-        with sqlite3.connect(backend.memory_store.db_path) as connection:
+        with closing(sqlite3.connect(backend.memory_store.db_path)) as connection:
             connection.execute(
                 """
                 INSERT INTO memory_relationships (

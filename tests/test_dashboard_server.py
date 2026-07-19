@@ -2,11 +2,13 @@ import json
 import os
 import threading
 import unittest
+from contextlib import closing
 from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import urllib.error
 import urllib.request
+from unittest import mock
 
 from capture_daemon import write_capture_drop
 from dashboard_server import DEFAULT_CONTEXT, DashboardRuntime, SynapseDashboardServer, main
@@ -18,6 +20,104 @@ class DashboardRuntimeTests(unittest.TestCase):
     def test_dashboard_server_preserves_single_threaded_mlx_affinity(self):
         self.assertTrue(issubclass(SynapseDashboardServer, HTTPServer))
         self.assertFalse(issubclass(SynapseDashboardServer, ThreadingHTTPServer))
+
+    def test_doctor_global_audit_detects_corruption_outside_active_namespace(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            other = runtime.backend.register_trace(
+                tag="other-namespace-memory",
+                embedding=runtime.backend.embed_text("Other namespace integrity"),
+                context_id="other",
+                source_text="Other namespace integrity",
+                metadata={},
+            )
+            import sqlite3
+
+            with closing(sqlite3.connect(Path(tmp) / "memory.sqlite3")) as conn:
+                conn.execute(
+                    "DELETE FROM memory_spikes WHERE memory_id = ?",
+                    (other["memory_id"],),
+                )
+                conn.commit()
+            payload = runtime.doctor_report(
+                context_id="demo",
+                include_apps=False,
+                wait_for_semantic_audit=True,
+            )
+
+        semantic = next(
+            check for check in payload["checks"] if check["id"] == "semantic_indexes"
+        )
+        self.assertEqual(semantic["status"], "degraded")
+        self.assertIn("all namespaces", semantic["detail"])
+        self.assertIn("1 mismatched", semantic["detail"])
+
+    def test_dashboard_doctor_returns_pending_while_global_audit_runs_in_background(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            started = threading.Event()
+            release = threading.Event()
+            finished = threading.Event()
+            waiter_started = threading.Event()
+            waiter_finished = threading.Event()
+            waiter_payload: dict[str, object] = {}
+            original = runtime.backend.memory_store.audit_semantic_indexes
+
+            def delayed_audit(*args, **kwargs):
+                started.set()
+                release.wait(timeout=2.0)
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    finished.set()
+
+            def wait_for_current_audit() -> None:
+                waiter_started.set()
+                waiter_payload.update(runtime._semantic_audit_health(wait=True))
+                waiter_finished.set()
+
+            with mock.patch.object(
+                runtime.backend.memory_store,
+                "audit_semantic_indexes",
+                side_effect=delayed_audit,
+            ) as audit_mock:
+                first = runtime.doctor_report(
+                    context_id="demo",
+                    include_apps=False,
+                )
+                self.assertTrue(started.wait(timeout=1.0))
+                first_semantic = next(
+                    check
+                    for check in first["checks"]
+                    if check["id"] == "semantic_indexes"
+                )
+                self.assertEqual(first_semantic["status"], "degraded")
+                self.assertIn("pending True", first_semantic["detail"])
+                waiter = threading.Thread(
+                    target=wait_for_current_audit,
+                    daemon=True,
+                )
+                waiter.start()
+                self.assertTrue(waiter_started.wait(timeout=1.0))
+                self.assertFalse(waiter_finished.is_set())
+                release.set()
+                self.assertTrue(finished.wait(timeout=2.0))
+                self.assertTrue(waiter_finished.wait(timeout=2.0))
+                waiter.join(timeout=2.0)
+                self.assertEqual(audit_mock.call_count, 1)
+                self.assertEqual(waiter_payload.get("status"), "ready")
+                second = runtime.doctor_report(
+                    context_id="demo",
+                    include_apps=False,
+                )
+
+            second_semantic = next(
+                check
+                for check in second["checks"]
+                if check["id"] == "semantic_indexes"
+            )
+            self.assertEqual(second_semantic["status"], "ready")
+            self.assertIn("pending False", second_semantic["detail"])
 
     def make_runtime(self, tmp: str) -> DashboardRuntime:
         backend = SpikingAttentionBackend(
@@ -1429,6 +1529,8 @@ class DashboardRuntimeTests(unittest.TestCase):
                 )
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     urllib.request.urlopen(blocked_request, timeout=10)
+                with closing(raised.exception) as blocked_response:
+                    self.assertEqual(blocked_response.code, 403)
                 allowed_request = urllib.request.Request(
                     url,
                     data=json.dumps({"context_id": "demo", "enabled": False}).encode(),
@@ -1445,7 +1547,6 @@ class DashboardRuntimeTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
-        self.assertEqual(raised.exception.code, 403)
         self.assertFalse(allowed_payload["effective_enabled"])
 
     def test_remember_endpoint_persists_new_memory(self):

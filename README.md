@@ -199,6 +199,7 @@ Real memory is stored locally in `.synapse_s2/memory.sqlite3`. Runtime toggles a
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode`, `metadata.semantic_surprise_score`, and `metadata.lexical_surprise_score`, so operators can tell whether a boundary was cut by semantic embedding distance or by lexical fallback.
 SQLite maintains a durable sparse spike index and a durable surface-term index for prompt recall. The surface index is built from tags, display labels, display summaries, semantic facets, detail badges, keywords, and bounded source text, and existing memory databases are backfilled automatically on startup.
+Compound entry/index/event writes use explicit SQLite transactions with `FULL` synchronous durability by default. Set `SYNAPSE_S2_SQLITE_DURABILITY=balanced` only when measured throughput is more important than retaining the latest committed transaction through sudden power loss.
 
 Inspect, export, and back up the memory store:
 
@@ -210,6 +211,40 @@ Inspect, export, and back up the memory store:
 .venv/bin/python synapse_cli.py --json backup-memory \
   --output .synapse_s2/default-memory-backup.sqlite3
 ```
+
+Audit derived recall indexes before relying on Doctor or after any interrupted,
+disk-full, or legacy write. Audit mode opens the existing database read-only,
+does not apply schema migrations, and returns a content-bound `audit_revision`:
+
+```bash
+.venv/bin/python synapse_cli.py --json memory-integrity --context default
+```
+
+If the report is `degraded` and `repairable` is true, review its mismatch
+samples and pass that exact revision into the confirmed repair:
+
+```bash
+.venv/bin/python synapse_cli.py --json memory-integrity \
+  --context default \
+  --repair \
+  --confirm \
+  --expected-revision '<audit_revision>'
+```
+
+Repair refuses stale plans and malformed canonical source data. Before changing
+an index it drains cooperating dashboard, capture, MCP, and CLI writers; verifies
+enough free-space headroom; creates a private, SHA-256 recorded SQLite safety
+snapshot; and verifies `quick_check` and foreign keys. It then repairs only
+affected rows (including missing derived-index schema) in one bounded writer
+transaction, bumps the durable semantic-index generation so every process cache
+invalidates, writes a target-digested maintenance receipt, and performs a full
+post-repair audit. If planning, backup, or commit fails, the transaction rolls
+back and the unused attempt backup is removed.
+
+Dashboard Doctor audits all namespaces, not only the active selector. The full
+scan refreshes in a background worker and Doctor returns a bounded pending or
+age-stamped cached state so the single-thread MLX request loop stays responsive;
+the CLI Doctor waits for a current authoritative audit.
 
 Connected MCP clients now hydrate automatically when their SYNAPSE-S2 server process starts. To run the same hydration manually for diagnostics:
 

@@ -10,6 +10,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import uuid
@@ -39,6 +40,7 @@ MAX_TEXT_BYTES = 64 * 1024
 DEFAULT_CONTEXT = os.getenv("SYNAPSE_S2_DASHBOARD_CONTEXT", "default")
 CONFIRMATION_TOKEN_TTL_SECONDS = 120.0
 MAX_CONFIRMATION_TOKENS = 256
+SEMANTIC_AUDIT_CACHE_TTL_SECONDS = 300.0
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; "
@@ -71,6 +73,13 @@ class DashboardRuntime:
         self.started_at = time.time()
         self._system_info_cache: dict[str, Any] | None = None
         self._confirmation_tokens: dict[str, dict[str, Any]] = {}
+        self._semantic_audit_cache: dict[str, Any] | None = None
+        self._semantic_audit_cached_at = 0.0
+        self._semantic_audit_running = False
+        self._semantic_audit_lock = threading.Lock()
+        self._semantic_audit_condition = threading.Condition(
+            self._semantic_audit_lock
+        )
 
     @property
     def backend(self) -> mlx_backend.SpikingAttentionBackend:
@@ -89,6 +98,140 @@ class DashboardRuntime:
             root=os.getenv("SYNAPSE_S2_CAPTURE_ROOT"),
             backend=self.backend,
         )
+
+    def _refresh_semantic_audit(self) -> None:
+        try:
+            payload = self.backend.memory_store.audit_semantic_indexes(
+                context_id=None,
+                sample_limit=5,
+            )
+        except Exception as exc:
+            LOGGER.exception("background semantic-index audit failed")
+            payload = {
+                "action": "semantic-index-audit",
+                "status": "blocked",
+                "checked_memory_count": 0,
+                "mismatched_memory_count": 0,
+                "audit_revision": "unavailable",
+                "repairable": False,
+                "error": str(exc),
+            }
+        with self._semantic_audit_condition:
+            self._semantic_audit_cache = dict(payload)
+            self._semantic_audit_cached_at = time.time()
+            self._semantic_audit_running = False
+            self._semantic_audit_condition.notify_all()
+
+    def _semantic_audit_health(self, *, wait: bool) -> dict[str, Any]:
+        if wait:
+            run_refresh = False
+            with self._semantic_audit_condition:
+                if self._semantic_audit_running:
+                    deadline = time.monotonic() + 60.0
+                    while self._semantic_audit_running:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                "timed out waiting for semantic-index audit"
+                            )
+                        self._semantic_audit_condition.wait(timeout=remaining)
+                else:
+                    self._semantic_audit_running = True
+                    run_refresh = True
+            if run_refresh:
+                self._refresh_semantic_audit()
+            with self._semantic_audit_condition:
+                payload = dict(self._semantic_audit_cache or {})
+                cached_at = self._semantic_audit_cached_at
+            payload.update(
+                {
+                    "audit_cached": True,
+                    "audit_cache_age_seconds": max(0.0, time.time() - cached_at),
+                    "audit_pending": False,
+                }
+            )
+            return payload
+
+        now = time.time()
+        worker: threading.Thread | None = None
+        with self._semantic_audit_condition:
+            cached = (
+                dict(self._semantic_audit_cache)
+                if self._semantic_audit_cache is not None
+                else None
+            )
+            cache_age = (
+                max(0.0, now - self._semantic_audit_cached_at)
+                if cached is not None
+                else float("inf")
+            )
+            if cached is not None and cache_age <= SEMANTIC_AUDIT_CACHE_TTL_SECONDS:
+                cached.update(
+                    {
+                        "audit_cached": True,
+                        "audit_cache_age_seconds": cache_age,
+                        "audit_pending": self._semantic_audit_running,
+                    }
+                )
+                return cached
+            if not self._semantic_audit_running:
+                self._semantic_audit_running = True
+                worker = threading.Thread(
+                    target=self._refresh_semantic_audit,
+                    name="synapse-semantic-audit",
+                    daemon=True,
+                )
+                worker.start()
+
+        # Tiny stores usually complete inside this bounded grace period. Large
+        # stores return immediately as pending so the single-thread HTTP loop
+        # remains responsive while the daemon worker refreshes the global audit.
+        if worker is not None:
+            worker.join(timeout=0.05)
+        with self._semantic_audit_condition:
+            refreshed = (
+                dict(self._semantic_audit_cache)
+                if self._semantic_audit_cache is not None
+                else None
+            )
+            refreshed_age = (
+                max(0.0, time.time() - self._semantic_audit_cached_at)
+                if refreshed is not None
+                else float("inf")
+            )
+            pending = self._semantic_audit_running
+        if refreshed is not None and refreshed_age <= SEMANTIC_AUDIT_CACHE_TTL_SECONDS:
+            refreshed.update(
+                {
+                    "audit_cached": True,
+                    "audit_cache_age_seconds": refreshed_age,
+                    "audit_pending": pending,
+                }
+            )
+            return refreshed
+        if refreshed is not None:
+            refreshed["status"] = (
+                "blocked" if refreshed.get("status") == "blocked" else "degraded"
+            )
+            refreshed.update(
+                {
+                    "audit_cached": True,
+                    "audit_cache_age_seconds": refreshed_age,
+                    "audit_pending": True,
+                    "audit_stale": True,
+                }
+            )
+            return refreshed
+        return {
+            "action": "semantic-index-audit",
+            "status": "degraded",
+            "checked_memory_count": 0,
+            "mismatched_memory_count": 0,
+            "audit_revision": "pending",
+            "repairable": False,
+            "audit_cached": False,
+            "audit_pending": True,
+        }
 
     def handle(
         self,
@@ -1416,6 +1559,7 @@ class DashboardRuntime:
         context_id: str,
         include_apps: bool = True,
         repair_plan: bool = True,
+        wait_for_semantic_audit: bool = False,
     ) -> dict[str, Any]:
         context = mlx_backend.sanitize_context_id(context_id)
         started = time.perf_counter()
@@ -1452,10 +1596,39 @@ class DashboardRuntime:
         add_check(
             "memory_db",
             label="SQLite memory",
-            status="ready" if memory_path else "blocked",
+            status="ready" if memory_path.is_file() else "blocked",
             detail=str(memory_path),
             repair="Set SYNAPSE_S2_MEMORY_DB to a writable local SQLite path.",
         )
+        try:
+            semantic_indexes = self._semantic_audit_health(
+                wait=wait_for_semantic_audit,
+            )
+            semantic_status = str(semantic_indexes.get("status") or "blocked")
+            add_check(
+                "semantic_indexes",
+                label="Semantic indexes",
+                status=semantic_status,
+                detail=(
+                    f"all namespaces: {semantic_indexes.get('checked_memory_count', 0)} checked, "
+                    f"{semantic_indexes.get('mismatched_memory_count', 0)} mismatched; "
+                    f"revision {semantic_indexes.get('audit_revision', 'unknown')}; "
+                    f"active namespace {context}; "
+                    f"pending {bool(semantic_indexes.get('audit_pending'))}"
+                ),
+                repair=(
+                    "Run memory-integrity, review its audit_revision, then run "
+                    "memory-integrity --repair --confirm --expected-revision <revision>."
+                ),
+            )
+        except Exception as exc:
+            add_check(
+                "semantic_indexes",
+                label="Semantic indexes",
+                status="blocked",
+                detail=str(exc),
+                repair="Run memory-integrity from the project virtualenv and inspect SQLite.",
+            )
         provider_error = str(provider.get("error") or "")
         provider_type = str(provider.get("provider_type") or "")
         add_check(

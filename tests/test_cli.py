@@ -1,9 +1,13 @@
 import json
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+
+from memory_store import DurableMemoryStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +90,97 @@ class SynapseCliTests(unittest.TestCase):
         self.assertNotIn("seed-demo", help_result.stdout)
         self.assertNotEqual(invalid_result.returncode, 0)
         self.assertIn("invalid choice", invalid_result.stderr)
+
+    def test_cli_memory_integrity_audits_and_requires_confirmed_repair(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            store = DurableMemoryStore(memory_path)
+            entry = store.upsert_entry(
+                tag="cli-index-repair",
+                context_id="demo",
+                source_text="Durable operator evidence.",
+                metadata={"display_label": "Operator evidence"},
+                embedding_dimensions=8,
+                spike_indices=[1, 2, 3],
+                neuron_indices=[1, 2],
+            )
+            with closing(sqlite3.connect(memory_path)) as conn:
+                conn.execute(
+                    "DELETE FROM memory_spikes WHERE memory_id = ? AND spike_index = ?",
+                    (entry["memory_id"], 2),
+                )
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = 'memory_spikes_v1'"
+                )
+                conn.commit()
+
+            audit = self.run_cli(
+                "memory-integrity",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            audit_payload = json.loads(audit.stdout)
+            unconfirmed = self.run_cli(
+                "memory-integrity",
+                "--context",
+                "demo",
+                "--repair",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            stale = self.run_cli(
+                "memory-integrity",
+                "--context",
+                "demo",
+                "--repair",
+                "--confirm",
+                "--expected-revision",
+                "stale-revision",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            with closing(sqlite3.connect(memory_path)) as conn:
+                pre_repair_spikes = conn.execute(
+                    "SELECT spike_index FROM memory_spikes WHERE memory_id = ? ORDER BY 1",
+                    (entry["memory_id"],),
+                ).fetchall()
+                pre_repair_marker = conn.execute(
+                    "SELECT 1 FROM store_migrations WHERE key = 'memory_spikes_v1'"
+                ).fetchone()
+            repaired = self.run_cli(
+                "memory-integrity",
+                "--context",
+                "demo",
+                "--repair",
+                "--confirm",
+                "--expected-revision",
+                audit_payload["audit_revision"],
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            verified = self.run_cli(
+                "memory-integrity",
+                "--context",
+                "demo",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(audit.returncode, 0, audit.stderr)
+        self.assertEqual(audit_payload["status"], "degraded")
+        self.assertNotEqual(unconfirmed.returncode, 0)
+        self.assertIn("requires confirm=True", unconfirmed.stdout)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("repair plan is stale", stale.stdout)
+        self.assertEqual(pre_repair_spikes, [(1,), (3,)])
+        self.assertIsNone(pre_repair_marker)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        self.assertEqual(json.loads(repaired.stdout)["repaired_memory_count"], 1)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(json.loads(verified.stdout)["status"], "ready")
 
     def test_cli_remembers_queries_and_toggles_text_context(self):
         with TemporaryDirectory() as tmp:
