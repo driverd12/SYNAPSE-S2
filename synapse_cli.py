@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from capture_daemon import CaptureInboxDaemon, write_capture_drop
+from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
 import mlx_backend
 from mlx_backend import (
     DEFAULT_NUM_NEURONS,
@@ -257,6 +257,7 @@ def command_capture_session(args: argparse.Namespace) -> dict[str, Any]:
         surprise_threshold=args.surprise_threshold,
         min_segment_sentences=args.min_segment_sentences,
         metadata=parse_metadata(args.metadata),
+        capture_id=args.capture_id or None,
     )
 
 
@@ -280,6 +281,7 @@ def command_capture_inbox_drop(args: argparse.Namespace) -> dict[str, Any]:
     text = _text_from_args(args).strip()
     if not text:
         raise ValueError("--text or --text-file must provide content")
+    capture_id = args.capture_id or new_capture_id()
     drop_path = write_capture_drop(
         root=args.capture_root,
         context_id=args.context,
@@ -287,6 +289,7 @@ def command_capture_inbox_drop(args: argparse.Namespace) -> dict[str, Any]:
         speaker=args.speaker,
         text=text,
         metadata=parse_metadata(args.metadata),
+        capture_id=capture_id,
     )
     return {
         "action": "capture-inbox-drop",
@@ -294,6 +297,8 @@ def command_capture_inbox_drop(args: argparse.Namespace) -> dict[str, Any]:
         "context_id": mlx_backend.sanitize_context_id(args.context),
         "source_tag": mlx_backend.sanitize_tag(args.tag).replace(" ", "-"),
         "speaker": mlx_backend.sanitize_agent_id(args.speaker),
+        "capture_id": capture_id,
+        "capture_protocol": "capture.v2",
     }
 
 
@@ -348,6 +353,7 @@ def command_capture_clipboard(args: argparse.Namespace) -> dict[str, Any]:
         source_tag=args.tag,
         speaker=args.speaker,
         metadata=parse_metadata(args.metadata),
+        capture_id=args.capture_id or None,
     )
 
 
@@ -378,6 +384,7 @@ def command_app_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         connection_id=args.connection_id,
         confirmed=bool(args.confirm),
         metadata=parse_metadata(args.metadata),
+        capture_id=args.capture_id or None,
     )
 
 
@@ -733,6 +740,8 @@ def command_wrap_session(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.source_tag:
         payload["source_tag"] = args.source_tag
+    if args.capture_id:
+        payload["capture_id"] = args.capture_id
     if args.preview:
         return _dashboard_runtime_from_args(args).wrap_session_preview(payload)
     if not args.confirm:
@@ -1022,6 +1031,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture_session.add_argument("--text", default="")
     capture_session.add_argument("--text-file", default=None)
     capture_session.add_argument("--metadata", default=None)
+    capture_session.add_argument(
+        "--capture-id",
+        default="",
+        help="reuse an s2cap_ id only when retrying the same logical capture",
+    )
     capture_session.add_argument("--surprise-threshold", type=float, default=0.5)
     capture_session.add_argument("--min-segment-sentences", type=int, default=1)
     capture_session.set_defaults(func=command_capture_session)
@@ -1045,6 +1059,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture_inbox_drop.add_argument("--text-file", default=None)
     capture_inbox_drop.add_argument("--metadata", default=None)
     capture_inbox_drop.add_argument("--capture-root", default=None)
+    capture_inbox_drop.add_argument(
+        "--capture-id",
+        default="",
+        help="reuse an s2cap_ id only when retrying the same logical drop",
+    )
     capture_inbox_drop.set_defaults(func=command_capture_inbox_drop)
 
     capture_inbox_status = subparsers.add_parser("capture-inbox-status")
@@ -1088,6 +1107,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture_clipboard.add_argument("--text-file", default=None)
     capture_clipboard.add_argument("--metadata", default=None)
     capture_clipboard.add_argument("--capture-root", default=None)
+    capture_clipboard.add_argument(
+        "--capture-id",
+        default="",
+        help="reuse an s2cap_ id only when retrying the same logical capture",
+    )
     capture_clipboard.set_defaults(func=command_capture_clipboard)
 
     app_list = subparsers.add_parser("app-list")
@@ -1115,6 +1139,11 @@ def build_parser() -> argparse.ArgumentParser:
     app_snapshot.add_argument("--connection-id", required=True)
     app_snapshot.add_argument("--metadata", default=None)
     app_snapshot.add_argument("--capture-root", default=None)
+    app_snapshot.add_argument(
+        "--capture-id",
+        default="",
+        help="reuse an s2cap_ id only when retrying the same logical snapshot",
+    )
     app_snapshot.add_argument("--confirm", action="store_true")
     app_snapshot.set_defaults(func=command_app_snapshot)
 
@@ -1374,6 +1403,11 @@ def build_parser() -> argparse.ArgumentParser:
     wrap_session.add_argument("--text", default="")
     wrap_session.add_argument("--text-file", default=None)
     wrap_session.add_argument("--operation-log-json", default="")
+    wrap_session.add_argument(
+        "--capture-id",
+        default="",
+        help="reuse an s2cap_ id only when retrying the same logical wrap",
+    )
     wrap_session.add_argument("--preview", action="store_true")
     wrap_session.add_argument("--confirm", action="store_true")
     wrap_session.set_defaults(func=command_wrap_session)

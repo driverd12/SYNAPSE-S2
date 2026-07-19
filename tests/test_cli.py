@@ -939,7 +939,53 @@ class SynapseCliTests(unittest.TestCase):
             any(entry["tag"].startswith("cli-magic-event") for entry in graph_payload["entries"])
         )
         self.assertTrue(
-            all("sk-test-secret123" not in entry["source_text"] for entry in graph_payload["entries"])
+            all(
+                "sk-test-secret123" not in entry["source_text"]
+                for entry in graph_payload["entries"]
+            )
+        )
+
+    def test_cli_capture_session_replays_supplied_capture_id(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            capture_id = "s2cap_" + ("9" * 32)
+            args = (
+                "capture-session",
+                "--context",
+                "demo",
+                "--tag",
+                "cli-retry",
+                "--speaker",
+                "codex",
+                "--text",
+                "Thread: CLI retry. Event: one supplied operation ID commits once.",
+                "--capture-id",
+                capture_id,
+            )
+
+            first = self.run_cli(
+                *args,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            replay = self.run_cli(
+                *args,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        first_payload = json.loads(first.stdout)
+        replay_payload = json.loads(replay.stdout)
+        self.assertEqual(first_payload["capture_id"], capture_id)
+        self.assertEqual(replay_payload["capture_id"], capture_id)
+        self.assertFalse(first_payload["idempotent_replay"])
+        self.assertTrue(replay_payload["idempotent_replay"])
+        self.assertEqual(
+            first_payload["agent_deployment"]["event_id"],
+            replay_payload["agent_deployment"]["event_id"],
         )
 
     def test_cli_transcript_source_register_poll_and_clipboard_capture(self):

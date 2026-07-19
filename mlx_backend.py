@@ -16,7 +16,7 @@ from typing import Any
 
 from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
 from event_segmenter import BayesianSurpriseEventSegmenter
-from memory_store import DurableMemoryStore
+from memory_store import CAPTURE_ID_RE, CAPTURE_PROTOCOL_VERSION, DurableMemoryStore
 from redaction import redact_capture_text, redact_sensitive_value
 
 try:
@@ -65,6 +65,13 @@ CONSOLIDATION_PHASES = (
 DEFAULT_AGENT_TARGETS = ("mcp-clients", "codex-desktop", "local-ide-adapters")
 CONTEXT_BUS_DELIVERY_MODE = "leased-at-least-once"
 CONTEXT_BUS_PROTOCOL_VERSION = "context-delivery.v2"
+CAPTURE_UNTRUSTED_DIGEST_KEYS = {
+    "input_sha256",
+    "raw_input_sha256",
+    "raw_sha256",
+    "raw_text_sha256",
+    "payload_sha256",
+}
 CONSUMER_GROUPS_BY_AGENT = {
     "codex-desktop": ("mcp-clients", "local-ide-adapters"),
     "claude-desktop": ("mcp-clients", "local-ide-adapters"),
@@ -3967,6 +3974,731 @@ class SpikingAttentionBackend:
                 badges.append(value)
         return badges[:4]
 
+    def _canonical_capture_id(self, capture_id: str | None) -> str:
+        if capture_id is None:
+            return f"s2cap_{uuid.uuid4().hex}"
+        if type(capture_id) is not str or CAPTURE_ID_RE.fullmatch(capture_id) is None:
+            raise ValueError(
+                "capture_id must use canonical s2cap_<32 lowercase hex> format"
+            )
+        return capture_id
+
+    def _capture_safe_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], int]:
+        """Return canonical, key-aware redacted metadata for a capture plan.
+
+        Capture producers historically supplied ``input_sha256`` over raw text.
+        Persisting that value would retain a stable digest of secrets even after
+        the text itself was redacted, so capture.v2 deliberately discards those
+        untrusted raw-input digest fields.
+        """
+
+        source = metadata if isinstance(metadata, dict) else {}
+        redacted_value, value_redactions = redact_sensitive_value(source)
+        try:
+            serialized = json.dumps(
+                redacted_value,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("capture metadata must be finite JSON-safe data") from exc
+        redacted_serialized, serialized_redactions = redact_capture_text(serialized)
+        try:
+            decoded = json.loads(redacted_serialized)
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive boundary
+            raise ValueError("redacted capture metadata was not valid JSON") from exc
+
+        def strip_untrusted_digests(value: Any) -> Any:
+            if isinstance(value, dict):
+                clean: dict[str, Any] = {}
+                for raw_key, item in value.items():
+                    key = str(raw_key)
+                    folded = key.strip().casefold().replace("-", "_")
+                    if (
+                        folded in CAPTURE_UNTRUSTED_DIGEST_KEYS
+                        or (folded.startswith("raw_") and "sha" in folded)
+                    ):
+                        continue
+                    clean[key] = strip_untrusted_digests(item)
+                return clean
+            if isinstance(value, list):
+                return [strip_untrusted_digests(item) for item in value]
+            return value
+
+        stripped = strip_untrusted_digests(decoded)
+        if not isinstance(stripped, dict):  # pragma: no cover - source is a dict
+            stripped = {}
+        return (
+            self._json_safe_metadata(stripped),
+            int(value_redactions + serialized_redactions),
+        )
+
+    def _capture_request_fingerprint(
+        self,
+        *,
+        text: str,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+        surprise_threshold: float,
+        min_segment_sentences: int,
+        metadata: dict[str, Any],
+    ) -> str:
+        request = {
+            "protocol": CAPTURE_PROTOCOL_VERSION,
+            "text": str(text),
+            "context_id": str(context_id),
+            "source_tag": str(source_tag),
+            "speaker": str(speaker),
+            "surprise_threshold": float(surprise_threshold),
+            "min_segment_sentences": int(min_segment_sentences),
+            "metadata": metadata,
+        }
+        canonical = json.dumps(
+            request,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _capture_operation_matches(
+        self,
+        operation: dict[str, Any],
+        *,
+        request_fingerprint: str,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+    ) -> bool:
+        return bool(
+            operation.get("protocol") == CAPTURE_PROTOCOL_VERSION
+            and operation.get("request_fingerprint") == request_fingerprint
+            and operation.get("context_id") == context_id
+            and operation.get("source_tag") == source_tag
+            and operation.get("speaker") == speaker
+        )
+
+    def _capture_response_from_operation(
+        self,
+        operation: dict[str, Any],
+        *,
+        idempotent_replay: bool,
+    ) -> dict[str, Any]:
+        raw_result = operation.get("result")
+        if not isinstance(raw_result, dict):
+            raise RuntimeError("capture receipt is missing its committed result")
+        deployment = operation.get("deployment_event")
+        if not isinstance(deployment, dict):
+            raise RuntimeError("capture receipt is missing its deployment event")
+        response = {
+            "action": "capture-conversation",
+            "status": str(raw_result.get("status") or "committed"),
+            "context_id": str(operation.get("context_id") or ""),
+            "source_tag": str(operation.get("source_tag") or ""),
+            "speaker": str(operation.get("speaker") or ""),
+            "event_count": int(raw_result.get("event_count") or 0),
+            "entry_count": int(raw_result.get("entry_count") or 0),
+            "relationship_count": int(
+                raw_result.get("relationship_count") or 0
+            ),
+            "capture_id": str(operation.get("capture_id") or ""),
+            "protocol": CAPTURE_PROTOCOL_VERSION,
+            "capture_protocol": CAPTURE_PROTOCOL_VERSION,
+            "idempotent_replay": bool(idempotent_replay),
+            "receipt_compact": True,
+            "agent_deployment": self._decorate_context_event(deployment),
+        }
+        # The request fingerprint is durable conflict-detection state, not a
+        # public content digest.  Never copy it into capture responses.
+        response.pop("request_fingerprint", None)
+        return response
+
+    def _capture_first_commit_response(
+        self,
+        *,
+        operation: dict[str, Any],
+        result: dict[str, Any],
+        deployment: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Render the rich first response without duplicating it in SQLite."""
+
+        deployment_receipt = operation.get("deployment_event")
+        if not isinstance(deployment_receipt, dict):
+            raise RuntimeError("capture receipt is missing its deployment event")
+        response = dict(result)
+        response.update(
+            {
+                "capture_id": str(operation.get("capture_id") or ""),
+                "protocol": CAPTURE_PROTOCOL_VERSION,
+                "capture_protocol": CAPTURE_PROTOCOL_VERSION,
+                "idempotent_replay": False,
+                "receipt_compact": False,
+                "agent_deployment": self._decorate_context_event(
+                    {
+                        **deployment,
+                        **deployment_receipt,
+                    }
+                ),
+            }
+        )
+        response.pop("request_fingerprint", None)
+        return response
+
+    def replay_capture_operation(
+        self,
+        capture_id: str,
+        *,
+        context_id: str | None = None,
+        source_tag: str | None = None,
+        speaker: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return an existing durable receipt without re-reading live input.
+
+        Dynamic producers such as clipboard and Accessibility adapters cannot
+        safely reconstruct a request after a successful response is lost: the
+        external surface may already have changed.  They call this lookup
+        before observing that surface again.  Optional producer identities are
+        checked against the committed operation so an ID cannot cross a
+        context/source/speaker boundary.
+        """
+
+        canonical_capture_id = self._canonical_capture_id(capture_id)
+        operation = self.memory_store.get_capture_operation(canonical_capture_id)
+        if operation is None:
+            return None
+        expected = {
+            "context_id": (
+                sanitize_context_id(context_id) if context_id is not None else None
+            ),
+            "source_tag": (
+                sanitize_tag(source_tag).replace(" ", "-")
+                if source_tag is not None
+                else None
+            ),
+            "speaker": sanitize_agent_id(speaker) if speaker is not None else None,
+        }
+        mismatched = [
+            key
+            for key, value in expected.items()
+            if value is not None and operation.get(key) != value
+        ]
+        if mismatched:
+            raise ValueError(
+                "capture_id is already committed for a different capture producer"
+            )
+        response = self._capture_response_from_operation(
+            operation,
+            idempotent_replay=True,
+        )
+        self._refresh_after_capture(committed_new_operation=False)
+        return response
+
+    def _refresh_after_capture(self, *, committed_new_operation: bool) -> None:
+        refreshes = [
+            self._refresh_registered_traces,
+            self._surface_recall_cache.clear,
+        ]
+        if committed_new_operation:
+            refreshes.append(self._persist_runtime_state)
+        refreshes.append(self._mark_activity)
+        for refresh in refreshes:
+            try:
+                refresh()
+            except Exception:
+                # The SQLite receipt is authoritative. A cache or JSON runtime
+                # refresh is repairable and must never revoke committed success.
+                LOGGER.exception("post-commit capture runtime refresh failed")
+
+    def _prepare_capture_entry(
+        self,
+        *,
+        tag: str,
+        text: str,
+        context_id: str,
+        metadata: dict[str, Any],
+        registered_at: float,
+    ) -> dict[str, Any]:
+        redacted_text, text_redactions = redact_capture_text(str(text or ""))
+        safe_metadata, metadata_redactions = self._capture_safe_metadata(metadata)
+        total_redactions = int(text_redactions + metadata_redactions)
+        if total_redactions:
+            safe_metadata = {
+                **safe_metadata,
+                "redaction_count": int(
+                    total_redactions + int(safe_metadata.get("redaction_count", 0) or 0)
+                ),
+                "raw_text_stored": False,
+            }
+        payload = self.embed_text_payload(redacted_text)
+        base_metadata = {
+            **safe_metadata,
+            "embedding_provider": payload["provenance"],
+        }
+        merged_metadata = self._json_safe_metadata(
+            {
+                **base_metadata,
+                **self._surface_node_details(
+                    tag=tag,
+                    text=redacted_text,
+                    metadata=base_metadata,
+                ),
+            }
+        )
+        clean_tag = sanitize_tag(tag)
+        embedding = self._coerce_embedding(payload["embedding"])
+        self._ensure_projection_shape(int(embedding.shape[0]))
+        sensory_spikes = self.encode_to_spikes_top_k(embedding)
+        spike_indices = self._active_indices_from_spikes(sensory_spikes)
+        neuron_indices = self._project_sensory_indices(spike_indices)
+        memory_id = self.memory_store.stable_memory_id(
+            context_id=context_id,
+            tag=clean_tag,
+        )
+        return {
+            "memory_id": memory_id,
+            "tag": clean_tag,
+            "context_id": context_id,
+            "source_text": redacted_text,
+            "metadata": merged_metadata,
+            "embedding_dimensions": int(embedding.shape[0]),
+            "spike_indices": spike_indices,
+            "neuron_indices": neuron_indices,
+            "registered_at": float(registered_at),
+        }
+
+    def _prepare_capture_relationship(
+        self,
+        *,
+        context_id: str,
+        source_memory_id: str,
+        target_memory_id: str,
+        relation_type: str,
+        weight: float,
+        evidence: dict[str, Any],
+        entries_by_id: dict[str, dict[str, Any]],
+        created_at: float,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        numeric_weight = float(weight)
+        if not math.isfinite(numeric_weight):
+            raise ValueError("capture relationship weight must be finite")
+        bounded_weight = min(max(numeric_weight, 0.0), 1.0)
+        safe_evidence, _redactions = self._capture_safe_metadata(evidence)
+        relationship_id = self.memory_store.stable_relationship_id(
+            context_id=context_id,
+            source_memory_id=source_memory_id,
+            target_memory_id=target_memory_id,
+            relation_type=relation_type,
+        )
+        spec = {
+            "relationship_id": relationship_id,
+            "context_id": context_id,
+            "source_memory_id": source_memory_id,
+            "target_memory_id": target_memory_id,
+            "relation_type": relation_type,
+            "weight": bounded_weight,
+            "evidence": safe_evidence,
+            "created_at": float(created_at),
+        }
+        source_entry = entries_by_id[source_memory_id]
+        target_entry = entries_by_id[target_memory_id]
+        rendered = {
+            **spec,
+            "source_tag": source_entry["tag"],
+            "target_tag": target_entry["tag"],
+            "weight": round(bounded_weight, 6),
+            "updated_at": float(created_at),
+        }
+        return spec, rendered
+
+    def _capture_event_memory_tag(
+        self,
+        *,
+        segment: dict[str, Any],
+        capture_id: str,
+    ) -> str:
+        base_tag = sanitize_tag(str(segment.get("tag") or "event")).replace(" ", "-")
+        return sanitize_tag(f"{base_tag}-{capture_id[6:]}").replace(" ", "-")
+
+    def _build_capture_plan(
+        self,
+        *,
+        capture_id: str,
+        text: str,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+        surprise_threshold: float,
+        min_segment_sentences: int,
+        metadata: dict[str, Any],
+        namespace_profile: dict[str, Any],
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        planned_at = time.time()
+        surprise_model = self._surprise_model_info()
+        segmenter = BayesianSurpriseEventSegmenter(
+            surprise_threshold=surprise_threshold,
+            min_segment_sentences=min_segment_sentences,
+            embedding_fn=self._embed_sentence_for_surprise,
+        )
+        segments = segmenter.segment(
+            text,
+            context_id=context_id,
+            source_tag=source_tag,
+        )
+        entries: list[dict[str, Any]] = []
+        entries_by_id: dict[str, dict[str, Any]] = {}
+        relationship_specs: list[dict[str, Any]] = []
+        relationship_results: list[dict[str, Any]] = []
+        relationship_ids: set[str] = set()
+
+        def add_entry(*, tag: str, source_text: str, entry_metadata: dict[str, Any]) -> dict[str, Any]:
+            entry = self._prepare_capture_entry(
+                tag=tag,
+                text=source_text,
+                context_id=context_id,
+                metadata=entry_metadata,
+                registered_at=planned_at,
+            )
+            existing = entries_by_id.get(str(entry["memory_id"]))
+            if existing is None:
+                entries.append(entry)
+                entries_by_id[str(entry["memory_id"])] = entry
+                return entry
+            if existing != entry:
+                raise ValueError("capture plan produced conflicting stable memory entries")
+            return existing
+
+        def add_relationship(
+            *,
+            source_memory_id: str,
+            target_memory_id: str,
+            relation_type: str,
+            weight: float,
+            evidence: dict[str, Any],
+        ) -> dict[str, Any]:
+            spec, rendered = self._prepare_capture_relationship(
+                context_id=context_id,
+                source_memory_id=source_memory_id,
+                target_memory_id=target_memory_id,
+                relation_type=relation_type,
+                weight=weight,
+                evidence=evidence,
+                entries_by_id=entries_by_id,
+                created_at=planned_at,
+            )
+            relationship_id = str(spec["relationship_id"])
+            if relationship_id not in relationship_ids:
+                relationship_ids.add(relationship_id)
+                relationship_specs.append(spec)
+                relationship_results.append(rendered)
+                return rendered
+            return next(
+                item
+                for item in relationship_results
+                if item["relationship_id"] == relationship_id
+            )
+
+        event_records: list[dict[str, Any]] = []
+        capture_metadata = self._json_safe_metadata(
+            {
+                **metadata,
+                "source": "conversation-capture",
+                "conversation_capture": True,
+                "speaker": speaker,
+                "temporal": True,
+                "capture_id": capture_id,
+                "capture_protocol": CAPTURE_PROTOCOL_VERSION,
+                "context_namespace": namespace_profile["namespace_id"],
+                "context_namespace_title": namespace_profile["namespace_title"],
+                "context_namespace_source": namespace_profile["namespace_source"],
+            }
+        )
+        for segment in segments:
+            safe_segment = dict(segment)
+            safe_segment_text, segment_redactions = redact_capture_text(
+                str(segment.get("text") or "")
+            )
+            safe_segment["text"] = safe_segment_text
+            safe_segment["keywords"] = self._surface_words(safe_segment_text)[:10]
+            if segment_redactions:
+                safe_segment["redaction_count"] = int(segment_redactions)
+                safe_segment["raw_text_stored"] = False
+            event_metadata = self._json_safe_metadata(
+                {
+                    **capture_metadata,
+                    "event_segment": True,
+                    "segment_id": safe_segment["segment_id"],
+                    "sequence_id": safe_segment["sequence_id"],
+                    "segment_index": safe_segment["segment_index"],
+                    "sentence_count": safe_segment["sentence_count"],
+                    "surprise_score": safe_segment["surprise_score"],
+                    "surprise_mode": safe_segment.get("surprise_mode", "lexical"),
+                    "lexical_surprise_score": safe_segment.get(
+                        "lexical_surprise_score",
+                        safe_segment["surprise_score"],
+                    ),
+                    "semantic_surprise_score": safe_segment.get(
+                        "semantic_surprise_score",
+                        0.0,
+                    ),
+                    "surprise_model": surprise_model,
+                    "keywords": safe_segment["keywords"],
+                    "source_tag": safe_segment["source_tag"],
+                }
+            )
+            entry = add_entry(
+                tag=self._capture_event_memory_tag(
+                    segment=safe_segment,
+                    capture_id=capture_id,
+                ),
+                source_text=safe_segment_text,
+                entry_metadata=event_metadata,
+            )
+            event_records.append(
+                {
+                    "tag": entry["tag"],
+                    "memory_id": entry["memory_id"],
+                    "segment": safe_segment,
+                }
+            )
+
+        for previous, current in zip(event_records, event_records[1:]):
+            current_segment = current["segment"]
+            add_relationship(
+                source_memory_id=str(previous["memory_id"]),
+                target_memory_id=str(current["memory_id"]),
+                relation_type="temporal_next",
+                weight=max(0.5, float(current_segment["surprise_score"])),
+                evidence={
+                    "capture_id": capture_id,
+                    "sequence_id": current_segment["sequence_id"],
+                    "source_tag": source_tag,
+                    "surprise_score": current_segment["surprise_score"],
+                    "surprise_mode": current_segment.get("surprise_mode", "lexical"),
+                    "lexical_surprise_score": current_segment.get(
+                        "lexical_surprise_score",
+                        current_segment["surprise_score"],
+                    ),
+                    "semantic_surprise_score": current_segment.get(
+                        "semantic_surprise_score",
+                        0.0,
+                    ),
+                    "surprise_model": surprise_model,
+                },
+            )
+
+        for left_index, left in enumerate(event_records):
+            left_keywords = set(left["segment"]["keywords"])
+            if not left_keywords:
+                continue
+            for right in event_records[left_index + 1 :]:
+                right_keywords = set(right["segment"]["keywords"])
+                if not right_keywords:
+                    continue
+                overlap = left_keywords & right_keywords
+                if not overlap:
+                    continue
+                weight = len(overlap) / max(1, len(left_keywords | right_keywords))
+                if weight < 0.12:
+                    continue
+                add_relationship(
+                    source_memory_id=str(left["memory_id"]),
+                    target_memory_id=str(right["memory_id"]),
+                    relation_type="semantic_overlap",
+                    weight=weight,
+                    evidence={
+                        "capture_id": capture_id,
+                        "source_tag": source_tag,
+                        "keywords": sorted(overlap),
+                    },
+                )
+
+        namespace_id = str(namespace_profile.get("namespace_id") or "default")
+        namespace_title, _namespace_redactions = redact_capture_text(
+            str(namespace_profile.get("namespace_title") or namespace_id)
+        )
+        sequence_id = str(segments[0]["sequence_id"] if segments else "")
+        namespace_metadata = {
+            "source": "context-namespace-automation",
+            "context_automation": True,
+            "context_namespace": namespace_id,
+            "context_namespace_title": namespace_title,
+            "context_namespace_source": namespace_profile.get("namespace_source", ""),
+            "source_tag": source_tag,
+            "speaker": speaker,
+            "sequence_id": sequence_id,
+            "capture_id": capture_id,
+            "capture_protocol": CAPTURE_PROTOCOL_VERSION,
+        }
+        namespace_entry = add_entry(
+            tag=f"namespace-{namespace_id}",
+            source_text=f"Namespace: {namespace_title}",
+            entry_metadata={
+                **namespace_metadata,
+                "context_namespace_anchor": True,
+                "context_memory_type": "namespace",
+            },
+        )
+        namespace_nodes: list[dict[str, Any]] = [
+            {
+                "memory_id": namespace_entry["memory_id"],
+                "tag": namespace_entry["tag"],
+                "context_memory_type": "namespace",
+                "text": namespace_entry["source_text"],
+            }
+        ]
+        typed_nodes: list[dict[str, Any]] = []
+        labels = (
+            namespace_profile.get("labels")
+            if isinstance(namespace_profile.get("labels"), dict)
+            else {}
+        )
+        for memory_type in ("topic", "goal", "objective", "event"):
+            values = labels.get(memory_type, [])
+            if not isinstance(values, list):
+                continue
+            for index, label in enumerate(values, start=1):
+                clean_label, _label_redactions = redact_capture_text(
+                    self._clean_context_label(str(label or ""))
+                )
+                clean_label = self._clean_context_label(clean_label)
+                if not clean_label:
+                    continue
+                identity_parts = [namespace_id, memory_type, str(index), clean_label]
+                digest = hashlib.sha256(
+                    "\x1f".join(identity_parts).encode("utf-8")
+                ).hexdigest()[:8]
+                if memory_type == "event":
+                    # Event nodes are temporal occurrences. Use the complete
+                    # capture identity instead of a collision-prone short hash.
+                    digest = capture_id[6:]
+                entry = add_entry(
+                    tag=f"namespace-{namespace_id}-{memory_type}-{index}-{digest}",
+                    source_text=f"{memory_type.title()}: {clean_label}",
+                    entry_metadata={
+                        **namespace_metadata,
+                        "context_memory_type": memory_type,
+                        "context_label": clean_label,
+                        "context_label_index": index,
+                    },
+                )
+                node = {
+                    "memory_id": entry["memory_id"],
+                    "tag": entry["tag"],
+                    "context_memory_type": memory_type,
+                    "text": entry["source_text"],
+                }
+                typed_nodes.append(node)
+                namespace_nodes.append(node)
+
+        namespace_relationships: list[dict[str, Any]] = []
+        for node in typed_nodes:
+            namespace_relationships.append(
+                add_relationship(
+                    source_memory_id=str(namespace_entry["memory_id"]),
+                    target_memory_id=str(node["memory_id"]),
+                    relation_type="namespace_contains",
+                    weight=0.95,
+                    evidence={
+                        "capture_id": capture_id,
+                        "namespace_id": namespace_id,
+                        "target_type": node["context_memory_type"],
+                        "source_tag": source_tag,
+                    },
+                )
+            )
+        for event in event_records:
+            namespace_relationships.append(
+                add_relationship(
+                    source_memory_id=str(namespace_entry["memory_id"]),
+                    target_memory_id=str(event["memory_id"]),
+                    relation_type="namespace_contains",
+                    weight=0.88,
+                    evidence={
+                        "capture_id": capture_id,
+                        "namespace_id": namespace_id,
+                        "target_type": "conversation_event",
+                        "source_tag": source_tag,
+                    },
+                )
+            )
+        for previous, current in zip(typed_nodes, typed_nodes[1:]):
+            namespace_relationships.append(
+                add_relationship(
+                    source_memory_id=str(previous["memory_id"]),
+                    target_memory_id=str(current["memory_id"]),
+                    relation_type="typed_context_sequence",
+                    weight=0.74,
+                    evidence={
+                        "capture_id": capture_id,
+                        "namespace_id": namespace_id,
+                        "source_type": previous["context_memory_type"],
+                        "target_type": current["context_memory_type"],
+                        "source_tag": source_tag,
+                    },
+                )
+            )
+
+        context_namespace = {
+            "namespace_id": namespace_id,
+            "namespace_title": namespace_title,
+            "namespace_source": namespace_profile.get("namespace_source", ""),
+            "context_id": context_id,
+            "source_tag": source_tag,
+            "speaker": speaker,
+            "node_count": len(namespace_nodes),
+            "source_event_count": len(event_records),
+            "relationship_count": len(namespace_relationships),
+            "nodes": namespace_nodes,
+            "relationships": namespace_relationships,
+            "automated": True,
+        }
+        result = {
+            "context_id": context_id,
+            "source_tag": source_tag,
+            "sequence_id": sequence_id,
+            "event_count": len(event_records),
+            "relationship_count": len(relationship_results),
+            "surprise_model": surprise_model,
+            "events": event_records,
+            "relationships": relationship_results,
+            "memory_db_path": str(self.memory_store.db_path),
+            "action": "capture-conversation",
+            "speaker": speaker,
+            "context_namespace": context_namespace,
+        }
+        deployment = {
+            "context_id": context_id,
+            "source_surface": "conversation-capture",
+            "event_type": "conversation-capture",
+            "summary": f"{source_tag} captured {len(event_records)} conversation events",
+            "payload": {
+                "capture_id": capture_id,
+                "protocol": CAPTURE_PROTOCOL_VERSION,
+                "source_tag": source_tag,
+                "sequence_id": sequence_id,
+                "speaker": speaker,
+                "event_count": len(event_records),
+                "relationship_count": len(relationship_results),
+                "context_namespace": context_namespace,
+                "events": event_records,
+                "relationships": relationship_results,
+            },
+            "agent_targets": list(DEFAULT_AGENT_TARGETS),
+            "created_at": planned_at,
+        }
+        return entries, relationship_specs, deployment, result
+
     def capture_conversation(
         self,
         *,
@@ -3977,74 +4709,119 @@ class SpikingAttentionBackend:
         surprise_threshold: float = 0.5,
         min_segment_sentences: int = 1,
         metadata: dict[str, Any] | None = None,
+        capture_id: str | None = None,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         source = sanitize_tag(source_tag).replace(" ", "-")
-        clean_text = str(text or "").strip()
-        if not clean_text:
+        raw_text = str(text or "").strip()
+        if not raw_text:
             raise ValueError("conversation text must not be empty")
         clean_speaker = sanitize_agent_id(speaker)
+        canonical_capture_id = self._canonical_capture_id(capture_id)
+        clean_text, text_redactions = redact_capture_text(raw_text)
+        safe_metadata, metadata_redactions = self._capture_safe_metadata(metadata)
+        total_redactions = int(text_redactions + metadata_redactions)
+        if total_redactions:
+            safe_metadata = {
+                **safe_metadata,
+                "redaction_count": int(
+                    total_redactions + int(safe_metadata.get("redaction_count", 0) or 0)
+                ),
+                "raw_text_stored": False,
+            }
+        try:
+            normalized_threshold = float(surprise_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("surprise_threshold must be a finite number") from exc
+        if not math.isfinite(normalized_threshold):
+            raise ValueError("surprise_threshold must be a finite number")
+        normalized_threshold = min(max(normalized_threshold, 0.0), 1.0)
+        if normalized_threshold == 0.0:
+            normalized_threshold = 0.0  # canonicalize negative zero for hashing
+        if isinstance(min_segment_sentences, bool):
+            raise ValueError("min_segment_sentences must be an integer")
+        try:
+            normalized_min_sentences = max(1, int(min_segment_sentences))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("min_segment_sentences must be an integer") from exc
+        request_fingerprint = self._capture_request_fingerprint(
+            text=clean_text,
+            context_id=context,
+            source_tag=source,
+            speaker=clean_speaker,
+            surprise_threshold=normalized_threshold,
+            min_segment_sentences=normalized_min_sentences,
+            metadata=safe_metadata,
+        )
+
+        committed = self.memory_store.get_capture_operation(canonical_capture_id)
+        if committed is not None:
+            if not self._capture_operation_matches(
+                committed,
+                request_fingerprint=request_fingerprint,
+                context_id=context,
+                source_tag=source,
+                speaker=clean_speaker,
+            ):
+                raise ValueError(
+                    "capture_id is already committed for a different capture request"
+                )
+            response = self._capture_response_from_operation(
+                committed,
+                idempotent_replay=True,
+            )
+            # A prior caller may have lost the response after SQLite committed
+            # but before this process refreshed its in-memory trace view.
+            self._refresh_after_capture(committed_new_operation=False)
+            return response
+
         namespace_profile = self._infer_context_namespace(
             text=clean_text,
             context_id=context,
             source_tag=source,
             speaker=clean_speaker,
-            metadata=metadata or {},
-        )
-        capture_metadata = self._json_safe_metadata(
-            {
-                **(metadata or {}),
-                "source": "conversation-capture",
-                "conversation_capture": True,
-                "speaker": clean_speaker,
-                "temporal": True,
-                "context_namespace": namespace_profile["namespace_id"],
-                "context_namespace_title": namespace_profile["namespace_title"],
-                "context_namespace_source": namespace_profile["namespace_source"],
-            }
+            metadata=safe_metadata,
         )
         try:
-            ingestion = self.ingest_text_events(
+            entries, relationships, deployment, result = self._build_capture_plan(
+                capture_id=canonical_capture_id,
                 text=clean_text,
                 context_id=context,
                 source_tag=source,
-                surprise_threshold=surprise_threshold,
-                min_segment_sentences=min_segment_sentences,
-                metadata=capture_metadata,
+                speaker=clean_speaker,
+                surprise_threshold=normalized_threshold,
+                min_segment_sentences=normalized_min_sentences,
+                metadata=safe_metadata,
+                namespace_profile=namespace_profile,
             )
-            context_namespace = self._materialize_context_namespace(
+            operation = self.memory_store.commit_capture_plan(
+                capture_id=canonical_capture_id,
+                request_fingerprint=request_fingerprint,
                 context_id=context,
                 source_tag=source,
                 speaker=clean_speaker,
-                namespace_profile=namespace_profile,
-                ingestion=ingestion,
+                entries=entries,
+                relationships=relationships,
+                deployment=deployment,
+                result=result,
             )
-            ingestion["action"] = "capture-conversation"
-            ingestion["speaker"] = clean_speaker
-            ingestion["context_namespace"] = context_namespace
-            ingestion["relationship_count"] = int(ingestion.get("relationship_count") or 0) + int(
-                context_namespace.get("relationship_count") or 0
+            idempotent_replay = bool(operation.get("idempotent_replay", False))
+            response = (
+                self._capture_response_from_operation(
+                    operation,
+                    idempotent_replay=True,
+                )
+                if idempotent_replay
+                else self._capture_first_commit_response(
+                    operation=operation,
+                    result=result,
+                    deployment=deployment,
+                )
             )
-            ingestion["relationships"].extend(context_namespace.get("relationships", []))
-            ingestion["agent_deployment"] = self.publish_context_event(
-                context_id=context,
-                source_surface="conversation-capture",
-                event_type="conversation-capture",
-                summary=(
-                    f"{source} captured {ingestion['event_count']} conversation events"
-                ),
-                payload={
-                    "source_tag": ingestion["source_tag"],
-                    "sequence_id": ingestion["sequence_id"],
-                    "speaker": clean_speaker,
-                    "event_count": ingestion["event_count"],
-                    "relationship_count": ingestion["relationship_count"],
-                    "context_namespace": context_namespace,
-                    "events": ingestion["events"],
-                    "relationships": ingestion["relationships"],
-                },
+            self._refresh_after_capture(
+                committed_new_operation=not idempotent_replay
             )
-            return ingestion
+            return response
         except Exception:
             LOGGER.exception(
                 "conversation capture failed for context_id=%s source_tag=%s",
@@ -6651,6 +7428,7 @@ def capture_conversation(
     surprise_threshold: float = 0.5,
     min_segment_sentences: int = 1,
     metadata: dict[str, Any] | None = None,
+    capture_id: str | None = None,
 ) -> dict[str, Any]:
     return get_backend().capture_conversation(
         text=text,
@@ -6660,6 +7438,7 @@ def capture_conversation(
         surprise_threshold=surprise_threshold,
         min_segment_sentences=min_segment_sentences,
         metadata=metadata,
+        capture_id=capture_id,
     )
 
 

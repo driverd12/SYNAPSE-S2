@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sqlite3
 import unittest
 from tempfile import TemporaryDirectory
@@ -19,6 +20,19 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.tmpdir = TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.state_path = Path(self.tmpdir.name) / "state.json"
+
+    def _capture_storage_counts(self, backend):
+        with closing(sqlite3.connect(backend.memory_store.db_path)) as conn:
+            return tuple(
+                int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "memory_entries",
+                    "memory_events",
+                    "memory_relationships",
+                    "agent_context_events",
+                    "capture_operations",
+                )
+            )
 
     def test_encode_to_spikes_top_k_selects_standardized_top_coordinates(self):
         backend = SpikingAttentionBackend(
@@ -1890,6 +1904,449 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertGreaterEqual(len(event_entries), 2)
         self.assertIn("first retained memory", event_text)
         self.assertIn("second retained memory", event_text)
+
+    def test_capture_conversation_replays_same_capture_id_without_new_effects_or_embeddings(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("a" * 32)
+        request = {
+            "text": (
+                "Thread: Exactly once replay. "
+                "Event: a producer may retry after losing the first response."
+            ),
+            "context_id": "demo",
+            "source_tag": "exactly-once",
+            "speaker": "codex",
+            "capture_id": capture_id,
+        }
+
+        first = backend.capture_conversation(**request)
+        first_counts = self._capture_storage_counts(backend)
+        original_embed = backend.embed_text_payload
+
+        def unexpected_embed(*_args, **_kwargs):
+            raise AssertionError("committed replay must resolve before embeddings")
+
+        backend.embed_text_payload = unexpected_embed
+        try:
+            replay = backend.capture_conversation(**request)
+        finally:
+            backend.embed_text_payload = original_embed
+
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["protocol"], "capture.v2")
+        self.assertEqual(replay["capture_protocol"], "capture.v2")
+        self.assertEqual(replay["capture_id"], capture_id)
+        self.assertTrue(replay["receipt_compact"])
+        self.assertEqual(replay["event_count"], first["event_count"])
+        self.assertEqual(
+            replay["relationship_count"],
+            first["relationship_count"],
+        )
+        self.assertNotIn("events", replay)
+        self.assertEqual(
+            replay["agent_deployment"]["event_id"],
+            first["agent_deployment"]["event_id"],
+        )
+        self.assertEqual(self._capture_storage_counts(backend), first_counts)
+        self.assertNotIn("request_fingerprint", replay)
+
+    def test_capture_conversation_rejects_capture_id_conflict_without_new_effects(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("b" * 32)
+        backend.capture_conversation(
+            text="Thread: Capture conflict. Event: the original durable request.",
+            context_id="demo",
+            source_tag="conflict",
+            speaker="codex",
+            capture_id=capture_id,
+        )
+        committed_counts = self._capture_storage_counts(backend)
+
+        with self.assertRaisesRegex(ValueError, "different capture request"):
+            backend.capture_conversation(
+                text="Thread: Capture conflict. Event: a different payload is rejected.",
+                context_id="demo",
+                source_tag="conflict",
+                speaker="codex",
+                capture_id=capture_id,
+            )
+
+        self.assertEqual(self._capture_storage_counts(backend), committed_counts)
+
+    def test_capture_conversation_same_content_with_distinct_ids_creates_distinct_occurrences(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        request = {
+            "text": (
+                "Thread: Distinct occurrences. "
+                "Event: identical text can represent two intentional captures."
+            ),
+            "context_id": "demo",
+            "source_tag": "occurrence",
+            "speaker": "codex",
+        }
+
+        first = backend.capture_conversation(
+            **request,
+            capture_id="s2cap_" + ("c" * 32),
+        )
+        second = backend.capture_conversation(
+            **request,
+            capture_id="s2cap_" + ("d" * 32),
+        )
+
+        self.assertEqual(first["sequence_id"], second["sequence_id"])
+        self.assertNotEqual(
+            first["events"][0]["memory_id"],
+            second["events"][0]["memory_id"],
+        )
+        self.assertNotEqual(
+            first["agent_deployment"]["event_id"],
+            second["agent_deployment"]["event_id"],
+        )
+        self.assertEqual(self._capture_storage_counts(backend)[-1], 2)
+
+    def test_capture_conversation_lost_response_replays_committed_receipt_and_refreshes_cache(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("e" * 32)
+        request = {
+            "text": (
+                "Thread: Lost response. "
+                "Event: SQLite commits before the transport response disappears."
+            ),
+            "context_id": "demo",
+            "source_tag": "lost-response",
+            "speaker": "codex",
+            "capture_id": capture_id,
+        }
+        real_commit = backend.memory_store.commit_capture_plan
+
+        def commit_then_drop_response(**kwargs):
+            real_commit(**kwargs)
+            raise ConnectionError("simulated response loss after commit")
+
+        backend.memory_store.commit_capture_plan = commit_then_drop_response
+        try:
+            with self.assertRaisesRegex(ConnectionError, "response loss"):
+                backend.capture_conversation(**request)
+        finally:
+            backend.memory_store.commit_capture_plan = real_commit
+        committed_counts = self._capture_storage_counts(backend)
+
+        replay = backend.capture_conversation(**request)
+
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertTrue(replay["receipt_compact"])
+        self.assertEqual(self._capture_storage_counts(backend), committed_counts)
+        self.assertTrue(
+            any(
+                trace.get("metadata", {}).get("capture_id") == capture_id
+                for trace in backend.registered_traces
+            )
+        )
+
+    def test_replay_capture_operation_avoids_reobserving_dynamic_input(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("5" * 32)
+        first = backend.capture_conversation(
+            text="Thread: Dynamic adapter. Event: the first observed surface is durable.",
+            context_id="demo",
+            source_tag="app-connect",
+            speaker="operator",
+            capture_id=capture_id,
+        )
+        committed_counts = self._capture_storage_counts(backend)
+
+        replay = backend.replay_capture_operation(
+            capture_id,
+            context_id="demo",
+            source_tag="app-connect",
+            speaker="operator",
+        )
+
+        self.assertIsNotNone(replay)
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertTrue(replay["receipt_compact"])
+        self.assertEqual(replay["event_count"], first["event_count"])
+        self.assertNotIn("events", replay)
+        self.assertEqual(self._capture_storage_counts(backend), committed_counts)
+        self.assertIsNone(
+            backend.replay_capture_operation(
+                "s2cap_" + ("6" * 32),
+                context_id="demo",
+                source_tag="app-connect",
+                speaker="operator",
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "different capture producer"):
+            backend.replay_capture_operation(
+                capture_id,
+                context_id="other-context",
+                source_tag="app-connect",
+                speaker="operator",
+            )
+
+    def test_capture_conversation_replay_after_prune_does_not_resurrect_data(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("f" * 32)
+        request = {
+            "text": "Thread: Governed prune. Event: this occurrence is removed by policy.",
+            "context_id": "demo",
+            "source_tag": "prune-replay",
+            "speaker": "codex",
+            "capture_id": capture_id,
+        }
+        first = backend.capture_conversation(**request)
+        memory_id = str(first["events"][0]["memory_id"])
+        deployment_event_id = int(first["agent_deployment"]["event_id"])
+        backend.memory_store.delete_entry(
+            context_id="demo",
+            memory_id=memory_id,
+        )
+        backend.memory_store.delete_context_event(
+            context_id="demo",
+            event_id=deployment_event_id,
+        )
+        governed_counts = self._capture_storage_counts(backend)
+
+        replay = backend.capture_conversation(**request)
+
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(
+            replay["agent_deployment"]["event_id"],
+            deployment_event_id,
+        )
+        self.assertIsNone(backend.memory_store.get_entry(memory_id))
+        self.assertNotIn(
+            deployment_event_id,
+            {
+                int(event["event_id"])
+                for event in backend.memory_store.list_context_events(
+                    context_id="demo",
+                    limit=100,
+                )
+            },
+        )
+        self.assertEqual(self._capture_storage_counts(backend), governed_counts)
+
+    def test_capture_conversation_store_fault_rolls_back_every_planned_effect(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("1" * 32)
+        request = {
+            "text": (
+                "Thread: Atomic capture. "
+                "Goal: all graph and delivery rows commit together. "
+                "Event: a fault after entry writes must roll everything back."
+            ),
+            "context_id": "demo",
+            "source_tag": "atomic-capture",
+            "speaker": "codex",
+            "capture_id": capture_id,
+        }
+        baseline = self._capture_storage_counts(backend)
+        real_commit = backend.memory_store.commit_capture_plan
+
+        def commit_with_fault(**kwargs):
+            def fail_after_entries(stage):
+                if stage == "after_entries":
+                    raise RuntimeError("injected capture transaction fault")
+
+            return real_commit(**kwargs, fault_hook=fail_after_entries)
+
+        backend.memory_store.commit_capture_plan = commit_with_fault
+        try:
+            with self.assertRaisesRegex(RuntimeError, "transaction fault"):
+                backend.capture_conversation(**request)
+        finally:
+            backend.memory_store.commit_capture_plan = real_commit
+
+        self.assertEqual(self._capture_storage_counts(backend), baseline)
+        committed = backend.capture_conversation(**request)
+        self.assertFalse(committed["idempotent_replay"])
+        self.assertEqual(self._capture_storage_counts(backend)[-1], 1)
+
+    def test_capture_conversation_committed_success_survives_runtime_refresh_failure(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("3" * 32)
+        original_persist = backend._persist_runtime_state
+
+        def fail_runtime_refresh():
+            raise OSError("simulated repairable runtime cache failure")
+
+        backend._persist_runtime_state = fail_runtime_refresh
+        try:
+            capture = backend.capture_conversation(
+                text=(
+                    "Thread: Authoritative receipt. "
+                    "Event: SQLite success survives a repairable JSON refresh failure."
+                ),
+                context_id="demo",
+                source_tag="runtime-refresh",
+                speaker="codex",
+                capture_id=capture_id,
+            )
+        finally:
+            backend._persist_runtime_state = original_persist
+
+        self.assertFalse(capture["idempotent_replay"])
+        self.assertIsNotNone(backend.memory_store.get_capture_operation(capture_id))
+        self.assertEqual(self._capture_storage_counts(backend)[-1], 1)
+
+    def test_capture_conversation_drops_raw_secret_digest_from_plan_and_receipt(self):
+        backend = SpikingAttentionBackend(
+            dimension=64,
+            num_neurons=32,
+            default_top_k=6,
+            recall_count=8,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        raw_text = (
+            "Thread: Capture secret boundary. "
+            "Event: api_key=sk-secret-digest-value must be redacted."
+        )
+        raw_digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        capture_id = "s2cap_" + ("2" * 32)
+
+        capture = backend.capture_conversation(
+            text=raw_text,
+            context_id="demo",
+            source_tag="secret-boundary",
+            speaker="codex",
+            capture_id=capture_id,
+            metadata={
+                "input_sha256": raw_digest,
+                "api_key": "plain-metadata-secret",
+            },
+        )
+        operation = backend.memory_store.get_capture_operation(capture_id)
+        graph = backend.list_memory_graph(context_id="demo", limit=100)
+        combined = json.dumps(
+            {"capture": capture, "operation": operation, "graph": graph},
+            sort_keys=True,
+            default=str,
+        )
+
+        self.assertNotIn("sk-secret-digest-value", combined)
+        self.assertNotIn("plain-metadata-secret", combined)
+        self.assertNotIn(raw_digest, combined)
+        self.assertIn("[REDACTED_SECRET]", combined)
+
+    def test_capture_conversation_raw_input_digest_is_not_part_of_idempotency_identity(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        capture_id = "s2cap_" + ("4" * 32)
+        request = {
+            "text": "Thread: Digest omission. Event: raw digests are not durable identity.",
+            "context_id": "demo",
+            "source_tag": "digest-omission",
+            "speaker": "codex",
+            "capture_id": capture_id,
+        }
+        backend.capture_conversation(
+            **request,
+            metadata={"input_sha256": "9" * 64},
+        )
+
+        replay = backend.capture_conversation(**request)
+
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(self._capture_storage_counts(backend)[-1], 1)
+
+    def test_capture_conversation_rejects_noncanonical_producer_capture_ids(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        for invalid_capture_id in (
+            "",
+            "S2CAP_" + ("a" * 32),
+            "s2cap_abc",
+            " s2cap_" + ("a" * 32),
+        ):
+            with self.subTest(capture_id=invalid_capture_id):
+                with self.assertRaisesRegex(ValueError, "canonical"):
+                    backend.capture_conversation(
+                        text="Thread: Invalid identity. Event: reject malformed IDs.",
+                        capture_id=invalid_capture_id,
+                    )
 
     def test_direct_capture_redacts_memory_and_context_bus_payloads(self):
         backend = SpikingAttentionBackend(

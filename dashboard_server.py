@@ -832,6 +832,7 @@ class DashboardRuntime:
                     **self._metadata_payload(payload),
                     "source_surface": "dashboard",
                 },
+                capture_id=self._capture_id_payload(payload),
             )
             return self._json_response(capture)
         if method == "POST" and path == "/api/app-connect":
@@ -884,6 +885,7 @@ class DashboardRuntime:
                         "source_surface": "dashboard-app-snapshot",
                     },
                     confirmed=True,
+                    capture_id=self._capture_id_payload(payload),
                 )
             )
         if method == "POST" and path == "/api/app-selection-capture":
@@ -907,6 +909,7 @@ class DashboardRuntime:
                         "source_surface": "dashboard-app-selection-capture",
                     },
                     confirmed=True,
+                    capture_id=self._capture_id_payload(payload),
                     ),
                     action="capture-app-selected-text",
                     status="ready",
@@ -2348,6 +2351,7 @@ class DashboardRuntime:
                 "wrap_session": True,
                 "agent_id": preview["agent_id"],
             },
+            capture_id=self._capture_id_payload(payload),
         )
         capture["action"] = "wrap-session"
         capture["receipt"] = self._operation_receipt(
@@ -3113,6 +3117,7 @@ class DashboardRuntime:
         return {
             "connection_id": self._text_payload(payload, "connection_id", max_bytes=512),
             "metadata": self._metadata_payload(payload),
+            "capture_id": self._capture_id_payload(payload) or "",
         }
 
     def _connection_preview(self, connection_id: str) -> dict[str, Any]:
@@ -3148,7 +3153,11 @@ class DashboardRuntime:
                     "file": str(item.get("file") or ""),
                     "bytes": int(item.get("bytes") or 0),
                     "modified_at": float(item.get("modified_at") or 0.0),
-                    "sha256": str(item.get("sha256") or ""),
+                    "transport_token": str(item.get("transport_token") or ""),
+                    "request_fingerprint": str(
+                        item.get("request_fingerprint") or ""
+                    ),
+                    "fingerprint_mode": str(item.get("fingerprint_mode") or ""),
                 }
                 for item in selected_files
                 if isinstance(item, dict)
@@ -3493,6 +3502,17 @@ class DashboardRuntime:
         if not isinstance(metadata, dict):
             raise DashboardError(HTTPStatus.BAD_REQUEST, "metadata must be an object")
         return metadata
+
+    def _capture_id_payload(self, payload: dict[str, Any]) -> str | None:
+        capture_id = str(payload.get("capture_id", "") or "").strip()
+        if not capture_id:
+            return None
+        if len(capture_id.encode("utf-8")) > 128:
+            raise DashboardError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "capture_id is too large",
+            )
+        return capture_id
 
     def _string_list_payload(self, payload: dict[str, Any], key: str) -> list[str]:
         value = payload.get(key, [])

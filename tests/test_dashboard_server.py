@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import threading
@@ -1151,6 +1152,11 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("renderAppConnect", app)
         self.assertIn("snapshotConnectedApp", app)
         self.assertIn("captureSelectedAppText", app)
+        self.assertIn("window.crypto.getRandomValues", app)
+        self.assertIn("captureRetries: new Map()", app)
+        self.assertIn("retryableCaptureRequest", app)
+        self.assertIn("finishRetryableCapture", app)
+        self.assertIn("const body = { ...retry.body, capture_id: retry.captureId }", app)
         self.assertIn("/api/context-events", app)
         self.assertIn("danger-button", styles)
         self.assertIn("app-connect-panel", styles)
@@ -1751,6 +1757,63 @@ class DashboardRuntimeTests(unittest.TestCase):
             )
         )
 
+    def test_capture_conversation_endpoint_replays_supplied_capture_id_once(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            capture_id = "s2cap_" + ("7" * 32)
+            request = {
+                "context_id": "demo",
+                "source_tag": "dashboard-retry",
+                "speaker": "codex",
+                "text": "Thread: Dashboard retry. Event: one logical capture is committed once.",
+                "capture_id": capture_id,
+            }
+
+            first_status, first = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-conversation",
+                    json.dumps(request).encode(),
+                )
+            )
+            graph_after_first = runtime.backend.list_memory_graph(
+                context_id="demo",
+                limit=100,
+            )
+            counts_after_first = (
+                graph_after_first["entry_count"],
+                graph_after_first["relationship_count"],
+                len(runtime.backend.list_context_events(context_id="demo")["events"]),
+            )
+            replay_status, replay = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-conversation",
+                    json.dumps(request).encode(),
+                )
+            )
+            graph_after_replay = runtime.backend.list_memory_graph(
+                context_id="demo",
+                limit=100,
+            )
+            counts_after_replay = (
+                graph_after_replay["entry_count"],
+                graph_after_replay["relationship_count"],
+                len(runtime.backend.list_context_events(context_id="demo")["events"]),
+            )
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(replay_status, 200)
+        self.assertEqual(first["capture_id"], capture_id)
+        self.assertEqual(replay["capture_id"], capture_id)
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(
+            first["agent_deployment"]["event_id"],
+            replay["agent_deployment"]["event_id"],
+        )
+        self.assertEqual(counts_after_replay, counts_after_first)
+
     def test_prune_memory_endpoint_removes_single_nodes_edges_and_deployments(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -1877,13 +1940,14 @@ class DashboardRuntimeTests(unittest.TestCase):
             os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = tmp
             try:
                 runtime = self.make_runtime(tmp)
-                write_capture_drop(
+                drop_path = write_capture_drop(
                     root=tmp,
                     context_id="demo",
                     source_tag="dashboard-magic",
                     speaker="codex",
                     text="Dashboard capture inbox should process this dropped payload.",
                 )
+                raw_file_sha256 = hashlib.sha256(drop_path.read_bytes()).hexdigest()
 
                 status_before, payload_before = self.decode(
                     runtime.handle("GET", "/api/capture-inbox")
@@ -1931,6 +1995,15 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(preflight_status, 200)
         self.assertEqual(preflight_payload["selected_file_count"], 1)
         self.assertTrue(preflight_payload["requires_confirmation_token"])
+        selected = preflight_payload["selected_files"][0]
+        self.assertNotIn("sha256", selected)
+        self.assertRegex(selected["transport_token"], r"^[0-9a-f]{64}$")
+        self.assertRegex(selected["request_fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertNotEqual(
+            selected["request_fingerprint"],
+            raw_file_sha256,
+        )
+        self.assertNotIn(raw_file_sha256, json.dumps(preflight_payload, sort_keys=True))
         self.assertEqual(process_status, 200)
         self.assertEqual(process_payload["processed_file_count"], 1)
         self.assertEqual(graph_status, 200)
@@ -1940,6 +2013,62 @@ class DashboardRuntimeTests(unittest.TestCase):
                 for entry in graph_payload["entries"]
             )
         )
+
+    def test_capture_inbox_confirmation_rejects_changed_safe_transport_target(self):
+        with TemporaryDirectory() as tmp:
+            previous_root = os.environ.get("SYNAPSE_S2_CAPTURE_ROOT")
+            os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = tmp
+            try:
+                runtime = self.make_runtime(tmp)
+                drop_path = write_capture_drop(
+                    root=tmp,
+                    context_id="demo",
+                    source_tag="dashboard-toctou",
+                    speaker="codex",
+                    text="Original confirmed capture request.",
+                )
+                preflight_status, preflight_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/capture-inbox/preflight",
+                        json.dumps({"max_files": 50}).encode(),
+                    )
+                )
+                changed = json.loads(drop_path.read_text(encoding="utf-8"))
+                changed["text"] = "Changed after operator preflight."
+                drop_path.write_text(
+                    json.dumps(changed, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                process_status, process_payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/capture-inbox/process",
+                        json.dumps(
+                            {
+                                "max_files": 50,
+                                "confirmation_token": preflight_payload[
+                                    "confirmation_token"
+                                ],
+                            }
+                        ).encode(),
+                    )
+                )
+                status_after, payload_after = self.decode(
+                    runtime.handle("GET", "/api/capture-inbox")
+                )
+            finally:
+                if previous_root is None:
+                    os.environ.pop("SYNAPSE_S2_CAPTURE_ROOT", None)
+                else:
+                    os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = previous_root
+
+        self.assertEqual(preflight_status, 200)
+        self.assertEqual(process_status, 409)
+        self.assertIn("target changed", process_payload["error"])
+        self.assertEqual(status_after, 200)
+        self.assertEqual(payload_after["pending_file_count"], 1)
+        self.assertEqual(payload_after["processed_file_count"], 0)
 
     def test_app_connect_endpoint_registers_manual_local_app_connection(self):
         with TemporaryDirectory() as tmp:

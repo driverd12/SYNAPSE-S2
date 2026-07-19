@@ -150,6 +150,8 @@ class ClientSessionBridgeTests(unittest.TestCase):
             self.assertEqual(payload["context_id"], "demo")
             self.assertEqual(payload["source_tag"], "client-session-boundary")
             self.assertEqual(payload["speaker"], "claude-code")
+            self.assertEqual(payload["capture_id"], result["capture_id"])
+            self.assertRegex(result["capture_id"], r"^s2cap_[0-9a-f]{32}$")
             self.assertIn("SYNAPSE-S2 MCP client session ended", payload["text"])
             self.assertIn("[REDACTED_SECRET]", payload["text"])
             self.assertNotIn("sk-test-secret123", payload["text"])
@@ -166,6 +168,7 @@ class ClientSessionBridgeTests(unittest.TestCase):
 
         bridge = ClientSessionBridge.from_environment(env=env, backend=None)
 
+        self.assertRegex(bridge.session_id, r"^[0-9a-f]{32}$")
         self.assertTrue(bridge.config.enabled)
         self.assertTrue(bridge.config.cortex_enabled)
         self.assertEqual(bridge.config.cortex_mode, "strict")

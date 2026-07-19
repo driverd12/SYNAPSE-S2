@@ -404,6 +404,28 @@ class McpServerTests(unittest.TestCase):
         self.assertNotIn("sk-mcp-secret123", combined)
         self.assertIn("[REDACTED_SECRET]", combined)
 
+    def test_mcp_capture_conversation_replays_supplied_capture_id(self):
+        capture_id = "s2cap_" + ("8" * 32)
+        request = {
+            "text": "Thread: MCP retry. Event: the same tool request is committed once.",
+            "context_id": "demo",
+            "source_tag": "mcp-retry",
+            "speaker": "codex",
+            "capture_id": capture_id,
+        }
+
+        first = json.loads(mcp_server.capture_spiking_conversation(**request))
+        replay = json.loads(mcp_server.capture_spiking_conversation(**request))
+
+        self.assertEqual(first["capture_id"], capture_id)
+        self.assertEqual(replay["capture_id"], capture_id)
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(
+            first["agent_deployment"]["event_id"],
+            replay["agent_deployment"]["event_id"],
+        )
+
     def test_mcp_capture_inbox_tools_drop_process_and_redact(self):
         drop = json.loads(
             mcp_server.drop_spiking_capture_inbox(

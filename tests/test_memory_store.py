@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +10,84 @@ from memory_store import DurableMemoryStore
 
 
 class DurableMemoryStoreTests(unittest.TestCase):
+    @staticmethod
+    def _capture_plan(
+        store: DurableMemoryStore,
+        *,
+        capture_hex: str = "a",
+        fingerprint_hex: str = "b",
+        context_id: str = "demo",
+    ) -> dict:
+        first_memory_id = store.stable_memory_id(
+            context_id=context_id,
+            tag="capture-first",
+        )
+        second_memory_id = store.stable_memory_id(
+            context_id=context_id,
+            tag="capture-second",
+        )
+        return {
+            "capture_id": "s2cap_" + capture_hex * 32,
+            "request_fingerprint": fingerprint_hex * 64,
+            "context_id": context_id,
+            "source_tag": "codex-session",
+            "speaker": "codex",
+            "entries": [
+                {
+                    "memory_id": first_memory_id,
+                    "tag": "capture-first",
+                    "context_id": context_id,
+                    "source_text": "First atomic capture trace.",
+                    "metadata": {"sequence": 1},
+                    "embedding_dimensions": 8,
+                    "spike_indices": [1, 3],
+                    "neuron_indices": [1, 3],
+                    "registered_at": 100.0,
+                },
+                {
+                    "memory_id": second_memory_id,
+                    "tag": "capture-second",
+                    "context_id": context_id,
+                    "source_text": "Second atomic capture trace.",
+                    "metadata": {"sequence": 2},
+                    "embedding_dimensions": 8,
+                    "spike_indices": [2, 4],
+                    "neuron_indices": [2, 4],
+                    "registered_at": 101.0,
+                },
+            ],
+            "relationships": [
+                {
+                    "relationship_id": store.stable_relationship_id(
+                        context_id=context_id,
+                        source_memory_id=first_memory_id,
+                        target_memory_id=second_memory_id,
+                        relation_type="temporal_next",
+                    ),
+                    "context_id": context_id,
+                    "source_memory_id": first_memory_id,
+                    "target_memory_id": second_memory_id,
+                    "relation_type": "temporal_next",
+                    "weight": 0.91,
+                    "evidence": {"reason": "capture-order"},
+                    "created_at": 102.0,
+                    "updated_at": 102.0,
+                }
+            ],
+            "deployment": {
+                "context_id": context_id,
+                "source_surface": "test-suite",
+                "event_type": "conversation-capture",
+                "summary": "Atomic capture committed.",
+                "payload": {"tag": "codex-session"},
+                "agent_targets": ["mcp-clients"],
+                "created_at": 103.0,
+            },
+            "result": {
+                "event_count": 2,
+            },
+        }
+
     def test_upsert_list_recall_export_and_backup_are_durable(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "synapse-memory.sqlite3"
@@ -818,6 +897,609 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(after_prune["entry_total"], 1)
         self.assertEqual(after_prune["relationship_total"], 0)
         self.assertEqual(after_prune["relationships"], [])
+
+    def test_capture_plan_commits_once_and_replays_durable_result(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            plan = self._capture_plan(store)
+
+            committed = store.commit_capture_plan(**plan)
+            with closing(sqlite3.connect(db_path)) as conn:
+                counts_after_commit = {
+                    table: int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                    for table in (
+                        "memory_entries",
+                        "memory_spikes",
+                        "memory_surface_terms",
+                        "memory_events",
+                        "memory_relationships",
+                        "agent_context_events",
+                        "agent_context_event_targets",
+                        "capture_operations",
+                    )
+                }
+
+            replayed = store.commit_capture_plan(**plan)
+            fetched = store.get_capture_operation(plan["capture_id"])
+            with closing(sqlite3.connect(db_path)) as conn:
+                counts_after_replay = {
+                    table: int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                    for table in counts_after_commit
+                }
+            stats = store.stats(context_id="demo")
+
+        self.assertFalse(committed["idempotent_replay"])
+        self.assertTrue(replayed["idempotent_replay"])
+        self.assertEqual(fetched, replayed)
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "idempotent_replay"},
+            {key: value for key, value in replayed.items() if key != "idempotent_replay"},
+        )
+        self.assertEqual(counts_after_replay, counts_after_commit)
+        self.assertEqual(counts_after_commit["memory_entries"], 2)
+        self.assertEqual(counts_after_commit["memory_events"], 2)
+        self.assertEqual(counts_after_commit["memory_relationships"], 1)
+        self.assertEqual(counts_after_commit["agent_context_events"], 1)
+        self.assertEqual(counts_after_commit["capture_operations"], 1)
+        self.assertEqual(stats["capture_protocol_version"], "capture.v2")
+        self.assertEqual(stats["capture_operation_count"], 1)
+        self.assertEqual(stats["capture_operation_entry_count"], 2)
+        self.assertEqual(stats["capture_operation_relationship_count"], 1)
+        self.assertEqual(stats["capture_operation_schema_error_count"], 0)
+        self.assertEqual(stats["capture_operation_integrity_error_count"], 0)
+        self.assertEqual(stats["capture_operation_health"], "ready")
+        self.assertEqual(
+            committed["result"],
+            {
+                "status": "committed",
+                "event_count": 2,
+                "entry_count": 2,
+                "relationship_count": 1,
+            },
+        )
+        self.assertEqual(
+            set(committed["deployment_event"]),
+            {
+                "event_id",
+                "context_id",
+                "event_type",
+                "source_surface",
+                "published_at",
+            },
+        )
+
+    def test_concurrent_capture_plan_retries_serialize_to_one_commit(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            plan = self._capture_plan(store)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(
+                    executor.map(
+                        lambda _: store.commit_capture_plan(**plan),
+                        range(2),
+                    )
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                counts = {
+                    table: int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                    for table in (
+                        "memory_entries",
+                        "memory_events",
+                        "memory_relationships",
+                        "agent_context_events",
+                        "capture_operations",
+                    )
+                }
+
+        self.assertEqual(
+            sorted(result["idempotent_replay"] for result in outcomes),
+            [False, True],
+        )
+        self.assertEqual(
+            counts,
+            {
+                "memory_entries": 2,
+                "memory_events": 2,
+                "memory_relationships": 1,
+                "agent_context_events": 1,
+                "capture_operations": 1,
+            },
+        )
+
+    def test_capture_plan_rejects_identity_mismatch_without_writes(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            plan = self._capture_plan(store)
+            store.commit_capture_plan(**plan)
+
+            for field, replacement in (
+                ("request_fingerprint", "c" * 64),
+                ("context_id", "other"),
+                ("source_tag", "other-source"),
+                ("speaker", "operator"),
+            ):
+                mismatch = dict(plan)
+                mismatch[field] = replacement
+                with self.subTest(field=field):
+                    with self.assertRaisesRegex(ValueError, field):
+                        store.commit_capture_plan(**mismatch)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                counts = {
+                    table: int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                    for table in (
+                        "memory_entries",
+                        "memory_events",
+                        "memory_relationships",
+                        "agent_context_events",
+                        "capture_operations",
+                    )
+                }
+
+        self.assertEqual(
+            counts,
+            {
+                "memory_entries": 2,
+                "memory_events": 2,
+                "memory_relationships": 1,
+                "agent_context_events": 1,
+                "capture_operations": 1,
+            },
+        )
+
+    def test_capture_plan_faults_roll_back_every_durable_surface(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+
+            for offset, stage in enumerate(
+                (
+                    "after_entries",
+                    "after_relationships",
+                    "after_deployment",
+                    "before_ledger",
+                )
+            ):
+                plan = self._capture_plan(
+                    store,
+                    capture_hex="abcdef0123456789"[offset],
+                    fingerprint_hex="fedcba9876543210"[offset],
+                )
+
+                def fail_at_stage(observed_stage, *, expected_stage=stage):
+                    if observed_stage == expected_stage:
+                        raise RuntimeError(f"fault:{expected_stage}")
+
+                with self.subTest(stage=stage):
+                    with self.assertRaisesRegex(RuntimeError, f"fault:{stage}"):
+                        store.commit_capture_plan(**plan, fault_hook=fail_at_stage)
+                    with closing(sqlite3.connect(db_path)) as conn:
+                        counts = {
+                            table: int(
+                                conn.execute(
+                                    f"SELECT COUNT(*) FROM {table}"
+                                ).fetchone()[0]
+                            )
+                            for table in (
+                                "memory_entries",
+                                "memory_spikes",
+                                "memory_surface_terms",
+                                "memory_events",
+                                "memory_relationships",
+                                "agent_context_events",
+                                "agent_context_event_targets",
+                                "capture_operations",
+                            )
+                        }
+                    self.assertEqual(set(counts.values()), {0})
+
+    def test_capture_plan_validates_whole_plan_before_opening_transaction(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            valid = self._capture_plan(store)
+            invalid_plans = []
+
+            invalid_capture_id = dict(valid)
+            invalid_capture_id["capture_id"] = "S2CAP_" + "A" * 32
+            invalid_plans.append(("capture_id", invalid_capture_id))
+
+            invalid_fingerprint = dict(valid)
+            invalid_fingerprint["request_fingerprint"] = "B" * 64
+            invalid_plans.append(("request_fingerprint", invalid_fingerprint))
+
+            invalid_weight = dict(valid)
+            invalid_weight["relationships"] = [dict(valid["relationships"][0])]
+            invalid_weight["relationships"][0]["weight"] = float("nan")
+            invalid_plans.append(("weight", invalid_weight))
+
+            invalid_targets = dict(valid)
+            invalid_targets["deployment"] = dict(valid["deployment"])
+            invalid_targets["deployment"]["agent_targets"] = ["mcp-clients", 3]
+            invalid_plans.append(("agent_targets", invalid_targets))
+
+            invalid_result = dict(valid)
+            invalid_result["result"] = {"bad": {1, 2}}
+            invalid_plans.append(("result", invalid_result))
+
+            for label, invalid in invalid_plans:
+                with self.subTest(label=label):
+                    with self.assertRaises(ValueError):
+                        store.commit_capture_plan(**invalid)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                self.assertEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM capture_operations").fetchone()[0]),
+                    0,
+                )
+                self.assertEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0]),
+                    0,
+                )
+                self.assertEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM agent_context_events").fetchone()[0]),
+                    0,
+                )
+
+    def test_capture_plan_rejects_cross_context_and_unplanned_relationship_endpoints(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            foreign_entry = store.upsert_entry(
+                tag="foreign-entry",
+                context_id="other",
+                source_text="Must never be attached to a demo capture.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[7],
+                neuron_indices=[7],
+            )
+            valid = self._capture_plan(store)
+            planned_source = valid["entries"][0]["memory_id"]
+            unplanned_same_context = store.stable_memory_id(
+                context_id="demo",
+                tag="not-in-plan",
+            )
+
+            for label, target_memory_id in (
+                ("cross-context", foreign_entry["memory_id"]),
+                ("same-context-unplanned", unplanned_same_context),
+            ):
+                invalid = dict(valid)
+                invalid["relationships"] = [dict(valid["relationships"][0])]
+                invalid["relationships"][0].update(
+                    {
+                        "target_memory_id": target_memory_id,
+                        "relationship_id": store.stable_relationship_id(
+                            context_id="demo",
+                            source_memory_id=planned_source,
+                            target_memory_id=target_memory_id,
+                            relation_type="temporal_next",
+                        ),
+                    }
+                )
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "endpoints must reference entries in the same capture plan",
+                    ):
+                        store.commit_capture_plan(**invalid)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                self.assertEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0]),
+                    1,
+                )
+                self.assertEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM memory_relationships").fetchone()[0]),
+                    0,
+                )
+                self.assertEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM agent_context_events").fetchone()[0]),
+                    0,
+                )
+                self.assertEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM capture_operations").fetchone()[0]),
+                    0,
+                )
+
+    def test_capture_receipt_survives_prune_and_replay_never_resurrects_graph(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            plan = self._capture_plan(store)
+            committed = store.commit_capture_plan(**plan)
+
+            for memory_id in [entry["memory_id"] for entry in plan["entries"]]:
+                store.delete_entry(context_id="demo", memory_id=memory_id)
+            store.delete_context_event(
+                context_id="demo",
+                event_id=committed["deployment_event"]["event_id"],
+            )
+
+            cached = store.get_capture_operation(plan["capture_id"])
+            replayed = store.commit_capture_plan(**plan)
+            stats = store.stats(context_id="demo")
+            with closing(sqlite3.connect(db_path)) as conn:
+                graph_counts = {
+                    table: int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                    for table in (
+                        "memory_entries",
+                        "memory_events",
+                        "memory_relationships",
+                        "agent_context_events",
+                        "capture_operations",
+                    )
+                }
+
+        self.assertEqual(cached, replayed)
+        self.assertTrue(replayed["idempotent_replay"])
+        self.assertEqual(
+            graph_counts,
+            {
+                "memory_entries": 0,
+                "memory_events": 0,
+                "memory_relationships": 0,
+                "agent_context_events": 0,
+                "capture_operations": 1,
+            },
+        )
+        self.assertEqual(stats["capture_operation_pruned_deployment_count"], 1)
+        self.assertEqual(stats["capture_operation_integrity_error_count"], 0)
+        self.assertEqual(stats["capture_operation_health"], "ready")
+
+    def test_capture_receipt_excludes_private_content_from_live_and_backup_rows(self):
+        private_marker = "PRIVATE_CAPTURE_MARKER_7f09c4828d4b"
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            backup_path = Path(tmp) / "capture-backup.sqlite3"
+            store = DurableMemoryStore(db_path)
+            plan = self._capture_plan(store)
+            plan["entries"][0]["source_text"] = (
+                f"Operator content {private_marker} must stay outside the receipt."
+            )
+            plan["entries"][0]["metadata"] = {
+                "namespace_title": private_marker,
+            }
+            plan["relationships"][0]["evidence"] = {
+                "private_evidence": private_marker,
+            }
+            plan["deployment"]["summary"] = f"private summary {private_marker}"
+            plan["deployment"]["payload"] = {
+                "events": [{"source_text": private_marker}],
+                "context_namespace": {"namespace_title": private_marker},
+            }
+            plan["result"] = {
+                "event_count": 2,
+                "events": [{"source_text": private_marker}],
+                "context_namespace": {"namespace_title": private_marker},
+                "relationship_evidence": private_marker,
+            }
+
+            committed = store.commit_capture_plan(**plan)
+            with closing(sqlite3.connect(db_path)) as conn:
+                live_result_json = str(
+                    conn.execute(
+                        "SELECT result_json FROM capture_operations WHERE capture_id = ?",
+                        (plan["capture_id"],),
+                    ).fetchone()[0]
+                )
+            self.assertNotIn(private_marker, live_result_json)
+            self.assertLessEqual(len(live_result_json.encode("utf-8")), 2048)
+            self.assertEqual(
+                set(json.loads(live_result_json)["result"]),
+                {"status", "event_count", "entry_count", "relationship_count"},
+            )
+
+            for entry in plan["entries"]:
+                store.delete_entry(
+                    context_id="demo",
+                    memory_id=entry["memory_id"],
+                )
+            store.delete_context_event(
+                context_id="demo",
+                event_id=committed["deployment_event"]["event_id"],
+            )
+            store.backup(backup_path)
+
+            with closing(sqlite3.connect(backup_path)) as conn:
+                backup_result_json = str(
+                    conn.execute(
+                        "SELECT result_json FROM capture_operations WHERE capture_id = ?",
+                        (plan["capture_id"],),
+                    ).fetchone()[0]
+                )
+                backup_counts = {
+                    table: int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                    for table in (
+                        "memory_entries",
+                        "memory_relationships",
+                        "agent_context_events",
+                        "capture_operations",
+                    )
+                }
+
+        self.assertEqual(backup_result_json, live_result_json)
+        self.assertNotIn(private_marker, backup_result_json)
+        self.assertEqual(
+            backup_counts,
+            {
+                "memory_entries": 0,
+                "memory_relationships": 0,
+                "agent_context_events": 0,
+                "capture_operations": 1,
+            },
+        )
+
+    def test_startup_transactionally_scrubs_legacy_full_capture_receipt(self):
+        private_marker = "LEGACY_PRIVATE_MARKER_0c9c636ccab7"
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            deployment = store.publish_context_event(
+                context_id="demo",
+                source_surface="legacy-capture",
+                event_type="conversation-capture",
+                summary=f"legacy summary {private_marker}",
+                payload={"source_text": private_marker},
+                agent_targets=["mcp-clients"],
+                created_at=203.0,
+            )
+            store.delete_context_event(
+                context_id="demo",
+                event_id=deployment["event_id"],
+            )
+            capture_id = "s2cap_" + "d" * 32
+            fingerprint = "e" * 64
+            committed_at = 204.0
+            legacy_envelope = {
+                "capture_id": capture_id,
+                "protocol": "capture.v2",
+                "request_fingerprint": fingerprint,
+                "context_id": "demo",
+                "source_tag": "legacy-session",
+                "speaker": "operator",
+                "result": {
+                    "event_count": 2,
+                    "events": [{"source_text": private_marker}],
+                    "context_namespace": {"namespace_title": private_marker},
+                    "relationships": [{"evidence": private_marker}],
+                },
+                "deployment_event": deployment,
+                "entry_count": 3,
+                "relationship_count": 1,
+                "committed_at": committed_at,
+            }
+            legacy_json = json.dumps(
+                legacy_envelope,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            self.assertIn(private_marker, legacy_json)
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = ?",
+                    ("capture_operations_private_receipts_v1",),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO capture_operations (
+                        capture_id, protocol, request_fingerprint, context_id,
+                        source_tag, speaker, result_json, deployment_event_id,
+                        entry_count, relationship_count, committed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        capture_id,
+                        "capture.v2",
+                        fingerprint,
+                        "demo",
+                        "legacy-session",
+                        "operator",
+                        legacy_json,
+                        deployment["event_id"],
+                        3,
+                        1,
+                        committed_at,
+                    ),
+                )
+                conn.commit()
+
+            restored = DurableMemoryStore(db_path)
+            receipt = restored.get_capture_operation(capture_id)
+            with closing(sqlite3.connect(db_path)) as conn:
+                scrubbed_json = str(
+                    conn.execute(
+                        "SELECT result_json FROM capture_operations WHERE capture_id = ?",
+                        (capture_id,),
+                    ).fetchone()[0]
+                )
+                migration_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM store_migrations WHERE key = ?",
+                        ("capture_operations_private_receipts_v1",),
+                    ).fetchone()[0]
+                )
+
+        self.assertIsNotNone(receipt)
+        self.assertNotIn(private_marker, scrubbed_json)
+        self.assertLessEqual(len(scrubbed_json.encode("utf-8")), 2048)
+        self.assertEqual(migration_count, 1)
+        self.assertEqual(
+            receipt["result"],
+            {
+                "status": "committed",
+                "event_count": 2,
+                "entry_count": 3,
+                "relationship_count": 1,
+            },
+        )
+        self.assertEqual(
+            receipt["deployment_event"],
+            {
+                "event_id": deployment["event_id"],
+                "context_id": "demo",
+                "event_type": "conversation-capture",
+                "source_surface": "legacy-capture",
+                "published_at": 203.0,
+            },
+        )
+        self.assertTrue(receipt["idempotent_replay"])
+
+    def test_capture_ledger_detects_schema_and_result_integrity_tampering(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            plan = self._capture_plan(store)
+            store.commit_capture_plan(**plan)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE capture_operations SET result_json = '{}' WHERE capture_id = ?",
+                    (plan["capture_id"],),
+                )
+                conn.commit()
+            # Supply an already-open audit connection so stats can report the
+            # degraded ledger instead of the normal startup gate failing fast.
+            with closing(store._connect_read_only()) as conn:
+                degraded = store.stats(context_id="demo", _conn=conn)
+            self.assertEqual(degraded["capture_operation_integrity_error_count"], 1)
+            self.assertEqual(degraded["capture_operation_health"], "degraded")
+            with self.assertRaisesRegex(RuntimeError, "integrity validation"):
+                DurableMemoryStore(db_path)
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            DurableMemoryStore(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("DROP INDEX ix_capture_operations_context_committed")
+                conn.execute(
+                    """
+                    CREATE INDEX ix_capture_operations_context_committed
+                    ON capture_operations(source_tag)
+                    """
+                )
+                conn.commit()
+            with self.assertRaisesRegex(RuntimeError, "schema validation"):
+                DurableMemoryStore(db_path)
 
 
 if __name__ == "__main__":

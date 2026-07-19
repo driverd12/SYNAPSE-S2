@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -49,7 +50,10 @@ class ClientSessionBridge:
     ) -> None:
         self.config = config
         self.backend = backend
-        self.session_id = uuid.uuid4().hex[:12]
+        # Keep the full 128-bit nonce. This value scopes both the delivery
+        # consumer instance and the deterministic session-boundary capture ID;
+        # truncating it weakens collision resistance across long-lived clients.
+        self.session_id = uuid.uuid4().hex
         self.started_at: float | None = None
         self.hydration: dict[str, Any] | None = None
         self.cortex_session: dict[str, Any] | None = None
@@ -158,6 +162,7 @@ class ClientSessionBridge:
         ended_at = time.time()
         text = self._render_boundary_note(reason=reason, ended_at=ended_at, final_note=final_note)
         redacted_text, redaction_count = capture_daemon.redact_capture_text(text)
+        capture_id = self._boundary_capture_id()
         try:
             drop_path = capture_daemon.write_capture_drop(
                 root=self.config.capture_root,
@@ -165,6 +170,7 @@ class ClientSessionBridge:
                 source_tag=self.config.source_tag,
                 speaker=self.config.agent_id,
                 text=redacted_text,
+                capture_id=capture_id,
                 metadata={
                     "client_session_bridge": True,
                     "session_id": self.session_id,
@@ -199,8 +205,10 @@ class ClientSessionBridge:
                 "drop_path": str(drop_path),
                 "redaction_count": int(redaction_count),
                 "session_id": self.session_id,
+                "capture_id": capture_id,
                 **cortex_result,
             }
+
         except Exception as exc:
             LOGGER.exception(
                 "SYNAPSE-S2 client session boundary capture failed agent_id=%s context_id=%s",
@@ -213,6 +221,17 @@ class ClientSessionBridge:
                 "error": str(exc),
                 "session_id": self.session_id,
             }
+
+    def _boundary_capture_id(self) -> str:
+        payload = "\x1f".join(
+            (
+                "client-session-boundary.v2",
+                self.config.context_id,
+                self.config.agent_id,
+                self.session_id,
+            )
+        ).encode("utf-8")
+        return "s2cap_" + hashlib.sha256(payload).hexdigest()[:32]
 
     def _render_boundary_note(
         self,

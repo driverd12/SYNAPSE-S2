@@ -427,6 +427,7 @@ const state = {
     apps: [],
     connections: [],
   },
+  captureRetries: new Map(),
   operator: {
     receipts: [],
     lastWrapPreview: null,
@@ -737,6 +738,34 @@ async function requestJson(path, { method = "GET", params = {}, body = null } = 
     throw new Error(payload.error || `HTTP ${response.status}`);
   }
   return payload;
+}
+
+function newCaptureId() {
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return `s2cap_${Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function retryableCaptureRequest(key, intent, body) {
+  const signature = JSON.stringify(intent);
+  const existing = state.captureRetries.get(key);
+  if (existing?.signature === signature) {
+    return existing;
+  }
+  const request = {
+    signature,
+    captureId: newCaptureId(),
+    body: { ...body },
+  };
+  state.captureRetries.set(key, request);
+  return request;
+}
+
+function finishRetryableCapture(key, captureId) {
+  const pending = state.captureRetries.get(key);
+  if (pending?.captureId === captureId) {
+    state.captureRetries.delete(key);
+  }
 }
 
 function confirmPreflight(title, lines) {
@@ -3970,12 +3999,18 @@ function runWrapSession(button, { previewOnly = false } = {}) {
     return Promise.resolve(null);
   }
   return withBusy(button, previewOnly ? "Wrap Session preview" : "Wrap Session", async () => {
-    const body = {
+    const proposedBody = {
       context_id: state.context,
       agent_id: "dashboard-ui",
       text,
       operation_log: operationLogForWrap(),
     };
+    const retry = retryableCaptureRequest(
+      "wrap-session",
+      { context_id: state.context, agent_id: "dashboard-ui", text },
+      proposedBody,
+    );
+    const body = { ...retry.body, capture_id: retry.captureId };
     const preview = await requestJson("/api/wrap-session/preview", {
       method: "POST",
       body,
@@ -3999,6 +4034,7 @@ function runWrapSession(button, { previewOnly = false } = {}) {
       },
     });
     await publishAwareResult(payload);
+    finishRetryableCapture("wrap-session", retry.captureId);
     state.operator.lastWrapPreview = null;
     elements.wrapSessionNotes.value = "";
     elements.wrapSessionOutput.innerHTML = renderReceiptCard(payload.receipt);
@@ -6142,10 +6178,16 @@ async function snapshotConnectedApp(button) {
       connection_id: connectionId,
       metadata: { source: "dashboard-app-snapshot" },
     };
+    const retry = retryableCaptureRequest(
+      "app-snapshot",
+      { connection_id: connectionId },
+      snapshotBody,
+    );
+    const body = { ...retry.body, capture_id: retry.captureId };
     setAppConnectState("Preparing snapshot", "Checking the attached app connection.", "pending");
     const preflight = await requestJson("/api/app-snapshot/preflight", {
       method: "POST",
-      body: snapshotBody,
+      body,
     });
     const connection = preflight.connection || {};
     setAppConnectState(
@@ -6156,10 +6198,11 @@ async function snapshotConnectedApp(button) {
     const payload = await requestJson("/api/app-snapshot", {
       method: "POST",
       body: {
-        ...snapshotBody,
+        ...body,
         confirmation_token: preflight.confirmation_token,
       },
     });
+    finishRetryableCapture("app-snapshot", retry.captureId);
     await publishAwareResult(payload);
     await refreshAppConnect({ detect: false });
     const lowSignal = payload.snapshot_quality?.low_signal === true;
@@ -6201,16 +6244,26 @@ async function captureSelectedAppText(button) {
     return null;
   }
   return withBusy(button, "App selection capture", async () => {
+    const selectionBody = {
+      connection_id: connectionId,
+      text,
+      confirm: true,
+      metadata: { source: "dashboard-app-selected-text" },
+    };
+    const retry = retryableCaptureRequest(
+      "app-selection",
+      { connection_id: connectionId, text },
+      selectionBody,
+    );
     setAppConnectState("Capturing selected text", "Redacting selected app text before memory ingest.", "pending");
     const payload = await requestJson("/api/app-selection-capture", {
       method: "POST",
       body: {
-        connection_id: connectionId,
-        text,
-        confirm: true,
-        metadata: { source: "dashboard-app-selected-text" },
+        ...retry.body,
+        capture_id: retry.captureId,
       },
     });
+    finishRetryableCapture("app-selection", retry.captureId);
     await publishAwareResult(payload);
     await refreshAppConnect({ detect: false });
     elements.appConnectionSelect.value = connectionId;
@@ -6750,16 +6803,26 @@ elements.captureForm.addEventListener("submit", async (event) => {
     return;
   }
   await withBusy(elements.captureForm.querySelector("button"), "Capture conversation", async () => {
+    const captureBody = {
+      context_id: state.context,
+      source_tag: tag,
+      speaker,
+      text,
+      metadata: { source: "dashboard" },
+    };
+    const retry = retryableCaptureRequest(
+      "conversation-capture",
+      { context_id: state.context, source_tag: tag, speaker, text },
+      captureBody,
+    );
     const payload = await requestJson("/api/capture-conversation", {
       method: "POST",
       body: {
-        context_id: state.context,
-        source_tag: tag,
-        speaker,
-        text,
-        metadata: { source: "dashboard" },
+        ...retry.body,
+        capture_id: retry.captureId,
       },
     });
+    finishRetryableCapture("conversation-capture", retry.captureId);
     await publishAwareResult(payload);
     elements.captureText.value = "";
     return payload;

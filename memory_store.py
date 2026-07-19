@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 
 LOGGER = logging.getLogger("synapse_s2.memory_store")
@@ -31,6 +31,55 @@ LOGGER.propagate = False
 
 CONTEXT_EVENT_TARGET_GROUPS = frozenset(
     {"mcp-clients", "local-ide-adapters"}
+)
+CAPTURE_PROTOCOL_VERSION = "capture.v2"
+CAPTURE_ID_RE = re.compile(r"s2cap_[0-9a-f]{32}")
+CAPTURE_REQUEST_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+CAPTURE_OPERATION_RESULT_JSON_MAX_BYTES = 2048
+CAPTURE_OPERATION_COUNTER_MAX = 10_000_000
+CAPTURE_OPERATION_ENVELOPE_KEYS = frozenset(
+    {
+        "capture_id",
+        "protocol",
+        "request_fingerprint",
+        "context_id",
+        "source_tag",
+        "speaker",
+        "result",
+        "deployment_event",
+        "entry_count",
+        "relationship_count",
+        "committed_at",
+    }
+)
+CAPTURE_OPERATION_DEPLOYMENT_HEADER_KEYS = frozenset(
+    {
+        "event_id",
+        "context_id",
+        "event_type",
+        "source_surface",
+        "published_at",
+    }
+)
+CAPTURE_OPERATION_LEGACY_DEPLOYMENT_KEYS = frozenset(
+    {
+        "event_id",
+        "context_id",
+        "source_surface",
+        "event_type",
+        "summary",
+        "payload",
+        "agent_targets",
+        "created_at",
+    }
+)
+CAPTURE_OPERATION_RESULT_KEYS = frozenset(
+    {
+        "status",
+        "event_count",
+        "entry_count",
+        "relationship_count",
+    }
 )
 
 SCHEMA_SQL = """
@@ -165,6 +214,43 @@ CREATE TABLE IF NOT EXISTS agent_context_event_targets (
 CREATE INDEX IF NOT EXISTS ix_agent_context_event_targets_route
 ON agent_context_event_targets(target_kind, target_id, event_id);
 
+CREATE TABLE IF NOT EXISTS capture_operations (
+    capture_id TEXT PRIMARY KEY NOT NULL,
+    protocol TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    source_tag TEXT NOT NULL,
+    speaker TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    deployment_event_id INTEGER NOT NULL,
+    entry_count INTEGER NOT NULL,
+    relationship_count INTEGER NOT NULL,
+    committed_at REAL NOT NULL,
+    CHECK(protocol = 'capture.v2'),
+    CHECK(length(capture_id) = 38),
+    CHECK(substr(capture_id, 1, 6) = 's2cap_'),
+    CHECK(substr(capture_id, 7) NOT GLOB '*[^0-9a-f]*'),
+    CHECK(length(request_fingerprint) = 64),
+    CHECK(request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    CHECK(length(context_id) BETWEEN 1 AND 128),
+    CHECK(context_id = trim(context_id)),
+    CHECK(length(source_tag) BETWEEN 1 AND 200),
+    CHECK(source_tag = trim(source_tag)),
+    CHECK(length(speaker) BETWEEN 1 AND 128),
+    CHECK(speaker = trim(speaker)),
+    CHECK(deployment_event_id > 0),
+    CHECK(entry_count >= 0),
+    CHECK(relationship_count >= 0),
+    CHECK(typeof(committed_at) IN ('integer', 'real')),
+    CHECK(abs(committed_at) < 1.0e308)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_capture_operations_deployment_event
+ON capture_operations(deployment_event_id);
+
+CREATE INDEX IF NOT EXISTS ix_capture_operations_context_committed
+ON capture_operations(context_id, committed_at DESC, capture_id);
+
 CREATE TABLE IF NOT EXISTS agent_context_delivery_cursors (
     context_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
@@ -270,6 +356,59 @@ CREATE TABLE IF NOT EXISTS store_maintenance_receipts (
 CREATE INDEX IF NOT EXISTS ix_store_maintenance_receipts_type_created
 ON store_maintenance_receipts(operation_type, created_at DESC);
 """
+
+CAPTURE_OPERATION_COLUMN_SIGNATURE = (
+    ("capture_id", "TEXT", 1, None, 1),
+    ("protocol", "TEXT", 1, None, 0),
+    ("request_fingerprint", "TEXT", 1, None, 0),
+    ("context_id", "TEXT", 1, None, 0),
+    ("source_tag", "TEXT", 1, None, 0),
+    ("speaker", "TEXT", 1, None, 0),
+    ("result_json", "TEXT", 1, None, 0),
+    ("deployment_event_id", "INTEGER", 1, None, 0),
+    ("entry_count", "INTEGER", 1, None, 0),
+    ("relationship_count", "INTEGER", 1, None, 0),
+    ("committed_at", "REAL", 1, None, 0),
+)
+CAPTURE_OPERATION_INDEX_COLUMNS = {
+    "ux_capture_operations_deployment_event": (
+        True,
+        ("deployment_event_id",),
+    ),
+    "ix_capture_operations_context_committed": (
+        False,
+        ("context_id", "committed_at", "capture_id"),
+    ),
+}
+CAPTURE_OPERATION_INDEX_SQL = {
+    "ux_capture_operations_deployment_event": (
+        "CREATE UNIQUE INDEX ux_capture_operations_deployment_event "
+        "ON capture_operations(deployment_event_id)"
+    ),
+    "ix_capture_operations_context_committed": (
+        "CREATE INDEX ix_capture_operations_context_committed "
+        "ON capture_operations(context_id, committed_at DESC, capture_id)"
+    ),
+}
+CAPTURE_OPERATION_CHECK_FRAGMENTS = (
+    "check(protocol = 'capture.v2')",
+    "check(length(capture_id) = 38)",
+    "check(substr(capture_id, 1, 6) = 's2cap_')",
+    "check(substr(capture_id, 7) not glob '*[^0-9a-f]*')",
+    "check(length(request_fingerprint) = 64)",
+    "check(request_fingerprint not glob '*[^0-9a-f]*')",
+    "check(length(context_id) between 1 and 128)",
+    "check(context_id = trim(context_id))",
+    "check(length(source_tag) between 1 and 200)",
+    "check(source_tag = trim(source_tag))",
+    "check(length(speaker) between 1 and 128)",
+    "check(speaker = trim(speaker))",
+    "check(deployment_event_id > 0)",
+    "check(entry_count >= 0)",
+    "check(relationship_count >= 0)",
+    "check(typeof(committed_at) in ('integer', 'real'))",
+    "check(abs(committed_at) < 1.0e308)",
+)
 
 # Context delivery is intentionally installed by a versioned migration rather
 # than the general ``CREATE TABLE IF NOT EXISTS`` bootstrap above.  An early v2
@@ -921,6 +1060,20 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(_json_safe(value, {}), sort_keys=True, separators=(",", ":"))
 
 
+def _capture_json_dumps(value: Any, *, field: str) -> str:
+    """Serialize capture-plan values without coercion or non-finite numbers."""
+
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be finite, JSON-safe data") from exc
+
+
 def _json_list(values: Iterable[int]) -> str:
     safe_values = [int(value) for value in values]
     return json.dumps(safe_values, separators=(",", ":"))
@@ -939,6 +1092,7 @@ class DurableMemoryStore:
     def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
         self.db_path = self._resolve_db_path(db_path)
         self._target_integrity_verified = False
+        self._capture_integrity_verified = False
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._protect_path(self.db_path.parent, directory=True)
         self._initialize()
@@ -953,6 +1107,7 @@ class DurableMemoryStore:
         store = cls.__new__(cls)
         store.db_path = store._resolve_db_path(db_path)
         store._target_integrity_verified = False
+        store._capture_integrity_verified = False
         if not store.db_path.is_file():
             raise FileNotFoundError(
                 f"SYNAPSE-S2 memory store does not exist: {store.db_path}"
@@ -1130,6 +1285,509 @@ class DurableMemoryStore:
     def _normalized_schema_sql(raw_sql: str) -> str:
         normalized = re.sub(r"\s+", " ", str(raw_sql or "").strip().casefold())
         return normalized.replace(" if not exists ", " ")
+
+    def _capture_operation_schema_errors(
+        self,
+        conn: sqlite3.Connection,
+    ) -> list[str]:
+        errors: list[str] = []
+        table_row = conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?",
+            ("capture_operations",),
+        ).fetchone()
+        if table_row is None or str(table_row["type"]) != "table":
+            return ["capture_operations:missing-table"]
+
+        actual_columns = tuple(
+            (
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                None if row["dflt_value"] is None else str(row["dflt_value"]),
+                int(row["pk"]),
+            )
+            for row in conn.execute(
+                'PRAGMA table_info("capture_operations")'
+            ).fetchall()
+        )
+        if actual_columns != CAPTURE_OPERATION_COLUMN_SIGNATURE:
+            errors.append("capture_operations:column-signature")
+        if conn.execute(
+            'PRAGMA foreign_key_list("capture_operations")'
+        ).fetchall():
+            # Capture receipts intentionally survive graph/deployment pruning.
+            errors.append("capture_operations:unexpected-foreign-key")
+
+        normalized_table_sql = self._normalized_schema_sql(str(table_row["sql"] or ""))
+        for fragment in CAPTURE_OPERATION_CHECK_FRAGMENTS:
+            if self._normalized_schema_sql(fragment) not in normalized_table_sql:
+                errors.append("capture_operations:constraint-sql")
+                break
+
+        listed_indexes = {
+            str(row["name"]): row
+            for row in conn.execute(
+                'PRAGMA index_list("capture_operations")'
+            ).fetchall()
+        }
+        for index_name, (expected_unique, expected_columns) in (
+            CAPTURE_OPERATION_INDEX_COLUMNS.items()
+        ):
+            index_row = listed_indexes.get(index_name)
+            schema_row = conn.execute(
+                "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+                (index_name,),
+            ).fetchone()
+            actual_columns = tuple(
+                str(row["name"])
+                for row in conn.execute(
+                    f'PRAGMA index_info("{index_name}")'
+                ).fetchall()
+            )
+            if (
+                index_row is None
+                or schema_row is None
+                or str(schema_row["type"]) != "index"
+                or str(schema_row["tbl_name"]) != "capture_operations"
+                or bool(index_row["unique"]) is not bool(expected_unique)
+                or int(index_row["partial"]) != 0
+                or actual_columns != expected_columns
+                or self._normalized_schema_sql(str(schema_row["sql"] or ""))
+                != self._normalized_schema_sql(CAPTURE_OPERATION_INDEX_SQL[index_name])
+            ):
+                errors.append(f"{index_name}:index-signature")
+        return errors
+
+    @staticmethod
+    def _capture_operation_live_event(row: sqlite3.Row) -> dict[str, Any] | None:
+        if "live_event_context_id" not in row.keys():
+            return None
+        if row["live_event_context_id"] is None:
+            return None
+        return {
+            "context_id": str(row["live_event_context_id"]),
+            "event_type": str(row["live_event_type"]),
+            "source_surface": str(row["live_event_source_surface"]),
+            "published_at": float(row["live_event_published_at"]),
+        }
+
+    @staticmethod
+    def _capture_operation_bounded_count(
+        value: Any,
+        *,
+        field: str,
+        maximum: int = CAPTURE_OPERATION_COUNTER_MAX,
+    ) -> int:
+        if type(value) is not int or not 0 <= value <= maximum:
+            raise ValueError(
+                f"{field} must be an exact integer between 0 and {maximum}"
+            )
+        return value
+
+    def _build_private_capture_operation_receipt(
+        self,
+        *,
+        capture_id: str,
+        request_fingerprint: str,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+        deployment_event_id: int,
+        deployment_event_type: str,
+        deployment_source_surface: str,
+        deployment_published_at: float,
+        event_count: int,
+        entry_count: int,
+        relationship_count: int,
+        committed_at: float,
+    ) -> tuple[dict[str, Any], str]:
+        clean_capture_id = self._validate_capture_id(capture_id)
+        clean_fingerprint = self._validate_capture_fingerprint(request_fingerprint)
+        clean_context = self._validate_capture_identity_text(
+            context_id,
+            field="context_id",
+            max_length=128,
+        )
+        clean_source_tag = self._validate_capture_identity_text(
+            source_tag,
+            field="source_tag",
+            max_length=200,
+        )
+        clean_speaker = self._validate_capture_identity_text(
+            speaker,
+            field="speaker",
+            max_length=128,
+        )
+        clean_event_type = self._validate_capture_identity_text(
+            deployment_event_type,
+            field="deployment_event.event_type",
+            max_length=200,
+        )
+        clean_source_surface = self._validate_capture_identity_text(
+            deployment_source_surface,
+            field="deployment_event.source_surface",
+            max_length=200,
+        )
+        if type(deployment_event_id) is not int or deployment_event_id <= 0:
+            raise ValueError("deployment_event.event_id must be a positive exact integer")
+        clean_event_count = self._capture_operation_bounded_count(
+            event_count,
+            field="result.event_count",
+        )
+        clean_entry_count = self._capture_operation_bounded_count(
+            entry_count,
+            field="entry_count",
+        )
+        clean_relationship_count = self._capture_operation_bounded_count(
+            relationship_count,
+            field="relationship_count",
+        )
+        if clean_event_count > clean_entry_count:
+            raise ValueError("result.event_count must not exceed entry_count")
+        clean_published_at = self._validate_capture_timestamp(
+            deployment_published_at,
+            field="deployment_event.published_at",
+        )
+        clean_committed_at = self._validate_capture_timestamp(
+            committed_at,
+            field="committed_at",
+        )
+        envelope = {
+            "capture_id": clean_capture_id,
+            "protocol": CAPTURE_PROTOCOL_VERSION,
+            "request_fingerprint": clean_fingerprint,
+            "context_id": clean_context,
+            "source_tag": clean_source_tag,
+            "speaker": clean_speaker,
+            "result": {
+                "status": "committed",
+                "event_count": clean_event_count,
+                "entry_count": clean_entry_count,
+                "relationship_count": clean_relationship_count,
+            },
+            "deployment_event": {
+                "event_id": deployment_event_id,
+                "context_id": clean_context,
+                "event_type": clean_event_type,
+                "source_surface": clean_source_surface,
+                "published_at": clean_published_at,
+            },
+            "entry_count": clean_entry_count,
+            "relationship_count": clean_relationship_count,
+            "committed_at": clean_committed_at,
+        }
+        envelope_json = _capture_json_dumps(envelope, field="result_json")
+        if len(envelope_json.encode("utf-8")) > CAPTURE_OPERATION_RESULT_JSON_MAX_BYTES:
+            raise ValueError(
+                "content-free capture receipt exceeds the bounded storage envelope"
+            )
+        return envelope, envelope_json
+
+    def _capture_operation_receipt_reasons(
+        self,
+        row: sqlite3.Row,
+        envelope: Any,
+        raw_result: str,
+        *,
+        live_event: dict[str, Any] | None = None,
+    ) -> list[str]:
+        reasons: list[str] = []
+        capture_id = str(row["capture_id"])
+        fingerprint = str(row["request_fingerprint"])
+        row_context = str(row["context_id"])
+        source_tag = str(row["source_tag"])
+        speaker = str(row["speaker"])
+        deployment_event_id = int(row["deployment_event_id"])
+        entry_count = int(row["entry_count"])
+        relationship_count = int(row["relationship_count"])
+        committed_at = float(row["committed_at"])
+        if CAPTURE_ID_RE.fullmatch(capture_id) is None:
+            reasons.append("capture-id")
+        if str(row["protocol"]) != CAPTURE_PROTOCOL_VERSION:
+            reasons.append("protocol")
+        if CAPTURE_REQUEST_FINGERPRINT_RE.fullmatch(fingerprint) is None:
+            reasons.append("request-fingerprint")
+        if not (1 <= len(row_context) <= 128 and row_context == row_context.strip()):
+            reasons.append("context-id")
+        if not (1 <= len(source_tag) <= 200 and source_tag == source_tag.strip()):
+            reasons.append("source-tag")
+        if not (1 <= len(speaker) <= 128 and speaker == speaker.strip()):
+            reasons.append("speaker")
+        if (
+            deployment_event_id <= 0
+            or not 0 <= entry_count <= CAPTURE_OPERATION_COUNTER_MAX
+            or not 0 <= relationship_count <= CAPTURE_OPERATION_COUNTER_MAX
+            or not math.isfinite(committed_at)
+        ):
+            reasons.append("numeric-envelope")
+        if len(raw_result.encode("utf-8")) > CAPTURE_OPERATION_RESULT_JSON_MAX_BYTES:
+            reasons.append("result-json-size")
+        if not isinstance(envelope, dict):
+            reasons.append("result-json")
+            return reasons
+        if set(envelope) != CAPTURE_OPERATION_ENVELOPE_KEYS:
+            reasons.append("result-envelope-keys")
+        if (
+            type(envelope.get("capture_id")) is not str
+            or type(envelope.get("protocol")) is not str
+            or type(envelope.get("request_fingerprint")) is not str
+            or type(envelope.get("context_id")) is not str
+            or type(envelope.get("source_tag")) is not str
+            or type(envelope.get("speaker")) is not str
+            or type(envelope.get("entry_count")) is not int
+            or type(envelope.get("relationship_count")) is not int
+            or not isinstance(envelope.get("committed_at"), (int, float))
+            or isinstance(envelope.get("committed_at"), bool)
+            or not math.isfinite(float(envelope.get("committed_at")))
+            or abs(float(envelope.get("committed_at"))) >= 1.0e308
+            or envelope.get("capture_id") != capture_id
+            or envelope.get("protocol") != CAPTURE_PROTOCOL_VERSION
+            or envelope.get("request_fingerprint") != fingerprint
+            or envelope.get("context_id") != row_context
+            or envelope.get("source_tag") != source_tag
+            or envelope.get("speaker") != speaker
+            or envelope.get("entry_count") != entry_count
+            or envelope.get("relationship_count") != relationship_count
+            or envelope.get("committed_at") != committed_at
+        ):
+            reasons.append("result-envelope-values")
+
+        result = envelope.get("result")
+        if not isinstance(result, dict) or set(result) != CAPTURE_OPERATION_RESULT_KEYS:
+            reasons.append("result-counter-keys")
+        elif (
+            result.get("status") != "committed"
+            or type(result.get("event_count")) is not int
+            or not 0 <= result["event_count"] <= min(
+                entry_count,
+                CAPTURE_OPERATION_COUNTER_MAX,
+            )
+            or type(result.get("entry_count")) is not int
+            or type(result.get("relationship_count")) is not int
+            or result.get("entry_count") != entry_count
+            or result.get("relationship_count") != relationship_count
+        ):
+            reasons.append("result-counter-values")
+
+        deployment = envelope.get("deployment_event")
+        if (
+            not isinstance(deployment, dict)
+            or set(deployment) != CAPTURE_OPERATION_DEPLOYMENT_HEADER_KEYS
+        ):
+            reasons.append("result-deployment-keys")
+        else:
+            event_type = deployment.get("event_type")
+            source_surface = deployment.get("source_surface")
+            published_at = deployment.get("published_at")
+            if (
+                type(deployment.get("event_id")) is not int
+                or deployment.get("event_id") != deployment_event_id
+                or type(deployment.get("context_id")) is not str
+                or deployment.get("context_id") != row_context
+                or type(event_type) is not str
+                or not 1 <= len(event_type) <= 200
+                or event_type != event_type.strip()
+                or type(source_surface) is not str
+                or not 1 <= len(source_surface) <= 200
+                or source_surface != source_surface.strip()
+                or not isinstance(published_at, (int, float))
+                or isinstance(published_at, bool)
+                or not math.isfinite(float(published_at))
+                or abs(float(published_at)) >= 1.0e308
+            ):
+                reasons.append("result-deployment-values")
+            if live_event is not None and (
+                live_event.get("context_id") != row_context
+                or event_type != live_event.get("event_type")
+                or source_surface != live_event.get("source_surface")
+                or published_at != live_event.get("published_at")
+            ):
+                reasons.append("deployment-live-parity")
+        try:
+            if _capture_json_dumps(envelope, field="result_json") != raw_result:
+                reasons.append("result-json-not-canonical")
+        except ValueError:
+            reasons.append("result-json-not-canonical")
+        return reasons
+
+    def _capture_operation_is_legacy_full_receipt(
+        self,
+        row: sqlite3.Row,
+        envelope: Any,
+        raw_result: str,
+    ) -> bool:
+        """Recognize the exact pre-privacy v2 envelope without blessing tampering."""
+
+        if not isinstance(envelope, dict) or set(envelope) != CAPTURE_OPERATION_ENVELOPE_KEYS:
+            return False
+        try:
+            canonical = _capture_json_dumps(envelope, field="result_json")
+        except ValueError:
+            return False
+        if canonical != raw_result:
+            return False
+        if (
+            envelope.get("capture_id") != str(row["capture_id"])
+            or envelope.get("protocol") != CAPTURE_PROTOCOL_VERSION
+            or envelope.get("request_fingerprint") != str(row["request_fingerprint"])
+            or envelope.get("context_id") != str(row["context_id"])
+            or envelope.get("source_tag") != str(row["source_tag"])
+            or envelope.get("speaker") != str(row["speaker"])
+            or envelope.get("entry_count") != int(row["entry_count"])
+            or envelope.get("relationship_count") != int(row["relationship_count"])
+            or envelope.get("committed_at") != float(row["committed_at"])
+            or not isinstance(envelope.get("result"), dict)
+        ):
+            return False
+        deployment = envelope.get("deployment_event")
+        return bool(
+            isinstance(deployment, dict)
+            and set(deployment) == CAPTURE_OPERATION_LEGACY_DEPLOYMENT_KEYS
+            and deployment.get("event_id") == int(row["deployment_event_id"])
+            and deployment.get("context_id") == str(row["context_id"])
+        )
+
+    def _scrub_legacy_capture_operation_receipts(
+        self,
+        conn: sqlite3.Connection,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT
+                operation.*,
+                event.context_id AS live_event_context_id,
+                event.event_type AS live_event_type,
+                event.source_surface AS live_event_source_surface,
+                event.created_at AS live_event_published_at
+            FROM capture_operations AS operation
+            LEFT JOIN agent_context_events AS event
+              ON event.event_id = operation.deployment_event_id
+            ORDER BY operation.committed_at, operation.capture_id
+            """
+        ).fetchall()
+        scrubbed = 0
+        for row in rows:
+            raw_result = str(row["result_json"])
+            try:
+                envelope = json.loads(raw_result)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not self._capture_operation_receipt_reasons(
+                row,
+                envelope,
+                raw_result,
+            ):
+                continue
+            if not self._capture_operation_is_legacy_full_receipt(
+                row,
+                envelope,
+                raw_result,
+            ):
+                continue
+            live_event = self._capture_operation_live_event(row)
+            legacy_deployment = envelope["deployment_event"]
+            legacy_result = envelope["result"]
+            event_type = (
+                str(live_event["event_type"])
+                if live_event is not None
+                else str(legacy_deployment.get("event_type") or "unknown")
+            )
+            source_surface = (
+                str(live_event["source_surface"])
+                if live_event is not None
+                else str(legacy_deployment.get("source_surface") or "unknown")
+            )
+            published_at = (
+                float(live_event["published_at"])
+                if live_event is not None
+                else legacy_deployment.get(
+                    "published_at",
+                    legacy_deployment.get("created_at", row["committed_at"]),
+                )
+            )
+            legacy_event_count = legacy_result.get("event_count", 0)
+            if (
+                type(legacy_event_count) is not int
+                or not 0 <= legacy_event_count <= min(
+                    int(row["entry_count"]),
+                    CAPTURE_OPERATION_COUNTER_MAX,
+                )
+            ):
+                legacy_event_count = 0
+            _, private_json = self._build_private_capture_operation_receipt(
+                capture_id=str(row["capture_id"]),
+                request_fingerprint=str(row["request_fingerprint"]),
+                context_id=str(row["context_id"]),
+                source_tag=str(row["source_tag"]),
+                speaker=str(row["speaker"]),
+                deployment_event_id=int(row["deployment_event_id"]),
+                deployment_event_type=event_type,
+                deployment_source_surface=source_surface,
+                deployment_published_at=published_at,
+                event_count=legacy_event_count,
+                entry_count=int(row["entry_count"]),
+                relationship_count=int(row["relationship_count"]),
+                committed_at=float(row["committed_at"]),
+            )
+            conn.execute(
+                "UPDATE capture_operations SET result_json = ? WHERE capture_id = ?",
+                (private_json, str(row["capture_id"])),
+            )
+            scrubbed += 1
+        return scrubbed
+
+    def _capture_operation_integrity_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str | None = None,
+        sample_limit: int = 10,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        params: tuple[Any, ...] = ()
+        where = ""
+        if context_id is not None:
+            where = "WHERE operation.context_id = ?"
+            params = (str(context_id),)
+        rows = conn.execute(
+            f"""
+            SELECT
+                operation.*,
+                event.context_id AS live_event_context_id,
+                event.event_type AS live_event_type,
+                event.source_surface AS live_event_source_surface,
+                event.created_at AS live_event_published_at
+            FROM capture_operations AS operation
+            LEFT JOIN agent_context_events AS event
+              ON event.event_id = operation.deployment_event_id
+            {where}
+            ORDER BY operation.committed_at, operation.capture_id
+            """,
+            params,
+        ).fetchall()
+        error_count = 0
+        samples: list[dict[str, Any]] = []
+        for row in rows:
+            raw_result = str(row["result_json"])
+            try:
+                envelope = json.loads(raw_result)
+            except (TypeError, json.JSONDecodeError):
+                envelope = None
+            reasons = self._capture_operation_receipt_reasons(
+                row,
+                envelope,
+                raw_result,
+                live_event=self._capture_operation_live_event(row),
+            )
+            if reasons:
+                error_count += 1
+                if len(samples) < max(0, int(sample_limit)):
+                    samples.append(
+                        {
+                            "capture_id": str(row["capture_id"]),
+                            "reasons": sorted(set(reasons)),
+                        }
+                    )
+        return error_count, samples
 
     def _context_delivery_v2_table_errors(
         self,
@@ -3856,6 +4514,8 @@ class DurableMemoryStore:
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
         required_migrations = {
+            "capture_operations_v1",
+            "capture_operations_private_receipts_v1",
             "memory_spikes_v1",
             "memory_surface_terms_v1",
             "context_event_targets_v2",
@@ -3909,6 +4569,15 @@ class DurableMemoryStore:
         target_highwater_error_count, _ = (
             self._context_event_target_highwater_audit(conn)
         )
+        capture_schema_errors = self._capture_operation_schema_errors(conn)
+        startup_capture_integrity_required = not bool(
+            getattr(self, "_capture_integrity_verified", False)
+        )
+        capture_integrity_error_count = 0
+        if not capture_schema_errors and startup_capture_integrity_required:
+            capture_integrity_error_count, _ = self._capture_operation_integrity_audit(
+                conn
+            )
         if (
             applied_migrations == required_migrations
             and delivery_schema_ready
@@ -3918,8 +4587,11 @@ class DurableMemoryStore:
             and target_integrity_error_count == 0
             and event_ledger_integrity_error_count == 0
             and target_highwater_error_count == 0
+            and not capture_schema_errors
+            and capture_integrity_error_count == 0
         ):
             self._target_integrity_verified = True
+            self._capture_integrity_verified = True
             return
 
         # Recheck after acquiring the writer lock. Another process may have
@@ -3927,6 +4599,35 @@ class DurableMemoryStore:
         with self._transaction(conn, immediate=True):
             index_rows_changed = 0
             target_integrity_after_event_id = 0
+            capture_schema_errors = self._capture_operation_schema_errors(conn)
+            if capture_schema_errors:
+                raise RuntimeError(
+                    "capture operation ledger failed schema validation "
+                    f"(samples={capture_schema_errors[:3]!r})"
+                )
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("capture_operations_v1",),
+            ).fetchone():
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("capture_operations_v1", time.time()),
+                )
+            self._scrub_legacy_capture_operation_receipts(conn)
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("capture_operations_private_receipts_v1",),
+            ).fetchone():
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("capture_operations_private_receipts_v1", time.time()),
+                )
             if not startup_target_integrity_required:
                 prior_highwater_row = conn.execute(
                     "SELECT value_json FROM store_metadata WHERE key = ?",
@@ -4136,6 +4837,16 @@ class DurableMemoryStore:
                     "context event target reconciliation highwater failed "
                     f"integrity validation (samples={target_highwater_samples!r})"
                 )
+            (
+                capture_integrity_error_count,
+                capture_integrity_samples,
+            ) = self._capture_operation_integrity_audit(conn)
+            if capture_integrity_error_count:
+                raise RuntimeError(
+                    "capture operation ledger failed integrity validation "
+                    f"(operations={capture_integrity_error_count}, "
+                    f"samples={capture_integrity_samples[:3]!r})"
+                )
 
             if index_rows_changed:
                 generation_row = conn.execute(
@@ -4165,6 +4876,7 @@ class DurableMemoryStore:
                     ),
                 )
         self._target_integrity_verified = True
+        self._capture_integrity_verified = True
 
     def _protect_path(self, path: Path, *, directory: bool) -> None:
         try:
@@ -4217,6 +4929,538 @@ class DurableMemoryStore:
             f"{normalized_direction}"
         ).encode("utf-8")
         return "s2cl_" + hashlib.sha256(key).hexdigest()[:32]
+
+    @staticmethod
+    def _validate_capture_id(capture_id: Any) -> str:
+        if type(capture_id) is not str or CAPTURE_ID_RE.fullmatch(capture_id) is None:
+            raise ValueError(
+                "capture_id must be canonical s2cap_ followed by 32 lowercase hex characters"
+            )
+        return capture_id
+
+    @staticmethod
+    def _validate_capture_fingerprint(request_fingerprint: Any) -> str:
+        if (
+            type(request_fingerprint) is not str
+            or CAPTURE_REQUEST_FINGERPRINT_RE.fullmatch(request_fingerprint) is None
+        ):
+            raise ValueError(
+                "request_fingerprint must be exactly 64 lowercase hex characters"
+            )
+        return request_fingerprint
+
+    @staticmethod
+    def _validate_capture_identity_text(
+        value: Any,
+        *,
+        field: str,
+        max_length: int,
+    ) -> str:
+        if (
+            type(value) is not str
+            or not value
+            or value != value.strip()
+            or len(value) > max_length
+        ):
+            raise ValueError(
+                f"{field} must be a stripped, nonempty string no longer than {max_length} characters"
+            )
+        return value
+
+    @staticmethod
+    def _validate_capture_timestamp(value: Any, *, field: str) -> float:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or abs(float(value)) >= 1.0e308
+        ):
+            raise ValueError(f"{field} must be a finite timestamp")
+        return float(value)
+
+    def _normalize_capture_plan_entries(
+        self,
+        entries: Iterable[dict[str, Any]],
+        *,
+        context_id: str,
+        default_timestamp: float,
+    ) -> list[dict[str, Any]]:
+        if isinstance(entries, (str, bytes, dict)):
+            raise ValueError("entries must be an iterable of objects")
+        try:
+            raw_entries = list(entries)
+        except TypeError as exc:
+            raise ValueError("entries must be an iterable of objects") from exc
+        normalized: list[dict[str, Any]] = []
+        seen_memory_ids: set[str] = set()
+        for index, raw_entry in enumerate(raw_entries):
+            if not isinstance(raw_entry, dict):
+                raise ValueError(f"entries[{index}] must be an object")
+            entry_context = raw_entry.get("context_id", context_id)
+            if entry_context != context_id:
+                raise ValueError(f"entries[{index}].context_id must match capture context_id")
+            tag = self._validate_capture_identity_text(
+                raw_entry.get("tag"),
+                field=f"entries[{index}].tag",
+                max_length=200,
+            )
+            source_text = raw_entry.get("source_text", "")
+            if type(source_text) is not str:
+                raise ValueError(f"entries[{index}].source_text must be a string")
+            metadata = raw_entry.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise ValueError(f"entries[{index}].metadata must be an object")
+            metadata_json = _capture_json_dumps(
+                metadata,
+                field=f"entries[{index}].metadata",
+            )
+            embedding_dimensions = raw_entry.get("embedding_dimensions")
+            if type(embedding_dimensions) is not int or embedding_dimensions <= 0:
+                raise ValueError(
+                    f"entries[{index}].embedding_dimensions must be a positive exact integer"
+                )
+            spike_indices = raw_entry.get("spike_indices", [])
+            neuron_indices = raw_entry.get("neuron_indices", [])
+            if not isinstance(spike_indices, (list, tuple)):
+                raise ValueError(f"entries[{index}].spike_indices must be a list")
+            if not isinstance(neuron_indices, (list, tuple)):
+                raise ValueError(f"entries[{index}].neuron_indices must be a list")
+            if any(type(value) is not int for value in spike_indices):
+                raise ValueError(
+                    f"entries[{index}].spike_indices must contain exact integers"
+                )
+            if any(
+                value < 0 or value >= embedding_dimensions
+                for value in spike_indices
+            ):
+                raise ValueError(
+                    f"entries[{index}].spike_indices must be within embedding dimensions"
+                )
+            if any(type(value) is not int or value < 0 for value in neuron_indices):
+                raise ValueError(
+                    f"entries[{index}].neuron_indices must contain non-negative exact integers"
+                )
+            clean_spike_indices = sorted(set(spike_indices))
+            clean_neuron_indices = list(dict.fromkeys(neuron_indices))
+            registered_at = self._validate_capture_timestamp(
+                raw_entry.get("registered_at", default_timestamp),
+                field=f"entries[{index}].registered_at",
+            )
+            memory_id = self.stable_memory_id(context_id=context_id, tag=tag)
+            supplied_memory_id = raw_entry.get("memory_id")
+            if supplied_memory_id is not None and supplied_memory_id != memory_id:
+                raise ValueError(
+                    f"entries[{index}].memory_id does not match the stable store identity"
+                )
+            if memory_id in seen_memory_ids:
+                raise ValueError(f"entries[{index}] duplicates memory_id {memory_id}")
+            seen_memory_ids.add(memory_id)
+            normalized.append(
+                {
+                    "memory_id": memory_id,
+                    "tag": tag,
+                    "context_id": context_id,
+                    "source_text": source_text,
+                    "metadata": json.loads(metadata_json),
+                    "metadata_json": metadata_json,
+                    "embedding_dimensions": embedding_dimensions,
+                    "clean_spike_indices": clean_spike_indices,
+                    "clean_neuron_indices": clean_neuron_indices,
+                    "spike_json": _json_list(clean_spike_indices),
+                    "neuron_json": _json_list(clean_neuron_indices),
+                    "registered_at": registered_at,
+                }
+            )
+        return normalized
+
+    def _normalize_capture_plan_relationships(
+        self,
+        relationships: Iterable[dict[str, Any]],
+        *,
+        context_id: str,
+        default_timestamp: float,
+    ) -> list[dict[str, Any]]:
+        if isinstance(relationships, (str, bytes, dict)):
+            raise ValueError("relationships must be an iterable of objects")
+        try:
+            raw_relationships = list(relationships)
+        except TypeError as exc:
+            raise ValueError("relationships must be an iterable of objects") from exc
+        normalized: list[dict[str, Any]] = []
+        seen_relationship_ids: set[str] = set()
+        for index, raw_relationship in enumerate(raw_relationships):
+            if not isinstance(raw_relationship, dict):
+                raise ValueError(f"relationships[{index}] must be an object")
+            relationship_context = raw_relationship.get("context_id", context_id)
+            if relationship_context != context_id:
+                raise ValueError(
+                    f"relationships[{index}].context_id must match capture context_id"
+                )
+            source_memory_id = self._validate_capture_identity_text(
+                raw_relationship.get("source_memory_id"),
+                field=f"relationships[{index}].source_memory_id",
+                max_length=160,
+            )
+            target_memory_id = self._validate_capture_identity_text(
+                raw_relationship.get("target_memory_id"),
+                field=f"relationships[{index}].target_memory_id",
+                max_length=160,
+            )
+            relation_type = self._validate_capture_identity_text(
+                raw_relationship.get("relation_type"),
+                field=f"relationships[{index}].relation_type",
+                max_length=200,
+            )
+            raw_weight = raw_relationship.get("weight")
+            if (
+                not isinstance(raw_weight, (int, float))
+                or isinstance(raw_weight, bool)
+                or not math.isfinite(float(raw_weight))
+                or not 0.0 <= float(raw_weight) <= 1.0
+            ):
+                raise ValueError(
+                    f"relationships[{index}].weight must be finite and between 0 and 1"
+                )
+            evidence = raw_relationship.get("evidence", {})
+            if not isinstance(evidence, dict):
+                raise ValueError(f"relationships[{index}].evidence must be an object")
+            evidence_json = _capture_json_dumps(
+                evidence,
+                field=f"relationships[{index}].evidence",
+            )
+            created_at = self._validate_capture_timestamp(
+                raw_relationship.get("created_at", default_timestamp),
+                field=f"relationships[{index}].created_at",
+            )
+            updated_at = self._validate_capture_timestamp(
+                raw_relationship.get("updated_at", created_at),
+                field=f"relationships[{index}].updated_at",
+            )
+            if updated_at < created_at:
+                raise ValueError(
+                    f"relationships[{index}].updated_at must not precede created_at"
+                )
+            relationship_id = self.stable_relationship_id(
+                context_id=context_id,
+                source_memory_id=source_memory_id,
+                target_memory_id=target_memory_id,
+                relation_type=relation_type,
+            )
+            supplied_relationship_id = raw_relationship.get("relationship_id")
+            if (
+                supplied_relationship_id is not None
+                and supplied_relationship_id != relationship_id
+            ):
+                raise ValueError(
+                    f"relationships[{index}].relationship_id does not match the stable store identity"
+                )
+            if relationship_id in seen_relationship_ids:
+                raise ValueError(
+                    f"relationships[{index}] duplicates relationship_id {relationship_id}"
+                )
+            seen_relationship_ids.add(relationship_id)
+            normalized.append(
+                {
+                    "relationship_id": relationship_id,
+                    "context_id": context_id,
+                    "source_memory_id": source_memory_id,
+                    "target_memory_id": target_memory_id,
+                    "relation_type": relation_type,
+                    "weight": float(raw_weight),
+                    "evidence_json": evidence_json,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                }
+            )
+        return normalized
+
+    def _normalize_capture_plan_deployment(
+        self,
+        deployment: dict[str, Any],
+        *,
+        context_id: str,
+        default_timestamp: float,
+    ) -> dict[str, Any]:
+        if not isinstance(deployment, dict):
+            raise ValueError("deployment must be an object")
+        deployment_context = deployment.get("context_id", context_id)
+        if deployment_context != context_id:
+            raise ValueError("deployment.context_id must match capture context_id")
+        source_surface = self._validate_capture_identity_text(
+            deployment.get("source_surface"),
+            field="deployment.source_surface",
+            max_length=200,
+        )
+        event_type = self._validate_capture_identity_text(
+            deployment.get("event_type"),
+            field="deployment.event_type",
+            max_length=200,
+        )
+        summary = deployment.get("summary", "")
+        if type(summary) is not str:
+            raise ValueError("deployment.summary must be a string")
+        payload = deployment.get("payload", {})
+        if not isinstance(payload, dict):
+            raise ValueError("deployment.payload must be an object")
+        payload_json = _capture_json_dumps(payload, field="deployment.payload")
+        raw_targets = deployment.get("agent_targets", ["mcp-clients"])
+        if not isinstance(raw_targets, (list, tuple)):
+            raise ValueError("deployment.agent_targets must be a list of strings")
+        if any(type(value) is not str or not value.strip() for value in raw_targets):
+            raise ValueError("deployment.agent_targets must contain nonempty strings")
+        targets = self._normalize_event_targets(raw_targets)
+        if not targets:
+            targets = ["mcp-clients"]
+        if not self._normalized_event_target_records(targets):
+            raise ValueError("deployment.agent_targets did not resolve to valid targets")
+        created_at = self._validate_capture_timestamp(
+            deployment.get("created_at", default_timestamp),
+            field="deployment.created_at",
+        )
+        return {
+            "context_id": context_id,
+            "source_surface": source_surface,
+            "event_type": event_type,
+            "summary": summary,
+            "payload_json": payload_json,
+            "targets": targets,
+            "created_at": created_at,
+        }
+
+    def _capture_operation_envelope_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        live_event: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raw_result = str(row["result_json"])
+        try:
+            envelope = json.loads(raw_result)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"capture operation {row['capture_id']} has invalid result_json"
+            ) from exc
+        reasons = self._capture_operation_receipt_reasons(
+            row,
+            envelope,
+            raw_result,
+            live_event=live_event,
+        )
+        if reasons:
+            raise RuntimeError(
+                f"capture operation {row['capture_id']} has an invalid private receipt "
+                f"(reasons={sorted(set(reasons))!r})"
+            )
+        return envelope
+
+    def get_capture_operation(self, capture_id: str) -> dict[str, Any] | None:
+        clean_capture_id = self._validate_capture_id(capture_id)
+        with closing(self._connect_read_only()) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    operation.*,
+                    event.context_id AS live_event_context_id,
+                    event.event_type AS live_event_type,
+                    event.source_surface AS live_event_source_surface,
+                    event.created_at AS live_event_published_at
+                FROM capture_operations AS operation
+                LEFT JOIN agent_context_events AS event
+                  ON event.event_id = operation.deployment_event_id
+                WHERE operation.capture_id = ?
+                """,
+                (clean_capture_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        envelope = self._capture_operation_envelope_from_row(
+            row,
+            live_event=self._capture_operation_live_event(row),
+        )
+        return {**envelope, "idempotent_replay": True}
+
+    def commit_capture_plan(
+        self,
+        *,
+        capture_id: str,
+        request_fingerprint: str,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+        entries: Iterable[dict[str, Any]],
+        relationships: Iterable[dict[str, Any]],
+        deployment: dict[str, Any],
+        result: dict[str, Any],
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically commit a pure capture plan or replay its durable receipt."""
+
+        clean_capture_id = self._validate_capture_id(capture_id)
+        clean_fingerprint = self._validate_capture_fingerprint(request_fingerprint)
+        clean_context = self._validate_capture_identity_text(
+            context_id,
+            field="context_id",
+            max_length=128,
+        )
+        clean_source_tag = self._validate_capture_identity_text(
+            source_tag,
+            field="source_tag",
+            max_length=200,
+        )
+        clean_speaker = self._validate_capture_identity_text(
+            speaker,
+            field="speaker",
+            max_length=128,
+        )
+        if type(result) is not dict:
+            raise ValueError("result must be an object")
+        if fault_hook is not None and not callable(fault_hook):
+            raise ValueError("fault_hook must be callable")
+        plan_timestamp = time.time()
+        normalized_entries = self._normalize_capture_plan_entries(
+            entries,
+            context_id=clean_context,
+            default_timestamp=plan_timestamp,
+        )
+        normalized_relationships = self._normalize_capture_plan_relationships(
+            relationships,
+            context_id=clean_context,
+            default_timestamp=plan_timestamp,
+        )
+        plan_memory_ids = {
+            str(entry["memory_id"])
+            for entry in normalized_entries
+        }
+        for index, relationship in enumerate(normalized_relationships):
+            missing_endpoints = [
+                field
+                for field in ("source_memory_id", "target_memory_id")
+                if str(relationship[field]) not in plan_memory_ids
+            ]
+            if missing_endpoints:
+                raise ValueError(
+                    f"relationships[{index}] endpoints must reference entries in "
+                    "the same capture plan; missing "
+                    + ", ".join(missing_endpoints)
+                )
+        event_count = self._capture_operation_bounded_count(
+            result.get("event_count"),
+            field="result.event_count",
+        )
+        if event_count > len(normalized_entries):
+            raise ValueError("result.event_count must not exceed capture entry_count")
+        self._capture_operation_bounded_count(
+            len(normalized_entries),
+            field="entry_count",
+        )
+        self._capture_operation_bounded_count(
+            len(normalized_relationships),
+            field="relationship_count",
+        )
+        normalized_deployment = self._normalize_capture_plan_deployment(
+            deployment,
+            context_id=clean_context,
+            default_timestamp=plan_timestamp,
+        )
+
+        with closing(self._connect()) as conn:
+            with self._transaction(conn, immediate=True):
+                existing = conn.execute(
+                    "SELECT * FROM capture_operations WHERE capture_id = ?",
+                    (clean_capture_id,),
+                ).fetchone()
+                if existing is not None:
+                    mismatch_fields = [
+                        field
+                        for field, expected in (
+                            ("request_fingerprint", clean_fingerprint),
+                            ("context_id", clean_context),
+                            ("source_tag", clean_source_tag),
+                            ("speaker", clean_speaker),
+                        )
+                        if str(existing[field]) != expected
+                    ]
+                    if mismatch_fields:
+                        raise ValueError(
+                            "capture_id is already committed with a different "
+                            + ", ".join(mismatch_fields)
+                        )
+                    envelope = self._capture_operation_envelope_from_row(existing)
+                    return {**envelope, "idempotent_replay": True}
+
+                for entry in normalized_entries:
+                    self._upsert_entry_conn(conn, **entry)
+                if fault_hook is not None:
+                    fault_hook("after_entries")
+
+                for relationship in normalized_relationships:
+                    self._upsert_relationship_conn(conn, **relationship)
+                if fault_hook is not None:
+                    fault_hook("after_relationships")
+
+                deployment_event = self._publish_context_event_conn(
+                    conn,
+                    **normalized_deployment,
+                )
+                if fault_hook is not None:
+                    fault_hook("after_deployment")
+
+                committed_at = time.time()
+                envelope, envelope_json = (
+                    self._build_private_capture_operation_receipt(
+                        capture_id=clean_capture_id,
+                        request_fingerprint=clean_fingerprint,
+                        context_id=clean_context,
+                        source_tag=clean_source_tag,
+                        speaker=clean_speaker,
+                        deployment_event_id=int(deployment_event["event_id"]),
+                        deployment_event_type=str(deployment_event["event_type"]),
+                        deployment_source_surface=str(
+                            deployment_event["source_surface"]
+                        ),
+                        deployment_published_at=float(
+                            deployment_event["created_at"]
+                        ),
+                        event_count=event_count,
+                        entry_count=len(normalized_entries),
+                        relationship_count=len(normalized_relationships),
+                        committed_at=committed_at,
+                    )
+                )
+                if fault_hook is not None:
+                    fault_hook("before_ledger")
+                conn.execute(
+                    """
+                    INSERT INTO capture_operations (
+                        capture_id,
+                        protocol,
+                        request_fingerprint,
+                        context_id,
+                        source_tag,
+                        speaker,
+                        result_json,
+                        deployment_event_id,
+                        entry_count,
+                        relationship_count,
+                        committed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_capture_id,
+                        CAPTURE_PROTOCOL_VERSION,
+                        clean_fingerprint,
+                        clean_context,
+                        clean_source_tag,
+                        clean_speaker,
+                        envelope_json,
+                        int(deployment_event["event_id"]),
+                        len(normalized_entries),
+                        len(normalized_relationships),
+                        committed_at,
+                    ),
+                )
+        return {**envelope, "idempotent_replay": False}
 
     @staticmethod
     def _normalize_recall_scope(scope: str) -> str:
@@ -4277,118 +5521,156 @@ class DurableMemoryStore:
         try:
             with closing(self._connect()) as conn:
                 with self._transaction(conn, immediate=True):
-                    conn.execute(
-                        """
-                        INSERT INTO memory_entries (
-                            memory_id,
-                            tag,
-                            context_id,
-                            source_text,
-                            metadata_json,
-                            embedding_dimensions,
-                            spike_indices_json,
-                            neuron_indices_json,
-                            created_at,
-                            updated_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(memory_id) DO UPDATE SET
-                            tag = excluded.tag,
-                            context_id = excluded.context_id,
-                            source_text = excluded.source_text,
-                            metadata_json = excluded.metadata_json,
-                            embedding_dimensions = excluded.embedding_dimensions,
-                            spike_indices_json = excluded.spike_indices_json,
-                            neuron_indices_json = excluded.neuron_indices_json,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            memory_id,
-                            tag,
-                            context_id,
-                            str(source_text or ""),
-                            metadata_json,
-                            int(embedding_dimensions),
-                            spike_json,
-                            neuron_json,
-                            now,
-                            time.time(),
-                        ),
-                    )
-                    conn.execute(
-                        "DELETE FROM memory_spikes WHERE memory_id = ?",
-                        (memory_id,),
-                    )
-                    if clean_spike_indices:
-                        conn.executemany(
-                            """
-                            INSERT INTO memory_spikes (
-                                memory_id,
-                                context_id,
-                                spike_index
-                            )
-                            VALUES (?, ?, ?)
-                            """,
-                            [
-                                (memory_id, context_id, spike_index)
-                                for spike_index in clean_spike_indices
-                            ],
-                        )
-                    conn.execute(
-                        "DELETE FROM memory_surface_terms WHERE memory_id = ?",
-                        (memory_id,),
-                    )
-                    surface_rows = self._surface_term_rows(
+                    entry = self._upsert_entry_conn(
+                        conn,
                         memory_id=memory_id,
-                        context_id=context_id,
-                        tag=tag,
+                        tag=str(tag),
+                        context_id=str(context_id),
                         source_text=str(source_text or ""),
                         metadata=metadata or {},
+                        metadata_json=metadata_json,
+                        embedding_dimensions=int(embedding_dimensions),
+                        clean_spike_indices=clean_spike_indices,
+                        clean_neuron_indices=clean_neuron_indices,
+                        spike_json=spike_json,
+                        neuron_json=neuron_json,
+                        registered_at=now,
                     )
-                    if surface_rows:
-                        conn.executemany(
-                            """
-                            INSERT INTO memory_surface_terms (
-                                memory_id,
-                                context_id,
-                                term,
-                                weight
-                            )
-                            VALUES (?, ?, ?, ?)
-                            """,
-                            surface_rows,
-                        )
-                    conn.execute(
-                        """
-                        INSERT INTO memory_events (
-                            memory_id,
-                            event_type,
-                            payload_json,
-                            created_at
-                        )
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (
-                            memory_id,
-                            "upsert",
-                            _json_dumps(
-                                {
-                                    "tag": tag,
-                                    "context_id": context_id,
-                                    "embedding_dimensions": int(embedding_dimensions),
-                                    "spike_count": len(clean_spike_indices),
-                                }
-                            ),
-                            time.time(),
-                        ),
-                    )
-            entry = self.get_entry(memory_id)
-            if entry is None:
-                raise RuntimeError(f"memory entry {memory_id} was not readable after upsert")
             return entry
         except Exception:
             LOGGER.exception("failed to upsert memory entry tag=%s context_id=%s", tag, context_id)
             raise
+
+    def _upsert_entry_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        memory_id: str,
+        tag: str,
+        context_id: str,
+        source_text: str,
+        metadata: dict[str, Any],
+        metadata_json: str,
+        embedding_dimensions: int,
+        clean_spike_indices: list[int],
+        clean_neuron_indices: list[int],
+        spike_json: str,
+        neuron_json: str,
+        registered_at: float,
+    ) -> dict[str, Any]:
+        updated_at = time.time()
+        conn.execute(
+            """
+            INSERT INTO memory_entries (
+                memory_id,
+                tag,
+                context_id,
+                source_text,
+                metadata_json,
+                embedding_dimensions,
+                spike_indices_json,
+                neuron_indices_json,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(memory_id) DO UPDATE SET
+                tag = excluded.tag,
+                context_id = excluded.context_id,
+                source_text = excluded.source_text,
+                metadata_json = excluded.metadata_json,
+                embedding_dimensions = excluded.embedding_dimensions,
+                spike_indices_json = excluded.spike_indices_json,
+                neuron_indices_json = excluded.neuron_indices_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                memory_id,
+                tag,
+                context_id,
+                source_text,
+                metadata_json,
+                embedding_dimensions,
+                spike_json,
+                neuron_json,
+                registered_at,
+                updated_at,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM memory_spikes WHERE memory_id = ?",
+            (memory_id,),
+        )
+        if clean_spike_indices:
+            conn.executemany(
+                """
+                INSERT INTO memory_spikes (
+                    memory_id,
+                    context_id,
+                    spike_index
+                )
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (memory_id, context_id, spike_index)
+                    for spike_index in clean_spike_indices
+                ],
+            )
+        conn.execute(
+            "DELETE FROM memory_surface_terms WHERE memory_id = ?",
+            (memory_id,),
+        )
+        surface_rows = self._surface_term_rows(
+            memory_id=memory_id,
+            context_id=context_id,
+            tag=tag,
+            source_text=source_text,
+            metadata=metadata,
+        )
+        if surface_rows:
+            conn.executemany(
+                """
+                INSERT INTO memory_surface_terms (
+                    memory_id,
+                    context_id,
+                    term,
+                    weight
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                surface_rows,
+            )
+        conn.execute(
+            """
+            INSERT INTO memory_events (
+                memory_id,
+                event_type,
+                payload_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                "upsert",
+                _json_dumps(
+                    {
+                        "tag": tag,
+                        "context_id": context_id,
+                        "embedding_dimensions": embedding_dimensions,
+                        "spike_count": len(clean_spike_indices),
+                    }
+                ),
+                updated_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM memory_entries WHERE memory_id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"memory entry {memory_id} was not readable after upsert")
+        return self._row_to_entry(row)
 
     def get_entry(self, memory_id: str) -> dict[str, Any] | None:
         try:
@@ -5515,57 +6797,18 @@ class DurableMemoryStore:
         try:
             with closing(self._connect()) as conn:
                 with self._transaction(conn, immediate=True):
-                    conn.execute(
-                        """
-                        INSERT INTO memory_relationships (
-                            relationship_id,
-                            context_id,
-                            source_memory_id,
-                            target_memory_id,
-                            relation_type,
-                            weight,
-                            evidence_json,
-                            created_at,
-                            updated_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(relationship_id) DO UPDATE SET
-                            weight = excluded.weight,
-                            evidence_json = excluded.evidence_json,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            relationship_id,
-                            str(context_id),
-                            str(source_memory_id),
-                            str(target_memory_id),
-                            str(relation_type),
-                            bounded_weight,
-                            _json_dumps(evidence or {}),
-                            now,
-                            now,
-                        ),
+                    return self._upsert_relationship_conn(
+                        conn,
+                        relationship_id=relationship_id,
+                        context_id=str(context_id),
+                        source_memory_id=str(source_memory_id),
+                        target_memory_id=str(target_memory_id),
+                        relation_type=str(relation_type),
+                        weight=bounded_weight,
+                        evidence_json=_json_dumps(evidence or {}),
+                        created_at=now,
+                        updated_at=now,
                     )
-                    relationship_row = conn.execute(
-                        """
-                        SELECT
-                            r.*,
-                            source.tag AS source_tag,
-                            target.tag AS target_tag
-                        FROM memory_relationships AS r
-                        JOIN memory_entries AS source
-                            ON source.memory_id = r.source_memory_id
-                        JOIN memory_entries AS target
-                            ON target.memory_id = r.target_memory_id
-                        WHERE r.relationship_id = ?
-                        """,
-                        (relationship_id,),
-                    ).fetchone()
-            if relationship_row is None:
-                raise RuntimeError(
-                    f"relationship {relationship_id} was not readable after upsert"
-                )
-            return self._row_to_relationship(relationship_row)
         except Exception:
             LOGGER.exception(
                 "failed to upsert relationship context_id=%s source=%s target=%s",
@@ -5574,6 +6817,72 @@ class DurableMemoryStore:
                 target_memory_id,
             )
             raise
+
+    def _upsert_relationship_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        relationship_id: str,
+        context_id: str,
+        source_memory_id: str,
+        target_memory_id: str,
+        relation_type: str,
+        weight: float,
+        evidence_json: str,
+        created_at: float,
+        updated_at: float,
+    ) -> dict[str, Any]:
+        conn.execute(
+            """
+            INSERT INTO memory_relationships (
+                relationship_id,
+                context_id,
+                source_memory_id,
+                target_memory_id,
+                relation_type,
+                weight,
+                evidence_json,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(relationship_id) DO UPDATE SET
+                weight = excluded.weight,
+                evidence_json = excluded.evidence_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                relationship_id,
+                context_id,
+                source_memory_id,
+                target_memory_id,
+                relation_type,
+                weight,
+                evidence_json,
+                created_at,
+                updated_at,
+            ),
+        )
+        relationship_row = conn.execute(
+            """
+            SELECT
+                r.*,
+                source.tag AS source_tag,
+                target.tag AS target_tag
+            FROM memory_relationships AS r
+            JOIN memory_entries AS source
+                ON source.memory_id = r.source_memory_id
+            JOIN memory_entries AS target
+                ON target.memory_id = r.target_memory_id
+            WHERE r.relationship_id = ?
+            """,
+            (relationship_id,),
+        ).fetchone()
+        if relationship_row is None:
+            raise RuntimeError(
+                f"relationship {relationship_id} was not readable after upsert"
+            )
+        return self._row_to_relationship(relationship_row)
 
     def get_relationship(self, relationship_id: str) -> dict[str, Any] | None:
         relationships = self.list_relationships(
@@ -5865,53 +7174,16 @@ class DurableMemoryStore:
         try:
             with closing(self._connect()) as conn:
                 with self._transaction(conn, immediate=True):
-                    cursor = conn.execute(
-                        """
-                        INSERT INTO agent_context_events (
-                            context_id,
-                            source_surface,
-                            event_type,
-                            summary,
-                            payload_json,
-                            agent_targets_json,
-                            created_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            context,
-                            str(source_surface or "unknown"),
-                            str(event_type or "context-update"),
-                            str(summary or ""),
-                            _json_dumps(payload or {}),
-                            _json_dumps(targets),
-                            now,
-                        ),
+                    return self._publish_context_event_conn(
+                        conn,
+                        context_id=context,
+                        source_surface=str(source_surface or "unknown"),
+                        event_type=str(event_type or "context-update"),
+                        summary=str(summary or ""),
+                        payload_json=_json_dumps(payload or {}),
+                        targets=targets,
+                        created_at=now,
                     )
-                    event_id = int(cursor.lastrowid)
-                    target_records = self._normalized_event_target_records(targets)
-                    conn.executemany(
-                        """
-                        INSERT INTO agent_context_event_targets (
-                            event_id,
-                            target_kind,
-                            target_id,
-                            created_at
-                        )
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        [
-                            (event_id, target_kind, target_id, now)
-                            for target_kind, target_id in target_records
-                        ],
-                    )
-                    event_row = conn.execute(
-                        "SELECT * FROM agent_context_events WHERE event_id = ?",
-                        (event_id,),
-                    ).fetchone()
-            if event_row is None:
-                raise RuntimeError(f"context event {event_id} was not readable after publish")
-            return self._row_to_context_event(event_row)
         except Exception:
             LOGGER.exception(
                 "failed to publish context event context_id=%s event_type=%s",
@@ -5919,6 +7191,66 @@ class DurableMemoryStore:
                 event_type,
             )
             raise
+
+    def _publish_context_event_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str,
+        source_surface: str,
+        event_type: str,
+        summary: str,
+        payload_json: str,
+        targets: list[str],
+        created_at: float,
+    ) -> dict[str, Any]:
+        cursor = conn.execute(
+            """
+            INSERT INTO agent_context_events (
+                context_id,
+                source_surface,
+                event_type,
+                summary,
+                payload_json,
+                agent_targets_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                context_id,
+                source_surface,
+                event_type,
+                summary,
+                payload_json,
+                _json_dumps(targets),
+                created_at,
+            ),
+        )
+        event_id = int(cursor.lastrowid)
+        target_records = self._normalized_event_target_records(targets)
+        conn.executemany(
+            """
+            INSERT INTO agent_context_event_targets (
+                event_id,
+                target_kind,
+                target_id,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (event_id, target_kind, target_id, created_at)
+                for target_kind, target_id in target_records
+            ],
+        )
+        event_row = conn.execute(
+            "SELECT * FROM agent_context_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if event_row is None:
+            raise RuntimeError(f"context event {event_id} was not readable after publish")
+        return self._row_to_context_event(event_row)
 
     @classmethod
     def _normalize_event_targets(
@@ -8164,6 +9496,47 @@ class DurableMemoryStore:
                         """,
                         (context_id, context_id),
                     ).fetchone()[0]
+                capture_filter = "" if context_id is None else "WHERE context_id = ?"
+                capture_params: tuple[Any, ...] = (
+                    () if context_id is None else (str(context_id),)
+                )
+                capture_operation_row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS operation_count,
+                        COALESCE(SUM(entry_count), 0) AS entry_count,
+                        COALESCE(SUM(relationship_count), 0) AS relationship_count,
+                        COALESCE(MAX(committed_at), 0.0) AS latest_committed_at
+                    FROM capture_operations
+                    {capture_filter}
+                    """,
+                    capture_params,
+                ).fetchone()
+                capture_operation_pruned_deployment_count = int(
+                    conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM capture_operations AS operation
+                        {"WHERE operation.context_id = ? AND" if context_id is not None else "WHERE"}
+                            NOT EXISTS (
+                                SELECT 1
+                                FROM agent_context_events AS event
+                                WHERE event.event_id = operation.deployment_event_id
+                            )
+                        """,
+                        capture_params,
+                    ).fetchone()[0]
+                )
+                capture_operation_schema_errors = (
+                    self._capture_operation_schema_errors(conn)
+                )
+                (
+                    capture_operation_integrity_error_count,
+                    capture_operation_integrity_error_samples,
+                ) = self._capture_operation_integrity_audit(
+                    conn,
+                    context_id=context_id,
+                )
                 event_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
                 context_rows = conn.execute(
                     """
@@ -8211,6 +9584,40 @@ class DurableMemoryStore:
                 ),
                 "context_bus_max_delivery_attempts": max_delivery_attempts,
                 "context_link_count": int(context_link_count),
+                "capture_protocol_version": CAPTURE_PROTOCOL_VERSION,
+                "capture_operation_count": int(
+                    capture_operation_row["operation_count"]
+                ),
+                "capture_operation_entry_count": int(
+                    capture_operation_row["entry_count"]
+                ),
+                "capture_operation_relationship_count": int(
+                    capture_operation_row["relationship_count"]
+                ),
+                "capture_operation_latest_committed_at": float(
+                    capture_operation_row["latest_committed_at"]
+                ),
+                "capture_operation_pruned_deployment_count": int(
+                    capture_operation_pruned_deployment_count
+                ),
+                "capture_operation_schema_error_count": len(
+                    capture_operation_schema_errors
+                ),
+                "capture_operation_schema_error_samples": (
+                    capture_operation_schema_errors[:10]
+                ),
+                "capture_operation_integrity_error_count": int(
+                    capture_operation_integrity_error_count
+                ),
+                "capture_operation_integrity_error_samples": (
+                    capture_operation_integrity_error_samples
+                ),
+                "capture_operation_health": (
+                    "ready"
+                    if not capture_operation_schema_errors
+                    and capture_operation_integrity_error_count == 0
+                    else "degraded"
+                ),
                 "contexts": {str(row["context_id"]): int(row["count"]) for row in context_rows},
             }
         except Exception:

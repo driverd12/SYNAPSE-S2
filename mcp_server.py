@@ -561,6 +561,7 @@ def capture_spiking_conversation(
     surprise_threshold: float = 0.5,
     min_segment_sentences: int = 1,
     metadata: dict[str, Any] | None = None,
+    capture_id: str = "",
 ) -> str:
     """Capture real operator/agent conversation notes as temporal event memories."""
     context = _sanitize_context_id(context_id)
@@ -578,6 +579,7 @@ def capture_spiking_conversation(
                 **(metadata or {}),
                 "source_surface": "mcp",
             },
+            capture_id=str(capture_id or "") or None,
         )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
@@ -595,12 +597,14 @@ def drop_spiking_capture_inbox(
     source_tag: str = "codex-session",
     speaker: str = "operator",
     metadata: dict[str, Any] | None = None,
+    capture_id: str = "",
 ) -> str:
     """Drop opt-in session text into the local capture inbox for sidecar ingestion."""
     context = _sanitize_context_id(context_id)
     try:
         source_text = _validate_text(text)
         capture_daemon = _load_capture_daemon()
+        resolved_capture_id = str(capture_id or "") or capture_daemon.new_capture_id()
         drop_path = capture_daemon.write_capture_drop(
             context_id=context,
             source_tag=source_tag,
@@ -610,12 +614,15 @@ def drop_spiking_capture_inbox(
                 **(metadata or {}),
                 "source_surface": "mcp-inbox",
             },
+            capture_id=resolved_capture_id,
         )
         return json.dumps(
             {
                 "action": "drop-spiking-capture-inbox",
                 "context_id": context,
                 "drop_path": str(drop_path),
+                "capture_id": resolved_capture_id,
+                "capture_protocol": "capture.v2",
             },
             sort_keys=True,
         )
@@ -759,6 +766,7 @@ def capture_spiking_clipboard(
     source_tag: str = "frontmost-selection",
     speaker: str = "operator",
     metadata: dict[str, Any] | None = None,
+    capture_id: str = "",
 ) -> str:
     """Capture explicitly selected/copied text as a one-shot transcript payload."""
     context = _sanitize_context_id(context_id)
@@ -777,6 +785,7 @@ def capture_spiking_clipboard(
                 **(metadata or {}),
                 "source_surface": "mcp-clipboard",
             },
+            capture_id=str(capture_id or "") or None,
         )
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
@@ -875,6 +884,7 @@ def capture_spiking_app_snapshot(
     connection_id: str,
     metadata: dict[str, Any] | None = None,
     confirmed: bool = False,
+    capture_id: str = "",
 ) -> str:
     """Capture a confirmed local app accessibility snapshot into the SYNAPSE-S2 graph."""
     try:
@@ -890,6 +900,7 @@ def capture_spiking_app_snapshot(
                 "source_surface": "mcp-app-snapshot",
             },
             confirmed=bool(confirmed),
+            capture_id=str(capture_id or "") or None,
         )
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:

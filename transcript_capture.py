@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from capture_daemon import redact_capture_text
 import mlx_backend
@@ -26,6 +31,7 @@ LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
 
 MAX_TRANSCRIPT_DELTA_BYTES = 256_000
+SOURCE_INSTANCE_ID_RE = re.compile(r"s2src_[0-9a-f]{32}")
 APP_DETECT_SYSTEM_EVENTS_TIMEOUT_SECONDS = float(
     os.getenv("SYNAPSE_S2_APP_DETECT_TIMEOUT_SECONDS", "12.0")
 )
@@ -75,11 +81,108 @@ def _sha256_path(path: Path) -> str:
     return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
 
 
+def _capture_id_for_file_delta(
+    *,
+    source_instance_id: str,
+    stream_generation: int,
+    cursor_start: int,
+    cursor_end: int,
+) -> str:
+    """Return the logical operation id for one durable file-tail delta.
+
+    The random source instance is minted at explicit registration and persisted
+    independently from the mutable cursor cache. Path, capture root, inode,
+    mtime, and content hashes are deliberately excluded. They may help detect a
+    rotation, but they never define capture identity.
+    """
+
+    payload = "\x1f".join(
+        (
+            "file-tail.v3",
+            str(source_instance_id),
+            str(int(stream_generation)),
+            str(int(cursor_start)),
+            str(int(cursor_end)),
+        )
+    ).encode("utf-8")
+    return "s2cap_" + hashlib.sha256(payload).hexdigest()[:32]
+
+
+@contextmanager
+def _exclusive_file_lock(
+    path: Path,
+    *,
+    blocking: bool,
+) -> Iterator[bool]:
+    """Hold a private advisory lock for the complete protected operation."""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    acquired = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        lock_flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(descriptor, lock_flags)
+            acquired = True
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _json_safe(value: Any, fallback: Any) -> Any:
     try:
         return json.loads(json.dumps(value, default=str))
     except Exception:
         return fallback
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Durably replace a private JSON cache without shared temporary names."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 class TranscriptCaptureManager:
@@ -106,8 +209,213 @@ class TranscriptCaptureManager:
         return {
             "root": self.root,
             "source_state_path": self.root / "transcript_sources.json",
+            "source_state_lock_path": self.root / ".transcript_sources.lock",
+            "source_lock_dir": self.root / "transcript_source_locks",
+            "source_lineage_dir": self.root / "transcript_source_lineages",
             "app_state_path": self.root / "app_connections.json",
         }
+
+    def _source_lock_path(self, source_id: str) -> Path:
+        digest = hashlib.sha256(str(source_id).encode("utf-8")).hexdigest()[:32]
+        return self.paths()["source_lock_dir"] / f"{digest}.lock"
+
+    def _source_lineage_path(self, source_id: str) -> Path:
+        digest = hashlib.sha256(str(source_id).encode("utf-8")).hexdigest()[:32]
+        return self.paths()["source_lineage_dir"] / f"{digest}.json"
+
+    def _new_source_instance_id(self) -> str:
+        return f"s2src_{secrets.token_hex(16)}"
+
+    def _validate_source_instance_id(self, value: Any) -> str:
+        if type(value) is not str or SOURCE_INSTANCE_ID_RE.fullmatch(value) is None:
+            raise ValueError(
+                "source_instance_id must be canonical s2src_<32 lowercase hex>"
+            )
+        return value
+
+    def _read_source_lineage(self, source_id: str) -> dict[str, Any] | None:
+        path = self._source_lineage_path(source_id)
+        if not path.exists():
+            return None
+        try:
+            lineage = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"transcript source lineage is unreadable for {source_id}"
+            ) from exc
+        if not isinstance(lineage, dict) or lineage.get("source_id") != source_id:
+            raise RuntimeError(
+                f"transcript source lineage does not match {source_id}"
+            )
+        try:
+            source_instance_id = self._validate_source_instance_id(
+                lineage.get("source_instance_id")
+            )
+            registration_generation = int(lineage.get("registration_generation", 0))
+            stream_generation = int(lineage.get("stream_generation", 0))
+            cursor = int(lineage.get("cursor", 0))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"transcript source lineage is invalid for {source_id}"
+            ) from exc
+        if registration_generation < 0 or stream_generation < 0 or cursor < 0:
+            raise RuntimeError(
+                f"transcript source lineage has negative counters for {source_id}"
+            )
+        return {
+            **lineage,
+            "version": 1,
+            "source_id": source_id,
+            "source_instance_id": source_instance_id,
+            "registration_generation": registration_generation,
+            "stream_generation": stream_generation,
+            "cursor": cursor,
+        }
+
+    def _source_lineage_record(self, source: dict[str, Any]) -> dict[str, Any]:
+        source_id = str(source.get("source_id") or "")
+        source_instance_id = self._validate_source_instance_id(
+            source.get("source_instance_id")
+        )
+        return {
+            "version": 1,
+            "source_id": source_id,
+            "source_instance_id": source_instance_id,
+            "registration_generation": max(
+                0,
+                int(source.get("registration_generation") or 0),
+            ),
+            "stream_generation": max(0, int(source.get("stream_generation") or 0)),
+            "cursor": max(0, int(source.get("cursor") or 0)),
+            "file_device": int(source.get("file_device") or 0),
+            "file_inode": int(source.get("file_inode") or 0),
+            "path_sha256": str(source.get("path_sha256") or ""),
+            "file_size": max(0, int(source.get("file_size") or 0)),
+            "file_mtime_ns": max(0, int(source.get("file_mtime_ns") or 0)),
+            "file_ctime_ns": max(0, int(source.get("file_ctime_ns") or 0)),
+            "created_at": float(
+                source.get("source_instance_created_at")
+                or source.get("created_at")
+                or time.time()
+            ),
+            "updated_at": time.time(),
+        }
+
+    def _persist_source_lineage(self, source: dict[str, Any]) -> None:
+        lineage = self._source_lineage_record(source)
+        _atomic_write_json(
+            self._source_lineage_path(str(lineage["source_id"])),
+            lineage,
+        )
+
+    def _ensure_source_lineage(self, source: dict[str, Any]) -> dict[str, Any]:
+        source_id = str(source.get("source_id") or "")
+        if not source_id:
+            raise ValueError("transcript source is missing source_id")
+        persisted = self._read_source_lineage(source_id)
+        raw_instance_id = source.get("source_instance_id")
+        if raw_instance_id:
+            source_instance_id = self._validate_source_instance_id(raw_instance_id)
+            if (
+                persisted is not None
+                and persisted.get("source_instance_id") != source_instance_id
+            ):
+                raise RuntimeError(
+                    f"transcript source lineage conflicts with state for {source_id}"
+                )
+            if persisted is not None:
+                source.setdefault(
+                    "registration_generation",
+                    int(persisted.get("registration_generation", 0)),
+                )
+                source.setdefault(
+                    "source_instance_created_at",
+                    float(
+                        persisted.get("created_at")
+                        or source.get("created_at")
+                        or time.time()
+                    ),
+                )
+                for stat_field in ("file_size", "file_mtime_ns", "file_ctime_ns"):
+                    if not source.get(stat_field) and persisted.get(stat_field):
+                        source[stat_field] = int(persisted[stat_field])
+        elif persisted is not None:
+            source_instance_id = str(persisted["source_instance_id"])
+            source["source_instance_id"] = source_instance_id
+            source["registration_generation"] = int(
+                persisted.get("registration_generation", 0)
+            )
+            source["source_instance_created_at"] = float(
+                persisted.get("created_at") or source.get("created_at") or time.time()
+            )
+        else:
+            source_instance_id = self._new_source_instance_id()
+            source["source_instance_id"] = source_instance_id
+            source["registration_generation"] = 0
+            source["source_instance_created_at"] = time.time()
+        if persisted is None:
+            self._persist_source_lineage(source)
+        return source
+
+    def _assert_safe_source_re_registration(self, source: dict[str, Any]) -> None:
+        old_path = Path(str(source.get("path") or "")).expanduser().resolve()
+        try:
+            self._validate_source_path(old_path)
+            stat = old_path.stat()
+        except Exception as exc:
+            raise ValueError(
+                "cannot re-register transcript source until its prior file is readable"
+            ) from exc
+        cursor = max(0, int(source.get("cursor") or 0))
+        prior_device = int(source.get("file_device") or 0)
+        prior_inode = int(source.get("file_inode") or 0)
+        same_stream = bool(
+            prior_device == int(stat.st_dev) and prior_inode == int(stat.st_ino)
+        )
+        if not same_stream or int(stat.st_size) != cursor:
+            raise ValueError(
+                "cannot re-register transcript source while unread bytes remain; poll it first"
+            )
+        prior_mtime_ns = int(source.get("file_mtime_ns") or 0)
+        prior_ctime_ns = int(source.get("file_ctime_ns") or 0)
+        if (
+            (prior_mtime_ns and prior_mtime_ns != int(stat.st_mtime_ns))
+            or (prior_ctime_ns and prior_ctime_ns != int(stat.st_ctime_ns))
+        ):
+            raise ValueError(
+                "cannot re-register transcript source after an unprocessed rewrite; poll it first"
+            )
+
+    def _commit_source_record(
+        self,
+        source: dict[str, Any],
+        *,
+        allow_instance_replacement: bool,
+    ) -> None:
+        source_id = str(source.get("source_id") or "")
+        with _exclusive_file_lock(
+            self.paths()["source_state_lock_path"],
+            blocking=True,
+        ) as acquired:
+            if not acquired:  # pragma: no cover - blocking lock always acquires
+                raise RuntimeError("failed to acquire transcript state lock")
+            latest = self._read_state()
+            sources = latest.setdefault("sources", {})
+            existing = sources.get(source_id)
+            if (
+                isinstance(existing, dict)
+                and not allow_instance_replacement
+                and existing.get("source_instance_id")
+                and existing.get("source_instance_id") != source.get("source_instance_id")
+            ):
+                raise RuntimeError(
+                    f"transcript source instance changed while polling {source_id}"
+                )
+            sources[source_id] = source
+            self._write_state(latest)
+        # State is the mutable cursor authority. Persist the independent lineage
+        # immediately after it so whole-state loss can recover the latest cursor.
+        self._persist_source_lineage(source)
 
     def status(self) -> dict[str, Any]:
         sources = self.list_sources()["sources"]
@@ -290,7 +598,6 @@ class TranscriptCaptureManager:
             "preview_text": preview_text,
             "preview_line_count": len([line for line in preview_text.splitlines() if line.strip()]),
             "redaction_count": int(redaction_count),
-            "input_sha256": _sha256_text(snapshot_text),
             "snapshot_quality": quality,
             "quality_badge": badge,
             "capability_badge": self._app_capability_badge(connection, quality=quality),
@@ -332,7 +639,6 @@ class TranscriptCaptureManager:
             "preview_text": "",
             "preview_line_count": 0,
             "redaction_count": 0,
-            "input_sha256": "",
             "snapshot_quality": quality,
             "quality_badge": badge,
             "capability_badge": self._app_capability_badge(connection, quality=quality),
@@ -346,52 +652,32 @@ class TranscriptCaptureManager:
             "error": quality["blocked_reason"],
         }
 
-    def capture_app_snapshot(
+    def _replay_dynamic_capture(
         self,
         *,
-        connection_id: str,
-        confirmed: bool = False,
-        metadata: dict[str, Any] | None = None,
+        capture_id: str,
+        context_id: str,
+        source_tag: str,
+        speaker: str,
+    ) -> dict[str, Any] | None:
+        return self.backend.replay_capture_operation(
+            capture_id,
+            context_id=context_id,
+            source_tag=source_tag,
+            speaker=speaker,
+        )
+
+    def _render_app_snapshot_capture(
+        self,
+        *,
+        connection: dict[str, Any],
+        capture: dict[str, Any],
+        snapshot_quality: dict[str, Any],
+        redaction_count: int,
+        replay_without_live_read: bool = False,
     ) -> dict[str, Any]:
-        if not confirmed:
-            raise ValueError("explicit confirmation is required to capture an app snapshot")
-        connection = self._get_connection(connection_id)
-        snapshot_text = self._clean_accessibility_snapshot_text(
-            str(self.app_snapshot_provider(connection) or "")
-        )
-        if not snapshot_text:
-            raise ValueError("app snapshot did not return text")
-        if len(snapshot_text.encode("utf-8")) > MAX_TRANSCRIPT_DELTA_BYTES:
-            snapshot_text = snapshot_text.encode("utf-8")[:MAX_TRANSCRIPT_DELTA_BYTES].decode(
-                "utf-8",
-                errors="replace",
-            )
-        snapshot_quality = self._snapshot_quality(snapshot_text)
         quality_badge = self._snapshot_quality_badge(snapshot_quality)
-        redacted_text, redaction_count = redact_capture_text(snapshot_text)
-        capture = self.backend.capture_conversation(
-            text=redacted_text,
-            context_id=str(connection.get("context_id") or "default"),
-            source_tag=str(connection.get("source_tag") or "app-connect"),
-            speaker=str(connection.get("speaker") or "operator"),
-            surprise_threshold=0.5,
-            min_segment_sentences=1,
-            metadata={
-                **_json_safe(connection.get("metadata") or {}, {}),
-                **_json_safe(metadata or {}, {}),
-                "transcript_adapter": True,
-                "adapter_kind": "app-accessibility-snapshot",
-                "capture_mode": "confirmed-local-app-snapshot",
-                "connection_id": connection["connection_id"],
-                "app_name": connection["app_name"],
-                "bundle_id": connection.get("bundle_id", ""),
-                "pid": connection.get("pid", 0),
-                "redaction_count": int(redaction_count),
-                "input_sha256": _sha256_text(snapshot_text),
-                "remote_control_plane": False,
-                "snapshot_quality": snapshot_quality,
-            },
-        )
+        protocol = capture.get("protocol") or capture.get("capture_protocol")
         return {
             "action": "capture-app-snapshot",
             "adapter_kind": "app-accessibility-snapshot",
@@ -403,10 +689,20 @@ class TranscriptCaptureManager:
             "event_count": capture["event_count"],
             "relationship_count": capture["relationship_count"],
             "agent_deployment": capture.get("agent_deployment"),
+            "capture_id": capture.get("capture_id"),
+            "protocol": protocol,
+            "capture_protocol": capture.get("capture_protocol") or protocol,
+            "idempotent_replay": bool(capture.get("idempotent_replay", False)),
+            "receipt_compact": bool(capture.get("receipt_compact", False)),
+            "replay_without_live_read": bool(replay_without_live_read),
             "redaction_count": int(redaction_count),
+            "redaction_count_known": not replay_without_live_read,
             "snapshot_quality": snapshot_quality,
             "quality_badge": quality_badge,
-            "capability_badge": self._app_capability_badge(connection, quality=snapshot_quality),
+            "capability_badge": self._app_capability_badge(
+                connection,
+                quality=snapshot_quality,
+            ),
             "capture_guidance": self._app_capture_guidance(
                 connection=connection,
                 quality=snapshot_quality,
@@ -419,7 +715,11 @@ class TranscriptCaptureManager:
                 "summary": (
                     f"{capture['event_count']} events, "
                     f"{capture['relationship_count']} relationships, "
-                    f"{snapshot_quality['signal_chars']} signal chars"
+                    + (
+                        "signal stats unavailable on compact replay"
+                        if replay_without_live_read
+                        else f"{snapshot_quality['signal_chars']} signal chars"
+                    )
                 ),
                 "context_id": capture["context_id"],
                 "source_tag": capture["source_tag"],
@@ -430,6 +730,117 @@ class TranscriptCaptureManager:
             },
         }
 
+    def capture_app_snapshot(
+        self,
+        *,
+        connection_id: str,
+        confirmed: bool = False,
+        metadata: dict[str, Any] | None = None,
+        capture_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("explicit confirmation is required to capture an app snapshot")
+        connection = self._get_connection(connection_id)
+        context_id = str(connection.get("context_id") or "default")
+        source_tag = str(connection.get("source_tag") or "app-connect")
+        speaker = str(connection.get("speaker") or "operator")
+        if capture_id is not None:
+            replay = self._replay_dynamic_capture(
+                capture_id=capture_id,
+                context_id=context_id,
+                source_tag=source_tag,
+                speaker=speaker,
+            )
+            if replay is not None:
+                snapshot_quality = {
+                    "line_count": 0,
+                    "unique_line_count": 0,
+                    "signal_chars": 0,
+                    "signal_stats_known": False,
+                    "low_signal": False,
+                    "repetitive": False,
+                    "quality": "replayed",
+                    "replay_without_live_read": True,
+                }
+                return self._render_app_snapshot_capture(
+                    connection=connection,
+                    capture=replay,
+                    snapshot_quality=snapshot_quality,
+                    redaction_count=0,
+                    replay_without_live_read=True,
+                )
+        snapshot_text = self._clean_accessibility_snapshot_text(
+            str(self.app_snapshot_provider(connection) or "")
+        )
+        if not snapshot_text:
+            raise ValueError("app snapshot did not return text")
+        if len(snapshot_text.encode("utf-8")) > MAX_TRANSCRIPT_DELTA_BYTES:
+            snapshot_text = snapshot_text.encode("utf-8")[:MAX_TRANSCRIPT_DELTA_BYTES].decode(
+                "utf-8",
+                errors="replace",
+            )
+        snapshot_quality = self._snapshot_quality(snapshot_text)
+        redacted_text, redaction_count = redact_capture_text(snapshot_text)
+        capture = self.backend.capture_conversation(
+            text=redacted_text,
+            context_id=context_id,
+            source_tag=source_tag,
+            speaker=speaker,
+            surprise_threshold=0.5,
+            min_segment_sentences=1,
+            capture_id=capture_id,
+            metadata={
+                **_json_safe(connection.get("metadata") or {}, {}),
+                **_json_safe(metadata or {}, {}),
+                "transcript_adapter": True,
+                "adapter_kind": "app-accessibility-snapshot",
+                "capture_mode": "confirmed-local-app-snapshot",
+                "connection_id": connection["connection_id"],
+                "app_name": connection["app_name"],
+                "bundle_id": connection.get("bundle_id", ""),
+                "pid": connection.get("pid", 0),
+                "redaction_count": int(redaction_count),
+                "remote_control_plane": False,
+                "snapshot_quality": snapshot_quality,
+            },
+        )
+        return self._render_app_snapshot_capture(
+            connection=connection,
+            capture=capture,
+            snapshot_quality=snapshot_quality,
+            redaction_count=redaction_count,
+        )
+
+    def _render_app_selected_text_capture(
+        self,
+        *,
+        connection: dict[str, Any],
+        capture: dict[str, Any],
+        redaction_count: int,
+        replay_without_live_read: bool = False,
+    ) -> dict[str, Any]:
+        protocol = capture.get("protocol") or capture.get("capture_protocol")
+        return {
+            "action": "capture-app-selected-text",
+            "adapter_kind": "app-selected-text",
+            "connection_id": connection["connection_id"],
+            "app_name": connection["app_name"],
+            "context_id": capture["context_id"],
+            "source_tag": capture["source_tag"],
+            "speaker": capture.get("speaker"),
+            "event_count": capture["event_count"],
+            "relationship_count": capture["relationship_count"],
+            "agent_deployment": capture.get("agent_deployment"),
+            "capture_id": capture.get("capture_id"),
+            "protocol": protocol,
+            "capture_protocol": capture.get("capture_protocol") or protocol,
+            "idempotent_replay": bool(capture.get("idempotent_replay", False)),
+            "receipt_compact": bool(capture.get("receipt_compact", False)),
+            "replay_without_live_read": bool(replay_without_live_read),
+            "redaction_count": int(redaction_count),
+            "redaction_count_known": not replay_without_live_read,
+        }
+
     def capture_app_selected_text(
         self,
         *,
@@ -437,10 +848,28 @@ class TranscriptCaptureManager:
         text: str | None = None,
         confirmed: bool = False,
         metadata: dict[str, Any] | None = None,
+        capture_id: str | None = None,
     ) -> dict[str, Any]:
         if not confirmed:
             raise ValueError("explicit confirmation is required to capture app selected text")
         connection = self._get_connection(connection_id)
+        context_id = str(connection.get("context_id") or "default")
+        source_tag = str(connection.get("source_tag") or "app-connect")
+        speaker = str(connection.get("speaker") or "operator")
+        if text is None and capture_id is not None:
+            replay = self._replay_dynamic_capture(
+                capture_id=capture_id,
+                context_id=context_id,
+                source_tag=source_tag,
+                speaker=speaker,
+            )
+            if replay is not None:
+                return self._render_app_selected_text_capture(
+                    connection=connection,
+                    capture=replay,
+                    redaction_count=0,
+                    replay_without_live_read=True,
+                )
         raw_text = self._read_clipboard() if text is None else str(text or "")
         clean_text = raw_text.strip()
         if not clean_text:
@@ -453,11 +882,12 @@ class TranscriptCaptureManager:
         redacted_text, redaction_count = redact_capture_text(clean_text)
         capture = self.backend.capture_conversation(
             text=redacted_text,
-            context_id=str(connection.get("context_id") or "default"),
-            source_tag=str(connection.get("source_tag") or "app-connect"),
-            speaker=str(connection.get("speaker") or "operator"),
+            context_id=context_id,
+            source_tag=source_tag,
+            speaker=speaker,
             surprise_threshold=0.5,
             min_segment_sentences=1,
+            capture_id=capture_id,
             metadata={
                 **_json_safe(connection.get("metadata") or {}, {}),
                 **_json_safe(metadata or {}, {}),
@@ -469,23 +899,14 @@ class TranscriptCaptureManager:
                 "bundle_id": connection.get("bundle_id", ""),
                 "pid": connection.get("pid", 0),
                 "redaction_count": int(redaction_count),
-                "input_sha256": _sha256_text(clean_text),
                 "remote_control_plane": False,
             },
         )
-        return {
-            "action": "capture-app-selected-text",
-            "adapter_kind": "app-selected-text",
-            "connection_id": connection["connection_id"],
-            "app_name": connection["app_name"],
-            "context_id": capture["context_id"],
-            "source_tag": capture["source_tag"],
-            "speaker": capture.get("speaker"),
-            "event_count": capture["event_count"],
-            "relationship_count": capture["relationship_count"],
-            "agent_deployment": capture.get("agent_deployment"),
-            "redaction_count": int(redaction_count),
-        }
+        return self._render_app_selected_text_capture(
+            connection=connection,
+            capture=capture,
+            redaction_count=redaction_count,
+        )
 
     def register_file_source(
         self,
@@ -507,33 +928,115 @@ class TranscriptCaptureManager:
             raise ValueError("source_id must not be empty")
         resolved = Path(path).expanduser().resolve()
         self._validate_source_path(resolved)
-        state = self._read_state()
-        sources = state.setdefault("sources", {})
-        cursor = int(resolved.stat().st_size) if start_at_end else 0
-        now = time.time()
-        record = {
-            "source_id": source,
-            "kind": "file-tail",
-            "path": str(resolved),
-            "path_sha256": _sha256_path(resolved),
-            "context_id": mlx_backend.sanitize_context_id(context_id),
-            "source_tag": mlx_backend.sanitize_tag(source_tag).replace(" ", "-"),
-            "speaker": mlx_backend.sanitize_agent_id(speaker),
-            "enabled": bool(enabled),
-            "cursor": cursor,
-            "format": resolved.suffix.lower().lstrip(".") or "text",
-            "created_at": float(sources.get(source, {}).get("created_at") or now),
-            "updated_at": now,
-            "metadata": _json_safe(metadata or {}, {}),
-            "consent": {
-                "operator_confirmed": True,
-                "mode": "explicit-registration",
-                "registered_at": now,
-            },
-        }
-        sources[source] = record
-        self._write_state(state)
-        return self._public_source(record)
+        with _exclusive_file_lock(self._source_lock_path(source), blocking=False) as acquired:
+            if not acquired:
+                raise RuntimeError(
+                    f"transcript source is busy and cannot be re-registered: {source}"
+                )
+            stat = resolved.stat()
+            state = self._read_state()
+            existing = state.setdefault("sources", {}).get(source)
+            lineage = self._read_source_lineage(source)
+            now = time.time()
+
+            if isinstance(existing, dict):
+                existing = dict(existing)
+                self._ensure_source_lineage(existing)
+                self._assert_safe_source_re_registration(existing)
+                source_instance_id = self._new_source_instance_id()
+                registration_generation = (
+                    max(0, int(existing.get("registration_generation") or 0)) + 1
+                )
+                source_instance_created_at = now
+                stream_generation = 0
+                cursor = int(stat.st_size) if start_at_end else 0
+                created_at = float(existing.get("created_at") or now)
+            elif lineage is not None:
+                # A lineage sidecar outlives the mutable aggregate state file.
+                # Recover the immutable source identity and its latest cursor
+                # instead of silently minting a colliding/replayed producer.
+                source_instance_id = str(lineage["source_instance_id"])
+                registration_generation = int(
+                    lineage.get("registration_generation", 0)
+                )
+                source_instance_created_at = float(
+                    lineage.get("created_at") or now
+                )
+                created_at = source_instance_created_at
+                recovered_cursor = max(0, int(lineage.get("cursor") or 0))
+                same_stream = bool(
+                    int(lineage.get("file_device") or 0) == int(stat.st_dev)
+                    and int(lineage.get("file_inode") or 0) == int(stat.st_ino)
+                )
+                same_size_rewrite = bool(
+                    same_stream
+                    and int(stat.st_size) == recovered_cursor
+                    and (
+                        (
+                            int(lineage.get("file_mtime_ns") or 0)
+                            and int(lineage.get("file_mtime_ns") or 0)
+                            != int(stat.st_mtime_ns)
+                        )
+                        or (
+                            int(lineage.get("file_ctime_ns") or 0)
+                            and int(lineage.get("file_ctime_ns") or 0)
+                            != int(stat.st_ctime_ns)
+                        )
+                    )
+                )
+                if same_stream and int(stat.st_size) >= recovered_cursor and not same_size_rewrite:
+                    cursor = recovered_cursor
+                    stream_generation = max(
+                        0,
+                        int(lineage.get("stream_generation") or 0),
+                    )
+                else:
+                    # This is recovery, not a deliberate registration reset:
+                    # read the replacement from its beginning so no bytes are
+                    # skipped merely because start_at_end defaults to true.
+                    cursor = 0
+                    stream_generation = (
+                        max(0, int(lineage.get("stream_generation") or 0)) + 1
+                    )
+            else:
+                source_instance_id = self._new_source_instance_id()
+                registration_generation = 0
+                source_instance_created_at = now
+                stream_generation = 0
+                cursor = int(stat.st_size) if start_at_end else 0
+                created_at = now
+
+            record = {
+                "source_id": source,
+                "source_instance_id": source_instance_id,
+                "registration_generation": registration_generation,
+                "source_instance_created_at": source_instance_created_at,
+                "kind": "file-tail",
+                "path": str(resolved),
+                "path_sha256": _sha256_path(resolved),
+                "context_id": mlx_backend.sanitize_context_id(context_id),
+                "source_tag": mlx_backend.sanitize_tag(source_tag).replace(" ", "-"),
+                "speaker": mlx_backend.sanitize_agent_id(speaker),
+                "enabled": bool(enabled),
+                "cursor": cursor,
+                "stream_generation": stream_generation,
+                "file_device": int(stat.st_dev),
+                "file_inode": int(stat.st_ino),
+                "file_size": int(stat.st_size),
+                "file_mtime_ns": int(stat.st_mtime_ns),
+                "file_ctime_ns": int(stat.st_ctime_ns),
+                "format": resolved.suffix.lower().lstrip(".") or "text",
+                "created_at": created_at,
+                "updated_at": now,
+                "metadata": _json_safe(metadata or {}, {}),
+                "consent": {
+                    "operator_confirmed": True,
+                    "mode": "explicit-registration",
+                    "registered_at": now,
+                },
+            }
+            self._commit_source_record(record, allow_instance_replacement=True)
+            return self._public_source(record)
 
     def list_sources(self) -> dict[str, Any]:
         state = self._read_state()
@@ -560,48 +1063,90 @@ class TranscriptCaptureManager:
         sources = state.get("sources", {})
         bounded_max = max(1, min(int(max_bytes), MAX_TRANSCRIPT_DELTA_BYTES))
         requested = mlx_backend.sanitize_tag(source_id).replace(" ", "-") if source_id else ""
-        selected: list[dict[str, Any]] = []
+        selected_ids: list[str] = []
         if requested:
             source = sources.get(requested)
             if isinstance(source, dict):
-                selected.append(source)
+                selected_ids.append(requested)
             else:
                 raise ValueError(f"transcript source not found: {requested}")
         else:
-            selected = [
-                source
-                for source in sources.values()
+            selected_ids = [
+                str(source_key)
+                for source_key, source in sources.items()
                 if isinstance(source, dict) and bool(source.get("enabled", True))
             ]
 
         captures: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        for source in selected:
-            if not bool(source.get("enabled", True)):
-                continue
-            try:
-                capture = self._poll_file_source(source, max_bytes=bounded_max)
+        deferred_sources: list[dict[str, Any]] = []
+        for selected_id in selected_ids:
+            with _exclusive_file_lock(
+                self._source_lock_path(selected_id),
+                blocking=False,
+            ) as acquired:
+                if not acquired:
+                    deferred_sources.append(
+                        {
+                            "source_id": selected_id,
+                            "reason": "source-busy",
+                        }
+                    )
+                    continue
+
+                # Never use the state snapshot taken before waiting for the
+                # source lock. Another process may have advanced the cursor.
+                locked_state = self._read_state()
+                source = locked_state.get("sources", {}).get(selected_id)
+                if not isinstance(source, dict):
+                    errors.append(
+                        {
+                            "source_id": selected_id,
+                            "error": "transcript source disappeared while polling",
+                        }
+                    )
+                    continue
+                source = dict(source)
+                if not bool(source.get("enabled", True)):
+                    continue
+                try:
+                    self._ensure_source_lineage(source)
+                    capture = self._poll_file_source(source, max_bytes=bounded_max)
+                except Exception as exc:
+                    LOGGER.exception(
+                        "failed to poll transcript source %s",
+                        source.get("source_id"),
+                    )
+                    errors.append(
+                        {
+                            "source_id": str(source.get("source_id") or ""),
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+
+                # Keep state commit failures visible to the caller. The
+                # backend receipt is already durable, so a retry will use the
+                # same source lineage/range operation id without duplicating
+                # database effects.
+                self._commit_source_record(
+                    source,
+                    allow_instance_replacement=False,
+                )
                 if capture is not None:
                     captures.append(capture)
-            except Exception as exc:
-                LOGGER.exception("failed to poll transcript source %s", source.get("source_id"))
-                errors.append(
-                    {
-                        "source_id": str(source.get("source_id") or ""),
-                        "error": str(exc),
-                    }
-                )
-        self._write_state(state)
         return {
             "action": "poll-transcript-sources",
             "root": str(self.root),
-            "source_count": len(selected),
+            "source_count": len(selected_ids),
             "captured_source_count": len(captures),
+            "deferred_source_count": len(deferred_sources),
             "captured_event_count": sum(int(item.get("event_count") or 0) for item in captures),
             "captured_relationship_count": sum(
                 int(item.get("relationship_count") or 0) for item in captures
             ),
             "captures": captures,
+            "deferred_sources": deferred_sources,
             "errors": errors,
         }
 
@@ -613,7 +1158,24 @@ class TranscriptCaptureManager:
         source_tag: str = "frontmost-selection",
         speaker: str = "operator",
         metadata: dict[str, Any] | None = None,
+        capture_id: str | None = None,
     ) -> dict[str, Any]:
+        canonical_context_id = mlx_backend.sanitize_context_id(context_id)
+        canonical_source_tag = mlx_backend.sanitize_tag(source_tag).replace(" ", "-")
+        canonical_speaker = mlx_backend.sanitize_agent_id(speaker)
+        if text is None and capture_id is not None:
+            replay = self._replay_dynamic_capture(
+                capture_id=capture_id,
+                context_id=canonical_context_id,
+                source_tag=canonical_source_tag,
+                speaker=canonical_speaker,
+            )
+            if replay is not None:
+                return self._render_clipboard_capture(
+                    capture=replay,
+                    redaction_count=0,
+                    replay_without_live_read=True,
+                )
         raw_text = self._read_clipboard() if text is None else str(text or "")
         clean_text = raw_text.strip()
         if not clean_text:
@@ -621,21 +1183,34 @@ class TranscriptCaptureManager:
         redacted_text, redaction_count = redact_capture_text(clean_text)
         capture = self.backend.capture_conversation(
             text=redacted_text,
-            context_id=mlx_backend.sanitize_context_id(context_id),
-            source_tag=mlx_backend.sanitize_tag(source_tag).replace(" ", "-"),
-            speaker=mlx_backend.sanitize_agent_id(speaker),
+            context_id=canonical_context_id,
+            source_tag=canonical_source_tag,
+            speaker=canonical_speaker,
             surprise_threshold=0.5,
             min_segment_sentences=1,
+            capture_id=capture_id,
             metadata={
                 **_json_safe(metadata or {}, {}),
                 "transcript_adapter": True,
                 "adapter_kind": "clipboard-once",
                 "capture_mode": "explicit-one-shot",
                 "redaction_count": int(redaction_count),
-                "input_sha256": _sha256_text(clean_text),
                 "remote_control_plane": False,
             },
         )
+        return self._render_clipboard_capture(
+            capture=capture,
+            redaction_count=redaction_count,
+        )
+
+    def _render_clipboard_capture(
+        self,
+        *,
+        capture: dict[str, Any],
+        redaction_count: int,
+        replay_without_live_read: bool = False,
+    ) -> dict[str, Any]:
+        protocol = capture.get("protocol") or capture.get("capture_protocol")
         return {
             "action": "capture-clipboard-once",
             "adapter_kind": "clipboard-once",
@@ -645,7 +1220,14 @@ class TranscriptCaptureManager:
             "event_count": capture["event_count"],
             "relationship_count": capture["relationship_count"],
             "agent_deployment": capture.get("agent_deployment"),
+            "capture_id": capture.get("capture_id"),
+            "protocol": protocol,
+            "capture_protocol": capture.get("capture_protocol") or protocol,
+            "idempotent_replay": bool(capture.get("idempotent_replay", False)),
+            "receipt_compact": bool(capture.get("receipt_compact", False)),
+            "replay_without_live_read": bool(replay_without_live_read),
             "redaction_count": int(redaction_count),
+            "redaction_count_known": not replay_without_live_read,
         }
 
     def _poll_file_source(
@@ -656,25 +1238,75 @@ class TranscriptCaptureManager:
     ) -> dict[str, Any] | None:
         path = Path(str(source.get("path") or "")).expanduser().resolve()
         self._validate_source_path(path)
-        size = int(path.stat().st_size)
+        stat = path.stat()
+        size = int(stat.st_size)
         cursor = max(0, int(source.get("cursor") or 0))
-        if size < cursor:
+        stream_generation = max(0, int(source.get("stream_generation") or 0))
+        source_instance_id = self._validate_source_instance_id(
+            source.get("source_instance_id")
+        )
+        previous_device = int(source.get("file_device") or 0)
+        previous_inode = int(source.get("file_inode") or 0)
+        previous_size = max(0, int(source.get("file_size") or 0))
+        previous_mtime_ns = max(0, int(source.get("file_mtime_ns") or 0))
+        previous_ctime_ns = max(0, int(source.get("file_ctime_ns") or 0))
+        same_file_identity = bool(
+            previous_device == int(stat.st_dev)
+            and previous_inode == int(stat.st_ino)
+        )
+        same_size_rewrite = bool(
+            same_file_identity
+            and size == cursor
+            and (
+                (previous_mtime_ns and previous_mtime_ns != int(stat.st_mtime_ns))
+                or (previous_ctime_ns and previous_ctime_ns != int(stat.st_ctime_ns))
+            )
+        )
+        rotated = bool(
+            (previous_device and previous_device != int(stat.st_dev))
+            or (previous_inode and previous_inode != int(stat.st_ino))
+            or size < cursor
+            or (previous_size and size < previous_size)
+            or same_size_rewrite
+        )
+        # This adapter is intentionally append-only. Timestamp changes with
+        # unchanged committed size detect same-inode rewrites without storing a
+        # raw-content digest. A producer that rewrites old bytes *and* grows the
+        # file in one operation cannot be distinguished from a normal append;
+        # such producers must rotate/rename the file instead.
+        if rotated:
+            stream_generation += 1
             cursor = 0
-        if size <= cursor:
-            source["cursor"] = size
+
+        def update_source_file_state(committed_cursor: int) -> None:
+            source["cursor"] = max(0, int(committed_cursor))
+            source["stream_generation"] = stream_generation
+            source["file_device"] = int(stat.st_dev)
+            source["file_inode"] = int(stat.st_ino)
+            source["file_size"] = size
+            source["file_mtime_ns"] = int(stat.st_mtime_ns)
+            source["file_ctime_ns"] = int(stat.st_ctime_ns)
             source["updated_at"] = time.time()
+
+        if size <= cursor:
+            update_source_file_state(size)
             return None
         end = min(size, cursor + max_bytes)
         with path.open("rb") as handle:
             handle.seek(cursor)
             raw = handle.read(end - cursor)
         text = raw.decode("utf-8", errors="replace").strip()
-        source["cursor"] = end
-        source["updated_at"] = time.time()
         if not text:
+            update_source_file_state(end)
             return None
         redacted_text, redaction_count = redact_capture_text(text)
         source_id = str(source.get("source_id") or "")
+        capture_id = _capture_id_for_file_delta(
+            source_instance_id=source_instance_id,
+            stream_generation=stream_generation,
+            cursor_start=cursor,
+            cursor_end=end,
+        )
         capture = self.backend.capture_conversation(
             text=redacted_text,
             context_id=str(source.get("context_id") or "default"),
@@ -682,63 +1314,81 @@ class TranscriptCaptureManager:
             speaker=str(source.get("speaker") or "operator"),
             surprise_threshold=0.5,
             min_segment_sentences=1,
+            capture_id=capture_id,
             metadata={
                 **_json_safe(source.get("metadata") or {}, {}),
                 "transcript_adapter": True,
                 "adapter_kind": "file-tail",
                 "capture_mode": "registered-file-delta",
                 "source_id": source_id,
+                "source_instance_id": source_instance_id,
+                "registration_generation": max(
+                    0,
+                    int(source.get("registration_generation") or 0),
+                ),
                 "path_sha256": source.get("path_sha256") or _sha256_path(path),
                 "path_name": path.name,
                 "cursor_start": cursor,
                 "cursor_end": end,
+                "stream_generation": stream_generation,
                 "truncated": end < size,
                 "redaction_count": int(redaction_count),
-                "input_sha256": _sha256_text(text),
                 "remote_control_plane": False,
             },
         )
+        # The cursor is only advanced after the capture ledger has committed (or
+        # returned the cached result for this exact operation id).  If the state
+        # file write is lost, the next poll recomputes the same id and cannot
+        # duplicate the database effects.
+        update_source_file_state(end)
         return {
             "source_id": source_id,
+            "source_instance_id": source_instance_id,
+            "registration_generation": max(
+                0,
+                int(source.get("registration_generation") or 0),
+            ),
             "adapter_kind": "file-tail",
             "context_id": capture["context_id"],
             "source_tag": capture["source_tag"],
             "speaker": capture.get("speaker"),
             "cursor_start": cursor,
             "cursor_end": end,
+            "stream_generation": stream_generation,
             "bytes_captured": len(raw),
             "truncated": end < size,
             "event_count": capture["event_count"],
             "relationship_count": capture["relationship_count"],
             "redaction_count": int(redaction_count),
             "agent_deployment": capture.get("agent_deployment"),
+            "capture_id": capture.get("capture_id", capture_id),
+            "protocol": capture.get("protocol") or capture.get("capture_protocol"),
+            "capture_protocol": (
+                capture.get("capture_protocol") or capture.get("protocol")
+            ),
+            "idempotent_replay": bool(capture.get("idempotent_replay", False)),
         }
 
     def _read_state(self) -> dict[str, Any]:
         path = self.paths()["source_state_path"]
         if not path.exists():
-            return {"version": 1, "sources": {}}
+            return {"version": 3, "sources": {}}
         try:
             parsed = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             LOGGER.warning("failed to read transcript source state", exc_info=True)
-            return {"version": 1, "sources": {}}
+            return {"version": 3, "sources": {}}
         if not isinstance(parsed, dict):
-            return {"version": 1, "sources": {}}
+            return {"version": 3, "sources": {}}
         if not isinstance(parsed.get("sources"), dict):
             parsed["sources"] = {}
-        parsed["version"] = 1
+        parsed["version"] = 3
         return parsed
 
     def _write_state(self, state: dict[str, Any]) -> None:
         path = self.paths()["source_state_path"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".tmp")
-        temp_path.write_text(
-            json.dumps(state, indent=2, sort_keys=True, default=str),
-            encoding="utf-8",
-        )
-        temp_path.replace(path)
+        state["version"] = 3
+        _atomic_write_json(path, state)
 
     def _read_app_state(self) -> dict[str, Any]:
         path = self.paths()["app_state_path"]
@@ -758,13 +1408,7 @@ class TranscriptCaptureManager:
 
     def _write_app_state(self, state: dict[str, Any]) -> None:
         path = self.paths()["app_state_path"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".tmp")
-        temp_path.write_text(
-            json.dumps(state, indent=2, sort_keys=True, default=str),
-            encoding="utf-8",
-        )
-        temp_path.replace(path)
+        _atomic_write_json(path, state)
 
     def _match_running_app(
         self,
@@ -1069,6 +1713,16 @@ class TranscriptCaptureManager:
 
     def _snapshot_quality_badge(self, quality: dict[str, Any]) -> dict[str, Any]:
         quality_id = str(quality.get("quality") or "low")
+        if quality_id == "replayed":
+            return {
+                "status": "ready",
+                "label": "Durable replay",
+                "detail": (
+                    "The committed compact receipt was returned without observing "
+                    "the live app again."
+                ),
+                "next_action": "No recapture is needed for this capture ID.",
+            }
         if quality_id == "high":
             return {
                 "status": "ready",
@@ -1105,6 +1759,11 @@ class TranscriptCaptureManager:
         badge: dict[str, Any],
     ) -> list[str]:
         app_name = str(connection.get("app_name") or "the app")
+        if bool(quality.get("replay_without_live_read")):
+            return [
+                f"Returned the durable compact receipt for {app_name}.",
+                "The live app was not observed again and no recapture is needed.",
+            ]
         guidance = [
             f"Preview shows locally exposed Accessibility text from {app_name}.",
             str(badge.get("next_action") or "Capture only if the preview matches the intended content."),
@@ -1204,6 +1863,11 @@ class TranscriptCaptureManager:
         path = Path(str(source.get("path") or ""))
         return {
             "source_id": str(source.get("source_id") or ""),
+            "source_instance_id": str(source.get("source_instance_id") or ""),
+            "registration_generation": max(
+                0,
+                int(source.get("registration_generation") or 0),
+            ),
             "kind": str(source.get("kind") or "file-tail"),
             "path": str(source.get("path") or ""),
             "path_name": path.name,
@@ -1213,6 +1877,7 @@ class TranscriptCaptureManager:
             "speaker": str(source.get("speaker") or "operator"),
             "enabled": bool(source.get("enabled", True)),
             "cursor": int(source.get("cursor") or 0),
+            "stream_generation": max(0, int(source.get("stream_generation") or 0)),
             "format": str(source.get("format") or ""),
             "created_at": float(source.get("created_at") or 0.0),
             "updated_at": float(source.get("updated_at") or 0.0),

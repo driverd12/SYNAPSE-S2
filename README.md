@@ -118,6 +118,8 @@ The single-pack readiness certification runbook is in `docs/OPERATOR_READINESS_C
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
 The point-in-time live status report is in `docs/CURRENT_STATUS.md`.
+The durable idempotency, crash-recovery, and rollout contract for capture
+producers is in `docs/EXACTLY_ONCE_CAPTURE.md`.
 Regenerate it before demos, handoffs, or readiness claims:
 
 ```bash
@@ -337,6 +339,13 @@ scripts/install_capture_daemon.sh
 ```
 
 Manual inbox processing is confirmation-gated. The launchd sidecar can process its own local queue continuously, but CLI and MCP one-shot processing require `--confirm` / `confirm=true`, and the dashboard Magic Capture button performs a preflight with a short-lived confirmation token before committing pending files.
+
+Every new producer should use capture protocol `capture.v2`: create one
+`s2cap_<32 lowercase hex>` ID before its first attempt and reuse that ID only
+when retrying the exact same redacted request. The SQLite capture ledger is the
+source of truth; filenames, paths, timestamps, and raw-input hashes are never
+capture identity. See `docs/EXACTLY_ONCE_CAPTURE.md` before deploying or rolling
+back capture producers and the sidecar.
 
 App Connect gives operators a local attach path for already-running apps. It detects attachable local apps through a fast filtered process-list scan, records a confirmed attachment, and can capture either intentionally selected text or a redacted Accessibility snapshot into the same temporal event graph and context bus. Dashboard app attach and snapshot actions use preflight confirmation tokens bound to the selected app/connection so a stale click cannot silently retarget capture. This is a hardened local connector, not a remote control plane.
 
