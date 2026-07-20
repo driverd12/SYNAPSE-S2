@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import os
 import platform
 import re
@@ -22,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 from redaction import (
     SecretSafeArgumentParser,
+    mask_public_paths,
     redact_capture_text,
     redact_sensitive_value,
     reject_sensitive_identifier,
@@ -31,6 +33,11 @@ from redaction import (
 
 DEFAULT_LAUNCHER = Path.home() / ".local" / "bin" / "synapse-s2-mcp"
 DEFAULT_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+MCP_CONTRACT_SCHEMA = "synapse-s2.token-contract.v1"
+MCP_SAFETY_SCHEMA = "synapse-s2.mcp-safety-summary.v1"
+MCP_SAFETY_PREFIX = "SYNAPSE-S2 safety summary: "
+MCP_COMPACT_BUDGET = 12_288
+MCP_SAFETY_BUDGET = 4_096
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RAW_DIGEST_TEXT_RE = re.compile(
     r"(?i)(?:['\"]?)(?:input_sha256|raw_input_sha256|raw_sha256|"
@@ -41,6 +48,7 @@ RAW_DIGEST_TEXT_RE = re.compile(
 REQUIRED_PROOFS = [
     "client_config",
     "mcp_connect",
+    "mcp_contract_probe",
     "neural_embedding",
     "doctor",
     "start_work",
@@ -292,6 +300,468 @@ def classify_overall(results: list[CheckResult]) -> str:
     if any(result.status == "degraded" for result in results):
         return "needs_attention"
     return "ready"
+
+
+def mcp_compact_contract_probe_status(
+    returncode: int,
+    parsed: Any,
+    stdout: str,
+    stderr: str,
+) -> tuple[str, str, str, dict[str, Any]]:
+    """Fail-closed verification of the installed compact MCP wire contract."""
+
+    repair = (
+        "Reinstall the local launcher, inspect the MCP contract artifacts, and "
+        "rerun the compact contract probe."
+    )
+
+    def blocked(reason: str) -> tuple[str, str, str, dict[str, Any]]:
+        return "blocked", reason, repair, {}
+
+    def contains_local_path(value: Any) -> bool:
+        if isinstance(value, str):
+            return mask_public_paths(value) != value
+        if isinstance(value, dict):
+            return any(
+                contains_local_path(key) or contains_local_path(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(contains_local_path(item) for item in value)
+        return False
+
+    def valid_bounded_text(
+        value: Any,
+        *,
+        max_chars: int,
+        allow_empty: bool = True,
+    ) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) <= max_chars
+            and (allow_empty or bool(value))
+        )
+
+    def valid_nonnegative_integer(value: Any) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value >= 0
+        )
+
+    def valid_finite_number(value: Any) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        )
+
+    def valid_warning(value: Any, *, include_message: bool) -> bool:
+        expected = {"code", "severity", "action_required"}
+        if include_message:
+            expected.add("message")
+        if not isinstance(value, dict) or set(value) != expected:
+            return False
+        if (
+            not valid_bounded_text(
+                value.get("code"),
+                max_chars=80,
+                allow_empty=False,
+            )
+            or re.fullmatch(r"[a-z0-9][a-z0-9_.:-]*", value["code"]) is None
+            or value.get("severity") not in {"critical", "high", "warning", "info"}
+            or not isinstance(value.get("action_required"), bool)
+        ):
+            return False
+        return not include_message or valid_bounded_text(
+            value.get("message"),
+            max_chars=240,
+            allow_empty=False,
+        )
+
+    if returncode != 0:
+        return blocked(compact_text(stderr or stdout or "FastMCP contract probe failed"))
+    if not isinstance(parsed, dict):
+        return blocked("FastMCP contract probe did not return a JSON object.")
+    if json_safe(parsed) != parsed:
+        return blocked(
+            "FastMCP result changes under the independent public-boundary sanitizer."
+        )
+    if contains_local_path(parsed):
+        return blocked("FastMCP result exposes a local filesystem path.")
+
+    error_keys = [key for key in ("is_error", "isError") if key in parsed]
+    if len(error_keys) != 1 or parsed.get(error_keys[0]) is not False:
+        return blocked("FastMCP contract probe did not prove an unambiguous non-error result.")
+
+    structured_keys = [
+        key
+        for key in ("structured_content", "structuredContent")
+        if key in parsed
+    ]
+    if len(structured_keys) != 1:
+        return blocked("FastMCP contract probe returned missing or ambiguous structured content.")
+    error_key = error_keys[0]
+    structured_key = structured_keys[0]
+    if (error_key, structured_key) not in {
+        ("is_error", "structured_content"),
+        ("isError", "structuredContent"),
+    }:
+        return blocked("FastMCP result mixes incompatible wire field conventions.")
+    if set(parsed) != {error_key, structured_key, "content"}:
+        return blocked("FastMCP result contains missing or unknown top-level fields.")
+    structured = parsed.get(structured_keys[0])
+    if not isinstance(structured, dict):
+        return blocked("FastMCP structured content is not a JSON object.")
+
+    if structured.get("schema") != MCP_CONTRACT_SCHEMA:
+        return blocked("MCP compact contract schema is missing or unexpected.")
+    version = structured.get("version")
+    if isinstance(version, bool) or version != 1:
+        return blocked("MCP compact contract version is not exactly integer 1.")
+    if structured.get("operation") != "memory-list":
+        return blocked("MCP compact contract operation is not memory-list.")
+    if structured.get("ok") is not True:
+        return blocked("MCP compact contract did not report ok=true.")
+
+    response_contract = structured.get("response_contract")
+    if not isinstance(response_contract, dict):
+        return blocked("MCP compact response_contract metadata is missing.")
+    if response_contract.get("profile") != "compact":
+        return blocked("MCP response profile is not compact.")
+    effective_budget = response_contract.get("max_output_bytes")
+    if (
+        isinstance(effective_budget, bool)
+        or effective_budget != MCP_COMPACT_BUDGET
+    ):
+        return blocked("MCP compact structured-content budget is not exactly 12288 bytes.")
+    declared_size = response_contract.get("serialized_bytes")
+    if (
+        isinstance(declared_size, bool)
+        or not isinstance(declared_size, int)
+        or declared_size < 0
+    ):
+        return blocked("MCP compact serialized_bytes is not a non-negative integer.")
+    try:
+        canonical = json.dumps(
+            structured,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return blocked("MCP compact structured content is not canonical-JSON encodable.")
+    canonical_size = len(canonical)
+    if canonical_size != declared_size:
+        return blocked("MCP compact declared and independently measured byte counts differ.")
+    if canonical_size > MCP_COMPACT_BUDGET:
+        return blocked("MCP compact structured content exceeds 12288 bytes.")
+    estimated_tokens = response_contract.get("estimated_tokens")
+    if (
+        isinstance(estimated_tokens, bool)
+        or not isinstance(estimated_tokens, int)
+        or estimated_tokens != (canonical_size + 3) // 4
+        or not isinstance(response_contract.get("truncated"), bool)
+    ):
+        return blocked("MCP compact token estimate or truncation metadata is invalid.")
+    if json_safe(structured) != structured:
+        return blocked(
+            "MCP compact structured content changes under the independent public-boundary sanitizer."
+        )
+    if contains_local_path(structured):
+        return blocked("MCP compact structured content exposes a local filesystem path.")
+
+    expected_root_keys = {
+        "schema",
+        "version",
+        "operation",
+        "ok",
+        "data",
+        "provenance",
+        "warnings",
+        "pagination",
+        "completeness",
+        "continuation",
+        "response_contract",
+    }
+    if set(structured) != expected_root_keys:
+        return blocked("MCP compact contract contains missing or unknown top-level fields.")
+    if set(response_contract) != {
+        "profile",
+        "max_output_bytes",
+        "serialized_bytes",
+        "estimated_tokens",
+        "truncated",
+        "omissions",
+    }:
+        return blocked("MCP compact response_contract fields are not allowlisted.")
+    omissions = response_contract.get("omissions")
+    if not isinstance(omissions, dict) or any(
+        not valid_bounded_text(key, max_chars=96, allow_empty=False)
+        or re.fullmatch(r"[a-z0-9][a-z0-9_.:-]*", key) is None
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        for key, count in omissions.items()
+    ):
+        return blocked("MCP compact omission accounting is invalid.")
+    truncated = response_contract.get("truncated")
+    if truncated is not bool(omissions):
+        return blocked("MCP compact truncation and omission accounting disagree.")
+
+    data = structured.get("data")
+    if not isinstance(data, dict) or set(data) != {
+        "context_id",
+        "recall_scope",
+        "one_hop_only",
+        "returned",
+        "entries",
+    }:
+        return blocked("MCP compact memory-list data fields are not allowlisted.")
+    entries = data.get("entries")
+    returned = data.get("returned")
+    if (
+        not isinstance(entries, list)
+        or isinstance(returned, bool)
+        or not isinstance(returned, int)
+        or returned != len(entries)
+        or returned > 1
+    ):
+        return blocked("MCP compact memory-list returned-count truth is invalid.")
+    if (
+        not valid_bounded_text(
+            data.get("context_id"),
+            max_chars=128,
+            allow_empty=False,
+        )
+        or data.get("recall_scope") != "local"
+        or data.get("one_hop_only") is not False
+    ):
+        return blocked("MCP compact memory-list scope metadata is invalid.")
+    expected_entry_keys = {
+        "memory_id",
+        "tag",
+        "context_id",
+        "excerpt",
+        "trust",
+        "embedding_dimensions",
+        "spike_count",
+        "neuron_count",
+        "created_at",
+        "updated_at",
+        "provenance",
+    }
+    allowed_entry_provenance = {
+        "recall_scope",
+        "recall_provenance",
+        "via_context_link_id",
+        "via_relation_type",
+        "via_direction",
+        "source_surface",
+        "speaker",
+    }
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != expected_entry_keys:
+            return blocked("MCP compact memory entry fields are not allowlisted.")
+        if (
+            not valid_bounded_text(
+                entry.get("memory_id"),
+                max_chars=256,
+                allow_empty=False,
+            )
+            or not valid_bounded_text(entry.get("tag"), max_chars=160)
+            or not valid_bounded_text(entry.get("excerpt"), max_chars=360)
+            or any(
+                not valid_nonnegative_integer(entry.get(field))
+                for field in (
+                    "embedding_dimensions",
+                    "spike_count",
+                    "neuron_count",
+                )
+            )
+            or any(
+                not valid_finite_number(entry.get(field))
+                for field in ("created_at", "updated_at")
+            )
+        ):
+            return blocked("MCP compact memory entry values are invalid.")
+        if entry.get("trust") != "untrusted-memory-evidence":
+            return blocked("MCP compact memory entry has a forged or missing trust label.")
+        entry_provenance = entry.get("provenance")
+        if not isinstance(entry_provenance, dict) or not set(
+            entry_provenance
+        ).issubset(allowed_entry_provenance):
+            return blocked("MCP compact memory entry provenance is not allowlisted.")
+        if any(
+            not valid_bounded_text(value, max_chars=256, allow_empty=False)
+            for value in entry_provenance.values()
+        ):
+            return blocked("MCP compact memory entry provenance values are invalid.")
+        if entry_provenance.get("recall_scope", "local") != "local":
+            return blocked("MCP compact memory entry provenance scope is invalid.")
+        if entry.get("context_id") != data.get("context_id"):
+            return blocked("MCP compact memory entry escaped its requested context.")
+
+    provenance = structured.get("provenance")
+    if (
+        not isinstance(provenance, dict)
+        or set(provenance) != {"source", "context_id", "recall_scope"}
+        or provenance.get("source") != "sqlite-memory-store"
+        or provenance.get("context_id") != data.get("context_id")
+        or provenance.get("recall_scope") != data.get("recall_scope")
+    ):
+        return blocked("MCP compact memory-list provenance is invalid.")
+    warning_rows = structured.get("warnings")
+    if not isinstance(warning_rows, list) or any(
+        not valid_warning(item, include_message=True)
+        for item in warning_rows
+    ):
+        return blocked("MCP compact warning values are invalid or not allowlisted.")
+    warning_codes = {
+        item["code"] for item in warning_rows if isinstance(item, dict)
+    }
+    if "pagination-unsupported" not in warning_codes:
+        return blocked("MCP compact memory-list omitted its pagination warning.")
+    if truncated != ("output-truncated" in warning_codes):
+        return blocked("MCP compact truncation warning disagrees with its contract metadata.")
+    pagination = structured.get("pagination")
+    if not isinstance(pagination, dict) or set(pagination) != {
+        "supported",
+        "strategy",
+        "requested_limit",
+        "effective_limit",
+        "returned",
+        "has_more",
+        "next_cursor",
+    } or pagination.get("returned") != returned:
+        return blocked("MCP compact pagination metadata is invalid.")
+    if (
+        pagination.get("supported") is not False
+        or pagination.get("strategy") != "retrieval-v2-required"
+        or type(pagination.get("requested_limit")) is not int
+        or pagination.get("requested_limit") != 1
+        or type(pagination.get("effective_limit")) is not int
+        or pagination.get("effective_limit") != 1
+        or pagination.get("has_more") is not None
+        or pagination.get("next_cursor") is not None
+    ):
+        return blocked("MCP compact pagination values are invalid.")
+    completeness = structured.get("completeness")
+    if not isinstance(completeness, dict) or set(completeness) != {
+        "complete",
+        "source_limit_reduced",
+        "reason",
+    }:
+        return blocked("MCP compact completeness metadata is invalid.")
+    if (
+        completeness.get("complete") is not None
+        or completeness.get("source_limit_reduced") is not False
+        or completeness.get("reason")
+        != "authoritative-total-and-cursor-unavailable"
+    ):
+        return blocked("MCP compact completeness values are invalid.")
+    continuation = structured.get("continuation")
+    if not isinstance(continuation, dict) or set(continuation) != {
+        "strategy",
+        "cursor",
+    }:
+        return blocked("MCP compact continuation metadata is invalid.")
+    if (
+        continuation.get("strategy")
+        != "request-full-or-wait-for-retrieval-v2"
+        or continuation.get("cursor") is not None
+    ):
+        return blocked("MCP compact continuation values are invalid.")
+
+    content = parsed.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return blocked("MCP safety channel must contain exactly one content item.")
+    content_item = content[0]
+    if (
+        not isinstance(content_item, dict)
+        or set(content_item) != {"type", "text"}
+        or content_item.get("type") != "text"
+        or not isinstance(content_item.get("text"), str)
+    ):
+        return blocked("MCP safety channel did not return exactly one text item.")
+    safety_text = content_item["text"]
+    safety_size = len(safety_text.encode("utf-8"))
+    if safety_size > MCP_SAFETY_BUDGET:
+        return blocked("MCP safety summary exceeds 4096 bytes.")
+    if not safety_text.startswith(MCP_SAFETY_PREFIX):
+        return blocked("MCP safety summary prefix is missing.")
+    if sanitize_evidence_text(safety_text) != safety_text:
+        return blocked(
+            "MCP safety summary changes under the independent public-boundary sanitizer."
+        )
+    if mask_public_paths(safety_text) != safety_text:
+        return blocked("MCP safety summary exposes a local filesystem path.")
+    try:
+        safety = json.loads(safety_text[len(MCP_SAFETY_PREFIX) :])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return blocked("MCP safety summary suffix is not valid JSON.")
+    if not isinstance(safety, dict):
+        return blocked("MCP safety summary suffix is not a JSON object.")
+    if safety.get("schema") != MCP_SAFETY_SCHEMA:
+        return blocked("MCP safety summary schema is missing or unexpected.")
+    if set(safety) != {
+        "schema",
+        "operation",
+        "ok",
+        "structuredContent_required",
+        "warnings",
+        "continuation",
+        "max_bytes",
+    }:
+        return blocked("MCP safety summary fields are not allowlisted.")
+    if safety.get("operation") != structured.get("operation"):
+        return blocked("MCP safety and structured operations do not match.")
+    if safety.get("ok") is not True:
+        return blocked("MCP safety summary did not report ok=true.")
+    if safety.get("structuredContent_required") is not True:
+        return blocked("MCP safety summary does not require structuredContent.")
+    safety_budget = safety.get("max_bytes")
+    if isinstance(safety_budget, bool) or safety_budget != MCP_SAFETY_BUDGET:
+        return blocked("MCP safety summary budget is not exactly 4096 bytes.")
+    safety_warnings = safety.get("warnings")
+    if not isinstance(safety_warnings, list) or any(
+        not valid_warning(item, include_message=False)
+        for item in safety_warnings
+    ):
+        return blocked("MCP safety warning values are invalid or not allowlisted.")
+    expected_safety_warnings = [
+        {
+            "code": item["code"],
+            "severity": item["severity"],
+            "action_required": item["action_required"],
+        }
+        for item in warning_rows
+    ]
+    if safety_warnings != expected_safety_warnings:
+        return blocked("MCP safety warnings disagree with structured content.")
+    safety_continuation = safety.get("continuation")
+    if safety_continuation != {"strategy": continuation["strategy"]}:
+        return blocked("MCP safety continuation disagrees with structured content.")
+
+    metrics = {
+        "contract_schema": structured["schema"],
+        "profile": response_contract["profile"],
+        "requested_max_output_bytes": MCP_COMPACT_BUDGET,
+        "effective_max_output_bytes": effective_budget,
+        "declared_serialized_bytes": declared_size,
+        "canonical_structured_content_bytes": canonical_size,
+        "safety_text_bytes": safety_size,
+        "safety_text_max_bytes": safety_budget,
+        "component_total_bytes": canonical_size + safety_size,
+        "transport_framing_included": False,
+    }
+    return (
+        "ready",
+        "Installed MCP compact structured and safety channels passed independent byte and schema verification.",
+        "",
+        metrics,
+    )
 
 
 def choose_app(apps: list[dict[str, Any]], preferred: str = "") -> dict[str, Any] | None:
@@ -591,6 +1061,7 @@ class OperatorReadinessCertifier:
     ) -> CheckResult:
         stdout = ""
         stderr = ""
+        raw_parsed: Any = None
         parsed: Any = None
         start = time.perf_counter()
         returncode: int | None
@@ -623,7 +1094,8 @@ class OperatorReadinessCertifier:
 
         if stdout.strip():
             try:
-                parsed = json_safe(parse_json_stdout(stdout))
+                raw_parsed = parse_json_stdout(stdout)
+                parsed = json_safe(raw_parsed)
                 safe_stdout = json.dumps(
                     parsed,
                     indent=2,
@@ -642,7 +1114,7 @@ class OperatorReadinessCertifier:
 
         status, detail, repair, metrics = evaluator(
             -1 if returncode is None else int(returncode),
-            parsed,
+            raw_parsed,
             safe_stdout,
             safe_stderr,
         )
@@ -720,6 +1192,14 @@ class OperatorReadinessCertifier:
 
     def _check_mcp_connect(self) -> None:
         fastmcp = str(ROOT / ".venv" / "bin" / "fastmcp")
+        read_only_launcher = command_to_text(
+            [
+                "/usr/bin/env",
+                "SYNAPSE_S2_CLIENT_SESSION_BRIDGE=0",
+                "SYNAPSE_S2_CLIENT_CORTEX=0",
+                str(self.launcher),
+            ]
+        )
 
         def list_eval(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0:
@@ -751,7 +1231,7 @@ class OperatorReadinessCertifier:
                 fastmcp,
                 "list",
                 "--command",
-                str(self.launcher),
+                read_only_launcher,
                 "--json",
                 "--timeout",
                 "20",
@@ -784,7 +1264,7 @@ class OperatorReadinessCertifier:
                 fastmcp,
                 "call",
                 "--command",
-                str(self.launcher),
+                read_only_launcher,
                 "--target",
                 "get_spiking_attention_status",
                 "--input-json",
@@ -796,6 +1276,36 @@ class OperatorReadinessCertifier:
             required=True,
             timeout=45,
             evaluator=status_eval,
+        )
+
+        self._run_command(
+            "mcp_contract_probe",
+            label="MCP compact contract probe",
+            command=[
+                fastmcp,
+                "call",
+                "--command",
+                read_only_launcher,
+                "--target",
+                "list_spiking_memory",
+                "--input-json",
+                json.dumps(
+                    {
+                        "context_id": self.context,
+                        "limit": 1,
+                        "response_mode": "compact",
+                        "max_response_bytes": MCP_COMPACT_BUDGET,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "--json",
+                "--timeout",
+                "30",
+            ],
+            required=True,
+            timeout=60,
+            evaluator=mcp_compact_contract_probe_status,
         )
 
     def _check_neural_embedding(self) -> None:
@@ -1788,6 +2298,7 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         "",
         "- Client configs dry-run without pending changes.",
         "- FastMCP connects to the installed local launcher and lists SYNAPSE-S2 tools.",
+        "- The installed launcher returns the compact MCP contract within the separate 12,288-byte structured and 4,096-byte safety-channel ceilings.",
         "- The requested embedding provider produces a non-empty local vector; `mlx-neural` must report native MLX.",
         "- Doctor is clean or returns concrete repair steps.",
         "- Start Work generates an operator brief from real memory.",

@@ -99,7 +99,7 @@ For the Monday operator-trust certification path, run:
   --embedding-provider mlx-neural
 ```
 
-This writes a single evidence pack under `.synapse_s2/evidence_packs/` proving client config, MCP launcher connection, native MLX neural embeddings, Doctor, Start Work, real memory write and recall, App Connect no-write preview, Wrap Session persistence, and dashboard render smoke. The command exits non-zero unless every required proof is ready.
+This writes a single evidence pack under `.synapse_s2/evidence_packs/` proving client config, MCP launcher connection, the installed compact MCP contract and its two independently bounded output channels, native MLX neural embeddings, Doctor, Start Work, real memory write and recall, App Connect no-write preview, Wrap Session persistence, and dashboard render smoke. The command exits non-zero unless every required proof is ready.
 
 For the full install/prep path, run:
 
@@ -120,7 +120,11 @@ The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
 The point-in-time live status report is in `docs/CURRENT_STATUS.md`.
 The durable idempotency, crash-recovery, and rollout contract for capture
 producers is in `docs/EXACTLY_ONCE_CAPTURE.md`.
-Regenerate it before demos, handoffs, or readiness claims:
+The bounded installed-client response profiles, receipt-safety invariants, and
+the reproducible measurement acceptance gate are in `docs/TOKEN_CONTRACTS.md`.
+Do not publish Phase 6 reduction numbers until its isolated measurement script
+has generated the sanitized aggregate evidence artifact.
+Regenerate `docs/CURRENT_STATUS.md` before demos, handoffs, or readiness claims:
 
 ```bash
 .venv/bin/python scripts/synapse_status_report.py \
@@ -143,7 +147,9 @@ The loopback dashboard now has a single operator workflow for first-use and hand
   --mode morning \
   --context default \
   --agent-id codex-desktop \
-  --prompt "Prepare SYNAPSE-S2 for today's operator work."
+  --prompt "Prepare SYNAPSE-S2 for today's operator work." \
+  --response-mode compact \
+  --max-response-bytes 12288
 # After consuming every rendered deployment, ACK its exact receipt (repeat as needed):
 .venv/bin/python synapse_cli.py --json ack-context \
   --context default \
@@ -185,6 +191,11 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 - Spike recall and surface-text recall both use durable SQLite indexes (`memory_spikes` and `memory_surface_terms`) maintained on every memory write, so recall does not need to scan the full memory table as the graph grows.
 - Client config installation refuses malformed existing JSON instead of silently overwriting it.
 - Existing client configs receive private, exclusive, collision-proof backups before atomic replacement. The local MCP bridge starts in a compact control-plane mode and defers dense neural state until a neural tool is actually requested.
+- Installed MCP clients default to the versioned `compact` response profile with an exact 12,288-byte post-redaction UTF-8 ceiling for authoritative `structuredContent` on memory lists, memory graphs, agent hydration, and Cortex state. MCP emits one separate safety `TextContent` item bounded to 4,096 bytes in compact mode; full-mode safety text is separately bounded to 131,072 bytes. Outer JSON-RPC framing is excluded. Each envelope reports provenance, completeness, pagination support, serialized bytes, and counted omissions; `response_mode="full"` is an explicit bounded diagnostic escape hatch.
+- CLI `agent-brief`, `list-memory`, `graph`, and `cortex-state` use the same compact contract by default. They accept `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics and `--response-mode legacy` only for known local compatibility consumers.
+- Compact projection never drops a leased receipt or its matching visible event. If a hydration projection cannot be delivered safely, its leases are released and acknowledgement remains a separate exact-receipt operation.
+- Critical/high, action-required, and protected contract warnings survive compact projection. Noncritical warnings may be omitted only as complete items with a truthful omission count. MCP consumers must treat `structuredContent` as authoritative; the bounded text item is only a safety decision aid.
+- The loopback dashboard keeps its rich browser API and Namespace Galaxy payloads; the installed MCP token ceiling does not reduce the operator visualization.
 - LaunchAgent installers fence concurrent installs, publish private/fsynced plists, wait for launchd unload/start transitions, probe the authoritative service, and restore the prior definition and policy when a health gate fails.
 
 ### 3. Write and Query Persistent Memory
@@ -203,7 +214,8 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 .venv/bin/python synapse_cli.py --json query-text \
   --context default \
   --text "Which clients share the SYNAPSE-S2 memory database and launcher?"
-.venv/bin/python synapse_cli.py --json graph --context default --limit 10
+.venv/bin/python synapse_cli.py --json graph --context default --limit 10 \
+  --response-mode compact --max-response-bytes 12288
 ```
 
 Expected query output returns ranked registered traces such as `production-memory-contract` and linked event traces from `production-preflight-brief`.
@@ -218,7 +230,8 @@ Compound entry/index/event writes use explicit SQLite transactions with `FULL` s
 Inspect and export the memory store:
 
 ```bash
-.venv/bin/python synapse_cli.py --json list-memory --context default --limit 20
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 20 \
+  --response-mode compact --max-response-bytes 12288
 .venv/bin/python synapse_cli.py --json export-memory \
   --context default \
   --output .synapse_s2/default-memory-export.json
@@ -342,10 +355,21 @@ Connected MCP processes hydrate recall and graph state on startup, but deliberat
 .venv/bin/python synapse_cli.py --json agent-brief \
   --context default \
   --agent-id codex-desktop \
-  --prompt "Summarize the current SYNAPSE-S2 work and next implementation gap."
+  --prompt "Summarize the current SYNAPSE-S2 work and next implementation gap." \
+  --response-mode compact \
+  --max-response-bytes 12288
 ```
 
 `agent-brief` composes a leased FIFO event batch, text recall, and graph summary into one agent-ready briefing. It never acknowledges before stdout or transport delivery: after the briefing is successfully consumed, acknowledge each returned `receipt_id`. `agent-brief --mode morning` returns the operator Start Work structure; the dashboard acknowledges its receipts only after rendering succeeds. Delivery is target-isolated and at-least-once, with a stable `delivery_id` for consumer deduplication and a new fenced receipt on each expired retry. Use the lower-level commands when diagnosing delivery state directly:
+
+The CLI command above and installed MCP `hydrate_spiking_agent_context` calls
+return `synapse-s2.token-contract.v1` in `compact` mode by default. Compact
+hydration preserves one visible deployment for every leased receipt and reports
+`ack_required`, `has_more`, retry/dead-letter blockers, provenance, and any
+projection omissions. MCP callers can pass `response_mode="full"` and
+`max_response_bytes`; CLI callers use `--response-mode full` and
+`--max-response-bytes`. CLI `--response-mode legacy` exists only for known local
+compatibility consumers. See `docs/TOKEN_CONTRACTS.md` for the exact contract.
 
 ```bash
 .venv/bin/python synapse_cli.py --json observe-context --context default --since-event-id 0 --order asc --limit 10
@@ -389,7 +413,9 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --agent-id codex-desktop \
   --session-id "$SESSION_ID" \
   --reason "validated-and-wrapped"
-.venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
+.venv/bin/python synapse_cli.py --json cortex-state --context default \
+  --agent-id codex-desktop \
+  --response-mode compact --max-response-bytes 12288
 ```
 
 The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goals, assumptions, contradictions, suggested next move, and capture queue in Cortex state. Use `goal.create`, `goal.update`, and `goal.list` to track lightweight operational goals with owner, state, evidence, and next action; MCP clients use `create_spiking_goal`, `update_spiking_goal`, and `list_spiking_goals` for the same ledger. Close the session after verified traces or Wrap Session handoff are captured so the dashboard returns to an explicit idle state instead of leaving stale active sessions. Runtime state persistence now merges cross-process Cortex session closures, so a long-running dashboard or capture daemon cannot resurrect a session that a fresh CLI/MCP process already closed.
@@ -417,7 +443,8 @@ scripts/install_capture_daemon.sh
   --text "Capture a concise factual session note here."
 .venv/bin/python synapse_cli.py --json capture-inbox-status
 .venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
-.venv/bin/python synapse_cli.py --json graph --context default --limit 30
+.venv/bin/python synapse_cli.py --json graph --context default --limit 30 \
+  --response-mode compact --max-response-bytes 12288
 ```
 
 Manual inbox processing is confirmation-gated. The launchd sidecar can process its own local queue continuously, but CLI and MCP one-shot processing require `--confirm` / `confirm=true`, and the dashboard Magic Capture button performs a preflight with a short-lived confirmation token before committing pending files.
@@ -466,7 +493,8 @@ Local transcript files can also be registered as bounded delta sources for clien
 Hand-prune bad or sensitive memory from the same durable store:
 
 ```bash
-.venv/bin/python synapse_cli.py --json graph --context default --limit 30
+.venv/bin/python synapse_cli.py --json graph --context default --limit 30 \
+  --response-mode compact --max-response-bytes 12288
 .venv/bin/python synapse_cli.py --json prune-memory \
   --context default \
   --target-type event \
@@ -504,7 +532,7 @@ The MCP server exposes these tools:
 | `remember_spiking_context` | Persist a named context trace from text and/or an embedding. |
 | `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
-| `list_spiking_memory` | List persisted SQLite memory entries for a context. |
+| `list_spiking_memory` | List persisted SQLite memory through the compact contract by default; `full` is explicit and compact mode rejects vector/index arrays. |
 | `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
 | `capture_spiking_conversation` | Capture real operator/agent conversation notes as temporal event memories. |
 | `drop_spiking_capture_inbox` | Drop opt-in session text into the local capture inbox sidecar. |
@@ -518,19 +546,19 @@ The MCP server exposes these tools:
 | `connect_spiking_app` | Attach a confirmed local app connection for snapshot/selection capture. |
 | `list_spiking_app_connections` | List App Connect attachments. |
 | `capture_spiking_app_snapshot` | Capture a confirmed redacted local app Accessibility snapshot into memory. |
-| `list_spiking_memory_graph` | List compact memory entries and relationship edges for a context. |
+| `list_spiking_memory_graph` | List compact memory nodes and relationship edges with endpoint resolution, provenance, completeness, and omission metadata. |
 | `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Atomically acknowledge exact receipt ids after their deployments were consumed. |
 | `dead_letter_spiking_context_delivery` | Quarantine a retry-exhausted delivery with a reason, explicit confirmation, and durable governance audit. |
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
-| `hydrate_spiking_agent_context` | Lease an agent-ready briefing with new deployments, prompt recall, and graph highlights; acknowledge returned receipts separately after use. |
+| `hydrate_spiking_agent_context` | Lease a bounded agent-ready contract with one visible event per receipt, prompt recall, and graph highlights; acknowledge returned receipts separately after use. |
 | `enter_spiking_cortex` | Start a governed agent session with policy, recall, and a context-bus deployment. |
 | `tick_spiking_cortex` | Evaluate the current observation, proposed action, intended files, and intended tools against governed memory before proceeding. |
 | `close_spiking_cortex` | End an active governed session after validation or handoff and publish a `cortex-closed` lifecycle event. |
 | `commit_spiking_cortical_trace` | Persist a typed governed trace with truth posture, confidence, and evidence. |
 | `moderate_spiking_cortical_trace` | Promote, demote, or prune a governed trace from MCP clients by memory id. |
-| `get_spiking_cortex_state` | Inspect active governed sessions and typed cortical memory for a context. |
+| `get_spiking_cortex_state` | Inspect active governed sessions and typed cortical memory through the compact contract by default. |
 | `create_spiking_goal` | Create an auditable goal-ledger trace with owner, state, evidence, and next action. |
 | `update_spiking_goal` | Append a state update to an existing goal-ledger trace. |
 | `list_spiking_goals` | List current goal-ledger state for a context. |
@@ -599,7 +627,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and signed paired recovery points.
+The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and signed paired recovery points. Its rich local HTTP payloads are intentionally separate from the installed MCP compact-response projector, so the 12,288-byte agent budget does not remove graph or drill-down evidence from the browser.
 
 ### Connected namespace recall and neural galaxy
 

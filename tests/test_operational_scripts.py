@@ -340,6 +340,8 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn("umask 077", script)
         self.assertIn("MLX_DEVICE:=gpu", script)
         self.assertIn("SYNAPSE_S2_MEMORY_DB", script)
+        self.assertIn("SYNAPSE_S2_DEFAULT_RESPONSE_MODE:=compact", script)
+        self.assertIn("SYNAPSE_S2_MAX_RESPONSE_BYTES:=12288", script)
         self.assertNotIn('"$REPO_ROOT/mcp_server.py"', script)
         self.assertIn('mktemp "${LAUNCHER_DIR}/.synapse-s2-mcp.XXXXXX"', script)
         self.assertIn('/bin/sh -n "$LAUNCHER_TEMP"', script)
@@ -380,6 +382,9 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             self.assertEqual(stat.S_IMODE(launcher_dir.stat().st_mode), 0o755)
             self.assertEqual(stat.S_IMODE(launcher.stat().st_mode), 0o755)
             self.assertEqual(list(launcher_dir.glob(".synapse-s2-mcp.*")), [])
+            launcher_text = launcher.read_text(encoding="utf-8")
+            self.assertIn("SYNAPSE_S2_DEFAULT_RESPONSE_MODE:=compact", launcher_text)
+            self.assertIn("SYNAPSE_S2_MAX_RESPONSE_BYTES:=12288", launcher_text)
 
     def test_local_launcher_replace_failure_preserves_prior_launcher(self):
         with TemporaryDirectory() as tmp:

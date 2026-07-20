@@ -69,6 +69,12 @@ class RedactionTests(unittest.TestCase):
             },
             "token_count": 17,
             "max_tokens": 128,
+            "max_output_bytes": 4096,
+            "estimated_tokens": 1024,
+            "response_contract": {"profile": "compact"},
+            "token_budget": 999,
+            "estimated_token_count": 999,
+            "lease_token": "synthetic-not-a-real-secret",
             "redaction_count": 2,
         }
 
@@ -87,6 +93,12 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn(SYNTHETIC_MARKER, str(safe))
         self.assertEqual(safe["token_count"], 17)
         self.assertEqual(safe["max_tokens"], 128)
+        self.assertEqual(safe["max_output_bytes"], 4096)
+        self.assertEqual(safe["estimated_tokens"], 1024)
+        self.assertEqual(safe["response_contract"], {"profile": "compact"})
+        self.assertEqual(safe["token_budget"], REDACTED_SECRET)
+        self.assertEqual(safe["estimated_token_count"], REDACTED_SECRET)
+        self.assertEqual(safe["lease_token"], REDACTED_SECRET)
         self.assertEqual(safe["redaction_count"], 2)
         self.assertTrue(is_sensitive_key("secretAccessKey"))
         self.assertTrue(is_sensitive_key("authorization_header"))
@@ -144,6 +156,45 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("/Users/operator", rendered)
         self.assertNotIn("\x00", rendered)
         self.assertLessEqual(len(rendered), 120)
+
+    def test_public_error_masks_cross_platform_local_paths(self):
+        paths = (
+            "/Volumes/OperatorDisk/private/config.json",
+            "/home/operator/.config/private.json",
+            "/root/.ssh/id_ed25519",
+            "/data/synapse/private.sqlite3",
+            "/workspace/Agentic Playground/SYNAPSE-S2/state.json",
+            "/run/secrets/runtime",
+            "/dev/disk4",
+            "/proc/1234/environ",
+            r"C:\Users\operator\private\config.json",
+            r"C:\ProgramData\Synapse S2\private\config.json",
+            r"\\fileserver\operators\private\config.json",
+        )
+
+        for path in paths:
+            with self.subTest(path=path):
+                rendered = safe_public_error(RuntimeError(f"failed at {path}"))
+                self.assertEqual(rendered, "failed at [LOCAL_PATH]")
+                self.assertNotIn("operator", rendered.casefold())
+
+    def test_public_error_preserves_remote_url_but_masks_local_url_parameters(self):
+        remote = "https://example.com/Users/public/docs"
+        unix_query = "https://example.com/view?file=/Users/operator/private/db.sqlite3"
+        encoded_query = "https://example.com/view?file=%2Froot%2F.ssh%2Fid_ed25519"
+        windows_query = r"https://example.com/view?path=C:\Users\Dan\secret.txt"
+        fragment_path = "https://example.com/view#open=/data/private/ledger.sqlite3"
+
+        self.assertEqual(safe_public_error(remote), remote)
+        for url in (unix_query, encoded_query, windows_query, fragment_path):
+            with self.subTest(url=url):
+                rendered = safe_public_error(url)
+                self.assertIn("example.com", rendered)
+                self.assertNotIn("Users", rendered)
+                self.assertNotIn("id_ed25519", rendered)
+                self.assertNotIn("secret.txt", rendered)
+                self.assertNotIn("ledger.sqlite3", rendered)
+                self.assertIn("LOCAL_PATH", rendered)
 
     def test_log_formatter_redacts_messages_and_tracebacks(self):
         stream = io.StringIO()

@@ -29,6 +29,8 @@ DEFAULT_DIMENSION = "1024"
 DEFAULT_NEURONS = "8192"
 DEFAULT_TOP_K = "256"
 DEFAULT_RECALL_COUNT = "10"
+DEFAULT_RESPONSE_MODE = "compact"
+DEFAULT_MAX_RESPONSE_BYTES = "12288"
 
 
 def build_server_definition(
@@ -62,6 +64,8 @@ def build_server_definition(
             "SYNAPSE_S2_NEURONS": DEFAULT_NEURONS,
             "SYNAPSE_S2_TOP_K": DEFAULT_TOP_K,
             "SYNAPSE_S2_RECALL_COUNT": DEFAULT_RECALL_COUNT,
+            "SYNAPSE_S2_DEFAULT_RESPONSE_MODE": DEFAULT_RESPONSE_MODE,
+            "SYNAPSE_S2_MAX_RESPONSE_BYTES": DEFAULT_MAX_RESPONSE_BYTES,
             "SYNAPSE_S2_STATE_PATH": str(repo / ".synapse_s2" / "runtime_state.json"),
             "SYNAPSE_S2_MEMORY_DB": str(repo / ".synapse_s2" / "memory.sqlite3"),
             "SYNAPSE_S2_EXPORT_DIR": str(repo / ".synapse_s2"),
@@ -253,6 +257,32 @@ def _write_json_if_changed(
     *,
     dry_run: bool,
 ) -> dict[str, Any]:
+    current = _read_text(path)
+    if current:
+        try:
+            current_payload = json.loads(current)
+            current_canonical = json.dumps(
+                current_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            next_canonical = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            current_canonical = None
+            next_canonical = None
+        if current_canonical is not None and current_canonical == next_canonical:
+            return {
+                "path": str(path),
+                "changed": False,
+                "would_change": False,
+                "backup_path": None,
+            }
     next_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     return _write_text_if_changed(path, next_text, dry_run=dry_run)
 

@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -17,7 +18,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
-    def run_cli(self, *args: str, state_path: Path, memory_path: Path | None = None):
+    def run_cli(
+        self,
+        *args: str,
+        state_path: Path,
+        memory_path: Path | None = None,
+        environment_overrides: dict[str, str] | None = None,
+    ):
         command = [
             sys.executable,
             str(ROOT / "synapse_cli.py"),
@@ -34,14 +41,38 @@ class SynapseCliTests(unittest.TestCase):
             "--json",
             *args,
         ]
+        environment = os.environ.copy()
+        environment.pop("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", None)
+        environment.pop("SYNAPSE_S2_MAX_RESPONSE_BYTES", None)
+        environment.update(environment_overrides or {})
         return subprocess.run(
             command,
             cwd=ROOT,
+            env=environment,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
+
+    def assert_compact_contract(
+        self,
+        result: subprocess.CompletedProcess[str],
+        *,
+        operation: str,
+        budget: int,
+    ) -> dict:
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["schema"], "synapse-s2.token-contract.v1")
+        self.assertEqual(payload["operation"], operation)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["response_contract"]["profile"], "compact")
+        self.assertEqual(payload["response_contract"]["max_output_bytes"], budget)
+        encoded = result.stdout.rstrip("\n").encode("utf-8")
+        self.assertEqual(payload["response_contract"]["serialized_bytes"], len(encoded))
+        self.assertLessEqual(len(encoded), budget)
+        return payload
 
     def test_emit_exits_cleanly_when_stdout_pipe_closes(self):
         import synapse_cli
@@ -565,6 +596,8 @@ class SynapseCliTests(unittest.TestCase):
                 "list-memory",
                 "--context",
                 "demo",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -577,6 +610,305 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(listing.stdout)["entries"][0]["metadata"]["embedding_provider"]["provider"],
             "semantic-hash-v1",
+        )
+
+    def test_cli_contract_surfaces_default_compact_and_support_full_and_legacy(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            remember = self.run_cli(
+                "remember-text",
+                "--context",
+                "contract-cli",
+                "--tag",
+                "contract-cli-memory",
+                "--text",
+                "Compact CLI contracts keep actionable provenance while omitting vectors.",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            compact_results = {
+                "memory-list": self.run_cli(
+                    "list-memory",
+                    "--context",
+                    "contract-cli",
+                    "--max-response-bytes",
+                    "4096",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+                "memory-graph": self.run_cli(
+                    "graph",
+                    "--context",
+                    "contract-cli",
+                    "--max-response-bytes",
+                    "4096",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+                "cortex-state": self.run_cli(
+                    "cortex-state",
+                    "--context",
+                    "contract-cli",
+                    "--max-response-bytes",
+                    "4096",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+                "agent-hydration": self.run_cli(
+                    "agent-brief",
+                    "--context",
+                    "contract-cli",
+                    "--agent-id",
+                    "codex-desktop",
+                    "--consumer-instance-id",
+                    "cli-contract-test",
+                    "--max-response-bytes",
+                    "4096",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+            }
+            full = self.run_cli(
+                "list-memory",
+                "--context",
+                "contract-cli",
+                "--response-mode",
+                "full",
+                "--max-response-bytes",
+                "131072",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            legacy = self.run_cli(
+                "list-memory",
+                "--context",
+                "contract-cli",
+                "--response-mode",
+                "legacy",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(remember.returncode, 0, remember.stderr)
+        compact_payloads = {
+            operation: self.assert_compact_contract(
+                result,
+                operation=operation,
+                budget=4096,
+            )
+            for operation, result in compact_results.items()
+        }
+        compact_rendered = json.dumps(compact_payloads, sort_keys=True)
+        self.assertNotIn(str(Path(tmp)), compact_rendered)
+        self.assertNotIn("memory_db_path", compact_rendered)
+        self.assertNotIn("lease_token", compact_rendered)
+        self.assertNotIn("spike_indices", compact_rendered)
+        deployments = compact_payloads["agent-hydration"]["data"]["delivery"]["deployments"]
+        self.assertEqual(len(deployments), 1)
+        self.assertTrue(deployments[0]["receipt_id"].startswith("ctxrcpt_"))
+        self.assertIsInstance(deployments[0]["event"], dict)
+
+        self.assertEqual(full.returncode, 0, full.stderr)
+        full_payload = json.loads(full.stdout)
+        self.assertEqual(full_payload["response_contract"]["profile"], "full")
+        self.assertEqual(
+            full_payload["data"]["payload"]["entries"][0]["tag"],
+            "contract-cli-memory",
+        )
+        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+        legacy_payload = json.loads(legacy.stdout)
+        self.assertNotIn("schema", legacy_payload)
+        self.assertEqual(legacy_payload["entries"][0]["tag"], "contract-cli-memory")
+
+    def test_cli_contract_budget_vector_and_secret_errors_are_bounded(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            too_small = self.run_cli(
+                "list-memory",
+                "--max-response-bytes",
+                "1024",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            compact_vectors = self.run_cli(
+                "list-memory",
+                "--include-vectors",
+                "--max-response-bytes",
+                "4096",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            secret = "sk-cli-contract-secret-1234567890"
+            secret_mode = self.run_cli(
+                "graph",
+                "--response-mode",
+                f"api_key={secret}",
+                "--max-response-bytes",
+                "4096",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            secret_budget = self.run_cli(
+                "cortex-state",
+                "--max-response-bytes",
+                f"password={secret}",
+                state_path=state_path,
+                memory_path=memory_path,
+                environment_overrides={
+                    "SYNAPSE_S2_MAX_RESPONSE_BYTES": "12288",
+                },
+            )
+            self.assertFalse(state_path.exists())
+            self.assertFalse(memory_path.exists())
+            self.assertFalse(memory_path.with_suffix(".sqlite3.lock").exists())
+
+        for result, expected_fragment in (
+            (too_small, "at least 4096"),
+            (compact_vectors, "do not support vectors"),
+            (secret_mode, "compact or full"),
+            (secret_budget, "must be an integer"),
+        ):
+            with self.subTest(expected_fragment=expected_fragment):
+                self.assertEqual(result.returncode, 1)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["schema"], "synapse-s2.token-contract.v1")
+                self.assertFalse(payload["ok"])
+                self.assertIn(expected_fragment, payload["data"]["error"]["message"])
+                self.assertLessEqual(
+                    len(result.stdout.rstrip("\n").encode("utf-8")),
+                    payload["response_contract"]["max_output_bytes"],
+                )
+                self.assertNotIn(secret, result.stdout)
+                self.assertNotIn(secret, result.stderr)
+        vector_payload = json.loads(compact_vectors.stdout)
+        self.assertEqual(
+            vector_payload["response_contract"]["max_output_bytes"],
+            4096,
+        )
+        secret_mode_payload = json.loads(secret_mode.stdout)
+        self.assertEqual(
+            secret_mode_payload["response_contract"]["max_output_bytes"],
+            4096,
+        )
+        secret_budget_payload = json.loads(secret_budget.stdout)
+        self.assertEqual(
+            secret_budget_payload["response_contract"]["max_output_bytes"],
+            12288,
+        )
+
+    def test_cli_compact_limits_are_normalized_before_source_metadata(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            commands = {
+                "memory-list": self.run_cli(
+                    "list-memory",
+                    "--limit",
+                    "-9",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+                "memory-graph": self.run_cli(
+                    "graph",
+                    "--limit",
+                    "-9",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+                "cortex-state": self.run_cli(
+                    "cortex-state",
+                    "--limit",
+                    "-9",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+                "agent-hydration": self.run_cli(
+                    "agent-brief",
+                    "--context",
+                    "negative-limit",
+                    "--agent-id",
+                    "codex-desktop",
+                    "--consumer-instance-id",
+                    "negative-limit-test",
+                    "--limit",
+                    "-9",
+                    "--graph-limit",
+                    "-7",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                ),
+            }
+
+        for operation, result in commands.items():
+            with self.subTest(operation=operation):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["operation"], operation)
+                if operation == "agent-hydration":
+                    self.assertEqual(payload["pagination"]["requested_limit"], 1)
+                    self.assertEqual(payload["pagination"]["effective_limit"], 1)
+                    self.assertFalse(
+                        payload["completeness"]["graph_source_limit_reduced"]
+                    )
+                else:
+                    self.assertEqual(payload["pagination"]["requested_limit"], 1)
+                    self.assertEqual(payload["pagination"]["effective_limit"], 1)
+
+    def test_cli_hydration_projection_failure_releases_receipts_after_source_cap(self):
+        import synapse_cli
+
+        backend = mock.Mock()
+        backend.delivery_instance_id = "cli-contract-instance"
+        backend.hydrate_agent_context.return_value = {
+            "context_id": "demo",
+            "agent_id": "codex-desktop",
+            "deliveries": [
+                {
+                    "receipt_id": "ctxrcpt_test-projection-release",
+                    "event_id": 1,
+                }
+            ],
+        }
+        args = mock.Mock(
+            mode="hydrate",
+            context="demo",
+            agent_id="codex-desktop",
+            prompt="",
+            since_event_id=None,
+            limit=500,
+            graph_limit=500,
+            observe_only=False,
+            consumer_instance_id="",
+            lease_seconds=60.0,
+            response_mode="compact",
+            max_response_bytes="4096",
+        )
+        with (
+            mock.patch("synapse_cli.build_backend", return_value=backend),
+            mock.patch(
+                "synapse_cli.project_response",
+                side_effect=RuntimeError("projection failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "projection failed"),
+        ):
+            synapse_cli.command_agent_brief(args)
+
+        effective_event_limit = backend.hydrate_agent_context.call_args.kwargs[
+            "event_limit"
+        ]
+        self.assertGreaterEqual(effective_event_limit, 1)
+        self.assertLessEqual(effective_event_limit, 8)
+        self.assertEqual(
+            backend.hydrate_agent_context.call_args.kwargs["graph_limit"],
+            20,
+        )
+        backend.release_context_events.assert_called_once_with(
+            context_id="demo",
+            agent_id="codex-desktop",
+            consumer_instance_id="cli-contract-instance",
+            receipt_ids=["ctxrcpt_test-projection-release"],
         )
 
     def test_cli_provider_benchmark_reports_latency_and_provenance(self):
@@ -1032,6 +1364,8 @@ class SynapseCliTests(unittest.TestCase):
                 "demo",
                 "--limit",
                 "5",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1096,6 +1430,8 @@ class SynapseCliTests(unittest.TestCase):
                 "graph",
                 "--context",
                 "demo",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1138,6 +1474,8 @@ class SynapseCliTests(unittest.TestCase):
                 "graph",
                 "--context",
                 "demo",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1228,6 +1566,8 @@ class SynapseCliTests(unittest.TestCase):
                 "graph",
                 "--context",
                 "demo",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1617,6 +1957,8 @@ class SynapseCliTests(unittest.TestCase):
                 "cli-agent-instance",
                 "--prompt",
                 "CLI context deployments",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1642,6 +1984,8 @@ class SynapseCliTests(unittest.TestCase):
                 "cli-agent-instance",
                 "--prompt",
                 "CLI context deployments",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1803,6 +2147,8 @@ class SynapseCliTests(unittest.TestCase):
                 "demo",
                 "--agent-id",
                 "cli-agent",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )
@@ -1904,6 +2250,8 @@ class SynapseCliTests(unittest.TestCase):
                 "--limit",
                 "5",
                 "--include-vectors",
+                "--response-mode",
+                "legacy",
                 state_path=state_path,
                 memory_path=memory_path,
             )

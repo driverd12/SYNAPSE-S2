@@ -8,20 +8,27 @@ SYNAPSE-S2 MCP clients launched through `/Users/dan.driver/.local/bin/synapse-s2
 .venv/bin/python synapse_cli.py --json agent-brief \
   --context default \
   --agent-id codex-desktop \
-  --prompt "<current task or user request>"
+  --prompt "<current task or user request>" \
+  --response-mode compact \
+  --max-response-bytes 12288
 # After actually consuming each deployment, acknowledge its exact receipt:
 .venv/bin/python synapse_cli.py --json ack-context \
   --context default \
   --agent-id codex-desktop \
-  --receipt-id '<receipt_id from agent-brief>'
+  --receipt-id '<data.delivery.deployments[].receipt_id from agent-brief>'
 ```
 
 If you need lower-level diagnostics, inspect the raw context bus and graph:
 
 ```bash
 .venv/bin/python synapse_cli.py --json observe-context --context default --since-event-id 0 --order asc --limit 20
-.venv/bin/python synapse_cli.py --json graph --context default --limit 30
+.venv/bin/python synapse_cli.py --json graph --context default --limit 30 \
+  --response-mode compact --max-response-bytes 12288
 ```
+
+`observe-context` is a raw read-only delivery-ledger diagnostic, not one of the
+four compact response-contract surfaces. Keep its limit small and do not paste
+the raw output into an agent context unless the individual events are needed.
 
 When a session produces useful project memory, capture a concise factual session note before finishing:
 

@@ -1,6 +1,6 @@
 # SYNAPSE-S2 Operator Readiness Certification
 
-This runbook is the Monday trust gate. It is not a demo seeder and it does not use example datasets. It runs real local SYNAPSE-S2 commands against the selected context, writes and recalls one factual readiness trace, previews a real running app, wraps the session, proves processed capture authority, creates and re-verifies a signed paired recovery point, proves an isolated restore, and packages the evidence into one local artifact.
+This runbook is the Monday trust gate. It is not a demo seeder and it does not use example datasets. It runs real local SYNAPSE-S2 commands against the selected context, verifies the installed compact MCP contract through both output channels, writes and recalls one factual readiness trace, previews a real running app, wraps the session, proves processed capture authority, creates and re-verifies a signed paired recovery point, proves an isolated restore, and packages the evidence into one local artifact.
 
 ## Run
 
@@ -29,6 +29,7 @@ Exit code `0` means every required proof returned `ready`. Any `degraded` or `bl
 | Local launcher | `/Users/dan.driver/.local/bin/synapse-s2-mcp` exists and is executable. |
 | Client config | `scripts/install_client_configs.py --dry-run` has no pending changes. |
 | MCP connect | FastMCP lists SYNAPSE-S2 tools through the installed launcher and can call status. |
+| MCP compact contract probe | An installed-launcher `list_spiking_memory` call returns exactly one authoritative `synapse-s2.token-contract.v1` compact `structuredContent` envelope at or below 12,288 bytes, with independently verified canonical byte accounting, plus exactly one `synapse-s2.mcp-safety-summary.v1` `TextContent` item at or below its separate 4,096-byte ceiling. The safety item must declare `structuredContent_required: true`. Outer JSON-RPC framing is excluded. |
 | Neural embedding | The requested provider returns a non-empty vector; `mlx-neural` must report native MLX. |
 | Doctor | Doctor is clean, or the evidence pack clearly reports a repair plan. |
 | Start Work | Start Work returns real operator sections from the selected context. |
@@ -55,6 +56,13 @@ Open `summary.md` first. The top section shows:
 
 Only `Operator trustworthy: true` is acceptable for "ready to use with coworkers." A degraded pack is still useful as a repair report, but it is not a success certificate.
 
+The compact contract probe does not add its two channels together into one
+budget. `response_contract.serialized_bytes` measures only authoritative
+`structuredContent`; the safety `TextContent` is verified independently, and
+transport framing belongs to neither measurement. Full-mode diagnostics use a
+separate safety-text ceiling of 131,072 bytes and are not the installed compact
+readiness gate.
+
 ## Common Repairs
 
 | Failed proof | Operator action |
@@ -62,6 +70,7 @@ Only `Operator trustworthy: true` is acceptable for "ready to use with coworkers
 | `local_launcher` | Run `scripts/install_local_launcher.sh`. |
 | `client_config` | Run `scripts/install_client_configs.py`, then restart Codex, Claude Desktop, and Claude Code. |
 | `mcp_connect` or `mcp_status_call` | Run `uv sync`, reinstall the launcher, then rerun FastMCP list/call. |
+| `mcp_contract_probe` | Run `scripts/install_local_launcher.sh` and `scripts/install_client_configs.py`, restart the MCP client, and rerun certification. Inspect the probe artifact for schema/profile/budget mismatch, falsified canonical size, multiple or missing structured payloads, or an invalid/oversized safety summary; do not raise a ceiling to hide a contract failure. |
 | `neural_embedding` | Verify `.synapse_s2/models` contains the configured model snapshot, `SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY=1`, and the provider benchmark passes with `--embedding-provider mlx-neural`. |
 | `doctor` | Follow the repair plan inside `summary.md`; rerun Doctor before rerunning certification. |
 | `memory_write` | Check memory DB writeability and `SYNAPSE_S2_MEMORY_DB`. |

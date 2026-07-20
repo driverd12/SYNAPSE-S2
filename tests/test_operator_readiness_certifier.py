@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 from pathlib import Path
 import stat
@@ -10,11 +11,17 @@ import zipfile
 
 from scripts.operator_readiness_certify import (
     CheckResult,
+    MCP_COMPACT_BUDGET,
+    MCP_CONTRACT_SCHEMA,
+    MCP_SAFETY_BUDGET,
+    MCP_SAFETY_PREFIX,
+    MCP_SAFETY_SCHEMA,
     OperatorReadinessCertifier,
     app_preview_status,
     choose_app,
     classify_overall,
     json_safe,
+    mcp_compact_contract_probe_status,
     render_runbook_markdown,
     render_summary_markdown,
     sanitize_evidence_text,
@@ -23,6 +30,136 @@ from scripts.operator_readiness_certify import (
 
 
 class OperatorReadinessCertifierTests(unittest.TestCase):
+    @staticmethod
+    def _set_canonical_contract_size(structured):
+        contract = structured["response_contract"]
+        contract["serialized_bytes"] = 0
+        contract["estimated_tokens"] = 0
+        for _ in range(12):
+            measured = len(
+                json.dumps(
+                    structured,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+            estimated = (measured + 3) // 4
+            if (
+                contract["serialized_bytes"] == measured
+                and contract["estimated_tokens"] == estimated
+            ):
+                return measured
+            contract["serialized_bytes"] = measured
+            contract["estimated_tokens"] = estimated
+        raise AssertionError("serialized_bytes did not reach a fixed point")
+
+    @classmethod
+    def _compact_mcp_result(cls, *, camel_case=False):
+        structured = {
+            "schema": MCP_CONTRACT_SCHEMA,
+            "version": 1,
+            "operation": "memory-list",
+            "ok": True,
+            "data": {
+                "context_id": "default",
+                "recall_scope": "local",
+                "one_hop_only": False,
+                "returned": 1,
+                "entries": [
+                    {
+                        "memory_id": "s2mem_fixture",
+                        "tag": "fixture",
+                        "context_id": "default",
+                        "excerpt": "bounded evidence",
+                        "trust": "untrusted-memory-evidence",
+                        "embedding_dimensions": 8,
+                        "spike_count": 2,
+                        "neuron_count": 2,
+                        "created_at": 1.0,
+                        "updated_at": 1.0,
+                        "provenance": {
+                            "recall_scope": "local",
+                            "source_surface": "unit-test",
+                        },
+                    }
+                ],
+            },
+            "provenance": {
+                "source": "sqlite-memory-store",
+                "context_id": "default",
+                "recall_scope": "local",
+            },
+            "warnings": [
+                {
+                    "code": "pagination-unsupported",
+                    "severity": "info",
+                    "message": "Authoritative cursor unavailable.",
+                    "action_required": False,
+                }
+            ],
+            "pagination": {
+                "supported": False,
+                "strategy": "retrieval-v2-required",
+                "requested_limit": 1,
+                "effective_limit": 1,
+                "returned": 1,
+                "has_more": None,
+                "next_cursor": None,
+            },
+            "completeness": {
+                "complete": None,
+                "source_limit_reduced": False,
+                "reason": "authoritative-total-and-cursor-unavailable",
+            },
+            "continuation": {
+                "strategy": "request-full-or-wait-for-retrieval-v2",
+                "cursor": None,
+            },
+            "response_contract": {
+                "profile": "compact",
+                "max_output_bytes": MCP_COMPACT_BUDGET,
+                "serialized_bytes": 0,
+                "estimated_tokens": 0,
+                "truncated": False,
+                "omissions": {},
+            },
+        }
+        cls._set_canonical_contract_size(structured)
+        safety = {
+            "schema": MCP_SAFETY_SCHEMA,
+            "operation": "memory-list",
+            "ok": True,
+            "structuredContent_required": True,
+            "max_bytes": MCP_SAFETY_BUDGET,
+            "warnings": [
+                {
+                    "code": "pagination-unsupported",
+                    "severity": "info",
+                    "action_required": False,
+                }
+            ],
+            "continuation": {
+                "strategy": "request-full-or-wait-for-retrieval-v2"
+            },
+        }
+        return {
+            "isError" if camel_case else "is_error": False,
+            "structuredContent" if camel_case else "structured_content": structured,
+            "content": [
+                {
+                    "type": "text",
+                    "text": MCP_SAFETY_PREFIX
+                    + json.dumps(
+                        safety,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+            ],
+        }
+
     @staticmethod
     def _args(default_output_dir: Path, **overrides):
         values = {
@@ -65,6 +202,347 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertEqual(env["SYNAPSE_S2_DIMENSION"], "768")
         self.assertEqual(env["SYNAPSE_S2_NEURONS"], "6800")
         self.assertEqual(env["SYNAPSE_S2_TOP_K"], "192")
+
+    def test_mcp_compact_contract_probe_accepts_snake_and_camel_wire_shapes(self):
+        for camel_case in (False, True):
+            with self.subTest(camel_case=camel_case):
+                parsed = self._compact_mcp_result(camel_case=camel_case)
+                structured_key = (
+                    "structuredContent" if camel_case else "structured_content"
+                )
+                expected_size = len(
+                    json.dumps(
+                        parsed[structured_key],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                )
+                status, detail, repair, metrics = (
+                    mcp_compact_contract_probe_status(0, parsed, "", "")
+                )
+
+                self.assertEqual(status, "ready")
+                self.assertIn("independent byte", detail)
+                self.assertEqual(repair, "")
+                self.assertEqual(metrics["contract_schema"], MCP_CONTRACT_SCHEMA)
+                self.assertEqual(metrics["profile"], "compact")
+                self.assertEqual(
+                    metrics["requested_max_output_bytes"], MCP_COMPACT_BUDGET
+                )
+                self.assertEqual(
+                    metrics["effective_max_output_bytes"], MCP_COMPACT_BUDGET
+                )
+                self.assertEqual(
+                    metrics["declared_serialized_bytes"], expected_size
+                )
+                self.assertEqual(
+                    metrics["canonical_structured_content_bytes"], expected_size
+                )
+                self.assertFalse(metrics["transport_framing_included"])
+
+    def test_mcp_compact_contract_probe_fails_closed_on_contract_tampering(self):
+        def mutate_structured(parsed, mutator):
+            mutated = copy.deepcopy(parsed)
+            structured = mutated["structured_content"]
+            mutator(structured)
+            self._set_canonical_contract_size(structured)
+            return mutated
+
+        valid = self._compact_mcp_result()
+        cases = {
+            "wrong-schema": mutate_structured(
+                valid, lambda value: value.__setitem__("schema", "wrong")
+            ),
+            "missing-schema": mutate_structured(
+                valid, lambda value: value.pop("schema")
+            ),
+            "wrong-version": mutate_structured(
+                valid, lambda value: value.__setitem__("version", True)
+            ),
+            "wrong-operation": mutate_structured(
+                valid, lambda value: value.__setitem__("operation", "memory-graph")
+            ),
+            "full-profile": mutate_structured(
+                valid,
+                lambda value: value["response_contract"].__setitem__(
+                    "profile", "full"
+                ),
+            ),
+            "wrong-budget": mutate_structured(
+                valid,
+                lambda value: value["response_contract"].__setitem__(
+                    "max_output_bytes", MCP_COMPACT_BUDGET + 1
+                ),
+            ),
+            "outer-error": {**copy.deepcopy(valid), "is_error": True},
+            "missing-structured": {
+                key: value
+                for key, value in copy.deepcopy(valid).items()
+                if key != "structured_content"
+            },
+            "ambiguous-structured": {
+                **copy.deepcopy(valid),
+                "structuredContent": copy.deepcopy(valid["structured_content"]),
+            },
+        }
+        falsified_size = copy.deepcopy(valid)
+        falsified_size["structured_content"]["response_contract"][
+            "serialized_bytes"
+        ] += 1
+        cases["falsified-size"] = falsified_size
+        oversized = mutate_structured(
+            valid,
+            lambda value: value.__setitem__("padding", "x" * MCP_COMPACT_BUDGET),
+        )
+        cases["over-budget"] = oversized
+
+        for name, parsed in cases.items():
+            with self.subTest(case=name):
+                status, _, repair, metrics = mcp_compact_contract_probe_status(
+                    0, parsed, "", ""
+                )
+                self.assertEqual(status, "blocked")
+                self.assertTrue(repair)
+                self.assertEqual(metrics, {})
+
+    def test_mcp_compact_contract_probe_fails_closed_on_safety_tampering(self):
+        valid = self._compact_mcp_result()
+
+        def safety_mutation(mutator):
+            mutated = copy.deepcopy(valid)
+            text = mutated["content"][0]["text"]
+            safety = json.loads(text[len(MCP_SAFETY_PREFIX) :])
+            mutator(safety)
+            mutated["content"][0]["text"] = MCP_SAFETY_PREFIX + json.dumps(
+                safety,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return mutated
+
+        cases = {
+            "missing-prefix": copy.deepcopy(valid),
+            "malformed-json": copy.deepcopy(valid),
+            "wrong-schema": safety_mutation(
+                lambda value: value.__setitem__("schema", "wrong")
+            ),
+            "wrong-operation": safety_mutation(
+                lambda value: value.__setitem__("operation", "memory-graph")
+            ),
+            "wrong-budget": safety_mutation(
+                lambda value: value.__setitem__("max_bytes", MCP_SAFETY_BUDGET + 1)
+            ),
+            "not-required": safety_mutation(
+                lambda value: value.__setitem__("structuredContent_required", False)
+            ),
+            "too-many-content-items": copy.deepcopy(valid),
+            "over-budget": copy.deepcopy(valid),
+        }
+        cases["missing-prefix"]["content"][0]["text"] = "{}"
+        cases["malformed-json"]["content"][0]["text"] = MCP_SAFETY_PREFIX + "{"
+        cases["too-many-content-items"]["content"].append(
+            {"type": "text", "text": "extra"}
+        )
+        cases["over-budget"]["content"][0]["text"] = (
+            MCP_SAFETY_PREFIX + "x" * MCP_SAFETY_BUDGET
+        )
+
+        for name, parsed in cases.items():
+            with self.subTest(case=name):
+                status, _, _, _ = mcp_compact_contract_probe_status(
+                    0, parsed, "", ""
+                )
+                self.assertEqual(status, "blocked")
+
+    def test_mcp_compact_contract_probe_rejects_leaks_and_forged_evidence(self):
+        marker = "SYNTHETIC_ONLY_PROBE_SECRET_1234"
+        raw_digest = "a" * 64
+        valid = self._compact_mcp_result()
+
+        def mutation(mutator):
+            parsed = copy.deepcopy(valid)
+            structured = parsed["structured_content"]
+            mutator(structured["data"]["entries"][0])
+            self._set_canonical_contract_size(structured)
+            return parsed
+
+        cases = {
+            "secret": mutation(
+                lambda entry: entry.__setitem__("excerpt", f"password={marker}")
+            ),
+            "local-path": mutation(
+                lambda entry: entry.__setitem__(
+                    "excerpt", "/Users/example/private/evidence.txt"
+                )
+            ),
+            "raw-digest": mutation(
+                lambda entry: entry.__setitem__(
+                    "excerpt", f"input_sha256={raw_digest}"
+                )
+            ),
+            "forged-trust": mutation(
+                lambda entry: entry.__setitem__("trust", "trusted")
+            ),
+            "forbidden-source-text": mutation(
+                lambda entry: entry.__setitem__("source_text", "hidden evidence")
+            ),
+        }
+        outer_secret = copy.deepcopy(valid)
+        outer_secret["debug"] = f"password={marker}"
+        cases["outer-result-secret"] = outer_secret
+        annotated_secret = copy.deepcopy(valid)
+        annotated_secret["content"][0]["annotations"] = {
+            "debug": f"password={marker}"
+        }
+        cases["content-annotation-secret"] = annotated_secret
+        outer_path = copy.deepcopy(valid)
+        outer_path["debug"] = "/Users/example/private/mcp-result.json"
+        cases["outer-result-path"] = outer_path
+        for name, parsed in cases.items():
+            with self.subTest(case=name):
+                status, _, _, _ = mcp_compact_contract_probe_status(
+                    0, parsed, "", ""
+                )
+                self.assertEqual(status, "blocked")
+
+    def test_mcp_compact_contract_probe_rejects_malformed_semantic_values(self):
+        valid = self._compact_mcp_result()
+
+        def structured_mutation(mutator):
+            parsed = copy.deepcopy(valid)
+            structured = parsed["structured_content"]
+            mutator(structured)
+            self._set_canonical_contract_size(structured)
+            return parsed
+
+        cases = {
+            "harmless-outer-extra": {**copy.deepcopy(valid), "debug": "extra"},
+            "mixed-wire-conventions": {
+                "is_error": False,
+                "structuredContent": copy.deepcopy(valid["structured_content"]),
+                "content": copy.deepcopy(valid["content"]),
+            },
+            "content-annotation": copy.deepcopy(valid),
+            "malformed-entry-count": structured_mutation(
+                lambda value: value["data"]["entries"][0].__setitem__(
+                    "spike_count", "2"
+                )
+            ),
+            "malformed-warning": structured_mutation(
+                lambda value: value.__setitem__(
+                    "warnings",
+                    [
+                        {
+                            "code": "pagination-unsupported",
+                            "severity": False,
+                            "message": [],
+                            "action_required": "no",
+                        }
+                    ],
+                )
+            ),
+            "malformed-pagination": structured_mutation(
+                lambda value: value["pagination"].update(
+                    {
+                        "supported": "no",
+                        "strategy": "execute-shell",
+                        "requested_limit": False,
+                        "effective_limit": False,
+                        "has_more": "no",
+                        "next_cursor": {"cursor": "forged"},
+                    }
+                )
+            ),
+            "malformed-completeness": structured_mutation(
+                lambda value: value["completeness"].update(
+                    {
+                        "complete": "yes",
+                        "source_limit_reduced": "no",
+                        "reason": {"claim": "forged"},
+                    }
+                )
+            ),
+            "malformed-continuation": structured_mutation(
+                lambda value: value.__setitem__(
+                    "continuation",
+                    {"strategy": ["execute-shell"], "cursor": {"forged": True}},
+                )
+            ),
+        }
+        cases["content-annotation"]["content"][0]["annotations"] = {"audience": []}
+
+        def safety_mutation(mutator):
+            parsed = copy.deepcopy(valid)
+            text = parsed["content"][0]["text"]
+            safety = json.loads(text[len(MCP_SAFETY_PREFIX) :])
+            mutator(safety)
+            parsed["content"][0]["text"] = MCP_SAFETY_PREFIX + json.dumps(
+                safety,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return parsed
+
+        cases["malformed-safety-warning"] = safety_mutation(
+            lambda value: value.__setitem__(
+                "warnings",
+                [
+                    {
+                        "code": "pagination-unsupported",
+                        "severity": "urgent",
+                        "action_required": "no",
+                    }
+                ],
+            )
+        )
+        cases["forged-safety-continuation"] = safety_mutation(
+            lambda value: value.__setitem__(
+                "continuation", {"strategy": "execute-shell"}
+            )
+        )
+
+        for name, parsed in cases.items():
+            with self.subTest(case=name):
+                status, _, repair, metrics = mcp_compact_contract_probe_status(
+                    0, parsed, "", ""
+                )
+                self.assertEqual(status, "blocked")
+                self.assertTrue(repair)
+                self.assertEqual(metrics, {})
+
+    def test_mcp_connect_checks_use_read_only_launcher_and_probe_contract(self):
+        with TemporaryDirectory() as tmp:
+            certifier = OperatorReadinessCertifier(self._args(Path(tmp)))
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_mcp_connect()
+
+        calls = run_command.call_args_list
+        self.assertEqual(
+            [call.args[0] for call in calls],
+            ["mcp_connect", "mcp_status_call", "mcp_contract_probe"],
+        )
+        for call in calls:
+            command = call.kwargs["command"]
+            launcher_spec = command[command.index("--command") + 1]
+            self.assertIn("SYNAPSE_S2_CLIENT_SESSION_BRIDGE=0", launcher_spec)
+            self.assertIn("SYNAPSE_S2_CLIENT_CORTEX=0", launcher_spec)
+        probe = calls[2]
+        self.assertTrue(probe.kwargs["required"])
+        command = probe.kwargs["command"]
+        self.assertEqual(command[command.index("--target") + 1], "list_spiking_memory")
+        self.assertEqual(
+            json.loads(command[command.index("--input-json") + 1]),
+            {
+                "context_id": "default",
+                "limit": 1,
+                "response_mode": "compact",
+                "max_response_bytes": MCP_COMPACT_BUDGET,
+            },
+        )
+        self.assertEqual(command[command.index("--timeout") + 1], "30")
+        self.assertEqual(probe.kwargs["timeout"], 60)
 
     def test_private_evidence_writer_preserves_existing_parent_mode(self):
         with TemporaryDirectory() as tmp:
@@ -212,6 +690,47 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             self.assertNotIn("input_sha256", artifact_text)
             self.assertIn("[REDACTED_SECRET]", artifact_text)
             self.assertNotIn("input_sha256", result.parsed)
+
+    def test_command_evaluator_sees_raw_wire_but_persistence_stays_sanitized(self):
+        marker = "sk-synthetic-raw-evaluator-secret-1234567890"
+        observed = {}
+        with TemporaryDirectory() as tmp:
+            certifier = OperatorReadinessCertifier(self._args(Path(tmp)))
+            certifier.pack_dir.mkdir(mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            completed = __import__("subprocess").CompletedProcess(
+                ["synthetic"],
+                0,
+                stdout=json.dumps(
+                    {"ready": True, "nested": {"api_key": marker}}
+                ),
+                stderr="",
+            )
+
+            def evaluator(_returncode, parsed, _stdout, _stderr):
+                observed["parsed"] = parsed
+                return "ready", "safe", "", {}
+
+            with mock.patch(
+                "scripts.operator_readiness_certify.subprocess.run",
+                return_value=completed,
+            ):
+                result = certifier._run_command(
+                    "synthetic-raw",
+                    label="Synthetic raw command",
+                    command=["synthetic"],
+                    required=True,
+                    timeout=1,
+                    evaluator=evaluator,
+                )
+
+            self.assertEqual(observed["parsed"]["nested"]["api_key"], marker)
+            self.assertNotIn(marker, json.dumps(result.parsed, sort_keys=True))
+            persisted = "\n".join(
+                Path(path).read_text(encoding="utf-8")
+                for path in result.artifact_paths.values()
+            )
+            self.assertNotIn(marker, persisted)
 
     def test_json_artifacts_and_zip_remain_parseable_after_string_sanitization(self):
         raw_digest = "d" * 64
@@ -390,6 +909,9 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertIn("Fix dashboard warnings.", summary)
         self.assertIn("scripts/operator_readiness_certify.py", runbook)
         self.assertIn("--embedding-provider mlx-neural", runbook)
+        self.assertIn("compact MCP contract", runbook)
+        self.assertIn("12,288-byte structured", runbook)
+        self.assertIn("4,096-byte safety", runbook)
 
     def test_pack_summary_is_json_serializable_shape(self):
         result = CheckResult(

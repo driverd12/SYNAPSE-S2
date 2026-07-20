@@ -9,6 +9,43 @@ import client_config
 
 
 class ClientConfigTests(unittest.TestCase):
+    def test_json_writer_is_idempotent_across_formatting_and_key_order(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.json"
+            original = '{\n  "z": 2,\n  "a": {"b": true}\n}\n'
+            target.write_text(original, encoding="utf-8")
+            payload = {"a": {"b": True}, "z": 2}
+
+            dry_run = client_config._write_json_if_changed(
+                target,
+                payload,
+                dry_run=True,
+            )
+            applied = client_config._write_json_if_changed(
+                target,
+                payload,
+                dry_run=False,
+            )
+
+            self.assertFalse(dry_run["would_change"])
+            self.assertFalse(applied["changed"])
+            self.assertIsNone(applied["backup_path"])
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(target.parent.glob("config.json.bak-*")), [])
+
+    def test_json_writer_does_not_equate_boolean_and_integer_values(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.json"
+            target.write_text('{"enabled": 1}\n', encoding="utf-8")
+
+            result = client_config._write_json_if_changed(
+                target,
+                {"enabled": True},
+                dry_run=True,
+            )
+
+            self.assertTrue(result["would_change"])
+
     def test_existing_config_backup_is_private_complete_and_never_overwritten(self):
         with TemporaryDirectory() as tmp:
             target = Path(tmp) / "config.json"
@@ -136,6 +173,11 @@ class ClientConfigTests(unittest.TestCase):
         self.assertEqual(server["env"]["SYNAPSE_S2_CAPTURE_ROOT"], str(resolved_repo / ".synapse_s2"))
         self.assertEqual(server["env"]["SYNAPSE_S2_CONTEXT_ID"], "default")
         self.assertEqual(server["env"]["SYNAPSE_S2_NEURONS"], "8192")
+        self.assertEqual(
+            server["env"]["SYNAPSE_S2_DEFAULT_RESPONSE_MODE"],
+            "compact",
+        )
+        self.assertEqual(server["env"]["SYNAPSE_S2_MAX_RESPONSE_BYTES"], "12288")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"], "codex-desktop")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_SESSION_BRIDGE"], "1")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_CORTEX"], "1")

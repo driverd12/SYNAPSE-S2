@@ -2342,13 +2342,37 @@ class SpikingAttentionBackend:
             limit=min(max(int(limit), 1), 500),
             lease_seconds=lease_seconds,
         )
-        leased["events"] = [
-            self._decorate_context_event(event)
-            for event in leased.get("events", [])
-        ]
-        for delivery in leased.get("deliveries", []):
-            if isinstance(delivery, dict) and isinstance(delivery.get("event"), dict):
-                delivery["event"] = self._decorate_context_event(delivery["event"])
+        try:
+            leased["events"] = [
+                self._decorate_context_event(event)
+                for event in leased.get("events", [])
+            ]
+            for delivery in leased.get("deliveries", []):
+                if isinstance(delivery, dict) and isinstance(delivery.get("event"), dict):
+                    delivery["event"] = self._decorate_context_event(delivery["event"])
+        except Exception:
+            receipt_ids = [
+                str(delivery.get("receipt_id") or "")
+                for delivery in leased.get("deliveries", [])
+                if isinstance(delivery, dict) and str(delivery.get("receipt_id") or "")
+            ]
+            if receipt_ids:
+                try:
+                    self.memory_store.release_context_deliveries(
+                        context_id=context,
+                        agent_id=agent,
+                        consumer_instance_id=instance,
+                        receipt_ids=receipt_ids,
+                    )
+                except Exception as release_exc:
+                    LOGGER.exception(
+                        "context lease decoration failed and receipts could not be released"
+                    )
+                    raise RuntimeError(
+                        "context lease construction failed and receipts could not be released; "
+                        "wait for lease expiry before retrying"
+                    ) from release_exc
+            raise
         self._mark_activity()
         return leased
 
@@ -3976,37 +4000,6 @@ class SpikingAttentionBackend:
             if since_event_id is None
             else max(0, int(since_event_id))
         )
-        if claim_events:
-            deployments = self.lease_context_events(
-                context_id=context,
-                agent_id=agent,
-                consumer_instance_id=(
-                    consumer_instance_id or self.delivery_instance_id
-                ),
-                limit=bounded_event_limit,
-                lease_seconds=lease_seconds,
-            )
-            start_event_id = int(
-                deployments.get("cursor", {}).get("last_event_id", start_event_id)
-            )
-        else:
-            deployments = {
-                "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
-                "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
-                "events": [],
-                "deliveries": [],
-                "has_more": False,
-                "ack_required": False,
-                "observation_only": True,
-            }
-        raw_events = deployments["events"]
-        events = [
-            self._summarize_agent_context_event(event)
-            for event in raw_events
-        ]
-        latest_event_id = max(
-            [start_event_id] + [int(event["event_id"]) for event in raw_events]
-        )
         graph = self.list_memory_graph(context_id=context, limit=bounded_graph_limit)
 
         prompt_text, prompt_redactions = redact_capture_text(
@@ -4046,6 +4039,110 @@ class SpikingAttentionBackend:
             agent_id=agent,
             limit=bounded_graph_limit,
         )
+        instance = consumer_instance_id or self.delivery_instance_id
+        if claim_events:
+            deployments = self.lease_context_events(
+                context_id=context,
+                agent_id=agent,
+                consumer_instance_id=instance,
+                limit=bounded_event_limit,
+                lease_seconds=lease_seconds,
+            )
+            start_event_id = int(
+                deployments.get("cursor", {}).get("last_event_id", start_event_id)
+            )
+        else:
+            deployments = {
+                "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
+                "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
+                "events": [],
+                "deliveries": [],
+                "has_more": False,
+                "ack_required": False,
+                "observation_only": True,
+            }
+        try:
+            return self._compose_agent_hydration_payload(
+                context=context,
+                agent=agent,
+                start_event_id=start_event_id,
+                deployments=deployments,
+                claim_events=claim_events,
+                prompt_text=prompt_text,
+                prompt_redactions=prompt_redactions,
+                recall_result=recall_result,
+                recall_items=recall_items,
+                normalized_recall_mode=normalized_recall_mode,
+                graph_summary=graph_summary,
+                graph_entries=graph_entries,
+                graph_relationships=graph_relationships,
+                cortex_state=cortex_state,
+            )
+        except Exception:
+            receipt_ids = [
+                str(delivery.get("receipt_id") or "")
+                for delivery in deployments.get("deliveries", [])
+                if isinstance(delivery, dict) and str(delivery.get("receipt_id") or "")
+            ]
+            if receipt_ids:
+                try:
+                    self.release_context_events(
+                        context_id=context,
+                        agent_id=agent,
+                        consumer_instance_id=instance,
+                        receipt_ids=receipt_ids,
+                    )
+                except Exception as release_exc:
+                    LOGGER.exception(
+                        "agent hydration failed and leased receipts could not be released"
+                    )
+                    raise RuntimeError(
+                        "agent hydration failed and leased receipts could not be released; "
+                        "wait for lease expiry before retrying"
+                    ) from release_exc
+            raise
+
+    def _compose_agent_hydration_payload(
+        self,
+        *,
+        context: str,
+        agent: str,
+        start_event_id: int,
+        deployments: dict[str, Any],
+        claim_events: bool,
+        prompt_text: str,
+        prompt_redactions: int,
+        recall_result: str,
+        recall_items: list[str],
+        normalized_recall_mode: str,
+        graph_summary: dict[str, Any],
+        graph_entries: list[dict[str, Any]],
+        graph_relationships: list[dict[str, Any]],
+        cortex_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_events = deployments["events"]
+        events = [self._summarize_agent_context_event(event) for event in raw_events]
+        latest_event_id = max(
+            [start_event_id] + [int(event["event_id"]) for event in raw_events]
+        )
+        raw_blocking = deployments.get("blocking_delivery")
+        blocking_delivery = None
+        if isinstance(raw_blocking, dict):
+            blocking_delivery = {
+                key: raw_blocking.get(key)
+                for key in (
+                    "delivery_id",
+                    "event_id",
+                    "attempt_count",
+                    "max_delivery_attempts",
+                    "reason",
+                    "requires_governed_dead_letter",
+                    "lease_expires_at",
+                )
+                if key in raw_blocking
+            }
+            if not blocking_delivery.get("reason") and "lease_expires_at" in raw_blocking:
+                blocking_delivery["reason"] = "active-lease"
         payload = {
             "action": "agent-context-hydrate",
             "context_id": context,
@@ -4071,6 +4168,13 @@ class SpikingAttentionBackend:
                 else "No delivery acknowledgement is required."
             ),
             "has_more_events": bool(deployments.get("has_more", False)),
+            "remaining_pending_count": int(
+                deployments.get("remaining_pending_count", 0) or 0
+            ),
+            "blocking_delivery": blocking_delivery,
+            "max_delivery_attempts": int(
+                deployments.get("max_delivery_attempts", 0) or 0
+            ),
             "claim_events": bool(claim_events),
             "recall_prompt": prompt_text,
             "input_redaction_count": int(prompt_redactions),

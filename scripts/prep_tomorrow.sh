@@ -35,6 +35,8 @@ export SYNAPSE_S2_STATE_PATH="${SYNAPSE_S2_STATE_PATH:-$ROOT/.synapse_s2/runtime
 export SYNAPSE_S2_MEMORY_DB="${SYNAPSE_S2_MEMORY_DB:-$ROOT/.synapse_s2/memory.sqlite3}"
 export SYNAPSE_S2_EXPORT_DIR="${SYNAPSE_S2_EXPORT_DIR:-$ROOT/.synapse_s2}"
 export SYNAPSE_S2_CAPTURE_ROOT="${SYNAPSE_S2_CAPTURE_ROOT:-$ROOT/.synapse_s2}"
+export SYNAPSE_S2_DEFAULT_RESPONSE_MODE="${SYNAPSE_S2_DEFAULT_RESPONSE_MODE:-compact}"
+export SYNAPSE_S2_MAX_RESPONSE_BYTES="${SYNAPSE_S2_MAX_RESPONSE_BYTES:-12288}"
 
 mkdir -p "$SYNAPSE_S2_EXPORT_DIR"
 
@@ -67,7 +69,7 @@ echo "=== unit tests ==="
 SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash .venv/bin/python -m unittest discover -s tests -v
 
 echo "=== compile check ==="
-.venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py
+.venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py token_contracts.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py scripts/operator_readiness_certify.py scripts/measure_token_contracts.py
 
 if [ "$VERIFY_ONLY" = "1" ]; then
   echo "=== verify-only read-only-ish checks ==="

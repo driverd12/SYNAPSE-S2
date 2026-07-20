@@ -1,10 +1,13 @@
 import contextlib
 import ast
+import asyncio
 import io
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
@@ -38,12 +41,35 @@ class McpServerTests(unittest.TestCase):
         self.previous_client_agent_id = os.environ.get(
             "SYNAPSE_S2_CLIENT_AGENT_ID"
         )
+        self.previous_response_mode = os.environ.get(
+            "SYNAPSE_S2_DEFAULT_RESPONSE_MODE"
+        )
+        self.previous_response_budget = os.environ.get(
+            "SYNAPSE_S2_MAX_RESPONSE_BYTES"
+        )
         os.environ["SYNAPSE_S2_EXPORT_DIR"] = self.tmpdir.name
         os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = str(Path(self.tmpdir.name) / "capture-root")
         os.environ["SYNAPSE_S2_CLIENT_AGENT_ID"] = "codex-desktop"
+        os.environ["SYNAPSE_S2_DEFAULT_RESPONSE_MODE"] = "compact"
+        os.environ.pop("SYNAPSE_S2_MAX_RESPONSE_BYTES", None)
         self.addCleanup(self._restore_export_dir)
         self.addCleanup(self._restore_capture_root)
         self.addCleanup(self._restore_client_agent_id)
+        self.addCleanup(self._restore_response_contract_environment)
+
+    def _contract_payload(self, response) -> dict:
+        if isinstance(response, dict):
+            return response
+        structured = getattr(response, "structured_content", None)
+        self.assertIsInstance(structured, dict)
+        return structured
+
+    def _full_contract_payload(self, response) -> dict:
+        response = self._contract_payload(response)
+        self.assertEqual(response["schema"], "synapse-s2.token-contract.v1")
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(response["response_contract"]["profile"], "full")
+        return response["data"]["payload"]
 
     def _restore_export_dir(self):
         if self.previous_export_dir is None:
@@ -63,6 +89,20 @@ class McpServerTests(unittest.TestCase):
         else:
             os.environ["SYNAPSE_S2_CLIENT_AGENT_ID"] = (
                 self.previous_client_agent_id
+            )
+
+    def _restore_response_contract_environment(self):
+        if self.previous_response_mode is None:
+            os.environ.pop("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", None)
+        else:
+            os.environ["SYNAPSE_S2_DEFAULT_RESPONSE_MODE"] = (
+                self.previous_response_mode
+            )
+        if self.previous_response_budget is None:
+            os.environ.pop("SYNAPSE_S2_MAX_RESPONSE_BYTES", None)
+        else:
+            os.environ["SYNAPSE_S2_MAX_RESPONSE_BYTES"] = (
+                self.previous_response_budget
             )
 
     def test_query_rejects_empty_embedding(self):
@@ -87,6 +127,893 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("[LOCAL_PATH]", result)
         self.assertNotIn(secret, result)
         self.assertNotIn(local_path, result)
+
+    def test_token_contract_tools_default_compact_and_honor_byte_budgets(self):
+        registration = json.loads(
+            mcp_server.remember_spiking_context(
+                tag="compact-contract-memory",
+                context_id="compact-contract",
+                text="Compact MCP responses preserve provenance without vectors or local paths.",
+                metadata={"surface": "mcp-test"},
+            )
+        )
+        responses = {
+            "memory-list": self._contract_payload(mcp_server.list_spiking_memory(
+                context_id="compact-contract",
+                max_response_bytes=4096,
+            )),
+            "memory-graph": self._contract_payload(mcp_server.list_spiking_memory_graph(
+                context_id="compact-contract",
+                max_response_bytes=4096,
+            )),
+            "cortex-state": self._contract_payload(mcp_server.get_spiking_cortex_state(
+                context_id="compact-contract",
+                max_response_bytes=4096,
+            )),
+            "agent-hydration": self._contract_payload(mcp_server.hydrate_spiking_agent_context(
+                agent_id="codex-desktop",
+                context_id="compact-contract",
+                max_response_bytes=4096,
+            )),
+        }
+
+        for operation, response in responses.items():
+            with self.subTest(operation=operation):
+                encoded = json.dumps(
+                    response,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.assertTrue(response["ok"], response)
+                self.assertEqual(
+                    response["schema"],
+                    "synapse-s2.token-contract.v1",
+                )
+                self.assertEqual(response["operation"], operation)
+                self.assertEqual(response["response_contract"]["profile"], "compact")
+                self.assertEqual(response["response_contract"]["max_output_bytes"], 4096)
+                self.assertEqual(
+                    response["response_contract"]["serialized_bytes"],
+                    len(encoded),
+                )
+                self.assertLessEqual(len(encoded), 4096)
+
+        hydration = responses["agent-hydration"]
+        receipts = [
+            item["receipt_id"]
+            for item in hydration["data"]["delivery"]["deployments"]
+        ]
+        self.assertEqual(len(receipts), 1)
+        ack = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="compact-contract",
+                receipt_ids=receipts,
+            )
+        )
+        self.assertEqual(ack["acknowledged_count"], 1)
+        self.assertEqual(
+            hydration["data"]["event_window"]["latest_event_id"],
+            registration["agent_deployment"]["event_id"],
+        )
+        compact_json = json.dumps(responses, sort_keys=True)
+        self.assertNotIn(str(Path(self.tmpdir.name)), compact_json)
+        self.assertNotIn("memory_db_path", compact_json)
+        self.assertNotIn("lease_token", compact_json)
+        self.assertNotIn("spike_indices", compact_json)
+        self.assertNotIn("neuron_indices", compact_json)
+
+    def test_compact_memory_rejects_vectors_before_loading_backend(self):
+        with mock.patch.object(mcp_server, "_load_backend") as load_backend:
+            response = self._contract_payload(mcp_server.list_spiking_memory(
+                context_id="demo",
+                include_vectors=True,
+            ))
+
+        load_backend.assert_not_called()
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["operation"], "memory-list")
+        self.assertIn("do not support vectors", response["data"]["error"]["message"])
+
+    def test_contract_backend_error_preserves_valid_requested_budget(self):
+        with mock.patch.object(
+            mcp_server,
+            "_load_backend",
+            side_effect=RuntimeError("synthetic backend failure"),
+        ):
+            response = self._contract_payload(
+                mcp_server.list_spiking_memory(
+                    context_id="demo",
+                    max_response_bytes=4096,
+                )
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["response_contract"]["max_output_bytes"], 4096)
+
+    def test_contract_argument_errors_preserve_valid_requested_budget(self):
+        secret = "sk-budget-error-secret-1234567890"
+        responses = (
+            self._contract_payload(
+                mcp_server.list_spiking_memory(
+                    response_mode="unsupported",
+                    max_response_bytes=4096,
+                )
+            ),
+            self._contract_payload(
+                mcp_server.list_spiking_memory(
+                    context_id=f"api_key={secret}",
+                    max_response_bytes=4096,
+                )
+            ),
+        )
+
+        for response in responses:
+            self.assertFalse(response["ok"])
+            self.assertEqual(
+                response["response_contract"]["max_output_bytes"], 4096
+            )
+            self.assertNotIn(secret, json.dumps(response, sort_keys=True))
+
+    def test_compact_hydration_caps_before_lease_and_exposes_every_receipt(self):
+        backend = mlx_backend.get_backend()
+        for ordinal in range(12):
+            backend.publish_context_event(
+                context_id="compact-cap",
+                source_surface="mcp-contract-test",
+                event_type="compact-cap",
+                summary=f"compact event {ordinal}",
+                agent_targets=["codex-desktop"],
+            )
+
+        with mock.patch.object(
+            backend,
+            "hydrate_agent_context",
+            wraps=backend.hydrate_agent_context,
+        ) as hydrate:
+            response = self._contract_payload(mcp_server.hydrate_spiking_agent_context(
+                agent_id="codex-desktop",
+                context_id="compact-cap",
+                limit=500,
+                graph_limit=500,
+                max_response_bytes=4096,
+            ))
+
+        self.assertTrue(response["ok"], response)
+        effective_event_limit = hydrate.call_args.kwargs["event_limit"]
+        self.assertGreaterEqual(effective_event_limit, 1)
+        self.assertLess(effective_event_limit, 12)
+        self.assertEqual(hydrate.call_args.kwargs["graph_limit"], 20)
+        deployments = response["data"]["delivery"]["deployments"]
+        self.assertEqual(len(deployments), effective_event_limit)
+        self.assertEqual(
+            len({item["receipt_id"] for item in deployments}),
+            len(deployments),
+        )
+        self.assertEqual(
+            len({item["event_id"] for item in deployments}),
+            len(deployments),
+        )
+        self.assertTrue(all(isinstance(item["event"], dict) for item in deployments))
+        self.assertTrue(response["data"]["delivery"]["has_more"])
+        self.assertEqual(
+            response["pagination"]["effective_limit"],
+            effective_event_limit,
+        )
+        ack = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id="compact-cap",
+                receipt_ids=[item["receipt_id"] for item in deployments],
+            )
+        )
+        self.assertEqual(ack["acknowledged_count"], effective_event_limit)
+
+    def test_hydration_projection_failure_releases_all_leased_receipts(self):
+        backend = mlx_backend.get_backend()
+        backend.publish_context_event(
+            context_id="projection-failure",
+            source_surface="mcp-contract-test",
+            event_type="projection-failure",
+            summary="Release this receipt if projection fails.",
+            agent_targets=["codex-desktop"],
+        )
+        secret = "sk-projection-secret-1234567890"
+        local_path = "/Users/dan.driver/private/projection.json"
+        with (
+            mock.patch.object(
+                backend,
+                "release_context_events",
+                wraps=backend.release_context_events,
+            ) as release,
+            mock.patch.object(
+                mcp_server,
+                "project_response",
+                side_effect=RuntimeError(f"token={secret} at {local_path}"),
+            ),
+        ):
+            response = self._contract_payload(mcp_server.hydrate_spiking_agent_context(
+                agent_id="codex-desktop",
+                context_id="projection-failure",
+            ))
+
+        self.assertFalse(response["ok"])
+        release.assert_called_once()
+        released_receipts = release.call_args.kwargs["receipt_ids"]
+        self.assertEqual(len(released_receipts), 1)
+        self.assertTrue(released_receipts[0].startswith("ctxrcpt_"))
+        rendered = json.dumps(response, sort_keys=True)
+        self.assertIn("[REDACTED_SECRET]", rendered)
+        self.assertIn("[LOCAL_PATH]", rendered)
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(local_path, rendered)
+
+    def test_hydration_failure_before_claim_never_creates_a_lease(self):
+        backend = mlx_backend.get_backend()
+        backend.publish_context_event(
+            context_id="pre-claim-failure",
+            source_surface="mcp-contract-test",
+            event_type="pre-claim-failure",
+            summary="This event must remain unleased if evidence assembly fails.",
+            agent_targets=["codex-desktop"],
+        )
+        with (
+            mock.patch.object(
+                backend,
+                "list_memory_graph",
+                side_effect=RuntimeError("synthetic graph failure"),
+            ),
+            mock.patch.object(
+                backend,
+                "lease_context_events",
+                wraps=backend.lease_context_events,
+            ) as lease,
+        ):
+            response = self._contract_payload(
+                mcp_server.hydrate_spiking_agent_context(
+                    agent_id="codex-desktop",
+                    context_id="pre-claim-failure",
+                )
+            )
+
+        self.assertFalse(response["ok"])
+        lease.assert_not_called()
+
+    def test_backend_post_claim_hydration_failure_releases_receipts(self):
+        backend = mlx_backend.get_backend()
+        backend.publish_context_event(
+            context_id="post-claim-failure",
+            source_surface="mcp-contract-test",
+            event_type="post-claim-failure",
+            summary="This receipt must be released if final composition fails.",
+            agent_targets=["codex-desktop"],
+        )
+        with (
+            mock.patch.object(
+                backend,
+                "_compose_agent_hydration_payload",
+                side_effect=RuntimeError("synthetic compose failure"),
+            ),
+            mock.patch.object(
+                backend,
+                "release_context_events",
+                wraps=backend.release_context_events,
+            ) as release,
+        ):
+            response = self._contract_payload(
+                mcp_server.hydrate_spiking_agent_context(
+                    agent_id="codex-desktop",
+                    context_id="post-claim-failure",
+                )
+            )
+
+        self.assertFalse(response["ok"])
+        release.assert_called_once()
+        self.assertEqual(len(release.call_args.kwargs["receipt_ids"]), 1)
+
+    def test_invalid_any_contract_arguments_do_not_echo_secrets(self):
+        secret = "sk-contract-argument-secret-1234567890"
+        with self.assertLogs(mcp_server.LOGGER, level="WARNING") as captured:
+            direct = self._contract_payload(mcp_server.list_spiking_memory(
+                response_mode=f"api_key={secret}",
+            ))
+            in_memory = asyncio.run(
+                mcp_server.mcp.call_tool(
+                    "list_spiking_memory",
+                    {"max_response_bytes": {"password": secret}},
+                )
+            )
+
+        combined = "\n".join(captured.output) + json.dumps(direct, sort_keys=True) + repr(in_memory)
+        self.assertNotIn(secret, combined)
+        self.assertFalse(direct["ok"])
+        self.assertIn("compact or full", direct["data"]["error"]["message"])
+        self.assertFalse(in_memory.structured_content["ok"])
+        self.assertIn(
+            "must be an integer",
+            in_memory.structured_content["data"]["error"]["message"],
+        )
+
+    def test_fastmcp_contract_tools_publish_output_schema_and_structured_content(self):
+        async def inspect_tools():
+            tools = await mcp_server.mcp.list_tools()
+            result = await mcp_server.mcp.call_tool(
+                "list_spiking_memory",
+                {"context_id": "structured-output"},
+            )
+            return tools, result
+
+        tools, result = asyncio.run(inspect_tools())
+        selected_names = {
+            "list_spiking_memory",
+            "list_spiking_memory_graph",
+            "hydrate_spiking_agent_context",
+            "get_spiking_cortex_state",
+        }
+        selected = {tool.name: tool for tool in tools if tool.name in selected_names}
+        self.assertEqual(set(selected), selected_names)
+        for tool in selected.values():
+            with self.subTest(tool=tool.name):
+                self.assertEqual(
+                    tool.output_schema["properties"]["schema"]["const"],
+                    "synapse-s2.token-contract.v1",
+                )
+                self.assertFalse(tool.output_schema["additionalProperties"])
+                self.assertEqual(
+                    tool.parameters["properties"]["response_mode"]["type"],
+                    "string",
+                )
+                self.assertEqual(
+                    len(tool.parameters["properties"]["max_response_bytes"]["oneOf"]),
+                    2,
+                )
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(
+            result.structured_content["schema"],
+            "synapse-s2.token-contract.v1",
+        )
+        guidance = result.content[0].text
+        self.assertLess(len(guidance.encode("utf-8")), 512)
+        self.assertIn("structuredContent", guidance)
+        self.assertFalse(guidance.lstrip().startswith("{"))
+        structured_bytes = json.dumps(
+            result.structured_content,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.assertEqual(
+            len(structured_bytes),
+            result.structured_content["response_contract"]["serialized_bytes"],
+        )
+
+    def test_fastmcp_contract_arguments_never_reflect_prevalidation_secrets(self):
+        secret = "SYNTHETIC_ONLY_PREVALIDATION_SECRET_1234"
+        credential = f"password={secret}"
+        cases = (
+            ("list_spiking_memory", {"context_id": {"password": secret}}),
+            ("list_spiking_memory", {"limit": credential}),
+            ("list_spiking_memory", {"include_vectors": credential}),
+            ("list_spiking_memory_graph", {"context_id": {"password": secret}}),
+            ("list_spiking_memory_graph", {"limit": credential}),
+            ("hydrate_spiking_agent_context", {"agent_id": {"password": secret}}),
+            (
+                "hydrate_spiking_agent_context",
+                {"agent_id": "codex-desktop", "context_id": {"password": secret}},
+            ),
+            (
+                "hydrate_spiking_agent_context",
+                {"agent_id": "codex-desktop", "prompt": {"password": secret}},
+            ),
+            (
+                "hydrate_spiking_agent_context",
+                {"agent_id": "codex-desktop", "limit": credential},
+            ),
+            (
+                "hydrate_spiking_agent_context",
+                {"agent_id": "codex-desktop", "graph_limit": credential},
+            ),
+            ("get_spiking_cortex_state", {"agent_id": {"password": secret}}),
+            ("get_spiking_cortex_state", {"context_id": {"password": secret}}),
+            ("get_spiking_cortex_state", {"limit": credential}),
+        )
+        for tool_name, arguments in cases:
+            with self.subTest(tool=tool_name, field=next(iter(arguments))):
+                arguments = {**arguments, "max_response_bytes": 4096}
+                with self.assertLogs("synapse_s2.mcp", level="WARNING") as captured:
+                    result = asyncio.run(
+                        mcp_server.mcp.call_tool(tool_name, arguments)
+                    )
+                rendered = json.dumps(
+                    {
+                        "structured": result.structured_content,
+                        "content": [
+                            getattr(item, "text", "") for item in result.content
+                        ],
+                        "logs": captured.output,
+                    },
+                    sort_keys=True,
+                )
+                self.assertNotIn(secret, rendered)
+                self.assertNotIn(credential, rendered)
+                self.assertFalse(result.is_error)
+                self.assertFalse(result.structured_content["ok"])
+                self.assertEqual(
+                    result.structured_content["response_contract"][
+                        "max_output_bytes"
+                    ],
+                    4096,
+                )
+
+    def test_fastmcp_contract_tools_reject_unknown_arguments_before_validation(self):
+        secret = "SYNTHETIC_UNKNOWN_ARGUMENT_SECRET_987654321"
+        credential = f"password={secret}"
+        local_path = "/Users/operator/private/unknown-argument-secret.json"
+        cases = (
+            ("list_spiking_memory", {}, "memory-list"),
+            ("list_spiking_memory_graph", {}, "memory-graph"),
+            (
+                "hydrate_spiking_agent_context",
+                {"agent_id": "codex-desktop"},
+                "agent-hydration",
+            ),
+            ("get_spiking_cortex_state", {}, "cortex-state"),
+        )
+        for tool_name, required_arguments, operation in cases:
+            for run_middleware in (True, False):
+                with self.subTest(
+                    tool=tool_name,
+                    run_middleware=run_middleware,
+                ):
+                    arguments = {
+                        **required_arguments,
+                        "max_response_bytes": 4096,
+                        secret: {
+                            "password": credential,
+                            "path": local_path,
+                        },
+                    }
+                    with self.assertLogs(
+                        "synapse_s2.mcp",
+                        level="WARNING",
+                    ) as captured:
+                        result = asyncio.run(
+                            mcp_server.mcp.call_tool(
+                                tool_name,
+                                arguments,
+                                run_middleware=run_middleware,
+                            )
+                        )
+                    rendered = json.dumps(
+                        {
+                            "structured": result.structured_content,
+                            "content": [
+                                getattr(item, "text", "")
+                                for item in result.content
+                            ],
+                            "logs": captured.output,
+                        },
+                        sort_keys=True,
+                    )
+                    self.assertNotIn(secret, rendered)
+                    self.assertNotIn(credential, rendered)
+                    self.assertNotIn(local_path, rendered)
+                    self.assertFalse(result.is_error)
+                    self.assertFalse(result.structured_content["ok"])
+                    self.assertEqual(
+                        result.structured_content["operation"],
+                        operation,
+                    )
+                    self.assertEqual(
+                        result.structured_content["response_contract"][
+                            "max_output_bytes"
+                        ],
+                        4096,
+                    )
+                    self.assertIn(
+                        "undeclared tool arguments",
+                        result.structured_content["data"]["error"]["message"],
+                    )
+
+    def test_fastmcp_transport_and_registry_bypasses_never_log_raw_arguments(self):
+        secret = "SYNTHETIC_TRANSPORT_ARGUMENT_SECRET_13579"
+        credential = f"password={secret}"
+        local_path = "/Users/operator/private/transport-secret.json"
+        cases = (
+            ("list_spiking_memory", {}, "context_id"),
+            ("list_spiking_memory_graph", {}, "context_id"),
+            (
+                "hydrate_spiking_agent_context",
+                {"agent_id": "codex-desktop"},
+                "prompt",
+            ),
+            ("get_spiking_cortex_state", {}, "context_id"),
+        )
+
+        async def exercise(tool_name, arguments):
+            wire = await mcp_server.mcp._call_tool_mcp(tool_name, arguments)
+            tool = await mcp_server.mcp.get_tool(tool_name)
+            direct = await tool.run(arguments)
+            internal = await tool._run(arguments)
+            return wire, direct, internal
+
+        transport_logger = logging.getLogger(
+            "fastmcp.server.mixins.mcp_operations"
+        )
+        previous_level = transport_logger.level
+        transport_logger.setLevel(logging.DEBUG)
+        try:
+            for tool_name, required_arguments, declared_field in cases:
+                payloads = (
+                    {
+                        **required_arguments,
+                        "max_response_bytes": 4096,
+                        secret: {
+                            "password": credential,
+                            "path": local_path,
+                        },
+                    },
+                    {
+                        **required_arguments,
+                        declared_field: {
+                            "password": credential,
+                            "path": local_path,
+                        },
+                        "max_response_bytes": 4096,
+                    },
+                )
+                for arguments in payloads:
+                    with self.subTest(
+                        tool=tool_name,
+                        unknown_argument=secret in arguments,
+                    ):
+                        with self.assertLogs(level="DEBUG") as captured:
+                            wire, direct, internal = asyncio.run(
+                                exercise(tool_name, arguments)
+                            )
+                        wire_content, wire_structured = wire
+                        rendered = json.dumps(
+                            {
+                                "wire": {
+                                    "content": [
+                                        item.model_dump(by_alias=True)
+                                        for item in wire_content
+                                    ],
+                                    "structuredContent": wire_structured,
+                                },
+                                "direct": direct.structured_content,
+                                "internal": internal.structured_content,
+                                "logs": captured.output,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                        normalized = re.sub(r"\s+", "", rendered)
+                        self.assertNotIn(secret, normalized)
+                        self.assertNotIn(credential, normalized)
+                        self.assertNotIn(local_path, normalized)
+                        self.assertFalse(wire_structured["ok"])
+                        self.assertFalse(direct.structured_content["ok"])
+                        self.assertFalse(internal.structured_content["ok"])
+        finally:
+            transport_logger.setLevel(previous_level)
+
+    def test_fastmcp_real_in_memory_transport_never_logs_unknown_arguments(self):
+        from fastmcp import Client
+
+        secret = "SYNTHETIC_REAL_TRANSPORT_SECRET_24680"
+        credential = f"password={secret}"
+        local_path = "/Users/operator/private/real-transport-secret.json"
+        cases = (
+            ("list_spiking_memory", {}),
+            ("list_spiking_memory_graph", {}),
+            (
+                "hydrate_spiking_agent_context",
+                {"agent_id": "codex-desktop"},
+            ),
+            ("get_spiking_cortex_state", {}),
+        )
+
+        async def exercise():
+            results = {}
+            async with Client(mcp_server.mcp) as client:
+                for tool_name, required_arguments in cases:
+                    results[tool_name] = await client.call_tool(
+                        tool_name,
+                        {
+                            **required_arguments,
+                            "max_response_bytes": 4096,
+                            secret: {
+                                "password": credential,
+                                "path": local_path,
+                            },
+                        },
+                    )
+            return results
+
+        fastmcp_logger = logging.getLogger("fastmcp")
+        previous_level = fastmcp_logger.level
+        fastmcp_logger.setLevel(logging.DEBUG)
+        try:
+            with self.assertLogs(level="DEBUG") as captured:
+                results = asyncio.run(exercise())
+        finally:
+            fastmcp_logger.setLevel(previous_level)
+
+        rendered = json.dumps(
+            {
+                "logs": captured.output,
+                "results": {
+                    tool_name: {
+                        "content": [
+                            item.model_dump(by_alias=True)
+                            for item in result.content
+                        ],
+                        "structuredContent": result.structured_content,
+                    }
+                    for tool_name, result in results.items()
+                },
+            },
+            sort_keys=True,
+            default=str,
+        )
+        normalized = re.sub(r"\s+", "", rendered)
+        self.assertNotIn(secret, normalized)
+        self.assertNotIn(credential, normalized)
+        self.assertNotIn(local_path, normalized)
+        for tool_name, result in results.items():
+            with self.subTest(tool=tool_name):
+                self.assertFalse(result.is_error)
+                self.assertFalse(result.structured_content["ok"])
+                self.assertEqual(
+                    result.structured_content["response_contract"][
+                        "max_output_bytes"
+                    ],
+                    4096,
+                )
+
+    def test_invalid_mcp_budget_errors_keep_the_installed_ceiling(self):
+        cases = (
+            ("list_spiking_memory", {}),
+            ("list_spiking_memory_graph", {}),
+            ("hydrate_spiking_agent_context", {"agent_id": "codex-desktop"}),
+            ("get_spiking_cortex_state", {}),
+        )
+        secret = "password=SYNTHETIC_INVALID_BUDGET_1234"
+        with mock.patch.dict(
+            os.environ,
+            {"SYNAPSE_S2_MAX_RESPONSE_BYTES": "12288"},
+            clear=False,
+        ):
+            for tool_name, arguments in cases:
+                with self.subTest(tool=tool_name):
+                    result = asyncio.run(
+                        mcp_server.mcp.call_tool(
+                            tool_name,
+                            {**arguments, "max_response_bytes": secret},
+                        )
+                    )
+                    rendered = json.dumps(
+                        {
+                            "structured": result.structured_content,
+                            "content": [
+                                getattr(item, "text", "") for item in result.content
+                            ],
+                        },
+                        sort_keys=True,
+                    )
+                    self.assertNotIn(secret, rendered)
+                    self.assertFalse(result.structured_content["ok"])
+                    self.assertEqual(
+                        result.structured_content["response_contract"][
+                            "max_output_bytes"
+                        ],
+                        12288,
+                    )
+
+    def test_fastmcp_hydration_safety_summary_keeps_every_receipt_consumable(self):
+        backend = mlx_backend.get_backend()
+        for mode in ("compact", "full"):
+            with self.subTest(mode=mode):
+                context_id = f"safety-summary-{mode}"
+                backend.publish_context_event(
+                    context_id=context_id,
+                    source_surface="mcp-contract-test",
+                    event_type="safety-summary-event",
+                    summary="Fallback clients need bounded evidence before acknowledging.",
+                    agent_targets=["codex-desktop"],
+                )
+                result = asyncio.run(
+                    mcp_server.mcp.call_tool(
+                        "hydrate_spiking_agent_context",
+                        {
+                            "agent_id": "codex-desktop",
+                            "context_id": context_id,
+                            "response_mode": mode,
+                            "max_response_bytes": 4096 if mode == "compact" else 131072,
+                        },
+                    )
+                )
+                prefix = "SYNAPSE-S2 safety summary: "
+                self.assertTrue(result.content[0].text.startswith(prefix))
+                summary = json.loads(result.content[0].text[len(prefix) :])
+                structured = result.structured_content
+                fallback_receipts = summary["delivery"]["receipts"]
+                structured_deployments = (
+                    structured["data"]["delivery"]["deployments"]
+                    if mode == "compact"
+                    else structured["data"]["payload"]["deliveries"]
+                )
+                self.assertEqual(
+                    {(item["receipt_id"], item["event_id"]) for item in fallback_receipts},
+                    {(item["receipt_id"], item["event_id"]) for item in structured_deployments},
+                )
+                self.assertTrue(all(item["event_type"] for item in fallback_receipts))
+                self.assertTrue(all(item["source_surface"] for item in fallback_receipts))
+                self.assertTrue(all(item["summary"] for item in fallback_receipts))
+                self.assertTrue(
+                    all(item["trust"] == "untrusted-event-evidence" for item in fallback_receipts)
+                )
+                self.assertLess(len(result.content[0].text.encode("utf-8")), 4096)
+                ack = json.loads(
+                    mcp_server.ack_spiking_context_deployments(
+                        agent_id="codex-desktop",
+                        context_id=context_id,
+                        receipt_ids=[item["receipt_id"] for item in fallback_receipts],
+                    )
+                )
+                self.assertEqual(ack["acknowledged_count"], len(fallback_receipts))
+
+    def test_compact_safety_summary_is_bounded_for_eight_maximum_text_receipts(self):
+        backend = mlx_backend.get_backend()
+        context_id = "safety-summary-worst-compact"
+        for index in range(8):
+            backend.publish_context_event(
+                context_id=context_id,
+                source_surface=f"source-{index}-" + ("s" * 70),
+                event_type=f"event-{index}-" + ("e" * 71),
+                summary=(f"receipt evidence {index} " + ("x" * 1_000)),
+                agent_targets=["codex-desktop"],
+            )
+        result = asyncio.run(
+            mcp_server.mcp.call_tool(
+                "hydrate_spiking_agent_context",
+                {
+                    "agent_id": "codex-desktop",
+                    "context_id": context_id,
+                    "limit": 8,
+                    "response_mode": "compact",
+                    "max_response_bytes": 12_288,
+                },
+            )
+        )
+        prefix = mcp_server.MCP_SAFETY_SUMMARY_PREFIX
+        text_content = result.content[0].text
+        self.assertTrue(text_content.startswith(prefix))
+        self.assertLessEqual(
+            len(text_content.encode("utf-8")),
+            mcp_server.MCP_COMPACT_SAFETY_SUMMARY_BYTES,
+        )
+        summary = json.loads(text_content[len(prefix) :])
+        receipts = summary["delivery"]["receipts"]
+        structured_receipts = result.structured_content["data"]["delivery"]["deployments"]
+        self.assertEqual(len(receipts), 8)
+        self.assertEqual(
+            {(item["receipt_id"], item["event_id"]) for item in receipts},
+            {
+                (item["receipt_id"], item["event_id"])
+                for item in structured_receipts
+            },
+        )
+        self.assertTrue(summary["delivery"]["receipt_decision_supported"])
+        self.assertTrue(summary["delivery"]["evidence_text_truncated"])
+        self.assertGreater(summary["delivery"]["omitted_text_characters"], 0)
+        self.assertTrue(
+            all(item["trust"] == "untrusted-event-evidence" for item in receipts)
+        )
+        ack = json.loads(
+            mcp_server.ack_spiking_context_deployments(
+                agent_id="codex-desktop",
+                context_id=context_id,
+                receipt_ids=[item["receipt_id"] for item in receipts],
+            )
+        )
+        self.assertEqual(ack["acknowledged_count"], 8)
+
+    def test_compact_safety_summary_survives_maximum_ids_and_unicode_evidence(self):
+        events = []
+        deliveries = []
+        for index in range(1, 9):
+            events.append(
+                {
+                    "event_id": index,
+                    "context_id": "default",
+                    "event_type": "🧠" * 128,
+                    "source_surface": "神" * 128,
+                    "summary": "🚀" * 360,
+                    "created_at": 1_900_000_000.0 + index,
+                    "payload_summary": {"event_count": 1},
+                }
+            )
+            deliveries.append(
+                {
+                    "receipt_id": "ctxrcpt_" + f"{index:043d}",
+                    "delivery_id": ("d" * 158) + f"{index:02d}",
+                    "event_id": index,
+                    "context_id": "default",
+                    "agent_id": "codex-desktop",
+                    "consumer_instance_id": "c" * 256,
+                    "state": "leased",
+                    "attempt_count": 1,
+                    "redelivered": False,
+                    "ack_required": True,
+                    "lease_expires_at": 1_900_000_100.0 + index,
+                }
+            )
+        payload = {
+            "context_id": "default",
+            "agent_id": "codex-desktop",
+            "protocol_version": "context-delivery.v2",
+            "delivery_mode": "leased-at-least-once",
+            "claim_events": True,
+            "ack_required": True,
+            "has_more_events": False,
+            "remaining_pending_count": 8,
+            "max_delivery_attempts": 3,
+            "since_event_id": 0,
+            "latest_event_id": 8,
+            "new_event_count": 8,
+            "events": events,
+            "deliveries": deliveries,
+            "recall_items": [],
+            "graph_entries": [],
+            "graph_relationships": [],
+            "graph_summary": {
+                "entry_count": 0,
+                "relationship_count": 0,
+                "relationship_modes": {"total": 0, "by_type": {}},
+            },
+            "cortex_state": {
+                "context_id": "default",
+                "agent_id": "codex-desktop",
+                "active_session_count": 0,
+                "goal_count": 0,
+                "typed_memory_counts": {},
+            },
+        }
+        structured = mcp_server.project_response(
+            "agent-hydration",
+            payload,
+            mode="compact",
+            max_response_bytes=12_288,
+        )
+        result = mcp_server._contract_tool_result(structured)
+        text_content = result.content[0].text
+
+        self.assertLessEqual(
+            len(text_content.encode("utf-8")),
+            mcp_server.MCP_COMPACT_SAFETY_SUMMARY_BYTES,
+        )
+        summary = json.loads(
+            text_content[len(mcp_server.MCP_SAFETY_SUMMARY_PREFIX) :]
+        )
+        receipts = summary["delivery"]["receipts"]
+        self.assertEqual(len(receipts), 8)
+        self.assertTrue(summary["delivery"]["receipt_decision_supported"])
+        self.assertTrue(
+            all(
+                item["event_type"]
+                and item["source_surface"]
+                and item["summary"]
+                for item in receipts
+            )
+        )
+        self.assertEqual(
+            {item["receipt_id"] for item in receipts},
+            {item["receipt_id"] for item in deliveries},
+        )
 
     def test_direct_tool_calls_guard_secret_bearing_context_and_agent_ids(self):
         secret = "sk-mcp-identifier-secret-1234567890"
@@ -341,7 +1268,13 @@ class McpServerTests(unittest.TestCase):
                 metadata={"surface": "mcp"},
             )
         )
-        listing = json.loads(mcp_server.list_spiking_memory(context_id="demo", limit=5))
+        listing = self._full_contract_payload(
+            mcp_server.list_spiking_memory(
+                context_id="demo",
+                limit=5,
+                response_mode="full",
+            )
+        )
         status = json.loads(mcp_server.get_spiking_attention_status(context_id="demo"))
 
         self.assertEqual(registration["embedding_provider"]["provider"], "semantic-hash-v1")
@@ -382,7 +1315,13 @@ class McpServerTests(unittest.TestCase):
             metadata={"surface": "mcp"},
         )
 
-        listing = json.loads(mcp_server.list_spiking_memory(context_id="demo", limit=5))
+        listing = self._full_contract_payload(
+            mcp_server.list_spiking_memory(
+                context_id="demo",
+                limit=5,
+                response_mode="full",
+            )
+        )
         exported = json.loads(mcp_server.export_spiking_memory(context_id="demo"))
         backup = json.loads(
             mcp_server.backup_spiking_memory(
@@ -553,11 +1492,12 @@ class McpServerTests(unittest.TestCase):
             metadata={"surface": "mcp"},
         )
 
-        listing = json.loads(
+        listing = self._full_contract_payload(
             mcp_server.list_spiking_memory(
                 context_id="demo",
                 limit=5,
                 include_vectors=True,
+                response_mode="full",
             )
         )
 
@@ -582,7 +1522,12 @@ class McpServerTests(unittest.TestCase):
                 min_segment_sentences=1,
             )
         )
-        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+        graph = self._full_contract_payload(
+            mcp_server.list_spiking_memory_graph(
+                context_id="demo",
+                response_mode="full",
+            )
+        )
 
         self.assertGreaterEqual(ingestion["event_count"], 2)
         self.assertTrue(ingestion["agent_deployment"]["published"])
@@ -602,7 +1547,12 @@ class McpServerTests(unittest.TestCase):
                 speaker="codex",
             )
         )
-        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+        graph = self._full_contract_payload(
+            mcp_server.list_spiking_memory_graph(
+                context_id="demo",
+                response_mode="full",
+            )
+        )
         memory_id = next(
             entry["memory_id"]
             for entry in graph["entries"]
@@ -658,7 +1608,12 @@ class McpServerTests(unittest.TestCase):
                 speaker="codex",
             )
         )
-        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+        graph = self._full_contract_payload(
+            mcp_server.list_spiking_memory_graph(
+                context_id="demo",
+                response_mode="full",
+            )
+        )
         deployments = json.loads(
             mcp_server.pull_spiking_context_deployments(
                 agent_id="codex-desktop",
@@ -713,7 +1668,12 @@ class McpServerTests(unittest.TestCase):
         processed = json.loads(
             mcp_server.process_spiking_capture_inbox(max_files=10, confirm=True)
         )
-        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+        graph = self._full_contract_payload(
+            mcp_server.list_spiking_memory_graph(
+                context_id="demo",
+                response_mode="full",
+            )
+        )
 
         self.assertFalse(Path(drop["drop_path"]).exists())
         self.assertEqual(status_before["pending_file_count"], 1)
@@ -799,7 +1759,12 @@ class McpServerTests(unittest.TestCase):
             )
         )
         listed = json.loads(mcp_server.list_spiking_transcript_sources())
-        graph = json.loads(mcp_server.list_spiking_memory_graph(context_id="demo"))
+        graph = self._full_contract_payload(
+            mcp_server.list_spiking_memory_graph(
+                context_id="demo",
+                response_mode="full",
+            )
+        )
 
         self.assertEqual(registered["source_id"], "claude-file")
         self.assertGreaterEqual(polled["captured_event_count"], 1)
@@ -918,11 +1883,12 @@ class McpServerTests(unittest.TestCase):
             )
         )
 
-        first = json.loads(
+        first = self._full_contract_payload(
             mcp_server.hydrate_spiking_agent_context(
                 agent_id="codex-desktop",
                 context_id="demo",
                 prompt="deployment context",
+                response_mode="full",
             )
         )
         ack = json.loads(
@@ -932,11 +1898,12 @@ class McpServerTests(unittest.TestCase):
                 receipt_id=first["deliveries"][0]["receipt_id"],
             )
         )
-        second = json.loads(
+        second = self._full_contract_payload(
             mcp_server.hydrate_spiking_agent_context(
                 agent_id="codex-desktop",
                 context_id="demo",
                 prompt="deployment context",
+                response_mode="full",
             )
         )
 
@@ -1012,10 +1979,11 @@ class McpServerTests(unittest.TestCase):
                 reason="MCP operator verified",
             )
         )
-        state = json.loads(
+        state = self._full_contract_payload(
             mcp_server.get_spiking_cortex_state(
                 agent_id="mcp-agent",
                 context_id="demo",
+                response_mode="full",
             )
         )
         closed = json.loads(
@@ -1026,10 +1994,11 @@ class McpServerTests(unittest.TestCase):
                 reason="mcp-test-complete",
             )
         )
-        closed_state = json.loads(
+        closed_state = self._full_contract_payload(
             mcp_server.get_spiking_cortex_state(
                 agent_id="mcp-agent",
                 context_id="demo",
+                response_mode="full",
             )
         )
 
@@ -1072,7 +2041,12 @@ class McpServerTests(unittest.TestCase):
             )
         )
         listed = json.loads(mcp_server.list_spiking_goals(context_id="demo"))
-        state = json.loads(mcp_server.get_spiking_cortex_state(context_id="demo"))
+        state = self._full_contract_payload(
+            mcp_server.get_spiking_cortex_state(
+                context_id="demo",
+                response_mode="full",
+            )
+        )
 
         self.assertEqual(created["action"], "goal-create")
         self.assertEqual(updated["action"], "goal-update")
@@ -1168,12 +2142,10 @@ class McpServerTests(unittest.TestCase):
             None,
         )
         try:
-            hydration = json.loads(
-                mcp_server.hydrate_spiking_agent_context(
-                    agent_id="codex-desktop",
-                    context_id="demo",
-                )
-            )
+            hydration = self._contract_payload(mcp_server.hydrate_spiking_agent_context(
+                agent_id="codex-desktop",
+                context_id="demo",
+            ))
             pull = json.loads(
                 mcp_server.pull_spiking_context_deployments(
                     agent_id="codex-desktop",
@@ -1188,8 +2160,11 @@ class McpServerTests(unittest.TestCase):
                     "SYNAPSE_S2_ALLOW_UNCONFIGURED_DELIVERY_IDENTITY"
                 ] = override
 
-        self.assertIn("error", hydration)
-        self.assertIn("SYNAPSE_S2_CLIENT_AGENT_ID", hydration["error"])
+        self.assertFalse(hydration["ok"])
+        self.assertIn(
+            "SYNAPSE_S2_CLIENT_AGENT_ID",
+            hydration["data"]["error"]["message"],
+        )
         self.assertIn("error", pull)
         self.assertNotIn("UnboundLocalError", json.dumps(hydration))
 

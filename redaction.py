@@ -6,7 +6,9 @@ import json
 import logging
 import re
 import sys
+import unicodedata
 from typing import Any, Iterable
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 
 REDACTED_SECRET = "[REDACTED_SECRET]"
@@ -188,9 +190,52 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 _PUBLIC_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:/(?:Users|private|var|tmp|opt|etc|Library)/[^\s,;:]+)"
+    r"(?<![A-Za-z0-9_.-])(?:"
+    r"/(?!/)[^\r\n,;:<>'\"]+"
+    r"|[A-Za-z]:\\[^\r\n,;:<>'\"]+"
+    r"|\\\\[^\\\r\n,;:<>'\"]+\\[^\\\r\n,;:<>'\"]+"
+    r"(?:\\[^\r\n,;:<>'\"]+)*"
+    r")"
 )
+_PUBLIC_URL_RE = re.compile(r"\b(?:https?|ftp)://[^\s<>'\"]+", re.IGNORECASE)
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
+
+
+def _mask_public_paths(value: str) -> str:
+    """Mask local absolute paths while preserving non-local URL components."""
+
+    parts: list[str] = []
+    cursor = 0
+    for match in _PUBLIC_URL_RE.finditer(value):
+        parts.append(_PUBLIC_PATH_RE.sub("[LOCAL_PATH]", value[cursor : match.start()]))
+        url = match.group(0)
+        try:
+            parsed = urlsplit(url)
+            query_items: list[tuple[str, str]] = []
+            for key, raw_value in parse_qsl(parsed.query, keep_blank_values=True):
+                decoded = unquote(raw_value)
+                query_items.append(
+                    (key, _PUBLIC_PATH_RE.sub("[LOCAL_PATH]", decoded))
+                )
+            fragment = _PUBLIC_PATH_RE.sub(
+                "[LOCAL_PATH]",
+                unquote(parsed.fragment),
+            )
+            url = urlunsplit(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    urlencode(query_items),
+                    fragment,
+                )
+            )
+        except Exception:
+            url = _PUBLIC_PATH_RE.sub("[LOCAL_PATH]", url)
+        parts.append(url)
+        cursor = match.end()
+    parts.append(_PUBLIC_PATH_RE.sub("[LOCAL_PATH]", value[cursor:]))
+    return "".join(parts)
 
 
 def _normalized_key(value: Any) -> str:
@@ -464,7 +509,7 @@ def safe_public_error(
 
     raw = str(error or "")
     redacted, _ = redact_capture_text(raw)
-    redacted = _PUBLIC_PATH_RE.sub("[LOCAL_PATH]", redacted)
+    redacted = _mask_public_paths(redacted)
     redacted = _CONTROL_RE.sub(" ", redacted)
     compact = " ".join(redacted.split()) or str(fallback or "request failed")
     limit = max(32, min(int(max_chars), 2_048))
@@ -473,11 +518,44 @@ def safe_public_error(
     return compact
 
 
+def validate_public_identifier(
+    value: Any,
+    *,
+    field: str,
+    max_chars: int,
+) -> str:
+    """Require an identifier to survive the public redaction boundary exactly."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string identifier")
+    raw = reject_sensitive_identifier(value, field=field)
+    if (
+        not raw
+        or raw != raw.strip()
+        or len(raw) > int(max_chars)
+        or any(unicodedata.category(char).startswith("C") for char in raw)
+        or safe_public_error(
+            raw,
+            fallback="invalid identifier",
+            max_chars=int(max_chars),
+        )
+        != raw
+    ):
+        raise ValueError(f"{field} is invalid")
+    return raw
+
+
+def mask_public_paths(value: Any) -> str:
+    """Mask absolute local filesystem paths without otherwise rewriting text."""
+
+    return _mask_public_paths(str(value or ""))
+
+
 def secret_safe_cli_text(value: Any) -> str:
     """Redact argparse output while preserving its normal line formatting."""
 
     redacted, _ = redact_capture_text(str(value or ""))
-    redacted = _PUBLIC_PATH_RE.sub("[LOCAL_PATH]", redacted)
+    redacted = _mask_public_paths(redacted)
     return _CONTROL_RE.sub(" ", redacted)
 
 

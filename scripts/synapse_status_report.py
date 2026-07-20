@@ -316,7 +316,18 @@ def collect_live_report(args: argparse.Namespace) -> dict[str, Any]:
         "doctor": run_json([*base, "doctor", "--context", args.context, "--include-apps", "--repair-plan"]),
         "context_health": run_json([*base, "context-health", "--context", args.context]),
         "memory_hygiene": run_json([*base, "memory-hygiene", "--context", args.context, "--limit", str(args.hygiene_limit)]),
-        "cortex_state": run_json([*base, "cortex-state", "--context", args.context, "--agent-id", args.agent_id]),
+        "cortex_state": run_json(
+            [
+                *base,
+                "cortex-state",
+                "--context",
+                args.context,
+                "--agent-id",
+                args.agent_id,
+                "--response-mode",
+                "legacy",
+            ]
+        ),
         "git": git_snapshot(),
     }
 

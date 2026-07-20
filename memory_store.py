@@ -15,6 +15,7 @@ import stat
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -35,6 +36,7 @@ from redaction import (
     reject_sensitive_identifier,
     strip_untrusted_raw_digest_fields,
     strip_untrusted_raw_digest_text,
+    validate_public_identifier,
 )
 
 
@@ -2200,6 +2202,30 @@ class DurableMemoryStore:
     def _context_event_context_id_is_valid(value: Any) -> bool:
         text = value if isinstance(value, str) else ""
         return bool(1 <= len(text) <= 128 and text == text.strip())
+
+    @staticmethod
+    def _context_event_public_label_is_valid(value: Any) -> bool:
+        try:
+            validate_public_identifier(
+                value,
+                field="context event label",
+                max_chars=128,
+            )
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _context_event_summary_is_valid(value: Any) -> bool:
+        text = value if isinstance(value, str) else ""
+        return bool(
+            text.strip()
+            and any(
+                not character.isspace()
+                and not unicodedata.category(character).startswith("C")
+                for character in text
+            )
+        )
 
     @staticmethod
     def _context_delivery_receipt_id_is_valid(value: Any) -> bool:
@@ -4502,7 +4528,8 @@ class DurableMemoryStore:
         context = None if context_id is None else str(context_id)
         rows = conn.execute(
             """
-            SELECT event_id, context_id, created_at
+            SELECT event_id, context_id, source_surface, event_type, summary,
+                   created_at
             FROM agent_context_events
             WHERE (? IS NULL OR context_id = ?)
               AND event_id > ?
@@ -4518,6 +4545,14 @@ class DurableMemoryStore:
             raw_context_id = row["context_id"]
             if not self._context_event_context_id_is_valid(raw_context_id):
                 reasons.append("context-id-invalid")
+            if not self._context_event_public_label_is_valid(
+                row["source_surface"]
+            ):
+                reasons.append("source-surface-invalid")
+            if not self._context_event_public_label_is_valid(row["event_type"]):
+                reasons.append("event-type-invalid")
+            if not self._context_event_summary_is_valid(row["summary"]):
+                reasons.append("summary-evidence-invalid")
             if not self._context_delivery_timestamp_is_valid(row["created_at"]):
                 reasons.append("created-at-invalid")
             if not reasons:
@@ -7865,15 +7900,23 @@ class DurableMemoryStore:
             raise ValueError(
                 "context_id must be stripped, nonempty, and at most 128 characters"
             )
-        clean_source_surface = reject_sensitive_identifier(
-            source_surface or "unknown",
+        clean_source_surface = str(source_surface or "unknown").strip()[:128] or "unknown"
+        clean_event_type = str(event_type or "context-update").strip()[:128] or "context-update"
+        clean_source_surface = validate_public_identifier(
+            clean_source_surface,
             field="source_surface",
-        ).strip()[:128] or "unknown"
-        clean_event_type = reject_sensitive_identifier(
-            event_type or "context-update",
+            max_chars=128,
+        )
+        clean_event_type = validate_public_identifier(
+            clean_event_type,
             field="event_type",
-        ).strip()[:128] or "context-update"
+            max_chars=128,
+        )
         safe_summary, _ = redact_capture_text(str(summary or ""))
+        if not self._context_event_summary_is_valid(safe_summary):
+            raise ValueError(
+                "context event summary must contain non-control evidence text"
+            )
         safe_payload, payload_redactions = redact_sensitive_value(payload or {})
         safe_payload, raw_digest_removals = strip_untrusted_raw_digest_fields(
             safe_payload
@@ -8706,6 +8749,7 @@ class DurableMemoryStore:
                                     blocking_delivery = {
                                         "delivery_id": str(delivery_row["delivery_id"]),
                                         "event_id": event_id,
+                                        "reason": "active-lease",
                                         "lease_owner": lease_owner,
                                         "lease_expires_at": lease_expires_at,
                                     }

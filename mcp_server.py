@@ -7,7 +7,9 @@ import re
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import BeforeValidator, WithJsonSchema
 
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
@@ -15,17 +17,36 @@ from redaction import (
     reject_sensitive_identifier,
     safe_public_error,
 )
+from token_contracts import (
+    COMPACT_SOURCE_LIMITS,
+    DEFAULT_RESPONSE_BYTES,
+    TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    ResponseContractError,
+    compact_agent_event_limit,
+    normalize_response_budget,
+    normalize_response_mode,
+    project_response,
+    response_error,
+)
 
 try:
     from fastmcp import FastMCP
+    from fastmcp.tools import FunctionTool, ToolResult
+    from mcp.types import TextContent
 except Exception as fastmcp_exc:  # pragma: no cover - host dependent
     try:
         from mcp.server.fastmcp import FastMCP  # type: ignore[no-redef]
     except Exception as mcp_exc:  # pragma: no cover - host dependent
         FastMCP = None  # type: ignore[assignment,misc]
+        FunctionTool = None  # type: ignore[assignment,misc]
+        ToolResult = None  # type: ignore[assignment,misc]
+        TextContent = None  # type: ignore[assignment,misc]
         _FASTMCP_IMPORT_ERROR: Exception | None = mcp_exc
         _FASTMCP_PRIMARY_ERROR: Exception | None = fastmcp_exc
     else:
+        FunctionTool = None  # type: ignore[assignment,misc]
+        ToolResult = None  # type: ignore[assignment,misc]
+        TextContent = None  # type: ignore[assignment,misc]
         _FASTMCP_IMPORT_ERROR = None
         _FASTMCP_PRIMARY_ERROR = fastmcp_exc
 else:
@@ -43,8 +64,264 @@ install_secret_safe_formatters(logging.getLogger().handlers)
 
 MAX_TOOL_EMBEDDING_DIMS = 32_768
 MCP_DELIVERY_INSTANCE_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex}"
+MCP_COMPACT_SAFETY_SUMMARY_BYTES = 4_096
+MCP_FULL_SAFETY_SUMMARY_BYTES = 131_072
+MCP_SAFETY_SUMMARY_PREFIX = "SYNAPSE-S2 safety summary: "
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
+_SCHEMA_INVALID_STRING = "[INVALID_STRING]"
+_SCHEMA_INVALID_INTEGER = "[INVALID_INTEGER]"
+_SCHEMA_INVALID_BOOLEAN = "[INVALID_BOOLEAN]"
+
+
+def _schema_safe_string(value: Any) -> str:
+    return value if isinstance(value, str) else _SCHEMA_INVALID_STRING
+
+
+def _schema_safe_integer(value: Any) -> int | str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        try:
+            reject_sensitive_identifier(value, field="integer input")
+        except ValueError:
+            return _SCHEMA_INVALID_INTEGER
+        return value
+    return _SCHEMA_INVALID_INTEGER
+
+
+def _schema_safe_boolean(value: Any) -> bool | str:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        try:
+            reject_sensitive_identifier(value, field="boolean input")
+        except ValueError:
+            return _SCHEMA_INVALID_BOOLEAN
+        if value.strip().casefold() in {"true", "false"}:
+            return value
+    return _SCHEMA_INVALID_BOOLEAN
+
+
+def _schema_safe_response_mode(value: Any) -> str:
+    return value if isinstance(value, str) else "[INVALID_RESPONSE_MODE]"
+
+
+def _schema_safe_response_budget(value: Any) -> int | str:
+    if isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    return "[INVALID_RESPONSE_BUDGET]"
+
+
+ResponseModeInput = Annotated[
+    str,
+    BeforeValidator(_schema_safe_response_mode),
+    WithJsonSchema(
+        {
+            "type": "string",
+            "enum": ["", "compact", "full"],
+            "description": "Bounded response profile; empty uses the installed compact default.",
+        }
+    ),
+]
+ResponseBudgetInput = Annotated[
+    int | str,
+    BeforeValidator(_schema_safe_response_budget),
+    WithJsonSchema(
+        {
+            "oneOf": [
+                {"type": "integer", "minimum": 4096, "maximum": 131072},
+                {"type": "string", "pattern": "^(?:|[0-9]+)$"},
+            ],
+            "description": "Exact UTF-8 JSON ceiling in bytes; empty uses the installed default.",
+        }
+    ),
+]
+ToolStringInput = Annotated[
+    str,
+    BeforeValidator(_schema_safe_string),
+    WithJsonSchema({"type": "string"}),
+]
+ToolIntegerInput = Annotated[
+    int | str,
+    BeforeValidator(_schema_safe_integer),
+    WithJsonSchema({"type": "integer", "minimum": 1, "maximum": 500}),
+]
+ToolBooleanInput = Annotated[
+    bool | str,
+    BeforeValidator(_schema_safe_boolean),
+    WithJsonSchema({"type": "boolean"}),
+]
+
+
+_CONTRACT_TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
+    "list_spiking_memory": frozenset(
+        {
+            "context_id",
+            "limit",
+            "include_vectors",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
+    "list_spiking_memory_graph": frozenset(
+        {
+            "context_id",
+            "limit",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
+    "hydrate_spiking_agent_context": frozenset(
+        {
+            "agent_id",
+            "context_id",
+            "prompt",
+            "limit",
+            "graph_limit",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
+    "get_spiking_cortex_state": frozenset(
+        {
+            "agent_id",
+            "context_id",
+            "limit",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
+}
+_CONTRACT_TOOL_SURFACES = {
+    "list_spiking_memory": "memory-list",
+    "list_spiking_memory_graph": "memory-graph",
+    "hydrate_spiking_agent_context": "agent-hydration",
+    "get_spiking_cortex_state": "cortex-state",
+}
+
+
+def _undeclared_contract_argument_count(
+    arguments: Any,
+    *,
+    allowed: frozenset[str],
+) -> int:
+    if arguments is None:
+        return 0
+    if not isinstance(arguments, dict):
+        return 1
+    return sum(
+        1
+        for key in arguments
+        if not isinstance(key, str) or key not in allowed
+    )
+
+
+if FastMCP is not None:
+
+    class _SecretSafeFastMCP(FastMCP):
+        """Reject unknown contract arguments before FastMCP validation can echo them."""
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, Any] | None = None,
+            *,
+            version: Any = None,
+            run_middleware: bool = True,
+            task_meta: Any = None,
+        ) -> Any:
+            allowed = _CONTRACT_TOOL_ARGUMENTS.get(name)
+            if allowed is not None:
+                invalid_count = _undeclared_contract_argument_count(
+                    arguments,
+                    allowed=allowed,
+                )
+                if invalid_count:
+                    # Never render the rejected key or value. FastMCP's default
+                    # Pydantic error includes the raw input in its warning log.
+                    LOGGER.warning(
+                        "rejected %d undeclared argument(s) for contracted tool %s",
+                        invalid_count,
+                        name,
+                    )
+                    return _contract_prevalidation_error_result(
+                        tool_name=name,
+                        arguments=arguments,
+                    )
+            return await super().call_tool(
+                name,
+                arguments,
+                version=version,
+                run_middleware=run_middleware,
+                task_meta=task_meta,
+            )
+
+        async def _call_tool_mcp(self, key: str, arguments: dict[str, Any]) -> Any:
+            """Handle the real MCP transport without logging raw tool arguments."""
+
+            import mcp.types as mcp_types
+            from fastmcp.exceptions import DisabledError, NotFoundError
+            from fastmcp.server.tasks.config import TaskMeta
+            from fastmcp.utilities.versions import VersionSpec
+
+            # FastMCP's default handler logs the complete argument mapping at
+            # DEBUG before call_tool() or Pydantic validation. Log only a
+            # content-free event so debug operation cannot become a secret sink.
+            LOGGER.debug("MCP transport tool call received")
+            try:
+                version_str: str | None = None
+                task_meta: TaskMeta | None = None
+                try:
+                    context = self._mcp_server.request_context
+                    if context.meta:
+                        meta = context.meta.model_dump(exclude_none=True)
+                        version_str = meta.get("fastmcp", {}).get("version")
+                    if context.experimental.is_task:
+                        mcp_task_meta = context.experimental.task_metadata
+                        task_meta_dict = mcp_task_meta.model_dump(exclude_none=True)
+                        task_meta = TaskMeta(ttl=task_meta_dict.get("ttl"))
+                except (AttributeError, LookupError):
+                    pass
+
+                version = VersionSpec(eq=version_str) if version_str else None
+                result = await self.call_tool(
+                    key,
+                    arguments,
+                    version=version,
+                    task_meta=task_meta,
+                )
+                if isinstance(result, mcp_types.CreateTaskResult):
+                    return result
+                return result.to_mcp_result()
+            except DisabledError:
+                raise NotFoundError("Unknown or disabled tool") from None
+            except NotFoundError:
+                raise NotFoundError("Unknown or disabled tool") from None
+
+
+if FunctionTool is not None:
+
+    class _SecretSafeContractFunctionTool(FunctionTool):
+        """Keep registry-level tool execution behind the same closed schema."""
+
+        async def run(self, arguments: dict[str, Any]) -> Any:
+            allowed = _CONTRACT_TOOL_ARGUMENTS[self.name]
+            invalid_count = _undeclared_contract_argument_count(
+                arguments,
+                allowed=allowed,
+            )
+            if invalid_count:
+                LOGGER.warning(
+                    "rejected %d undeclared argument(s) for contracted tool %s",
+                    invalid_count,
+                    self.name,
+                )
+                return _contract_prevalidation_error_result(
+                    tool_name=self.name,
+                    arguments=arguments,
+                )
+            return await super().run(arguments)
 
 
 class _UnavailableMCP:
@@ -71,7 +348,7 @@ class _UnavailableMCP:
 
 
 mcp = (
-    FastMCP(name="SYNAPSE-S2 Spiking Attention MCP Server")
+    _SecretSafeFastMCP(name="SYNAPSE-S2 Spiking Attention MCP Server")
     if FastMCP is not None
     else _UnavailableMCP()
 )
@@ -81,6 +358,341 @@ def _public_error(label: str, error: BaseException) -> str:
     """Preserve the public error label while bounding and redacting details."""
 
     return f"{label}: {safe_public_error(error, fallback=label)}"
+
+
+def _token_response_options(
+    *,
+    surface: str,
+    response_mode: Any,
+    max_response_bytes: Any,
+) -> tuple[str, int]:
+    budget = _token_response_budget(
+        surface=surface,
+        max_response_bytes=max_response_bytes,
+    )
+    configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+    mode = normalize_response_mode(response_mode, default=configured_mode)
+    return mode, budget
+
+
+def _token_response_budget(
+    *,
+    surface: str,
+    max_response_bytes: Any,
+) -> int:
+    configured_budget: Any = os.getenv("SYNAPSE_S2_MAX_RESPONSE_BYTES", "")
+    requested_budget = (
+        max_response_bytes
+        if max_response_bytes not in (None, "")
+        else configured_budget
+    )
+    budget = normalize_response_budget(
+        requested_budget,
+        default_bytes=DEFAULT_RESPONSE_BYTES[surface],
+    )
+    return budget
+
+
+def _token_error_budget(*, surface: str) -> int:
+    """Return the installed valid ceiling when a requested ceiling is malformed."""
+
+    configured_budget: Any = os.getenv("SYNAPSE_S2_MAX_RESPONSE_BYTES", "")
+    try:
+        return normalize_response_budget(
+            configured_budget,
+            default_bytes=DEFAULT_RESPONSE_BYTES[surface],
+        )
+    except ResponseContractError:
+        return DEFAULT_RESPONSE_BYTES[surface]
+
+
+def _contract_prevalidation_error_result(
+    *,
+    tool_name: str,
+    arguments: Any,
+) -> Any:
+    """Build a bounded error without inspecting or reflecting rejected inputs."""
+
+    surface = _CONTRACT_TOOL_SURFACES[tool_name]
+    budget = _token_error_budget(surface=surface)
+    if isinstance(arguments, dict):
+        requested_budget = arguments.get("max_response_bytes", "")
+        try:
+            budget = min(
+                budget,
+                normalize_response_budget(
+                    requested_budget,
+                    default_bytes=budget,
+                ),
+            )
+        except ResponseContractError:
+            pass
+    return _contract_tool_result(
+        _contract_error(
+            surface,
+            ResponseContractError("request contains undeclared tool arguments"),
+            max_response_bytes=budget,
+        )
+    )
+
+
+def _contract_error(
+    surface: str,
+    error: BaseException,
+    *,
+    max_response_bytes: int | None = None,
+) -> dict[str, Any]:
+    return response_error(
+        operation=surface,
+        error=error,
+        max_response_bytes=max_response_bytes,
+    )
+
+
+def _summary_text(value: Any, max_characters: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_characters:
+        return text
+    if max_characters <= 0:
+        return ""
+    if max_characters == 1:
+        # A one-byte marker keeps the final receipt-decision fallback bounded
+        # even when the source evidence is entirely four-byte Unicode.
+        return "~"
+    return text[: max_characters - 1] + "…"
+
+
+def _mcp_safety_summary_text(
+    summary: dict[str, Any],
+    *,
+    profile: str,
+) -> str:
+    ceiling = (
+        MCP_FULL_SAFETY_SUMMARY_BYTES
+        if profile == "full"
+        else MCP_COMPACT_SAFETY_SUMMARY_BYTES
+    )
+    summary["max_bytes"] = ceiling
+    delivery = summary.get("delivery")
+    receipts = (
+        delivery.get("receipts", [])
+        if isinstance(delivery, dict) and isinstance(delivery.get("receipts"), list)
+        else []
+    )
+    original_text = [
+        {
+            "event_type": str(item.get("event_type") or ""),
+            "source_surface": str(item.get("source_surface") or ""),
+            "summary": str(item.get("summary") or ""),
+        }
+        for item in receipts
+        if isinstance(item, dict)
+    ]
+    cap_profiles = (
+        (
+            (64, 64, 192),
+            (48, 48, 128),
+            (32, 32, 96),
+            (24, 24, 64),
+            (16, 16, 48),
+            (8, 8, 32),
+            (4, 4, 8),
+            (2, 2, 4),
+            (1, 1, 1),
+            (0, 0, 0),
+        )
+        if profile != "full"
+        else (
+            (96, 96, 256),
+            (64, 64, 192),
+            (48, 48, 128),
+            (32, 32, 96),
+            (16, 16, 48),
+            (8, 8, 24),
+            (4, 4, 8),
+            (2, 2, 4),
+            (1, 1, 1),
+        )
+    )
+    if not receipts:
+        cap_profiles = ((0, 0, 0),)
+
+    for event_type_cap, source_cap, summary_cap in cap_profiles:
+        omitted_characters = 0
+        for item, original in zip(receipts, original_text, strict=True):
+            for field, cap in (
+                ("event_type", event_type_cap),
+                ("source_surface", source_cap),
+                ("summary", summary_cap),
+            ):
+                shortened = _summary_text(original[field], cap)
+                item[field] = shortened
+                omitted_characters += max(0, len(original[field]) - len(shortened))
+        if isinstance(delivery, dict):
+            delivery["evidence_text_truncated"] = omitted_characters > 0
+            delivery["omitted_text_characters"] = omitted_characters
+            delivery["receipt_decision_supported"] = all(
+                bool(item.get("event_type"))
+                and bool(item.get("source_surface"))
+                and bool(item.get("summary"))
+                for item in receipts
+                if isinstance(item, dict)
+            )
+            if not delivery["receipt_decision_supported"]:
+                continue
+        rendered = MCP_SAFETY_SUMMARY_PREFIX + json.dumps(
+            summary,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        if len(rendered.encode("utf-8")) <= ceiling:
+            return rendered
+
+    raise ResponseContractError(
+        "MCP safety summary cannot preserve every receipt identity within its byte ceiling"
+    )
+
+
+def _contract_tool_result(payload: dict[str, Any]) -> Any:
+    if ToolResult is None or TextContent is None:  # pragma: no cover - legacy fallback
+        return payload
+    operation = str(payload.get("operation") or "response")
+    warnings = [
+        {
+            "code": _summary_text(item.get("code") or "warning", 96),
+            "severity": _summary_text(item.get("severity") or "warning", 24),
+            "action_required": bool(item.get("action_required", False)),
+        }
+        for item in payload.get("warnings", [])
+        if isinstance(item, dict)
+    ]
+    continuation = payload.get("continuation")
+    summary: dict[str, Any] = {
+        "schema": "synapse-s2.mcp-safety-summary.v1",
+        "operation": operation,
+        "ok": bool(payload.get("ok")),
+        "structuredContent_required": True,
+        "warnings": warnings,
+        "continuation": {
+            key: _summary_text(continuation.get(key), 240)
+            for key in ("strategy", "instruction")
+            if isinstance(continuation, dict) and continuation.get(key) not in (None, "")
+        },
+    }
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    profile = str(
+        (payload.get("response_contract") or {}).get("profile") or "compact"
+    )
+    source_data = (
+        data.get("payload")
+        if profile == "full" and isinstance(data.get("payload"), dict)
+        else data
+    )
+    error = data.get("error") if isinstance(data.get("error"), dict) else None
+    if error is not None:
+        summary["error"] = {
+            "code": _summary_text(error.get("code"), 96),
+            "message": _summary_text(error.get("message"), 320),
+            "retryable": bool(error.get("retryable", False)),
+        }
+    if operation == "agent-hydration":
+        if profile == "full":
+            full_events = {
+                int(item.get("event_id") or 0): item
+                for item in source_data.get("events", [])
+                if isinstance(item, dict)
+            }
+            deployments = [
+                {
+                    **item,
+                    "event": full_events.get(int(item.get("event_id") or 0), {}),
+                }
+                for item in source_data.get("deliveries", [])
+                if isinstance(item, dict)
+            ]
+            delivery = {
+                "observed": bool(source_data.get("claim_events")),
+                "ack_required": bool(source_data.get("ack_required")),
+                "has_more": bool(source_data.get("has_more_events")),
+                "blocking": source_data.get("blocking_delivery"),
+                "deployments": deployments,
+            }
+        else:
+            delivery = (
+                source_data.get("delivery")
+                if isinstance(source_data.get("delivery"), dict)
+                else {}
+            )
+        summary["delivery"] = {
+            "observed": bool(delivery.get("observed")),
+            "ack_required": bool(delivery.get("ack_required")),
+            "has_more": bool(delivery.get("has_more")),
+            "blocking": delivery.get("blocking"),
+            "receipts": [
+                {
+                    "receipt_id": str(item.get("receipt_id") or ""),
+                    "event_id": int(item.get("event_id") or 0),
+                    "event_type": _summary_text(
+                        (item.get("event") or {}).get("event_type") or ""
+                        , 512
+                    )
+                    if isinstance(item.get("event"), dict)
+                    else "",
+                    "source_surface": _summary_text(
+                        (item.get("event") or {}).get("source_surface") or ""
+                        , 512
+                    )
+                    if isinstance(item.get("event"), dict)
+                    else "",
+                    "summary": _summary_text(
+                        (item.get("event") or {}).get("summary") or "", 2_048
+                    )
+                    if isinstance(item.get("event"), dict)
+                    else "",
+                    "trust": "untrusted-event-evidence",
+                }
+                for item in delivery.get("deployments", [])
+                if isinstance(item, dict)
+            ],
+        }
+    elif operation == "cortex-state":
+        if profile == "full":
+            sessions = [
+                item
+                for item in source_data.get("active_sessions", [])
+                if isinstance(item, dict)
+            ]
+            latest = sessions[0] if sessions else {}
+            actionable_codes = sorted(
+                {
+                    str(warning.get("code") or "cortex-governor-warning")
+                    for session in sessions
+                    for warning in session.get("last_warnings", [])
+                    if isinstance(warning, dict)
+                    and (
+                        bool(warning.get("action_required"))
+                        or str(warning.get("severity") or "").casefold()
+                        in {"critical", "high"}
+                    )
+                }
+            )
+            summary["governance"] = {
+                "latest_decision": _summary_text(latest.get("last_decision"), 160),
+                "action_required": bool(actionable_codes),
+                "warning_codes": [_summary_text(code, 96) for code in actionable_codes],
+            }
+        else:
+            summary["governance"] = (
+                source_data.get("governance")
+                if isinstance(source_data.get("governance"), dict)
+                else {}
+            )
+    guidance = _mcp_safety_summary_text(summary, profile=profile)
+    return ToolResult(
+        content=[TextContent(type="text", text=guidance)],
+        structured_content=payload,
+    )
 
 
 def _sanitize_context_id(context_id: str) -> str:
@@ -161,7 +773,32 @@ def _validate_text(text: str, *, field_name: str = "text") -> str:
     return value
 
 
-def _validate_limit(limit: int) -> int:
+def _validate_tool_string(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str) or value == _SCHEMA_INVALID_STRING:
+        raise ValueError(f"{field_name} must be a string")
+    return value
+
+
+def _validate_tool_boolean(value: Any, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value != _SCHEMA_INVALID_BOOLEAN:
+        normalized = value.strip().casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+def _validate_limit(limit: Any) -> int:
+    if isinstance(limit, bool) or limit == _SCHEMA_INVALID_INTEGER:
+        raise ValueError("limit must be an integer")
+    if isinstance(limit, str):
+        try:
+            reject_sensitive_identifier(limit, field="limit")
+        except ValueError as exc:
+            raise ValueError("limit must be an integer") from exc
     try:
         value = int(limit)
     except (TypeError, ValueError) as exc:
@@ -529,34 +1166,74 @@ def get_spiking_attention_status(context_id: str = "default") -> str:
 
 
 @mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
     annotations={
         "title": "List Persisted SYNAPSE-S2 Memory",
         "readOnlyHint": True,
     }
 )
 def list_spiking_memory(
-    context_id: str = "default",
-    limit: int = 50,
-    include_vectors: bool = False,
-) -> str:
-    """List persisted local memory entries for a context."""
+    context_id: ToolStringInput = "default",
+    limit: ToolIntegerInput = 50,
+    include_vectors: ToolBooleanInput = False,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """List persisted memory using a compact or explicitly full response contract."""
     context = "unknown"
+    budget: int | None = _token_error_budget(surface="memory-list")
     try:
-        context = _sanitize_context_id(context_id)
+        budget = _token_response_budget(
+            surface="memory-list",
+            max_response_bytes=max_response_bytes,
+        )
+        configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+        mode = normalize_response_mode(response_mode, default=configured_mode)
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
         bounded_limit = _validate_limit(limit)
+        include_vector_data = _validate_tool_boolean(
+            include_vectors,
+            field_name="include_vectors",
+        )
+        if mode == "compact" and include_vector_data:
+            raise ResponseContractError(
+                "compact memory responses do not support vectors; use full mode"
+            )
+        effective_limit = (
+            min(bounded_limit, COMPACT_SOURCE_LIMITS["memory-list"])
+            if mode == "compact"
+            else bounded_limit
+        )
         _, mlx_backend = _load_backend()
         payload = mlx_backend.get_backend().list_memory(
             context_id=context,
-            limit=bounded_limit,
-            include_vectors=bool(include_vectors),
+            limit=effective_limit,
+            include_vectors=include_vector_data,
         )
-        return json.dumps(payload, sort_keys=True)
+        payload["_response_source"] = {
+            "requested_limit": bounded_limit,
+            "effective_limit": effective_limit,
+        }
+        return _contract_tool_result(
+            project_response(
+                "memory-list",
+                payload,
+                mode=mode,
+                max_response_bytes=budget,
+            )
+        )
     except ValueError as exc:
         LOGGER.warning("invalid memory list request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": _public_error("invalid memory list request", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("memory-list", exc, max_response_bytes=budget)
+        )
     except Exception as exc:
         LOGGER.exception("memory list failed for context_id=%s", context)
-        return json.dumps({"error": _public_error("memory list failed", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("memory-list", exc, max_response_bytes=budget)
+        )
 
 
 @mcp.tool()
@@ -1074,29 +1751,64 @@ def prune_spiking_memory(
 
 
 @mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
     annotations={
         "title": "List SYNAPSE-S2 Memory Graph",
         "readOnlyHint": True,
     }
 )
-def list_spiking_memory_graph(context_id: str = "default", limit: int = 100) -> str:
-    """List compact memory entries and their persisted relationship graph."""
+def list_spiking_memory_graph(
+    context_id: ToolStringInput = "default",
+    limit: ToolIntegerInput = 100,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """List memory graph evidence using a bounded structured response contract."""
     context = "unknown"
+    budget: int | None = _token_error_budget(surface="memory-graph")
     try:
-        context = _sanitize_context_id(context_id)
+        budget = _token_response_budget(
+            surface="memory-graph",
+            max_response_bytes=max_response_bytes,
+        )
+        configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+        mode = normalize_response_mode(response_mode, default=configured_mode)
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
         bounded_limit = _validate_limit(limit)
+        effective_limit = (
+            min(bounded_limit, COMPACT_SOURCE_LIMITS["memory-graph"])
+            if mode == "compact"
+            else bounded_limit
+        )
         _, mlx_backend = _load_backend()
         payload = mlx_backend.list_memory_graph(
             context_id=context,
-            limit=bounded_limit,
+            limit=effective_limit,
         )
-        return json.dumps(payload, sort_keys=True)
+        payload["_response_source"] = {
+            "requested_limit": bounded_limit,
+            "effective_limit": effective_limit,
+        }
+        return _contract_tool_result(
+            project_response(
+                "memory-graph",
+                payload,
+                mode=mode,
+                max_response_bytes=budget,
+            )
+        )
     except ValueError as exc:
         LOGGER.warning("invalid graph list request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": _public_error("invalid graph list request", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("memory-graph", exc, max_response_bytes=budget)
+        )
     except Exception as exc:
         LOGGER.exception("memory graph list failed for context_id=%s", context)
-        return json.dumps({"error": _public_error("memory graph list failed", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("memory-graph", exc, max_response_bytes=budget)
+        )
 
 
 @mcp.tool(
@@ -1305,42 +2017,109 @@ def inspect_spiking_context_delivery_health() -> str:
 
 
 @mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
     annotations={
         "title": "Hydrate Agent Context From SYNAPSE-S2",
         "readOnlyHint": False,
     }
 )
 def hydrate_spiking_agent_context(
-    agent_id: str,
-    context_id: str = "default",
-    prompt: str = "",
-    limit: int = 20,
-    graph_limit: int = 30,
-) -> str:
-    """Lease an agent-ready context brief; acknowledge returned receipts separately."""
+    agent_id: ToolStringInput,
+    context_id: ToolStringInput = "default",
+    prompt: ToolStringInput = "",
+    limit: ToolIntegerInput = 20,
+    graph_limit: ToolIntegerInput = 30,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Lease a bounded agent context contract; acknowledge every returned receipt separately."""
     context = "unknown"
     agent = "unknown"
+    backend = None
+    payload: dict[str, Any] | None = None
+    budget: int | None = _token_error_budget(surface="agent-hydration")
     try:
-        context = _sanitize_context_id(context_id)
-        agent = _delivery_agent_id(agent_id)
-        prompt_text = str(prompt or "").strip()
+        budget = _token_response_budget(
+            surface="agent-hydration",
+            max_response_bytes=max_response_bytes,
+        )
+        configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+        mode = normalize_response_mode(response_mode, default=configured_mode)
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
+        agent = _delivery_agent_id(
+            _validate_tool_string(agent_id, field_name="agent_id")
+        )
+        prompt_text = _validate_tool_string(prompt, field_name="prompt").strip()
         if len(prompt_text) > 20_000:
             raise ValueError("prompt exceeds 20000 characters")
         bounded_limit = _validate_limit(limit)
         bounded_graph_limit = _validate_limit(graph_limit)
+        effective_limit = (
+            compact_agent_event_limit(
+                requested_limit=bounded_limit,
+                max_output_bytes=budget,
+            )
+            if mode == "compact"
+            else bounded_limit
+        )
+        effective_graph_limit = (
+            min(bounded_graph_limit, COMPACT_SOURCE_LIMITS["agent-graph"])
+            if mode == "compact"
+            else bounded_graph_limit
+        )
         _, mlx_backend = _load_backend()
-        payload = mlx_backend.hydrate_agent_context(
+        backend = mlx_backend.get_backend()
+        payload = backend.hydrate_agent_context(
             context_id=context,
             agent_id=agent,
             prompt=prompt_text,
             since_event_id=None,
-            event_limit=bounded_limit,
-            graph_limit=bounded_graph_limit,
+            event_limit=effective_limit,
+            graph_limit=effective_graph_limit,
             acknowledge=False,
             claim_events=True,
             consumer_instance_id=MCP_DELIVERY_INSTANCE_ID,
         )
-        return json.dumps(payload, sort_keys=True, default=str)
+        payload["_response_source"] = {
+            "requested_event_limit": bounded_limit,
+            "effective_event_limit": effective_limit,
+            "requested_graph_limit": bounded_graph_limit,
+            "effective_graph_limit": effective_graph_limit,
+        }
+        try:
+            return _contract_tool_result(
+                project_response(
+                    "agent-hydration",
+                    payload,
+                    mode=mode,
+                    max_response_bytes=budget,
+                )
+            )
+        except Exception:
+            receipt_ids = [
+                str(item.get("receipt_id") or "")
+                for item in payload.get("deliveries", [])
+                if isinstance(item, dict) and str(item.get("receipt_id") or "")
+            ]
+            if receipt_ids:
+                try:
+                    backend.release_context_events(
+                        context_id=context,
+                        agent_id=agent,
+                        consumer_instance_id=MCP_DELIVERY_INSTANCE_ID,
+                        receipt_ids=receipt_ids,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "failed to release agent context receipts after projection failure"
+                    )
+                    raise ResponseContractError(
+                        "projection failed and leased receipts could not be released; "
+                        "wait for lease expiry before retrying"
+                    )
+            raise
     except ValueError as exc:
         LOGGER.warning(
             "invalid agent context hydration for context_id=%s agent_id=%s: %s",
@@ -1348,14 +2127,18 @@ def hydrate_spiking_agent_context(
             agent,
             exc,
         )
-        return json.dumps({"error": _public_error("invalid agent context hydration", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("agent-hydration", exc, max_response_bytes=budget)
+        )
     except Exception as exc:
         LOGGER.exception(
             "agent context hydration failed for context_id=%s agent_id=%s",
             context,
             agent,
         )
-        return json.dumps({"error": _public_error("agent context hydration failed", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("agent-hydration", exc, max_response_bytes=budget)
+        )
 
 
 @mcp.tool(
@@ -1604,30 +2387,59 @@ def moderate_spiking_cortical_trace(
 
 
 @mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
     annotations={
         "title": "Get SYNAPSE-S2 Cortex State",
         "readOnlyHint": True,
     }
 )
 def get_spiking_cortex_state(
-    agent_id: str = "",
-    context_id: str = "default",
-    limit: int = 50,
-) -> str:
-    """Inspect active governed sessions and typed cortical memory for a context."""
+    agent_id: ToolStringInput = "",
+    context_id: ToolStringInput = "default",
+    limit: ToolIntegerInput = 50,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Inspect governed Cortex state through a bounded structured contract."""
     context = "unknown"
     agent = "unknown"
+    budget: int | None = _token_error_budget(surface="cortex-state")
     try:
-        context = _sanitize_context_id(context_id)
-        agent = _sanitize_agent_id(agent_id) if str(agent_id or "").strip() else ""
+        budget = _token_response_budget(
+            surface="cortex-state",
+            max_response_bytes=max_response_bytes,
+        )
+        configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+        mode = normalize_response_mode(response_mode, default=configured_mode)
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
+        agent_input = _validate_tool_string(agent_id, field_name="agent_id")
+        agent = _sanitize_agent_id(agent_input) if agent_input.strip() else ""
         bounded_limit = _validate_limit(limit)
+        effective_limit = (
+            min(bounded_limit, COMPACT_SOURCE_LIMITS["cortex-state"])
+            if mode == "compact"
+            else bounded_limit
+        )
         _, mlx_backend = _load_backend()
         payload = mlx_backend.get_cortex_state(
             context_id=context,
             agent_id=agent,
-            limit=bounded_limit,
+            limit=effective_limit,
         )
-        return json.dumps(payload, sort_keys=True, default=str)
+        payload["_response_source"] = {
+            "requested_limit": bounded_limit,
+            "effective_limit": effective_limit,
+        }
+        return _contract_tool_result(
+            project_response(
+                "cortex-state",
+                payload,
+                mode=mode,
+                max_response_bytes=budget,
+            )
+        )
     except ValueError as exc:
         LOGGER.warning(
             "invalid cortex state request for context_id=%s agent_id=%s: %s",
@@ -1635,14 +2447,18 @@ def get_spiking_cortex_state(
             agent or "<all>",
             exc,
         )
-        return json.dumps({"error": _public_error("invalid cortex state request", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("cortex-state", exc, max_response_bytes=budget)
+        )
     except Exception as exc:
         LOGGER.exception(
             "cortex state request failed for context_id=%s agent_id=%s",
             context,
             agent or "<all>",
         )
-        return json.dumps({"error": _public_error("cortex state request failed", exc)}, sort_keys=True)
+        return _contract_tool_result(
+            _contract_error("cortex-state", exc, max_response_bytes=budget)
+        )
 
 
 @mcp.tool(
@@ -2157,6 +2973,37 @@ def trigger_idle_maintenance(force_deep_sleep: bool = False) -> str:
     except Exception as exc:
         LOGGER.exception("idle maintenance failed")
         return json.dumps({"error": _public_error("idle maintenance failed", exc)}, sort_keys=True)
+
+
+def _install_contract_tool_guards() -> None:
+    """Replace contracted registry entries with validation-safe tool objects."""
+
+    if FunctionTool is None:  # pragma: no cover - legacy fallback
+        return
+    components = tuple(mcp.local_provider._components.values())
+    for tool_name in _CONTRACT_TOOL_ARGUMENTS:
+        matches = [
+            component
+            for component in components
+            if isinstance(component, FunctionTool) and component.name == tool_name
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "contracted MCP tool registration must resolve exactly once"
+            )
+        original = matches[0]
+        if isinstance(original, _SecretSafeContractFunctionTool):
+            continue
+        values = {
+            field_name: getattr(original, field_name)
+            for field_name in FunctionTool.model_fields
+        }
+        guarded = _SecretSafeContractFunctionTool(**values)
+        mcp.local_provider.remove_tool(original.name, original.version)
+        mcp.add_tool(guarded)
+
+
+_install_contract_tool_guards()
 
 
 if __name__ == "__main__":

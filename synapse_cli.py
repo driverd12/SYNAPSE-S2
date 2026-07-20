@@ -9,9 +9,27 @@ from pathlib import Path
 from typing import Any
 
 from redaction import reject_sensitive_identifier, safe_public_error
+from token_contracts import (
+    COMPACT_SOURCE_LIMITS,
+    CONTRACT_SCHEMA,
+    DEFAULT_RESPONSE_BYTES,
+    ResponseContractError,
+    compact_agent_event_limit,
+    normalize_response_budget,
+    normalize_response_mode,
+    project_response,
+    response_error,
+    serialize_response,
+)
 
 
 _STARTUP_IMPORT_ERROR: Exception | None = None
+_CONTRACT_COMMAND_SURFACES = {
+    "agent-brief": "agent-hydration",
+    "list-memory": "memory-list",
+    "graph": "memory-graph",
+    "cortex-state": "cortex-state",
+}
 try:
     from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
     import mlx_backend
@@ -62,7 +80,10 @@ def _emit_line(line: str) -> None:
 
 def emit(payload: dict[str, Any], *, as_json: bool) -> None:
     if as_json:
-        _emit_line(json.dumps(payload, sort_keys=True, default=_json_default))
+        if payload.get("schema") == CONTRACT_SCHEMA:
+            _emit_line(serialize_response(payload))
+        else:
+            _emit_line(json.dumps(payload, sort_keys=True, default=_json_default))
         return
 
     for key, value in payload.items():
@@ -115,6 +136,64 @@ def parse_string_list(raw: str | None, *, field_name: str) -> list[str]:
         if text:
             values.append(text)
     return values
+
+
+def _cli_response_options(
+    args: argparse.Namespace,
+    *,
+    surface: str,
+    default_mode: str = "compact",
+) -> tuple[str, int] | tuple[str, None]:
+    requested_mode = str(getattr(args, "response_mode", "") or "").strip()
+    if requested_mode.casefold() == "legacy":
+        return "legacy", None
+    budget = _cli_response_budget(args, surface=surface)
+    configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", default_mode)
+    mode = normalize_response_mode(requested_mode, default=configured_mode)
+    return mode, budget
+
+
+def _cli_response_budget(args: argparse.Namespace, *, surface: str) -> int:
+    requested_budget: Any = getattr(args, "max_response_bytes", "")
+    if requested_budget in (None, ""):
+        requested_budget = os.getenv("SYNAPSE_S2_MAX_RESPONSE_BYTES", "")
+    budget = normalize_response_budget(
+        requested_budget,
+        default_bytes=DEFAULT_RESPONSE_BYTES[surface],
+    )
+    return budget
+
+
+def _cli_error_response_budget(*, surface: str) -> int:
+    configured_budget: Any = os.getenv("SYNAPSE_S2_MAX_RESPONSE_BYTES", "")
+    try:
+        return normalize_response_budget(
+            configured_budget,
+            default_bytes=DEFAULT_RESPONSE_BYTES[surface],
+        )
+    except ResponseContractError:
+        return DEFAULT_RESPONSE_BYTES[surface]
+
+
+def _add_response_contract_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--response-mode",
+        default="",
+        help="compact (default), full contract, or legacy unwrapped compatibility output",
+    )
+    parser.add_argument(
+        "--max-response-bytes",
+        default="",
+        help="UTF-8 JSON byte ceiling from 4096 through 131072",
+    )
+
+
+def _normalize_cli_limit(value: Any, *, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ResponseContractError("limit must be an integer") from exc
+    return min(max(parsed, 1), max(1, int(maximum)))
 
 
 def _optional_public_output_path(value: Any, *, field: str) -> str | None:
@@ -461,8 +540,30 @@ def command_app_snapshot_preview(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
+    mode, budget = _cli_response_options(args, surface="memory-graph")
+    requested_limit = _normalize_cli_limit(args.limit, maximum=500)
+    effective_limit = (
+        min(requested_limit, COMPACT_SOURCE_LIMITS["memory-graph"])
+        if mode == "compact"
+        else requested_limit
+    )
     backend = build_backend(args)
-    return backend.list_memory_graph(context_id=args.context, limit=args.limit)
+    payload = backend.list_memory_graph(
+        context_id=args.context,
+        limit=effective_limit,
+    )
+    if mode == "legacy":
+        return payload
+    payload["_response_source"] = {
+        "requested_limit": requested_limit,
+        "effective_limit": effective_limit,
+    }
+    return project_response(
+        "memory-graph",
+        payload,
+        mode=mode,
+        max_response_bytes=budget,
+    )
 
 
 def command_namespace_map(args: argparse.Namespace) -> dict[str, Any]:
@@ -580,6 +681,13 @@ def command_context_delivery_health(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_agent_brief(args: argparse.Namespace) -> dict[str, Any]:
     if args.mode == "morning":
+        if str(getattr(args, "response_mode", "") or "").strip().casefold() not in {
+            "",
+            "legacy",
+        }:
+            raise ResponseContractError(
+                "morning mode is an operator receipt; use legacy response mode"
+            )
         runtime = _dashboard_runtime_from_args(args)
         payload = runtime.start_work(
             context_id=args.context,
@@ -600,21 +708,71 @@ def command_agent_brief(args: argparse.Namespace) -> dict[str, Any]:
             payload["receipt"]["action"] = "agent-brief-morning"
             payload["receipt"]["title"] = payload["receipt"].get("title") or "Morning brief"
         return payload
+    mode, budget = _cli_response_options(args, surface="agent-hydration")
+    requested_limit = _normalize_cli_limit(args.limit, maximum=100)
+    requested_graph_limit = _normalize_cli_limit(args.graph_limit, maximum=200)
+    effective_limit = (
+        compact_agent_event_limit(
+            requested_limit=requested_limit,
+            max_output_bytes=int(budget),
+        )
+        if mode == "compact"
+        else requested_limit
+    )
+    effective_graph_limit = (
+        min(requested_graph_limit, COMPACT_SOURCE_LIMITS["agent-graph"])
+        if mode == "compact"
+        else requested_graph_limit
+    )
     backend = build_backend(args)
-    return backend.hydrate_agent_context(
+    consumer_instance_id = args.consumer_instance_id or backend.delivery_instance_id
+    payload = backend.hydrate_agent_context(
         context_id=args.context,
         agent_id=args.agent_id,
         prompt=args.prompt,
         since_event_id=args.since_event_id,
-        event_limit=args.limit,
-        graph_limit=args.graph_limit,
+        event_limit=effective_limit,
+        graph_limit=effective_graph_limit,
         acknowledge=False,
         claim_events=not args.observe_only,
-        consumer_instance_id=(
-            args.consumer_instance_id or backend.delivery_instance_id
-        ),
+        consumer_instance_id=consumer_instance_id,
         lease_seconds=args.lease_seconds,
     )
+    if mode == "legacy":
+        return payload
+    payload["_response_source"] = {
+        "requested_event_limit": requested_limit,
+        "effective_event_limit": effective_limit,
+        "requested_graph_limit": requested_graph_limit,
+        "effective_graph_limit": effective_graph_limit,
+    }
+    try:
+        return project_response(
+            "agent-hydration",
+            payload,
+            mode=mode,
+            max_response_bytes=budget,
+        )
+    except Exception:
+        receipt_ids = [
+            str(item.get("receipt_id") or "")
+            for item in payload.get("deliveries", [])
+            if isinstance(item, dict) and str(item.get("receipt_id") or "")
+        ]
+        if receipt_ids:
+            try:
+                backend.release_context_events(
+                    context_id=args.context,
+                    agent_id=args.agent_id,
+                    consumer_instance_id=consumer_instance_id,
+                    receipt_ids=receipt_ids,
+                )
+            except Exception as release_exc:
+                raise ResponseContractError(
+                    "projection failed and leased receipts could not be released; "
+                    "wait for lease expiry before retrying"
+                ) from release_exc
+        raise
 
 
 def command_enter_cortex(args: argparse.Namespace) -> dict[str, Any]:
@@ -678,11 +836,30 @@ def command_commit_cortex(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_cortex_state(args: argparse.Namespace) -> dict[str, Any]:
+    mode, budget = _cli_response_options(args, surface="cortex-state")
+    requested_limit = _normalize_cli_limit(args.limit, maximum=500)
+    effective_limit = (
+        min(requested_limit, COMPACT_SOURCE_LIMITS["cortex-state"])
+        if mode == "compact"
+        else requested_limit
+    )
     backend = build_backend(args)
-    return backend.get_cortex_state(
+    payload = backend.get_cortex_state(
         context_id=args.context,
         agent_id=args.agent_id,
-        limit=args.limit,
+        limit=effective_limit,
+    )
+    if mode == "legacy":
+        return payload
+    payload["_response_source"] = {
+        "requested_limit": requested_limit,
+        "effective_limit": effective_limit,
+    }
+    return project_response(
+        "cortex-state",
+        payload,
+        mode=mode,
+        max_response_bytes=budget,
     )
 
 
@@ -849,11 +1026,34 @@ def command_sleep(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_list_memory(args: argparse.Namespace) -> dict[str, Any]:
+    mode, budget = _cli_response_options(args, surface="memory-list")
+    if mode == "compact" and bool(args.include_vectors):
+        raise ResponseContractError(
+            "compact memory responses do not support vectors; use full or legacy mode"
+        )
+    requested_limit = _normalize_cli_limit(args.limit, maximum=10_000)
+    effective_limit = (
+        min(requested_limit, COMPACT_SOURCE_LIMITS["memory-list"])
+        if mode == "compact"
+        else requested_limit
+    )
     backend = build_backend(args)
-    return backend.list_memory(
+    payload = backend.list_memory(
         context_id=args.context,
-        limit=args.limit,
+        limit=effective_limit,
         include_vectors=args.include_vectors,
+    )
+    if mode == "legacy":
+        return payload
+    payload["_response_source"] = {
+        "requested_limit": requested_limit,
+        "effective_limit": effective_limit,
+    }
+    return project_response(
+        "memory-list",
+        payload,
+        mode=mode,
+        max_response_bytes=budget,
     )
 
 
@@ -1358,6 +1558,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph = subparsers.add_parser("graph")
     add_context(graph)
     graph.add_argument("--limit", type=int, default=100)
+    _add_response_contract_args(graph)
     graph.set_defaults(func=command_graph)
 
     namespace_map = subparsers.add_parser("namespace-map")
@@ -1452,6 +1653,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Hydrate recall and graph without leasing context events.",
     )
+    _add_response_contract_args(agent_brief)
     agent_brief.set_defaults(func=command_agent_brief)
 
     enter_cortex = subparsers.add_parser("enter-cortex")
@@ -1512,6 +1714,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(cortex_state)
     cortex_state.add_argument("--agent-id", default="")
     cortex_state.add_argument("--limit", type=int, default=50)
+    _add_response_contract_args(cortex_state)
     cortex_state.set_defaults(func=command_cortex_state)
 
     moderate_cortex = subparsers.add_parser("moderate-cortex")
@@ -1639,6 +1842,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(list_memory)
     list_memory.add_argument("--limit", type=int, default=50)
     list_memory.add_argument("--include-vectors", action="store_true")
+    _add_response_contract_args(list_memory)
     list_memory.set_defaults(func=command_list_memory)
 
     export_memory = subparsers.add_parser("export-memory")
@@ -1808,10 +2012,31 @@ def main(argv: list[str] | None = None) -> int:
         emit(payload, as_json=args.json)
         return 0
     except Exception as exc:
-        emit(
-            {"error": safe_public_error(exc, fallback="command failed")},
-            as_json=args.json,
-        )
+        surface = _CONTRACT_COMMAND_SURFACES.get(str(getattr(args, "command", "")))
+        response_mode = str(getattr(args, "response_mode", "") or "").strip().casefold()
+        if surface and response_mode != "legacy" and not (
+            getattr(args, "command", "") == "agent-brief"
+            and getattr(args, "mode", "") == "morning"
+            and response_mode in {"", "legacy"}
+        ):
+            error_budget: int | None = _cli_error_response_budget(surface=surface)
+            try:
+                error_budget = _cli_response_budget(args, surface=surface)
+            except Exception:
+                pass
+            emit(
+                response_error(
+                    operation=surface,
+                    error=exc,
+                    max_response_bytes=error_budget,
+                ),
+                as_json=args.json,
+            )
+        else:
+            emit(
+                {"error": safe_public_error(exc, fallback="command failed")},
+                as_json=args.json,
+            )
         return 1
 
 

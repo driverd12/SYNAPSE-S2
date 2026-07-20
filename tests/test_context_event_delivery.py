@@ -149,6 +149,62 @@ class DurableContextEventDeliveryTests(unittest.TestCase):
         self.assertLessEqual(len(rows), 1)
         return rows[0] if rows else None
 
+    def test_publish_rejects_event_evidence_that_cannot_cross_the_public_contract(self):
+        invalid_cases = (
+            {"source_surface": "worker\nalpha"},
+            {"source_surface": "/Users/alice/private-worker"},
+            {"event_type": "event\x7ftype"},
+            {"summary": "   \n\t"},
+            {"summary": "\x00\x01"},
+        )
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            for overrides in invalid_cases:
+                request = {
+                    "context_id": self.context_id,
+                    "source_surface": "phase-6-test",
+                    "event_type": "contract-boundary",
+                    "summary": "renderable evidence",
+                    "payload": {},
+                    "agent_targets": [self.agent_id],
+                    "created_at": 100.0,
+                    **overrides,
+                }
+                with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                    store.publish_context_event(**request)
+
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                event_count = int(
+                    conn.execute("SELECT COUNT(*) FROM agent_context_events").fetchone()[0]
+                )
+        self.assertEqual(event_count, 0)
+
+    def test_delivery_health_detects_legacy_unrenderable_event_evidence(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO agent_context_events (
+                        context_id, source_surface, event_type, summary,
+                        payload_json, agent_targets_json, created_at
+                    ) VALUES (?, ?, ?, ?, '{}', '[]', ?)
+                    """,
+                    (self.context_id, "legacy\nsource", "legacy-event", "", 100.0),
+                )
+                conn.commit()
+
+            health = store.context_delivery_health(context_id=self.context_id)
+
+        self.assertGreaterEqual(health["event_ledger_integrity_error_count"], 1)
+        reasons = {
+            reason
+            for sample in health["event_ledger_integrity_error_samples"]
+            for reason in sample["reasons"]
+        }
+        self.assertIn("source-surface-invalid", reasons)
+        self.assertIn("summary-evidence-invalid", reasons)
+
     def test_fifo_batches_of_twenty_five_never_skip_the_oldest_backlog(self):
         with TemporaryDirectory() as tmp:
             store = self._store(tmp)

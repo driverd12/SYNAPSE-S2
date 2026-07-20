@@ -14,9 +14,11 @@ cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
   --embedding-provider mlx-neural
 ```
 
-The certifier writes one evidence pack under `.synapse_s2/evidence_packs/` and exits non-zero unless client config, MCP connection, native neural embedding, Doctor, Start Work, real memory write and recall, App Connect no-write preview, Wrap Session persistence, and dashboard smoke are all ready. Start with this pack before showing coworkers the system.
+The certifier writes one evidence pack under `.synapse_s2/evidence_packs/` and exits non-zero unless client config, MCP connection, the required compact MCP contract probe, native neural embedding, Doctor, Start Work, real memory write and recall, App Connect no-write preview, Wrap Session persistence, and dashboard smoke are all ready. Start with this pack before showing coworkers the system.
 
 The detailed certification runbook is `docs/OPERATOR_READINESS_CERTIFICATION.md`.
+The installed-client response schema and byte-budget contract are documented in
+`docs/TOKEN_CONTRACTS.md`.
 
 ## One-command install and preflight
 
@@ -57,6 +59,11 @@ Restart Codex, Claude Desktop, and Claude Code after the client-config installer
 - `test-validated` Cortex memory requires concrete validation evidence such as a test command, test list, output summary, artifact path, commit, or verification report. Use `observed` or `operator-confirmed` for ordinary notes.
 - Recall is backed by durable SQLite indexes for sparse spikes and surface terms. Existing databases are backfilled automatically, and `memory_store.stats()` exposes the populated index counts.
 - Client config installation refuses malformed existing JSON instead of silently replacing it.
+- Installed MCP clients default to `synapse-s2.token-contract.v1` compact responses with a 12,288-byte post-redaction UTF-8 ceiling for authoritative `structuredContent` on memory list, graph, agent hydration, and Cortex state calls. MCP also emits one separate compact safety `TextContent` item bounded to 4,096 bytes; full-mode safety text is bounded separately to 131,072 bytes. Outer JSON-RPC framing is excluded from all three ceilings. `response_mode="full"` is an explicit bounded diagnostic choice, never an automatic fallback.
+- CLI `agent-brief`, `list-memory`, `graph`, and `cortex-state` use the same compact envelope by default. Use `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics or `--response-mode legacy` only for a known compatibility consumer.
+- Compact hydration preserves a one-to-one mapping from every leased `receipt_id` to a visible deployment event. Projection failure releases acquired leases; only a later exact-receipt acknowledgement advances durable delivery state.
+- Critical/high, action-required, and protected contract warnings survive compact projection. Noncritical warnings may be omitted only as complete items with a truthful omission count. MCP consumers must treat `structuredContent` as authoritative; safety text is a bounded decision aid.
+- The loopback dashboard stays on its rich local API. The MCP compact profile does not reduce Namespace Galaxy, ganglion, neuron, or graph inspection payloads in the browser.
 
 ## Expected ready signal
 
@@ -75,6 +82,7 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | :--- | :--- | :--- |
 | `dependencies_importable` | `mlx.core`, `mlxsnn`, `fastmcp`, or `mcp` is not importable. | Run `uv sync`. |
 | `launcher_executable` | `/Users/dan.driver/.local/bin/synapse-s2-mcp` is missing or not executable. | Run `scripts/install_local_launcher.sh`. |
+| `mcp_contract_probe` | The installed launcher did not return the exact compact schema/budget, independently verified canonical size, or the separate bounded safety summary. | Reinstall the launcher and client configs, restart the MCP client, then rerun certification. Inspect `docs/TOKEN_CONTRACTS.md` before changing a ceiling. |
 | `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Capture a real trace with `synapse_cli.py --json remember-text --context default --tag <tag> --text <text>`. |
 | `relationship_minimum_met` | The selected context has too few persisted event relationships for the requested gate. | Run the event graph ingestion command below. |
 | `resource_envelope_met` | The default topology is outside the configured 96-384 MB estimated resource envelope. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then adjust `SYNAPSE_S2_NEURONS` or topology CLI args. |
@@ -104,7 +112,9 @@ receipt-bearing alternative and ACK only after consumption:
   --mode morning \
   --context default \
   --agent-id codex-desktop \
-  --prompt "Prepare SYNAPSE-S2 for today's operator work."
+  --prompt "Prepare SYNAPSE-S2 for today's operator work." \
+  --response-mode compact \
+  --max-response-bytes 12288
 .venv/bin/python synapse_cli.py --json ack-context \
   --context default \
   --agent-id codex-desktop \
@@ -188,13 +198,15 @@ Status:
 Compact memory list:
 
 ```bash
-.venv/bin/python synapse_cli.py --json list-memory --context default --limit 10
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 10 \
+  --response-mode compact --max-response-bytes 12288
 ```
 
 Full vector details, only when needed:
 
 ```bash
-.venv/bin/python synapse_cli.py --json list-memory --context default --limit 2 --include-vectors
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 2 \
+  --include-vectors --response-mode full --max-response-bytes 131072
 ```
 
 Recall smoke:
@@ -214,7 +226,8 @@ Event graph ingestion:
   --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients pull with fenced receipts, acknowledge exactly after consumption, and track through derived delivery cursors." \
   --surprise-threshold 0.58 \
   --min-segment-sentences 1
-.venv/bin/python synapse_cli.py --json graph --context default --limit 10
+.venv/bin/python synapse_cli.py --json graph --context default --limit 5 \
+  --response-mode full --max-response-bytes 131072
 ```
 
 The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship. Event memory metadata should also include `surprise_model`, `surprise_mode`, `semantic_surprise_score`, and `lexical_surprise_score`. `surprise_mode: embedding` means the boundary was cut from the configured local provider's cosine-distance signal; `surprise_mode: lexical` means SYNAPSE-S2 used the hardened token-overlap fallback.
@@ -225,10 +238,22 @@ Agent context hydration:
 .venv/bin/python synapse_cli.py --json agent-brief \
   --context default \
   --agent-id codex-desktop \
-  --prompt "Prepare SYNAPSE-S2 for the next live operator session."
+  --prompt "Prepare SYNAPSE-S2 for the next live operator session." \
+  --response-mode compact \
+  --max-response-bytes 12288
 ```
 
-This returns a compact Markdown briefing plus structured JSON for recall hits, graph highlights, and leased deployments. It does not acknowledge them. The client wrapper performs a separate observation-only hydration at MCP startup; this command remains useful for manual diagnostics. Use receipt-driven delivery directly when validating the protocol:
+This CLI command and installed MCP `hydrate_spiking_agent_context` calls default to the bounded `synapse-s2.token-contract.v1` compact envelope. Every compact receipt has a matching visible deployment, and the envelope reports `ack_required`, `has_more`, retry/dead-letter blockers, provenance, completeness, and counted omissions. CLI callers use `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics; MCP callers pass the corresponding `response_mode` and `max_response_bytes` arguments. CLI `--response-mode legacy` is reserved for known local compatibility consumers. Neither compact nor full mode acknowledges a lease. The client wrapper performs a separate observation-only hydration at MCP startup; this command remains useful for manual diagnostics. Use receipt-driven delivery directly when validating the protocol:
+
+Follow `continuation.strategy` literally. `claim-events-to-observe-delivery`
+means the observation-only call cannot establish queue completeness;
+`hydrate-when-context-expected` is the observed idle state; receipt-bearing
+responses require consume-then-ACK (or release) before another hydration; an
+`active-lease` strategy requires waiting for its expiry without touching another
+consumer's receipt; and a `retry-exhausted` strategy requires governed
+dead-letter review. A response can contain both receipts and a blocker, in which
+case finish the receipt instruction first and then the blocker instruction. The
+complete strategy matrix is in `docs/TOKEN_CONTRACTS.md`.
 
 ```bash
 .venv/bin/python synapse_cli.py --json pull-context \
@@ -310,7 +335,8 @@ Use transcript sources for local tools that already write session logs. SYNAPSE-
 Hand pruning:
 
 ```bash
-.venv/bin/python synapse_cli.py --json graph --context default --limit 30
+.venv/bin/python synapse_cli.py --json graph --context default --limit 30 \
+  --response-mode compact --max-response-bytes 12288
 .venv/bin/python synapse_cli.py --json prune-memory \
   --context default \
   --target-type event \
@@ -358,7 +384,8 @@ Embedding provider provenance:
   --context default \
   --tag neural-provider-check \
   --text "Apple Silicon Metal acceleration should recall M-series MLX GPU compute context."
-.venv/bin/python synapse_cli.py --json list-memory --context default --limit 1
+.venv/bin/python synapse_cli.py --json list-memory --context default --limit 5 \
+  --response-mode full --max-response-bytes 131072
 ```
 
 The benchmark should report `embedding_provider.provider: mlx-neural-v1`, `model_id: mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`, and `native_mlx: true`. First run may include model download or cache load cost; warm in-process runs should show the steady-state embedding latency. The memory entry metadata should carry the same neural provider provenance. For deterministic no-model fallback, set `--embedding-provider semantic-hash`; for an IT-managed local encoder, set `--embedding-provider python:/absolute/path/encoder.py:embed` or `SYNAPSE_S2_EMBEDDING_PROVIDER` to the same value.
@@ -465,7 +492,7 @@ Launch the loopback dashboard:
 open "http://127.0.0.1:8765/?context_id=default"
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, App Connect local app detection/attachment/snapshot capture, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its API smoke check can run without a fixed port:
+The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, App Connect local app detection/attachment/snapshot capture, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its loopback HTTP API intentionally keeps the rich graph and visualization payloads; installed MCP compact budgets do not reduce browser data. Its API smoke check can run without a fixed port:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default
@@ -503,7 +530,9 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --agent-id codex-desktop \
   --session-id "$SESSION_ID" \
   --reason "runbook-smoke-complete"
-.venv/bin/python synapse_cli.py --json cortex-state --context default --agent-id codex-desktop
+.venv/bin/python synapse_cli.py --json cortex-state --context default \
+  --agent-id codex-desktop \
+  --response-mode compact --max-response-bytes 12288
 ```
 
 ## MCP Inspector
@@ -528,20 +557,20 @@ Useful tool calls:
 | `process_spiking_capture_inbox` | Manually processes pending capture inbox files; requires `confirm=true`. |
 | `preflight_spiking_capture_error_resolution` | Returns content-free terminal, historical, unsafe, and unresolved error counts plus a revision-bound confirmation token. |
 | `resolve_spiking_capture_errors` | Archives only the reviewed terminal/historical artifacts; requires the matching token, reason, scope, and `confirm=true`. |
-| `list_spiking_memory` | Lists compact persisted memory records. |
-| `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
+| `list_spiking_memory` | Lists persisted records through the compact response contract by default; compact mode rejects vector/index arrays and `full` is explicit. |
+| `list_spiking_memory_graph` | Lists compact nodes and graph relationships with endpoint, provenance, completeness, and omission metadata. |
 | `prune_spiking_memory` | Removes a node, relationship edge, deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pulls context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Atomically acknowledges exact receipt ids after their deployments were consumed. |
 | `dead_letter_spiking_context_delivery` | Quarantines a retry-exhausted delivery with explicit confirmation, reason, and audit receipt. |
 | `list_spiking_context_cursors` | Lists per-agent delivery cursors and pending deployment counts. |
-| `hydrate_spiking_agent_context` | Leases new deployments and returns prompt recall plus graph highlights; acknowledgement is a separate exact-receipt call. |
+| `hydrate_spiking_agent_context` | Leases a bounded compact deployment contract with one visible event per receipt, prompt recall, and graph highlights; acknowledgement is a separate exact-receipt call. |
 | `enter_spiking_cortex` | Starts a governed agent session with recall and policy. |
 | `tick_spiking_cortex` | Checks the current observation, proposed action, intended files, intended tools, mutation, confidence, and sensitive-data scope before acting. |
 | `close_spiking_cortex` | Ends an active governed session after validation or handoff and publishes a lifecycle event. |
 | `commit_spiking_cortical_trace` | Persists typed validation, decision, constraint, risk, or implementation memory with evidence. |
 | `moderate_spiking_cortical_trace` | Promotes, demotes, or prunes a governed trace by memory id. |
-| `get_spiking_cortex_state` | Shows active governed sessions and typed cortical memory. |
+| `get_spiking_cortex_state` | Shows active governed sessions and typed cortical memory through the compact response contract by default. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `certify_spiking_runtime` | Emits native MLX/mlxsnn/provider/envelope certification evidence. |
 | `backup_spiking_memory` | Writes a segregated SQLite-only diagnostic snapshot; not a complete recovery point. |
