@@ -66,7 +66,19 @@ else
 fi
 
 echo "=== unit tests ==="
-SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash .venv/bin/python -m unittest discover -s tests -v
+(
+  # The exported paths above belong to the live operational checks below.
+  # Keep unit tests hermetic so injected TemporaryDirectory state is authoritative.
+  unset MLX_DEVICE
+  unset SYNAPSE_S2_NEURAL_MODEL SYNAPSE_S2_NEURAL_CACHE_DIR
+  unset SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY SYNAPSE_S2_DIMENSION
+  unset SYNAPSE_S2_NEURONS SYNAPSE_S2_TOP_K SYNAPSE_S2_RECALL_COUNT
+  unset SYNAPSE_S2_STATE_PATH SYNAPSE_S2_MEMORY_DB
+  unset SYNAPSE_S2_EXPORT_DIR SYNAPSE_S2_CAPTURE_ROOT
+  unset SYNAPSE_S2_DEFAULT_RESPONSE_MODE SYNAPSE_S2_MAX_RESPONSE_BYTES
+  SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash \
+    .venv/bin/python -m unittest discover -s tests -v
+)
 
 echo "=== compile check ==="
 .venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py token_contracts.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py scripts/operator_readiness_certify.py scripts/measure_token_contracts.py

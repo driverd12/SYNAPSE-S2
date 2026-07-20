@@ -236,6 +236,17 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn("SYNAPSE_S2_PREFLIGHT_VERIFY_ONLY", script)
         self.assertIn("Skipping launcher/client/LaunchAgent installs", script)
 
+    def test_prep_tomorrow_unit_tests_do_not_inherit_production_paths(self):
+        script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text(encoding="utf-8")
+        unit_test_section = script.split('echo "=== unit tests ==="', 1)[1].split(
+            'echo "=== compile check ==="',
+            1,
+        )[0]
+
+        self.assertIn("unset SYNAPSE_S2_STATE_PATH SYNAPSE_S2_MEMORY_DB", unit_test_section)
+        self.assertIn("unset SYNAPSE_S2_EXPORT_DIR SYNAPSE_S2_CAPTURE_ROOT", unit_test_section)
+        self.assertIn("SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash", unit_test_section)
+
     def test_capture_daemon_installer_declares_launch_agent(self):
         script = (ROOT / "scripts" / "install_capture_daemon.sh").read_text(encoding="utf-8")
 
