@@ -289,10 +289,23 @@ independently.
 ## Measurement method and acceptance gate
 
 The normative Phase 6 gate is contract correctness, not a target percentage
-reduction. No measured acceptance snapshot is claimed here until a reproducible
-measurement script and aggregate evidence artifact have been generated from a
-verified Phase 5 recovery bundle, using an isolated disposable restore and no
-writes to live state.
+reduction. The sanitized acceptance snapshot is published at
+[`evidence/phase6-token-contract-acceptance.json`](evidence/phase6-token-contract-acceptance.json).
+It is bound to source commit `519af911d64a6bf169f55956510969c56205f786`,
+used a verified Phase 5 recovery bundle through an isolated disposable restore,
+and made no benchmark writes to live state.
+
+The artifact passed all 11 gates across memory list, memory graph, Cortex state,
+and agent hydration. Its informational byte measurements are:
+
+- installed policy: 1,200,724 legacy-requested-source bytes versus 38,205
+  compact structured bytes, a 96.818% reduction; and
+- same source: 106,735 legacy-identical-source bytes versus 23,450 compact
+  structured bytes, a 78.03% projection reduction.
+
+Token counts and transport framing are excluded. The measurements are not
+interchangeable: installed policy includes compact source caps plus projection,
+while same-source holds producer rows and limits constant.
 
 `scripts/measure_token_contracts.py` implements that gate. It verifies the
 signed Phase 5 receipt, restores the paired database and capture root into a
@@ -315,9 +328,11 @@ local recovery-identity verification:
   --context default
 ```
 
-After the implementation commit is clean, add `--output` with a new repository
-path under `docs/evidence/`. Percentage reductions remain informational
-observations; they never substitute for the correctness gates below.
+To refresh the snapshot, start from a clean implementation commit and add
+`--output` with a new, previously unused repository path under `docs/evidence/`.
+The publisher will not overwrite this artifact. Percentage reductions remain
+informational observations; they never substitute for the correctness gates
+below.
 
 That acceptance run must record, for each compact surface:
 
@@ -351,9 +366,8 @@ safety or provenance field, the separate MCP safety `TextContent` is at or below
 4,096 bytes, and independent canonicalization agrees with the declared size.
 Transport framing is excluded. Full-mode payloads and their separate 131,072
 byte safety channel may be measured for visibility but are not compared to the
-compact installed-client budget. The reproducible script and sanitized evidence
-artifact are still required before publishing reduction numbers or a verified
-Phase 6 measurement snapshot.
+compact installed-client budget. The published acceptance artifact verifies
+these boundaries independently for every contracted surface.
 
 ## Operator checks
 

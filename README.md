@@ -122,8 +122,12 @@ The durable idempotency, crash-recovery, and rollout contract for capture
 producers is in `docs/EXACTLY_ONCE_CAPTURE.md`.
 The bounded installed-client response profiles, receipt-safety invariants, and
 the reproducible measurement acceptance gate are in `docs/TOKEN_CONTRACTS.md`.
-Do not publish Phase 6 reduction numbers until its isolated measurement script
-has generated the sanitized aggregate evidence artifact.
+The sanitized Phase 6 acceptance artifact is
+`docs/evidence/phase6-token-contract-acceptance.json`: it passed all 11
+correctness gates against a verified isolated recovery restore, with an
+informational 96.818% installed-policy byte reduction and 78.03% same-source
+projection reduction. Those two measurements are deliberately separate and do
+not replace the correctness gates.
 Regenerate `docs/CURRENT_STATUS.md` before demos, handoffs, or readiness claims:
 
 ```bash
@@ -195,6 +199,7 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 - CLI `agent-brief`, `list-memory`, `graph`, and `cortex-state` use the same compact contract by default. They accept `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics and `--response-mode legacy` only for known local compatibility consumers.
 - Compact projection never drops a leased receipt or its matching visible event. If a hydration projection cannot be delivered safely, its leases are released and acknowledgement remains a separate exact-receipt operation.
 - Critical/high, action-required, and protected contract warnings survive compact projection. Noncritical warnings may be omitted only as complete items with a truthful omission count. MCP consumers must treat `structuredContent` as authoritative; the bounded text item is only a safety decision aid.
+- The reproducible Phase 6 acceptance artifact passed all 11 gates on all four contracted surfaces. It records 1,200,724 legacy installed-policy bytes versus 38,205 compact structured bytes (96.818% reduction), and 106,735 identical-source legacy bytes versus 23,450 compact structured bytes (78.03% reduction). These are informational byte measurements from a verified isolated restore; token counts and transport framing are excluded.
 - The loopback dashboard keeps its rich browser API and Namespace Galaxy payloads; the installed MCP token ceiling does not reduce the operator visualization.
 - LaunchAgent installers fence concurrent installs, publish private/fsynced plists, wait for launchd unload/start transitions, probe the authoritative service, and restore the prior definition and policy when a health gate fails.
 
