@@ -70,6 +70,137 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertTrue(closed_stdout.closed)
 
+    def test_cli_public_error_redacts_secret_and_local_path(self):
+        import synapse_cli
+
+        secret = "sk-cli-error-secret-1234567890"
+        local_path = "/Users/dan.driver/private/cli-token.json"
+        parsed_args = mock.Mock(json=True)
+        parsed_args.func = mock.Mock(
+            side_effect=RuntimeError(f"token={secret} at {local_path}")
+        )
+        parser = mock.Mock()
+        parser.parse_args.return_value = parsed_args
+        with (
+            mock.patch.object(synapse_cli, "build_parser", return_value=parser),
+            mock.patch.object(synapse_cli, "emit") as emit_mock,
+        ):
+            return_code = synapse_cli.main(["--json"])
+
+        self.assertEqual(return_code, 1)
+        payload = emit_mock.call_args.args[0]
+        self.assertIn("[REDACTED_SECRET]", payload["error"])
+        self.assertIn("[LOCAL_PATH]", payload["error"])
+        self.assertNotIn(secret, payload["error"])
+        self.assertNotIn(local_path, payload["error"])
+        self.assertTrue(emit_mock.call_args.kwargs["as_json"])
+
+    def test_cli_startup_import_error_is_sanitized(self):
+        import synapse_cli
+
+        secret = "sk-cli-startup-secret-1234567890"
+        local_path = "/Users/dan.driver/private/startup.py"
+        with (
+            mock.patch.object(
+                synapse_cli,
+                "_STARTUP_IMPORT_ERROR",
+                RuntimeError(f"api_key={secret} from {local_path}"),
+            ),
+            mock.patch.object(synapse_cli, "emit") as emit_mock,
+        ):
+            return_code = synapse_cli.main(["--json"])
+
+        self.assertEqual(return_code, 1)
+        payload = emit_mock.call_args.args[0]
+        self.assertIn("[REDACTED_SECRET]", payload["error"])
+        self.assertIn("[LOCAL_PATH]", payload["error"])
+        self.assertNotIn(secret, payload["error"])
+        self.assertNotIn(local_path, payload["error"])
+        self.assertTrue(emit_mock.call_args.kwargs["as_json"])
+
+    def test_cli_rejects_secret_bearing_output_paths_before_backend_side_effects(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            secret = "sk-cli-output-secret-1234567890"
+            unsafe_parent = Path(tmp) / f"api_key={secret}"
+            commands = (
+                ("certify-runtime", "--output", str(unsafe_parent / "certification.json")),
+                (
+                    "export-memory",
+                    "--context",
+                    "default",
+                    "--output",
+                    str(unsafe_parent / "memory.json"),
+                ),
+                ("backup-memory", "--output", str(unsafe_parent / "memory.sqlite3")),
+            )
+
+            for command in commands:
+                with self.subTest(command=command[0]):
+                    result = self.run_cli(
+                        *command,
+                        state_path=state_path,
+                        memory_path=memory_path,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    payload = json.loads(result.stdout)
+                    self.assertIn("credential material", payload["error"])
+                    self.assertNotIn(secret, result.stdout)
+                    self.assertNotIn(secret, result.stderr)
+                    self.assertFalse(unsafe_parent.exists())
+                    self.assertFalse(state_path.exists())
+                    self.assertFalse(memory_path.exists())
+
+    def test_cli_argparse_json_errors_never_echo_secret_values(self):
+        secret = "sk-cli-argparse-secret-1234567890"
+        cases = (
+            ["--json", f"password={secret}"],
+            ["--json", "--dimension", f"password={secret}", "status"],
+            ["--json", "status", "--unknown", f"password={secret}"],
+        )
+
+        for argv in cases:
+            with self.subTest(argv=argv):
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "synapse_cli.py"), *argv],
+                    cwd=ROOT,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                combined = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, combined)
+                self.assertEqual(result.stderr, "")
+                payload = json.loads(result.stdout)
+                self.assertIn("error", payload)
+                self.assertIn("[REDACTED_SECRET]", payload["error"])
+                self.assertNotIn(secret, combined)
+
+    def test_cli_argparse_text_errors_preserve_safe_usage_without_secret(self):
+        secret = "sk-cli-text-argparse-secret-1234567890"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "synapse_cli.py"),
+                "--dimension",
+                f"password={secret}",
+                "status",
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("usage: synapse_cli.py", result.stderr)
+        self.assertIn("[REDACTED_SECRET]", result.stderr)
+        self.assertNotIn(secret, result.stderr)
+
     def test_cli_does_not_expose_seed_demo_command(self):
         help_result = subprocess.run(
             [sys.executable, str(ROOT / "synapse_cli.py"), "--help"],
@@ -646,6 +777,38 @@ class SynapseCliTests(unittest.TestCase):
         self.assertIn("checks", payload)
         self.assertIn("resource_profile", payload)
 
+    def test_cli_output_paths_reject_secret_shapes_without_creating_files(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            marker = "SYNTHETIC_CLI_OUTPUT_SECRET_42"
+            commands = (
+                "certify-runtime",
+                "export-memory",
+                "backup-memory",
+            )
+            results = []
+            outputs = []
+            for command in commands:
+                output = Path(tmp) / f"password={marker}-{command}.json"
+                outputs.append(output)
+                results.append(
+                    self.run_cli(
+                        command,
+                        "--output",
+                        str(output),
+                        state_path=state_path,
+                        memory_path=memory_path,
+                    )
+                )
+
+        rendered = "\n".join(
+            result.stdout + result.stderr for result in results
+        )
+        self.assertTrue(all(result.returncode == 1 for result in results))
+        self.assertNotIn(marker, rendered)
+        self.assertTrue(all(not output.exists() for output in outputs))
+
     def test_cli_preflight_can_require_native_certification(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
@@ -944,6 +1107,73 @@ class SynapseCliTests(unittest.TestCase):
                 for entry in graph_payload["entries"]
             )
         )
+
+    def test_cli_capture_error_resolution_archives_reviewed_history(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            capture_root = Path(tmp) / "capture-root"
+            initial = self.run_cli(
+                "capture-inbox-status",
+                "--capture-root",
+                str(capture_root),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            evidence = capture_root / "capture_errors" / "terminal.evidence.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "artifact_type": "stale-capture-inbox-temp",
+                        "raw_payload_retained": False,
+                        "content_digest_recorded": False,
+                        "disposition": "recovered-discard-complete",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence.chmod(0o600)
+            reason = "reviewed terminal capture evidence"
+            preflight = self.run_cli(
+                "capture-error-preflight",
+                "--capture-root",
+                str(capture_root),
+                "--reason",
+                reason,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            token = json.loads(preflight.stdout)["preflight_token"]
+            rejected = self.run_cli(
+                "capture-error-resolve",
+                "--capture-root",
+                str(capture_root),
+                "--preflight-token",
+                token,
+                "--reason",
+                reason,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            resolved = self.run_cli(
+                "capture-error-resolve",
+                "--capture-root",
+                str(capture_root),
+                "--preflight-token",
+                token,
+                "--reason",
+                reason,
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("confirm=true", rejected.stdout + rejected.stderr)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(json.loads(resolved.stdout)["resolved_count"], 1)
 
     def test_cli_capture_session_replays_supplied_capture_id(self):
         with TemporaryDirectory() as tmp:

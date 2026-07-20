@@ -12,14 +12,18 @@ from typing import Any, Callable, Mapping
 
 import capture_daemon
 import mlx_backend
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    SecretRedactingFormatter,
+    redact_capture_text,
+    safe_public_error,
+)
 
 
 LOGGER = logging.getLogger("synapse_s2.client_session_bridge")
 if not LOGGER.handlers:
     _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    _handler.setFormatter(SecretRedactingFormatter(SECRET_SAFE_LOG_FORMAT))
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
@@ -35,6 +39,7 @@ class ClientSessionBridgeConfig:
     enabled: bool = True
     cortex_enabled: bool = True
     cortex_mode: str = "strict"
+    startup_recall_mode: str = "surface"
     event_limit: int = 20
     graph_limit: int = 30
 
@@ -78,6 +83,7 @@ class ClientSessionBridge:
             prompt = (
                 f"Hydrate SYNAPSE-S2 context for {agent_id} local MCP client startup."
             )
+        prompt, _ = redact_capture_text(prompt)
         capture_root = values.get("SYNAPSE_S2_CAPTURE_ROOT", "").strip()
         config = ClientSessionBridgeConfig(
             context_id=context_id,
@@ -91,6 +97,10 @@ class ClientSessionBridge:
             enabled=_env_enabled(values.get("SYNAPSE_S2_CLIENT_SESSION_BRIDGE", "1")),
             cortex_enabled=_env_enabled(values.get("SYNAPSE_S2_CLIENT_CORTEX", "1")),
             cortex_mode=values.get("SYNAPSE_S2_CLIENT_CORTEX_MODE", "strict"),
+            startup_recall_mode=values.get(
+                "SYNAPSE_S2_CLIENT_STARTUP_RECALL_MODE",
+                "surface",
+            ),
             event_limit=_env_int(values.get("SYNAPSE_S2_CLIENT_EVENT_LIMIT"), default=20),
             graph_limit=_env_int(values.get("SYNAPSE_S2_CLIENT_GRAPH_LIMIT"), default=30),
         )
@@ -107,7 +117,7 @@ class ClientSessionBridge:
             }
             return self.hydration
         try:
-            backend = self.backend or mlx_backend.get_backend()
+            backend = self.backend or mlx_backend.get_control_plane_backend()
             self.hydration = backend.hydrate_agent_context(
                 context_id=self.config.context_id,
                 agent_id=self.config.agent_id,
@@ -117,6 +127,7 @@ class ClientSessionBridge:
                 acknowledge=False,
                 claim_events=False,
                 consumer_instance_id=f"bridge-{self.session_id}",
+                recall_mode=self.config.startup_recall_mode,
             )
             LOGGER.info(
                 "hydrated SYNAPSE-S2 client session agent_id=%s context_id=%s new_events=%s latest_event_id=%s",
@@ -128,7 +139,10 @@ class ClientSessionBridge:
             self._enter_cortex_session(backend)
             return self.hydration
         except Exception as exc:
-            self.start_error = str(exc)
+            self.start_error = safe_public_error(
+                exc,
+                fallback="client session startup failed",
+            )
             LOGGER.exception(
                 "SYNAPSE-S2 client startup hydration failed agent_id=%s context_id=%s",
                 self.config.agent_id,
@@ -139,7 +153,10 @@ class ClientSessionBridge:
                 "enabled": True,
                 "context_id": self.config.context_id,
                 "agent_id": self.config.agent_id,
-                "error": str(exc),
+                "error": safe_public_error(
+                    exc,
+                    fallback="client session startup failed",
+                ),
             }
             return self.hydration
 
@@ -173,6 +190,15 @@ class ClientSessionBridge:
                 capture_id=capture_id,
                 metadata={
                     "client_session_bridge": True,
+                    # The capture daemon turns the exactly-once boundary drop
+                    # into the durable typed follow-up trace. This keeps MCP
+                    # shutdown fast without weakening the Cortex provenance.
+                    "cortex_governor": bool(self.cortex_session_id),
+                    "trace_type": "follow_up",
+                    "cortex_trace_type": "follow_up",
+                    "truth_posture": "observed",
+                    "confidence": 0.76,
+                    "deferred_cortex_commit": bool(self.cortex_session_id),
                     "session_id": self.session_id,
                     "cortex_session_id": self.cortex_session_id,
                     "agent_id": self.config.agent_id,
@@ -218,7 +244,10 @@ class ClientSessionBridge:
             return {
                 "action": "client-session-finish",
                 "dropped": False,
-                "error": str(exc),
+                "error": safe_public_error(
+                    exc,
+                    fallback="client session finish failed",
+                ),
                 "session_id": self.session_id,
             }
 
@@ -285,6 +314,7 @@ class ClientSessionBridge:
                 agent_id=self.config.agent_id,
                 task=self.config.startup_prompt,
                 mode=self.config.cortex_mode,
+                recall_mode=self.config.startup_recall_mode,
             )
             session_id = str(session.get("session_id", "") or "")
             if session_id and session_id in backend.cortex_sessions:
@@ -318,10 +348,13 @@ class ClientSessionBridge:
                 session.get("session_id"),
             )
         except Exception as exc:
-            self.cortex_error = str(exc)
+            self.cortex_error = safe_public_error(
+                exc,
+                fallback="cortex session enter failed",
+            )
             if isinstance(self.hydration, dict):
                 self.hydration["client_cortex_enabled"] = True
-                self.hydration["client_cortex_error"] = str(exc)
+                self.hydration["client_cortex_error"] = self.cortex_error
             LOGGER.exception(
                 "SYNAPSE-S2 Cortex session enter failed agent_id=%s context_id=%s",
                 self.config.agent_id,
@@ -346,7 +379,20 @@ class ClientSessionBridge:
                 "cortex_reason": "no-cortex-session",
                 "cortex_error": self.cortex_error,
             }
-        backend = self.backend or mlx_backend.get_backend()
+        backend = self.backend or mlx_backend.get_control_plane_backend()
+        if backend.control_plane_only:
+            self._mark_cortex_session_finished(
+                backend,
+                reason=reason,
+                ended_at=ended_at,
+            )
+            return {
+                "cortex_committed": False,
+                "cortex_queued": True,
+                "cortex_reason": "exactly-once-capture-queued",
+                "cortex_session_id": session_id,
+                "cortex_trace_type": "follow_up",
+            }
         try:
             commit = backend.commit_cortical_trace(
                 context_id=self.config.context_id,
@@ -375,7 +421,10 @@ class ClientSessionBridge:
                 "cortex_trace_type": commit.get("trace_type", ""),
             }
         except Exception as exc:
-            self.cortex_error = str(exc)
+            self.cortex_error = safe_public_error(
+                exc,
+                fallback="cortex boundary commit failed",
+            )
             self._mark_cortex_session_finished(backend, reason=reason, ended_at=ended_at)
             LOGGER.exception(
                 "SYNAPSE-S2 Cortex boundary commit failed agent_id=%s context_id=%s session_id=%s",
@@ -386,7 +435,7 @@ class ClientSessionBridge:
             return {
                 "cortex_committed": False,
                 "cortex_session_id": session_id,
-                "cortex_error": str(exc),
+                "cortex_error": self.cortex_error,
             }
 
     def _mark_cortex_session_finished(

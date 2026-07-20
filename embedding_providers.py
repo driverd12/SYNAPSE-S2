@@ -12,6 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from redaction import (
+    redact_capture_text,
+    redact_sensitive_value,
+    reject_sensitive_identifier,
+    safe_public_error,
+)
+
 
 MAX_PROVIDER_DIMS = 32_768
 TOKEN_RE = re.compile(r"[a-z0-9_.:/#-]+")
@@ -182,7 +189,8 @@ class LexicalHashEmbeddingProvider(EmbeddingProvider):
 
     def embed(self, text: str, *, dimensions: int) -> EmbeddingResult:
         dims = _validate_dimensions(dimensions)
-        normalized = str(text or "").strip().lower()
+        safe_text, _ = redact_capture_text(str(text or ""))
+        normalized = safe_text.strip().lower()
         tokens = _tokens(normalized)
         features = tokens + [
             f"{tokens[index]}::{tokens[index + 1]}"
@@ -210,7 +218,8 @@ class SemanticHashEmbeddingProvider(EmbeddingProvider):
 
     def embed(self, text: str, *, dimensions: int) -> EmbeddingResult:
         dims = _validate_dimensions(dimensions)
-        normalized = str(text or "").strip().lower()
+        safe_text, _ = redact_capture_text(str(text or ""))
+        normalized = safe_text.strip().lower()
         tokens = _tokens(normalized)
         normalized_tokens = _normalized_tokens(tokens)
         concepts = _matched_concepts(normalized_tokens)
@@ -250,14 +259,38 @@ class PythonCallableEmbeddingProvider(EmbeddingProvider):
     provider_id = "python-callable"
 
     def __init__(self, spec: str) -> None:
-        _, payload = spec.split("python:", 1)
+        try:
+            safe_spec = reject_sensitive_identifier(
+                spec,
+                field="python provider spec",
+            )
+        except ValueError as exc:
+            raise EmbeddingProviderError(
+                "python provider spec must not contain credential material"
+            ) from exc
+        if not safe_spec.casefold().startswith("python:"):
+            raise EmbeddingProviderError(
+                "python provider must look like python:/path/to/module.py:function"
+            )
+        payload = safe_spec.split(":", 1)[1]
         module_ref, separator, function_name = payload.rpartition(":")
         if not separator or not module_ref.strip() or not function_name.strip():
             raise EmbeddingProviderError(
                 "python provider must look like python:/path/to/module.py:function"
             )
-        self.module_ref = module_ref.strip()
-        self.function_name = function_name.strip()
+        try:
+            self.module_ref = reject_sensitive_identifier(
+                module_ref.strip(),
+                field="python provider module",
+            )
+            self.function_name = reject_sensitive_identifier(
+                function_name.strip(),
+                field="python provider function",
+            )
+        except ValueError as exc:
+            raise EmbeddingProviderError(
+                "python provider identifiers must not contain credential material"
+            ) from exc
         self._callable = self._load_callable()
 
     def _load_callable(self) -> Callable[..., Any]:
@@ -284,13 +317,22 @@ class PythonCallableEmbeddingProvider(EmbeddingProvider):
 
     def embed(self, text: str, *, dimensions: int) -> EmbeddingResult:
         dims = _validate_dimensions(dimensions)
-        raw = self._callable(str(text or ""), dims)
+        safe_text, _ = redact_capture_text(str(text or ""))
+        raw = self._callable(safe_text, dims)
         details: dict[str, Any] = {}
         model_id = f"{self.module_ref}:{self.function_name}"
         semantic = True
         if isinstance(raw, dict):
             vector = raw.get("vector")
-            model_id = str(raw.get("model_id") or model_id)
+            try:
+                model_id = reject_sensitive_identifier(
+                    str(raw.get("model_id") or model_id),
+                    field="python provider model_id",
+                )
+            except ValueError as exc:
+                raise EmbeddingProviderError(
+                    "python provider model_id must not contain credential material"
+                ) from exc
             semantic = bool(raw.get("semantic", True))
             if isinstance(raw.get("details"), dict):
                 details = _json_safe(raw["details"])
@@ -305,7 +347,7 @@ class PythonCallableEmbeddingProvider(EmbeddingProvider):
                 dimensions=dims,
                 semantic=semantic,
                 local_only=True,
-                tokens=_tokens(str(text or "").lower()),
+                tokens=_tokens(safe_text.lower()),
                 concepts=[],
                 vector=safe_vector,
                 feature_count=None,
@@ -330,13 +372,14 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
         normalize: bool | None = None,
         local_files_only: bool | None = None,
     ) -> None:
-        self.model_id = (
+        raw_model_id = (
             model_id
             or os.getenv("SYNAPSE_S2_NEURAL_MODEL")
             or DEFAULT_NEURAL_MODEL
         ).strip()
-        if not self.model_id:
+        if not raw_model_id:
             raise EmbeddingProviderError("MLX neural provider requires a model id")
+        self.model_id = _provider_identifier(raw_model_id, field="MLX model_id")
         self.pooling = _validate_pooling(
             pooling or os.getenv("SYNAPSE_S2_NEURAL_POOLING") or DEFAULT_NEURAL_POOLING
         )
@@ -347,15 +390,28 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
             default=DEFAULT_NEURAL_MAX_TOKENS,
             name="SYNAPSE_S2_NEURAL_MAX_TOKENS",
         )
-        self.cache_dir = _optional_path_str(
+        raw_cache_dir = (
             cache_dir
             if cache_dir is not None
             else os.getenv("SYNAPSE_S2_NEURAL_CACHE_DIR")
         )
-        self.revision = (
+        if raw_cache_dir is None or not str(raw_cache_dir).strip():
+            self.cache_dir = None
+        else:
+            safe_cache_dir = _provider_identifier(
+                str(raw_cache_dir),
+                field="MLX cache_dir",
+            )
+            self.cache_dir = _optional_path_str(safe_cache_dir)
+        raw_revision = (
             revision
             if revision is not None
             else os.getenv("SYNAPSE_S2_NEURAL_REVISION")
+        )
+        self.revision = (
+            _provider_identifier(str(raw_revision), field="MLX revision")
+            if raw_revision is not None and str(raw_revision).strip()
+            else None
         )
         self.normalize = _env_bool(
             "SYNAPSE_S2_NEURAL_NORMALIZE",
@@ -371,9 +427,10 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
     def embed(self, text: str, *, dimensions: int) -> EmbeddingResult:
         dims = _validate_dimensions(dimensions)
         runtime = self._get_runtime()
+        safe_text, _ = redact_capture_text(str(text or ""))
         try:
             raw_vector = runtime.embed_text(
-                str(text or ""),
+                safe_text,
                 pooling=self.pooling,
                 max_tokens=self.max_tokens,
             )
@@ -381,21 +438,31 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
             raise
         except Exception as exc:
             raise EmbeddingProviderError(
-                f"MLX neural model {self.model_id} failed to embed text: {exc}"
+                f"MLX neural model {self.model_id} failed to embed text: "
+                f"{safe_public_error(exc, fallback='model execution failed')}"
             ) from exc
 
         source_vector = _validate_float_list(raw_vector)
         vector = _project_vector(source_vector, dimensions=dims)
         if self.normalize:
             vector = _normalize_vector(vector)
-        runtime_model_id = str(getattr(runtime, "model_id", self.model_id))
+        runtime_model_id = _provider_identifier(
+            str(getattr(runtime, "model_id", self.model_id)),
+            field="MLX runtime model_id",
+        )
+        raw_runtime_source = str(getattr(runtime, "source", ""))
+        runtime_source = (
+            _provider_identifier(raw_runtime_source, field="MLX runtime source")
+            if raw_runtime_source
+            else ""
+        )
         provenance = _provenance(
             provider=self.provider_id,
             provider_type="mlx-neural",
             dimensions=dims,
             semantic=True,
             local_only=True,
-            tokens=_tokens(str(text or "").lower()),
+            tokens=_tokens(safe_text.lower()),
             concepts=[],
             vector=vector,
             feature_count=None,
@@ -406,7 +473,7 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
                 "max_tokens": self.max_tokens,
                 "local_files_only": bool(self.local_files_only),
                 "projection": "signed-hash-projection-v1",
-                "runtime_source": str(getattr(runtime, "source", "")),
+                "runtime_source": runtime_source,
                 "cache_fallback_used": bool(
                     getattr(runtime, "cache_fallback_used", False)
                 ),
@@ -468,7 +535,8 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
             raise EmbeddingProviderError(
                 f"failed to load MLX neural embedding model {self.model_id}; "
                 "verify SYNAPSE_S2_NEURAL_MODEL, SYNAPSE_S2_NEURAL_CACHE_DIR, "
-                f"and network/cache access: {exc}"
+                "and network/cache access: "
+                f"{safe_public_error(exc, fallback='model load failed')}"
             ) from exc
         return self._runtime
 
@@ -747,6 +815,17 @@ def _optional_path_str(value: str | os.PathLike[str] | None) -> str | None:
     return str(Path(text).expanduser())
 
 
+def _provider_identifier(value: Any, *, field: str) -> str:
+    """Reject credential-shaped provider provenance without echoing it."""
+
+    try:
+        return reject_sensitive_identifier(value, field=field).strip()
+    except ValueError as exc:
+        raise EmbeddingProviderError(
+            f"{field} must not contain credential material"
+        ) from exc
+
+
 def _env_bool(name: str, *, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -812,8 +891,9 @@ def _vector_sha256(vector: list[float]) -> str:
 
 
 def _json_safe(value: Any) -> dict[str, Any]:
+    safe_value, _ = redact_sensitive_value(value)
     try:
-        payload = json.loads(json.dumps(value, default=str))
+        payload = json.loads(json.dumps(safe_value, allow_nan=False))
         return payload if isinstance(payload, dict) else {"value": payload}
-    except Exception:
-        return {"value": str(value)}
+    except (TypeError, ValueError):
+        return {"value": "[UNSERIALIZABLE]"}

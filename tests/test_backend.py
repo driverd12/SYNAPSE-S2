@@ -1,12 +1,15 @@
 import json
 import hashlib
+import os
 import sqlite3
+import threading
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 import time
 import subprocess
 from contextlib import closing
+from unittest.mock import patch
 
 import mlx.core as mx
 
@@ -20,6 +23,64 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.tmpdir = TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.state_path = Path(self.tmpdir.name) / "state.json"
+
+    def test_private_json_writer_preserves_existing_parent_mode(self):
+        parent = Path(self.tmpdir.name) / "caller-owned"
+        parent.mkdir(mode=0o755)
+        parent.chmod(0o755)
+        target = parent / "private.json"
+
+        mlx_backend._atomic_write_private_json(target, {"safe": True})
+
+        self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_private_json_writer_secures_only_directories_it_creates(self):
+        existing = Path(self.tmpdir.name) / "existing"
+        existing.mkdir(mode=0o755)
+        existing.chmod(0o755)
+        target = existing / "created" / "nested" / "private.json"
+
+        mlx_backend._atomic_write_private_json(target, {"safe": True})
+
+        self.assertEqual(existing.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(target.parent.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_runtime_state_path_rejects_credentials_before_file_or_lock_creation(self):
+        marker = "SYNTHETIC_ONLY_RUNTIME_PATH_SECRET_42"
+        secret_path = (
+            Path(self.tmpdir.name)
+            / f"password={marker}"
+            / "runtime_state.json"
+        )
+
+        with self.assertRaises(ValueError) as explicit_error:
+            SpikingAttentionBackend(
+                dimension=4,
+                num_neurons=6,
+                compile_graph=False,
+                state_path=secret_path,
+            )
+        self.assertNotIn(marker, str(explicit_error.exception))
+        self.assertIn("credential material", str(explicit_error.exception))
+        self.assertFalse(secret_path.parent.exists())
+
+        with patch.dict(
+            mlx_backend.os.environ,
+            {"SYNAPSE_S2_STATE_PATH": str(secret_path)},
+            clear=False,
+        ):
+            with self.assertRaises(ValueError) as env_error:
+                SpikingAttentionBackend(
+                    dimension=4,
+                    num_neurons=6,
+                    compile_graph=False,
+                )
+        self.assertNotIn(marker, str(env_error.exception))
+        self.assertIn("credential material", str(env_error.exception))
+        self.assertFalse(secret_path.parent.exists())
 
     def _capture_storage_counts(self, backend):
         with closing(sqlite3.connect(backend.memory_store.db_path)) as conn:
@@ -101,6 +162,106 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(registration["tag"], "wing-load-analysis")
         self.assertIn("wing-load-analysis", result)
         self.assertNotIn("demo::neuron-", result)
+
+    def test_lowest_trace_boundary_redacts_source_and_metadata(self):
+        backend = SpikingAttentionBackend(
+            dimension=6,
+            num_neurons=10,
+            default_top_k=2,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+
+        backend.register_trace(
+            tag="vector-memory",
+            embedding=mx.array([0.0, 1.0, 9.0, 2.0, 7.0, -4.0]),
+            context_id="demo",
+            source_text=f"password={marker}",
+            metadata={
+                "apiKey": marker,
+                "authorization_header": marker,
+                "api_key_value": marker,
+                "password_hint": marker,
+                "safe": "preserved",
+            },
+        )
+        entry = backend.list_memory(context_id="demo")["entries"][0]
+        rendered = json.dumps(entry, sort_keys=True)
+
+        self.assertNotIn(marker, rendered)
+        self.assertIn("[REDACTED_SECRET]", entry["source_text"])
+        self.assertEqual(entry["metadata"]["apiKey"], "[REDACTED_SECRET]")
+        self.assertEqual(
+            entry["metadata"]["authorization_header"],
+            "[REDACTED_SECRET]",
+        )
+        self.assertEqual(entry["metadata"]["api_key_value"], "[REDACTED_SECRET]")
+        self.assertEqual(entry["metadata"]["password_hint"], "[REDACTED_SECRET]")
+        self.assertEqual(entry["metadata"]["safe"], "preserved")
+        self.assertEqual(self.state_path.stat().st_mode & 0o777, 0o600)
+
+    def test_embedding_and_event_segmentation_never_receive_raw_secrets(self):
+        backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+        observed_provider_text: list[str] = []
+        original_embed = backend.embedding_provider.embed
+
+        def recording_embed(text, *, dimensions):
+            observed_provider_text.append(text)
+            return original_embed(text, dimensions=dimensions)
+
+        with patch.object(backend.embedding_provider, "embed", side_effect=recording_embed):
+            payload = backend.embed_text_payload(f"api_key={marker}")
+
+        with patch.object(
+            mlx_backend.BayesianSurpriseEventSegmenter,
+            "segment",
+            autospec=True,
+            return_value=[],
+        ) as segment:
+            backend.ingest_text_events(
+                text=f"Event: provider boundary password={marker}",
+                context_id="demo",
+                source_tag="secret-boundary",
+            )
+
+        segment_text = segment.call_args.args[1]
+        self.assertTrue(observed_provider_text)
+        self.assertNotIn(marker, observed_provider_text[0])
+        self.assertNotIn(marker, segment_text)
+        self.assertGreaterEqual(payload["input_redaction_count"], 1)
+        self.assertFalse(payload["raw_input_stored"])
+
+    def test_secret_bearing_durable_identifiers_are_rejected(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=8,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+
+        with self.assertRaisesRegex(ValueError, "credential material"):
+            backend.register_text_trace(
+                tag=f"api_key={marker}",
+                text="safe text",
+                context_id="demo",
+            )
+        with self.assertRaisesRegex(ValueError, "credential material"):
+            backend.capture_conversation(
+                text="safe text",
+                context_id="demo",
+                source_tag="capture",
+                speaker=f"token={marker}",
+            )
 
     def test_namespace_map_suggestions_require_explicit_link_approval(self):
         backend = SpikingAttentionBackend(
@@ -698,8 +859,10 @@ class SpikingAttentionBackendTests(unittest.TestCase):
                 output_path=evidence_path,
             )
             evidence_exists = evidence_path.exists()
+            evidence_mode = evidence_path.stat().st_mode & 0o777
 
         self.assertTrue(evidence_exists)
+        self.assertEqual(evidence_mode, 0o600)
         self.assertEqual(certification["action"], "certify-runtime")
         self.assertIn("checks", certification)
         self.assertIn("resource_profile", certification)
@@ -707,6 +870,22 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(certification["evidence_path"], str(evidence_path.resolve()))
         self.assertEqual(certification["checks"]["mlx_available"]["passed"], True)
         self.assertIn("embedding_provider_native_mlx", certification["checks"])
+
+    def test_native_certification_rejects_secret_shaped_output_path(self):
+        marker = "SYNTHETIC_CERT_PATH_SECRET_42"
+        output = Path(self.tmpdir.name) / f"password={marker}.json"
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            backend.certify_runtime(output_path=output)
+
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertFalse(output.exists())
 
     def test_native_certification_retries_cold_quick_prune_sample(self):
         backend = SpikingAttentionBackend(
@@ -853,6 +1032,78 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertTrue(status["global_enabled"])
         self.assertFalse(status["effective_enabled"])
         self.assertEqual(status["context_overrides"], {"demo": False})
+
+    def test_stale_backends_merge_distinct_overrides_and_global_control(self):
+        backend_a = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend_b = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        backend_a.set_enabled(False, context_id="alpha")
+        backend_a.set_enabled(False)
+        backend_b.set_enabled(True, context_id="beta")
+
+        restored = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        self.assertFalse(restored.global_enabled)
+        self.assertEqual(
+            restored.context_overrides,
+            {"alpha": False, "beta": True},
+        )
+
+    def test_toggle_intent_survives_failed_atomic_persist(self):
+        backend = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        with patch.object(
+            mlx_backend,
+            "_atomic_write_private_json",
+            side_effect=OSError("simulated runtime-state write failure"),
+        ):
+            with self.assertRaises(OSError):
+                backend.set_enabled(False, context_id="alpha")
+
+        self.assertEqual(backend._dirty_context_overrides, {"alpha"})
+        backend._persist_runtime_state()
+        self.assertEqual(backend._dirty_context_overrides, set())
+
+        with patch.object(
+            mlx_backend,
+            "_atomic_write_private_json",
+            side_effect=OSError("simulated runtime-state write failure"),
+        ):
+            with self.assertRaises(OSError):
+                backend.set_enabled(False)
+
+        self.assertTrue(backend._global_enabled_dirty)
+        backend._persist_runtime_state()
+        self.assertFalse(backend._global_enabled_dirty)
+
+        restored = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        self.assertFalse(restored.global_enabled)
+        self.assertEqual(restored.context_overrides, {"alpha": False})
 
     def test_status_reports_demo_readiness_fields(self):
         backend = SpikingAttentionBackend(
@@ -1125,6 +1376,49 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(second["since_event_id"], event["event_id"])
         self.assertFalse(second["ack_required"])
 
+    def test_control_plane_surface_hydration_defers_neural_substrate(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            control_plane_only=True,
+        )
+        full_backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        full_backend.register_text_trace(
+            tag="surface-bootstrap-memory",
+            context_id="demo",
+            text="surface bootstrap recalls durable local context",
+        )
+
+        hydrated = backend.hydrate_agent_context(
+            context_id="demo",
+            agent_id="codex-desktop",
+            prompt="surface bootstrap durable context",
+            claim_events=False,
+            recall_mode="surface",
+        )
+
+        self.assertTrue(backend.control_plane_only)
+        self.assertIsNone(backend.W_lateral)
+        self.assertEqual(hydrated["recall_mode"], "surface")
+        self.assertEqual(
+            hydrated["recall_provenance"],
+            "sqlite-surface-bootstrap",
+        )
+        self.assertIn("surface-bootstrap-memory", hydrated["recall_result"])
+        with self.assertRaisesRegex(mlx_backend.BackendUnavailable, "deferred"):
+            backend.query_text("must not materialize")
+
     def test_cortex_governor_enters_ticks_and_commits_typed_trace(self):
         backend = SpikingAttentionBackend(
             dimension=32,
@@ -1241,6 +1535,352 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(close["agent_deployment"]["event_type"], "cortex-closed")
         self.assertEqual(close["cortex_state"]["active_session_count"], 0)
         self.assertEqual(closed_state["active_session_count"], 0)
+
+    def test_cortex_boundaries_redact_before_provider_hash_storage_and_response(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        marker = "SYNTHETIC_ONLY_CORTEX_SECRET_42"
+        observed_provider_text: list[str] = []
+        original_embed = backend.embedding_provider.embed
+
+        def recording_embed(text, *, dimensions):
+            observed_provider_text.append(text)
+            return original_embed(text, dimensions=dimensions)
+
+        with patch.object(backend.embedding_provider, "embed", side_effect=recording_embed):
+            entered = backend.enter_spiking_cortex(
+                context_id="demo",
+                agent_id="codex",
+                task=f"Review production state password={marker}",
+                mode="security",
+            )
+            tick = backend.cortex_tick(
+                context_id="demo",
+                agent_id="codex",
+                session_id=entered["session_id"],
+                observation=f"Observed Authorization: Bearer {marker}",
+                proposed_action=f"Inspect /tmp/report?api_key={marker}",
+                intended_files=[f"/tmp/report?token={marker}"],
+                intended_tools=[f"curl -H 'Authorization: ApiKey {marker}'"],
+                mutation_intent=False,
+            )
+            hydrated = backend.hydrate_agent_context(
+                context_id="demo",
+                agent_id="codex",
+                prompt=f"Recall password={marker}",
+                claim_events=False,
+            )
+            committed = backend.commit_cortical_trace(
+                context_id="demo",
+                agent_id="codex",
+                session_id=entered["session_id"],
+                trace_type="risk",
+                text=f"Credential finding api_key={marker}",
+                evidence={"api_key": marker, "safe": "retained"},
+            )
+            closed = backend.close_spiking_cortex(
+                context_id="demo",
+                agent_id="codex",
+                session_id=entered["session_id"],
+                reason=f"done password={marker}",
+            )
+
+        public_payload = json.dumps(
+            {
+                "entered": entered,
+                "tick": tick,
+                "hydrated": hydrated,
+                "committed": committed,
+                "closed": closed,
+            },
+            sort_keys=True,
+        )
+        durable_state = self.state_path.read_text(encoding="utf-8")
+        with closing(sqlite3.connect(backend.memory_store.db_path)) as conn:
+            durable_rows = json.dumps(
+                conn.execute(
+                    "SELECT source_text, metadata_json FROM memory_entries"
+                ).fetchall(),
+                sort_keys=True,
+            )
+
+        self.assertNotIn(marker, public_payload)
+        self.assertNotIn(marker, durable_state)
+        self.assertNotIn(marker, durable_rows)
+        self.assertTrue(observed_provider_text)
+        self.assertTrue(all(marker not in text for text in observed_provider_text))
+        self.assertGreaterEqual(entered["input_redaction_count"], 1)
+        self.assertGreaterEqual(tick["input_redaction_count"], 2)
+        self.assertGreaterEqual(hydrated["input_redaction_count"], 1)
+        self.assertEqual(committed["metadata"]["evidence"]["api_key"], "[REDACTED_SECRET]")
+        self.assertEqual(committed["metadata"]["evidence"]["safe"], "retained")
+
+        with self.assertRaisesRegex(ValueError, "credential material"):
+            backend.cortex_tick(
+                context_id="demo",
+                agent_id="codex",
+                session_id=f"password={marker}",
+            )
+
+    def test_runtime_state_scrubs_legacy_secret_bearing_cortex_session_keys(self):
+        marker = "SYNTHETIC_ONLY_LEGACY_SESSION_SECRET_42"
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "global_enabled": True,
+                    "context_overrides": {},
+                    "cortex_sessions": {
+                        f"password={marker}": {
+                            "context_id": "demo",
+                            "agent_id": "codex",
+                            "task": f"Review api_key={marker}",
+                            "status": "closed",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        rewritten = self.state_path.read_text(encoding="utf-8")
+
+        self.assertNotIn(marker, rewritten)
+        self.assertEqual(len(backend.cortex_sessions), 1)
+        session_id = next(iter(backend.cortex_sessions))
+        self.assertTrue(session_id.startswith("ctx_legacy_"))
+        self.assertEqual(self.state_path.stat().st_mode & 0o777, 0o600)
+
+    def test_unreadable_runtime_state_is_safely_quarantined_with_repair_status(self):
+        marker = "SYNTHETIC_UNREADABLE_RUNTIME_SECRET_42"
+        digest = "ab" * 32
+        self.state_path.write_text(
+            f'broken {{ password={marker}, input_sha256={digest}',
+            encoding="utf-8",
+        )
+
+        backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        repaired_text = self.state_path.read_text(encoding="utf-8")
+        repaired = json.loads(repaired_text)
+        quarantine = self.state_path.parent / "runtime_state_quarantine"
+        artifacts = list(quarantine.glob("runtime-state-repair-*.json"))
+        artifact_text = artifacts[0].read_text(encoding="utf-8")
+        status = backend.status(context_id="default")
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertNotIn(marker, repaired_text)
+        self.assertNotIn(marker, artifact_text)
+        self.assertNotIn(digest, artifact_text)
+        self.assertNotIn("input_sha256", artifact_text)
+        self.assertEqual(repaired["runtime_state_repair"]["status"], "repair-required")
+        self.assertEqual(status["runtime_state_repair"]["status"], "repair-required")
+        self.assertFalse(status["runtime_state_repair"]["raw_source_retained"])
+        self.assertEqual(self.state_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(quarantine.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(artifacts[0].stat().st_mode & 0o777, 0o600)
+
+    def test_runtime_state_symlink_is_refused_without_mutating_target(self):
+        target = self.state_path.parent / "caller-owned-state.json"
+        original = '{"global_enabled": false}\n'
+        target.write_text(original, encoding="utf-8")
+        self.state_path.symlink_to(target)
+
+        with self.assertRaisesRegex(RuntimeError, "must not be a symlink"):
+            SpikingAttentionBackend(
+                dimension=16,
+                num_neurons=12,
+                compile_graph=False,
+                state_path=self.state_path,
+            )
+
+        self.assertEqual(target.read_text(encoding="utf-8"), original)
+        self.assertTrue(self.state_path.is_symlink())
+
+    def test_runtime_state_fifo_is_quarantined_without_blocking_startup(self):
+        os.mkfifo(self.state_path, 0o600)
+        result: dict[str, object] = {}
+
+        def construct_backend() -> None:
+            try:
+                result["backend"] = SpikingAttentionBackend(
+                    dimension=16,
+                    num_neurons=12,
+                    compile_graph=False,
+                    state_path=self.state_path,
+                )
+            except BaseException as exc:  # pragma: no cover - assertion aid
+                result["error"] = exc
+
+        worker = threading.Thread(target=construct_backend, daemon=True)
+        worker.start()
+        worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive(), "runtime FIFO blocked backend startup")
+        self.assertNotIn("error", result)
+        self.assertTrue(self.state_path.is_file())
+        artifacts = list(
+            (self.state_path.parent / "runtime_state_quarantine").glob(
+                "runtime-state-repair-*.json"
+            )
+        )
+        artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        self.assertFalse(artifact["sanitized_snapshot_preserved"])
+        self.assertEqual(artifact["sanitized_source_text"], "")
+
+    def test_oversized_runtime_state_is_bounded_and_quarantined(self):
+        with self.state_path.open("wb") as handle:
+            handle.truncate(mlx_backend.MAX_RUNTIME_STATE_BYTES + 1)
+
+        backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        artifacts = list(
+            (self.state_path.parent / "runtime_state_quarantine").glob(
+                "runtime-state-repair-*.json"
+            )
+        )
+        artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            artifact["source_size_bytes"],
+            mlx_backend.MAX_RUNTIME_STATE_BYTES + 1,
+        )
+        self.assertTrue(artifact["sanitized_snapshot_truncated"])
+        self.assertEqual(
+            backend.status(context_id="default")["runtime_state_repair"]["status"],
+            "repair-required",
+        )
+        self.assertLess(self.state_path.stat().st_size, 64_000)
+
+    def test_runtime_state_secure_read_rejects_symlink_swap(self):
+        target = self.state_path.parent / "swap-target.json"
+        target.write_text('{"global_enabled": false}\n', encoding="utf-8")
+        self.state_path.write_text('{"global_enabled": true}\n', encoding="utf-8")
+        original_target = target.read_text(encoding="utf-8")
+        real_open = os.open
+        swapped = False
+
+        def swap_before_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if Path(path) == self.state_path and not swapped:
+                swapped = True
+                self.state_path.unlink()
+                self.state_path.symlink_to(target)
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(mlx_backend.os, "open", side_effect=swap_before_open):
+            with self.assertRaises(OSError):
+                mlx_backend._read_bounded_regular_text(
+                    self.state_path,
+                    max_bytes=mlx_backend.MAX_RUNTIME_STATE_BYTES,
+                )
+
+        self.assertTrue(self.state_path.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), original_target)
+
+    def test_runtime_state_repairs_secret_records_without_losing_safe_records(self):
+        marker = "SYNTHETIC_ONLY_RUNTIME_STATE_SECRET_42"
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "global_enabled": False,
+                    "context_overrides": {
+                        "safe-context": False,
+                        f"password={marker}": True,
+                        "secret-value": f"api_key={marker}",
+                    },
+                    "cortex_sessions": {
+                        "safe-session": {
+                            "context_id": "safe-context",
+                            "agent_id": "codex",
+                            "task": "Preserve this session",
+                        },
+                        "secret-context-session": {
+                            "context_id": f"password={marker}",
+                            "agent_id": "codex",
+                        },
+                        "secret-agent-session": {
+                            "context_id": "safe-context",
+                            "agent_id": f"api_key={marker}",
+                        },
+                    },
+                    "registered_traces": [
+                        {
+                            "tag": "safe-trace",
+                            "context_id": "safe-context",
+                            "source_text": f"Safe note with password={marker}",
+                            "metadata": {"safe": True, "api_key": marker},
+                            "embedding_dimensions": 16,
+                            "spike_indices": [0, 1],
+                            "neuron_indices": [0, 1],
+                            "registered_at": 123.0,
+                        },
+                        {
+                            "tag": f"password={marker}",
+                            "context_id": "safe-context",
+                            "source_text": "must be dropped",
+                            "embedding_dimensions": 16,
+                            "spike_indices": [2],
+                            "neuron_indices": [2],
+                        },
+                        {
+                            "tag": "secret-context-trace",
+                            "context_id": f"api_key={marker}",
+                            "source_text": "must be dropped",
+                            "embedding_dimensions": 16,
+                            "spike_indices": [3],
+                            "neuron_indices": [3],
+                        },
+                    ],
+                    "unknown_secret_field": f"token={marker}",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        rewritten_text = self.state_path.read_text(encoding="utf-8")
+        rewritten = json.loads(rewritten_text)
+        entries = backend.list_memory(context_id="safe-context")["entries"]
+
+        self.assertNotIn(marker, rewritten_text)
+        self.assertEqual(backend.context_overrides, {"safe-context": False})
+        self.assertEqual(set(backend.cortex_sessions), {"safe-session"})
+        self.assertEqual([entry["tag"] for entry in entries], ["safe-trace"])
+        self.assertIn("[REDACTED_SECRET]", entries[0]["source_text"])
+        self.assertEqual(entries[0]["metadata"]["api_key"], "[REDACTED_SECRET]")
+        self.assertNotIn("registered_traces", rewritten)
+        self.assertNotIn("unknown_secret_field", rewritten)
+        self.assertFalse(backend.global_enabled)
+        self.assertEqual(self.state_path.stat().st_mode & 0o777, 0o600)
 
     def test_cortex_close_survives_stale_backend_runtime_persist(self):
         backend_a = SpikingAttentionBackend(
@@ -2268,7 +2908,9 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
         raw_text = (
             "Thread: Capture secret boundary. "
-            "Event: api_key=sk-secret-digest-value must be redacted."
+            "Event: api_key=sk-secret-digest-value must be redacted.\n"
+            "passphrase=correct horse battery synthetic-secret-phrase\n"
+            "auth_header=Bearer synthetic-auth-header-secret"
         )
         raw_digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
         capture_id = "s2cap_" + ("2" * 32)
@@ -2281,7 +2923,9 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             capture_id=capture_id,
             metadata={
                 "input_sha256": raw_digest,
+                "content_sha256": "content-equality-oracle",
                 "api_key": "plain-metadata-secret",
+                "auth_header": "Bearer metadata-auth-secret",
             },
         )
         operation = backend.memory_store.get_capture_operation(capture_id)
@@ -2294,6 +2938,10 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertNotIn("sk-secret-digest-value", combined)
         self.assertNotIn("plain-metadata-secret", combined)
+        self.assertNotIn("synthetic-secret-phrase", combined)
+        self.assertNotIn("synthetic-auth-header-secret", combined)
+        self.assertNotIn("metadata-auth-secret", combined)
+        self.assertNotIn("content-equality-oracle", combined)
         self.assertNotIn(raw_digest, combined)
         self.assertIn("[REDACTED_SECRET]", combined)
 

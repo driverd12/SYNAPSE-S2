@@ -1,5 +1,7 @@
 import contextlib
+import ast
 import io
+import inspect
 import json
 import os
 from pathlib import Path
@@ -63,6 +65,120 @@ class McpServerTests(unittest.TestCase):
 
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("invalid prompt_embedding", result)
+
+    def test_public_tool_error_redacts_secret_and_local_path(self):
+        secret = "sk-phase4-secret-1234567890"
+        local_path = "/Users/dan.driver/private/synapse-token.json"
+        with mock.patch.object(
+            mcp_server,
+            "_load_backend",
+            side_effect=RuntimeError(f"token={secret} at {local_path}"),
+        ):
+            result = mcp_server.query_spiking_attention_text("hello")
+
+        self.assertIn("spiking attention unavailable", result)
+        self.assertIn("[REDACTED_SECRET]", result)
+        self.assertIn("[LOCAL_PATH]", result)
+        self.assertNotIn(secret, result)
+        self.assertNotIn(local_path, result)
+
+    def test_direct_tool_calls_guard_secret_bearing_context_and_agent_ids(self):
+        secret = "sk-mcp-identifier-secret-1234567890"
+        credential_id = f"password={secret}"
+
+        plain_result = mcp_server.query_spiking_attention(
+            [1.0],
+            context_id=credential_id,
+        )
+        namespace_result = mcp_server.list_spiking_namespace_map(
+            context_id=credential_id,
+        )
+        cortex_result = mcp_server.enter_spiking_cortex(
+            agent_id=credential_id,
+            context_id="default",
+            task="safe task",
+        )
+        delivery_result = mcp_server.pull_spiking_context_deployments(
+            agent_id=credential_id,
+            context_id="default",
+        )
+
+        for result in (
+            plain_result,
+            namespace_result,
+            cortex_result,
+            delivery_result,
+        ):
+            with self.subTest(result=result):
+                self.assertIn("must not contain credential material", result)
+                self.assertNotIn(secret, result)
+
+        self.assertIn("error", json.loads(namespace_result))
+        self.assertIn("error", json.loads(cortex_result))
+        self.assertIn("error", json.loads(delivery_result))
+
+    def test_public_mcp_identifier_sanitizers_are_inside_tool_try_blocks(self):
+        tree = ast.parse(inspect.getsource(mcp_server))
+        sanitizer_names = {
+            "_sanitize_context_id",
+            "_sanitize_agent_id",
+            "_delivery_agent_id",
+        }
+        violations: list[str] = []
+
+        for function in (
+            node for node in tree.body if isinstance(node, ast.FunctionDef)
+        ):
+            if not any(
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.func.attr == "tool"
+                for decorator in function.decorator_list
+            ):
+                continue
+
+            protected_calls = {
+                id(node)
+                for statement in function.body
+                if isinstance(statement, ast.Try)
+                for node in ast.walk(statement)
+                if isinstance(node, ast.Call)
+            }
+            for call in (
+                node for node in ast.walk(function) if isinstance(node, ast.Call)
+            ):
+                if (
+                    isinstance(call.func, ast.Name)
+                    and call.func.id in sanitizer_names
+                    and id(call) not in protected_calls
+                ):
+                    violations.append(
+                        f"{function.name}:{call.lineno}:{call.func.id}"
+                    )
+
+        self.assertEqual(violations, [])
+
+    def test_unavailable_mcp_startup_error_is_sanitized(self):
+        secret = "sk-startup-secret-1234567890"
+        local_path = "/Users/dan.driver/private/fastmcp.py"
+        with (
+            mock.patch.object(
+                mcp_server,
+                "_FASTMCP_IMPORT_ERROR",
+                RuntimeError(f"api_key={secret} from {local_path}"),
+            ),
+            mock.patch.object(mcp_server.LOGGER, "error") as log_error,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            mcp_server._UnavailableMCP().run()
+
+        self.assertEqual(raised.exception.code, 1)
+        message = str(log_error.call_args.args[0])
+        self.assertIn("Import error:", message)
+        self.assertIn("[REDACTED_SECRET]", message)
+        self.assertIn("[LOCAL_PATH]", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(local_path, message)
 
     def test_query_sanitizes_context_id(self):
         registration = json.loads(
@@ -456,6 +572,48 @@ class McpServerTests(unittest.TestCase):
             all("sk-test-secret123" not in entry["source_text"] for entry in graph["entries"])
         )
 
+    def test_mcp_capture_error_resolution_requires_preflight_and_confirmation(self):
+        root = Path(os.environ["SYNAPSE_S2_CAPTURE_ROOT"])
+        status = json.loads(mcp_server.get_spiking_capture_inbox_status())
+        del status
+        error_path = root / "capture_errors" / "terminal.evidence.json"
+        error_path.write_text(
+            json.dumps(
+                {
+                    "artifact_type": "stale-capture-inbox-temp",
+                    "raw_payload_retained": False,
+                    "content_digest_recorded": False,
+                    "disposition": "recovered-discard-complete",
+                }
+            ),
+            encoding="utf-8",
+        )
+        error_path.chmod(0o600)
+
+        preflight = json.loads(
+            mcp_server.preflight_spiking_capture_error_resolution(
+                reason="reviewed terminal evidence",
+            )
+        )
+        rejected = json.loads(
+            mcp_server.resolve_spiking_capture_errors(
+                preflight_token=preflight["preflight_token"],
+                reason="reviewed terminal evidence",
+            )
+        )
+        resolved = json.loads(
+            mcp_server.resolve_spiking_capture_errors(
+                preflight_token=preflight["preflight_token"],
+                reason="reviewed terminal evidence",
+                confirm=True,
+            )
+        )
+
+        self.assertEqual(preflight["selected_count"], 1)
+        self.assertNotIn(error_path.name, json.dumps(preflight))
+        self.assertIn("confirm=true", rejected["error"])
+        self.assertEqual(resolved["resolved_count"], 1)
+
     def test_mcp_transcript_source_register_poll_and_clipboard_capture(self):
         transcript = Path(self.tmpdir.name) / "claude-session.log"
         transcript.write_text("Existing Claude transcript line.\n", encoding="utf-8")
@@ -822,6 +980,32 @@ class McpServerTests(unittest.TestCase):
 
         self.assertIn("error", result)
         self.assertIn("export root", result["error"])
+
+    def test_output_tools_reject_credential_shaped_paths_without_echo_or_write(self):
+        secret = "sk-mcp-output-path-secret-1234567890"
+        credential_component = f"password={secret}"
+        credential_root = Path(self.tmpdir.name) / credential_component
+        calls = (
+            mcp_server.export_spiking_memory(
+                context_id="demo",
+                output_path=str(credential_root / "memory.json"),
+            ),
+            mcp_server.backup_spiking_memory(
+                output_path=str(credential_root / "memory.sqlite3"),
+            ),
+            mcp_server.certify_spiking_runtime(
+                output_path=str(credential_root / "certification.json"),
+            ),
+        )
+
+        for result in calls:
+            with self.subTest(result=result):
+                payload = json.loads(result)
+                self.assertIn("error", payload)
+                self.assertIn("output_path must not contain credential material", result)
+                self.assertNotIn(secret, result)
+
+        self.assertFalse(credential_root.exists())
 
     def test_delivery_tools_fail_closed_without_configured_identity(self):
         configured = os.environ.pop("SYNAPSE_S2_CLIENT_AGENT_ID", None)

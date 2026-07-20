@@ -1,12 +1,19 @@
+import hashlib
 import json
 import sqlite3
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from memory_store import DurableMemoryStore
+from memory_store import (
+    LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS,
+    LEGACY_SECRET_CONTENT_COLUMNS,
+    LEGACY_SECRET_IDENTIFIER_COLUMNS,
+    DurableMemoryStore,
+)
 
 
 class DurableMemoryStoreTests(unittest.TestCase):
@@ -125,12 +132,153 @@ class DurableMemoryStoreTests(unittest.TestCase):
             self.assertTrue(export_path.exists())
             self.assertEqual(json.loads(export_path.read_text())["entries"][0]["tag"], "wing-load-analysis")
             self.assertEqual(backup["backup_path"], str(backup_path))
+            self.assertTrue(backup["verified"])
+            self.assertEqual(backup["quick_check"], ["ok"])
+            self.assertEqual(backup["foreign_key_error_count"], 0)
+            self.assertEqual(len(backup["sha256"]), 64)
             self.assertTrue(backup_path.exists())
 
             with closing(sqlite3.connect(backup_path)) as conn:
                 row_count = conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0]
 
             self.assertEqual(row_count, 1)
+
+    def test_export_is_atomic_durable_and_preserves_prior_file_on_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DurableMemoryStore(root / "memory.sqlite3")
+            output = root / "export.json"
+            output.write_text("prior-export\n", encoding="utf-8")
+
+            with patch("memory_store.os.replace", side_effect=OSError("injected")):
+                with self.assertRaises(OSError):
+                    store.export_json(output)
+
+            self.assertEqual(output.read_text(encoding="utf-8"), "prior-export\n")
+            self.assertEqual(list(root.glob(".export.json.*.tmp")), [])
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda _index: store.export_json(output), range(8)))
+
+            persisted = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(all(result["export_path"] == str(output) for result in results))
+            self.assertEqual(persisted["version"], results[-1]["version"])
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list(root.glob(".export.json.*.tmp")), [])
+
+    def test_backup_is_verified_private_and_never_overwrites_a_destination(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DurableMemoryStore(root / "memory.sqlite3")
+            backup_path = root / "verified.sqlite3"
+
+            result = store.backup(backup_path)
+            digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["sha256"], digest)
+            self.assertEqual(result["size_bytes"], backup_path.stat().st_size)
+            self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                store.backup(backup_path)
+            self.assertEqual(
+                result["sha256"],
+                hashlib.sha256(backup_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(list(root.glob(".verified.sqlite3.*.tmp")), [])
+
+            protected = root / "protected.sqlite3"
+            protected.write_bytes(b"protected")
+            symlink_path = root / "symlink-backup.sqlite3"
+            symlink_path.symlink_to(protected)
+            with self.assertRaises(FileExistsError):
+                store.backup(symlink_path)
+            self.assertEqual(protected.read_bytes(), b"protected")
+
+            export_target = root / "protected-export.json"
+            export_target.write_text("protected-export\n", encoding="utf-8")
+            export_symlink = root / "symlink-export.json"
+            export_symlink.symlink_to(export_target)
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                store.export_json(export_symlink)
+            self.assertEqual(
+                export_target.read_text(encoding="utf-8"),
+                "protected-export\n",
+            )
+
+    def test_caller_owned_database_and_output_parents_keep_permissions(self):
+        with TemporaryDirectory() as tmp:
+            shared = Path(tmp) / "shared-parent"
+            shared.mkdir(mode=0o755)
+            shared.chmod(0o755)
+            store = DurableMemoryStore(shared / "memory.sqlite3")
+            store.export_json(shared / "export.json")
+            store.backup(shared / "backup.sqlite3")
+
+            parent_mode = shared.stat().st_mode & 0o777
+            database_mode = (shared / "memory.sqlite3").stat().st_mode & 0o777
+            export_mode = (shared / "export.json").stat().st_mode & 0o777
+            backup_mode = (shared / "backup.sqlite3").stat().st_mode & 0o777
+
+        self.assertEqual(parent_mode, 0o755)
+        self.assertEqual(database_mode, 0o600)
+        self.assertEqual(export_mode, 0o600)
+        self.assertEqual(backup_mode, 0o600)
+
+    def test_database_export_and_backup_paths_reject_credential_shapes(self):
+        with TemporaryDirectory() as tmp:
+            marker = "SYNTHETIC_STORE_PATH_SECRET_42"
+            store = DurableMemoryStore(Path(tmp) / "memory.sqlite3")
+            unsafe_export = Path(tmp) / f"password={marker}-export.json"
+            unsafe_backup = Path(tmp) / f"password={marker}-backup.sqlite3"
+            unsafe_database = Path(tmp) / f"password={marker}-memory.sqlite3"
+
+            with self.assertRaises(ValueError) as export_error:
+                store.export_json(unsafe_export)
+            with self.assertRaises(ValueError) as backup_error:
+                store.backup(unsafe_backup)
+            with self.assertRaises(ValueError) as database_error:
+                DurableMemoryStore(unsafe_database)
+
+        rendered = "\n".join(
+            str(error.exception)
+            for error in (export_error, backup_error, database_error)
+        )
+        self.assertNotIn(marker, rendered)
+        self.assertFalse(unsafe_export.exists())
+        self.assertFalse(unsafe_backup.exists())
+        self.assertFalse(unsafe_database.exists())
+
+    def test_every_durable_text_column_has_a_secret_migration_policy(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "memory.sqlite3"
+            DurableMemoryStore(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                schema_text_columns: set[tuple[str, str]] = set()
+                tables = [
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                        """
+                    ).fetchall()
+                ]
+                for table_name in tables:
+                    for row in conn.execute(
+                        f'PRAGMA table_info("{table_name}")'
+                    ).fetchall():
+                        if "TEXT" in str(row[2]).upper():
+                            schema_text_columns.add((table_name, str(row[1])))
+
+        classified = set(LEGACY_SECRET_CONTENT_COLUMNS) | set(
+            LEGACY_SECRET_IDENTIFIER_COLUMNS
+        )
+        self.assertEqual(schema_text_columns, classified)
+        self.assertFalse(
+            set(LEGACY_SECRET_CONTENT_COLUMNS)
+            & set(LEGACY_SECRET_IDENTIFIER_COLUMNS)
+        )
 
     def test_list_entries_by_ids_preserves_requested_order_and_context(self):
         with TemporaryDirectory() as tmp:
@@ -663,6 +811,51 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(exported["context_cursors"][0]["agent_id"], "codex-desktop")
         self.assertEqual(len(exported["context_deliveries"]), 2)
         self.assertEqual(len(exported["context_delivery_receipts"]), 2)
+
+    def test_context_event_boundary_redacts_wrapped_keys_and_raw_digests(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            marker = "SYNTHETIC_CONTEXT_EVENT_SECRET_42"
+
+            event = store.publish_context_event(
+                context_id="demo",
+                source_surface="unit-test",
+                event_type="secret-boundary",
+                summary="authoritative context event boundary",
+                payload={
+                    "authorization_header": marker,
+                    "auth_header": f"Bearer {marker}",
+                    "input_sha256": "raw-input-equality-oracle",
+                    "content_sha256": "content-equality-oracle",
+                    "text_digest": "text-equality-oracle",
+                    "prompt_hash": "prompt-equality-oracle",
+                    "nested": {"payload_sha256": "nested-equality-oracle"},
+                    "sha256": "verified-artifact-checksum",
+                },
+                agent_targets=["mcp-clients"],
+            )
+            listed = store.list_context_events(context_id="demo", limit=5)
+            database_bytes = db_path.read_bytes()
+
+        payload = event["payload"]
+        self.assertEqual(payload["authorization_header"], "[REDACTED_SECRET]")
+        self.assertEqual(payload["auth_header"], "[REDACTED_SECRET]")
+        self.assertNotIn("input_sha256", payload)
+        self.assertNotIn("content_sha256", payload)
+        self.assertNotIn("text_digest", payload)
+        self.assertNotIn("prompt_hash", payload)
+        self.assertNotIn("payload_sha256", payload["nested"])
+        self.assertEqual(payload["sha256"], "verified-artifact-checksum")
+        self.assertGreaterEqual(payload["context_bus_redaction_count"], 7)
+        self.assertFalse(payload["raw_payload_stored"])
+        self.assertEqual(listed[0]["payload"], payload)
+        self.assertNotIn(marker.encode(), database_bytes)
+        self.assertNotIn(b"raw-input-equality-oracle", database_bytes)
+        self.assertNotIn(b"nested-equality-oracle", database_bytes)
+        self.assertNotIn(b"content-equality-oracle", database_bytes)
+        self.assertNotIn(b"text-equality-oracle", database_bytes)
+        self.assertNotIn(b"prompt-equality-oracle", database_bytes)
 
     def test_delete_entry_cascades_relationships_and_memory_events(self):
         with TemporaryDirectory() as tmp:
@@ -1500,6 +1693,426 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 conn.commit()
             with self.assertRaisesRegex(RuntimeError, "schema validation"):
                 DurableMemoryStore(db_path)
+
+    def test_secret_content_migration_scrubs_legacy_rows_and_reads_fail_safe(self):
+        marker = "SYNTHETIC_ONLY_LEGACY_DB_SECRET_42"
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            entry = store.upsert_entry(
+                tag="legacy-secret-test",
+                context_id="demo",
+                source_text="Initially safe source text.",
+                metadata={"safe": "retained"},
+                embedding_dimensions=8,
+                spike_indices=[1, 3],
+                neuron_indices=[1, 3],
+            )
+            safe_entry = store.upsert_entry(
+                tag="post-migration-read-defense",
+                context_id="demo",
+                source_text="Safe row retained for read-boundary testing.",
+                metadata={"safe": "retained"},
+                embedding_dimensions=8,
+                spike_indices=[2, 4],
+                neuron_indices=[2, 4],
+            )
+            digest_only_entry = store.upsert_entry(
+                tag="legacy-raw-digest-oracle",
+                context_id="demo",
+                source_text="Already redacted historical source text.",
+                metadata={"safe": "retained"},
+                embedding_dimensions=8,
+                spike_indices=[3, 5],
+                neuron_indices=[3, 5],
+            )
+            already_redacted_entry = store.upsert_entry(
+                tag="already-redacted-memory",
+                context_id="demo",
+                source_text="password=[REDACTED_SECRET]",
+                metadata={"password": "[REDACTED_SECRET]", "safe": "retained"},
+                embedding_dimensions=8,
+                spike_indices=[4, 6],
+                neuron_indices=[4, 6],
+            )
+            legacy_raw_digest = "ab" * 32
+            event = store.publish_context_event(
+                context_id="demo",
+                source_surface="unit-test",
+                event_type="legacy-secret-test",
+                summary="Initially safe summary.",
+                payload={"safe": "retained"},
+                agent_targets=["mcp-clients"],
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    """
+                    UPDATE memory_entries
+                    SET source_text = ?, metadata_json = ?
+                    WHERE memory_id = ?
+                    """,
+                    (
+                        f'password: "legacy phrase {marker}"',
+                        json.dumps({"api_key": marker, "safe": "retained"}),
+                        entry["memory_id"],
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memory_surface_terms (
+                        memory_id, context_id, term, weight
+                    ) VALUES (?, 'demo', ?, 99.0)
+                    """,
+                    (entry["memory_id"], marker.casefold()),
+                )
+                conn.execute(
+                    """
+                    UPDATE agent_context_events
+                    SET summary = ?, payload_json = ?
+                    WHERE event_id = ?
+                    """,
+                    (
+                        f"Authorization: Bearer {marker}",
+                        json.dumps({"client_secret": marker, "safe": "retained"}),
+                        event["event_id"],
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE memory_entries
+                    SET metadata_json = ?
+                    WHERE memory_id = ?
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "safe": "retained",
+                                "nested": {"input_sha256": legacy_raw_digest},
+                            }
+                        ),
+                        digest_only_entry["memory_id"],
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = 'secret_content_scrub_v1'"
+                )
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = 'raw_digest_oracle_scrub_v1'"
+                )
+                conn.commit()
+
+            reopened = DurableMemoryStore(db_path)
+            rendered_entry = reopened.get_entry(entry["memory_id"])
+            rendered_digest_entry = reopened.get_entry(
+                digest_only_entry["memory_id"]
+            )
+            rendered_already_redacted_entry = reopened.get_entry(
+                already_redacted_entry["memory_id"]
+            )
+            rendered_event = reopened.list_context_events(
+                context_id="demo",
+                since_event_id=0,
+                limit=20,
+            )[0]
+            with closing(sqlite3.connect(db_path)) as conn:
+                durable = "\n".join(
+                    str(value)
+                    for value in conn.execute(
+                        """
+                        SELECT summary, payload_json
+                        FROM agent_context_events WHERE event_id = ?
+                        """,
+                        (event["event_id"],),
+                    ).fetchone()
+                )
+                surface_hit_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM memory_surface_terms WHERE term = ?",
+                        (marker.casefold(),),
+                    ).fetchone()[0]
+                )
+                deleted_spike_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM memory_spikes WHERE memory_id = ?",
+                        (entry["memory_id"],),
+                    ).fetchone()[0]
+                )
+                deleted_relationship_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM memory_relationships
+                        WHERE source_memory_id = ? OR target_memory_id = ?
+                        """,
+                        (entry["memory_id"], entry["memory_id"]),
+                    ).fetchone()[0]
+                )
+                audit_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM store_maintenance_receipts
+                        WHERE operation_type = 'secret-content-scrub'
+                        """
+                    ).fetchone()[0]
+                )
+                already_redacted_spike_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM memory_spikes WHERE memory_id = ?",
+                        (already_redacted_entry["memory_id"],),
+                    ).fetchone()[0]
+                )
+                already_redacted_surface_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM memory_surface_terms WHERE memory_id = ?",
+                        (already_redacted_entry["memory_id"],),
+                    ).fetchone()[0]
+                )
+
+                # Defense in depth: even a post-migration direct SQL write is
+                # redacted by public row conversion before it can be exported.
+                conn.execute(
+                    "UPDATE memory_entries SET source_text = ? WHERE memory_id = ?",
+                    (f"password={marker}", safe_entry["memory_id"]),
+                )
+                conn.commit()
+            post_migration_injection = reopened.get_entry(safe_entry["memory_id"])
+
+        self.assertIsNone(rendered_entry)
+        self.assertIsNotNone(rendered_digest_entry)
+        self.assertEqual(rendered_digest_entry["metadata"]["safe"], "retained")
+        self.assertNotIn(
+            "input_sha256",
+            json.dumps(rendered_digest_entry["metadata"], sort_keys=True),
+        )
+        self.assertNotIn(
+            legacy_raw_digest,
+            json.dumps(rendered_digest_entry["metadata"], sort_keys=True),
+        )
+        self.assertIsNotNone(rendered_already_redacted_entry)
+        self.assertGreater(already_redacted_spike_count, 0)
+        self.assertGreater(already_redacted_surface_count, 0)
+        self.assertNotIn(marker, json.dumps(rendered_event, sort_keys=True))
+        self.assertNotIn(marker, durable)
+        self.assertNotIn(legacy_raw_digest, durable)
+        self.assertEqual(rendered_event["payload"]["safe"], "retained")
+        self.assertEqual(surface_hit_count, 0)
+        self.assertEqual(deleted_spike_count, 0)
+        self.assertEqual(deleted_relationship_count, 0)
+        self.assertEqual(audit_count, 1)
+        self.assertNotIn(
+            marker,
+            json.dumps(post_migration_injection, sort_keys=True),
+        )
+
+    def test_secret_migration_strips_raw_digest_from_malformed_json(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            event = store.publish_context_event(
+                context_id="demo",
+                source_surface="unit-test",
+                event_type="malformed-legacy-json",
+                summary="safe summary",
+                payload={"safe": True},
+                agent_targets=["mcp-clients"],
+            )
+            digest = "ab" * 32
+            marker = "SYNTHETIC_MALFORMED_JSON_SECRET_42"
+            malformed = f'broken {{ input_sha256={digest}, password={marker}'
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE agent_context_events SET payload_json = ? WHERE event_id = ?",
+                    (malformed, event["event_id"]),
+                )
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = 'secret_content_scrub_v1'"
+                )
+                conn.commit()
+
+            DurableMemoryStore(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                durable = str(
+                    conn.execute(
+                        "SELECT payload_json FROM agent_context_events WHERE event_id = ?",
+                        (event["event_id"],),
+                    ).fetchone()[0]
+                )
+                migration_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM store_migrations WHERE key = 'secret_content_scrub_v1'"
+                    ).fetchone()[0]
+                )
+
+        self.assertNotIn("input_sha256", durable)
+        self.assertNotIn(digest, durable)
+        self.assertNotIn(marker, durable)
+        self.assertEqual(migration_count, 1)
+
+    def test_secret_content_scrub_v3_rechecks_data_after_detection_upgrade(self):
+        marker = "SYNTHETIC_V3_SECRET_VALUE_42"
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            entry = store.upsert_entry(
+                tag="legacy-v3-entry",
+                context_id="demo",
+                source_text="safe before legacy injection",
+                metadata={},
+                embedding_dimensions=4,
+                spike_indices=[1],
+                neuron_indices=[1],
+            )
+            event = store.publish_context_event(
+                context_id="demo",
+                source_surface="unit-test",
+                event_type="legacy-v3-event",
+                summary="safe summary",
+                payload={"safe": True},
+                agent_targets=["mcp-clients"],
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE memory_entries SET source_text = ? WHERE memory_id = ?",
+                    (f"password={marker}", entry["memory_id"]),
+                )
+                conn.execute(
+                    "UPDATE agent_context_events SET payload_json = ? WHERE event_id = ?",
+                    (json.dumps({"client_secret": marker}), event["event_id"]),
+                )
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = 'secret_content_scrub_v3'"
+                )
+                conn.commit()
+
+            reopened = DurableMemoryStore(db_path)
+            scrubbed_event = reopened.list_context_events(
+                context_id="demo",
+                since_event_id=0,
+                limit=20,
+            )[0]
+            with closing(sqlite3.connect(db_path)) as conn:
+                migration_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM store_migrations WHERE key = 'secret_content_scrub_v3'"
+                    ).fetchone()[0]
+                )
+                receipt_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM store_maintenance_receipts
+                        WHERE operation_type = 'secret-content-scrub'
+                        """
+                    ).fetchone()[0]
+                )
+
+        self.assertIsNone(reopened.get_entry(entry["memory_id"]))
+        self.assertNotIn(marker, json.dumps(scrubbed_event, sort_keys=True))
+        self.assertEqual(migration_count, 1)
+        self.assertGreaterEqual(receipt_count, 1)
+
+    def test_secret_identifier_migration_fails_closed_without_echoing_value(self):
+        marker = "SYNTHETIC_ONLY_LEGACY_IDENTIFIER_SECRET_42"
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            entry = store.upsert_entry(
+                tag="safe-tag",
+                context_id="demo",
+                source_text="Safe source.",
+                metadata={},
+                embedding_dimensions=4,
+                spike_indices=[1],
+                neuron_indices=[1],
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("PRAGMA foreign_keys = OFF")
+                conn.execute(
+                    "UPDATE memory_entries SET context_id = ? WHERE memory_id = ?",
+                    (f"password={marker}", entry["memory_id"]),
+                )
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = 'secret_identifier_audit_v1'"
+                )
+                conn.commit()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "legacy secret-bearing identifiers",
+            ) as raised:
+                DurableMemoryStore(db_path)
+
+        self.assertNotIn(marker, str(raised.exception))
+
+    def test_empty_legacy_ack_receipts_table_is_retired_and_nonempty_fails_closed(self):
+        legacy_columns = {
+            ("agent_context_ack_receipts", column)
+            for column in (
+                "ack_id",
+                "delivery_id",
+                "context_id",
+                "agent_id",
+                "lease_token_sha256",
+            )
+        }
+        self.assertEqual(
+            set(LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS),
+            legacy_columns,
+        )
+
+        def create_legacy_table(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                CREATE TABLE agent_context_ack_receipts (
+                    ack_id TEXT PRIMARY KEY,
+                    delivery_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    lease_token_sha256 TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "DELETE FROM store_migrations "
+                "WHERE key = 'legacy_ack_receipts_retirement_v1'"
+            )
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "empty-legacy.sqlite3"
+            DurableMemoryStore(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                create_legacy_table(conn)
+                conn.commit()
+            DurableMemoryStore(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                table_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'agent_context_ack_receipts'"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(table_count, 0)
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "nonempty-legacy.sqlite3"
+            DurableMemoryStore(db_path)
+            marker = "ab" * 32
+            with closing(sqlite3.connect(db_path)) as conn:
+                create_legacy_table(conn)
+                conn.execute(
+                    """
+                    INSERT INTO agent_context_ack_receipts (
+                        ack_id, delivery_id, context_id, agent_id,
+                        lease_token_sha256
+                    ) VALUES ('ack-1', 'delivery-1', 'demo', 'agent-1', ?)
+                    """,
+                    (marker,),
+                )
+                conn.commit()
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "legacy acknowledgement receipts require governed repair",
+            ) as raised:
+                DurableMemoryStore(db_path)
+            self.assertNotIn(marker, str(raised.exception))
 
 
 if __name__ == "__main__":

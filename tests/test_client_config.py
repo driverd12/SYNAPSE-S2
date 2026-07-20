@@ -1,12 +1,109 @@
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import client_config
 
 
 class ClientConfigTests(unittest.TestCase):
+    def test_existing_config_backup_is_private_complete_and_never_overwritten(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.json"
+            target.write_text('{"version": 1}\n', encoding="utf-8")
+            collision = target.with_name("config.json.bak-20260719-120000-collision")
+            collision.write_text("older backup\n", encoding="utf-8")
+
+            with (
+                mock.patch("client_config.time.strftime", return_value="20260719-120000"),
+                mock.patch(
+                    "client_config.secrets.token_hex",
+                    side_effect=["collision", "freshbackup"],
+                ),
+            ):
+                result = client_config._write_text_if_changed(
+                    target,
+                    '{"version": 2}\n',
+                    dry_run=False,
+                )
+
+            backup = Path(result["backup_path"])
+            self.assertEqual(collision.read_text(encoding="utf-8"), "older backup\n")
+            self.assertEqual(backup.name, "config.json.bak-20260719-120000-freshbackup")
+            self.assertEqual(backup.read_text(encoding="utf-8"), '{"version": 1}\n')
+            self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"version": 2}\n')
+
+    def test_existing_config_symlink_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            real = Path(tmp) / "real.json"
+            real.write_text('{"safe": true}\n', encoding="utf-8")
+            target = Path(tmp) / "config.json"
+            os.symlink(real, target)
+
+            with self.assertRaises(OSError):
+                client_config._write_text_if_changed(
+                    target,
+                    '{"safe": false}\n',
+                    dry_run=False,
+                )
+
+            self.assertEqual(real.read_text(encoding="utf-8"), '{"safe": true}\n')
+
+    def test_private_config_writer_preserves_existing_parent_mode(self):
+        with TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "caller-owned"
+            parent.mkdir(mode=0o755)
+            parent.chmod(0o755)
+            target = parent / "config.json"
+
+            client_config._write_text_if_changed(
+                target,
+                '{"safe": true}\n',
+                dry_run=False,
+            )
+
+            self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_config_change_is_not_overwritten(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.json"
+            target.write_text('{"version": 1}\n', encoding="utf-8")
+            real_backup = client_config._create_exclusive_private_backup
+
+            def competing_write(path):
+                backup = real_backup(path)
+                path.write_text('{"version": "winning"}\n', encoding="utf-8")
+                return backup
+
+            with mock.patch(
+                "client_config._create_exclusive_private_backup",
+                side_effect=competing_write,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed during update"):
+                    client_config._write_text_if_changed(
+                        target,
+                        '{"version": 2}\n',
+                        dry_run=False,
+                    )
+
+            backups = list(target.parent.glob("config.json.bak-*"))
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                '{"version": "winning"}\n',
+            )
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                backups[0].read_text(encoding="utf-8"),
+                '{"version": 1}\n',
+            )
+            self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+            lock_path = target.with_name(f".{target.name}.synapse-config.lock")
+            self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+
     def test_server_definition_uses_shared_local_state_paths(self):
         with TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "SYNAPSE-S2"
@@ -89,6 +186,12 @@ class ClientConfigTests(unittest.TestCase):
                 (repo_root / ".mcp.json").read_text(encoding="utf-8")
             )
             resolved_repo = str(repo_root.resolve())
+            config_modes = {
+                "desktop": desktop_config.stat().st_mode & 0o777,
+                "claude_code": claude_code_config.stat().st_mode & 0o777,
+                "codex": codex_config.stat().st_mode & 0o777,
+                "project": (repo_root / ".mcp.json").stat().st_mode & 0o777,
+            }
 
         self.assertTrue(desktop["preferences"]["keepAwakeEnabled"])
         self.assertIn("synapse-s2", desktop["mcpServers"])
@@ -113,6 +216,11 @@ class ClientConfigTests(unittest.TestCase):
         self.assertIn('SYNAPSE_S2_CLIENT_SESSION_BRIDGE = "1"', codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_CORTEX = "1"', codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_CORTEX_MODE = "strict"', codex_text)
+        self.assertIn(
+            'SYNAPSE_S2_CLIENT_STARTUP_RECALL_MODE = "surface"',
+            codex_text,
+        )
+        self.assertEqual(set(config_modes.values()), {0o600})
         self.assertIn('SYNAPSE_S2_EMBEDDING_PROVIDER = "mlx-neural"', codex_text)
         self.assertIn(
             'SYNAPSE_S2_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"',

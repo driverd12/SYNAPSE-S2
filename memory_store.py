@@ -11,19 +11,28 @@ import secrets
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    SecretRedactingFormatter,
+    redact_capture_text,
+    redact_sensitive_value,
+    reject_sensitive_identifier,
+    strip_untrusted_raw_digest_fields,
+    strip_untrusted_raw_digest_text,
+)
+
 
 LOGGER = logging.getLogger("synapse_s2.memory_store")
 if not LOGGER.handlers:
     _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    _handler.setFormatter(SecretRedactingFormatter(SECRET_SAFE_LOG_FORMAT))
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
@@ -79,6 +88,101 @@ CAPTURE_OPERATION_RESULT_KEYS = frozenset(
         "event_count",
         "entry_count",
         "relationship_count",
+    }
+)
+
+# Every durable TEXT column is intentionally classified as either content that
+# can be redacted/deleted or an identifier/structural value that must fail the
+# secret-shape audit. A schema-coverage regression keeps this inventory exact.
+LEGACY_SECRET_CONTENT_COLUMNS = frozenset(
+    {
+        ("agent_context_events", "summary"),
+        ("agent_context_events", "payload_json"),
+        ("capture_operations", "result_json"),
+        ("context_relationships", "evidence_json"),
+        ("memory_entries", "tag"),
+        ("memory_entries", "source_text"),
+        ("memory_entries", "metadata_json"),
+        ("memory_events", "payload_json"),
+        ("memory_relationships", "evidence_json"),
+        ("store_maintenance_receipts", "payload_json"),
+        ("store_metadata", "value_json"),
+    }
+)
+LEGACY_SECRET_IDENTIFIER_COLUMNS = frozenset(
+    {
+        ("agent_context_consumer_groups", "agent_id"),
+        ("agent_context_consumer_groups", "group_id"),
+        ("agent_context_consumers", "agent_id"),
+        ("agent_context_consumers", "consumer_kind"),
+        ("agent_context_cursors", "context_id"),
+        ("agent_context_cursors", "agent_id"),
+        ("agent_context_deliveries", "delivery_id"),
+        ("agent_context_deliveries", "context_id"),
+        ("agent_context_deliveries", "agent_id"),
+        ("agent_context_deliveries", "state"),
+        ("agent_context_deliveries", "current_receipt_id"),
+        ("agent_context_deliveries", "lease_owner"),
+        ("agent_context_delivery_ack_tombstones", "receipt_digest"),
+        ("agent_context_delivery_ack_tombstones", "delivery_id"),
+        ("agent_context_delivery_ack_tombstones", "context_id"),
+        ("agent_context_delivery_ack_tombstones", "agent_id"),
+        ("agent_context_delivery_cursors", "context_id"),
+        ("agent_context_delivery_cursors", "agent_id"),
+        ("agent_context_delivery_receipts", "receipt_id"),
+        ("agent_context_delivery_receipts", "delivery_id"),
+        ("agent_context_delivery_receipts", "consumer_instance_id"),
+        ("agent_context_delivery_receipts", "state"),
+        ("agent_context_event_targets", "target_kind"),
+        ("agent_context_event_targets", "target_id"),
+        ("agent_context_events", "context_id"),
+        ("agent_context_events", "source_surface"),
+        ("agent_context_events", "event_type"),
+        ("agent_context_events", "agent_targets_json"),
+        ("capture_operations", "capture_id"),
+        ("capture_operations", "protocol"),
+        ("capture_operations", "request_fingerprint"),
+        ("capture_operations", "context_id"),
+        ("capture_operations", "source_tag"),
+        ("capture_operations", "speaker"),
+        ("context_relationships", "context_link_id"),
+        ("context_relationships", "source_context_id"),
+        ("context_relationships", "target_context_id"),
+        ("context_relationships", "relation_type"),
+        ("context_relationships", "direction"),
+        ("context_relationships", "approved_by"),
+        ("memory_entries", "memory_id"),
+        ("memory_entries", "context_id"),
+        ("memory_entries", "spike_indices_json"),
+        ("memory_entries", "neuron_indices_json"),
+        ("memory_events", "memory_id"),
+        ("memory_events", "event_type"),
+        ("memory_relationships", "relationship_id"),
+        ("memory_relationships", "context_id"),
+        ("memory_relationships", "source_memory_id"),
+        ("memory_relationships", "target_memory_id"),
+        ("memory_relationships", "relation_type"),
+        ("memory_spikes", "memory_id"),
+        ("memory_spikes", "context_id"),
+        ("memory_surface_terms", "memory_id"),
+        ("memory_surface_terms", "context_id"),
+        ("memory_surface_terms", "term"),
+        ("store_maintenance_receipts", "operation_id"),
+        ("store_maintenance_receipts", "operation_type"),
+        ("store_maintenance_receipts", "context_id"),
+        ("store_maintenance_receipts", "before_revision"),
+        ("store_maintenance_receipts", "after_revision"),
+        ("store_metadata", "key"),
+        ("store_migrations", "key"),
+    }
+)
+LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS = frozenset(
+    {
+        ("agent_context_ack_receipts", "ack_id"),
+        ("agent_context_ack_receipts", "delivery_id"),
+        ("agent_context_ack_receipts", "context_id"),
+        ("agent_context_ack_receipts", "agent_id"),
+        ("agent_context_ack_receipts", "lease_token_sha256"),
     }
 )
 
@@ -1050,9 +1154,11 @@ CONTEXT_SUGGESTION_STOP_TERMS = {
 
 
 def _json_safe(value: Any, fallback: Any) -> Any:
+    safe_value, _ = redact_sensitive_value(value)
+    safe_value, _ = strip_untrusted_raw_digest_fields(safe_value)
     try:
-        return json.loads(json.dumps(value, default=str))
-    except Exception:
+        return json.loads(json.dumps(safe_value, allow_nan=False))
+    except (TypeError, ValueError):
         return fallback
 
 
@@ -1063,9 +1169,11 @@ def _json_dumps(value: Any) -> str:
 def _capture_json_dumps(value: Any, *, field: str) -> str:
     """Serialize capture-plan values without coercion or non-finite numbers."""
 
+    safe_value, _ = redact_sensitive_value(value)
+    safe_value, _ = strip_untrusted_raw_digest_fields(safe_value)
     try:
         return json.dumps(
-            value,
+            safe_value,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
@@ -1093,8 +1201,7 @@ class DurableMemoryStore:
         self.db_path = self._resolve_db_path(db_path)
         self._target_integrity_verified = False
         self._capture_integrity_verified = False
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._protect_path(self.db_path.parent, directory=True)
+        self._ensure_directory(self.db_path.parent, owned=False)
         self._initialize()
 
     @classmethod
@@ -1116,15 +1223,16 @@ class DurableMemoryStore:
 
     def _resolve_db_path(self, db_path: str | os.PathLike[str] | None) -> Path:
         if db_path is not None:
+            reject_sensitive_identifier(str(db_path), field="memory_db_path")
             return Path(db_path).expanduser()
         configured = os.getenv("SYNAPSE_S2_MEMORY_DB")
         if configured:
+            reject_sensitive_identifier(configured, field="memory_db_path")
             return Path(configured).expanduser()
         return Path.cwd() / ".synapse_s2" / "memory.sqlite3"
 
     def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._protect_path(self.db_path.parent, directory=True)
+        self._ensure_directory(self.db_path.parent, owned=False)
         conn = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
         try:
             conn.row_factory = sqlite3.Row
@@ -4512,10 +4620,329 @@ class DurableMemoryStore:
         )
         return inserted_count
 
+    @staticmethod
+    def _redact_legacy_json_document(raw_value: Any) -> tuple[str, int]:
+        raw_text = str(raw_value or "")
+        try:
+            decoded = json.loads(raw_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            safe_text, redaction_count = redact_capture_text(raw_text)
+            safe_text, digest_removals = strip_untrusted_raw_digest_text(safe_text)
+            return safe_text, int(redaction_count) + int(digest_removals)
+        safe_value, redaction_count = redact_sensitive_value(decoded)
+        safe_value, digest_removals = strip_untrusted_raw_digest_fields(safe_value)
+        mutation_count = int(redaction_count) + int(digest_removals)
+        if not mutation_count:
+            return raw_text, 0
+        try:
+            encoded = json.dumps(
+                safe_value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return json.dumps("[REDACTED_UNSERIALIZABLE]"), max(
+                1,
+                mutation_count,
+            )
+        return encoded, mutation_count
+
+    def _scrub_legacy_secret_content(self, conn: sqlite3.Connection) -> int:
+        """Repair legacy secret content in one startup transaction.
+
+        Durable identifiers are intentionally not rewritten here because doing
+        so would invalidate graph and delivery foreign keys. New identifier
+        inputs are fail-closed; a separate integrity audit reports any legacy
+        identifier that still needs governed repair. Memory rows whose tag or
+        source contains credential material are deleted with their cascading
+        retrieval artifacts because identifiers, embeddings, and spikes were
+        derived before redaction. Metadata-only findings are repaired in place
+        and their surface-term index is rebuilt; metadata does not participate
+        in the stored embedding/spike derivation, so deleting those memories
+        would be unnecessary data loss.
+        """
+
+        content_columns: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
+            ("memory_events", "event_id", (("payload_json", "json"),)),
+            (
+                "memory_relationships",
+                "relationship_id",
+                (("evidence_json", "json"),),
+            ),
+            (
+                "context_relationships",
+                "context_link_id",
+                (("evidence_json", "json"),),
+            ),
+            (
+                "agent_context_events",
+                "event_id",
+                (("summary", "text"), ("payload_json", "json")),
+            ),
+            (
+                "capture_operations",
+                "capture_id",
+                (("result_json", "json"),),
+            ),
+            (
+                "store_maintenance_receipts",
+                "operation_id",
+                (("payload_json", "json"),),
+            ),
+            ("store_metadata", "key", (("value_json", "json"),)),
+        )
+        changed_cells: dict[str, int] = {}
+        contaminated_memory_ids: list[str] = []
+        repaired_memory_metadata: list[
+            tuple[str, str, str, str, str, dict[str, Any]]
+        ] = []
+        contaminated_memory_reasons = {
+            "tag": 0,
+            "source_text": 0,
+            "metadata_json": 0,
+        }
+        memory_rows = conn.execute(
+            """
+            SELECT memory_id, context_id, tag, source_text, metadata_json
+            FROM memory_entries
+            """
+        ).fetchall()
+        for row in memory_rows:
+            raw_tag = str(row["tag"] or "")
+            raw_source_text = str(row["source_text"] or "")
+            raw_metadata_json = str(row["metadata_json"] or "")
+            safe_tag, tag_redactions = redact_capture_text(raw_tag)
+            safe_source_text, source_redactions = redact_capture_text(
+                raw_source_text
+            )
+            safe_metadata_json, metadata_redactions = self._redact_legacy_json_document(
+                raw_metadata_json
+            )
+            tag_mutated = bool(tag_redactions and safe_tag != raw_tag)
+            source_mutated = bool(
+                source_redactions and safe_source_text != raw_source_text
+            )
+            metadata_mutated = bool(
+                metadata_redactions and safe_metadata_json != raw_metadata_json
+            )
+            if not (tag_mutated or source_mutated or metadata_mutated):
+                continue
+            memory_id = str(row["memory_id"])
+            contaminated_memory_reasons["tag"] += int(tag_mutated)
+            contaminated_memory_reasons["source_text"] += int(
+                source_mutated
+            )
+            contaminated_memory_reasons["metadata_json"] += int(
+                metadata_mutated
+            )
+            if tag_mutated or source_mutated:
+                contaminated_memory_ids.append(memory_id)
+                continue
+            if metadata_mutated:
+                safe_metadata = _decode_json(safe_metadata_json, {})
+                if not isinstance(safe_metadata, dict):
+                    safe_metadata = {}
+                repaired_memory_metadata.append(
+                    (
+                        memory_id,
+                        str(row["context_id"]),
+                        str(row["tag"]),
+                        str(row["source_text"]),
+                        safe_metadata_json,
+                        safe_metadata,
+                    )
+                )
+
+        for memory_id in contaminated_memory_ids:
+            conn.execute(
+                "DELETE FROM memory_entries WHERE memory_id = ?",
+                (memory_id,),
+            )
+        if contaminated_memory_ids:
+            changed_cells["memory_entries.removed_contaminated_rows"] = len(
+                contaminated_memory_ids
+            )
+
+        for (
+            memory_id,
+            context_id,
+            tag,
+            source_text,
+            safe_metadata_json,
+            safe_metadata,
+        ) in repaired_memory_metadata:
+            conn.execute(
+                "UPDATE memory_entries SET metadata_json = ? WHERE memory_id = ?",
+                (safe_metadata_json, memory_id),
+            )
+            conn.execute(
+                "DELETE FROM memory_surface_terms WHERE memory_id = ?",
+                (memory_id,),
+            )
+            surface_rows = self._surface_term_rows(
+                memory_id=memory_id,
+                context_id=context_id,
+                tag=tag,
+                source_text=source_text,
+                metadata=safe_metadata,
+            )
+            if surface_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO memory_surface_terms (
+                        memory_id, context_id, term, weight
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    surface_rows,
+                )
+        if repaired_memory_metadata:
+            changed_cells["memory_entries.metadata_json"] = len(
+                repaired_memory_metadata
+            )
+
+        for table_name, primary_key, columns in content_columns:
+            selected_columns = ", ".join(
+                [primary_key, *(column for column, _ in columns)]
+            )
+            rows = conn.execute(
+                f'SELECT {selected_columns} FROM "{table_name}"'
+            ).fetchall()
+            for row in rows:
+                updates: dict[str, str] = {}
+                for column_name, value_kind in columns:
+                    raw_value = str(row[column_name] or "")
+                    if value_kind == "json":
+                        safe_value, redaction_count = (
+                            self._redact_legacy_json_document(raw_value)
+                        )
+                    else:
+                        safe_value, redaction_count = redact_capture_text(raw_value)
+                    if redaction_count and safe_value != raw_value:
+                        updates[column_name] = safe_value
+                        count_key = f"{table_name}.{column_name}"
+                        changed_cells[count_key] = changed_cells.get(count_key, 0) + 1
+                if not updates:
+                    continue
+                assignments = ", ".join(
+                    f'"{column_name}" = ?' for column_name in updates
+                )
+                conn.execute(
+                    f'UPDATE "{table_name}" SET {assignments} '
+                    f'WHERE "{primary_key}" = ?',
+                    (*updates.values(), row[primary_key]),
+                )
+        index_rows_changed = len(contaminated_memory_ids) + len(
+            repaired_memory_metadata
+        )
+
+        if changed_cells:
+            operation_id = "s2maint_" + uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO store_maintenance_receipts (
+                    operation_id, operation_type, context_id,
+                    before_revision, after_revision, payload_json, created_at
+                )
+                VALUES (?, 'secret-content-scrub', 'all',
+                        'legacy-content', 'redacted-content-v1', ?, ?)
+                """,
+                (
+                    operation_id,
+                    _json_dumps(
+                        {
+                            "content_free": True,
+                            "changed_cell_count": sum(changed_cells.values()),
+                            "changed_cells_by_column": changed_cells,
+                            "removed_contaminated_memory_count": len(
+                                contaminated_memory_ids
+                            ),
+                            "repaired_memory_metadata_count": len(
+                                repaired_memory_metadata
+                            ),
+                            "removed_memory_reason_counts": (
+                                contaminated_memory_reasons
+                            ),
+                            "retrieval_artifacts_reconciled": True,
+                        }
+                    ),
+                    time.time(),
+                ),
+            )
+        return index_rows_changed
+
+    @staticmethod
+    def _legacy_secret_identifier_counts(
+        conn: sqlite3.Connection,
+    ) -> dict[str, int]:
+        """Count credential-shaped durable identifiers without exposing values."""
+
+        columns_by_table: dict[str, list[str]] = {}
+        for table_name, column_name in sorted(
+            LEGACY_SECRET_IDENTIFIER_COLUMNS
+            | LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS
+        ):
+            columns_by_table.setdefault(table_name, []).append(column_name)
+        findings: dict[str, int] = {}
+        for table_name, columns in columns_by_table.items():
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone():
+                continue
+            rows = conn.execute(
+                f'SELECT {", ".join(columns)} FROM "{table_name}"'
+            ).fetchall()
+            for row in rows:
+                for column_name in columns:
+                    _, redaction_count = redact_capture_text(
+                        str(row[column_name] or "")
+                    )
+                    if redaction_count:
+                        key = f"{table_name}.{column_name}"
+                        findings[key] = findings.get(key, 0) + 1
+        return findings
+
+    @staticmethod
+    def _retire_legacy_ack_receipts(conn: sqlite3.Connection) -> bool:
+        """Drop the obsolete pre-v2 acknowledgement table only when empty.
+
+        A non-empty table may contain a hashed lease credential and cannot be
+        silently discarded or summarized. Such stores require an explicit
+        governed repair, so startup fails closed without returning row values.
+        """
+
+        table_name = "agent_context_ack_receipts"
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone():
+            return False
+        row_count = int(
+            conn.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            or 0
+        )
+        if row_count:
+            raise RuntimeError(
+                "legacy acknowledgement receipts require governed repair "
+                f"(affected_rows={row_count})"
+            )
+        conn.execute(f'DROP TABLE "{table_name}"')
+        return True
+
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
         required_migrations = {
             "capture_operations_v1",
             "capture_operations_private_receipts_v1",
+            "secret_content_scrub_v1",
+            "secret_content_scrub_v2",
+            "secret_content_scrub_v3",
+            "raw_digest_oracle_scrub_v1",
+            "secret_identifier_audit_v1",
+            "legacy_ack_receipts_retirement_v1",
             "memory_spikes_v1",
             "memory_surface_terms_v1",
             "context_event_targets_v2",
@@ -4628,6 +5055,54 @@ class DurableMemoryStore:
                     """,
                     ("capture_operations_private_receipts_v1", time.time()),
                 )
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("secret_content_scrub_v1",),
+            ).fetchone():
+                index_rows_changed += self._scrub_legacy_secret_content(conn)
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("secret_content_scrub_v1", time.time()),
+                )
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("raw_digest_oracle_scrub_v1",),
+            ).fetchone():
+                index_rows_changed += self._scrub_legacy_secret_content(conn)
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("raw_digest_oracle_scrub_v1", time.time()),
+                )
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("secret_content_scrub_v2",),
+            ).fetchone():
+                index_rows_changed += self._scrub_legacy_secret_content(conn)
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("secret_content_scrub_v2", time.time()),
+                )
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("secret_content_scrub_v3",),
+            ).fetchone():
+                index_rows_changed += self._scrub_legacy_secret_content(conn)
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("secret_content_scrub_v3", time.time()),
+                )
             if not startup_target_integrity_required:
                 prior_highwater_row = conn.execute(
                     "SELECT value_json FROM store_metadata WHERE key = ?",
@@ -4671,6 +5146,37 @@ class DurableMemoryStore:
                     VALUES (?, ?)
                     """,
                     ("context_deliveries_v2", time.time()),
+                )
+
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("secret_identifier_audit_v1",),
+            ).fetchone():
+                identifier_findings = self._legacy_secret_identifier_counts(conn)
+                if identifier_findings:
+                    raise RuntimeError(
+                        "legacy secret-bearing identifiers require governed repair "
+                        f"(affected_cells={sum(identifier_findings.values())}, "
+                        f"columns={sorted(identifier_findings)})"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("secret_identifier_audit_v1", time.time()),
+                )
+            if not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("legacy_ack_receipts_retirement_v1",),
+            ).fetchone():
+                self._retire_legacy_ack_receipts(conn)
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("legacy_ack_receipts_retirement_v1", time.time()),
                 )
 
             if not conn.execute(
@@ -4885,6 +5391,51 @@ class DurableMemoryStore:
         except PermissionError:
             LOGGER.warning("could not chmod private memory-store path %s", path)
 
+    def _ensure_directory(self, path: Path, *, owned: bool) -> None:
+        """Create a private directory without chmoding caller-owned parents."""
+
+        existed = path.exists()
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if owned or not existed:
+            self._protect_path(path, directory=True)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _unique_private_temp_path(parent: Path, *, prefix: str) -> Path:
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix=prefix,
+            suffix=".tmp",
+            dir=str(parent),
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        return Path(raw_path)
+
     def _initialize(self) -> None:
         try:
             with closing(self._connect()):
@@ -4965,7 +5516,7 @@ class DurableMemoryStore:
             raise ValueError(
                 f"{field} must be a stripped, nonempty string no longer than {max_length} characters"
             )
-        return value
+        return reject_sensitive_identifier(value, field=field)
 
     @staticmethod
     def _validate_capture_timestamp(value: Any, *, field: str) -> float:
@@ -5007,6 +5558,7 @@ class DurableMemoryStore:
             source_text = raw_entry.get("source_text", "")
             if type(source_text) is not str:
                 raise ValueError(f"entries[{index}].source_text must be a string")
+            source_text, _ = redact_capture_text(source_text)
             metadata = raw_entry.get("metadata", {})
             if not isinstance(metadata, dict):
                 raise ValueError(f"entries[{index}].metadata must be an object")
@@ -5494,6 +6046,13 @@ class DurableMemoryStore:
         neuron_indices: Iterable[int],
         registered_at: float | None = None,
     ) -> dict[str, Any]:
+        clean_context_id = reject_sensitive_identifier(
+            context_id,
+            field="context_id",
+        )
+        clean_tag = reject_sensitive_identifier(tag, field="tag")
+        safe_source_text, _ = redact_capture_text(str(source_text or ""))
+        safe_metadata = _json_safe(metadata or {}, {})
         if type(embedding_dimensions) is not int or embedding_dimensions <= 0:
             raise ValueError("embedding_dimensions must be a positive exact integer")
         raw_spike_indices = list(spike_indices)
@@ -5511,9 +6070,12 @@ class DurableMemoryStore:
             raise ValueError("neuron_indices must contain exact integers, not booleans")
         if any(value < 0 for value in raw_neuron_indices):
             raise ValueError("neuron_indices must be non-negative")
-        memory_id = self.stable_memory_id(context_id=context_id, tag=tag)
+        memory_id = self.stable_memory_id(
+            context_id=clean_context_id,
+            tag=clean_tag,
+        )
         now = float(registered_at or time.time())
-        metadata_json = _json_dumps(metadata or {})
+        metadata_json = _json_dumps(safe_metadata)
         clean_spike_indices = sorted(set(raw_spike_indices))
         clean_neuron_indices = list(dict.fromkeys(raw_neuron_indices))
         spike_json = _json_list(clean_spike_indices)
@@ -5524,10 +6086,10 @@ class DurableMemoryStore:
                     entry = self._upsert_entry_conn(
                         conn,
                         memory_id=memory_id,
-                        tag=str(tag),
-                        context_id=str(context_id),
-                        source_text=str(source_text or ""),
-                        metadata=metadata or {},
+                        tag=clean_tag,
+                        context_id=clean_context_id,
+                        source_text=safe_source_text,
+                        metadata=safe_metadata,
                         metadata_json=metadata_json,
                         embedding_dimensions=int(embedding_dimensions),
                         clean_spike_indices=clean_spike_indices,
@@ -7160,11 +7722,43 @@ class DurableMemoryStore:
         agent_targets: Iterable[str] | None = None,
         created_at: float | None = None,
     ) -> dict[str, Any]:
-        context = str(context_id if context_id is not None else "")
+        context = reject_sensitive_identifier(
+            context_id if context_id is not None else "",
+            field="context_id",
+        )
         if not self._context_event_context_id_is_valid(context):
             raise ValueError(
                 "context_id must be stripped, nonempty, and at most 128 characters"
             )
+        clean_source_surface = reject_sensitive_identifier(
+            source_surface or "unknown",
+            field="source_surface",
+        ).strip()[:128] or "unknown"
+        clean_event_type = reject_sensitive_identifier(
+            event_type or "context-update",
+            field="event_type",
+        ).strip()[:128] or "context-update"
+        safe_summary, _ = redact_capture_text(str(summary or ""))
+        safe_payload, payload_redactions = redact_sensitive_value(payload or {})
+        safe_payload, raw_digest_removals = strip_untrusted_raw_digest_fields(
+            safe_payload
+        )
+        if not isinstance(safe_payload, dict):
+            safe_payload = {}
+        boundary_mutations = int(payload_redactions) + int(raw_digest_removals)
+        if boundary_mutations:
+            try:
+                prior_redactions = max(
+                    0,
+                    int(safe_payload.get("context_bus_redaction_count", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                prior_redactions = 0
+            safe_payload = {
+                **safe_payload,
+                "context_bus_redaction_count": prior_redactions + boundary_mutations,
+                "raw_payload_stored": False,
+            }
         targets = self._normalize_event_targets(agent_targets)
         if not targets:
             targets = ["mcp-clients"]
@@ -7177,10 +7771,10 @@ class DurableMemoryStore:
                     return self._publish_context_event_conn(
                         conn,
                         context_id=context,
-                        source_surface=str(source_surface or "unknown"),
-                        event_type=str(event_type or "context-update"),
-                        summary=str(summary or ""),
-                        payload_json=_json_dumps(payload or {}),
+                        source_surface=clean_source_surface,
+                        event_type=clean_event_type,
+                        summary=safe_summary,
+                        payload_json=_json_dumps(safe_payload),
                         targets=targets,
                         created_at=now,
                     )
@@ -7305,7 +7899,10 @@ class DurableMemoryStore:
 
     @staticmethod
     def _normalize_delivery_agent_id(agent_id: str) -> str:
-        raw = str(agent_id or "").strip()
+        raw = reject_sensitive_identifier(
+            agent_id,
+            field="agent_id",
+        ).strip()
         cleaned = re.sub(r"[^A-Za-z0-9_.:@-]+", "_", raw).strip("._-:@")
         return cleaned.casefold()[:128]
 
@@ -8514,10 +9111,17 @@ class DurableMemoryStore:
     ) -> dict[str, Any]:
         """Governedly quarantine a retry-exhausted delivery with an audit receipt."""
 
-        context = str(context_id or "").strip()
+        context = reject_sensitive_identifier(
+            context_id,
+            field="context_id",
+        ).strip()
         agent = self._normalize_delivery_agent_id(agent_id)
-        delivery_key = str(delivery_id or "").strip()
-        rationale = str(reason or "").strip()[:2000]
+        delivery_key = reject_sensitive_identifier(
+            delivery_id,
+            field="delivery_id",
+        ).strip()
+        rationale, _ = redact_capture_text(str(reason or "").strip())
+        rationale = rationale[:2000]
         if not confirm:
             raise ValueError("dead-letter quarantine requires confirm=True")
         if not context or not agent or not delivery_key or not rationale:
@@ -9632,8 +10236,7 @@ class DurableMemoryStore:
         allowed_foreign_key_errors: Iterable[Iterable[Any]] = (),
     ) -> dict[str, Any]:
         backup_dir = self.db_path.parent / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        self._protect_path(backup_dir, directory=True)
+        self._ensure_directory(backup_dir, owned=True)
         page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
         page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
         estimated_backup_bytes = max(
@@ -9796,8 +10399,7 @@ class DurableMemoryStore:
 
     def _maintenance_lock_dir(self) -> Path:
         lock_dir = self.db_path.parent / "maintenance-locks"
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        self._protect_path(lock_dir, directory=True)
+        self._ensure_directory(lock_dir, owned=True)
         return lock_dir
 
     def _acquire_writer_gate(self) -> int:
@@ -11243,55 +11845,148 @@ class DurableMemoryStore:
             }
             conn.commit()
         if path is not None:
+            reject_sensitive_identifier(path, field="export_path")
             output_path = Path(path).expanduser()
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            self._protect_path(output_path.parent, directory=True)
-            temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            self._ensure_directory(output_path.parent, owned=False)
+            if output_path.is_symlink():
+                raise ValueError("export_path must not be a symlink")
+            temp_path = self._unique_private_temp_path(
+                output_path.parent,
+                prefix=f".{output_path.name}.",
+            )
+            fd = os.open(temp_path, os.O_WRONLY | os.O_TRUNC)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     fd = -1
                     handle.write(json.dumps(payload, indent=2, sort_keys=True))
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, output_path)
+                self._protect_path(output_path, directory=False)
+                self._fsync_file(output_path)
+                self._fsync_directory(output_path.parent)
             finally:
                 if fd >= 0:
                     os.close(fd)
-            temp_path.replace(output_path)
-            self._protect_path(output_path, directory=False)
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
             payload["export_path"] = str(output_path)
         return payload
 
     def backup(self, path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
         if path is None:
             stamp = time.strftime("%Y%m%d-%H%M%S")
-            output_path = self.db_path.with_name(f"{self.db_path.stem}-{stamp}.sqlite3")
+            nonce = uuid.uuid4().hex[:12]
+            output_path = self.db_path.with_name(
+                f"{self.db_path.stem}-{stamp}-{nonce}.sqlite3"
+            )
         else:
+            reject_sensitive_identifier(path, field="backup_path")
             output_path = Path(path).expanduser()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._protect_path(output_path.parent, directory=True)
+        self._ensure_directory(output_path.parent, owned=False)
+        if output_path.exists() or output_path.is_symlink():
+            raise FileExistsError("backup_path already exists; refusing to overwrite it")
+        temp_path = self._unique_private_temp_path(
+            output_path.parent,
+            prefix=f".{output_path.name}.",
+        )
+        published = False
         try:
             with closing(self._connect()) as source:
-                with closing(sqlite3.connect(output_path)) as destination:
+                with closing(sqlite3.connect(temp_path)) as destination:
                     source.backup(destination)
+                    destination.commit()
+                    quick_check = [
+                        str(row[0])
+                        for row in destination.execute("PRAGMA quick_check").fetchall()
+                    ]
+                    foreign_key_errors = [
+                        list(row)
+                        for row in destination.execute(
+                            "PRAGMA foreign_key_check"
+                        ).fetchall()
+                    ]
+                    backup_tables = {
+                        str(row[0])
+                        for row in destination.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        ).fetchall()
+                    }
+                    entry_count = (
+                        int(
+                            destination.execute(
+                                "SELECT COUNT(*) FROM memory_entries"
+                            ).fetchone()[0]
+                        )
+                        if "memory_entries" in backup_tables
+                        else 0
+                    )
+                    event_count = (
+                        int(
+                            destination.execute(
+                                "SELECT COUNT(*) FROM memory_events"
+                            ).fetchone()[0]
+                        )
+                        if "memory_events" in backup_tables
+                        else 0
+                    )
+            if quick_check != ["ok"] or foreign_key_errors:
+                raise RuntimeError("backup failed SQLite integrity verification")
+            self._fsync_file(temp_path)
+            digest = hashlib.sha256()
+            with temp_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            size_bytes = int(temp_path.stat().st_size)
+            os.link(temp_path, output_path, follow_symlinks=False)
+            published = True
             self._protect_path(output_path, directory=False)
-            stats = self.stats()
+            self._fsync_file(output_path)
+            temp_path.unlink()
+            self._fsync_directory(output_path.parent)
             return {
                 "backup_path": str(output_path),
                 "memory_db_path": str(self.db_path),
-                "entry_count": int(stats["entry_count"]),
-                "event_count": int(stats["event_count"]),
+                "entry_count": entry_count,
+                "event_count": event_count,
+                "size_bytes": size_bytes,
+                "sha256": digest.hexdigest(),
+                "quick_check": quick_check,
+                "foreign_key_error_count": len(foreign_key_errors),
+                "verified": True,
                 "created_at": time.time(),
             }
-        except Exception:
+        except BaseException:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception("failed to remove incomplete backup temporary file")
+            if published:
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.exception("failed to remove incomplete published backup")
+            try:
+                self._fsync_directory(output_path.parent)
+            except OSError:
+                LOGGER.exception("failed to fsync backup directory after cleanup")
             LOGGER.exception("failed to back up memory store from %s to %s", self.db_path, output_path)
             raise
 
     def _row_to_entry(self, row: sqlite3.Row) -> dict[str, Any]:
+        safe_metadata = _json_safe(
+            _decode_json(str(row["metadata_json"]), {}),
+            {},
+        )
         return {
-            "memory_id": str(row["memory_id"]),
-            "tag": str(row["tag"]),
-            "context_id": str(row["context_id"]),
-            "source_text": str(row["source_text"]),
-            "metadata": _decode_json(str(row["metadata_json"]), {}),
+            "memory_id": redact_capture_text(str(row["memory_id"]))[0],
+            "tag": redact_capture_text(str(row["tag"]))[0],
+            "context_id": redact_capture_text(str(row["context_id"]))[0],
+            "source_text": redact_capture_text(str(row["source_text"]))[0],
+            "metadata": safe_metadata if isinstance(safe_metadata, dict) else {},
             "embedding_dimensions": int(row["embedding_dimensions"]),
             "spike_indices": [
                 int(value)
@@ -11306,35 +12001,42 @@ class DurableMemoryStore:
         }
 
     def _row_to_relationship(self, row: sqlite3.Row) -> dict[str, Any]:
+        safe_evidence = _json_safe(
+            _decode_json(str(row["evidence_json"]), {}),
+            {},
+        )
         return {
-            "relationship_id": str(row["relationship_id"]),
-            "context_id": str(row["context_id"]),
-            "source_memory_id": str(row["source_memory_id"]),
-            "target_memory_id": str(row["target_memory_id"]),
-            "source_tag": str(row["source_tag"]),
-            "target_tag": str(row["target_tag"]),
-            "relation_type": str(row["relation_type"]),
+            "relationship_id": redact_capture_text(str(row["relationship_id"]))[0],
+            "context_id": redact_capture_text(str(row["context_id"]))[0],
+            "source_memory_id": redact_capture_text(str(row["source_memory_id"]))[0],
+            "target_memory_id": redact_capture_text(str(row["target_memory_id"]))[0],
+            "source_tag": redact_capture_text(str(row["source_tag"]))[0],
+            "target_tag": redact_capture_text(str(row["target_tag"]))[0],
+            "relation_type": redact_capture_text(str(row["relation_type"]))[0],
             "weight": round(float(row["weight"]), 6),
-            "evidence": _decode_json(str(row["evidence_json"]), {}),
+            "evidence": safe_evidence if isinstance(safe_evidence, dict) else {},
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
         }
 
     def _row_to_context_link(self, row: sqlite3.Row) -> dict[str, Any]:
         confidence = round(float(row["confidence"]), 6)
-        evidence = _decode_json(str(row["evidence_json"]), {})
+        evidence = _json_safe(
+            _decode_json(str(row["evidence_json"]), {}),
+            {},
+        )
         return {
-            "context_link_id": str(row["context_link_id"]),
-            "source_context_id": str(row["source_context_id"]),
-            "target_context_id": str(row["target_context_id"]),
-            "relation_type": str(row["relation_type"]),
-            "direction": str(row["direction"]),
+            "context_link_id": redact_capture_text(str(row["context_link_id"]))[0],
+            "source_context_id": redact_capture_text(str(row["source_context_id"]))[0],
+            "target_context_id": redact_capture_text(str(row["target_context_id"]))[0],
+            "relation_type": redact_capture_text(str(row["relation_type"]))[0],
+            "direction": redact_capture_text(str(row["direction"]))[0],
             "confidence": confidence,
             "weight": confidence,
             "evidence": evidence if isinstance(evidence, dict) else {},
             "enabled": bool(row["enabled"]),
             "approved": True,
-            "approved_by": str(row["approved_by"]),
+            "approved_by": redact_capture_text(str(row["approved_by"]))[0],
             "approved_at": float(row["approved_at"]),
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
@@ -11342,15 +12044,19 @@ class DurableMemoryStore:
         }
 
     def _row_to_context_event(self, row: sqlite3.Row) -> dict[str, Any]:
+        safe_payload = _json_safe(
+            _decode_json(str(row["payload_json"]), {}),
+            {},
+        )
         return {
             "event_id": int(row["event_id"]),
-            "context_id": str(row["context_id"]),
-            "source_surface": str(row["source_surface"]),
-            "event_type": str(row["event_type"]),
-            "summary": str(row["summary"]),
-            "payload": _decode_json(str(row["payload_json"]), {}),
+            "context_id": redact_capture_text(str(row["context_id"]))[0],
+            "source_surface": redact_capture_text(str(row["source_surface"]))[0],
+            "event_type": redact_capture_text(str(row["event_type"]))[0],
+            "summary": redact_capture_text(str(row["summary"]))[0],
+            "payload": safe_payload if isinstance(safe_payload, dict) else {},
             "agent_targets": [
-                str(value)
+                redact_capture_text(str(value))[0]
                 for value in _decode_json(str(row["agent_targets_json"]), [])
             ],
             "created_at": float(row["created_at"]),

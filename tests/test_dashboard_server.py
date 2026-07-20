@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import json
 import os
 import threading
@@ -12,12 +13,38 @@ import urllib.request
 from unittest import mock
 
 from capture_daemon import write_capture_drop
-from dashboard_server import DEFAULT_CONTEXT, DashboardRuntime, SynapseDashboardServer, main
+from dashboard_server import (
+    DEFAULT_CONTEXT,
+    DashboardRuntime,
+    SynapseDashboardHandler,
+    SynapseDashboardServer,
+    main,
+)
 from mlx_backend import SpikingAttentionBackend
 from transcript_capture import TranscriptCaptureManager
 
 
 class DashboardRuntimeTests(unittest.TestCase):
+    def test_metadata_boundary_redacts_wrapped_secrets_and_raw_digests(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            marker = "SYNTHETIC_DASHBOARD_METADATA_SECRET_42"
+            metadata = runtime._metadata_payload(
+                {
+                    "metadata": {
+                        "authorization_header": marker,
+                        "input_sha256": "raw-input-equality-oracle",
+                        "nested": {"payload_sha256": "nested-equality-oracle"},
+                        "safe": "retained",
+                    }
+                }
+            )
+
+        self.assertEqual(metadata["authorization_header"], "[REDACTED_SECRET]")
+        self.assertNotIn("input_sha256", metadata)
+        self.assertNotIn("payload_sha256", metadata["nested"])
+        self.assertEqual(metadata["safe"], "retained")
+
     def test_dashboard_server_preserves_single_threaded_mlx_affinity(self):
         self.assertTrue(issubclass(SynapseDashboardServer, HTTPServer))
         self.assertFalse(issubclass(SynapseDashboardServer, ThreadingHTTPServer))
@@ -157,6 +184,57 @@ class DashboardRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(delivery_check["status"], "ready")
         self.assertIn("1 ACK tombstones", delivery_check["detail"])
+
+    def test_doctor_treats_terminal_capture_evidence_as_history(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime.capture_daemon().status()
+            evidence = Path(tmp) / "capture_errors" / "terminal.evidence.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "artifact_type": "stale-capture-inbox-temp",
+                        "content_digest_recorded": False,
+                        "raw_payload_retained": False,
+                        "disposition": "recovered-discard-complete",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence.chmod(0o600)
+            terminal_report = runtime.doctor_report(
+                context_id="demo",
+                include_apps=False,
+                wait_for_semantic_audit=True,
+            )
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "file": "sanitized-legacy.json",
+                        "error": "historical parser failure",
+                        "failed_at": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            historical_report = runtime.doctor_report(
+                context_id="demo",
+                include_apps=False,
+                wait_for_semantic_audit=True,
+            )
+
+        terminal_check = next(
+            check
+            for check in terminal_report["checks"]
+            if check["id"] == "capture_inbox"
+        )
+        historical_check = next(
+            check
+            for check in historical_report["checks"]
+            if check["id"] == "capture_inbox"
+        )
+        self.assertEqual(terminal_check["status"], "ready")
+        self.assertEqual(historical_check["status"], "degraded")
 
     def make_runtime(self, tmp: str) -> DashboardRuntime:
         backend = SpikingAttentionBackend(
@@ -477,16 +555,84 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("error_id", payload)
         self.assertNotIn("detail", payload)
 
-    def test_main_refuses_non_loopback_dashboard_bind_without_override(self):
-        previous = os.environ.get("SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD")
-        os.environ.pop("SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD", None)
-        try:
+    def test_debug_error_details_are_redacted_and_path_free(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+
+            def fail_query(*args, **kwargs):
+                raise RuntimeError(
+                    f"api_key={marker} at /Users/operator/private/config.json"
+                )
+
+            runtime.backend.query_text = fail_query  # type: ignore[method-assign]
+            with mock.patch.dict(
+                os.environ,
+                {"SYNAPSE_S2_DASHBOARD_DEBUG_ERRORS": "1"},
+            ):
+                status, payload = self.decode(
+                    runtime.handle(
+                        "POST",
+                        "/api/query",
+                        json.dumps(
+                            {"context_id": "demo", "prompt": "trigger failure"}
+                        ).encode(),
+                    )
+                )
+
+        self.assertEqual(status, 500)
+        self.assertNotIn(marker, payload["detail"])
+        self.assertNotIn("/Users/operator", payload["detail"])
+        self.assertIn("[REDACTED_SECRET]", payload["detail"])
+
+    def test_wrap_session_preview_and_commit_share_redacted_text(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+            request = {
+                "context_id": "demo",
+                "agent_id": "codex-desktop",
+                "text": f"Decision: password={marker}",
+                "operation_log": [
+                    {
+                        "action": "validation",
+                        "status": "ready",
+                        "summary": f"Authorization: ApiKey {marker}",
+                    }
+                ],
+                "capture_id": "s2cap_" + ("e" * 32),
+            }
+
+            preview_status, preview = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/wrap-session/preview",
+                    json.dumps(request).encode(),
+                )
+            )
+            wrap_status, wrap = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/wrap-session",
+                    json.dumps({**request, "confirm": True}).encode(),
+                )
+            )
+            stored = runtime.backend.list_memory(context_id="demo", limit=50)
+            rendered = json.dumps({"preview": preview, "wrap": wrap, "stored": stored})
+
+        self.assertEqual(preview_status, 200)
+        self.assertEqual(wrap_status, 200)
+        self.assertGreaterEqual(preview["redaction_count"], 2)
+        self.assertFalse(preview["raw_text_stored"])
+        self.assertNotIn(marker, rendered)
+        self.assertIn("[REDACTED_SECRET]", preview["preview_text"])
+
+    def test_main_refuses_non_loopback_dashboard_bind_even_with_legacy_override(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD": "true"},
+        ):
             status = main(["--host", "0.0.0.0", "--port", "0"])
-        finally:
-            if previous is None:
-                os.environ.pop("SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD", None)
-            else:
-                os.environ["SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD"] = previous
 
         self.assertEqual(status, 2)
 
@@ -818,6 +964,9 @@ class DashboardRuntimeTests(unittest.TestCase):
             self.assertEqual(pack_payload["action"], "evidence-pack")
             self.assertTrue(report_path.exists())
             self.assertTrue(backup_path.exists())
+            self.assertEqual(report_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(report_path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(report_path.parent, Path(tmp).resolve())
             self.assertIn("sha256", pack_payload)
             self.assertGreaterEqual(pack_payload["snapshot"]["graph"]["relationship_count"], 1)
@@ -1585,6 +1734,60 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(pin_payload["receipt"]["action"], "pin-memory")
         self.assertEqual(pin_payload["receipt"]["status"], "ready")
 
+    def test_pinned_notes_store_neither_raw_secrets_nor_secret_digests(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            query_status, query_payload = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/query",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "prompt": "SYNAPSE-S2 dashboard recalls local memory",
+                        }
+                    ).encode(),
+                )
+            )
+            memory_id = next(
+                item["memory_id"]
+                for item in query_payload["results"]
+                if item.get("memory_id")
+            )
+            raw_notes = [
+                "password=SYNTHETIC_PIN_SECRET_ALPHA_42",
+                "password=SYNTHETIC_PIN_SECRET_BRAVO_42",
+            ]
+            responses = []
+            for raw_note in raw_notes:
+                responses.append(
+                    self.decode(
+                        runtime.handle(
+                            "POST",
+                            "/api/pin-memory",
+                            json.dumps(
+                                {
+                                    "context_id": "demo",
+                                    "memory_id": memory_id,
+                                    "agent_id": "dashboard-ui",
+                                    "note": raw_note,
+                                }
+                            ).encode(),
+                        )
+                    )
+                )
+            database_bytes = (Path(tmp) / "memory.sqlite3").read_bytes()
+            rendered = json.dumps(responses, sort_keys=True)
+
+        self.assertEqual(query_status, 200)
+        self.assertTrue(all(status == 200 for status, _ in responses))
+        for raw_note in raw_notes:
+            marker = raw_note.split("=", 1)[1]
+            digest = hashlib.sha256(raw_note.encode("utf-8")).hexdigest()
+            self.assertNotIn(marker, rendered)
+            self.assertNotIn(marker.encode("utf-8"), database_bytes)
+            self.assertNotIn(digest.encode("ascii"), database_bytes)
+
     def test_http_handler_rejects_cross_origin_mutations(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -1625,6 +1828,51 @@ class DashboardRuntimeTests(unittest.TestCase):
                 thread.join(timeout=5)
 
         self.assertFalse(allowed_payload["effective_enabled"])
+
+    def test_http_handler_rejects_misdirected_host_headers(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=10,
+                )
+                connection.request(
+                    "GET",
+                    "/api/status",
+                    headers={"Host": "attacker.example"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                status = response.status
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(status, 421)
+        self.assertEqual(payload["error"], "host not allowed")
+
+    def test_http_access_log_omits_query_strings(self):
+        marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+        handler = object.__new__(SynapseDashboardHandler)
+        handler.client_address = ("127.0.0.1", 4242)
+        handler.command = "GET"
+        handler.path = f"/api/status?api_key={marker}"
+        handler.request_version = "HTTP/1.1"
+
+        with mock.patch("dashboard_server.LOGGER.info") as info:
+            handler.log_message('%s "%s"', "ignored", "ignored")
+
+        rendered = " ".join(str(value) for value in info.call_args.args)
+        self.assertNotIn(marker, rendered)
+        self.assertNotIn("api_key", rendered)
+        self.assertIn("/api/status", rendered)
 
     def test_remember_endpoint_persists_new_memory(self):
         with TemporaryDirectory() as tmp:

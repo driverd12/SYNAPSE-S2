@@ -4,6 +4,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import embedding_providers
 from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
@@ -69,6 +70,50 @@ class EmbeddingProviderTests(unittest.TestCase):
         self.assertTrue(result.provenance["semantic"])
         self.assertTrue(result.provenance["local_only"])
         self.assertEqual(result.provenance["details"], {"source": "unit-test"})
+
+    def test_python_provider_rejects_secret_identifiers_before_import_or_hash(self):
+        marker = "SYNTHETIC_ONLY_PROVIDER_SECRET_42"
+
+        for requested in (
+            f"python:password={marker}:embed",
+            f"python:local_encoder:api_key={marker}",
+        ):
+            with self.subTest(requested=requested), patch(
+                "embedding_providers.hashlib.sha256"
+            ) as sha256, patch(
+                "embedding_providers.importlib.import_module"
+            ) as import_module:
+                with self.assertRaises(EmbeddingProviderError) as raised:
+                    resolve_embedding_provider(requested)
+
+                sha256.assert_not_called()
+                import_module.assert_not_called()
+                self.assertNotIn(marker, str(raised.exception))
+                self.assertIn("credential material", str(raised.exception))
+
+    def test_python_provider_rejects_secret_model_id_before_provenance(self):
+        marker = "SYNTHETIC_ONLY_PROVIDER_RESULT_SECRET_42"
+        with TemporaryDirectory() as tmp:
+            module_path = Path(tmp) / "local_encoder.py"
+            module_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    def embed(text, dimensions):
+                        return {{
+                            "vector": [1.0] * dimensions,
+                            "model_id": "password={marker}",
+                        }}
+                    """
+                ),
+                encoding="utf-8",
+            )
+            provider = resolve_embedding_provider(f"python:{module_path}:embed")
+
+            with self.assertRaises(EmbeddingProviderError) as raised:
+                provider.embed("safe input", dimensions=8)
+
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertIn("credential material", str(raised.exception))
 
     def test_auto_provider_uses_semantic_hash_as_offline_default(self):
         provider = resolve_embedding_provider("auto")
@@ -146,6 +191,77 @@ class EmbeddingProviderTests(unittest.TestCase):
         self.assertTrue(result.provenance["native_mlx"])
         self.assertEqual(result.provenance["pooling"], "mean")
         self.assertEqual(result.provenance["source_dimensions"], 6)
+
+    def test_provider_boundary_redacts_before_custom_or_neural_execution(self):
+        marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+        observed: list[str] = []
+
+        class FakeRuntime:
+            model_id = "unit-neural-model"
+            native_mlx = True
+
+            def embed_text(self, text, *, pooling, max_tokens):
+                observed.append(text)
+                return [1.0, 2.0, 3.0]
+
+        provider = self._neural_provider_class()(
+            model_id="unit-neural-model",
+            runtime_factory=lambda config: FakeRuntime(),
+        )
+
+        provider.embed(f"password={marker}", dimensions=8)
+
+        self.assertEqual(len(observed), 1)
+        self.assertNotIn(marker, observed[0])
+        self.assertIn("[REDACTED_SECRET]", observed[0])
+
+    def test_mlx_provider_rejects_secret_configuration_before_runtime(self):
+        marker = "SYNTHETIC_ONLY_MLX_CONFIG_SECRET_42"
+        Provider = self._neural_provider_class()
+        configurations = (
+            {"model_id": f"password={marker}"},
+            {"cache_dir": f"/tmp/cache?api_key={marker}"},
+            {"revision": f"token={marker}"},
+        )
+
+        for configuration in configurations:
+            loaded = []
+            with self.subTest(configuration=tuple(configuration)):
+                with self.assertRaises(EmbeddingProviderError) as raised:
+                    Provider(
+                        runtime_factory=lambda config: loaded.append(config),
+                        **configuration,
+                    )
+                self.assertEqual(loaded, [])
+                self.assertNotIn(marker, str(raised.exception))
+                self.assertIn("credential material", str(raised.exception))
+
+    def test_mlx_provider_rejects_secret_runtime_provenance(self):
+        marker = "SYNTHETIC_ONLY_MLX_RUNTIME_SECRET_42"
+        Provider = self._neural_provider_class()
+
+        for field in ("model_id", "source"):
+            class FakeRuntime:
+                model_id = "unit-neural-model"
+                source = "unit-neural-model"
+                native_mlx = True
+
+                def embed_text(self, text, *, pooling, max_tokens):
+                    return [1.0, 2.0, 3.0]
+
+            setattr(FakeRuntime, field, f"password={marker}")
+            provider = Provider(
+                model_id="unit-neural-model",
+                runtime_factory=lambda config: FakeRuntime(),
+            )
+
+            with self.subTest(field=field), self.assertRaises(
+                EmbeddingProviderError
+            ) as raised:
+                provider.embed("safe input", dimensions=8)
+
+            self.assertNotIn(marker, str(raised.exception))
+            self.assertIn("credential material", str(raised.exception))
 
     def test_mlx_neural_provider_wraps_dependency_failure_with_actionable_message(self):
         Provider = self._neural_provider_class()

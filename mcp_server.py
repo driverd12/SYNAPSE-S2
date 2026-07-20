@@ -9,6 +9,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    install_secret_safe_formatters,
+    reject_sensitive_identifier,
+    safe_public_error,
+)
+
 try:
     from fastmcp import FastMCP
 except Exception as fastmcp_exc:  # pragma: no cover - host dependent
@@ -29,9 +36,10 @@ LOGGER = logging.getLogger("synapse_s2.mcp")
 logging.basicConfig(
     level=os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper(),
     stream=sys.stderr,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format=SECRET_SAFE_LOG_FORMAT,
     force=True,
 )
+install_secret_safe_formatters(logging.getLogger().handlers)
 
 MAX_TOOL_EMBEDDING_DIMS = 32_768
 MCP_DELIVERY_INSTANCE_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex}"
@@ -54,7 +62,10 @@ class _UnavailableMCP:
             "`python -m pip install fastmcp mlx`."
         )
         if _FASTMCP_IMPORT_ERROR is not None:
-            message = f"{message} Import error: {_FASTMCP_IMPORT_ERROR}"
+            message = (
+                f"{message} Import error: "
+                f"{safe_public_error(_FASTMCP_IMPORT_ERROR, fallback='dependency import failed')}"
+            )
         LOGGER.error(message)
         raise SystemExit(1)
 
@@ -66,14 +77,23 @@ mcp = (
 )
 
 
+def _public_error(label: str, error: BaseException) -> str:
+    """Preserve the public error label while bounding and redacting details."""
+
+    return f"{label}: {safe_public_error(error, fallback=label)}"
+
+
 def _sanitize_context_id(context_id: str) -> str:
-    raw = str(context_id or "default").strip()
+    raw = reject_sensitive_identifier(
+        context_id or "default",
+        field="context_id",
+    ).strip()
     cleaned = CONTEXT_ID_RE.sub("_", raw).strip("._-:")
     return (cleaned or "default")[:128]
 
 
 def _sanitize_agent_id(agent_id: str) -> str:
-    raw = str(agent_id or "").strip()
+    raw = reject_sensitive_identifier(agent_id or "", field="agent_id").strip()
     cleaned = AGENT_ID_RE.sub("_", raw).strip("._-:@")
     return (cleaned or "unknown-agent")[:128]
 
@@ -199,6 +219,7 @@ def _optional_output_path(
         return None
     if len(value) > 4096:
         raise ValueError("output_path exceeds 4096 characters")
+    value = reject_sensitive_identifier(value, field="output_path")
     export_root = Path(os.getenv("SYNAPSE_S2_EXPORT_DIR", ".synapse_s2")).expanduser()
     if not export_root.is_absolute():
         export_root = Path.cwd() / export_root
@@ -268,8 +289,9 @@ def query_spiking_attention(
     recall_scope: str = "local",
 ) -> str:
     """Return context-local, approved connected, or all-context memory matches."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         values = _validate_embedding(prompt_embedding)
         scope = _validate_recall_scope(recall_scope)
         mx, mlx_backend = _load_backend()
@@ -281,10 +303,10 @@ def query_spiking_attention(
         )
     except ValueError as exc:
         LOGGER.warning("invalid prompt_embedding for context_id=%s: %s", context, exc)
-        return f"invalid prompt_embedding: {exc}"
+        return _public_error("invalid prompt_embedding", exc)
     except Exception as exc:
         LOGGER.exception("spiking attention query failed for context_id=%s", context)
-        return f"spiking attention unavailable: {exc}"
+        return _public_error("spiking attention unavailable", exc)
 
 
 @mcp.tool(
@@ -299,8 +321,9 @@ def query_spiking_attention_text(
     recall_scope: str = "local",
 ) -> str:
     """Return scoped context matches using the configured local text embedding provider."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         prompt_text = _validate_text(prompt, field_name="prompt")
         scope = _validate_recall_scope(recall_scope)
         _, mlx_backend = _load_backend()
@@ -311,10 +334,10 @@ def query_spiking_attention_text(
         )
     except ValueError as exc:
         LOGGER.warning("invalid prompt text for context_id=%s: %s", context, exc)
-        return f"invalid prompt: {exc}"
+        return _public_error("invalid prompt", exc)
     except Exception as exc:
         LOGGER.exception("text spiking attention query failed for context_id=%s", context)
-        return f"spiking attention unavailable: {exc}"
+        return _public_error("spiking attention unavailable", exc)
 
 
 @mcp.tool(
@@ -329,8 +352,9 @@ def list_spiking_namespace_map(
     include_suggestions: bool = True,
 ) -> str:
     """List every namespace, approved bridge, and read-only bridge suggestion."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         bounded_limit = _validate_limit(limit)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.list_namespace_map(
@@ -341,10 +365,10 @@ def list_spiking_namespace_map(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid namespace map request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid namespace map request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid namespace map request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("namespace map failed for context_id=%s", context)
-        return json.dumps({"error": f"namespace map failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("namespace map failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -366,9 +390,11 @@ def approve_spiking_namespace_link(
     confirm: bool = False,
 ) -> str:
     """Persist one typed link after explicit confirmation; never copies memories."""
-    source = _sanitize_context_id(source_context_id)
-    target = _sanitize_context_id(target_context_id)
+    source = "unknown"
+    target = "unknown"
     try:
+        source = _sanitize_context_id(source_context_id)
+        target = _sanitize_context_id(target_context_id)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.approve_namespace_link(
             source_context_id=source,
@@ -383,10 +409,10 @@ def approve_spiking_namespace_link(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid namespace link request for %s -> %s: %s", source, target, exc)
-        return json.dumps({"error": f"invalid namespace link request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid namespace link request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("namespace link approval failed for %s -> %s", source, target)
-        return json.dumps({"error": f"namespace link approval failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("namespace link approval failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -398,8 +424,9 @@ def remember_spiking_context(
     metadata: dict[str, Any] | None = None,
 ) -> str:
     """Persist a named context trace for future spiking associative recall."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         mx, mlx_backend = _load_backend()
         values = _validate_optional_embedding(prompt_embedding)
         source_text = str(text or "").strip()
@@ -436,23 +463,24 @@ def remember_spiking_context(
         return json.dumps(registration, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid trace registration for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid trace: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid trace", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("trace registration failed for context_id=%s", context)
-        return json.dumps({"error": f"trace registration failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("trace registration failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
 def set_spiking_attention_enabled(enabled: bool, context_id: str = "global") -> str:
     """Enable or disable SYNAPSE-S2 globally or for one context id."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         _, mlx_backend = _load_backend()
         status = mlx_backend.set_enabled(bool(enabled), context_id=context)
         return json.dumps(status, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("toggle failed for context_id=%s", context)
-        return json.dumps({"error": f"toggle failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("toggle failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -463,14 +491,15 @@ def set_spiking_attention_enabled(enabled: bool, context_id: str = "global") -> 
 )
 def get_spiking_attention_status(context_id: str = "default") -> str:
     """Return runtime health, toggle state, and memory-store status."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         _, mlx_backend = _load_backend()
         status = mlx_backend.get_status(context_id=context)
         return json.dumps(status, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("status check failed for context_id=%s", context)
-        return json.dumps({"error": f"status failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("status failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -485,8 +514,9 @@ def list_spiking_memory(
     include_vectors: bool = False,
 ) -> str:
     """List persisted local memory entries for a context."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         bounded_limit = _validate_limit(limit)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.get_backend().list_memory(
@@ -497,10 +527,10 @@ def list_spiking_memory(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid memory list request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid memory list request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid memory list request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("memory list failed for context_id=%s", context)
-        return json.dumps({"error": f"memory list failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("memory list failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -513,8 +543,9 @@ def ingest_spiking_memory_text(
     metadata: dict[str, Any] | None = None,
 ) -> str:
     """Segment long text into event memories and persist graph relationships."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         source_text = _validate_text(text)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.ingest_text_events(
@@ -546,10 +577,10 @@ def ingest_spiking_memory_text(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid event ingestion request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid event ingestion request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid event ingestion request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("event ingestion failed for context_id=%s", context)
-        return json.dumps({"error": f"event ingestion failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("event ingestion failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -564,8 +595,9 @@ def capture_spiking_conversation(
     capture_id: str = "",
 ) -> str:
     """Capture real operator/agent conversation notes as temporal event memories."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         source_text = _validate_text(text)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.capture_conversation(
@@ -584,10 +616,10 @@ def capture_spiking_conversation(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid conversation capture for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid conversation capture: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid conversation capture", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("conversation capture failed for context_id=%s", context)
-        return json.dumps({"error": f"conversation capture failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("conversation capture failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -600,8 +632,9 @@ def drop_spiking_capture_inbox(
     capture_id: str = "",
 ) -> str:
     """Drop opt-in session text into the local capture inbox for sidecar ingestion."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         source_text = _validate_text(text)
         capture_daemon = _load_capture_daemon()
         resolved_capture_id = str(capture_id or "") or capture_daemon.new_capture_id()
@@ -628,10 +661,10 @@ def drop_spiking_capture_inbox(
         )
     except ValueError as exc:
         LOGGER.warning("invalid capture inbox drop for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid capture inbox drop: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid capture inbox drop", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("capture inbox drop failed for context_id=%s", context)
-        return json.dumps({"error": f"capture inbox drop failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("capture inbox drop failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -647,7 +680,7 @@ def get_spiking_capture_inbox_status() -> str:
         return json.dumps(capture_daemon.CaptureInboxDaemon().status(), sort_keys=True)
     except Exception as exc:
         LOGGER.exception("capture inbox status failed")
-        return json.dumps({"error": f"capture inbox status failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("capture inbox status failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -665,10 +698,73 @@ def process_spiking_capture_inbox(max_files: int = 50, confirm: bool = False) ->
         )
     except ValueError as exc:
         LOGGER.warning("invalid capture inbox process request: %s", exc)
-        return json.dumps({"error": f"invalid capture inbox process request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid capture inbox process request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("capture inbox process failed")
-        return json.dumps({"error": f"capture inbox process failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("capture inbox process failed", exc)}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Preflight SYNAPSE-S2 Capture Error Resolution",
+        "readOnlyHint": True,
+    }
+)
+def preflight_spiking_capture_error_resolution(
+    reason: str,
+    include_historical: bool = False,
+) -> str:
+    """Return a content-free token for a governed capture-error archival scope."""
+
+    try:
+        capture_daemon = _load_capture_daemon()
+        payload = capture_daemon.CaptureInboxDaemon().error_resolution_preflight(
+            reason=reason,
+            include_historical=bool(include_historical),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        return json.dumps(
+            {"error": _public_error("invalid capture error preflight", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("capture error resolution preflight failed")
+        return json.dumps(
+            {"error": _public_error("capture error preflight failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def resolve_spiking_capture_errors(
+    preflight_token: str,
+    reason: str,
+    include_historical: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Archive reviewed capture-error evidence after an exact preflight."""
+
+    try:
+        capture_daemon = _load_capture_daemon()
+        payload = capture_daemon.CaptureInboxDaemon().resolve_error_artifacts(
+            preflight_token=preflight_token,
+            reason=reason,
+            include_historical=bool(include_historical),
+            confirm=bool(confirm),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        return json.dumps(
+            {"error": _public_error("invalid capture error resolution", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("capture error resolution failed")
+        return json.dumps(
+            {"error": _public_error("capture error resolution failed", exc)},
+            sort_keys=True,
+        )
 
 
 @mcp.tool()
@@ -684,8 +780,9 @@ def register_spiking_transcript_source(
     enabled: bool = True,
 ) -> str:
     """Register an explicitly approved local transcript file for delta capture."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         transcript_capture = _load_transcript_capture()
         _, mlx_backend = _load_backend()
         manager = transcript_capture.TranscriptCaptureManager(
@@ -708,10 +805,10 @@ def register_spiking_transcript_source(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid transcript source registration for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid transcript source registration: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid transcript source registration", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("transcript source registration failed for context_id=%s", context)
-        return json.dumps({"error": f"transcript source registration failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("transcript source registration failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -731,7 +828,7 @@ def list_spiking_transcript_sources() -> str:
         return json.dumps(manager.list_sources(), sort_keys=True, default=str)
     except Exception as exc:
         LOGGER.exception("transcript source list failed")
-        return json.dumps({"error": f"transcript source list failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("transcript source list failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -753,10 +850,10 @@ def poll_spiking_transcript_sources(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid transcript source poll request: %s", exc)
-        return json.dumps({"error": f"invalid transcript source poll request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid transcript source poll request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("transcript source poll failed")
-        return json.dumps({"error": f"transcript source poll failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("transcript source poll failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -769,8 +866,9 @@ def capture_spiking_clipboard(
     capture_id: str = "",
 ) -> str:
     """Capture explicitly selected/copied text as a one-shot transcript payload."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         transcript_capture = _load_transcript_capture()
         _, mlx_backend = _load_backend()
         manager = transcript_capture.TranscriptCaptureManager(
@@ -790,10 +888,10 @@ def capture_spiking_clipboard(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid clipboard capture for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid clipboard capture: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid clipboard capture", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("clipboard capture failed for context_id=%s", context)
-        return json.dumps({"error": f"clipboard capture failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("clipboard capture failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -813,7 +911,7 @@ def list_spiking_running_apps() -> str:
         return json.dumps(manager.detect_running_apps(), sort_keys=True, default=str)
     except Exception as exc:
         LOGGER.exception("running app detection failed")
-        return json.dumps({"error": f"running app detection failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("running app detection failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -829,8 +927,9 @@ def connect_spiking_app(
     allow_manual: bool = False,
 ) -> str:
     """Attach a confirmed local app to SYNAPSE-S2 for explicit snapshot/selection capture."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         transcript_capture = _load_transcript_capture()
         _, mlx_backend = _load_backend()
         manager = transcript_capture.TranscriptCaptureManager(
@@ -853,10 +952,10 @@ def connect_spiking_app(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid app connect request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid app connect request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid app connect request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("app connect failed for context_id=%s", context)
-        return json.dumps({"error": f"app connect failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("app connect failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -876,7 +975,7 @@ def list_spiking_app_connections() -> str:
         return json.dumps(manager.list_app_connections(), sort_keys=True, default=str)
     except Exception as exc:
         LOGGER.exception("app connection list failed")
-        return json.dumps({"error": f"app connection list failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("app connection list failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -905,10 +1004,10 @@ def capture_spiking_app_snapshot(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid app snapshot request: %s", exc)
-        return json.dumps({"error": f"invalid app snapshot request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid app snapshot request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("app snapshot failed")
-        return json.dumps({"error": f"app snapshot failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("app snapshot failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -923,8 +1022,9 @@ def prune_spiking_memory(
     confirm: bool = False,
 ) -> str:
     """Prune one SYNAPSE-S2 memory node, edge, relationship mode, or deployment event."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         if confirm is not True:
             raise ValueError("confirm must be true before pruning memory graph data")
         _, mlx_backend = _load_backend()
@@ -941,10 +1041,10 @@ def prune_spiking_memory(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid memory prune for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid memory prune: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid memory prune", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("memory prune failed for context_id=%s", context)
-        return json.dumps({"error": f"memory prune failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("memory prune failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -955,8 +1055,9 @@ def prune_spiking_memory(
 )
 def list_spiking_memory_graph(context_id: str = "default", limit: int = 100) -> str:
     """List compact memory entries and their persisted relationship graph."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         bounded_limit = _validate_limit(limit)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.list_memory_graph(
@@ -966,10 +1067,10 @@ def list_spiking_memory_graph(context_id: str = "default", limit: int = 100) -> 
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid graph list request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid graph list request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid graph list request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("memory graph list failed for context_id=%s", context)
-        return json.dumps({"error": f"memory graph list failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("memory graph list failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -985,8 +1086,9 @@ def pull_spiking_context_deployments(
     lease_seconds: float = 60.0,
 ) -> str:
     """Lease the oldest eligible context events for the configured local agent."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         bounded_limit = _validate_limit(limit)
         agent = _delivery_agent_id(agent_id)
         _, mlx_backend = _load_backend()
@@ -1000,10 +1102,10 @@ def pull_spiking_context_deployments(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid context deployment pull for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid context deployment pull: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid context deployment pull", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("context deployment pull failed for context_id=%s", context)
-        return json.dumps({"error": f"context deployment pull failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("context deployment pull failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -1014,8 +1116,9 @@ def ack_spiking_context_deployments(
     receipt_ids: list[str] | None = None,
 ) -> str:
     """Atomically acknowledge one or more durable receipts after consumption."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         agent = _delivery_agent_id(agent_id)
         requested_receipts: list[str] = []
         if receipt_ids is not None:
@@ -1041,10 +1144,10 @@ def ack_spiking_context_deployments(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid context deployment ack for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid context deployment ack: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid context deployment ack", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("context deployment ack failed for context_id=%s", context)
-        return json.dumps({"error": f"context deployment ack failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("context deployment ack failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -1054,8 +1157,9 @@ def release_spiking_context_deployments(
     context_id: str = "default",
 ) -> str:
     """Release unconsumed leases so another attempt can retry immediately."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         agent = _delivery_agent_id(agent_id)
         if not isinstance(receipt_ids, list) or not receipt_ids:
             raise ValueError("receipt_ids must be a non-empty list")
@@ -1076,10 +1180,10 @@ def release_spiking_context_deployments(
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid context deployment release for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid context deployment release: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid context deployment release", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("context deployment release failed for context_id=%s", context)
-        return json.dumps({"error": f"context deployment release failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("context deployment release failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -1092,8 +1196,9 @@ def dead_letter_spiking_context_delivery(
 ) -> str:
     """Governedly quarantine one retry-exhausted delivery after lease expiry."""
 
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         agent = _delivery_agent_id(agent_id)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.dead_letter_context_delivery(
@@ -1111,7 +1216,7 @@ def dead_letter_spiking_context_delivery(
             exc,
         )
         return json.dumps(
-            {"error": f"invalid context delivery dead-letter: {exc}"},
+            {"error": _public_error("invalid context delivery dead-letter", exc)},
             sort_keys=True,
         )
     except Exception as exc:
@@ -1120,7 +1225,7 @@ def dead_letter_spiking_context_delivery(
             context,
         )
         return json.dumps(
-            {"error": f"context delivery dead-letter failed: {exc}"},
+            {"error": _public_error("context delivery dead-letter failed", exc)},
             sort_keys=True,
         )
 
@@ -1133,8 +1238,9 @@ def dead_letter_spiking_context_delivery(
 )
 def list_spiking_context_cursors(context_id: str = "default", limit: int = 50) -> str:
     """List durable per-agent context-bus delivery cursors."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         bounded_limit = _validate_limit(limit)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.list_context_cursors(
@@ -1144,10 +1250,10 @@ def list_spiking_context_cursors(context_id: str = "default", limit: int = 50) -
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid context cursor list for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid context cursor list: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid context cursor list", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("context cursor list failed for context_id=%s", context)
-        return json.dumps({"error": f"context cursor list failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("context cursor list failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1167,7 +1273,7 @@ def inspect_spiking_context_delivery_health() -> str:
     except Exception as exc:
         LOGGER.exception("context delivery health inspection failed")
         return json.dumps(
-            {"error": f"context delivery health inspection failed: {exc}"},
+            {"error": _public_error("context delivery health inspection failed", exc)},
             sort_keys=True,
         )
 
@@ -1186,9 +1292,10 @@ def hydrate_spiking_agent_context(
     graph_limit: int = 30,
 ) -> str:
     """Lease an agent-ready context brief; acknowledge returned receipts separately."""
-    context = _sanitize_context_id(context_id)
-    agent = str(agent_id or "").strip() or "<missing>"
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         agent = _delivery_agent_id(agent_id)
         prompt_text = str(prompt or "").strip()
         if len(prompt_text) > 20_000:
@@ -1215,14 +1322,14 @@ def hydrate_spiking_agent_context(
             agent,
             exc,
         )
-        return json.dumps({"error": f"invalid agent context hydration: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid agent context hydration", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception(
             "agent context hydration failed for context_id=%s agent_id=%s",
             context,
             agent,
         )
-        return json.dumps({"error": f"agent context hydration failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("agent context hydration failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1238,9 +1345,11 @@ def enter_spiking_cortex(
     mode: str = "strict",
 ) -> str:
     """Start a governed agent work session with recall, policy, and context-bus deployment."""
-    context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
+        agent = _sanitize_agent_id(agent_id)
         task_text = _validate_text(task, field_name="task")
         _, mlx_backend = _load_backend()
         payload = mlx_backend.enter_spiking_cortex(
@@ -1257,10 +1366,10 @@ def enter_spiking_cortex(
             agent,
             exc,
         )
-        return json.dumps({"error": f"invalid cortex enter: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid cortex enter", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("cortex enter failed for context_id=%s agent_id=%s", context, agent)
-        return json.dumps({"error": f"cortex enter failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("cortex enter failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1281,9 +1390,11 @@ def tick_spiking_cortex(
     confidence: float = 0.5,
 ) -> str:
     """Evaluate the current observation/action against governed memory before proceeding."""
-    context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
+        agent = _sanitize_agent_id(agent_id)
         clean_session_id = str(session_id or "").strip()
         if not clean_session_id:
             raise ValueError("session_id must not be empty")
@@ -1315,10 +1426,10 @@ def tick_spiking_cortex(
             agent,
             exc,
         )
-        return json.dumps({"error": f"invalid cortex tick: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid cortex tick", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("cortex tick failed for context_id=%s agent_id=%s", context, agent)
-        return json.dumps({"error": f"cortex tick failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("cortex tick failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1334,9 +1445,11 @@ def close_spiking_cortex(
     reason: str = "operator-complete",
 ) -> str:
     """End an active governed agent session after verified traces or handoff are captured."""
-    context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
+        agent = _sanitize_agent_id(agent_id)
         clean_session_id = str(session_id or "").strip()
         if not clean_session_id:
             raise ValueError("session_id must not be empty")
@@ -1355,10 +1468,10 @@ def close_spiking_cortex(
             agent,
             exc,
         )
-        return json.dumps({"error": f"invalid cortex close: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid cortex close", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("cortex close failed for context_id=%s agent_id=%s", context, agent)
-        return json.dumps({"error": f"cortex close failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("cortex close failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1378,9 +1491,11 @@ def commit_spiking_cortical_trace(
     confidence: float = -1.0,
 ) -> str:
     """Persist a typed governed memory trace with truth posture and optional evidence."""
-    context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
+        agent = _sanitize_agent_id(agent_id)
         text_value = _validate_text(text, field_name="text")
         evidence = _parse_json_object(evidence_json, field_name="evidence_json")
         confidence_value: float | None = None
@@ -1405,14 +1520,14 @@ def commit_spiking_cortical_trace(
             agent,
             exc,
         )
-        return json.dumps({"error": f"invalid cortical trace commit: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid cortical trace commit", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception(
             "cortical trace commit failed for context_id=%s agent_id=%s",
             context,
             agent,
         )
-        return json.dumps({"error": f"cortical trace commit failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("cortical trace commit failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1429,8 +1544,9 @@ def moderate_spiking_cortical_trace(
     confirm: bool = False,
 ) -> str:
     """Promote, demote, or prune a Cortex Governor trace by memory id."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         clean_memory_id = str(memory_id or "").strip()
         if not clean_memory_id:
             raise ValueError("memory_id is required")
@@ -1451,14 +1567,14 @@ def moderate_spiking_cortical_trace(
             str(memory_id or "").strip(),
             exc,
         )
-        return json.dumps({"error": f"invalid cortical trace moderation: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid cortical trace moderation", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception(
             "cortical trace moderation failed for context_id=%s memory_id=%s",
             context,
             str(memory_id or "").strip(),
         )
-        return json.dumps({"error": f"cortical trace moderation failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("cortical trace moderation failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1473,9 +1589,11 @@ def get_spiking_cortex_state(
     limit: int = 50,
 ) -> str:
     """Inspect active governed sessions and typed cortical memory for a context."""
-    context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id) if str(agent_id or "").strip() else ""
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
+        agent = _sanitize_agent_id(agent_id) if str(agent_id or "").strip() else ""
         bounded_limit = _validate_limit(limit)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.get_cortex_state(
@@ -1491,14 +1609,14 @@ def get_spiking_cortex_state(
             agent or "<all>",
             exc,
         )
-        return json.dumps({"error": f"invalid cortex state request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid cortex state request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception(
             "cortex state request failed for context_id=%s agent_id=%s",
             context,
             agent or "<all>",
         )
-        return json.dumps({"error": f"cortex state request failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("cortex state request failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1517,9 +1635,11 @@ def create_spiking_goal(
     evidence: str = "",
 ) -> str:
     """Create a lightweight goal-ledger trace for the active local context."""
-    context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
+        agent = _sanitize_agent_id(agent_id)
         clean_title = _validate_text(title, field_name="title")
         _, mlx_backend = _load_backend()
         payload = mlx_backend.create_goal(
@@ -1534,10 +1654,10 @@ def create_spiking_goal(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid goal create for context_id=%s agent_id=%s: %s", context, agent, exc)
-        return json.dumps({"error": f"invalid goal create: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid goal create", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("goal create failed for context_id=%s agent_id=%s", context, agent)
-        return json.dumps({"error": f"goal create failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("goal create failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1557,9 +1677,11 @@ def update_spiking_goal(
     evidence: str = "",
 ) -> str:
     """Append an auditable state update to an existing goal-ledger trace."""
-    context = _sanitize_context_id(context_id)
-    agent = _sanitize_agent_id(agent_id)
+    context = "unknown"
+    agent = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
+        agent = _sanitize_agent_id(agent_id)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.update_goal(
             context_id=context,
@@ -1574,10 +1696,10 @@ def update_spiking_goal(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid goal update for context_id=%s agent_id=%s: %s", context, agent, exc)
-        return json.dumps({"error": f"invalid goal update: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid goal update", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("goal update failed for context_id=%s agent_id=%s", context, agent)
-        return json.dumps({"error": f"goal update failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("goal update failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1588,18 +1710,19 @@ def update_spiking_goal(
 )
 def list_spiking_goals(context_id: str = "default", limit: int = 20) -> str:
     """List current goal-ledger state for the active local context."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         bounded_limit = _validate_limit(limit)
         _, mlx_backend = _load_backend()
         payload = mlx_backend.list_goals(context_id=context, limit=bounded_limit)
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid goal list for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid goal list: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid goal list", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("goal list failed for context_id=%s", context)
-        return json.dumps({"error": f"goal list failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("goal list failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1624,7 +1747,7 @@ def profile_spiking_resources(
         return json.dumps(payload, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("resource profile failed")
-        return json.dumps({"error": f"resource profile failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("resource profile failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1656,10 +1779,10 @@ def benchmark_spiking_embedding_provider(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid embedding provider benchmark request: %s", exc)
-        return json.dumps({"error": f"invalid embedding provider benchmark: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid embedding provider benchmark", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("embedding provider benchmark failed")
-        return json.dumps({"error": f"embedding provider benchmark failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("embedding provider benchmark failed", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1693,10 +1816,10 @@ def certify_spiking_runtime(
         return json.dumps(payload, sort_keys=True, default=str)
     except ValueError as exc:
         LOGGER.warning("invalid runtime certification request: %s", exc)
-        return json.dumps({"error": f"invalid runtime certification request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid runtime certification request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("runtime certification failed")
-        return json.dumps({"error": f"runtime certification failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("runtime certification failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -1705,18 +1828,19 @@ def export_spiking_memory(
     output_path: str = "",
 ) -> str:
     """Export persisted memory as JSON, optionally writing to output_path."""
-    context = _sanitize_context_id(context_id)
+    context = "unknown"
     try:
+        context = _sanitize_context_id(context_id)
         path = _optional_output_path(output_path, allowed_suffixes={".json"})
         _, mlx_backend = _load_backend()
         payload = mlx_backend.export_memory(path=path, context_id=context)
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid memory export request for context_id=%s: %s", context, exc)
-        return json.dumps({"error": f"invalid memory export request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid memory export request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("memory export failed for context_id=%s", context)
-        return json.dumps({"error": f"memory export failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("memory export failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -1732,10 +1856,10 @@ def backup_spiking_memory(output_path: str = "") -> str:
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
         LOGGER.warning("invalid memory backup request: %s", exc)
-        return json.dumps({"error": f"invalid memory backup request: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("invalid memory backup request", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("memory backup failed")
-        return json.dumps({"error": f"memory backup failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("memory backup failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -1747,7 +1871,7 @@ def trigger_sleep_consolidation() -> str:
         return json.dumps(status, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("sleep consolidation failed")
-        return f"sleep consolidation failed: {exc}"
+        return _public_error("sleep consolidation failed", exc)
 
 
 @mcp.tool()
@@ -1761,7 +1885,7 @@ def trigger_idle_maintenance(force_deep_sleep: bool = False) -> str:
         return json.dumps(status, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("idle maintenance failed")
-        return json.dumps({"error": f"idle maintenance failed: {exc}"}, sort_keys=True)
+        return json.dumps({"error": _public_error("idle maintenance failed", exc)}, sort_keys=True)
 
 
 if __name__ == "__main__":

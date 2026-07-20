@@ -9,13 +9,18 @@ import sys
 from collections import Counter
 from typing import Any, Callable
 
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    SecretRedactingFormatter,
+    redact_capture_text,
+    reject_sensitive_identifier,
+)
+
 
 LOGGER = logging.getLogger("synapse_s2.event_segmenter")
 if not LOGGER.handlers:
     _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    _handler.setFormatter(SecretRedactingFormatter(SECRET_SAFE_LOG_FORMAT))
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
@@ -66,7 +71,8 @@ EmbeddingFn = Callable[[str], Any]
 
 
 def _safe_tag(value: str) -> str:
-    cleaned = SAFE_TAG_RE.sub("-", str(value or "").strip()).strip(".-_:")
+    raw = reject_sensitive_identifier(value or "", field="source_tag")
+    cleaned = SAFE_TAG_RE.sub("-", raw.strip()).strip(".-_:")
     return (cleaned or "event")[:96]
 
 
@@ -99,12 +105,14 @@ class BayesianSurpriseEventSegmenter:
         context_id: str = "default",
         source_tag: str = "memory",
     ) -> list[dict[str, Any]]:
-        sentences = self._sentences(text)
+        safe_text, input_redactions = redact_capture_text(str(text or ""))
+        context = reject_sensitive_identifier(context_id, field="context_id")
+        sentences = self._sentences(safe_text)
         if not sentences:
             return []
 
         source = _safe_tag(source_tag)
-        sequence_id = _stable_id(context_id, source, " ".join(sentences))
+        sequence_id = _stable_id(context, source, " ".join(sentences))
         segments: list[dict[str, Any]] = []
         current: list[str] = []
         current_tokens: set[str] = set()
@@ -134,7 +142,7 @@ class BayesianSurpriseEventSegmenter:
                 segments.append(
                     self._render_segment(
                         current,
-                        context_id=context_id,
+                        context_id=context,
                         source_tag=source,
                         sequence_id=sequence_id,
                         segment_index=len(segments) + 1,
@@ -172,13 +180,17 @@ class BayesianSurpriseEventSegmenter:
             segments.append(
                 self._render_segment(
                     current,
-                    context_id=context_id,
+                    context_id=context,
                     source_tag=source,
                     sequence_id=sequence_id,
                     segment_index=len(segments) + 1,
                     boundary=boundary,
                 )
             )
+        if input_redactions:
+            for segment in segments:
+                segment["redaction_count"] = int(input_redactions)
+                segment["raw_text_stored"] = False
         return segments
 
     def _sentences(self, text: str) -> list[str]:

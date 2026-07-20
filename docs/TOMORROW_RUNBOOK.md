@@ -47,7 +47,7 @@ Restart Codex, Claude Desktop, and Claude Code after the client-config installer
 
 ## Hardened local contract
 
-- Dashboard HTTP binds to `127.0.0.1` by default. Binding to `0.0.0.0` or another non-loopback interface fails unless `SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD=true` is set intentionally for a controlled LAN demo.
+- Dashboard HTTP is strictly local. Binding to `0.0.0.0` or any non-loopback interface fails; remote access requires a separately authenticated and reviewed gateway.
 - Capture inbox payloads are redacted before the pending file is written. Pending, processed, error, export, backup, runtime, and SQLite paths are created private to the local user where the filesystem permits it.
 - Capture processing refuses symlinks and oversized payloads. It does not follow arbitrary filesystem targets from the inbox.
 - Direct `capture-session`, MCP `capture_spiking_conversation`, context-bus deployments, graph metadata, and returned API payloads all share the same redaction layer.
@@ -367,8 +367,13 @@ Backup:
 
 ```bash
 .venv/bin/python synapse_cli.py --json backup-memory \
-  --output .synapse_s2/manual-memory-backup.sqlite3
+  --output ".synapse_s2/manual-memory-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
 ```
+
+Backup destinations are exclusive: an existing file is never replaced. Every
+successful receipt includes a SHA-256 digest, size, `quick_check: ["ok"]`, and
+zero foreign-key errors. Restore proof is a separate Phase 5 gate; a copied file
+alone is not a verified recovery.
 
 Proposal lifecycle smoke:
 
@@ -449,6 +454,8 @@ Useful tool calls:
 | `drop_spiking_capture_inbox` | Drops opt-in session notes for the always-on local sidecar. |
 | `get_spiking_capture_inbox_status` | Shows pending and processed capture inbox counts. |
 | `process_spiking_capture_inbox` | Manually processes pending capture inbox files; requires `confirm=true`. |
+| `preflight_spiking_capture_error_resolution` | Returns content-free terminal, historical, unsafe, and unresolved error counts plus a revision-bound confirmation token. |
+| `resolve_spiking_capture_errors` | Archives only the reviewed terminal/historical artifacts; requires the matching token, reason, scope, and `confirm=true`. |
 | `list_spiking_memory` | Lists compact persisted memory records. |
 | `list_spiking_memory_graph` | Lists compact records plus graph relationships. |
 | `prune_spiking_memory` | Removes a node, relationship edge, deployment event, or relationship mode. |
@@ -486,6 +493,8 @@ The matrix maps each proposal requirement to implementation evidence and separat
 | `.synapse_s2/runtime_state.json` | Toggle/runtime state. |
 | `.synapse_s2/capture_inbox` | Pending opt-in session payloads and client-session boundary notes for the sidecar. |
 | `.synapse_s2/capture_processed` | Sidecar-processed payloads. |
+| `.synapse_s2/capture_error_archive` | Private governed archive of reviewed terminal or sanitized historical error evidence. |
+| `.synapse_s2/capture_error_resolutions` | Private crash-recoverable manifests for capture-error archival operations. |
 | `.synapse_s2/capture-daemon.log` | Capture sidecar stderr/stdout log. |
 | `.synapse_s2/*backup*.sqlite3` | Local backups. |
 | `/Users/dan.driver/.local/bin/synapse-s2-mcp` | Launcher used by Codex, FastMCP, and inspector tools. |

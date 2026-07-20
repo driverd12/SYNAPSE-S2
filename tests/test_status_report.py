@@ -1,9 +1,75 @@
+from pathlib import Path
+import stat
+from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
-from scripts.synapse_status_report import render_status_markdown, sorted_context_rows
+from scripts.synapse_status_report import (
+    main,
+    render_status_markdown,
+    sorted_context_rows,
+    validate_status_output_path,
+    write_private_status_report,
+)
 
 
 class SynapseStatusReportTests(unittest.TestCase):
+    def test_status_output_rejects_credentials_before_live_collection(self):
+        marker = "SYNTHETIC_ONLY_STATUS_OUTPUT_SECRET_42"
+        with TemporaryDirectory() as tmp:
+            unsafe = Path(tmp) / f"password={marker}" / "status.md"
+            with (
+                mock.patch(
+                    "scripts.synapse_status_report.collect_live_report"
+                ) as collect,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "must not contain credential material",
+                ),
+            ):
+                main(["--output", str(unsafe)])
+
+            collect.assert_not_called()
+            self.assertFalse(unsafe.parent.exists())
+
+            sensitive_parent = Path(tmp) / f"token={marker}"
+            sensitive_parent.mkdir()
+            safe_alias = Path(tmp) / "safe-alias"
+            safe_alias.symlink_to(sensitive_parent, target_is_directory=True)
+            with self.assertRaisesRegex(
+                ValueError,
+                "must not contain credential material",
+            ):
+                validate_status_output_path(safe_alias / "status.md")
+
+    def test_private_status_writer_is_atomic_and_preserves_parent_mode(self):
+        with TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "caller-owned"
+            parent.mkdir(mode=0o755)
+            parent.chmod(0o755)
+            target = validate_status_output_path(parent / "CURRENT_STATUS.md")
+
+            write_private_status_report(target, "first\n")
+
+            self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual(target.read_text(encoding="utf-8"), "first\n")
+
+            with (
+                mock.patch(
+                    "scripts.synapse_status_report.os.replace",
+                    side_effect=OSError("synthetic replace failure"),
+                ),
+                self.assertRaisesRegex(OSError, "synthetic replace failure"),
+            ):
+                write_private_status_report(target, "second\n")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "first\n")
+            self.assertEqual(
+                list(parent.glob(".CURRENT_STATUS.md.*.tmp")),
+                [],
+            )
+
     def test_sorted_context_rows_keeps_default_first(self):
         rows = sorted_context_rows({"servus": 3, "default": 10, "james": 2})
 

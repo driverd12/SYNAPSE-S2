@@ -172,14 +172,20 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 
 ### Hardened Local Operating Contract
 
-- Dashboard HTTP binds to loopback only by default. Non-loopback demos must set `SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD=true` explicitly.
+- Dashboard HTTP is a strictly loopback-only operator API. Non-loopback binds are refused; use an authenticated, separately reviewed gateway if remote access is ever required.
 - Capture inbox drops are redacted before they are written to disk; inbox, processed, error, backup, export, and SQLite files are kept private to the local user where the filesystem permits it.
+- Redaction is recursive across nested metadata and response payloads. Credential-shaped CLI/API identifiers are rejected without reflection, raw-content digest fields are removed before persistence, and public errors expose only sanitized categories.
 - Capture processing rejects symlink payloads and over-large payloads instead of following arbitrary files.
+- Capture commits are exactly-once by `capture_id`: the memory/event/relationship write and capture-operation ledger commit in one transaction, while durable receipt files make post-commit cleanup crash-recoverable.
+- Terminal discard evidence and sanitized historical capture errors remain visible until an operator reviews a content-free preflight and confirms archival. Use `capture-error-preflight` and `capture-error-resolve --confirm`; unsafe or raw-retaining artifacts are never auto-archived.
 - Direct conversation capture, context-bus deployments, graph metadata, and returned API/MCP payloads use the same redaction path, so sanitized storage does not mask a raw response leak.
+- Versioned startup hygiene re-runs stronger detection rules against legacy durable content. Secret-derived memory nodes and their retrieval artifacts are pruned; repairable event/metadata fields are transactionally sanitized; only count-only maintenance receipts are retained.
 - MCP memory and Cortex pruning require explicit `confirm=true`; CLI memory and Cortex pruning require `--confirm`; the dashboard requires a confirmation control before destructive graph operations and governed-trace deletion.
 - `test-validated` Cortex traces require concrete validation evidence such as a test command, test list, output summary, artifact path, commit, or verification report. Dashboard typed-memory defaults stay at `observed` evidence.
 - Spike recall and surface-text recall both use durable SQLite indexes (`memory_spikes` and `memory_surface_terms`) maintained on every memory write, so recall does not need to scan the full memory table as the graph grows.
 - Client config installation refuses malformed existing JSON instead of silently overwriting it.
+- Existing client configs receive private, exclusive, collision-proof backups before atomic replacement. The local MCP bridge starts in a compact control-plane mode and defers dense neural state until a neural tool is actually requested.
+- LaunchAgent installers fence concurrent installs, publish private/fsynced plists, wait for launchd unload/start transitions, probe the authoritative service, and restore the prior definition and policy when a health gate fails.
 
 ### 3. Write and Query Persistent Memory
 
@@ -217,8 +223,12 @@ Inspect, export, and back up the memory store:
   --context default \
   --output .synapse_s2/default-memory-export.json
 .venv/bin/python synapse_cli.py --json backup-memory \
-  --output .synapse_s2/default-memory-backup.sqlite3
+  --output ".synapse_s2/default-memory-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
 ```
+
+Exports publish through a private same-directory temporary file and atomic
+rename. Backups are integrity-checked, fsynced, hashed, and published without
+overwriting an existing path; choose a fresh destination for every backup run.
 
 Audit derived recall indexes before relying on Doctor or after any interrupted,
 disk-full, or legacy write. Audit mode opens the existing database read-only,

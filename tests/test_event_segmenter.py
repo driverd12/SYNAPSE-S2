@@ -80,6 +80,40 @@ class BayesianSurpriseEventSegmenterTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_secret_redaction_precedes_embedding_and_identifier_hashing(self):
+        observed: list[str] = []
+
+        def recording_embedder(sentence: str) -> list[float]:
+            observed.append(sentence)
+            return [1.0, 0.0]
+
+        segmenter = BayesianSurpriseEventSegmenter(
+            surprise_threshold=0.50,
+            min_segment_sentences=1,
+            embedding_fn=recording_embedder,
+        )
+        first_marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+        second_marker = "SYNTHETIC_ONLY_SECRET_VALUE_99"
+
+        first = segmenter.segment(
+            f"Event: password={first_marker} was rotated.",
+            context_id="demo",
+            source_tag="secret-boundary",
+        )
+        second = segmenter.segment(
+            f"Event: password={second_marker} was rotated.",
+            context_id="demo",
+            source_tag="secret-boundary",
+        )
+
+        self.assertTrue(observed)
+        self.assertNotIn(first_marker, " ".join(observed))
+        self.assertNotIn(second_marker, " ".join(observed))
+        self.assertEqual(first[0]["sequence_id"], second[0]["sequence_id"])
+        self.assertEqual(first[0]["segment_id"], second[0]["segment_id"])
+        self.assertIn("[REDACTED_SECRET]", first[0]["text"])
+        self.assertGreaterEqual(first[0]["redaction_count"], 1)
+
     def test_preserves_urls_ips_and_versions_inside_sentences(self):
         segmenter = BayesianSurpriseEventSegmenter(
             surprise_threshold=0.50,

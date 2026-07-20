@@ -8,17 +8,36 @@ import os
 import platform
 import re
 import shlex
-import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from redaction import (
+    SecretSafeArgumentParser,
+    redact_capture_text,
+    redact_sensitive_value,
+    reject_sensitive_identifier,
+    strip_untrusted_raw_digest_fields,
+)
+
+
 DEFAULT_LAUNCHER = Path.home() / ".local" / "bin" / "synapse-s2-mcp"
 DEFAULT_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RAW_DIGEST_TEXT_RE = re.compile(
+    r"(?i)(?:['\"]?)(?:input_sha256|raw_input_sha256|raw_sha256|"
+    r"raw_text_sha256|payload_sha256|source_text_sha256|"
+    r"raw_[A-Za-z0-9_-]*sha(?:256)?)(?:['\"]?)\s*[:=]\s*"
+    r"(?:['\"](?:\\.|[^'\"\\])*['\"]|[^\s,;}\]]+)"
+)
 REQUIRED_PROOFS = [
     "client_config",
     "mcp_connect",
@@ -76,16 +95,179 @@ def safe_filename(value: str) -> str:
     return cleaned or "artifact"
 
 
+def validate_run_id(value: Any) -> str:
+    raw = reject_sensitive_identifier(value, field="readiness run_id").strip()
+    if raw in {"", ".", ".."} or RUN_ID_RE.fullmatch(raw) is None:
+        raise ValueError(
+            "readiness run_id must be one safe basename component"
+        )
+    return raw
+
+
+def validate_evidence_path(value: Any, *, field: str) -> Path:
+    raw = reject_sensitive_identifier(value, field=field).strip()
+    if not raw:
+        raise ValueError(f"{field} must not be empty")
+    resolved = Path(raw).expanduser().resolve()
+    reject_sensitive_identifier(resolved, field=field)
+    return resolved
+
+
 def compact_text(value: Any, *, limit: int = 240) -> str:
-    text = " ".join(str(value or "").split())
+    text = " ".join(sanitize_evidence_text(value).split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def sanitize_evidence_text(value: Any) -> str:
+    redacted, _ = redact_capture_text(str(value or ""))
+    return RAW_DIGEST_TEXT_RE.sub("[REMOVED_RAW_DIGEST_FIELD]", redacted)
+
+
+def sanitize_json_string_values(value: Any) -> Any:
+    """Sanitize string values before JSON serialization, never its syntax."""
+
+    if isinstance(value, str):
+        return sanitize_evidence_text(value)
+    if isinstance(value, dict):
+        return {
+            key: sanitize_json_string_values(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_json_string_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_json_string_values(item) for item in value)
+    return value
+
+
 def json_safe(value: Any) -> Any:
+    safe_value, _ = redact_sensitive_value(value)
+    safe_value, _ = strip_untrusted_raw_digest_fields(safe_value)
+    safe_value = sanitize_json_string_values(safe_value)
     try:
-        return json.loads(json.dumps(value, default=str))
-    except Exception:
-        return str(value)
+        return json.loads(json.dumps(safe_value, allow_nan=False))
+    except (TypeError, ValueError):
+        return "[UNSERIALIZABLE]"
+
+
+def write_private_text(path: Path, text: str) -> None:
+    ensure_private_directory(path.parent)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        path.chmod(0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_private_evidence_zip(
+    archive_path: Path,
+    *,
+    pack_dir: Path,
+    members: set[Path],
+) -> None:
+    """Atomically create a private ZIP from this run's explicit file set."""
+
+    root = pack_dir.resolve()
+    ensure_private_directory(archive_path.parent)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{archive_path.name}.",
+        suffix=".tmp",
+        dir=str(archive_path.parent),
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.close(descriptor)
+        descriptor = -1
+        with zipfile.ZipFile(
+            temp_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            for member in sorted(members, key=lambda item: str(item)):
+                if member.is_symlink() or not member.is_file():
+                    raise ValueError("evidence ZIP members must be regular files")
+                resolved = member.resolve(strict=True)
+                try:
+                    relative = resolved.relative_to(root)
+                except ValueError as exc:
+                    raise ValueError(
+                        "evidence ZIP member escapes the run directory"
+                    ) from exc
+                info = zipfile.ZipInfo(str(relative))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o600 << 16
+                source_text = resolved.read_text(encoding="utf-8")
+                if resolved.suffix == ".json":
+                    source_payload = json.loads(source_text)
+                    archived_text = json.dumps(
+                        json_safe(source_payload),
+                        indent=2,
+                        sort_keys=True,
+                    ) + "\n"
+                elif resolved.suffix in {".txt", ".md"}:
+                    archived_text = sanitize_evidence_text(source_text)
+                else:
+                    raise ValueError(
+                        "evidence ZIP members must use JSON, text, or Markdown"
+                    )
+                archive.writestr(info, archived_text.encode("utf-8"))
+        with temp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, archive_path)
+        archive_path.chmod(0o600)
+        directory_fd = os.open(archive_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def ensure_private_directory(path: Path) -> None:
+    """Create missing evidence directories privately; preserve existing modes."""
+
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            if not directory.is_dir():
+                raise
 
 
 def parse_json_stdout(stdout: str) -> Any:
@@ -207,19 +389,66 @@ class OperatorReadinessCertifier:
         self.args = args
         self.context = sanitize_context(args.context)
         self.agent_id = sanitize_agent(args.agent_id)
-        self.run_id = args.run_id or f"operator-readiness-{time.strftime('%Y%m%d-%H%M%S')}"
-        output_root = Path(args.output_dir).expanduser()
-        self.pack_dir = (output_root / self.run_id).resolve()
+        self.run_id = validate_run_id(
+            args.run_id
+            or f"operator-readiness-{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+        self.output_root = validate_evidence_path(
+            args.output_dir,
+            field="readiness output_dir",
+        ).resolve()
+        self.pack_dir = (self.output_root / self.run_id).resolve()
+        try:
+            relative_pack = self.pack_dir.relative_to(self.output_root)
+        except ValueError as exc:  # pragma: no cover - RUN_ID_RE is fail-closed
+            raise ValueError("readiness run directory escapes output_dir") from exc
+        if len(relative_pack.parts) != 1:
+            raise ValueError("readiness run directory must be a direct output_dir child")
         self.artifact_dir = self.pack_dir / "artifacts"
+        self.archive_path = self.output_root / f"{self.run_id}.zip"
+        self._evidence_files: set[Path] = set()
         # Keep the venv shim path intact. Resolving it follows uv's interpreter
         # symlink and bypasses the virtualenv site-packages.
         self.python = str(ROOT / ".venv" / "bin" / "python")
-        self.launcher = Path(args.launcher).expanduser()
+        self.launcher = validate_evidence_path(
+            args.launcher,
+            field="readiness launcher path",
+        ).resolve()
+        self.args.embedding_provider = reject_sensitive_identifier(
+            args.embedding_provider,
+            field="readiness embedding provider",
+        ).strip()
+        if not self.args.embedding_provider:
+            raise ValueError("readiness embedding provider must not be empty")
+        self.args.neural_model = reject_sensitive_identifier(
+            args.neural_model,
+            field="readiness neural model",
+        ).strip()
+        if not self.args.neural_model:
+            raise ValueError("readiness neural model must not be empty")
+        self.args.neural_cache_dir = str(
+            validate_evidence_path(
+                args.neural_cache_dir,
+                field="readiness neural cache path",
+            )
+        )
+        self.args.app_name = reject_sensitive_identifier(
+            args.app_name,
+            field="readiness app name",
+        ).strip()
         self.results: list[CheckResult] = []
         self.metadata: dict[str, Any] = {}
 
     def run(self) -> dict[str, Any]:
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        if self.pack_dir.exists() or self.pack_dir.is_symlink():
+            raise FileExistsError("readiness run directory already exists")
+        if self.args.zip and (
+            self.archive_path.exists() or self.archive_path.is_symlink()
+        ):
+            raise FileExistsError("readiness archive already exists")
+        ensure_private_directory(self.output_root)
+        self.pack_dir.mkdir(mode=0o700)
+        self.artifact_dir.mkdir(mode=0o700)
         self.metadata = self._run_metadata()
         self._write_json(self.artifact_dir / "run_metadata.json", self.metadata)
 
@@ -319,14 +548,16 @@ class OperatorReadinessCertifier:
         repair: str = "",
         metrics: dict[str, Any] | None = None,
     ) -> CheckResult:
+        safe_detail = sanitize_evidence_text(detail)
+        safe_repair = sanitize_evidence_text(repair)
         result = CheckResult(
             check_id=check_id,
             label=label,
             status=status,
             required=required,
-            detail=detail,
-            repair=repair,
-            metrics=metrics or {},
+            detail=safe_detail,
+            repair=safe_repair,
+            metrics=json_safe(metrics or {}),
         )
         self.results.append(result)
         return result
@@ -371,26 +602,36 @@ class OperatorReadinessCertifier:
         prefix = self.artifact_dir / safe_filename(check_id)
         stdout_path = prefix.with_suffix(".stdout.txt")
         stderr_path = prefix.with_suffix(".stderr.txt")
-        stdout_path.write_text(stdout, encoding="utf-8")
-        stderr_path.write_text(stderr, encoding="utf-8")
-        paths["stdout"] = str(stdout_path)
-        paths["stderr"] = str(stderr_path)
+        safe_stdout = sanitize_evidence_text(stdout)
+        safe_stderr = sanitize_evidence_text(stderr)
 
         if stdout.strip():
             try:
-                parsed = parse_json_stdout(stdout)
+                parsed = json_safe(parse_json_stdout(stdout))
+                safe_stdout = json.dumps(
+                    parsed,
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n"
                 parsed_path = prefix.with_suffix(".parsed.json")
                 self._write_json(parsed_path, parsed)
                 paths["parsed"] = str(parsed_path)
             except Exception:
                 parsed = None
 
+        self._write_text(stdout_path, safe_stdout)
+        self._write_text(stderr_path, safe_stderr)
+        paths["stdout"] = str(stdout_path)
+        paths["stderr"] = str(stderr_path)
+
         status, detail, repair, metrics = evaluator(
             -1 if returncode is None else int(returncode),
             parsed,
-            stdout,
-            stderr,
+            safe_stdout,
+            safe_stderr,
         )
+        detail = sanitize_evidence_text(detail)
+        repair = sanitize_evidence_text(repair)
         result = CheckResult(
             check_id=check_id,
             label=label,
@@ -403,7 +644,7 @@ class OperatorReadinessCertifier:
             duration_ms=duration_ms,
             artifact_paths=paths,
             parsed=parsed,
-            metrics=metrics,
+            metrics=json_safe(metrics),
         )
         self.results.append(result)
         return result
@@ -970,18 +1211,30 @@ class OperatorReadinessCertifier:
                     {},
                 )
             warnings = list(parsed.get("warnings") or [])
-            ready = bool(parsed.get("index_loaded")) and bool(parsed.get("ready")) and not warnings
+            ready = (
+                bool(parsed.get("index_loaded"))
+                and bool(parsed.get("ready"))
+                and bool(parsed.get("graph_loaded"))
+                and bool(parsed.get("namespace_map_loaded"))
+                and not warnings
+            )
             status = "ready" if ready else "blocked"
             repair = "Fix dashboard warnings or failed asset/API checks before relying on the UI." if not ready else ""
             return (
                 status,
-                f"Dashboard smoke loaded index={parsed.get('index_loaded')} ready={parsed.get('ready')} warnings={len(warnings)}.",
+                "Dashboard smoke loaded "
+                f"index={parsed.get('index_loaded')} graph={parsed.get('graph_loaded')} "
+                f"galaxy={parsed.get('namespace_map_loaded')} ready={parsed.get('ready')} "
+                f"warnings={len(warnings)}.",
                 repair,
                 {
                     "url": parsed.get("url"),
                     "warnings": warnings,
                     "memory_entries": parsed.get("memory_entries"),
                     "relationships": parsed.get("relationships"),
+                    "graph_loaded": parsed.get("graph_loaded"),
+                    "namespace_map_loaded": parsed.get("namespace_map_loaded"),
+                    "namespace_count": parsed.get("namespace_count"),
                     "js_syntax_ok": parsed.get("js_syntax_ok"),
                 },
             )
@@ -999,41 +1252,58 @@ class OperatorReadinessCertifier:
         overall_status = classify_overall(self.results)
         required = [result for result in self.results if result.required]
         failed_required = [result for result in required if result.status != "ready"]
-        manifest = {
-            **self.metadata,
-            "overall_status": overall_status,
-            "operator_trustworthy": overall_status == "ready",
-            "required_ready": len(required) - len(failed_required),
-            "required_total": len(required),
-            "failed_required": [result.check_id for result in failed_required],
-            "checks": [result.to_manifest() for result in self.results],
-            "proofs": self._proof_summary(),
-        }
+        manifest = json_safe(
+            {
+                **self.metadata,
+                "overall_status": overall_status,
+                "operator_trustworthy": overall_status == "ready",
+                "required_ready": len(required) - len(failed_required),
+                "required_total": len(required),
+                "failed_required": [
+                    result.check_id for result in failed_required
+                ],
+                "checks": [result.to_manifest() for result in self.results],
+                "proofs": self._proof_summary(),
+            }
+        )
+        if not isinstance(manifest, dict):  # pragma: no cover - static shape
+            raise RuntimeError("readiness manifest sanitization failed")
         manifest_path = self.pack_dir / "manifest.json"
         summary_path = self.pack_dir / "summary.md"
         runbook_path = self.pack_dir / "runbook.md"
         self._write_json(manifest_path, manifest)
-        summary_path.write_text(render_summary_markdown(manifest, self.results), encoding="utf-8")
-        runbook_path.write_text(render_runbook_markdown(manifest), encoding="utf-8")
-        archive_path = ""
-        if self.args.zip:
-            archive_path = shutil.make_archive(str(self.pack_dir), "zip", root_dir=self.pack_dir)
-        result = {
-            "action": "operator-readiness-certification",
-            "run_id": self.run_id,
-            "context_id": self.context,
-            "overall_status": overall_status,
-            "operator_trustworthy": overall_status == "ready",
-            "pack_dir": str(self.pack_dir),
-            "manifest_path": str(manifest_path),
-            "summary_path": str(summary_path),
-            "runbook_path": str(runbook_path),
-            "archive_path": archive_path,
-            "failed_required": manifest["failed_required"],
-            "required_ready": manifest["required_ready"],
-            "required_total": manifest["required_total"],
-        }
+        self._write_text(
+            summary_path,
+            render_summary_markdown(manifest, self.results),
+        )
+        self._write_text(runbook_path, render_runbook_markdown(manifest))
+        archive_path = str(self.archive_path) if self.args.zip else ""
+        result = json_safe(
+            {
+                "action": "operator-readiness-certification",
+                "run_id": self.run_id,
+                "context_id": self.context,
+                "overall_status": overall_status,
+                "operator_trustworthy": overall_status == "ready",
+                "pack_dir": str(self.pack_dir),
+                "manifest_path": str(manifest_path),
+                "summary_path": str(summary_path),
+                "runbook_path": str(runbook_path),
+                "archive_path": archive_path,
+                "failed_required": manifest["failed_required"],
+                "required_ready": manifest["required_ready"],
+                "required_total": manifest["required_total"],
+            }
+        )
+        if not isinstance(result, dict):  # pragma: no cover - static shape
+            raise RuntimeError("readiness result sanitization failed")
         self._write_json(self.pack_dir / "result.json", result)
+        if self.args.zip:
+            write_private_evidence_zip(
+                self.archive_path,
+                pack_dir=self.pack_dir,
+                members=set(self._evidence_files),
+            )
         return result
 
     def _proof_summary(self) -> dict[str, Any]:
@@ -1047,17 +1317,35 @@ class OperatorReadinessCertifier:
         return proofs
 
     def _write_json(self, path: Path, payload: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
+        self._write_artifact(
+            path,
+            json.dumps(json_safe(payload), indent=2, sort_keys=True) + "\n",
+        )
+
+    def _write_text(self, path: Path, text: str) -> None:
+        self._write_artifact(path, sanitize_evidence_text(text))
+
+    def _write_artifact(self, path: Path, text: str) -> None:
+        candidate = path.resolve(strict=False)
+        try:
+            relative = candidate.relative_to(self.pack_dir)
+        except ValueError as exc:
+            raise ValueError("evidence artifact escapes the run directory") from exc
+        if not relative.parts:
+            raise ValueError("evidence artifact path must name a file")
+        write_private_text(candidate, text)
+        self._evidence_files.add(candidate)
 
 
 def sanitize_context(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value or "").strip()).strip("._-:")
+    raw = reject_sensitive_identifier(value, field="readiness context_id")
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "_", raw.strip()).strip("._-:")
     return (cleaned or "default")[:128]
 
 
 def sanitize_agent(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.:@-]+", "_", str(value or "").strip()).strip("._-:@")
+    raw = reject_sensitive_identifier(value, field="readiness agent_id")
+    cleaned = re.sub(r"[^A-Za-z0-9_.:@-]+", "_", raw.strip()).strip("._-:@")
     return (cleaned or "codex-desktop")[:128]
 
 
@@ -1161,7 +1449,7 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = SecretSafeArgumentParser(
         description="Produce a single SYNAPSE-S2 operator readiness evidence pack."
     )
     parser.add_argument("--context", default="default")

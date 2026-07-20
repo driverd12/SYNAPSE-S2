@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import json
@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,21 +17,31 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from capture_daemon import redact_capture_text
 import mlx_backend
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    SecretRedactingFormatter,
+    SecretSafeArgumentParser,
+    redact_capture_text,
+    redact_sensitive_value,
+    reject_sensitive_identifier,
+    safe_public_error,
+    strip_untrusted_raw_digest_fields,
+)
 
 
 LOGGER = logging.getLogger("synapse_s2.transcript_capture")
 if not LOGGER.handlers:
     _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    _handler.setFormatter(SecretRedactingFormatter(SECRET_SAFE_LOG_FORMAT))
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
 
 MAX_TRANSCRIPT_DELTA_BYTES = 256_000
+MAX_TRANSCRIPT_STATE_BYTES = 8_000_000
+SOURCE_STATE_VERSION = 3
+APP_STATE_VERSION = 1
 SOURCE_INSTANCE_ID_RE = re.compile(r"s2src_[0-9a-f]{32}")
 APP_DETECT_SYSTEM_EVENTS_TIMEOUT_SECONDS = float(
     os.getenv("SYNAPSE_S2_APP_DETECT_TIMEOUT_SECONDS", "12.0")
@@ -62,13 +73,33 @@ SENSITIVE_PATH_FRAGMENTS = {
     "secret",
     "secrets",
 }
+SENSITIVE_CREDENTIAL_STORE_PARTS = {
+    ".aws",
+    ".azure",
+    ".docker",
+    ".kube",
+    "gcloud",
+    "google-cloud-sdk",
+}
+SENSITIVE_CREDENTIAL_FILENAMES = {
+    ".dockercfg",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "accesstokens.json",
+    "application_default_credentials.json",
+    "azureprofile.json",
+}
 
 
 def resolve_capture_root(root: str | os.PathLike[str] | None = None) -> Path:
     if root is not None:
+        reject_sensitive_identifier(root, field="capture_root")
         return Path(root).expanduser().resolve()
     configured = os.getenv("SYNAPSE_S2_CAPTURE_ROOT")
     if configured:
+        reject_sensitive_identifier(configured, field="capture_root")
         return Path(configured).expanduser().resolve()
     return (Path.cwd() / ".synapse_s2").resolve()
 
@@ -116,11 +147,15 @@ def _exclusive_file_lock(
 ) -> Iterator[bool]:
     """Hold a private advisory lock for the complete protected operation."""
 
+    parent_existed = path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
+    # The capture root may be a caller-owned shared directory. Tighten only a
+    # directory that SYNAPSE created; never silently chmod an existing parent.
+    if not parent_existed:
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -129,6 +164,9 @@ def _exclusive_file_lock(
     descriptor = os.open(path, flags, 0o600)
     acquired = False
     try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError("transcript lock must be a regular file")
         os.fchmod(descriptor, 0o600)
         lock_flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
         try:
@@ -144,17 +182,208 @@ def _exclusive_file_lock(
         os.close(descriptor)
 
 
-def _json_safe(value: Any, fallback: Any) -> Any:
+def _source_stat_snapshot(stat_result: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_size),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+    )
+
+
+@contextmanager
+def _open_stable_transcript_source(
+    path: Path,
+) -> Iterator[tuple[int, os.stat_result, list[dict[str, int]]]]:
+    """Open a source by descriptor-relative no-follow traversal."""
+
+    if not path.is_absolute():
+        raise ValueError("transcript source path must be absolute")
+
+    common_flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        common_flags |= os.O_CLOEXEC
+    directory_flags = common_flags
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    root_fd = os.open(path.anchor or os.sep, directory_flags)
+    parent_fd = root_fd
+    parent_chain: list[dict[str, int]] = []
+    root_stat = os.fstat(root_fd)
+    parent_chain.append(
+        {"device": int(root_stat.st_dev), "inode": int(root_stat.st_ino)}
+    )
+    descriptor = -1
     try:
-        return json.loads(json.dumps(value, default=str))
-    except Exception:
+        for component in path.parent.parts[1:]:
+            next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            opened_parent = os.fstat(next_fd)
+            if not stat.S_ISDIR(opened_parent.st_mode):
+                os.close(next_fd)
+                raise ValueError("transcript source ancestor must remain a directory")
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
+            parent_chain.append(
+                {
+                    "device": int(opened_parent.st_dev),
+                    "inode": int(opened_parent.st_ino),
+                }
+            )
+
+        observed = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+            raise ValueError("transcript source must remain a regular non-symlink file")
+
+        file_flags = common_flags
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            file_flags |= os.O_NONBLOCK
+        descriptor = os.open(path.name, file_flags, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("transcript source must remain a regular file")
+        if _source_stat_snapshot(opened) != _source_stat_snapshot(observed):
+            raise ValueError("transcript source changed between validation and open")
+        yield descriptor, opened, parent_chain
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def _read_descriptor_range(descriptor: int, *, start: int, length: int) -> bytes:
+    os.lseek(descriptor, max(0, int(start)), os.SEEK_SET)
+    remaining = max(0, int(length))
+    chunks: list[bytes] = []
+    while remaining:
+        try:
+            chunk = os.read(descriptor, remaining)
+        except InterruptedError:
+            continue
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _json_safe(value: Any, fallback: Any) -> Any:
+    safe_value, _ = redact_sensitive_value(value)
+    safe_value, _ = strip_untrusted_raw_digest_fields(safe_value)
+    try:
+        return json.loads(json.dumps(safe_value, allow_nan=False))
+    except (TypeError, ValueError):
         return fallback
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Durably replace a private JSON cache without shared temporary names."""
+def _identifier_is_safe(value: Any, *, field: str) -> bool:
+    try:
+        reject_sensitive_identifier(str(value or ""), field=field)
+    except ValueError:
+        return False
+    return True
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+
+def _read_private_regular_bytes(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[bytes | None, os.stat_result | None]:
+    """Read a bounded private file without following its final path component."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise RuntimeError(f"{label} must be a regular non-symlink file")
+    if int(observed.st_size) > MAX_TRANSCRIPT_STATE_BYTES:
+        raise RuntimeError(f"{label} exceeds the supported size limit")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError(f"{label} must remain a regular file")
+        if (int(opened.st_dev), int(opened.st_ino)) != (
+            int(observed.st_dev),
+            int(observed.st_ino),
+        ):
+            raise RuntimeError(f"{label} changed between validation and open")
+        if int(opened.st_size) > MAX_TRANSCRIPT_STATE_BYTES:
+            raise RuntimeError(f"{label} exceeds the supported size limit")
+        chunks: list[bytes] = []
+        remaining = int(opened.st_size)
+        while remaining:
+            try:
+                chunk = os.read(descriptor, min(remaining, 1_048_576))
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if _source_stat_snapshot(after) != _source_stat_snapshot(opened):
+            raise RuntimeError(f"{label} changed while being read")
+        if len(raw) != int(opened.st_size):
+            raise RuntimeError(f"{label} changed while being read")
+        return raw, opened
+    finally:
+        os.close(descriptor)
+
+
+def _read_private_json_document(
+    path: Path,
+    *,
+    default: dict[str, Any],
+    label: str,
+) -> tuple[dict[str, Any], bytes | None, os.stat_result | None]:
+    raw, opened = _read_private_regular_bytes(path, label=label)
+    if raw is None:
+        return dict(default), None, None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{label} must contain a JSON object")
+    return parsed, raw, opened
+
+
+def _assert_private_replace_target(path: Path) -> None:
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise RuntimeError("private state target must be a regular non-symlink file")
+
+
+def _atomic_write_private_bytes(path: Path, payload: bytes) -> None:
+    """Durably replace a private regular file without retaining a backup."""
+
+    _assert_private_replace_target(path)
+
+    parent_existed = path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not parent_existed:
+        os.chmod(path.parent, 0o700)
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -163,14 +392,13 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     temp_path = Path(temp_name)
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
-            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
-            handle.write("\n")
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        _assert_private_replace_target(path)
         os.replace(temp_path, path)
-        os.chmod(path, 0o600)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -183,6 +411,20 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             temp_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Durably replace a private JSON cache without shared temporary names."""
+
+    serialized = (
+        json.dumps(
+            _json_safe(payload, {}),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    _atomic_write_private_bytes(path, serialized)
 
 
 class TranscriptCaptureManager:
@@ -201,6 +443,10 @@ class TranscriptCaptureManager:
         app_snapshot_provider: Callable[[dict[str, Any]], str] | None = None,
     ) -> None:
         self.root = resolve_capture_root(root)
+        # Legacy state repair is the only read-to-write transition. Normal
+        # state reads below are deliberately side-effect-free, so a stale
+        # reader can never overwrite a newer cursor or connection commit.
+        self._migrate_legacy_state()
         self.backend = backend or mlx_backend.get_backend()
         self.running_app_provider = running_app_provider or self._detect_running_apps_macos
         self.app_snapshot_provider = app_snapshot_provider or self._snapshot_app_accessibility
@@ -213,6 +459,7 @@ class TranscriptCaptureManager:
             "source_lock_dir": self.root / "transcript_source_locks",
             "source_lineage_dir": self.root / "transcript_source_lineages",
             "app_state_path": self.root / "app_connections.json",
+            "app_state_lock_path": self.root / ".app_connections.lock",
         }
 
     def _source_lock_path(self, source_id: str) -> Path:
@@ -222,6 +469,288 @@ class TranscriptCaptureManager:
     def _source_lineage_path(self, source_id: str) -> Path:
         digest = hashlib.sha256(str(source_id).encode("utf-8")).hexdigest()[:32]
         return self.paths()["source_lineage_dir"] / f"{digest}.json"
+
+    def _migration_source_lock_path(self, source_id: str) -> Path:
+        if not _identifier_is_safe(source_id, field="source_id"):
+            # Do not create a durable equality oracle by hashing a credential-
+            # shaped legacy identifier into a new lock filename.
+            return self.paths()["source_lock_dir"] / ".unsafe-legacy-source.lock"
+        return self._source_lock_path(source_id)
+
+    def _canonicalize_source_state(
+        self,
+        parsed: dict[str, Any],
+    ) -> tuple[dict[str, Any], set[str]]:
+        raw_sources = parsed.get("sources")
+        clean_sources: dict[str, dict[str, Any]] = {}
+        lineage_delete_ids: set[str] = set()
+        if isinstance(raw_sources, dict):
+            for raw_key, raw_source in raw_sources.items():
+                source_id = str(raw_key or "")
+                if not source_id:
+                    continue
+                if not isinstance(raw_source, dict):
+                    lineage_delete_ids.add(source_id)
+                    continue
+                identity_values = (
+                    (source_id, "source_id"),
+                    (raw_source.get("source_id"), "source_id"),
+                    (raw_source.get("path"), "transcript source path"),
+                    (raw_source.get("context_id"), "context_id"),
+                    (raw_source.get("source_tag"), "source_tag"),
+                    (raw_source.get("speaker"), "speaker"),
+                )
+                if any(
+                    not _identifier_is_safe(value, field=field)
+                    for value, field in identity_values
+                ):
+                    lineage_delete_ids.add(source_id)
+                    continue
+                if str(raw_source.get("source_id") or "") != source_id:
+                    lineage_delete_ids.add(source_id)
+                    continue
+                safe_source = _json_safe(raw_source, {})
+                if isinstance(safe_source, dict):
+                    clean_sources[source_id] = safe_source
+        return {
+            "version": SOURCE_STATE_VERSION,
+            "sources": clean_sources,
+        }, lineage_delete_ids
+
+    def _canonicalize_app_state(self, parsed: dict[str, Any]) -> dict[str, Any]:
+        raw_connections = parsed.get("connections")
+        clean_connections: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_connections, dict):
+            for raw_key, raw_connection in raw_connections.items():
+                connection_id = str(raw_key or "")
+                if not isinstance(raw_connection, dict) or not connection_id:
+                    continue
+                identity_values = (
+                    (connection_id, "connection_id"),
+                    (raw_connection.get("connection_id"), "connection_id"),
+                    (raw_connection.get("app_name"), "app_name"),
+                    (raw_connection.get("bundle_id"), "bundle_id"),
+                    (raw_connection.get("context_id"), "context_id"),
+                    (raw_connection.get("source_tag"), "source_tag"),
+                    (raw_connection.get("speaker"), "speaker"),
+                )
+                if any(
+                    not _identifier_is_safe(value, field=field)
+                    for value, field in identity_values
+                    if value not in (None, "")
+                ):
+                    continue
+                if str(raw_connection.get("connection_id") or "") != connection_id:
+                    continue
+                safe_connection = _json_safe(raw_connection, {})
+                if isinstance(safe_connection, dict):
+                    clean_connections[connection_id] = safe_connection
+        return {
+            "version": APP_STATE_VERSION,
+            "connections": clean_connections,
+        }
+
+    def _read_source_state_document(
+        self,
+    ) -> tuple[dict[str, Any], bytes | None, os.stat_result | None]:
+        return _read_private_json_document(
+            self.paths()["source_state_path"],
+            default={"version": SOURCE_STATE_VERSION, "sources": {}},
+            label="transcript source state",
+        )
+
+    def _read_app_state_document(
+        self,
+    ) -> tuple[dict[str, Any], bytes | None, os.stat_result | None]:
+        return _read_private_json_document(
+            self.paths()["app_state_path"],
+            default={"version": APP_STATE_VERSION, "connections": {}},
+            label="app connection state",
+        )
+
+    @staticmethod
+    def _requires_private_rewrite(
+        parsed: dict[str, Any],
+        canonical: dict[str, Any],
+        opened: os.stat_result | None,
+    ) -> bool:
+        return bool(
+            parsed != canonical
+            or (opened is not None and stat.S_IMODE(opened.st_mode) != 0o600)
+        )
+
+    def _rollback_state_bytes(self, path: Path, original: bytes | None) -> None:
+        if original is None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return
+        _atomic_write_private_bytes(path, original)
+
+    def _replace_migrated_state(
+        self,
+        *,
+        path: Path,
+        canonical: dict[str, Any],
+        original: bytes | None,
+        label: str,
+    ) -> None:
+        """Replace and verify migrated state with an in-memory rollback image."""
+
+        try:
+            _atomic_write_json(path, canonical)
+            verified, _, verified_stat = _read_private_json_document(
+                path,
+                default={},
+                label=label,
+            )
+            if verified != canonical or verified_stat is None:
+                raise RuntimeError(f"{label} migration verification failed")
+            if stat.S_IMODE(verified_stat.st_mode) != 0o600:
+                raise RuntimeError(f"{label} migration is not private")
+        except BaseException:
+            try:
+                self._rollback_state_bytes(path, original)
+            except BaseException as rollback_exc:
+                raise RuntimeError(f"{label} migration rollback failed") from rollback_exc
+            raise
+
+    def _read_lineage_rollback_image(self, path: Path) -> bytes | None:
+        try:
+            observed = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(observed.st_mode):
+            # Never follow or recreate an attacker-controlled lineage symlink.
+            return None
+        if not stat.S_ISREG(observed.st_mode):
+            raise RuntimeError("transcript source lineage must be a regular file")
+        raw, _ = _read_private_regular_bytes(
+            path,
+            label="transcript source lineage",
+        )
+        return raw
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            return
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _migrate_legacy_source_state(self) -> None:
+        """Idempotently canonicalize source state under source-to-state locks."""
+
+        for _attempt in range(8):
+            observed, _, _ = self._read_source_state_document()
+            _, candidates = self._canonicalize_source_state(observed)
+            with ExitStack() as locks:
+                source_lock_paths = sorted(
+                    {
+                        self._migration_source_lock_path(source_id)
+                        for source_id in candidates
+                    },
+                    key=str,
+                )
+                for source_lock_path in source_lock_paths:
+                    acquired = locks.enter_context(
+                        _exclusive_file_lock(
+                            source_lock_path,
+                            blocking=True,
+                        )
+                    )
+                    if not acquired:  # pragma: no cover - blocking lock acquires
+                        raise RuntimeError("failed to acquire transcript source lock")
+                state_acquired = locks.enter_context(
+                    _exclusive_file_lock(
+                        self.paths()["source_state_lock_path"],
+                        blocking=True,
+                    )
+                )
+                if not state_acquired:  # pragma: no cover - blocking lock acquires
+                    raise RuntimeError("failed to acquire transcript state lock")
+
+                parsed, original, opened = self._read_source_state_document()
+                canonical, current_candidates = self._canonicalize_source_state(parsed)
+                if not current_candidates.issubset(candidates):
+                    continue
+                needs_rewrite = self._requires_private_rewrite(
+                    parsed,
+                    canonical,
+                    opened,
+                )
+                if not needs_rewrite and not current_candidates:
+                    return
+
+                lineage_images: dict[Path, bytes | None] = {}
+                deleted_paths: list[Path] = []
+                try:
+                    # Remove unusable lineage first. If the process stops before
+                    # the aggregate write, the next initialization rechecks and
+                    # finishes the same idempotent repair.
+                    for source_id in sorted(current_candidates):
+                        lineage_path = self._source_lineage_path(source_id)
+                        try:
+                            os.lstat(lineage_path)
+                        except FileNotFoundError:
+                            continue
+                        lineage_images[lineage_path] = self._read_lineage_rollback_image(
+                            lineage_path
+                        )
+                        lineage_path.unlink()
+                        deleted_paths.append(lineage_path)
+                    if deleted_paths:
+                        self._fsync_directory(self.paths()["source_lineage_dir"])
+                    if needs_rewrite:
+                        self._replace_migrated_state(
+                            path=self.paths()["source_state_path"],
+                            canonical=canonical,
+                            original=original,
+                            label="transcript source state",
+                        )
+                except BaseException:
+                    for lineage_path in deleted_paths:
+                        rollback_image = lineage_images.get(lineage_path)
+                        if rollback_image is not None:
+                            _atomic_write_private_bytes(lineage_path, rollback_image)
+                    if deleted_paths:
+                        self._fsync_directory(self.paths()["source_lineage_dir"])
+                    raise
+                return
+        raise RuntimeError("transcript source migration could not stabilize state")
+
+    def _migrate_legacy_app_state(self) -> None:
+        with _exclusive_file_lock(
+            self.paths()["app_state_lock_path"],
+            blocking=True,
+        ) as acquired:
+            if not acquired:  # pragma: no cover - blocking lock acquires
+                raise RuntimeError("failed to acquire app connection state lock")
+            parsed, original, opened = self._read_app_state_document()
+            canonical = self._canonicalize_app_state(parsed)
+            if not self._requires_private_rewrite(parsed, canonical, opened):
+                return
+            self._replace_migrated_state(
+                path=self.paths()["app_state_path"],
+                canonical=canonical,
+                original=original,
+                label="app connection state",
+            )
+
+    def _migrate_legacy_state(self) -> None:
+        self._migrate_legacy_source_state()
+        self._reconcile_source_lineages()
+        self._migrate_legacy_app_state()
 
     def _new_source_instance_id(self) -> str:
         return f"s2src_{secrets.token_hex(16)}"
@@ -234,11 +763,21 @@ class TranscriptCaptureManager:
         return value
 
     def _read_source_lineage(self, source_id: str) -> dict[str, Any] | None:
+        reject_sensitive_identifier(source_id, field="source_id")
         path = self._source_lineage_path(source_id)
-        if not path.exists():
+        try:
+            raw, opened = _read_private_regular_bytes(
+                path,
+                label="transcript source lineage",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"transcript source lineage is unreadable for {source_id}"
+            ) from exc
+        if raw is None:
             return None
         try:
-            lineage = json.loads(path.read_text(encoding="utf-8"))
+            lineage = json.loads(raw.decode("utf-8"))
         except Exception as exc:
             raise RuntimeError(
                 f"transcript source lineage is unreadable for {source_id}"
@@ -247,13 +786,20 @@ class TranscriptCaptureManager:
             raise RuntimeError(
                 f"transcript source lineage does not match {source_id}"
             )
+        safe_lineage = _json_safe(lineage, {})
+        if not isinstance(safe_lineage, dict):  # pragma: no cover - dict input stays dict
+            raise RuntimeError(
+                f"transcript source lineage is invalid for {source_id}"
+            )
         try:
             source_instance_id = self._validate_source_instance_id(
-                lineage.get("source_instance_id")
+                safe_lineage.get("source_instance_id")
             )
-            registration_generation = int(lineage.get("registration_generation", 0))
-            stream_generation = int(lineage.get("stream_generation", 0))
-            cursor = int(lineage.get("cursor", 0))
+            registration_generation = int(
+                safe_lineage.get("registration_generation", 0)
+            )
+            stream_generation = int(safe_lineage.get("stream_generation", 0))
+            cursor = int(safe_lineage.get("cursor", 0))
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"transcript source lineage is invalid for {source_id}"
@@ -263,7 +809,11 @@ class TranscriptCaptureManager:
                 f"transcript source lineage has negative counters for {source_id}"
             )
         return {
-            **lineage,
+            **safe_lineage,
+            "_requires_private_rewrite": bool(
+                safe_lineage != lineage
+                or (opened is not None and stat.S_IMODE(opened.st_mode) != 0o600)
+            ),
             "version": 1,
             "source_id": source_id,
             "source_instance_id": source_instance_id,
@@ -274,6 +824,7 @@ class TranscriptCaptureManager:
 
     def _source_lineage_record(self, source: dict[str, Any]) -> dict[str, Any]:
         source_id = str(source.get("source_id") or "")
+        reject_sensitive_identifier(source_id, field="source_id")
         source_instance_id = self._validate_source_instance_id(
             source.get("source_instance_id")
         )
@@ -293,6 +844,10 @@ class TranscriptCaptureManager:
             "file_size": max(0, int(source.get("file_size") or 0)),
             "file_mtime_ns": max(0, int(source.get("file_mtime_ns") or 0)),
             "file_ctime_ns": max(0, int(source.get("file_ctime_ns") or 0)),
+            "parent_identity_chain": _json_safe(
+                source.get("parent_identity_chain") or [],
+                [],
+            ),
             "created_at": float(
                 source.get("source_instance_created_at")
                 or source.get("created_at")
@@ -308,60 +863,266 @@ class TranscriptCaptureManager:
             lineage,
         )
 
+    @staticmethod
+    def _source_progress(record: dict[str, Any]) -> tuple[int, int, int]:
+        return (
+            max(0, int(record.get("registration_generation") or 0)),
+            max(0, int(record.get("stream_generation") or 0)),
+            max(0, int(record.get("cursor") or 0)),
+        )
+
+    def _lineage_matches_source(
+        self,
+        source: dict[str, Any],
+        lineage: dict[str, Any],
+    ) -> bool:
+        if bool(lineage.get("_requires_private_rewrite")):
+            return False
+        expected = self._source_lineage_record(source)
+        for field in (
+            "source_id",
+            "source_instance_id",
+            "registration_generation",
+            "stream_generation",
+            "cursor",
+            "file_device",
+            "file_inode",
+            "path_sha256",
+            "file_size",
+            "file_mtime_ns",
+            "file_ctime_ns",
+            "parent_identity_chain",
+            "created_at",
+        ):
+            if lineage.get(field) != expected.get(field):
+                return False
+        return True
+
+    @staticmethod
+    def _promote_lineage_into_source(
+        source: dict[str, Any],
+        lineage: dict[str, Any],
+    ) -> dict[str, Any]:
+        promoted = dict(source)
+        promoted["source_instance_id"] = str(lineage["source_instance_id"])
+        promoted["registration_generation"] = max(
+            0,
+            int(lineage.get("registration_generation") or 0),
+        )
+        promoted["source_instance_created_at"] = float(
+            lineage.get("created_at")
+            or source.get("source_instance_created_at")
+            or source.get("created_at")
+            or time.time()
+        )
+        for field in (
+            "stream_generation",
+            "cursor",
+            "file_device",
+            "file_inode",
+            "file_size",
+            "file_mtime_ns",
+            "file_ctime_ns",
+        ):
+            promoted[field] = max(0, int(lineage.get(field) or 0))
+        if lineage.get("path_sha256"):
+            promoted["path_sha256"] = str(lineage["path_sha256"])
+        if lineage.get("parent_identity_chain"):
+            promoted["parent_identity_chain"] = _json_safe(
+                lineage["parent_identity_chain"],
+                [],
+            )
+        promoted["updated_at"] = time.time()
+        return promoted
+
+    @staticmethod
+    def _enrich_source_from_matching_lineage(
+        source: dict[str, Any],
+        lineage: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        enriched = dict(source)
+        changed = False
+        if not enriched.get("source_instance_created_at") and lineage.get(
+            "created_at"
+        ):
+            enriched["source_instance_created_at"] = float(lineage["created_at"])
+            changed = True
+        for field in (
+            "file_device",
+            "file_inode",
+            "file_size",
+            "file_mtime_ns",
+            "file_ctime_ns",
+        ):
+            if not enriched.get(field) and lineage.get(field):
+                enriched[field] = max(0, int(lineage[field]))
+                changed = True
+        if not enriched.get("path_sha256") and lineage.get("path_sha256"):
+            enriched["path_sha256"] = str(lineage["path_sha256"])
+            changed = True
+        if not enriched.get("parent_identity_chain") and lineage.get(
+            "parent_identity_chain"
+        ):
+            enriched["parent_identity_chain"] = _json_safe(
+                lineage["parent_identity_chain"],
+                [],
+            )
+            changed = True
+        if changed:
+            enriched["updated_at"] = time.time()
+        return enriched, changed
+
+    def _reconcile_source_record(
+        self,
+        source: dict[str, Any],
+        persisted: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], bool, bool]:
+        """Return source, aggregate-changed, lineage-changed monotonically."""
+
+        raw_instance_id = source.get("source_instance_id")
+        source_instance_id = ""
+        if raw_instance_id:
+            source_instance_id = self._validate_source_instance_id(raw_instance_id)
+        if not source_instance_id:
+            if persisted is not None:
+                return (
+                    self._promote_lineage_into_source(source, persisted),
+                    True,
+                    bool(persisted.get("_requires_private_rewrite")),
+                )
+            repaired = dict(source)
+            repaired["source_instance_id"] = self._new_source_instance_id()
+            repaired["registration_generation"] = max(
+                0,
+                int(repaired.get("registration_generation") or 0),
+            )
+            repaired["source_instance_created_at"] = float(
+                repaired.get("source_instance_created_at")
+                or repaired.get("created_at")
+                or time.time()
+            )
+            repaired["updated_at"] = time.time()
+            return repaired, True, True
+
+        if persisted is None:
+            return source, False, True
+
+        persisted_instance_id = str(persisted["source_instance_id"])
+        source_progress = self._source_progress(source)
+        lineage_progress = self._source_progress(persisted)
+        if source_instance_id != persisted_instance_id:
+            if source_progress[0] == lineage_progress[0]:
+                raise RuntimeError(
+                    "transcript source lineage has an ambiguous registration conflict"
+                )
+            if lineage_progress[0] > source_progress[0]:
+                return (
+                    self._promote_lineage_into_source(source, persisted),
+                    True,
+                    bool(persisted.get("_requires_private_rewrite")),
+                )
+            return source, False, True
+
+        if lineage_progress > source_progress:
+            return (
+                self._promote_lineage_into_source(source, persisted),
+                True,
+                bool(persisted.get("_requires_private_rewrite")),
+            )
+        if lineage_progress == source_progress:
+            enriched, aggregate_changed = self._enrich_source_from_matching_lineage(
+                source,
+                persisted,
+            )
+            if aggregate_changed:
+                return (
+                    enriched,
+                    True,
+                    bool(persisted.get("_requires_private_rewrite")),
+                )
+        if source_progress > lineage_progress or not self._lineage_matches_source(
+            source,
+            persisted,
+        ):
+            return source, False, True
+        return source, False, False
+
+    def _reconcile_source_lineages(self) -> None:
+        """Repair interrupted aggregate/lineage commits without regression."""
+
+        snapshot = self._read_state()
+        source_ids = sorted(
+            str(source_id)
+            for source_id, source in snapshot.get("sources", {}).items()
+            if isinstance(source, dict)
+        )
+        for source_id in source_ids:
+            with _exclusive_file_lock(
+                self._source_lock_path(source_id),
+                blocking=True,
+            ) as source_acquired:
+                if not source_acquired:  # pragma: no cover - blocking lock acquires
+                    raise RuntimeError("failed to acquire transcript source lock")
+                with _exclusive_file_lock(
+                    self.paths()["source_state_lock_path"],
+                    blocking=True,
+                ) as state_acquired:
+                    if not state_acquired:  # pragma: no cover - blocking lock acquires
+                        raise RuntimeError("failed to acquire transcript state lock")
+                    latest = self._read_state()
+                    current = latest.get("sources", {}).get(source_id)
+                    if not isinstance(current, dict):
+                        continue
+                    source = dict(current)
+                    persisted = self._read_source_lineage(source_id)
+                    repaired, aggregate_changed, lineage_changed = (
+                        self._reconcile_source_record(source, persisted)
+                    )
+                    if aggregate_changed:
+                        latest.setdefault("sources", {})[source_id] = repaired
+                        self._write_state(latest)
+                    if lineage_changed:
+                        self._persist_source_lineage(repaired)
+
     def _ensure_source_lineage(self, source: dict[str, Any]) -> dict[str, Any]:
         source_id = str(source.get("source_id") or "")
         if not source_id:
             raise ValueError("transcript source is missing source_id")
         persisted = self._read_source_lineage(source_id)
-        raw_instance_id = source.get("source_instance_id")
-        if raw_instance_id:
-            source_instance_id = self._validate_source_instance_id(raw_instance_id)
-            if (
-                persisted is not None
-                and persisted.get("source_instance_id") != source_instance_id
-            ):
-                raise RuntimeError(
-                    f"transcript source lineage conflicts with state for {source_id}"
-                )
-            if persisted is not None:
-                source.setdefault(
-                    "registration_generation",
-                    int(persisted.get("registration_generation", 0)),
-                )
-                source.setdefault(
-                    "source_instance_created_at",
-                    float(
-                        persisted.get("created_at")
-                        or source.get("created_at")
-                        or time.time()
-                    ),
-                )
-                for stat_field in ("file_size", "file_mtime_ns", "file_ctime_ns"):
-                    if not source.get(stat_field) and persisted.get(stat_field):
-                        source[stat_field] = int(persisted[stat_field])
-        elif persisted is not None:
-            source_instance_id = str(persisted["source_instance_id"])
-            source["source_instance_id"] = source_instance_id
-            source["registration_generation"] = int(
-                persisted.get("registration_generation", 0)
-            )
-            source["source_instance_created_at"] = float(
-                persisted.get("created_at") or source.get("created_at") or time.time()
-            )
-        else:
-            source_instance_id = self._new_source_instance_id()
-            source["source_instance_id"] = source_instance_id
-            source["registration_generation"] = 0
-            source["source_instance_created_at"] = time.time()
-        if persisted is None:
+        repaired, _aggregate_changed, lineage_changed = self._reconcile_source_record(
+            source,
+            persisted,
+        )
+        if repaired is not source:
+            source.clear()
+            source.update(repaired)
+        if lineage_changed:
             self._persist_source_lineage(source)
         return source
 
     def _assert_safe_source_re_registration(self, source: dict[str, Any]) -> None:
-        old_path = Path(str(source.get("path") or "")).expanduser().resolve()
+        old_path = Path(
+            os.path.abspath(
+                os.path.expanduser(str(source.get("path") or ""))
+            )
+        )
         try:
+            reject_sensitive_identifier(
+                str(old_path),
+                field="transcript source path",
+            )
             self._validate_source_path(old_path)
-            stat = old_path.stat()
+            with _open_stable_transcript_source(old_path) as (
+                _descriptor,
+                stat,
+                parent_identity_chain,
+            ):
+                expected_chain = _json_safe(
+                    source.get("parent_identity_chain") or [],
+                    [],
+                )
+                if expected_chain and expected_chain != parent_identity_chain:
+                    raise ValueError("transcript source ancestor identity changed")
         except Exception as exc:
             raise ValueError(
                 "cannot re-register transcript source until its prior file is readable"
@@ -402,20 +1163,53 @@ class TranscriptCaptureManager:
             latest = self._read_state()
             sources = latest.setdefault("sources", {})
             existing = sources.get(source_id)
-            if (
-                isinstance(existing, dict)
-                and not allow_instance_replacement
-                and existing.get("source_instance_id")
-                and existing.get("source_instance_id") != source.get("source_instance_id")
-            ):
-                raise RuntimeError(
-                    f"transcript source instance changed while polling {source_id}"
+            if isinstance(existing, dict):
+                existing_instance = str(existing.get("source_instance_id") or "")
+                candidate_instance = str(source.get("source_instance_id") or "")
+                existing_registration = max(
+                    0,
+                    int(existing.get("registration_generation") or 0),
                 )
+                candidate_registration = max(
+                    0,
+                    int(source.get("registration_generation") or 0),
+                )
+                if existing_instance and existing_instance != candidate_instance:
+                    if not allow_instance_replacement:
+                        raise RuntimeError(
+                            f"transcript source instance changed while polling {source_id}"
+                        )
+                    if candidate_registration <= existing_registration:
+                        raise RuntimeError(
+                            f"transcript source registration changed while committing {source_id}"
+                        )
+                elif candidate_registration < existing_registration:
+                    raise RuntimeError(
+                        f"transcript source registration regressed while committing {source_id}"
+                    )
+                elif candidate_registration == existing_registration:
+                    existing_stream = max(
+                        0,
+                        int(existing.get("stream_generation") or 0),
+                    )
+                    candidate_stream = max(
+                        0,
+                        int(source.get("stream_generation") or 0),
+                    )
+                    if candidate_stream < existing_stream or (
+                        candidate_stream == existing_stream
+                        and max(0, int(source.get("cursor") or 0))
+                        < max(0, int(existing.get("cursor") or 0))
+                    ):
+                        raise RuntimeError(
+                            f"transcript source cursor regressed while committing {source_id}"
+                        )
             sources[source_id] = source
             self._write_state(latest)
-        # State is the mutable cursor authority. Persist the independent lineage
-        # immediately after it so whole-state loss can recover the latest cursor.
-        self._persist_source_lineage(source)
+            # Aggregate state is authoritative while present; lineage is its
+            # monotonic recovery projection. Initialization reconciles this
+            # exact boundary if the process stops after the aggregate replace.
+            self._persist_source_lineage(source)
 
     def status(self) -> dict[str, Any]:
         sources = self.list_sources()["sources"]
@@ -447,12 +1241,21 @@ class TranscriptCaptureManager:
             provider_warning = str(exc.__class__.__name__)
             LOGGER.debug(
                 "running app provider failed; falling back to ps: %s",
-                str(exc)[:240],
+                safe_public_error(
+                    exc,
+                    fallback="running app provider failed",
+                ),
                 exc_info=True,
             )
             raw_apps = self._detect_running_apps_ps()
         for raw_app in raw_apps:
-            app = self._public_app(raw_app)
+            try:
+                app = self._public_app(raw_app)
+            except ValueError:
+                # Provider-supplied process labels are untrusted identifiers.
+                # Skip unsafe rows instead of hashing, echoing, or persisting
+                # credential-shaped material.
+                continue
             if not app["app_name"]:
                 continue
             if app.get("detection") == "ps" and not self._looks_like_attachable_app(app):
@@ -493,9 +1296,13 @@ class TranscriptCaptureManager:
         requested_name = " ".join(str(app_name or "").split())
         if not requested_name:
             raise ValueError("app_name must not be empty")
+        requested_bundle = " ".join(str(bundle_id or "").split())
+        reject_sensitive_identifier(requested_name, field="app_name")
+        if requested_bundle:
+            reject_sensitive_identifier(requested_bundle, field="bundle_id")
         detected = self._match_running_app(
             app_name=requested_name,
-            bundle_id=str(bundle_id or ""),
+            bundle_id=requested_bundle,
             pid=int(pid or 0),
         )
         if detected is None:
@@ -503,40 +1310,51 @@ class TranscriptCaptureManager:
                 raise ValueError("app is not currently detected; pass allow_manual only for a verified local app")
             detected = {
                 "app_name": requested_name,
-                "bundle_id": str(bundle_id or ""),
+                "bundle_id": requested_bundle,
                 "pid": int(pid or 0),
                 "detection": "manual-operator-entry",
             }
-        state = self._read_app_state()
-        connections = state.setdefault("connections", {})
-        now = time.time()
+        detected = self._public_app(detected)
         connection_id = self._connection_id(detected)
-        record = {
-            "connection_id": connection_id,
-            "app_name": str(detected.get("app_name") or requested_name),
-            "bundle_id": str(detected.get("bundle_id") or bundle_id or ""),
-            "pid": int(detected.get("pid") or pid or 0),
-            "context_id": mlx_backend.sanitize_context_id(context_id),
-            "source_tag": mlx_backend.sanitize_tag(source_tag).replace(" ", "-"),
-            "speaker": mlx_backend.sanitize_agent_id(speaker),
-            "enabled": True,
-            "adapter_kinds": [
-                "frontmost-selection",
-                "clipboard-once",
-                "app-accessibility-snapshot",
-                "app-selected-text",
-            ],
-            "created_at": float(connections.get(connection_id, {}).get("created_at") or now),
-            "updated_at": now,
-            "metadata": _json_safe(metadata or {}, {}),
-            "consent": {
-                "operator_confirmed": True,
-                "mode": "local-app-connect",
-                "attached_at": now,
-            },
-        }
-        connections[connection_id] = record
-        self._write_app_state(state)
+        with _exclusive_file_lock(
+            self.paths()["app_state_lock_path"],
+            blocking=True,
+        ) as acquired:
+            if not acquired:  # pragma: no cover - blocking lock acquires
+                raise RuntimeError("failed to acquire app connection state lock")
+            # Read again only after acquiring the global app-state lock. This
+            # makes the commit a lost-update-safe read-modify-write operation.
+            state = self._read_app_state()
+            connections = state.setdefault("connections", {})
+            now = time.time()
+            record = {
+                "connection_id": connection_id,
+                "app_name": str(detected.get("app_name") or requested_name),
+                "bundle_id": str(detected.get("bundle_id") or requested_bundle),
+                "pid": int(detected.get("pid") or pid or 0),
+                "context_id": mlx_backend.sanitize_context_id(context_id),
+                "source_tag": mlx_backend.sanitize_tag(source_tag).replace(" ", "-"),
+                "speaker": mlx_backend.sanitize_agent_id(speaker),
+                "enabled": True,
+                "adapter_kinds": [
+                    "frontmost-selection",
+                    "clipboard-once",
+                    "app-accessibility-snapshot",
+                    "app-selected-text",
+                ],
+                "created_at": float(
+                    connections.get(connection_id, {}).get("created_at") or now
+                ),
+                "updated_at": now,
+                "metadata": _json_safe(metadata or {}, {}),
+                "consent": {
+                    "operator_confirmed": True,
+                    "mode": "local-app-connect",
+                    "attached_at": now,
+                },
+            }
+            connections[connection_id] = record
+            self._write_app_state(state)
         return self._public_connection(record)
 
     def list_app_connections(self) -> dict[str, Any]:
@@ -923,17 +1741,35 @@ class TranscriptCaptureManager:
     ) -> dict[str, Any]:
         if not confirmed:
             raise ValueError("explicit --confirm is required to register a transcript source")
+        reject_sensitive_identifier(str(source_id or ""), field="source_id")
         source = mlx_backend.sanitize_tag(source_id).replace(" ", "-")
         if not source:
             raise ValueError("source_id must not be empty")
-        resolved = Path(path).expanduser().resolve()
+        expanded = Path(path).expanduser()
+        absolute_input = Path(os.path.abspath(str(expanded)))
+        reject_sensitive_identifier(
+            str(absolute_input),
+            field="transcript source path",
+        )
+        # Canonicalize platform aliases such as macOS /var -> /private/var once
+        # at registration. The stored canonical path is subsequently opened by
+        # descriptor-relative no-follow traversal, so later ancestor swaps fail
+        # closed rather than being followed.
+        resolved = Path(os.path.realpath(str(absolute_input)))
+        reject_sensitive_identifier(str(resolved), field="transcript source path")
         self._validate_source_path(resolved)
+        with _open_stable_transcript_source(resolved) as (
+            _descriptor,
+            registered_stat,
+            parent_identity_chain,
+        ):
+            stat_snapshot = registered_stat
         with _exclusive_file_lock(self._source_lock_path(source), blocking=False) as acquired:
             if not acquired:
                 raise RuntimeError(
                     f"transcript source is busy and cannot be re-registered: {source}"
                 )
-            stat = resolved.stat()
+            stat = stat_snapshot
             state = self._read_state()
             existing = state.setdefault("sources", {}).get(source)
             lineage = self._read_source_lineage(source)
@@ -1014,6 +1850,7 @@ class TranscriptCaptureManager:
                 "kind": "file-tail",
                 "path": str(resolved),
                 "path_sha256": _sha256_path(resolved),
+                "parent_identity_chain": parent_identity_chain,
                 "context_id": mlx_backend.sanitize_context_id(context_id),
                 "source_tag": mlx_backend.sanitize_tag(source_tag).replace(" ", "-"),
                 "speaker": mlx_backend.sanitize_agent_id(speaker),
@@ -1120,7 +1957,10 @@ class TranscriptCaptureManager:
                     errors.append(
                         {
                             "source_id": str(source.get("source_id") or ""),
-                            "error": str(exc),
+                            "error": safe_public_error(
+                                exc,
+                                fallback="transcript source poll failed",
+                            ),
                         }
                     )
                     continue
@@ -1236,65 +2076,101 @@ class TranscriptCaptureManager:
         *,
         max_bytes: int,
     ) -> dict[str, Any] | None:
-        path = Path(str(source.get("path") or "")).expanduser().resolve()
-        self._validate_source_path(path)
-        stat = path.stat()
-        size = int(stat.st_size)
-        cursor = max(0, int(source.get("cursor") or 0))
-        stream_generation = max(0, int(source.get("stream_generation") or 0))
-        source_instance_id = self._validate_source_instance_id(
-            source.get("source_instance_id")
-        )
-        previous_device = int(source.get("file_device") or 0)
-        previous_inode = int(source.get("file_inode") or 0)
-        previous_size = max(0, int(source.get("file_size") or 0))
-        previous_mtime_ns = max(0, int(source.get("file_mtime_ns") or 0))
-        previous_ctime_ns = max(0, int(source.get("file_ctime_ns") or 0))
-        same_file_identity = bool(
-            previous_device == int(stat.st_dev)
-            and previous_inode == int(stat.st_ino)
-        )
-        same_size_rewrite = bool(
-            same_file_identity
-            and size == cursor
-            and (
-                (previous_mtime_ns and previous_mtime_ns != int(stat.st_mtime_ns))
-                or (previous_ctime_ns and previous_ctime_ns != int(stat.st_ctime_ns))
+        path = Path(
+            os.path.abspath(
+                os.path.expanduser(str(source.get("path") or ""))
             )
         )
-        rotated = bool(
-            (previous_device and previous_device != int(stat.st_dev))
-            or (previous_inode and previous_inode != int(stat.st_ino))
-            or size < cursor
-            or (previous_size and size < previous_size)
-            or same_size_rewrite
+        reject_sensitive_identifier(
+            str(path),
+            field="transcript source path",
         )
-        # This adapter is intentionally append-only. Timestamp changes with
-        # unchanged committed size detect same-inode rewrites without storing a
-        # raw-content digest. A producer that rewrites old bytes *and* grows the
-        # file in one operation cannot be distinguished from a normal append;
-        # such producers must rotate/rename the file instead.
-        if rotated:
-            stream_generation += 1
-            cursor = 0
+        self._validate_source_path(path)
+        expected_parent_chain = _json_safe(
+            source.get("parent_identity_chain") or [],
+            [],
+        )
+        if not expected_parent_chain:
+            raise ValueError(
+                "transcript source requires explicit re-registration after path hardening"
+            )
+        with _open_stable_transcript_source(path) as (
+            descriptor,
+            source_stat,
+            parent_identity_chain,
+        ):
+            if parent_identity_chain != expected_parent_chain:
+                raise ValueError("transcript source ancestor identity changed")
+            size = int(source_stat.st_size)
+            cursor = max(0, int(source.get("cursor") or 0))
+            stream_generation = max(0, int(source.get("stream_generation") or 0))
+            source_instance_id = self._validate_source_instance_id(
+                source.get("source_instance_id")
+            )
+            previous_device = int(source.get("file_device") or 0)
+            previous_inode = int(source.get("file_inode") or 0)
+            previous_size = max(0, int(source.get("file_size") or 0))
+            previous_mtime_ns = max(0, int(source.get("file_mtime_ns") or 0))
+            previous_ctime_ns = max(0, int(source.get("file_ctime_ns") or 0))
+            same_file_identity = bool(
+                previous_device == int(source_stat.st_dev)
+                and previous_inode == int(source_stat.st_ino)
+            )
+            same_size_rewrite = bool(
+                same_file_identity
+                and size == cursor
+                and (
+                    (
+                        previous_mtime_ns
+                        and previous_mtime_ns != int(source_stat.st_mtime_ns)
+                    )
+                    or (
+                        previous_ctime_ns
+                        and previous_ctime_ns != int(source_stat.st_ctime_ns)
+                    )
+                )
+            )
+            rotated = bool(
+                (previous_device and previous_device != int(source_stat.st_dev))
+                or (previous_inode and previous_inode != int(source_stat.st_ino))
+                or size < cursor
+                or (previous_size and size < previous_size)
+                or same_size_rewrite
+            )
+            # This adapter is intentionally append-only. Timestamp changes with
+            # unchanged committed size detect same-inode rewrites without storing a
+            # raw-content digest. A producer that rewrites old bytes *and* grows the
+            # file in one operation cannot be distinguished from a normal append;
+            # such producers must rotate/rename the file instead.
+            if rotated:
+                stream_generation += 1
+                cursor = 0
 
-        def update_source_file_state(committed_cursor: int) -> None:
-            source["cursor"] = max(0, int(committed_cursor))
-            source["stream_generation"] = stream_generation
-            source["file_device"] = int(stat.st_dev)
-            source["file_inode"] = int(stat.st_ino)
-            source["file_size"] = size
-            source["file_mtime_ns"] = int(stat.st_mtime_ns)
-            source["file_ctime_ns"] = int(stat.st_ctime_ns)
-            source["updated_at"] = time.time()
+            def update_source_file_state(committed_cursor: int) -> None:
+                source["cursor"] = max(0, int(committed_cursor))
+                source["stream_generation"] = stream_generation
+                source["file_device"] = int(source_stat.st_dev)
+                source["file_inode"] = int(source_stat.st_ino)
+                source["file_size"] = size
+                source["file_mtime_ns"] = int(source_stat.st_mtime_ns)
+                source["file_ctime_ns"] = int(source_stat.st_ctime_ns)
+                source["parent_identity_chain"] = parent_identity_chain
+                source["updated_at"] = time.time()
 
-        if size <= cursor:
-            update_source_file_state(size)
-            return None
-        end = min(size, cursor + max_bytes)
-        with path.open("rb") as handle:
-            handle.seek(cursor)
-            raw = handle.read(end - cursor)
+            if size <= cursor:
+                update_source_file_state(size)
+                return None
+            end = min(size, cursor + max_bytes)
+            raw = _read_descriptor_range(
+                descriptor,
+                start=cursor,
+                length=end - cursor,
+            )
+            if len(raw) != end - cursor:
+                raise ValueError("transcript source changed while being read")
+            after_read = os.fstat(descriptor)
+            if _source_stat_snapshot(after_read) != _source_stat_snapshot(source_stat):
+                raise ValueError("transcript source changed while being read")
         text = raw.decode("utf-8", errors="replace").strip()
         if not text:
             update_source_file_state(end)
@@ -1370,45 +2246,37 @@ class TranscriptCaptureManager:
         }
 
     def _read_state(self) -> dict[str, Any]:
-        path = self.paths()["source_state_path"]
-        if not path.exists():
-            return {"version": 3, "sources": {}}
-        try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            LOGGER.warning("failed to read transcript source state", exc_info=True)
-            return {"version": 3, "sources": {}}
-        if not isinstance(parsed, dict):
-            return {"version": 3, "sources": {}}
-        if not isinstance(parsed.get("sources"), dict):
-            parsed["sources"] = {}
-        parsed["version"] = 3
-        return parsed
+        parsed, _, _ = self._read_source_state_document()
+        canonical, _ = self._canonicalize_source_state(parsed)
+        return canonical
 
     def _write_state(self, state: dict[str, Any]) -> None:
         path = self.paths()["source_state_path"]
-        state["version"] = 3
-        _atomic_write_json(path, state)
+        payload = dict(state)
+        payload["version"] = SOURCE_STATE_VERSION
+        _atomic_write_json(
+            path,
+            _json_safe(
+                payload,
+                {"version": SOURCE_STATE_VERSION, "sources": {}},
+            ),
+        )
 
     def _read_app_state(self) -> dict[str, Any]:
-        path = self.paths()["app_state_path"]
-        if not path.exists():
-            return {"version": 1, "connections": {}}
-        try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            LOGGER.warning("failed to read app connection state", exc_info=True)
-            return {"version": 1, "connections": {}}
-        if not isinstance(parsed, dict):
-            return {"version": 1, "connections": {}}
-        if not isinstance(parsed.get("connections"), dict):
-            parsed["connections"] = {}
-        parsed["version"] = 1
-        return parsed
+        parsed, _, _ = self._read_app_state_document()
+        return self._canonicalize_app_state(parsed)
 
     def _write_app_state(self, state: dict[str, Any]) -> None:
         path = self.paths()["app_state_path"]
-        _atomic_write_json(path, state)
+        payload = dict(state)
+        payload["version"] = APP_STATE_VERSION
+        _atomic_write_json(
+            path,
+            _json_safe(
+                payload,
+                {"version": APP_STATE_VERSION, "connections": {}},
+            ),
+        )
 
     def _match_running_app(
         self,
@@ -1420,7 +2288,12 @@ class TranscriptCaptureManager:
         requested_name = " ".join(str(app_name or "").split()).lower()
         requested_bundle = str(bundle_id or "").strip().lower()
         requested_pid = int(pid or 0)
-        candidates = [self._public_app(app) for app in self.running_app_provider()]
+        candidates: list[dict[str, Any]] = []
+        for raw_app in self.running_app_provider():
+            try:
+                candidates.append(self._public_app(raw_app))
+            except ValueError:
+                continue
         if requested_pid > 0:
             for app in candidates:
                 if int(app.get("pid") or 0) == requested_pid:
@@ -1443,6 +2316,9 @@ class TranscriptCaptureManager:
     def _connection_id(self, app: dict[str, Any]) -> str:
         app_name = " ".join(str(app.get("app_name") or "").split())
         bundle_id = " ".join(str(app.get("bundle_id") or "").split())
+        reject_sensitive_identifier(app_name, field="app_name")
+        if bundle_id:
+            reject_sensitive_identifier(bundle_id, field="bundle_id")
         pid = int(app.get("pid") or 0)
         fingerprint = f"{bundle_id}|{app_name}|{pid}"
         return "app_" + _sha256_text(fingerprint)[:16]
@@ -1451,6 +2327,7 @@ class TranscriptCaptureManager:
         requested = str(connection_id or "").strip()
         if not requested:
             raise ValueError("connection_id must not be empty")
+        reject_sensitive_identifier(requested, field="connection_id")
         connection = self._read_app_state().get("connections", {}).get(requested)
         if not isinstance(connection, dict):
             raise ValueError(f"app connection not found: {requested}")
@@ -1468,8 +2345,13 @@ class TranscriptCaptureManager:
             raise ValueError(f"transcript source suffix must be one of: {allowed}")
         lowered_parts = {part.lower() for part in path.parts}
         lowered_name = path.name.lower()
-        if lowered_parts & SENSITIVE_PATH_FRAGMENTS or any(
-            fragment in lowered_name for fragment in SENSITIVE_PATH_FRAGMENTS
+        if (
+            lowered_parts & SENSITIVE_PATH_FRAGMENTS
+            or lowered_parts & SENSITIVE_CREDENTIAL_STORE_PARTS
+            or lowered_name in SENSITIVE_CREDENTIAL_FILENAMES
+            or any(
+                fragment in lowered_name for fragment in SENSITIVE_PATH_FRAGMENTS
+            )
         ):
             raise ValueError("refusing to register sensitive-looking path as transcript source")
 
@@ -1852,9 +2734,17 @@ class TranscriptCaptureManager:
             pid = int(app.get("pid") or 0)
         except (TypeError, ValueError):
             pid = 0
+        app_name = " ".join(
+            str(app.get("app_name") or app.get("name") or "").split()
+        )
+        bundle_id = " ".join(str(app.get("bundle_id") or "").split())
+        if app_name:
+            reject_sensitive_identifier(app_name, field="app_name")
+        if bundle_id:
+            reject_sensitive_identifier(bundle_id, field="bundle_id")
         return {
-            "app_name": " ".join(str(app.get("app_name") or app.get("name") or "").split()),
-            "bundle_id": " ".join(str(app.get("bundle_id") or "").split()),
+            "app_name": app_name,
+            "bundle_id": bundle_id,
             "pid": pid,
             "detection": str(app.get("detection") or "provider"),
         }
@@ -1969,7 +2859,7 @@ class TranscriptCaptureManager:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Operate SYNAPSE-S2 transcript capture adapters.")
+    parser = SecretSafeArgumentParser(description="Operate SYNAPSE-S2 transcript capture adapters.")
     parser.add_argument("--capture-root", default=None)
     parser.add_argument("--state", default=None)
     parser.add_argument("--memory-db", default=None)

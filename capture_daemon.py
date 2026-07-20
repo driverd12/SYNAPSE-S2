@@ -10,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import stat
 import sys
 import time
@@ -17,15 +18,24 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import mlx_backend
-from redaction import redact_capture_text, redact_sensitive_value
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    SecretRedactingFormatter,
+    SecretSafeArgumentParser,
+    is_sensitive_key,
+    redact_capture_text,
+    redact_sensitive_value,
+    reject_sensitive_identifier,
+    safe_public_error,
+    strip_untrusted_raw_digest_fields,
+    strip_untrusted_raw_digest_text,
+)
 
 
 LOGGER = logging.getLogger("synapse_s2.capture_daemon")
 if not LOGGER.handlers:
     _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    _handler.setFormatter(SecretRedactingFormatter(SECRET_SAFE_LOG_FORMAT))
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
@@ -37,19 +47,37 @@ STALE_INBOX_TEMP_SECONDS = 300.0
 CAPTURE_PROTOCOL_VERSION = 2
 CAPTURE_ID_RE = re.compile(r"^s2cap_[0-9a-f]{32}$")
 CLAIM_DIR_RE = re.compile(r"^s2claim_[0-9a-f]{32}$")
+DETACHED_DISCARD_RE = re.compile(r"^\.s2-discard-([0-9a-f]{32})\.tmp$")
+DETACHED_TREE_DISCARD_RE = re.compile(
+    r"^\.s2-discard-tree-([0-9a-f]{32})\.tmp$"
+)
 LEGACY_INBOX_TEMP_RE = re.compile(r"^.+\.(?:json|jsonl|txt)\.tmp$", re.IGNORECASE)
 ATOMIC_INBOX_TEMP_RE = re.compile(
     r"^\..+\.(?:json|jsonl|txt)\.[0-9a-f]{32}\.tmp$",
     re.IGNORECASE,
 )
 LEGACY_TEXT_IDENTITY_FILE = ".capture-identity.json"
-UNTRUSTED_RAW_DIGEST_KEYS = {
-    "input_sha256",
-    "raw_input_sha256",
-    "raw_sha256",
-    "raw_text_sha256",
-    "payload_sha256",
-}
+PROCESSED_ARCHIVE_SCRUB_SCHEMA = "capture-processed-scrub.v1"
+GLOBAL_CAPTURE_LOCK = ".capture-maintenance.lock"
+ERROR_RESOLUTION_SCHEMA = "capture-error-resolution.v1"
+ERROR_RESOLUTION_ARCHIVE_RE = re.compile(r"^resolved-[0-9a-f]{32}\.json$")
+ERROR_RESOLUTION_MANIFEST_RE = re.compile(r"^resolution-[0-9a-f]{32}\.json$")
+TERMINAL_ERROR_DISPOSITIONS = frozenset(
+    {
+        "discarded-without-content-inspection",
+        "legacy-raw-quarantine-discarded",
+        "recovered-discard-complete",
+    }
+)
+RECOVERABLE_DISCARD_ARTIFACT_TYPES = frozenset(
+    {
+        "stale-capture-inbox-temp",
+        "legacy-raw-stale-temp-quarantine",
+        "detached-capture-discard-recovery",
+        "malformed-capture-claim",
+        "rejected-raw-capture-payload",
+    }
+)
 SENSITIVE_METADATA_KEYS = {
     "api_key",
     "access_token",
@@ -73,9 +101,11 @@ class CaptureCleanupPending(RuntimeError):
 
 def resolve_capture_root(root: str | os.PathLike[str] | None = None) -> Path:
     if root is not None:
+        reject_sensitive_identifier(root, field="capture_root")
         return Path(root).expanduser().resolve()
     configured = os.getenv("SYNAPSE_S2_CAPTURE_ROOT")
     if configured:
+        reject_sensitive_identifier(configured, field="capture_root")
         return Path(configured).expanduser().resolve()
     return (Path.cwd() / ".synapse_s2").resolve()
 
@@ -91,12 +121,43 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _ensure_private_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+def _ensure_private_dir(path: Path, *, tighten_existing: bool = False) -> None:
+    created = False
     try:
-        path.chmod(0o700)
-    except PermissionError:
-        LOGGER.warning("could not chmod private capture directory %s", path)
+        path.mkdir(parents=True, exist_ok=False, mode=0o700)
+        created = True
+    except FileExistsError:
+        pass
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("private capture directory is unavailable") from exc
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISDIR(path_stat.st_mode):
+        raise ValueError("private capture path must be a real directory")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    directory_fd = os.open(path, flags)
+    try:
+        opened_stat = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(opened_stat.st_mode)
+            or (int(opened_stat.st_dev), int(opened_stat.st_ino))
+            != (int(path_stat.st_dev), int(path_stat.st_ino))
+        ):
+            raise ValueError("private capture directory changed during validation")
+        if created or tighten_existing:
+            try:
+                os.fchmod(directory_fd, 0o700)
+            except PermissionError:
+                LOGGER.warning("could not chmod private capture directory %s", path)
+    finally:
+        os.close(directory_fd)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -143,6 +204,277 @@ def _atomic_write_private_text(path: Path, text: str) -> None:
             pass
 
 
+def _read_regular_file_at(
+    directory_fd: int,
+    filename: str,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, os.stat_result]:
+    """Read one unchanged regular file relative to an already-open directory."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(filename, flags, dir_fd=directory_fd)
+    try:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError("processed capture archive must be a regular file")
+        if int(opened_stat.st_size) > int(max_bytes):
+            raise ValueError("processed capture archive exceeds the size limit")
+        chunks: list[bytes] = []
+        remaining = int(opened_stat.st_size)
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) != int(opened_stat.st_size):
+            raise ValueError("processed capture archive changed while reading")
+        current_stat = os.stat(
+            filename,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(current_stat.st_mode)
+            or stat.S_ISLNK(current_stat.st_mode)
+            or _stat_identity(current_stat) != _stat_identity(opened_stat)
+        ):
+            raise ValueError("processed capture archive changed while reading")
+        return raw, opened_stat
+    finally:
+        os.close(fd)
+
+
+def _atomic_rewrite_private_text_at(
+    directory_fd: int,
+    filename: str,
+    text: str,
+    *,
+    expected_stat: os.stat_result,
+) -> None:
+    """Conditionally replace one verified regular file with private bytes."""
+
+    temp_name = f".{filename}.{secrets.token_hex(16)}.tmp"
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(
+            temp_name,
+            flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        encoded = text.encode("utf-8")
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise OSError("private archive rewrite made no write progress")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+
+        current_stat = os.stat(
+            filename,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(current_stat.st_mode)
+            or stat.S_ISLNK(current_stat.st_mode)
+            or _stat_identity(current_stat) != _stat_identity(expected_stat)
+        ):
+            raise ValueError("processed capture archive changed before replacement")
+        os.replace(
+            temp_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _ensure_private_regular_mode_at(
+    directory_fd: int,
+    filename: str,
+    *,
+    expected_stat: os.stat_result,
+) -> None:
+    """Tighten one already-verified archive through a no-follow descriptor."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(filename, flags, dir_fd=directory_fd)
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _stat_identity(opened_stat) != _stat_identity(expected_stat)
+        ):
+            raise ValueError("processed capture archive changed before mode repair")
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def _remove_tree_without_following_links(
+    path: Path,
+    *,
+    parent_dir: Path,
+) -> None:
+    """Remove one private transport tree without following symlinks."""
+
+    if path.parent != parent_dir or path.name in {"", ".", ".."}:
+        raise ValueError("capture cleanup target escaped its owned directory")
+    if not bool(getattr(shutil.rmtree, "avoids_symlink_attacks", False)):
+        raise RuntimeError("platform lacks symlink-safe recursive removal")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_fd = os.open(parent_dir, flags)
+    try:
+        try:
+            path_stat = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISDIR(path_stat.st_mode):
+            raise ValueError("capture cleanup target must be a real directory")
+        shutil.rmtree(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _staged_file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    """Identity fields stable across an atomic rename on macOS and Linux."""
+
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+    )
+
+
+def _stage_regular_file_for_discard(
+    *,
+    path: Path,
+    staging_dir: Path,
+    expected_stat: os.stat_result,
+) -> Path | None:
+    """Atomically detach one verified regular file before destructive cleanup."""
+
+    staged = staging_dir / f".s2-discard-{secrets.token_hex(16)}.tmp"
+    try:
+        os.replace(path, staged)
+    except FileNotFoundError:
+        return None
+    try:
+        staged_stat = staged.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        _staged_file_identity(staged_stat) != _staged_file_identity(expected_stat)
+        or not stat.S_ISREG(staged_stat.st_mode)
+        or stat.S_ISLNK(staged_stat.st_mode)
+    ):
+        try:
+            if not path.exists():
+                os.replace(staged, path)
+        except OSError:
+            LOGGER.warning("failed to restore changed discard candidate %s", path)
+        return None
+    _fsync_directory(path.parent)
+    if staging_dir != path.parent:
+        _fsync_directory(staging_dir)
+    return staged
+
+
+def _stage_tree_for_discard(
+    *,
+    path: Path,
+    staging_dir: Path,
+    expected_stat: os.stat_result,
+) -> Path | None:
+    """Atomically detach one verified owned directory before tree cleanup."""
+
+    staged = staging_dir / f".s2-discard-tree-{secrets.token_hex(16)}.tmp"
+    try:
+        os.replace(path, staged)
+    except FileNotFoundError:
+        return None
+    try:
+        staged_stat = staged.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISDIR(staged_stat.st_mode)
+        or stat.S_ISLNK(staged_stat.st_mode)
+        or (int(staged_stat.st_dev), int(staged_stat.st_ino))
+        != (int(expected_stat.st_dev), int(expected_stat.st_ino))
+    ):
+        try:
+            if not path.exists():
+                os.replace(staged, path)
+        except OSError:
+            LOGGER.warning("failed to restore changed discard tree %s", path)
+        return None
+    _fsync_directory(path.parent)
+    if staging_dir != path.parent:
+        _fsync_directory(staging_dir)
+    return staged
+
+
+def _discard_operation_id(staged: Path) -> str:
+    for pattern in (DETACHED_DISCARD_RE, DETACHED_TREE_DISCARD_RE):
+        match = pattern.fullmatch(staged.name)
+        if match is not None:
+            return match.group(1)
+    return ""
+
+
 def _canonical_capture_id(value: Any) -> str:
     capture_id = str(value or "").strip()
     if CAPTURE_ID_RE.fullmatch(capture_id) is None:
@@ -173,12 +505,17 @@ def write_capture_drop(
         raise ValueError("capture drop text must not be empty")
     capture_root = resolve_capture_root(root)
     inbox_dir = capture_root / "capture_inbox"
+    # The configured root may be an existing caller-owned directory. Preserve
+    # its mode, while enforcing privacy on the dedicated transport subdir.
     _ensure_private_dir(capture_root)
-    _ensure_private_dir(inbox_dir)
+    _ensure_private_dir(inbox_dir, tighten_existing=True)
     context = mlx_backend.sanitize_context_id(context_id)
     tag = mlx_backend.sanitize_tag(source_tag).replace(" ", "-")
     redacted_text, redaction_count = redact_capture_text(clean_text)
     safe_metadata, metadata_redactions = redact_sensitive_value(metadata or {})
+    safe_metadata, raw_digest_removals = strip_untrusted_raw_digest_fields(
+        safe_metadata
+    )
     canonical_capture_id = (
         _canonical_capture_id(capture_id)
         if capture_id is not None
@@ -193,7 +530,9 @@ def write_capture_drop(
         "speaker": mlx_backend.sanitize_agent_id(speaker),
         "text": redacted_text,
         "metadata": _json_safe(safe_metadata, {}),
-        "redaction_count": int(redaction_count + metadata_redactions),
+        "redaction_count": int(
+            redaction_count + metadata_redactions + raw_digest_removals
+        ),
         "raw_text_stored": False,
     }
     filename = (
@@ -219,6 +558,7 @@ class CaptureInboxDaemon:
     ) -> None:
         self.root = resolve_capture_root(root)
         self._backend = backend
+        self._processed_archive_scrub_verified = False
 
     @property
     def backend(self) -> mlx_backend.SpikingAttentionBackend:
@@ -235,21 +575,29 @@ class CaptureInboxDaemon:
             "processing_dir": self.root / "capture_processing",
             "processed_dir": self.root / "capture_processed",
             "error_dir": self.root / "capture_errors",
+            "error_archive_dir": self.root / "capture_error_archive",
+            "error_resolution_dir": self.root / "capture_error_resolutions",
             "receipt_dir": self.root / "capture_receipts",
             "lock_dir": self.root / "capture_locks",
             "state_path": self.root / "capture_daemon_state.json",
         }
 
     def _ensure_transport_dirs(self, paths: dict[str, Path]) -> None:
+        root = paths["root"]
+        _ensure_private_dir(root)
         for key in (
             "inbox_dir",
             "processing_dir",
             "processed_dir",
             "error_dir",
+            "error_archive_dir",
+            "error_resolution_dir",
             "receipt_dir",
             "lock_dir",
         ):
-            _ensure_private_dir(paths[key])
+            if paths[key].parent != root:
+                raise ValueError("capture transport directory escaped its root")
+            _ensure_private_dir(paths[key], tighten_existing=True)
 
     def status(self) -> dict[str, Any]:
         paths = self.paths()
@@ -259,7 +607,9 @@ class CaptureInboxDaemon:
         processing = self._processing_claims(paths["processing_dir"])
         processing_diagnostics = self._processing_diagnostics(paths["processing_dir"])
         processed = self._capture_files(paths["processed_dir"])
-        errors = self._capture_files(paths["error_dir"])
+        error_diagnostics = self._error_artifact_diagnostics(paths)
+        resolution_diagnostics = self._error_resolution_diagnostics(paths)
+        resolved_errors = self._capture_files(paths["error_archive_dir"])
         receipts = self._receipt_files(paths["receipt_dir"])
         last_result = self._read_state(paths["state_path"])
         return {
@@ -268,6 +618,7 @@ class CaptureInboxDaemon:
             "processing_dir": str(paths["processing_dir"]),
             "processed_dir": str(paths["processed_dir"]),
             "error_dir": str(paths["error_dir"]),
+            "error_archive_dir": str(paths["error_archive_dir"]),
             "receipt_dir": str(paths["receipt_dir"]),
             "pending_file_count": len(pending),
             "inbox_temp_file_count": temp_diagnostics["total"],
@@ -279,14 +630,646 @@ class CaptureInboxDaemon:
             "processing_empty_claim_count": processing_diagnostics["empty"],
             "processing_malformed_claim_count": processing_diagnostics["malformed"],
             "processed_file_count": len(processed),
-            "error_file_count": len(errors),
+            # Compatibility alias: completed terminal evidence is history, not
+            # an active failure. Unsafe and manual-review artifacts remain
+            # actionable until an explicit governed resolution succeeds.
+            "error_file_count": int(error_diagnostics["unresolved_error_count"]),
+            "unresolved_error_count": int(
+                error_diagnostics["unresolved_error_count"]
+            ),
+            "terminal_error_evidence_count": int(
+                error_diagnostics["terminal_evidence_count"]
+            ),
+            "historical_error_evidence_count": int(
+                error_diagnostics["historical_evidence_count"]
+            ),
+            "unsafe_error_artifact_count": int(
+                error_diagnostics["unsafe_error_count"]
+            ),
+            "resolved_error_count": len(resolved_errors),
+            "error_resolution_pending_count": int(
+                resolution_diagnostics["pending_count"]
+            ),
+            "error_resolution_failed_count": int(
+                resolution_diagnostics["failed_count"]
+            ),
             "receipt_count": len(receipts),
-            "pending_files": [path.name for path in pending[:20]],
-            "processing_files": [path.name for _, path in processing[:20]],
+            "pending_files": [
+                safe_public_error(path.name, fallback="capture payload")
+                for path in pending[:20]
+            ],
+            "processing_files": [
+                safe_public_error(path.name, fallback="capture payload")
+                for _, path in processing[:20]
+            ],
             "last_result": last_result,
             "enabled": True,
             "mode": "capture-inbox",
         }
+
+    def error_resolution_preflight(
+        self,
+        *,
+        reason: str,
+        include_historical: bool = False,
+    ) -> dict[str, Any]:
+        """Describe a filename-free, no-content error archival transaction."""
+
+        paths = self.paths()
+        self._ensure_transport_dirs(paths)
+        clean_reason, _ = redact_capture_text(" ".join(str(reason or "").split()))
+        if not clean_reason:
+            raise ValueError("a non-empty resolution reason is required")
+        diagnostics = self._error_artifact_diagnostics(paths)
+        return self._error_resolution_preflight_payload(
+            diagnostics=diagnostics,
+            reason=clean_reason,
+            include_historical=bool(include_historical),
+        )
+
+    def resolve_error_artifacts(
+        self,
+        *,
+        preflight_token: str,
+        reason: str,
+        include_historical: bool = False,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Move classified historical evidence into a durable private archive.
+
+        The operation never auto-resolves unsafe, raw-retained, malformed, or
+        special-file artifacts. A preflight token is fenced to the exact inode
+        snapshot, requested scope, and redacted operator reason.
+        """
+
+        if not confirm:
+            raise ValueError("confirm=true is required to resolve capture errors")
+        clean_reason, _ = redact_capture_text(" ".join(str(reason or "").split()))
+        if not clean_reason:
+            raise ValueError("a non-empty resolution reason is required")
+        token = reject_sensitive_identifier(
+            preflight_token,
+            field="error resolution preflight token",
+        ).strip()
+        if re.fullmatch(r"[0-9a-f]{64}", token) is None:
+            raise ValueError("invalid error resolution preflight token")
+
+        paths = self.paths()
+        self._ensure_transport_dirs(paths)
+        with self._exclusive_lock(
+            paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
+            blocking=True,
+        ) as acquired:
+            if not acquired:
+                raise RuntimeError("capture maintenance lock is unavailable")
+            recovery = self._reconcile_error_resolutions(paths)
+            if recovery["failed_count"]:
+                raise RuntimeError(
+                    "an incomplete capture-error resolution requires manual repair"
+                )
+            diagnostics = self._error_artifact_diagnostics(paths)
+            preflight = self._error_resolution_preflight_payload(
+                diagnostics=diagnostics,
+                reason=clean_reason,
+                include_historical=bool(include_historical),
+            )
+            if not secrets.compare_digest(token, preflight["preflight_token"]):
+                raise ValueError(
+                    "capture error set changed after preflight; review and retry"
+                )
+            if diagnostics["unsafe_error_count"]:
+                raise ValueError(
+                    "unsafe capture error artifacts require manual repair and cannot be archived"
+                )
+            selected = [
+                record
+                for record in diagnostics["records"]
+                if record["category"] == "terminal"
+                or (
+                    bool(include_historical)
+                    and record["category"] == "historical"
+                )
+            ]
+            if not selected:
+                return {
+                    "action": "capture-error-resolve",
+                    "status": "ready",
+                    "resolved_count": 0,
+                    "resolution_id": "",
+                    "reason": clean_reason,
+                    "recovery": recovery,
+                }
+
+            resolution_id = secrets.token_hex(16)
+            manifest_path = paths["error_resolution_dir"] / (
+                f"resolution-{resolution_id}.json"
+            )
+            items: list[dict[str, Any]] = []
+            for record in selected:
+                source_stat = record["stat"]
+                items.append(
+                    {
+                        "item_id": secrets.token_hex(16),
+                        "source_identity": record["token"],
+                        "source_suffix": ".json",
+                        "category": record["category"],
+                        "archive_name": f"resolved-{secrets.token_hex(16)}.json",
+                        "expected": self._error_resolution_expected_stat(source_stat),
+                        "moved": False,
+                    }
+                )
+            manifest: dict[str, Any] = {
+                "schema": ERROR_RESOLUTION_SCHEMA,
+                "resolution_id": resolution_id,
+                "state": "prepared",
+                "reason": clean_reason,
+                "include_historical": bool(include_historical),
+                "preflight_fence": token,
+                "confirmation_recorded": True,
+                "raw_content_stored": False,
+                "source_filenames_stored": False,
+                "raw_equality_oracle_stored": False,
+                "created_at": time.time(),
+                "items": items,
+            }
+            self._write_error_resolution_manifest(manifest_path, manifest)
+
+            records_by_token = {
+                str(record["token"]): record
+                for record in diagnostics["records"]
+            }
+            for item in items:
+                record = records_by_token.get(str(item["source_identity"]))
+                if record is None:
+                    raise RuntimeError(
+                        "capture error source disappeared during resolution"
+                    )
+                self._move_error_resolution_item(
+                    paths=paths,
+                    record=record,
+                    item=item,
+                )
+                item["moved"] = True
+                item["resolved_at"] = time.time()
+                self._write_error_resolution_manifest(manifest_path, manifest)
+
+            manifest["state"] = "complete"
+            manifest["completed_at"] = time.time()
+            self._write_error_resolution_manifest(manifest_path, manifest)
+            return {
+                "action": "capture-error-resolve",
+                "status": "ready",
+                "resolved_count": len(items),
+                "terminal_resolved_count": sum(
+                    1 for item in items if item["category"] == "terminal"
+                ),
+                "historical_resolved_count": sum(
+                    1 for item in items if item["category"] == "historical"
+                ),
+                "resolution_id": resolution_id,
+                "reason": clean_reason,
+                "recovery": recovery,
+            }
+
+    def _error_artifact_diagnostics(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, Any]:
+        error_dir = paths["error_dir"]
+        records: list[dict[str, Any]] = []
+        unsafe_count = 0
+        try:
+            entries = list(error_dir.iterdir())
+        except FileNotFoundError:
+            entries = []
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        directory_fd = os.open(error_dir, flags)
+        try:
+            for path in entries:
+                try:
+                    path_stat = path.lstat()
+                except FileNotFoundError:
+                    continue
+                category = "unsafe"
+                parsed: dict[str, Any] | None = None
+                if (
+                    stat.S_ISREG(path_stat.st_mode)
+                    and not stat.S_ISLNK(path_stat.st_mode)
+                    and path.suffix.lower() == ".json"
+                    and not path.name.startswith(".")
+                    and int(path_stat.st_size) <= MAX_CAPTURE_BYTES
+                ):
+                    try:
+                        raw, opened_stat = _read_regular_file_at(
+                            directory_fd,
+                            path.name,
+                            max_bytes=MAX_CAPTURE_BYTES,
+                        )
+                        candidate = json.loads(raw.decode("utf-8"))
+                        redacted, redactions = redact_sensitive_value(candidate)
+                        sanitized, digest_removals = strip_untrusted_raw_digest_fields(
+                            redacted
+                        )
+                        if (
+                            isinstance(candidate, dict)
+                            and candidate == sanitized
+                            and not redactions
+                            and not digest_removals
+                            and candidate.get("raw_payload_retained") is not True
+                        ):
+                            parsed = candidate
+                            path_stat = opened_stat
+                            if (
+                                candidate.get("artifact_type")
+                                in RECOVERABLE_DISCARD_ARTIFACT_TYPES
+                                and candidate.get("raw_payload_retained") is False
+                                and str(candidate.get("disposition") or "")
+                                in TERMINAL_ERROR_DISPOSITIONS
+                            ):
+                                category = "terminal"
+                            else:
+                                category = "historical"
+                    except (
+                        OSError,
+                        UnicodeError,
+                        ValueError,
+                        TypeError,
+                        json.JSONDecodeError,
+                    ):
+                        category = "unsafe"
+                token = self._preflight_transport_token(
+                    path=path,
+                    stat_result=path_stat,
+                )
+                if category == "unsafe":
+                    unsafe_count += 1
+                records.append(
+                    {
+                        "path": path,
+                        "stat": path_stat,
+                        "token": token,
+                        "category": category,
+                        # Parsed content is deliberately not returned or logged.
+                        "classified": parsed is not None,
+                    }
+                )
+        finally:
+            os.close(directory_fd)
+        terminal_count = sum(1 for item in records if item["category"] == "terminal")
+        historical_count = sum(
+            1 for item in records if item["category"] == "historical"
+        )
+        return {
+            "records": records,
+            "terminal_evidence_count": terminal_count,
+            "historical_evidence_count": historical_count,
+            "unsafe_error_count": unsafe_count,
+            "unresolved_error_count": historical_count + unsafe_count,
+        }
+
+    def _error_resolution_preflight_payload(
+        self,
+        *,
+        diagnostics: dict[str, Any],
+        reason: str,
+        include_historical: bool,
+    ) -> dict[str, Any]:
+        selected_tokens = sorted(
+            str(record["token"])
+            for record in diagnostics["records"]
+            if record["category"] == "terminal"
+            or (include_historical and record["category"] == "historical")
+        )
+        token_payload = {
+            "schema": ERROR_RESOLUTION_SCHEMA,
+            "reason": reason,
+            "include_historical": bool(include_historical),
+            "selected_source_tokens": selected_tokens,
+            "unsafe_error_count": int(diagnostics["unsafe_error_count"]),
+        }
+        preflight_token = _sha256_text(
+            json.dumps(token_payload, sort_keys=True, separators=(",", ":"))
+        )
+        return {
+            "action": "capture-error-resolution-preflight",
+            "preflight_token": preflight_token,
+            "terminal_evidence_count": int(
+                diagnostics["terminal_evidence_count"]
+            ),
+            "historical_evidence_count": int(
+                diagnostics["historical_evidence_count"]
+            ),
+            "unsafe_error_count": int(diagnostics["unsafe_error_count"]),
+            "selected_count": len(selected_tokens),
+            "include_historical": bool(include_historical),
+            "reason": reason,
+            "ready_to_resolve": bool(
+                selected_tokens and not diagnostics["unsafe_error_count"]
+            ),
+            "source_filenames_returned": False,
+            "content_returned": False,
+            "content_digests_returned": False,
+        }
+
+    def _move_error_resolution_item(
+        self,
+        *,
+        paths: dict[str, Path],
+        record: dict[str, Any],
+        item: dict[str, Any],
+    ) -> None:
+        source = record["path"]
+        source_stat = source.lstat()
+        if _stat_identity(source_stat) != _stat_identity(record["stat"]):
+            raise ValueError("capture error artifact changed during resolution")
+        archive_name = str(item["archive_name"])
+        if ERROR_RESOLUTION_ARCHIVE_RE.fullmatch(archive_name) is None:
+            raise ValueError("invalid capture error archive identity")
+        destination = paths["error_archive_dir"] / archive_name
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError("capture error archive target already exists")
+        os.replace(source, destination)
+        try:
+            destination.chmod(0o600)
+        except PermissionError:
+            LOGGER.warning("could not chmod resolved capture error archive")
+        _fsync_directory(paths["error_dir"])
+        _fsync_directory(paths["error_archive_dir"])
+
+    @staticmethod
+    def _error_resolution_expected_stat(value: os.stat_result) -> dict[str, int]:
+        return {
+            "device": int(value.st_dev),
+            "inode": int(value.st_ino),
+            "bytes": int(value.st_size),
+            "modified_ns": int(value.st_mtime_ns),
+            "changed_ns": int(value.st_ctime_ns),
+        }
+
+    def _classify_resolved_error_archive(
+        self,
+        *,
+        archive_dir: Path,
+        archive_name: str,
+    ) -> tuple[str, os.stat_result]:
+        """Revalidate an already-moved archive without trusting its manifest."""
+
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(archive_dir, directory_flags)
+        try:
+            raw, opened_stat = _read_regular_file_at(
+                directory_fd,
+                archive_name,
+                max_bytes=MAX_CAPTURE_BYTES,
+            )
+        finally:
+            os.close(directory_fd)
+        candidate = json.loads(raw.decode("utf-8"))
+        redacted, redactions = redact_sensitive_value(candidate)
+        sanitized, digest_removals = strip_untrusted_raw_digest_fields(redacted)
+        if (
+            not isinstance(candidate, dict)
+            or candidate != sanitized
+            or redactions
+            or digest_removals
+            or candidate.get("raw_payload_retained") is True
+        ):
+            raise ValueError("resolved capture error archive is unsafe")
+        if (
+            candidate.get("artifact_type") in RECOVERABLE_DISCARD_ARTIFACT_TYPES
+            and candidate.get("raw_payload_retained") is False
+            and str(candidate.get("disposition") or "")
+            in TERMINAL_ERROR_DISPOSITIONS
+        ):
+            return "terminal", opened_stat
+        return "historical", opened_stat
+
+    def _validate_prepared_error_resolution(
+        self,
+        *,
+        manifest_path: Path,
+        manifest: dict[str, Any],
+        diagnostics: dict[str, Any],
+        paths: dict[str, Path],
+    ) -> list[tuple[dict[str, Any], dict[str, Any] | None, Path]]:
+        """Validate recovery state independently of the file that described it."""
+
+        resolution_id = str(manifest.get("resolution_id") or "")
+        if re.fullmatch(r"[0-9a-f]{32}", resolution_id) is None:
+            raise ValueError("invalid capture error resolution id")
+        if manifest_path.name != f"resolution-{resolution_id}.json":
+            raise ValueError("capture error resolution id does not match its manifest")
+        include_historical = manifest.get("include_historical")
+        if type(include_historical) is not bool:
+            raise ValueError("invalid capture error resolution scope")
+        reason = str(manifest.get("reason") or "")
+        clean_reason, redactions = redact_capture_text(" ".join(reason.split()))
+        if not clean_reason or redactions or clean_reason != reason:
+            raise ValueError("invalid capture error resolution reason")
+        if (
+            manifest.get("raw_content_stored") is not False
+            or manifest.get("source_filenames_stored") is not False
+            or manifest.get("raw_equality_oracle_stored") is not False
+            or manifest.get("confirmation_recorded") is not True
+        ):
+            raise ValueError("capture error resolution attestations are invalid")
+        if int(diagnostics.get("unsafe_error_count") or 0):
+            raise ValueError(
+                "unsafe capture error artifacts block automatic resolution recovery"
+            )
+        items = manifest.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("invalid capture error resolution items")
+        source_identities: list[str] = []
+        item_ids: set[str] = set()
+        archive_names: set[str] = set()
+        validated: list[tuple[dict[str, Any], dict[str, Any] | None, Path]] = []
+        records_by_token = {
+            str(record["token"]): record for record in diagnostics["records"]
+        }
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("invalid capture error resolution item")
+            item_id = str(item.get("item_id") or "")
+            source_identity = str(item.get("source_identity") or "")
+            archive_name = str(item.get("archive_name") or "")
+            category = str(item.get("category") or "")
+            expected = item.get("expected")
+            if re.fullmatch(r"[0-9a-f]{32}", item_id) is None or item_id in item_ids:
+                raise ValueError("invalid or duplicate capture error resolution item id")
+            if re.fullmatch(r"[0-9a-f]{64}", source_identity) is None:
+                raise ValueError("invalid capture error source identity")
+            if source_identity in source_identities:
+                raise ValueError("duplicate capture error source identity")
+            if (
+                ERROR_RESOLUTION_ARCHIVE_RE.fullmatch(archive_name) is None
+                or archive_name in archive_names
+            ):
+                raise ValueError("invalid or duplicate capture error archive identity")
+            if category not in {"terminal", "historical"}:
+                raise ValueError("unsafe capture error category cannot be recovered")
+            if category == "historical" and not include_historical:
+                raise ValueError("historical capture error is outside resolution scope")
+            if not isinstance(expected, dict) or set(expected) != {
+                "device",
+                "inode",
+                "bytes",
+                "modified_ns",
+                "changed_ns",
+            }:
+                raise ValueError("invalid capture error expected-stat fence")
+            if any(type(expected[key]) is not int or expected[key] < 0 for key in expected):
+                raise ValueError("invalid capture error expected-stat value")
+            item_ids.add(item_id)
+            source_identities.append(source_identity)
+            archive_names.add(archive_name)
+            record = records_by_token.get(source_identity)
+            destination = paths["error_archive_dir"] / archive_name
+            destination_exists = destination.exists() and not destination.is_symlink()
+            if record is not None and destination_exists:
+                raise ValueError("capture error exists in both source and archive")
+            if record is not None:
+                if record.get("category") != category or not record.get("classified"):
+                    raise ValueError("capture error category changed during recovery")
+                if expected != self._error_resolution_expected_stat(record["stat"]):
+                    raise ValueError("capture error stat fence changed during recovery")
+            elif destination_exists:
+                archive_category, archive_stat = self._classify_resolved_error_archive(
+                    archive_dir=paths["error_archive_dir"],
+                    archive_name=archive_name,
+                )
+                if archive_category != category:
+                    raise ValueError("resolved capture error category does not match")
+                stable_expected = (
+                    expected["device"],
+                    expected["inode"],
+                    expected["bytes"],
+                    expected["modified_ns"],
+                )
+                if stable_expected != _staged_file_identity(archive_stat):
+                    raise ValueError("resolved capture error stat fence does not match")
+            else:
+                raise RuntimeError(
+                    "capture error resolution lost both source and archive"
+                )
+            validated.append((item, record, destination))
+
+        preflight_payload = {
+            "schema": ERROR_RESOLUTION_SCHEMA,
+            "reason": reason,
+            "include_historical": include_historical,
+            "selected_source_tokens": sorted(source_identities),
+            "unsafe_error_count": 0,
+        }
+        expected_preflight = _sha256_text(
+            json.dumps(preflight_payload, sort_keys=True, separators=(",", ":"))
+        )
+        preflight_token = str(manifest.get("preflight_fence") or "")
+        if not secrets.compare_digest(preflight_token, expected_preflight):
+            raise ValueError("capture error resolution preflight proof is invalid")
+        return validated
+
+    def _write_error_resolution_manifest(
+        self,
+        path: Path,
+        manifest: dict[str, Any],
+    ) -> None:
+        if ERROR_RESOLUTION_MANIFEST_RE.fullmatch(path.name) is None:
+            raise ValueError("invalid capture error resolution manifest identity")
+        safe_manifest, redactions = redact_sensitive_value(manifest)
+        safe_manifest, digest_removals = strip_untrusted_raw_digest_fields(
+            safe_manifest
+        )
+        if redactions or digest_removals or safe_manifest != manifest:
+            raise ValueError("capture error resolution manifest is not secret-safe")
+        _atomic_write_private_text(
+            path,
+            json.dumps(manifest, indent=2, sort_keys=True),
+        )
+
+    def _error_resolution_diagnostics(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, int]:
+        pending = 0
+        failed = 0
+        complete = 0
+        for path in self._capture_files(paths["error_resolution_dir"]):
+            if ERROR_RESOLUTION_MANIFEST_RE.fullmatch(path.name) is None:
+                failed += 1
+                continue
+            try:
+                parsed = json.loads(self._read_capture_text(path))
+            except Exception:
+                failed += 1
+                continue
+            if not isinstance(parsed, dict) or parsed.get("schema") != ERROR_RESOLUTION_SCHEMA:
+                failed += 1
+            elif parsed.get("state") == "complete":
+                complete += 1
+            elif parsed.get("state") == "prepared":
+                pending += 1
+            else:
+                failed += 1
+        return {
+            "pending_count": pending,
+            "failed_count": failed,
+            "complete_count": complete,
+        }
+
+    def _reconcile_error_resolutions(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, int]:
+        result = {"completed_count": 0, "moved_count": 0, "failed_count": 0}
+        diagnostics = self._error_artifact_diagnostics(paths)
+        for manifest_path in self._capture_files(paths["error_resolution_dir"]):
+            if ERROR_RESOLUTION_MANIFEST_RE.fullmatch(manifest_path.name) is None:
+                result["failed_count"] += 1
+                continue
+            try:
+                manifest = json.loads(self._read_capture_text(manifest_path))
+                if (
+                    not isinstance(manifest, dict)
+                    or manifest.get("schema") != ERROR_RESOLUTION_SCHEMA
+                ):
+                    raise ValueError("invalid capture error resolution manifest")
+                if manifest.get("state") == "complete":
+                    continue
+                if manifest.get("state") != "prepared":
+                    raise ValueError("unknown capture error resolution state")
+                validated = self._validate_prepared_error_resolution(
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                    diagnostics=diagnostics,
+                    paths=paths,
+                )
+                for item, record, _destination in validated:
+                    if record is not None:
+                        self._move_error_resolution_item(
+                            paths=paths,
+                            record=record,
+                            item=item,
+                        )
+                        result["moved_count"] += 1
+                    item["moved"] = True
+                    item.setdefault("resolved_at", time.time())
+                    self._write_error_resolution_manifest(manifest_path, manifest)
+                manifest["state"] = "complete"
+                manifest["completed_at"] = time.time()
+                manifest["recovered_after_interruption"] = True
+                self._write_error_resolution_manifest(manifest_path, manifest)
+                result["completed_count"] += 1
+            except Exception:
+                result["failed_count"] += 1
+                LOGGER.exception("failed to reconcile capture error resolution")
+        return result
 
     def preflight(self, *, max_files: int = 50) -> dict[str, Any]:
         paths = self.paths()
@@ -317,9 +1300,12 @@ class CaptureInboxDaemon:
                 request_fingerprint = ""
                 fingerprint_mode = "transport-metadata-only"
             selected_total_bytes += size
+            safe_suffix = path.suffix.lower()
+            if safe_suffix not in CAPTURE_SUFFIXES:
+                safe_suffix = ".payload"
             selected_files.append(
                 {
-                    "file": path.name,
+                    "file": f"capture-{transport_token[:16]}{safe_suffix}",
                     "bytes": size,
                     "modified_at": modified_at,
                     "transport_token": transport_token,
@@ -346,7 +1332,7 @@ class CaptureInboxDaemon:
         stat_result: os.stat_result,
     ) -> str:
         metadata = {
-            "file": path.name,
+            "protocol": "capture-transport.v3",
             "device": int(stat_result.st_dev),
             "inode": int(stat_result.st_ino),
             "mode": int(stat.S_IMODE(stat_result.st_mode)),
@@ -459,7 +1445,7 @@ class CaptureInboxDaemon:
         paths: dict[str, Path],
     ) -> dict[str, int]:
         repaired = {
-            "quarantined": 0,
+            "discarded": 0,
             "evidence_errors": 0,
         }
         inbox_dir = paths["inbox_dir"]
@@ -468,24 +1454,12 @@ class CaptureInboxDaemon:
                 continue
             path = artifact["path"]
             observed_stat = artifact["stat"]
-            observed_identity = (
-                int(observed_stat.st_dev),
-                int(observed_stat.st_ino),
-                int(observed_stat.st_size),
-                int(observed_stat.st_mtime_ns),
-                int(observed_stat.st_ctime_ns),
-            )
+            observed_identity = _stat_identity(observed_stat)
             try:
                 current_stat = path.lstat()
             except FileNotFoundError:
                 continue
-            current_identity = (
-                int(current_stat.st_dev),
-                int(current_stat.st_ino),
-                int(current_stat.st_size),
-                int(current_stat.st_mtime_ns),
-                int(current_stat.st_ctime_ns),
-            )
+            current_identity = _stat_identity(current_stat)
             if (
                 current_identity != observed_identity
                 or not stat.S_ISREG(current_stat.st_mode)
@@ -499,44 +1473,38 @@ class CaptureInboxDaemon:
             )
             if current_age < STALE_INBOX_TEMP_SECONDS:
                 continue
-            destination = self._unique_destination(
-                paths["error_dir"],
-                f"stale-temp-{path.name}",
+            staged = _stage_regular_file_for_discard(
+                path=path,
+                staging_dir=paths["error_dir"],
+                expected_stat=current_stat,
             )
-            try:
-                os.replace(path, destination)
-            except FileNotFoundError:
+            if staged is None:
                 continue
-            try:
-                destination.chmod(0o600)
-            except PermissionError:
-                LOGGER.warning("could not chmod quarantined temp %s", destination)
-            _fsync_directory(inbox_dir)
-            _fsync_directory(paths["error_dir"])
-            quarantined_at = time.time()
+            discarded_at = time.time()
             evidence = {
                 "artifact_type": "stale-capture-inbox-temp",
-                "original_file": path.name,
-                "quarantined_file": destination.name,
+                "discard_operation_id": _discard_operation_id(staged),
+                "original_file": safe_public_error(
+                    path.name,
+                    fallback="capture temp",
+                ),
                 "temp_kind": artifact["kind"],
                 "observed_bytes": int(current_stat.st_size),
                 "observed_modified_at": float(current_stat.st_mtime),
                 "observed_changed_at": float(current_stat.st_ctime),
                 "observed_age_seconds": round(current_age, 3),
-                "transport_token": self._preflight_transport_token(
-                    path=path,
-                    stat_result=current_stat,
-                ),
                 "content_inspected": False,
                 "content_digest_recorded": False,
-                "quarantined_at": quarantined_at,
+                "raw_payload_retained": True,
+                "disposition": "detached-pending-discard",
+                "discarded_at": discarded_at,
                 "reason": (
                     "stale capture inbox temp was never eligible for ingestion"
                 ),
             }
             evidence_path = self._unique_destination(
                 paths["error_dir"],
-                f"{destination.name}.evidence.json",
+                f"temp-discard-evidence-{secrets.token_hex(16)}.json",
             )
             try:
                 _atomic_write_private_text(
@@ -546,16 +1514,609 @@ class CaptureInboxDaemon:
             except Exception:
                 repaired["evidence_errors"] += 1
                 LOGGER.exception(
-                    "quarantined stale inbox temp but failed to persist evidence %s",
+                    "failed to persist stale inbox temp evidence %s",
                     evidence_path,
                 )
-            repaired["quarantined"] += 1
+                try:
+                    os.replace(staged, path)
+                    _fsync_directory(inbox_dir)
+                except OSError:
+                    LOGGER.exception("failed to restore capture temp after evidence error")
+                continue
+            try:
+                staged.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                repaired["evidence_errors"] += 1
+                LOGGER.exception("failed to discard detached capture temp")
+                continue
+            _fsync_directory(paths["error_dir"])
+            evidence["raw_payload_retained"] = False
+            evidence["disposition"] = "discarded-without-content-inspection"
+            try:
+                _atomic_write_private_text(
+                    evidence_path,
+                    json.dumps(evidence, indent=2, sort_keys=True),
+                )
+            except Exception:
+                repaired["evidence_errors"] += 1
+                LOGGER.exception("failed to finalize capture temp discard evidence")
+            repaired["discarded"] += 1
         return repaired
+
+    def _discard_legacy_raw_error_artifacts(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, int]:
+        """Remove raw stale-temp quarantine bytes left by pre-v2 daemons."""
+
+        result = {"discarded": 0, "evidence_errors": 0}
+        error_dir = paths["error_dir"]
+        try:
+            entries = list(error_dir.iterdir())
+        except FileNotFoundError:
+            return result
+        for path in entries:
+            if not path.name.startswith("stale-temp-") or path.name.endswith(
+                ".evidence.json"
+            ):
+                continue
+            try:
+                path_stat = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode):
+                continue
+            staged = _stage_regular_file_for_discard(
+                path=path,
+                staging_dir=error_dir,
+                expected_stat=path_stat,
+            )
+            if staged is None:
+                continue
+            evidence = {
+                "artifact_type": "legacy-raw-stale-temp-quarantine",
+                "discard_operation_id": _discard_operation_id(staged),
+                "original_file": safe_public_error(
+                    path.name,
+                    fallback="legacy capture temp",
+                ),
+                "observed_bytes": int(path_stat.st_size),
+                "observed_modified_at": float(path_stat.st_mtime),
+                "content_inspected": False,
+                "content_digest_recorded": False,
+                "raw_payload_retained": True,
+                "disposition": "legacy-raw-quarantine-detached",
+                "discarded_at": time.time(),
+                "reason": "legacy daemon retained rejected raw transport bytes",
+            }
+            evidence_path = self._unique_destination(
+                error_dir,
+                f"legacy-raw-discard-{int(time.time())}-{secrets.token_hex(8)}.evidence.json",
+            )
+            try:
+                _atomic_write_private_text(
+                    evidence_path,
+                    json.dumps(evidence, indent=2, sort_keys=True),
+                )
+            except Exception:
+                result["evidence_errors"] += 1
+                LOGGER.exception(
+                    "failed to persist legacy raw quarantine evidence %s",
+                    evidence_path,
+                )
+                try:
+                    os.replace(staged, path)
+                    _fsync_directory(error_dir)
+                except OSError:
+                    LOGGER.exception("failed to restore legacy temp after evidence error")
+                continue
+            try:
+                staged.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                result["evidence_errors"] += 1
+                LOGGER.exception("failed to discard detached legacy capture temp")
+                continue
+            _fsync_directory(error_dir)
+            evidence["raw_payload_retained"] = False
+            evidence["disposition"] = "legacy-raw-quarantine-discarded"
+            try:
+                _atomic_write_private_text(
+                    evidence_path,
+                    json.dumps(evidence, indent=2, sort_keys=True),
+                )
+            except Exception:
+                result["evidence_errors"] += 1
+                LOGGER.exception("failed to finalize legacy discard evidence")
+            result["discarded"] += 1
+        return result
+
+    def _recover_detached_discard_artifacts(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, int]:
+        """Finish interrupted raw-byte discards and reconcile their evidence."""
+
+        result = {"discarded": 0, "evidence_updates": 0, "errors": 0}
+        error_dir = paths["error_dir"]
+        completed_ids: set[str] = set()
+        try:
+            staged_paths = list(error_dir.iterdir())
+        except FileNotFoundError:
+            return result
+        for staged in staged_paths:
+            discard_id = _discard_operation_id(staged)
+            if not discard_id:
+                continue
+            try:
+                staged_stat = staged.lstat()
+            except FileNotFoundError:
+                continue
+            try:
+                if DETACHED_DISCARD_RE.fullmatch(staged.name):
+                    if not stat.S_ISREG(staged_stat.st_mode) or stat.S_ISLNK(
+                        staged_stat.st_mode
+                    ):
+                        raise ValueError(
+                            "detached capture discard must remain a regular file"
+                        )
+                    staged.unlink()
+                    _fsync_directory(error_dir)
+                else:
+                    if not stat.S_ISDIR(staged_stat.st_mode) or stat.S_ISLNK(
+                        staged_stat.st_mode
+                    ):
+                        raise ValueError(
+                            "detached capture discard tree must remain a real directory"
+                        )
+                    _remove_tree_without_following_links(
+                        staged,
+                        parent_dir=error_dir,
+                    )
+            except (OSError, RuntimeError, ValueError):
+                result["errors"] += 1
+                LOGGER.exception("failed to resume detached capture discard")
+                continue
+            result["discarded"] += 1
+            completed_ids.add(discard_id)
+
+        evidence_ids: set[str] = set()
+        pending_evidence: list[tuple[Path, dict[str, Any], str]] = []
+        for evidence_path in list(error_dir.glob("*.json")):
+            try:
+                evidence_stat = evidence_path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(evidence_stat.st_mode)
+                or stat.S_ISLNK(evidence_stat.st_mode)
+                or int(evidence_stat.st_size) > MAX_CAPTURE_BYTES
+            ):
+                continue
+            try:
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(evidence, dict):
+                continue
+            discard_id = str(evidence.get("discard_operation_id") or "")
+            if re.fullmatch(r"[0-9a-f]{32}", discard_id) is None:
+                continue
+            if evidence.get("artifact_type") not in RECOVERABLE_DISCARD_ARTIFACT_TYPES:
+                continue
+            evidence_ids.add(discard_id)
+            if evidence.get("raw_payload_retained") is True:
+                pending_evidence.append((evidence_path, evidence, discard_id))
+
+        for evidence_path, evidence, discard_id in pending_evidence:
+            staged_names = (
+                f".s2-discard-{discard_id}.tmp",
+                f".s2-discard-tree-{discard_id}.tmp",
+            )
+            retained_artifact_exists = False
+            for staged_name in staged_names:
+                try:
+                    (error_dir / staged_name).lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    retained_artifact_exists = True
+                    break
+                else:
+                    retained_artifact_exists = True
+                    break
+            if retained_artifact_exists:
+                continue
+            evidence["raw_payload_retained"] = False
+            evidence["disposition"] = "recovered-discard-complete"
+            evidence["recovered_at"] = time.time()
+            try:
+                _atomic_write_private_text(
+                    evidence_path,
+                    json.dumps(evidence, indent=2, sort_keys=True),
+                )
+            except Exception:
+                result["errors"] += 1
+                LOGGER.exception("failed to reconcile recovered discard evidence")
+            else:
+                result["evidence_updates"] += 1
+
+        for discard_id in completed_ids - evidence_ids:
+            recovery_evidence = {
+                "version": 2,
+                "artifact_type": "detached-capture-discard-recovery",
+                "discard_operation_id": discard_id,
+                "content_inspected": False,
+                "content_digest_recorded": False,
+                "raw_payload_retained": False,
+                "disposition": "recovered-discard-complete",
+                "recovered_at": time.time(),
+            }
+            try:
+                _atomic_write_private_text(
+                    self._unique_destination(
+                        error_dir,
+                        f"temp-discard-evidence-{secrets.token_hex(16)}.evidence.json",
+                    ),
+                    json.dumps(recovery_evidence, indent=2, sort_keys=True),
+                )
+                result["evidence_updates"] += 1
+            except Exception:
+                result["errors"] += 1
+                LOGGER.exception("failed to persist discard recovery evidence")
+        return result
+
+    def _scrub_legacy_temp_evidence_artifacts(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, int]:
+        """Canonicalize old discard evidence without retaining raw names/tokens."""
+
+        result = {"scrubbed": 0, "errors": 0}
+        error_dir = paths["error_dir"]
+        allowed_artifact_types = set(RECOVERABLE_DISCARD_ARTIFACT_TYPES)
+        allowed_keys = {
+            "artifact_type",
+            "discard_operation_id",
+            "temp_kind",
+            "observed_bytes",
+            "observed_modified_at",
+            "observed_changed_at",
+            "observed_age_seconds",
+            "content_inspected",
+            "content_digest_recorded",
+            "raw_payload_retained",
+            "disposition",
+            "discarded_at",
+            "recovered_at",
+            "reason",
+            "cleanup_kind",
+            "claim",
+            "children",
+            "file",
+            "error",
+            "failed_at",
+            "payload_disposition",
+            "redacted_payload_retained",
+        }
+        try:
+            entries = list(error_dir.iterdir())
+        except FileNotFoundError:
+            return result
+        for path in entries:
+            try:
+                path_stat = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(path_stat.st_mode)
+                or stat.S_ISLNK(path_stat.st_mode)
+                or path.suffix.lower() != ".json"
+                or int(path_stat.st_size) > MAX_CAPTURE_BYTES
+            ):
+                continue
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if (
+                not isinstance(parsed, dict)
+                or parsed.get("artifact_type") not in allowed_artifact_types
+            ):
+                continue
+            canonical = {
+                "version": 2,
+                **{key: parsed[key] for key in allowed_keys if key in parsed},
+                "original_filename_stored": False,
+                "transport_token_stored": False,
+                "content_digest_recorded": False,
+            }
+            canonical, _ = redact_sensitive_value(canonical)
+            canonical, _ = strip_untrusted_raw_digest_fields(canonical)
+            safe_name = bool(
+                re.fullmatch(
+                    r"(?:temp-discard-evidence|legacy-raw-discard)-[0-9a-f-]+(?:\.evidence)?\.json",
+                    path.name,
+                )
+            )
+            if canonical == parsed and safe_name:
+                continue
+            destination = self._unique_destination(
+                error_dir,
+                f"temp-discard-evidence-{secrets.token_hex(16)}.evidence.json",
+            )
+            try:
+                _atomic_write_private_text(
+                    destination,
+                    json.dumps(canonical, indent=2, sort_keys=True),
+                )
+                path.unlink()
+                _fsync_directory(error_dir)
+            except Exception:
+                result["errors"] += 1
+                LOGGER.exception("failed to canonicalize legacy discard evidence")
+                try:
+                    destination.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            result["scrubbed"] += 1
+        return result
+
+    @staticmethod
+    def _decode_processed_archive(
+        *,
+        suffix: str,
+        raw: bytes,
+    ) -> tuple[str, Any]:
+        text = raw.decode("utf-8")
+        if suffix == ".txt":
+            return "text", text
+        if suffix == ".jsonl":
+            records: list[dict[str, Any]] = []
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                parsed = json.loads(line)
+                if not isinstance(parsed, dict):
+                    raise ValueError("processed JSONL records must be objects")
+                records.append(parsed)
+            if not records:
+                raise ValueError("processed JSONL archive must not be empty")
+            return "jsonl", records
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            if not parsed or not all(isinstance(item, dict) for item in parsed):
+                raise ValueError("processed JSON list must contain objects")
+            return "json-list", parsed
+        if not isinstance(parsed, dict):
+            raise ValueError("processed JSON archive must be an object or list")
+        return "json-object", parsed
+
+    @staticmethod
+    def _processed_archive_capture_ids(document: Any) -> tuple[Any, ...]:
+        records = document if isinstance(document, list) else [document]
+        if not all(isinstance(record, dict) for record in records):
+            raise ValueError("processed capture archive records must be objects")
+        return tuple(record.get("capture_id") for record in records)
+
+    @classmethod
+    def _sanitize_processed_archive(
+        cls,
+        document: Any,
+    ) -> tuple[Any, int, int]:
+        if isinstance(document, str):
+            redacted, redaction_count = redact_capture_text(document)
+            sanitized, digest_removals = strip_untrusted_raw_digest_text(redacted)
+            stable, _ = redact_capture_text(sanitized)
+            stable, remaining_digests = strip_untrusted_raw_digest_text(stable)
+            if stable != sanitized or remaining_digests:
+                raise ValueError("processed text archive sanitization is not idempotent")
+            return sanitized, int(redaction_count), int(digest_removals)
+        capture_ids = cls._processed_archive_capture_ids(document)
+        redacted, redaction_count = redact_sensitive_value(document)
+        sanitized, digest_removals = strip_untrusted_raw_digest_fields(redacted)
+        if cls._processed_archive_capture_ids(sanitized) != capture_ids:
+            raise ValueError("processed capture archive identity is not rewritable")
+        stable, _ = redact_sensitive_value(sanitized)
+        stable, remaining_digests = strip_untrusted_raw_digest_fields(stable)
+        if stable != sanitized or remaining_digests:
+            raise ValueError("processed capture archive sanitization is not idempotent")
+        return sanitized, int(redaction_count), int(digest_removals)
+
+    @staticmethod
+    def _encode_processed_archive(*, document_kind: str, document: Any) -> str:
+        if document_kind == "text":
+            if not isinstance(document, str):
+                raise ValueError("processed text archive must remain text")
+            return document
+        if document_kind == "jsonl":
+            return "\n".join(
+                json.dumps(
+                    record,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                for record in document
+            ) + "\n"
+        return json.dumps(
+            document,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    def _scrub_legacy_processed_artifacts(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, Any]:
+        """Canonicalize private processed archives without changing identity."""
+
+        result: dict[str, Any] = {
+            "schema": PROCESSED_ARCHIVE_SCRUB_SCHEMA,
+            "scanned": 0,
+            "scrubbed": 0,
+            "clean": 0,
+            "skipped": 0,
+            "symlink_refusals": 0,
+            "errors": 0,
+            "redactions": 0,
+            "raw_digest_fields_removed": 0,
+            "post_pass_unsafe": 0,
+            "post_pass_unverified": 0,
+        }
+        if self._processed_archive_scrub_verified:
+            return result
+        processed_dir = paths["processed_dir"]
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            directory_fd = os.open(processed_dir, flags)
+        except OSError:
+            result["errors"] += 1
+            result["post_pass_unverified"] += 1
+            LOGGER.warning("processed capture archive scrub could not open its private directory")
+            return result
+        try:
+            try:
+                filenames = sorted(os.listdir(directory_fd))
+            except OSError:
+                result["errors"] += 1
+                result["post_pass_unverified"] += 1
+                return result
+            for filename in filenames:
+                suffix = Path(filename).suffix.lower()
+                if suffix not in {".json", ".jsonl", ".txt"}:
+                    result["skipped"] += 1
+                    continue
+                result["scanned"] += 1
+                unsafe = False
+                try:
+                    candidate_stat = os.stat(
+                        filename,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISLNK(candidate_stat.st_mode):
+                        result["symlink_refusals"] += 1
+                        result["errors"] += 1
+                        result["post_pass_unverified"] += 1
+                        continue
+                    if not stat.S_ISREG(candidate_stat.st_mode):
+                        result["skipped"] += 1
+                        continue
+                    raw, opened_stat = _read_regular_file_at(
+                        directory_fd,
+                        filename,
+                        max_bytes=MAX_CAPTURE_BYTES,
+                    )
+                    document_kind, document = self._decode_processed_archive(
+                        suffix=suffix,
+                        raw=raw,
+                    )
+                    sanitized, redactions, digest_removals = (
+                        self._sanitize_processed_archive(document)
+                    )
+                    unsafe = sanitized != document
+                    if not unsafe:
+                        _ensure_private_regular_mode_at(
+                            directory_fd,
+                            filename,
+                            expected_stat=opened_stat,
+                        )
+                        result["clean"] += 1
+                        continue
+                    encoded = self._encode_processed_archive(
+                        document_kind=document_kind,
+                        document=sanitized,
+                    )
+                    _atomic_rewrite_private_text_at(
+                        directory_fd,
+                        filename,
+                        encoded,
+                        expected_stat=opened_stat,
+                    )
+                    verify_raw, verify_stat = _read_regular_file_at(
+                        directory_fd,
+                        filename,
+                        max_bytes=MAX_CAPTURE_BYTES,
+                    )
+                    _, verify_document = self._decode_processed_archive(
+                        suffix=suffix,
+                        raw=verify_raw,
+                    )
+                    verify_sanitized, _, verify_digest_removals = (
+                        self._sanitize_processed_archive(verify_document)
+                    )
+                    if (
+                        verify_sanitized != verify_document
+                        or verify_digest_removals
+                    ):
+                        raise ValueError(
+                            "processed capture archive failed its post-write invariant"
+                        )
+                    _ensure_private_regular_mode_at(
+                        directory_fd,
+                        filename,
+                        expected_stat=verify_stat,
+                    )
+                    result["scrubbed"] += 1
+                    result["redactions"] += int(redactions)
+                    result["raw_digest_fields_removed"] += int(digest_removals)
+                except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                    result["errors"] += 1
+                    if unsafe:
+                        result["post_pass_unsafe"] += 1
+                    else:
+                        result["post_pass_unverified"] += 1
+        finally:
+            os.close(directory_fd)
+        if result["errors"]:
+            LOGGER.warning(
+                "processed capture archive scrub completed with %d count-only error(s)",
+                result["errors"],
+            )
+        elif not result["post_pass_unsafe"] and not result["post_pass_unverified"]:
+            # A long-running daemon processes only canonical archives after
+            # this pass. Avoid reparsing the entire immutable archive every
+            # poll interval; a fresh daemon process verifies it again.
+            self._processed_archive_scrub_verified = True
+        return result
 
     def process_once(self, *, max_files: int = 50) -> dict[str, Any]:
         paths = self.paths()
         self._ensure_transport_dirs(paths)
+        with self._exclusive_lock(
+            paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
+            blocking=True,
+        ) as acquired:
+            if not acquired:
+                raise RuntimeError("capture maintenance lock is unavailable")
+            return self._process_once_locked(paths=paths, max_files=max_files)
+
+    def _process_once_locked(
+        self,
+        *,
+        paths: dict[str, Path],
+        max_files: int,
+    ) -> dict[str, Any]:
         bounded_max = min(max(int(max_files), 1), 250)
+        error_resolution_repair = self._reconcile_error_resolutions(paths)
+        processed_archive_scrub = self._scrub_legacy_processed_artifacts(paths)
+        detached_discard_repair = self._recover_detached_discard_artifacts(paths)
+        legacy_error_repair = self._discard_legacy_raw_error_artifacts(paths)
+        legacy_evidence_repair = self._scrub_legacy_temp_evidence_artifacts(paths)
         temp_repair = self._repair_inbox_temp_artifacts(paths)
         repair = self._repair_processing_claims(paths)
         claims = self._processing_claims(paths["processing_dir"])[:bounded_max]
@@ -600,13 +2161,50 @@ class CaptureInboxDaemon:
         result = {
             "processed_at": time.time(),
             "root": str(self.root),
+            "processed_archive_scrub_schema": processed_archive_scrub["schema"],
+            "processed_archive_scanned_count": processed_archive_scrub["scanned"],
+            "processed_archive_scrubbed_count": processed_archive_scrub["scrubbed"],
+            "processed_archive_clean_count": processed_archive_scrub["clean"],
+            "processed_archive_skipped_count": processed_archive_scrub["skipped"],
+            "processed_archive_symlink_refusal_count": processed_archive_scrub[
+                "symlink_refusals"
+            ],
+            "processed_archive_scrub_error_count": processed_archive_scrub["errors"],
+            "processed_archive_redaction_count": processed_archive_scrub["redactions"],
+            "processed_archive_raw_digest_removed_count": processed_archive_scrub[
+                "raw_digest_fields_removed"
+            ],
+            "processed_archive_post_pass_unsafe_count": processed_archive_scrub[
+                "post_pass_unsafe"
+            ],
+            "processed_archive_post_pass_unverified_count": processed_archive_scrub[
+                "post_pass_unverified"
+            ],
+            "error_resolution_completed_count": error_resolution_repair[
+                "completed_count"
+            ],
+            "error_resolution_moved_count": error_resolution_repair["moved_count"],
+            "error_resolution_failed_count": error_resolution_repair["failed_count"],
             "processed_file_count": processed_file_count,
             "error_file_count": error_file_count,
             "deferred_file_count": deferred_file_count,
             "repaired_empty_claim_count": repair["empty_removed"],
             "quarantined_claim_count": repair["malformed_quarantined"],
-            "quarantined_stale_temp_count": temp_repair["quarantined"],
-            "temp_quarantine_evidence_error_count": temp_repair["evidence_errors"],
+            # Compatibility count: quarantine now retains metadata evidence
+            # only; the untrusted payload bytes are discarded.
+            "quarantined_stale_temp_count": temp_repair["discarded"],
+            "discarded_stale_temp_count": temp_repair["discarded"],
+            "discarded_legacy_raw_error_count": legacy_error_repair["discarded"],
+            "recovered_detached_discard_count": detached_discard_repair[
+                "discarded"
+            ],
+            "scrubbed_legacy_evidence_count": legacy_evidence_repair["scrubbed"],
+            "temp_quarantine_evidence_error_count": (
+                temp_repair["evidence_errors"]
+                + legacy_error_repair["evidence_errors"]
+                + legacy_evidence_repair["errors"]
+                + detached_discard_repair["errors"]
+            ),
             "inbox_temp_file_count": temp_diagnostics["total"],
             "fresh_inbox_temp_file_count": temp_diagnostics["fresh"],
             "stale_inbox_temp_file_count": temp_diagnostics["stale"],
@@ -619,10 +2217,25 @@ class CaptureInboxDaemon:
             "captures": captures,
             "errors": errors,
         }
-        if claims or temp_repair["quarantined"]:
+        if (
+            claims
+            or temp_repair["discarded"]
+            or legacy_error_repair["discarded"]
+            or legacy_evidence_repair["scrubbed"]
+            or detached_discard_repair["discarded"]
+            or processed_archive_scrub["scrubbed"]
+            or processed_archive_scrub["errors"]
+            or error_resolution_repair["completed_count"]
+            or error_resolution_repair["failed_count"]
+        ):
             _atomic_write_private_text(
                 paths["state_path"],
-                json.dumps(result, indent=2, sort_keys=True, default=str),
+                json.dumps(
+                    self._compact_process_result(result),
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                ),
             )
         return result
 
@@ -634,7 +2247,124 @@ class CaptureInboxDaemon:
         except Exception:
             LOGGER.warning("failed to read capture daemon state", exc_info=True)
             return {}
-        return parsed if isinstance(parsed, dict) else {}
+        if not isinstance(parsed, dict):
+            return {}
+        compact = self._compact_process_result(parsed)
+        if compact != parsed:
+            try:
+                _atomic_write_private_text(
+                    state_path,
+                    json.dumps(compact, indent=2, sort_keys=True, default=str),
+                )
+            except Exception:
+                LOGGER.warning(
+                    "failed to scrub legacy capture daemon state",
+                    exc_info=True,
+                )
+        return compact
+
+    def _compact_process_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Return the content-free durable/status form of one daemon receipt."""
+
+        scalar_keys = (
+            "processed_at",
+            "processed_file_count",
+            "error_file_count",
+            "deferred_file_count",
+            "repaired_empty_claim_count",
+            "quarantined_claim_count",
+            "quarantined_stale_temp_count",
+            "discarded_stale_temp_count",
+            "discarded_legacy_raw_error_count",
+            "recovered_detached_discard_count",
+            "scrubbed_legacy_evidence_count",
+            "temp_quarantine_evidence_error_count",
+            "inbox_temp_file_count",
+            "fresh_inbox_temp_file_count",
+            "stale_inbox_temp_file_count",
+            "ignored_inbox_temp_file_count",
+            "inbox_temp_stale_after_seconds",
+            "captured_payload_count",
+            "idempotent_capture_count",
+            "captured_event_count",
+            "captured_relationship_count",
+            "processed_archive_scrub_schema",
+            "processed_archive_scanned_count",
+            "processed_archive_scrubbed_count",
+            "processed_archive_clean_count",
+            "processed_archive_skipped_count",
+            "processed_archive_symlink_refusal_count",
+            "processed_archive_scrub_error_count",
+            "processed_archive_redaction_count",
+            "processed_archive_raw_digest_removed_count",
+            "processed_archive_post_pass_unsafe_count",
+            "processed_archive_post_pass_unverified_count",
+            "error_resolution_completed_count",
+            "error_resolution_moved_count",
+            "error_resolution_failed_count",
+        )
+        compact: dict[str, Any] = {
+            "protocol": "capture-daemon-state.v2",
+            "content_free": True,
+            "root": str(self.root),
+        }
+        for key in scalar_keys:
+            if key in result:
+                compact[key] = result[key]
+
+        capture_keys = (
+            "capture_id",
+            "context_id",
+            "source_tag",
+            "speaker",
+            "event_count",
+            "relationship_count",
+            "redaction_count",
+            "idempotent_replay",
+            "receipt_replay",
+            "receipt_compact",
+            "protocol",
+            "capture_protocol",
+        )
+        compact["captures"] = [
+            {key: item[key] for key in capture_keys if key in item}
+            for item in result.get("captures", [])
+            if isinstance(item, dict)
+        ]
+
+        error_keys = (
+            "file",
+            "failed_at",
+            "batch_atomicity",
+            "batch_record_count",
+            "failed_record_index",
+            "failed_capture_id",
+            "committed_capture_count",
+            "committed_capture_ids",
+            "committed_event_count",
+            "committed_relationship_count",
+            "idempotent_replay_count",
+            "receipt_replay_count",
+            "committed_captures",
+        )
+        compact_errors: list[dict[str, Any]] = []
+        for item in result.get("errors", []):
+            if not isinstance(item, dict):
+                continue
+            safe_item = {key: item[key] for key in error_keys if key in item}
+            if "file" in safe_item:
+                safe_item["file"] = safe_public_error(
+                    str(safe_item["file"]),
+                    fallback="capture payload",
+                )
+            if item.get("error"):
+                safe_item["error"] = safe_public_error(
+                    str(item["error"]),
+                    fallback="capture processing failed",
+                )
+            compact_errors.append(safe_item)
+        compact["errors"] = compact_errors
+        return compact
 
     def _capture_files(self, directory: Path) -> list[Path]:
         if not directory.exists():
@@ -790,27 +2520,74 @@ class CaptureInboxDaemon:
                     state = self._claim_state(claim_dir)
                     if state["missing"] or not state["malformed"]:
                         continue
-                    destination = self._unique_destination(
-                        paths["error_dir"],
-                        f"malformed-{claim_dir.name}",
+                    staged = _stage_tree_for_discard(
+                        path=claim_dir,
+                        staging_dir=paths["error_dir"],
+                        expected_stat=claim_stat,
                     )
-                    os.replace(claim_dir, destination)
-                    _fsync_directory(processing_dir)
-                    _fsync_directory(paths["error_dir"])
+                    if staged is None:
+                        continue
                     error_payload = {
+                        "artifact_type": "malformed-capture-claim",
+                        "discard_operation_id": _discard_operation_id(staged),
+                        "cleanup_kind": "tree",
                         "claim": claim_dir.name,
-                        "error": "malformed capture claim quarantined before effect",
-                        "children": state["child_names"],
+                        "error": "malformed capture claim discarded before effect",
+                        "children": [
+                            safe_public_error(name, fallback="claim artifact")
+                            for name in state["child_names"]
+                        ],
                         "failed_at": time.time(),
+                        "raw_payload_retained": True,
+                        "disposition": "raw-claim-detached-pending-discard",
+                        "payload_disposition": "raw-claim-detached-pending-discard",
                     }
-                    _atomic_write_private_text(
-                        self._unique_destination(
-                            paths["error_dir"],
-                            f"{claim_dir.name}.error.json",
-                        ),
-                        json.dumps(error_payload, indent=2, sort_keys=True),
+                    evidence_path = self._unique_destination(
+                        paths["error_dir"],
+                        f"{claim_dir.name}.error.json",
                     )
+                    try:
+                        _atomic_write_private_text(
+                            evidence_path,
+                            json.dumps(error_payload, indent=2, sort_keys=True),
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "failed to persist malformed claim discard evidence"
+                        )
+                        try:
+                            os.replace(staged, claim_dir)
+                            _fsync_directory(processing_dir)
+                            _fsync_directory(paths["error_dir"])
+                        except OSError:
+                            quarantine = True
+                            LOGGER.exception(
+                                "failed to restore detached malformed claim"
+                            )
+                        continue
                     quarantine = True
+                    try:
+                        _remove_tree_without_following_links(
+                            staged,
+                            parent_dir=paths["error_dir"],
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        LOGGER.exception(
+                            "failed to discard detached malformed claim tree"
+                        )
+                        continue
+                    error_payload["raw_payload_retained"] = False
+                    error_payload["disposition"] = "raw-claim-discarded"
+                    error_payload["payload_disposition"] = "raw-claim-discarded"
+                    try:
+                        _atomic_write_private_text(
+                            evidence_path,
+                            json.dumps(error_payload, indent=2, sort_keys=True),
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "failed to finalize malformed claim discard evidence"
+                        )
                 if quarantine:
                     repaired["malformed_quarantined"] += 1
                 continue
@@ -852,7 +2629,10 @@ class CaptureInboxDaemon:
     ) -> tuple[Path, Path] | None:
         claim_dir = processing_dir / f"s2claim_{secrets.token_hex(16)}"
         _ensure_private_dir(claim_dir)
-        claimed_path = claim_dir / inbox_path.name
+        safe_suffix = inbox_path.suffix.lower()
+        if safe_suffix not in CAPTURE_SUFFIXES:
+            safe_suffix = ".payload"
+        claimed_path = claim_dir / f"payload-{secrets.token_hex(16)}{safe_suffix}"
         try:
             os.replace(inbox_path, claimed_path)
         except FileNotFoundError:
@@ -871,10 +2651,17 @@ class CaptureInboxDaemon:
         return claim_dir, claimed_path
 
     @contextlib.contextmanager
-    def _exclusive_lock(self, lock_path: Path) -> Iterator[bool]:
+    def _exclusive_lock(
+        self,
+        lock_path: Path,
+        *,
+        blocking: bool = False,
+    ) -> Iterator[bool]:
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         try:
             fd = os.open(lock_path, flags, 0o600)
         except FileNotFoundError:
@@ -883,7 +2670,10 @@ class CaptureInboxDaemon:
         acquired = False
         try:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                operation = fcntl.LOCK_EX
+                if not blocking:
+                    operation |= fcntl.LOCK_NB
+                fcntl.flock(fd, operation)
                 acquired = True
             except BlockingIOError:
                 acquired = False
@@ -907,10 +2697,12 @@ class CaptureInboxDaemon:
                 return None
             captures: list[dict[str, Any]] = []
             payloads: list[dict[str, Any]] = []
+            payload_document_prepared = False
             current_payload: dict[str, Any] | None = None
             current_record_index: int | None = None
             try:
                 document_kind, payloads = self._prepare_payload_document(path)
+                payload_document_prepared = True
                 del document_kind
                 for record_index, payload in enumerate(payloads):
                     current_payload = payload
@@ -946,8 +2738,14 @@ class CaptureInboxDaemon:
             except Exception as exc:
                 LOGGER.exception("failed to process capture payload %s", path)
                 error_payload = {
-                    "file": path.name,
-                    "error": str(exc),
+                    "file": safe_public_error(
+                        path.name,
+                        fallback="capture payload",
+                    ),
+                    "error": safe_public_error(
+                        exc,
+                        fallback="capture processing failed",
+                    ),
                     "failed_at": time.time(),
                     "batch_atomicity": "per-record",
                     "batch_record_count": len(payloads),
@@ -957,18 +2755,91 @@ class CaptureInboxDaemon:
                         if isinstance(current_payload, dict)
                         else ""
                     ),
+                    "raw_payload_retained": not payload_document_prepared,
+                    "redacted_payload_retained": bool(payload_document_prepared),
+                    "payload_disposition": (
+                        "redacted-payload-quarantined"
+                        if payload_document_prepared
+                        else "raw-payload-pending-discard"
+                    ),
                     **self._committed_capture_audit(captures),
                 }
+                staged_raw: Path | None = None
+                if not payload_document_prepared:
+                    try:
+                        path_stat = path.lstat()
+                    except FileNotFoundError:
+                        path_stat = None
+                    if path_stat is None:
+                        return None
+                    staged_raw = _stage_regular_file_for_discard(
+                        path=path,
+                        staging_dir=paths["error_dir"],
+                        expected_stat=path_stat,
+                    )
+                    if staged_raw is None:
+                        return None
+                    error_payload.update(
+                        {
+                            "artifact_type": "rejected-raw-capture-payload",
+                            "discard_operation_id": _discard_operation_id(staged_raw),
+                            "cleanup_kind": "file",
+                            "disposition": "raw-payload-detached-pending-discard",
+                        }
+                    )
                 sidecar = self._unique_destination(
                     paths["error_dir"],
-                    f"{path.name}.error.json",
+                    f"capture-error-{int(time.time())}-{secrets.token_hex(8)}.json",
                 )
-                _atomic_write_private_text(
-                    sidecar,
-                    json.dumps(error_payload, indent=2, sort_keys=True),
-                )
-                if path.exists():
-                    self._move_file(path, paths["error_dir"])
+                try:
+                    _atomic_write_private_text(
+                        sidecar,
+                        json.dumps(error_payload, indent=2, sort_keys=True),
+                    )
+                except Exception:
+                    if staged_raw is not None:
+                        try:
+                            os.replace(staged_raw, path)
+                            _fsync_directory(claim_dir)
+                            _fsync_directory(paths["error_dir"])
+                        except OSError:
+                            LOGGER.exception(
+                                "failed to restore detached rejected capture payload"
+                            )
+                    raise
+                if payload_document_prepared:
+                    try:
+                        path.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        self._move_file(path, paths["error_dir"])
+                elif staged_raw is not None:
+                    moved = True
+                    try:
+                        staged_raw.unlink()
+                        _fsync_directory(paths["error_dir"])
+                    except FileNotFoundError:
+                        _fsync_directory(paths["error_dir"])
+                    except OSError:
+                        LOGGER.exception(
+                            "failed to discard rejected raw capture payload"
+                        )
+                    else:
+                        error_payload["raw_payload_retained"] = False
+                        error_payload["disposition"] = "raw-payload-discarded"
+                        error_payload["payload_disposition"] = (
+                            "raw-payload-discarded"
+                        )
+                        try:
+                            _atomic_write_private_text(
+                                sidecar,
+                                json.dumps(error_payload, indent=2, sort_keys=True),
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "failed to finalize rejected payload discard evidence"
+                            )
                 moved = True
                 outcome = {
                     "processed_file_count": 0,
@@ -1031,7 +2902,9 @@ class CaptureInboxDaemon:
         if suffix == ".txt":
             payload: dict[str, Any] = {
                 "version": 1,
-                "source_tag": path.stem,
+                # An inbox filename is untrusted transport metadata, not a
+                # semantic source label. Never let it enter request identity.
+                "source_tag": "legacy-text-capture",
                 "text": raw,
             }
             identity_path = path.parent / LEGACY_TEXT_IDENTITY_FILE
@@ -1129,66 +3002,112 @@ class CaptureInboxDaemon:
         payload: dict[str, Any],
         version: int,
     ) -> dict[str, Any]:
-        normalized = dict(payload)
-        text = str(normalized.get("text") or "").strip()
+        text = str(payload.get("text") or "").strip()
         if not text:
             raise ValueError(f"{path.name} capture payload text must not be empty")
         redacted_text, text_redactions = redact_capture_text(text)
-        inherited_redactions = int(normalized.get("redaction_count", 0) or 0)
-        raw_metadata = normalized.get("metadata", {})
+        try:
+            inherited_redactions = max(
+                0,
+                min(int(payload.get("redaction_count", 0) or 0), 1_000_000),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("redaction_count must be an integer") from exc
+        raw_metadata = payload.get("metadata", {})
         safe_metadata, metadata_redactions = self._safe_capture_metadata(
             raw_metadata if isinstance(raw_metadata, dict) else {}
         )
         source_default = "capture-daemon" if version == 2 else path.stem
         source_tag = mlx_backend.sanitize_tag(
             str(
-                normalized.get("source_tag")
-                or normalized.get("tag")
+                payload.get("source_tag")
+                or payload.get("tag")
                 or source_default
             )
         ).replace(" ", "-")
         context_id = mlx_backend.sanitize_context_id(
-            str(normalized.get("context_id") or "default")
+            str(payload.get("context_id") or "default")
         )
         speaker = mlx_backend.sanitize_agent_id(
-            str(normalized.get("speaker") or "capture-daemon")
+            str(payload.get("speaker") or "capture-daemon")
         )
         try:
-            surprise_threshold = float(normalized.get("surprise_threshold", 0.5))
+            surprise_threshold = float(payload.get("surprise_threshold", 0.5))
         except (TypeError, ValueError) as exc:
             raise ValueError("surprise_threshold must be a finite number") from exc
         if not math.isfinite(surprise_threshold):
             raise ValueError("surprise_threshold must be a finite number")
         surprise_threshold = min(max(surprise_threshold, 0.0), 1.0)
-        raw_min_sentences = normalized.get("min_segment_sentences", 1)
+        raw_min_sentences = payload.get("min_segment_sentences", 1)
         if isinstance(raw_min_sentences, bool):
             raise ValueError("min_segment_sentences must be an integer")
         try:
             min_segment_sentences = max(1, int(raw_min_sentences))
         except (TypeError, ValueError) as exc:
             raise ValueError("min_segment_sentences must be an integer") from exc
-        normalized.update(
-            {
-                "text": redacted_text,
-                "context_id": context_id,
-                "source_tag": source_tag,
-                "speaker": speaker,
-                "surprise_threshold": surprise_threshold,
-                "min_segment_sentences": min_segment_sentences,
-                "metadata": safe_metadata,
-                "redaction_count": int(
-                    inherited_redactions + text_redactions + metadata_redactions
+        canonical_input_keys = {
+            "version",
+            "capture_id",
+            "created_at",
+            "text",
+            "context_id",
+            "source_tag",
+            "tag",
+            "speaker",
+            "surprise_threshold",
+            "min_segment_sentences",
+            "metadata",
+            "redaction_count",
+            "raw_text_stored",
+            "dropped_top_level_field_count",
+        }
+        unknown_fields = {
+            str(key): value
+            for key, value in payload.items()
+            if str(key) not in canonical_input_keys
+        }
+        _, unknown_redactions = redact_sensitive_value(unknown_fields)
+        try:
+            prior_dropped_fields = max(
+                0,
+                min(
+                    int(payload.get("dropped_top_level_field_count", 0) or 0),
+                    1_000_000,
                 ),
-                "raw_text_stored": False,
-            }
-        )
-        for raw_key in list(normalized):
-            folded = str(raw_key).strip().casefold().replace("-", "_")
-            if (
-                folded in UNTRUSTED_RAW_DIGEST_KEYS
-                or (folded.startswith("raw_") and "sha" in folded)
-            ):
-                normalized.pop(raw_key, None)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "dropped_top_level_field_count must be an integer"
+            ) from exc
+        normalized: dict[str, Any] = {
+            "version": int(version),
+            "capture_id": _canonical_capture_id(payload.get("capture_id")),
+            "text": redacted_text,
+            "context_id": context_id,
+            "source_tag": source_tag,
+            "speaker": speaker,
+            "surprise_threshold": surprise_threshold,
+            "min_segment_sentences": min_segment_sentences,
+            "metadata": safe_metadata,
+            "redaction_count": int(
+                inherited_redactions
+                + text_redactions
+                + metadata_redactions
+                + unknown_redactions
+            ),
+            "raw_text_stored": False,
+            "dropped_top_level_field_count": (
+                prior_dropped_fields + len(unknown_fields)
+            ),
+        }
+        if payload.get("created_at") is not None:
+            try:
+                created_at = float(payload["created_at"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("created_at must be a finite timestamp") from exc
+            if not math.isfinite(created_at):
+                raise ValueError("created_at must be a finite timestamp")
+            normalized["created_at"] = created_at
         return normalized
 
     def _safe_capture_metadata(
@@ -1196,10 +3115,11 @@ class CaptureInboxDaemon:
         metadata: dict[str, Any],
     ) -> tuple[dict[str, Any], int]:
         redacted_value, value_redactions = redact_sensitive_value(metadata)
-        stripped_count = 0
+        redacted_value, _removed_digest_count = strip_untrusted_raw_digest_fields(
+            redacted_value
+        )
 
         def strip_sensitive_fields(value: Any) -> Any:
-            nonlocal stripped_count
             if isinstance(value, dict):
                 clean: dict[str, Any] = {}
                 for raw_key, item in value.items():
@@ -1207,8 +3127,8 @@ class CaptureInboxDaemon:
                     folded = key.strip().casefold().replace("-", "_")
                     compact_key = folded.replace("_", "")
                     if (
-                        folded in UNTRUSTED_RAW_DIGEST_KEYS
-                        or folded in SENSITIVE_METADATA_KEYS
+                        folded in SENSITIVE_METADATA_KEYS
+                        or is_sensitive_key(key)
                         or compact_key
                         in {
                             "apikey",
@@ -1217,9 +3137,7 @@ class CaptureInboxDaemon:
                             "clientsecret",
                             "privatekey",
                         }
-                        or (folded.startswith("raw_") and "sha" in folded)
                     ):
-                        stripped_count += 1
                         continue
                     clean[key] = strip_sensitive_fields(item)
                 return clean
@@ -1241,7 +3159,7 @@ class CaptureInboxDaemon:
         safe = json.loads(serialized)
         return (
             safe if isinstance(safe, dict) else {},
-            int(value_redactions + stripped_count),
+            int(value_redactions),
         )
 
     def _persist_legacy_text_payload(
@@ -1527,35 +3445,146 @@ class CaptureInboxDaemon:
         )
 
     def _move_file(self, path: Path, destination_dir: Path) -> Path:
-        destination = self._unique_destination(destination_dir, path.name)
-        os.replace(path, destination)
+        _ensure_private_dir(destination_dir, tighten_existing=True)
+        source_stat = path.lstat()
+        if not stat.S_ISREG(source_stat.st_mode) or stat.S_ISLNK(
+            source_stat.st_mode
+        ):
+            raise ValueError("capture archive source must be a regular file")
+
+        # Recover a crash after the no-replace link but before source unlink.
+        for existing in destination_dir.iterdir():
+            try:
+                existing_stat = existing.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISREG(existing_stat.st_mode)
+                and not stat.S_ISLNK(existing_stat.st_mode)
+                and (int(existing_stat.st_dev), int(existing_stat.st_ino))
+                == (int(source_stat.st_dev), int(source_stat.st_ino))
+            ):
+                path.unlink()
+                _fsync_directory(path.parent)
+                _fsync_directory(destination_dir)
+                return existing
+
+        candidate = Path(path.name)
+        destination: Path | None = None
+        for attempt in range(128):
+            if attempt == 0:
+                proposed = destination_dir / candidate.name
+            else:
+                proposed = destination_dir / (
+                    f"{candidate.stem}-{int(time.time() * 1000)}-"
+                    f"{secrets.token_hex(8)}{candidate.suffix}"
+                )
+            try:
+                # link(2) is an atomic no-overwrite reservation and transfer
+                # within this single-filesystem transport root. Unlike
+                # check-then-replace, a colliding archive is never clobbered.
+                os.link(path, proposed, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            destination = proposed
+            break
+        if destination is None:
+            raise FileExistsError("could not reserve a unique capture archive path")
+
+        descriptor = -1
         try:
-            destination.chmod(0o600)
-        except PermissionError:
-            LOGGER.warning("could not chmod moved capture file %s", destination)
-        _fsync_directory(path.parent)
+            flags = os.O_RDONLY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(destination, flags)
+            linked_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(linked_stat.st_mode)
+                or (int(linked_stat.st_dev), int(linked_stat.st_ino))
+                != (int(source_stat.st_dev), int(source_stat.st_ino))
+            ):
+                raise ValueError("capture archive reservation changed unexpectedly")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        except Exception:
+            try:
+                destination.unlink()
+                _fsync_directory(destination_dir)
+            except OSError:
+                LOGGER.exception("failed to roll back capture archive reservation")
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
         _fsync_directory(destination_dir)
+        try:
+            path.unlink()
+        except Exception:
+            # Keep both hard links. A retry recognizes the shared inode and
+            # completes the source unlink without duplicating the archive.
+            _fsync_directory(path.parent)
+            raise
+        _fsync_directory(path.parent)
         return destination
 
     def _cleanup_empty_claim(self, claim_dir: Path) -> None:
-        for private_name in (".lock", LEGACY_TEXT_IDENTITY_FILE):
+        processing_dir = self.paths()["processing_dir"]
+        if (
+            claim_dir.parent != processing_dir
+            or CLAIM_DIR_RE.fullmatch(claim_dir.name) is None
+        ):
+            raise ValueError("capture claim cleanup escaped its processing directory")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            parent_fd = os.open(processing_dir, flags)
+        except FileNotFoundError:
+            return
+        claim_fd = -1
+        try:
             try:
-                (claim_dir / private_name).unlink()
+                claim_stat = os.stat(
+                    claim_dir.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            if stat.S_ISLNK(claim_stat.st_mode) or not stat.S_ISDIR(
+                claim_stat.st_mode
+            ):
+                raise ValueError("capture claim cleanup target must be a real directory")
+            claim_fd = os.open(claim_dir.name, flags, dir_fd=parent_fd)
+            for private_name in (".lock", LEGACY_TEXT_IDENTITY_FILE):
+                try:
+                    os.unlink(private_name, dir_fd=claim_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return
+            try:
+                os.rmdir(claim_dir.name, dir_fd=parent_fd)
             except FileNotFoundError:
                 pass
             except OSError:
                 return
-        try:
-            claim_dir.rmdir()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return
-        _fsync_directory(claim_dir.parent)
+            os.fsync(parent_fd)
+        finally:
+            if claim_fd >= 0:
+                os.close(claim_fd)
+            os.close(parent_fd)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the SYNAPSE-S2 capture inbox daemon.")
+    parser = SecretSafeArgumentParser(description="Run the SYNAPSE-S2 capture inbox daemon.")
     parser.add_argument("--capture-root", default=None)
     parser.add_argument("--state", default=None)
     parser.add_argument("--memory-db", default=None)
@@ -1621,7 +3650,12 @@ def _poll_transcript_sources(
         ).poll_sources(max_bytes=max_bytes)
     except Exception as exc:
         LOGGER.exception("transcript source polling failed")
-        return {"error": str(exc)}
+        return {
+            "error": safe_public_error(
+                exc,
+                fallback="transcript source polling failed",
+            )
+        }
 
 
 if __name__ == "__main__":

@@ -23,6 +23,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from capture_daemon import CaptureInboxDaemon
 import mlx_backend
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    SecretSafeArgumentParser,
+    install_secret_safe_formatters,
+    redact_capture_text,
+    redact_sensitive_value,
+    safe_public_error,
+    strip_untrusted_raw_digest_fields,
+)
 from transcript_capture import TranscriptCaptureManager
 
 
@@ -30,9 +39,10 @@ LOGGER = logging.getLogger("synapse_s2.dashboard")
 logging.basicConfig(
     level=os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper(),
     stream=sys.stderr,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format=SECRET_SAFE_LOG_FORMAT,
     force=True,
 )
+install_secret_safe_formatters(logging.getLogger().handlers)
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
@@ -90,15 +100,23 @@ class DashboardRuntime:
 
     def capture_daemon(self) -> CaptureInboxDaemon:
         return CaptureInboxDaemon(
-            root=os.getenv("SYNAPSE_S2_CAPTURE_ROOT"),
+            root=self._capture_root(),
             backend=self.backend,
         )
 
     def transcript_capture(self) -> TranscriptCaptureManager:
         return TranscriptCaptureManager(
-            root=os.getenv("SYNAPSE_S2_CAPTURE_ROOT"),
+            root=self._capture_root(),
             backend=self.backend,
         )
+
+    def _capture_root(self) -> str | os.PathLike[str] | None:
+        configured = os.getenv("SYNAPSE_S2_CAPTURE_ROOT")
+        if configured:
+            return configured
+        if self._backend is not None:
+            return self._backend.state_path.parent
+        return None
 
     def _refresh_semantic_audit(self) -> None:
         try:
@@ -115,7 +133,10 @@ class DashboardRuntime:
                 "mismatched_memory_count": 0,
                 "audit_revision": "unavailable",
                 "repairable": False,
-                "error": str(exc),
+                "error": safe_public_error(
+                    exc,
+                    fallback="semantic index audit failed",
+                ),
             }
         with self._semantic_audit_condition:
             self._semantic_audit_cache = dict(payload)
@@ -250,13 +271,24 @@ class DashboardRuntime:
         except DashboardError as exc:
             return self._json_response({"error": exc.message}, status=exc.status)
         except ValueError as exc:
-            return self._json_response({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return self._json_response(
+                {
+                    "error": safe_public_error(
+                        exc,
+                        fallback="invalid dashboard request",
+                    )
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
         except Exception as exc:
             error_id = f"dash_{uuid.uuid4().hex[:12]}"
-            LOGGER.exception("dashboard request failed for %s %s", method, raw_path)
+            LOGGER.exception("dashboard request failed for %s %s", method, parsed.path)
             payload = {"error": "dashboard request failed", "error_id": error_id}
             if self._debug_error_details_enabled():
-                payload["detail"] = str(exc)
+                payload["detail"] = safe_public_error(
+                    exc,
+                    fallback="dashboard request failed",
+                )
             return self._json_response(payload, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _handle_api(
@@ -1133,7 +1165,8 @@ class DashboardRuntime:
         if method == "POST" and path == "/api/backup":
             export_root = self._export_root()
             stamp = time.strftime("%Y%m%d-%H%M%S")
-            backup_path = export_root / f"dashboard-memory-{stamp}.sqlite3"
+            nonce = uuid.uuid4().hex[:12]
+            backup_path = export_root / f"dashboard-memory-{stamp}-{nonce}.sqlite3"
             return self._json_response(self.backend.backup_memory(path=backup_path))
         if method == "POST" and path == "/api/readiness-audit":
             payload = self._parse_json_body(body)
@@ -1343,7 +1376,7 @@ class DashboardRuntime:
             if embedding_status != "ready":
                 recommended_actions.append("Resolve the embedding provider load path before trusting semantic recall.")
         except Exception as exc:
-            error = str(exc)
+            error = safe_public_error(exc, fallback="runtime check failed")
             set_component(
                 "runtime",
                 status="blocked",
@@ -1388,7 +1421,7 @@ class DashboardRuntime:
                 "context_bus",
                 status="blocked",
                 label="Context bus blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="context bus check failed"),
                 event_count=0,
             )
             recommended_actions.append("Repair context bus reads before depending on client hydration.")
@@ -1396,27 +1429,47 @@ class DashboardRuntime:
         try:
             inbox_status = self.capture_daemon().status()
             pending = int(inbox_status.get("pending_file_count") or 0)
-            errors = int(inbox_status.get("error_file_count") or 0)
+            unresolved = int(inbox_status.get("unresolved_error_count") or 0)
+            unsafe = int(inbox_status.get("unsafe_error_artifact_count") or 0)
+            resolution_failures = int(
+                inbox_status.get("error_resolution_failed_count") or 0
+            )
+            capture_status = (
+                "blocked"
+                if unsafe or resolution_failures
+                else "degraded"
+                if unresolved
+                else "ready"
+            )
             set_component(
                 "capture_inbox",
-                status="blocked" if errors else "ready",
-                label="Capture inbox ready" if not errors else "Capture inbox has errors",
+                status=capture_status,
+                label=(
+                    "Capture inbox ready"
+                    if capture_status == "ready"
+                    else "Capture inbox needs review"
+                ),
                 detail=(
-                    f"{pending} pending files, {errors} error files, "
+                    f"{pending} pending files, {unresolved} unresolved errors, "
+                    f"{inbox_status.get('resolved_error_count', 0)} resolved history, "
                     f"root {inbox_status.get('root', '')}"
                 ),
                 pending_file_count=pending,
-                error_file_count=errors,
+                error_file_count=unresolved,
+                unresolved_error_count=unresolved,
+                unsafe_error_artifact_count=unsafe,
                 root=inbox_status.get("root"),
             )
-            if errors:
-                recommended_actions.append("Process or clear capture inbox error files before more ingestion.")
+            if unresolved:
+                recommended_actions.append(
+                    "Review and govern capture error resolution before more ingestion."
+                )
         except Exception as exc:
             set_component(
                 "capture_inbox",
                 status="blocked",
                 label="Capture inbox blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="capture inbox check failed"),
                 pending_file_count=0,
                 error_file_count=0,
             )
@@ -1464,7 +1517,7 @@ class DashboardRuntime:
                 "app_connect",
                 status="blocked",
                 label="App Connect blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 app_count=0,
                 connection_count=0,
             )
@@ -1574,7 +1627,7 @@ class DashboardRuntime:
                 "resource_envelope",
                 label="Resource envelope",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 points_lost=10,
                 action="Run Doctor and inspect resource profile errors.",
             )
@@ -1799,7 +1852,7 @@ class DashboardRuntime:
                 "semantic_indexes",
                 label="Semantic indexes",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 repair="Run memory-integrity from the project virtualenv and inspect SQLite.",
             )
         try:
@@ -1829,7 +1882,7 @@ class DashboardRuntime:
                 "context_delivery",
                 label="Context delivery receipts",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 repair="Inspect the context-delivery v2 tables and SQLite foreign keys.",
             )
         provider_error = str(provider.get("error") or "")
@@ -1860,20 +1913,40 @@ class DashboardRuntime:
         )
         try:
             inbox = self.capture_daemon().status()
-            errors = int(inbox.get("error_file_count") or 0)
+            unresolved = int(inbox.get("unresolved_error_count") or 0)
+            unsafe = int(inbox.get("unsafe_error_artifact_count") or 0)
+            resolution_failures = int(
+                inbox.get("error_resolution_failed_count") or 0
+            )
+            capture_status = (
+                "blocked"
+                if unsafe or resolution_failures
+                else "degraded"
+                if unresolved
+                else "ready"
+            )
             add_check(
                 "capture_inbox",
                 label="Capture inbox",
-                status="ready" if errors == 0 else "degraded",
-                detail=f"{inbox.get('pending_file_count', 0)} pending, {errors} errors",
-                repair="Process pending drops or inspect error files in the capture root.",
+                status=capture_status,
+                detail=(
+                    f"{inbox.get('pending_file_count', 0)} pending, "
+                    f"{unresolved} unresolved, "
+                    f"{inbox.get('resolved_error_count', 0)} resolved history"
+                ),
+                repair=(
+                    "Run capture-error-resolution preflight and confirmed resolution; "
+                    "unsafe artifacts require manual repair."
+                    if unresolved or unsafe or resolution_failures
+                    else ""
+                ),
             )
         except Exception as exc:
             add_check(
                 "capture_inbox",
                 label="Capture inbox",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 repair="Check capture root permissions and daemon configuration.",
             )
         if include_apps:
@@ -1891,7 +1964,7 @@ class DashboardRuntime:
                     "app_connect_detect",
                     label="App Connect detection",
                     status="blocked",
-                    detail=str(exc),
+                    detail=safe_public_error(exc, fallback="readiness check failed"),
                     repair="Grant macOS Automation/Accessibility permissions or use selected-text capture.",
                 )
 
@@ -2297,12 +2370,13 @@ class DashboardRuntime:
                 HTTPStatus.BAD_REQUEST,
                 "text or operation_log is required for wrap session preview",
             )
-        preview_text = self._render_wrap_session_text(
+        raw_preview_text = self._render_wrap_session_text(
             context_id=context,
             agent_id=agent_id,
             text=text,
             operation_log=operation_log,
         )
+        preview_text, redaction_count = redact_capture_text(raw_preview_text)
         source_tag = mlx_backend.sanitize_tag(
             str(payload.get("source_tag", f"wrap-session-{agent_id}") or f"wrap-session-{agent_id}")
         ).replace(" ", "-")
@@ -2311,12 +2385,16 @@ class DashboardRuntime:
             "context_id": context,
             "agent_id": agent_id,
             "preview_text": preview_text,
+            "redaction_count": int(redaction_count),
+            "raw_text_stored": False,
             "proposed_capture": {
                 "source_tag": source_tag,
                 "speaker": agent_id,
                 "metadata": {
                     "source_surface": "dashboard-wrap-session",
                     "operation_log_count": len(operation_log) if isinstance(operation_log, list) else 0,
+                    "redaction_count": int(redaction_count),
+                    "raw_text_stored": False,
                 },
             },
             "capture_required": True,
@@ -2378,7 +2456,9 @@ class DashboardRuntime:
         memory_id = str(payload.get("memory_id", "") or "").strip()
         if not memory_id:
             raise DashboardError(HTTPStatus.BAD_REQUEST, "memory_id is required")
-        note = str(payload.get("note", "") or "").strip()
+        note, note_redactions = redact_capture_text(
+            str(payload.get("note", "") or "").strip()
+        )
         if len(note.encode("utf-8")) > MAX_TEXT_BYTES:
             raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "note is too large")
         entry = self.backend.memory_store.get_entry(memory_id)
@@ -2419,9 +2499,8 @@ class DashboardRuntime:
                 "pinned_memory_id": memory_id,
                 "pinned_tag": pinned_tag,
                 "pinned_context_id": entry_context,
-                "note_sha256": hashlib.sha256(note.encode("utf-8")).hexdigest()
-                if note
-                else "",
+                "note_redaction_count": int(note_redactions),
+                "raw_note_stored": False,
             },
             confidence=0.9,
         )
@@ -2588,7 +2667,7 @@ class DashboardRuntime:
                 "self_test",
                 label="Self test",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 required=True,
             )
             recommended_actions.append("Run Self Test and inspect the failing component before demo use.")
@@ -2637,14 +2716,14 @@ class DashboardRuntime:
                 "resource_envelope",
                 label="Resource envelope",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 required=True,
             )
             add_check(
                 "quick_prune",
                 label="Quick prune budget",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 required=True,
             )
             recommended_actions.append("Run the resource profile locally and resolve the reported error.")
@@ -2677,7 +2756,7 @@ class DashboardRuntime:
                 "embedding_latency",
                 label="Embedding warm path",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 required=True,
             )
             recommended_actions.append("Resolve the embedding provider load path before Monday demo.")
@@ -2711,7 +2790,7 @@ class DashboardRuntime:
                 "recall_audit",
                 label="Recall audit",
                 status="blocked",
-                detail=str(exc),
+                detail=safe_public_error(exc, fallback="readiness check failed"),
                 required=True,
             )
             recommended_actions.append("Seed real memory and rerun Readiness Audit before demo use.")
@@ -2794,8 +2873,9 @@ class DashboardRuntime:
         context = mlx_backend.sanitize_context_id(context_id)
         export_root = self._export_root()
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        report_path = export_root / f"evidence-pack-{context}-{stamp}.json"
-        backup_path = export_root / f"evidence-memory-{context}-{stamp}.sqlite3"
+        nonce = uuid.uuid4().hex[:12]
+        report_path = export_root / f"evidence-pack-{context}-{stamp}-{nonce}.json"
+        backup_path = export_root / f"evidence-memory-{context}-{stamp}-{nonce}.sqlite3"
         snapshot = self.snapshot(context_id=context, limit=250, include_graph=True)
         audit = self.readiness_audit(context_id=context)
         backup = self.backend.backup_memory(path=backup_path)
@@ -2810,10 +2890,7 @@ class DashboardRuntime:
         }
         digest_body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         payload["sha256"] = hashlib.sha256(digest_body).hexdigest()
-        report_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True, default=str),
-            encoding="utf-8",
-        )
+        mlx_backend._atomic_write_private_json(report_path, payload)
         return payload
 
     def _audit_prompt(self, graph: dict[str, Any]) -> str:
@@ -3501,7 +3578,9 @@ class DashboardRuntime:
             return {}
         if not isinstance(metadata, dict):
             raise DashboardError(HTTPStatus.BAD_REQUEST, "metadata must be an object")
-        return metadata
+        safe_metadata, _ = redact_sensitive_value(metadata)
+        safe_metadata, _ = strip_untrusted_raw_digest_fields(safe_metadata)
+        return safe_metadata if isinstance(safe_metadata, dict) else {}
 
     def _capture_id_payload(self, payload: dict[str, Any]) -> str | None:
         capture_id = str(payload.get("capture_id", "") or "").strip()
@@ -3541,7 +3620,8 @@ class DashboardRuntime:
         export_root = Path(os.getenv("SYNAPSE_S2_EXPORT_DIR", ROOT / ".synapse_s2")).expanduser()
         if not export_root.is_absolute():
             export_root = ROOT / export_root
-        export_root.mkdir(parents=True, exist_ok=True)
+        export_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        export_root.chmod(0o700)
         return export_root.resolve()
 
 
@@ -3555,6 +3635,13 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
         self._dispatch()
 
     def do_OPTIONS(self) -> None:
+        if not self._host_allowed():
+            status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
+                {"error": "host not allowed"},
+                status=HTTPStatus.MISDIRECTED_REQUEST,
+            )
+            self._write_response(status, headers, body)
+            return
         self.send_response(int(HTTPStatus.NO_CONTENT))
         self.send_header("Allow", "GET, POST, OPTIONS")
         for key, value in SECURITY_HEADERS.items():
@@ -3563,9 +3650,23 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:
-        LOGGER.info("%s - %s", self.address_string(), format % args)
+        del format, args
+        LOGGER.info(
+            "%s - %s %s %s",
+            self.address_string(),
+            self.command,
+            urlparse(self.path).path,
+            self.request_version,
+        )
 
     def _dispatch(self) -> None:
+        if not self._host_allowed():
+            status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
+                {"error": "host not allowed"},
+                status=HTTPStatus.MISDIRECTED_REQUEST,
+            )
+            self._write_response(status, headers, body)
+            return
         if self.command == "POST" and not self._origin_allowed():
             status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
                 {"error": "origin not allowed"},
@@ -3587,6 +3688,18 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
                 raw_body,
             )
         self._write_response(status, headers, body)
+
+    def _host_allowed(self) -> bool:
+        host_header = str(self.headers.get("Host") or "").strip()
+        if not host_header:
+            return False
+        try:
+            parsed = urlparse(f"//{host_header}")
+            host = str(parsed.hostname or "").casefold()
+            port = int(parsed.port or 80)
+        except (TypeError, ValueError):
+            return False
+        return host in LOOPBACK_HOSTS and port == int(self.server.server_port)
 
     def _origin_allowed(self) -> bool:
         origin = self.headers.get("Origin")
@@ -3627,7 +3740,7 @@ class SynapseDashboardServer(HTTPServer):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the SYNAPSE-S2 local dashboard.")
+    parser = SecretSafeArgumentParser(description="Run the SYNAPSE-S2 local dashboard.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--context", default=DEFAULT_CONTEXT)
@@ -3636,12 +3749,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.host not in LOOPBACK_HOSTS and os.getenv(
-        "SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD", ""
-    ).strip().lower() not in {"1", "true", "yes", "on"}:
+    if args.host not in LOOPBACK_HOSTS:
         LOGGER.error(
-            "refusing to bind dashboard to non-loopback host %s; set "
-            "SYNAPSE_S2_ALLOW_NON_LOOPBACK_DASHBOARD=true only for a controlled LAN demo",
+            "refusing to bind dashboard to non-loopback host %s; "
+            "the operator API is local-only",
             args.host,
         )
         return 2

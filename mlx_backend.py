@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import logging
 import json
@@ -7,9 +8,13 @@ import math
 import os
 import platform
 import re
+import secrets
+import stat
 import sys
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,7 +22,16 @@ from typing import Any
 from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
 from event_segmenter import BayesianSurpriseEventSegmenter
 from memory_store import CAPTURE_ID_RE, CAPTURE_PROTOCOL_VERSION, DurableMemoryStore
-from redaction import redact_capture_text, redact_sensitive_value
+from redaction import (
+    SECRET_SAFE_LOG_FORMAT,
+    SecretRedactingFormatter,
+    redact_capture_text,
+    redact_sensitive_value,
+    reject_sensitive_identifier,
+    safe_public_error,
+    strip_untrusted_raw_digest_fields,
+    strip_untrusted_raw_digest_text,
+)
 
 try:
     import mlx.core as mx
@@ -39,14 +53,14 @@ else:
 LOGGER = logging.getLogger("synapse_s2.backend")
 if not LOGGER.handlers:
     _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    _handler.setFormatter(SecretRedactingFormatter(SECRET_SAFE_LOG_FORMAT))
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
 
 MAX_EMBEDDING_DIMS = 32_768
+MAX_RUNTIME_STATE_BYTES = 8_000_000
+MAX_RUNTIME_QUARANTINE_SNAPSHOT_BYTES = 1_000_000
 DEFAULT_NUM_NEURONS = 8192
 DEFAULT_RESOURCE_TARGET_MIN_MB = 96.0
 DEFAULT_RESOURCE_TARGET_MAX_MB = 384.0
@@ -65,13 +79,6 @@ CONSOLIDATION_PHASES = (
 DEFAULT_AGENT_TARGETS = ("mcp-clients", "codex-desktop", "local-ide-adapters")
 CONTEXT_BUS_DELIVERY_MODE = "leased-at-least-once"
 CONTEXT_BUS_PROTOCOL_VERSION = "context-delivery.v2"
-CAPTURE_UNTRUSTED_DIGEST_KEYS = {
-    "input_sha256",
-    "raw_input_sha256",
-    "raw_sha256",
-    "raw_text_sha256",
-    "payload_sha256",
-}
 CONSUMER_GROUPS_BY_AGENT = {
     "codex-desktop": ("mcp-clients", "local-ide-adapters"),
     "claude-desktop": ("mcp-clients", "local-ide-adapters"),
@@ -153,26 +160,184 @@ class ConsolidationTiming:
 
 def _require_mx() -> Any:
     if mx is None:
-        raise BackendUnavailable(f"mlx.core import failed: {_MLX_IMPORT_ERROR}")
+        raise BackendUnavailable(
+            "mlx.core import failed: "
+            f"{safe_public_error(_MLX_IMPORT_ERROR or 'unavailable', fallback='unavailable')}"
+        )
     return mx
 
 
 def sanitize_context_id(context_id: str) -> str:
-    raw = str(context_id or "default").strip()
+    raw = reject_sensitive_identifier(
+        context_id or "default",
+        field="context_id",
+    ).strip()
     cleaned = CONTEXT_ID_RE.sub("_", raw).strip("._-:")
     return (cleaned or "default")[:128]
 
 
 def sanitize_tag(tag: str) -> str:
-    raw = str(tag or "").strip()
+    raw = reject_sensitive_identifier(tag or "", field="tag").strip()
     cleaned = TAG_RE.sub("_", raw).strip()
     return (cleaned or "untagged-trace")[:200]
 
 
 def sanitize_agent_id(agent_id: str) -> str:
-    raw = str(agent_id or "").strip()
+    raw = reject_sensitive_identifier(agent_id or "", field="agent_id").strip()
     cleaned = AGENT_ID_RE.sub("_", raw).strip("._-:@")
     return (cleaned or "unknown-agent")[:128]
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    _ensure_private_directory(path.parent)
+    temp_path = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
+    fd = -1
+    try:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        path.chmod(0o600)
+        _fsync_directory(path.parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _file_identity(stat_result: os.stat_result) -> tuple[int, int, int]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat.S_IFMT(stat_result.st_mode)),
+    )
+
+
+def _read_bounded_regular_text(
+    path: Path,
+    *,
+    max_bytes: int,
+    allow_truncate: bool = False,
+    errors: str = "strict",
+) -> tuple[str, os.stat_result, bool]:
+    """Read a stable regular file by descriptor without following symlinks."""
+
+    observed = os.lstat(path)
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise ValueError("runtime state must be a regular non-symlink file")
+    bounded_max = max(1, int(max_bytes))
+    if int(observed.st_size) > bounded_max and not allow_truncate:
+        raise ValueError("runtime state exceeds the supported size limit")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _file_identity(opened) != _file_identity(observed)
+        ):
+            raise ValueError("runtime state changed during secure open")
+        if int(opened.st_size) > bounded_max and not allow_truncate:
+            raise ValueError("runtime state exceeds the supported size limit")
+
+        remaining = bounded_max + 1
+        chunks: list[bytes] = []
+        while remaining > 0:
+            try:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(int(getattr(opened, key)) != int(getattr(after, key)) for key in stable_fields):
+            raise ValueError("runtime state changed while it was being read")
+        truncated = len(raw) > bounded_max or int(after.st_size) > bounded_max
+        if truncated and not allow_truncate:
+            raise ValueError("runtime state exceeds the supported size limit")
+        return raw[:bounded_max].decode("utf-8", errors=errors), opened, truncated
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create missing directories privately without chmodding existing owners."""
+
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            # A concurrently created directory is caller-owned; do not mutate it.
+            if not directory.is_dir():
+                raise
+
+
+@contextmanager
+def _exclusive_runtime_state_lock(state_path: Path):
+    """Serialize runtime-state read/merge/replace across local processes."""
+
+    _ensure_private_directory(state_path.parent)
+    lock_path = state_path.with_name(f".{state_path.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def context_consumer_groups(agent_id: str) -> tuple[str, ...]:
@@ -234,6 +399,7 @@ class SpikingAttentionBackend:
         memory_path: str | os.PathLike[str] | None = None,
         embedding_provider_name: str | None = None,
         require_native: bool = False,
+        control_plane_only: bool = False,
     ) -> None:
         native_mx = _require_mx()
         if dimension <= 0:
@@ -271,10 +437,19 @@ class SpikingAttentionBackend:
         )
         self.W_syn_decay_multiplier = 1.0
         self.W_lateral_decay_multiplier = 1.0
+        self.control_plane_only = bool(control_plane_only)
         self._mx = native_mx
-        self._lif_step = self._build_lif_step(compile_graph)
+        self._lif_step = (
+            None
+            if self.control_plane_only
+            else self._build_lif_step(compile_graph)
+        )
         self._mlxsnn_available = mlxsnn is not None
-        self._mlxsnn_lif_layer = self._build_mlxsnn_lif_layer()
+        self._mlxsnn_lif_layer = (
+            None
+            if self.control_plane_only
+            else self._build_mlxsnn_lif_layer()
+        )
         self.embedding_provider_name = embedding_provider_name or os.getenv(
             "SYNAPSE_S2_EMBEDDING_PROVIDER",
             "auto",
@@ -289,25 +464,38 @@ class SpikingAttentionBackend:
         self.delivery_instance_id = f"backend-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.global_enabled = True
         self.context_overrides: dict[str, bool] = {}
+        self._global_enabled_dirty = False
+        self._dirty_context_overrides: set[str] = set()
+        self.runtime_state_repair: dict[str, Any] = {}
         self.cortex_sessions: dict[str, dict[str, Any]] = {}
         self.registered_traces: list[dict[str, Any]] = []
         self._surface_recall_cache: dict[str, dict[str, Any]] = {}
 
-        self.W_syn = self._balanced_matrix(
-            (self.dimension, self.num_neurons),
-            scale=w_syn_scale,
-            excitatory_ratio=excitatory_ratio,
-        )
-        self.W_lateral = self._balanced_lateral_matrix(
-            self.num_neurons,
-            scale=w_lateral_scale,
-            excitatory_ratio=excitatory_ratio,
-        )
-        self.state: dict[str, Any] = {
-            "mem": native_mx.zeros((self.num_neurons,)),
-            "spk": native_mx.zeros((self.num_neurons,)),
-        }
-        self.active_traces = native_mx.zeros((self.num_neurons,))
+        if self.control_plane_only:
+            # MCP discovery, health, graph hydration, and Cortex bookkeeping do
+            # not need the dense recurrent substrate.  Avoid constructing the
+            # O(neurons^2) lateral matrix in short-lived control-plane clients;
+            # neural tools materialize the authoritative full backend lazily.
+            self.W_syn = None
+            self.W_lateral = None
+            self.state = {"mem": None, "spk": None}
+            self.active_traces = None
+        else:
+            self.W_syn = self._balanced_matrix(
+                (self.dimension, self.num_neurons),
+                scale=w_syn_scale,
+                excitatory_ratio=excitatory_ratio,
+            )
+            self.W_lateral = self._balanced_lateral_matrix(
+                self.num_neurons,
+                scale=w_lateral_scale,
+                excitatory_ratio=excitatory_ratio,
+            )
+            self.state = {
+                "mem": native_mx.zeros((self.num_neurons,)),
+                "spk": native_mx.zeros((self.num_neurons,)),
+            }
+            self.active_traces = native_mx.zeros((self.num_neurons,))
         self.memory_mapping: dict[int, str] = {}
         self.semantic_hierarchy: dict[str, dict[str, Any]] = {}
         self.last_pruning_monotonic = time.monotonic()
@@ -317,7 +505,8 @@ class SpikingAttentionBackend:
         self.last_maintenance: dict[str, Any] = {}
         self.consolidation_phase_history: list[dict[str, Any]] = []
         self._load_runtime_state()
-        self._refresh_registered_traces()
+        if not self.control_plane_only:
+            self._refresh_registered_traces()
 
         if not self._mlxsnn_available:
             LOGGER.warning(
@@ -334,14 +523,44 @@ class SpikingAttentionBackend:
 
     def _resolve_state_path(self, state_path: str | os.PathLike[str] | None) -> Path:
         if state_path is not None:
-            return Path(state_path)
+            return self._validated_runtime_state_path(state_path)
         configured = os.getenv("SYNAPSE_S2_STATE_PATH")
         if configured:
-            return Path(configured)
+            return self._validated_runtime_state_path(configured)
         project_dir = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("CODEX_PROJECT_DIR")
         if project_dir:
-            return Path(project_dir).expanduser() / ".synapse_s2" / "runtime_state.json"
+            safe_project_dir = reject_sensitive_identifier(
+                project_dir,
+                field="runtime project directory",
+            )
+            return (
+                Path(safe_project_dir).expanduser()
+                / ".synapse_s2"
+                / "runtime_state.json"
+            )
         return Path.cwd() / ".synapse_s2" / "runtime_state.json"
+
+    def _require_neural_substrate(self) -> None:
+        if self.control_plane_only:
+            raise BackendUnavailable(
+                "neural substrate is deferred in the control-plane backend; "
+                "use get_backend() for neural capture, tick, and retrieval operations"
+            )
+
+    @staticmethod
+    def _validated_runtime_state_path(
+        value: str | os.PathLike[str],
+    ) -> Path:
+        try:
+            safe_path = reject_sensitive_identifier(
+                str(value),
+                field="runtime state path",
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "runtime state path must not contain credential material"
+            ) from exc
+        return Path(safe_path)
 
     def _resolve_memory_path(self, memory_path: str | os.PathLike[str] | None) -> Path:
         if memory_path is not None:
@@ -355,32 +574,72 @@ class SpikingAttentionBackend:
         return self.state_path.parent / "memory.sqlite3"
 
     def _load_runtime_state(self) -> None:
+        with _exclusive_runtime_state_lock(self.state_path):
+            self._load_runtime_state_locked()
+
+    def _load_runtime_state_locked(self) -> None:
+        if self.state_path.is_symlink():
+            raise RuntimeError("runtime state path must not be a symlink")
         if not self.state_path.exists():
             return
         try:
-            migrated_trace_count = 0
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            raw_state, _state_stat, _truncated = _read_bounded_regular_text(
+                self.state_path,
+                max_bytes=MAX_RUNTIME_STATE_BYTES,
+            )
+            payload = json.loads(raw_state)
             if not isinstance(payload, dict):
                 raise ValueError("runtime state root must be an object")
-            self.global_enabled = bool(payload.get("global_enabled", True))
-            overrides = payload.get("context_overrides", {})
-            if isinstance(overrides, dict):
-                self.context_overrides = {
-                    sanitize_context_id(key): bool(value)
-                    for key, value in overrides.items()
-                }
-            cortex_sessions = payload.get("cortex_sessions", {})
-            if isinstance(cortex_sessions, dict):
-                self.cortex_sessions = {
-                    str(session_id): self._normalize_cortex_session(raw_session)
-                    for session_id, raw_session in cortex_sessions.items()
-                    if isinstance(raw_session, dict)
-                }
-            traces = payload.get("registered_traces", [])
-            if isinstance(traces, list):
-                for raw_trace in traces:
-                    if not isinstance(raw_trace, dict):
-                        continue
+        except Exception as exc:
+            LOGGER.error(
+                "quarantining unreadable runtime state from %s: %s",
+                self.state_path,
+                safe_public_error(exc, fallback="invalid runtime state"),
+            )
+            self.runtime_state_repair = self._quarantine_runtime_state_locked(exc)
+            self._persist_runtime_state(merge_existing=False, _lock_held=True)
+            return
+
+        migrated_trace_count = 0
+        dropped_record_count = 0
+        self.global_enabled = bool(payload.get("global_enabled", True))
+        raw_repair = payload.get("runtime_state_repair", {})
+        safe_repair = self._json_safe_metadata(
+            raw_repair if isinstance(raw_repair, dict) else {}
+        )
+        self.runtime_state_repair = safe_repair
+
+        overrides = payload.get("context_overrides", {})
+        if isinstance(overrides, dict):
+            self.context_overrides = self._normalize_persisted_context_overrides(
+                overrides
+            )
+            dropped_record_count += max(
+                0,
+                len(overrides) - len(self.context_overrides),
+            )
+        elif overrides is not None:
+            dropped_record_count += 1
+
+        cortex_sessions = payload.get("cortex_sessions", {})
+        if isinstance(cortex_sessions, dict):
+            self.cortex_sessions = self._normalize_persisted_cortex_sessions(
+                cortex_sessions
+            )
+            dropped_record_count += max(
+                0,
+                len(cortex_sessions) - len(self.cortex_sessions),
+            )
+        elif cortex_sessions is not None:
+            dropped_record_count += 1
+
+        traces = payload.get("registered_traces", [])
+        if isinstance(traces, list):
+            for ordinal, raw_trace in enumerate(traces):
+                if not isinstance(raw_trace, dict):
+                    dropped_record_count += 1
+                    continue
+                try:
                     trace = self._normalize_trace_payload(raw_trace)
                     self.memory_store.upsert_entry(
                         tag=trace["tag"],
@@ -393,65 +652,296 @@ class SpikingAttentionBackend:
                         registered_at=trace["registered_at"],
                     )
                     migrated_trace_count += 1
-            if migrated_trace_count:
-                LOGGER.info(
-                    "migrated %s legacy runtime traces into SQLite memory store",
-                    migrated_trace_count,
-                )
-                self._persist_runtime_state()
-        except Exception as exc:
-            LOGGER.error("failed to load runtime state from %s: %s", self.state_path, exc)
+                except Exception as exc:
+                    dropped_record_count += 1
+                    LOGGER.warning(
+                        "dropped unsafe legacy runtime trace at index %s: %s",
+                        ordinal,
+                        safe_public_error(exc, fallback="unsafe legacy trace"),
+                    )
+        elif traces is not None:
+            dropped_record_count += 1
 
-    def _persist_runtime_state(self) -> None:
-        try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cortex_sessions = self._merged_cortex_sessions_for_persist()
-            payload = {
-                "version": 2,
-                "global_enabled": self.global_enabled,
-                "context_overrides": self.context_overrides,
-                "cortex_sessions": self.cortex_sessions,
-                "memory_db_path": str(self.memory_store.db_path),
-                "updated_at": time.time(),
-            }
-            temp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-            temp_path.write_text(
-                json.dumps(payload, indent=2, sort_keys=True),
-                encoding="utf-8",
+        if migrated_trace_count:
+            LOGGER.info(
+                "migrated %s legacy runtime traces into SQLite memory store",
+                migrated_trace_count,
             )
-            temp_path.replace(self.state_path)
+        if dropped_record_count:
+            LOGGER.warning(
+                "dropped %s unsafe or invalid legacy runtime records",
+                dropped_record_count,
+            )
+
+        # Always rewrite a successfully read legacy document into the canonical
+        # schema. This removes unknown fields and retired embedded trace records,
+        # and avoids leaving one rejected record in the raw source document.
+        self._persist_runtime_state(merge_existing=False, _lock_held=True)
+
+    def _quarantine_runtime_state_locked(self, error: BaseException) -> dict[str, Any]:
+        """Preserve a sanitized repair artifact before replacing invalid state."""
+
+        quarantine_dir = self.state_path.parent / "runtime_state_quarantine"
+        if quarantine_dir.is_symlink():
+            raise RuntimeError("runtime state quarantine must not be a symlink")
+        _ensure_private_directory(quarantine_dir)
+        quarantine_stat = quarantine_dir.lstat()
+        if not stat.S_ISDIR(quarantine_stat.st_mode):
+            raise RuntimeError("runtime state quarantine must be a directory")
+        try:
+            os.chmod(quarantine_dir, 0o700)
+        except PermissionError:
+            pass
+
+        try:
+            observed = self.state_path.lstat()
+        except FileNotFoundError:
+            observed = None
+        raw_text = ""
+        source_size_bytes = int(observed.st_size) if observed is not None else 0
+        truncated = False
+        snapshot_preserved = False
+        if observed is not None and stat.S_ISREG(observed.st_mode):
+            raw_text, opened, truncated = _read_bounded_regular_text(
+                self.state_path,
+                max_bytes=MAX_RUNTIME_QUARANTINE_SNAPSHOT_BYTES,
+                allow_truncate=True,
+                errors="replace",
+            )
+            observed = opened
+            snapshot_preserved = True
+        safe_text, redaction_count = redact_capture_text(raw_text)
+        safe_text, digest_removals = strip_untrusted_raw_digest_text(safe_text)
+        artifact_name = (
+            f"runtime-state-repair-{time.strftime('%Y%m%d-%H%M%S')}-"
+            f"{secrets.token_hex(8)}.json"
+        )
+        artifact_path = quarantine_dir / artifact_name
+        repair = {
+            "status": "repair-required",
+            "reason": "unreadable-runtime-state",
+            "error_type": error.__class__.__name__,
+            "artifact_name": artifact_name,
+            "raw_source_retained": False,
+            "sanitized_snapshot_preserved": snapshot_preserved,
+            "sanitized_snapshot_truncated": truncated,
+            "redaction_count": int(redaction_count) + int(digest_removals),
+            "detected_at": time.time(),
+        }
+        _atomic_write_private_json(
+            artifact_path,
+            {
+                "version": 1,
+                "artifact_type": "runtime-state-repair",
+                **repair,
+                "source_size_bytes": source_size_bytes,
+                "sanitized_source_text": safe_text,
+            },
+        )
+        if observed is not None:
+            try:
+                current = self.state_path.lstat()
+            except FileNotFoundError:
+                current = None
+            if current is not None:
+                if _file_identity(current) != _file_identity(observed):
+                    raise RuntimeError(
+                        "runtime state changed before quarantine cleanup"
+                    )
+                self.state_path.unlink()
+        _fsync_directory(self.state_path.parent)
+        return repair
+
+    def _persist_runtime_state(
+        self,
+        *,
+        merge_existing: bool = True,
+        _lock_held: bool = False,
+    ) -> None:
+        try:
+            if _lock_held:
+                self._persist_runtime_state_locked(merge_existing=merge_existing)
+            else:
+                with _exclusive_runtime_state_lock(self.state_path):
+                    self._persist_runtime_state_locked(merge_existing=merge_existing)
         except Exception:
             LOGGER.exception("failed to persist runtime state to %s", self.state_path)
             raise
 
-    def _merged_cortex_sessions_for_persist(self) -> dict[str, dict[str, Any]]:
-        existing_sessions: dict[str, dict[str, Any]] = {}
-        if self.state_path.exists():
+    def _persist_runtime_state_locked(self, *, merge_existing: bool) -> None:
+        existing_payload: dict[str, Any] = {}
+        if self.state_path.is_symlink():
+            raise RuntimeError("runtime state path must not be a symlink")
+        if merge_existing and self.state_path.exists():
             try:
-                payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-                raw_sessions = payload.get("cortex_sessions", {}) if isinstance(payload, dict) else {}
-                if isinstance(raw_sessions, dict):
-                    existing_sessions = {
-                        str(session_id): self._normalize_cortex_session(raw_session)
-                        for session_id, raw_session in raw_sessions.items()
-                        if isinstance(raw_session, dict)
-                    }
+                raw_state, _state_stat, _truncated = _read_bounded_regular_text(
+                    self.state_path,
+                    max_bytes=MAX_RUNTIME_STATE_BYTES,
+                )
+                candidate = json.loads(raw_state)
+                if isinstance(candidate, dict):
+                    existing_payload = candidate
+                else:
+                    raise ValueError("runtime state root must be an object")
             except Exception as exc:
                 LOGGER.warning(
-                    "continuing without runtime state merge from %s: %s",
+                    "quarantining unreadable runtime state from %s: %s",
                     self.state_path,
-                    exc,
+                    safe_public_error(exc, fallback="invalid runtime state"),
                 )
+                self.runtime_state_repair = self._quarantine_runtime_state_locked(exc)
+
+        if merge_existing:
+            merged_sessions = self._merged_cortex_sessions_for_persist(
+                existing_payload
+            )
+            raw_existing_overrides = existing_payload.get("context_overrides", {})
+            merged_overrides = (
+                self._normalize_persisted_context_overrides(raw_existing_overrides)
+                if isinstance(raw_existing_overrides, dict)
+                else {}
+            )
+            if not existing_payload:
+                merged_overrides.update(self.context_overrides)
+            for context in self._dirty_context_overrides:
+                if context in self.context_overrides:
+                    merged_overrides[context] = bool(self.context_overrides[context])
+            merged_global_enabled = (
+                bool(self.global_enabled)
+                if self._global_enabled_dirty or not existing_payload
+                else bool(existing_payload.get("global_enabled", True))
+            )
+            raw_existing_repair = existing_payload.get("runtime_state_repair", {})
+            merged_repair = self._json_safe_metadata(
+                self.runtime_state_repair
+                or (raw_existing_repair if isinstance(raw_existing_repair, dict) else {})
+            )
+        else:
+            merged_sessions = dict(self.cortex_sessions)
+            merged_overrides = dict(self.context_overrides)
+            merged_global_enabled = bool(self.global_enabled)
+            merged_repair = self._json_safe_metadata(self.runtime_state_repair)
+
+        payload = {
+            "version": 2,
+            "global_enabled": merged_global_enabled,
+            "context_overrides": merged_overrides,
+            "cortex_sessions": merged_sessions,
+            "runtime_state_repair": merged_repair,
+            "memory_db_path": str(self.memory_store.db_path),
+            "updated_at": time.time(),
+        }
+        _atomic_write_private_json(self.state_path, payload)
+        self.global_enabled = merged_global_enabled
+        self.context_overrides = merged_overrides
+        self.cortex_sessions = merged_sessions
+        self.runtime_state_repair = merged_repair
+        self._global_enabled_dirty = False
+        self._dirty_context_overrides.clear()
+
+    def _merged_cortex_sessions_for_persist(
+        self,
+        existing_payload: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        existing_sessions: dict[str, dict[str, Any]] = {}
+        raw_sessions = existing_payload.get("cortex_sessions", {})
+        if isinstance(raw_sessions, dict):
+            existing_sessions = self._normalize_persisted_cortex_sessions(
+                raw_sessions
+            )
 
         merged = dict(existing_sessions)
         for session_id, raw_session in self.cortex_sessions.items():
-            clean_session_id = str(session_id)
-            normalized = self._normalize_cortex_session(raw_session)
+            candidate = dict(raw_session)
+            candidate["session_id"] = str(
+                candidate.get("session_id") or session_id
+            )
+            normalized = self._normalize_cortex_session(candidate)
+            clean_session_id = normalized["session_id"]
             merged[clean_session_id] = self._prefer_cortex_session(
                 merged.get(clean_session_id),
                 normalized,
             )
         return merged
+
+    def _normalize_persisted_context_overrides(
+        self,
+        raw_overrides: dict[Any, Any],
+    ) -> dict[str, bool]:
+        normalized: dict[str, bool] = {}
+        for ordinal, (raw_context, raw_value) in enumerate(raw_overrides.items()):
+            try:
+                _, value_redactions = redact_sensitive_value(raw_value)
+                if value_redactions:
+                    raise ValueError(
+                        "context override value must not contain credential material"
+                    )
+                context = sanitize_context_id(str(raw_context))
+            except Exception as exc:
+                LOGGER.warning(
+                    "dropped unsafe runtime context override at index %s: %s",
+                    ordinal,
+                    safe_public_error(exc, fallback="unsafe context override"),
+                )
+                continue
+            normalized[context] = bool(raw_value)
+        return normalized
+
+    def _normalize_persisted_cortex_sessions(
+        self,
+        raw_sessions: dict[Any, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Normalize legacy session maps without retaining secret-bearing keys."""
+
+        normalized: dict[str, dict[str, Any]] = {}
+        for ordinal, (stored_id, raw_session) in enumerate(raw_sessions.items()):
+            if not isinstance(raw_session, dict):
+                continue
+            try:
+                candidate = dict(raw_session)
+                raw_context = str(candidate.get("context_id", "default"))
+                raw_agent = str(candidate.get("agent_id", "unknown-agent"))
+                candidate["context_id"] = reject_sensitive_identifier(
+                    raw_context,
+                    field="cortex context_id",
+                )
+                candidate["agent_id"] = reject_sensitive_identifier(
+                    raw_agent,
+                    field="cortex agent_id",
+                )
+
+                candidate_id = str(candidate.get("session_id") or stored_id).strip()
+                try:
+                    candidate["session_id"] = reject_sensitive_identifier(
+                        candidate_id,
+                        field="cortex session_id",
+                    )
+                except ValueError:
+                    safe_candidate, _ = redact_sensitive_value(candidate)
+                    if not isinstance(safe_candidate, dict):
+                        safe_candidate = {}
+                    safe_candidate.pop("session_id", None)
+                    seed = json.dumps(
+                        {
+                            "legacy_session": safe_candidate,
+                            "ordinal": ordinal,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                    candidate = safe_candidate
+                    candidate["session_id"] = (
+                        "ctx_legacy_" + hashlib.sha256(seed).hexdigest()[:16]
+                    )
+                session = self._normalize_cortex_session(candidate)
+                normalized[session["session_id"]] = session
+            except Exception as exc:
+                LOGGER.warning(
+                    "dropped unsafe legacy cortex session at index %s: %s",
+                    ordinal,
+                    safe_public_error(exc, fallback="unsafe cortex session"),
+                )
+        return normalized
 
     @staticmethod
     def _prefer_cortex_session(
@@ -492,6 +982,7 @@ class SpikingAttentionBackend:
             raise
 
     def _trace_from_memory_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        safe_source_text, _ = redact_capture_text(str(entry.get("source_text", "")))
         return {
             "memory_id": str(entry["memory_id"]),
             "tag": sanitize_tag(str(entry["tag"])),
@@ -502,58 +993,92 @@ class SpikingAttentionBackend:
             "metadata": self._json_safe_metadata(entry.get("metadata", {})),
             "registered_at": float(entry.get("created_at", time.time())),
             "updated_at": float(entry.get("updated_at", time.time())),
-            "source_text": str(entry.get("source_text", "")),
+            "source_text": safe_source_text,
         }
 
     def _normalize_trace_payload(self, trace: dict[str, Any]) -> dict[str, Any]:
         metadata = trace.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {"value": str(metadata)}
+        safe_source_text, source_redactions = redact_capture_text(
+            str(trace.get("source_text", ""))
+        )
+        safe_metadata = self._json_safe_metadata(metadata)
+        if source_redactions:
+            safe_metadata = {
+                **safe_metadata,
+                "redaction_count": int(
+                    source_redactions
+                    + int(safe_metadata.get("redaction_count", 0) or 0)
+                ),
+                "raw_text_stored": False,
+            }
         return {
             "tag": sanitize_tag(str(trace.get("tag", "untagged-trace"))),
             "context_id": sanitize_context_id(str(trace.get("context_id", "default"))),
             "embedding_dimensions": int(trace.get("embedding_dimensions", self.dimension)),
             "spike_indices": [int(idx) for idx in trace.get("spike_indices", [])],
             "neuron_indices": [int(idx) for idx in trace.get("neuron_indices", [])],
-            "metadata": self._json_safe_metadata(metadata),
+            "metadata": safe_metadata,
             "registered_at": float(trace.get("registered_at", time.time())),
-            "source_text": str(trace.get("source_text", "")),
+            "source_text": safe_source_text,
         }
 
     def _json_safe_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
         if not metadata:
             return {}
+        safe_value, _ = redact_sensitive_value(metadata)
+        safe_value, _ = strip_untrusted_raw_digest_fields(safe_value)
+        if not isinstance(safe_value, dict):
+            return {}
         try:
-            return json.loads(json.dumps(metadata, default=str))
-        except Exception:
-            return {str(key): str(value) for key, value in metadata.items()}
+            decoded = json.loads(json.dumps(safe_value, allow_nan=False))
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
 
     def _normalize_cortex_session(self, session: dict[str, Any]) -> dict[str, Any]:
         now = time.time()
         session_id = str(session.get("session_id") or "").strip()
         if not session_id:
-            seed = json.dumps(session, sort_keys=True, default=str).encode("utf-8")
+            safe_session, _ = redact_sensitive_value(session)
+            seed = json.dumps(safe_session, sort_keys=True, default=str).encode("utf-8")
             session_id = "ctx_" + hashlib.sha256(seed).hexdigest()[:16]
+        else:
+            session_id = reject_sensitive_identifier(
+                session_id,
+                field="cortex session_id",
+            )
         mode = str(session.get("mode") or "strict").strip().lower()
         if mode not in CORTEX_MODES:
             mode = "strict"
         status = str(session.get("status") or "active").strip().lower()
         if status not in {"active", "closed", "finished", "orphaned"}:
             status = "active"
+        task, _ = redact_capture_text(str(session.get("task", "")))
+        observation, _ = redact_capture_text(
+            str(session.get("last_observation", ""))
+        )
+        proposed_action, _ = redact_capture_text(
+            str(session.get("last_proposed_action", ""))
+        )
+        last_decision, _ = redact_capture_text(
+            str(session.get("last_decision", "enter"))
+        )
         normalized = {
             "session_id": session_id,
             "context_id": sanitize_context_id(str(session.get("context_id", "default"))),
             "agent_id": sanitize_agent_id(str(session.get("agent_id", "unknown-agent"))),
-            "task": str(session.get("task", "")).strip()[:2000],
+            "task": task.strip()[:2000],
             "mode": mode,
             "status": status,
             "started_at": float(session.get("started_at", now) or now),
             "updated_at": float(session.get("updated_at", now) or now),
             "tick_count": int(max(0, int(session.get("tick_count", 0) or 0))),
-            "last_decision": str(session.get("last_decision", "enter")),
+            "last_decision": last_decision,
             "last_confidence": float(session.get("last_confidence", 0.0) or 0.0),
-            "last_observation": str(session.get("last_observation", ""))[:2000],
-            "last_proposed_action": str(session.get("last_proposed_action", ""))[:2000],
+            "last_observation": observation[:2000],
+            "last_proposed_action": proposed_action[:2000],
             "last_warnings": self._json_safe_metadata(
                 {"items": session.get("last_warnings", [])}
             ).get("items", []),
@@ -577,7 +1102,8 @@ class SpikingAttentionBackend:
             "orphan_reason",
         ):
             if session.get(key):
-                normalized[key] = str(session.get(key, ""))[:500]
+                safe_value, _ = redact_capture_text(str(session.get(key, "")))
+                normalized[key] = safe_value[:500]
         for key in ("finished_at", "owner_started_at"):
             if session.get(key) is not None:
                 try:
@@ -738,20 +1264,26 @@ class SpikingAttentionBackend:
         *,
         dimensions: int | None = None,
     ) -> dict[str, Any]:
+        self._require_neural_substrate()
         dims = int(dimensions or self.dimension)
         if dims <= 0 or dims > MAX_EMBEDDING_DIMS:
             raise ValueError(f"dimensions must be between 1 and {MAX_EMBEDDING_DIMS}")
+        safe_text, redaction_count = redact_capture_text(str(text or ""))
         try:
-            result = self.embedding_provider.embed(str(text or ""), dimensions=dims)
+            result = self.embedding_provider.embed(safe_text, dimensions=dims)
         except EmbeddingProviderError:
             raise
         except Exception as exc:
             raise EmbeddingProviderError(
-                f"embedding provider {self.embedding_provider_name} failed: {exc}"
+                "embedding provider "
+                f"{self.embedding_provider_name} failed: "
+                f"{safe_public_error(exc, fallback='provider execution failed')}"
             ) from exc
         return {
             "embedding": self._mx.array(result.vector, dtype=self._mx.float32),
             "provenance": self._json_safe_metadata(result.provenance),
+            "input_redaction_count": int(redaction_count),
+            "raw_input_stored": False,
         }
 
     def embedding_provider_info(self) -> dict[str, Any]:
@@ -765,7 +1297,10 @@ class SpikingAttentionBackend:
                 "provider_type": "unavailable",
                 "semantic": False,
                 "local_only": True,
-                "error": str(exc),
+                "error": safe_public_error(
+                    exc,
+                    fallback="embedding provider unavailable",
+                ),
             }
 
     def benchmark_embedding_provider(
@@ -779,7 +1314,8 @@ class SpikingAttentionBackend:
         dims = int(dimensions or self.dimension)
         if dims <= 0 or dims > MAX_EMBEDDING_DIMS:
             raise ValueError(f"dimensions must be between 1 and {MAX_EMBEDDING_DIMS}")
-        prompt = str(text or "")
+        raw_prompt = str(text or "")
+        prompt, input_redaction_count = redact_capture_text(raw_prompt)
         sample_latencies: list[float] = []
         payload: dict[str, Any] | None = None
         started = time.perf_counter()
@@ -797,8 +1333,9 @@ class SpikingAttentionBackend:
             vector = [float(value) for value in embedding]
         return {
             "action": "provider-benchmark",
-            "input_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "input_chars": len(prompt),
+            "input_redaction_count": int(input_redaction_count),
+            "raw_input_stored": False,
             "dimensions": dims,
             "runs": bounded_runs,
             "elapsed_ms": elapsed_ms,
@@ -835,7 +1372,6 @@ class SpikingAttentionBackend:
                         or 0
                     )
                 ),
-                "input_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
                 "raw_text_stored": False,
             }
         payload = self.embed_text_payload(redacted_text)
@@ -866,6 +1402,7 @@ class SpikingAttentionBackend:
 
     def run_snn_cycle(self, sensory_spikes: Any, *, steps: int = 12):
         """Run recurrent LIF propagation with immutable state updates."""
+        self._require_neural_substrate()
         native_mx = self._mx
         spikes_in = self._coerce_embedding(sensory_spikes)
         self._ensure_projection_shape(int(spikes_in.shape[0]))
@@ -929,8 +1466,22 @@ class SpikingAttentionBackend:
         metadata: dict[str, Any] | None = None,
         source_text: str = "",
     ) -> dict[str, Any]:
+        self._require_neural_substrate()
         context = sanitize_context_id(context_id)
         clean_tag = sanitize_tag(tag)
+        safe_source_text, source_redactions = redact_capture_text(
+            str(source_text or "")
+        )
+        safe_metadata = self._json_safe_metadata(metadata)
+        if source_redactions:
+            safe_metadata = {
+                **safe_metadata,
+                "redaction_count": int(
+                    source_redactions
+                    + int(safe_metadata.get("redaction_count", 0) or 0)
+                ),
+                "raw_text_stored": False,
+            }
         try:
             self._auto_quick_prune_if_due(trigger="register-trace")
             arr = self._coerce_embedding(embedding)
@@ -945,9 +1496,9 @@ class SpikingAttentionBackend:
                 "embedding_dimensions": int(arr.shape[0]),
                 "spike_indices": spike_indices,
                 "neuron_indices": neuron_indices,
-                "metadata": self._json_safe_metadata(metadata),
+                "metadata": safe_metadata,
                 "registered_at": registered_at,
-                "source_text": str(source_text or ""),
+                "source_text": safe_source_text,
             }
 
             persisted = self.memory_store.upsert_entry(
@@ -989,7 +1540,7 @@ class SpikingAttentionBackend:
         steps: int = 12,
         recall_scope: str = "local",
     ) -> str:
-        prompt_text = str(prompt or "").strip()
+        prompt_text, _ = redact_capture_text(str(prompt or "").strip())
         if not prompt_text:
             raise ValueError("prompt must not be empty")
         return self.query(
@@ -1491,10 +2042,13 @@ class SpikingAttentionBackend:
         *,
         context_id: str | None = None,
     ) -> dict[str, Any]:
-        if context_id is None or sanitize_context_id(context_id) in {"global", "all"}:
+        context = sanitize_context_id(context_id) if context_id is not None else None
+        if context is None or context in {"global", "all"}:
             self.global_enabled = bool(enabled)
+            self._global_enabled_dirty = True
         else:
-            self.context_overrides[sanitize_context_id(context_id)] = bool(enabled)
+            self.context_overrides[context] = bool(enabled)
+            self._dirty_context_overrides.add(context)
         self._persist_runtime_state()
         return self.status(context_id=context_id or "default")
 
@@ -1504,10 +2058,17 @@ class SpikingAttentionBackend:
         context_stats = self.memory_store.stats(context_id=context)
         return {
             "runtime": "ready" if self.is_enabled(context) else "disabled",
+            "runtime_mode": (
+                "control-plane" if self.control_plane_only else "neural"
+            ),
+            "neural_state": (
+                "deferred" if self.control_plane_only else "materialized"
+            ),
             "context_id": context,
             "global_enabled": bool(self.global_enabled),
             "effective_enabled": self.is_enabled(context),
             "context_overrides": dict(sorted(self.context_overrides.items())),
+            "runtime_state_repair": dict(self.runtime_state_repair),
             "dimension": int(self.dimension),
             "num_neurons": int(self.num_neurons),
             "default_top_k": int(self.default_top_k),
@@ -1914,15 +2475,21 @@ class SpikingAttentionBackend:
         agent_id: str = "mcp-client",
         task: str,
         mode: str = "strict",
+        recall_mode: str = "neural",
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
-        task_text = str(task or "").strip()
+        task_text, task_redactions = redact_capture_text(str(task or "").strip())
         if not task_text:
             raise ValueError("task must not be empty")
         clean_mode = str(mode or "strict").strip().lower()
         if clean_mode not in CORTEX_MODES:
             clean_mode = "strict"
+        normalized_recall_mode = self._normalize_agent_recall_mode(recall_mode)
+        if self.control_plane_only and normalized_recall_mode == "neural":
+            raise BackendUnavailable(
+                "neural recall is unavailable in the control-plane backend"
+            )
         now = time.time()
         seed = f"{context}\x1f{agent}\x1f{task_text}\x1f{now:.6f}".encode("utf-8")
         session_id = "ctx_" + hashlib.sha256(seed).hexdigest()[:18]
@@ -1942,8 +2509,18 @@ class SpikingAttentionBackend:
         )
         self.cortex_sessions[session_id] = session
         self._persist_runtime_state()
-        recall_result = self.query_text(task_text, context_id=context)
-        recall_items = self._split_recall_result(recall_result)
+        if normalized_recall_mode == "neural":
+            recall_result = self.query_text(task_text, context_id=context)
+            recall_items = self._split_recall_result(recall_result)
+        elif normalized_recall_mode == "surface":
+            recall_items = self._surface_bootstrap_recall(
+                context=context,
+                prompt_text=task_text,
+            )
+            recall_result = " / ".join(recall_items)
+        else:
+            recall_result = ""
+            recall_items = []
         policy = self._cortex_policy(clean_mode)
         state = self.get_cortex_state(context_id=context, agent_id=agent)
         deployment = self.publish_context_event(
@@ -1958,6 +2535,7 @@ class SpikingAttentionBackend:
                 "mode": clean_mode,
                 "governance_contract": policy["contract"],
                 "recall_items": recall_items[:8],
+                "recall_mode": normalized_recall_mode,
             },
         )
         return {
@@ -1966,11 +2544,21 @@ class SpikingAttentionBackend:
             "agent_id": agent,
             "session_id": session_id,
             "task": task_text,
+            "input_redaction_count": int(task_redactions),
+            "raw_input_stored": False,
             "mode": clean_mode,
             "governance_contract": policy["contract"],
             "policy": policy,
             "recall_result": recall_result,
             "recall_items": recall_items,
+            "recall_mode": normalized_recall_mode,
+            "recall_provenance": (
+                "mlx-spiking-neural"
+                if normalized_recall_mode == "neural"
+                else "sqlite-surface-bootstrap"
+                if normalized_recall_mode == "surface"
+                else "disabled"
+            ),
             "cortex_state": state,
             "agent_deployment": deployment,
         }
@@ -1990,14 +2578,21 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
-        clean_session_id = str(session_id or "").strip()
+        clean_session_id = reject_sensitive_identifier(
+            session_id,
+            field="cortex session_id",
+        ).strip()
         session = self._active_cortex_session(
             context=context,
             agent_id=agent,
             session_id=clean_session_id,
         )
-        observation_text = str(observation or "").strip()
-        proposed_text = str(proposed_action or "").strip()
+        observation_text, observation_redactions = redact_capture_text(
+            str(observation or "").strip()
+        )
+        proposed_text, proposed_redactions = redact_capture_text(
+            str(proposed_action or "").strip()
+        )
         scoped_files = self._normalize_cortex_intent_list(intended_files)
         scoped_tools = self._normalize_cortex_intent_list(intended_tools)
         bounded_confidence = min(max(float(confidence), 0.0), 1.0)
@@ -2068,6 +2663,10 @@ class SpikingAttentionBackend:
             "session_id": clean_session_id,
             "decision": decision,
             "confidence": bounded_confidence,
+            "input_redaction_count": int(
+                observation_redactions + proposed_redactions
+            ),
+            "raw_input_stored": False,
             "intended_files": scoped_files,
             "intended_tools": scoped_tools,
             "warnings": warnings,
@@ -2090,8 +2689,14 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
-        clean_session_id = str(session_id or "").strip()
-        clean_reason = str(reason or "operator-complete").strip()[:240] or "operator-complete"
+        clean_session_id = reject_sensitive_identifier(
+            session_id,
+            field="cortex session_id",
+        ).strip()
+        clean_reason, _ = redact_capture_text(
+            str(reason or "operator-complete").strip()
+        )
+        clean_reason = clean_reason[:240] or "operator-complete"
         session = self._active_cortex_session(
             context=context,
             agent_id=agent,
@@ -2149,10 +2754,13 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
-        clean_text = str(text or "").strip()
+        clean_text, text_redactions = redact_capture_text(str(text or "").strip())
         if not clean_text:
             raise ValueError("text must not be empty")
-        clean_session_id = str(session_id or "").strip() or "direct-cortex-commit"
+        clean_session_id = reject_sensitive_identifier(
+            session_id or "direct-cortex-commit",
+            field="cortex session_id",
+        ).strip() or "direct-cortex-commit"
         clean_trace_type = self._normalize_cortex_trace_type(trace_type, clean_text)
         clean_truth_posture = self._normalize_truth_posture(truth_posture)
         safe_evidence = self._json_safe_metadata(evidence or {})
@@ -2186,6 +2794,8 @@ class SpikingAttentionBackend:
                 "truth_posture": clean_truth_posture,
                 "confidence": scored_confidence,
                 "evidence": safe_evidence,
+                "redaction_count": int(text_redactions),
+                "raw_text_stored": False,
                 "governance_mode": session.get("mode", "direct"),
                 "task": session.get("task", ""),
             }
@@ -2375,13 +2985,17 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
-        clean_title = " ".join(str(title or "").split())
+        clean_title, _ = redact_capture_text(" ".join(str(title or "").split()))
         if not clean_title:
             raise ValueError("title is required")
         clean_state = self._normalize_goal_state(state or "planned")
-        clean_owner = " ".join(str(owner or agent).split())
-        clean_next_action = " ".join(str(next_action or "").split())
-        clean_evidence = " ".join(str(evidence or "").split())
+        clean_owner, _ = redact_capture_text(" ".join(str(owner or agent).split()))
+        clean_next_action, _ = redact_capture_text(
+            " ".join(str(next_action or "").split())
+        )
+        clean_evidence, _ = redact_capture_text(
+            " ".join(str(evidence or "").split())
+        )
         evidence_payload = {
             "source": "goal-ledger",
             "title": clean_title,
@@ -2456,7 +3070,10 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id)
-        clean_goal_id = str(goal_id or "").strip()
+        clean_goal_id = reject_sensitive_identifier(
+            goal_id,
+            field="goal_id",
+        ).strip()
         existing: dict[str, Any] | None = None
         if clean_goal_id:
             entry = self.memory_store.get_entry(clean_goal_id)
@@ -2464,15 +3081,25 @@ class SpikingAttentionBackend:
                 metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
                 if metadata.get("cortex_governor") is True and metadata.get("trace_type") == "goal":
                     existing = self._goal_from_cortex_summary(self._summarize_cortex_memory(entry))
-        clean_title = " ".join(str(title or (existing or {}).get("title", "")).split())
+        clean_title, _ = redact_capture_text(
+            " ".join(str(title or (existing or {}).get("title", "")).split())
+        )
         if not clean_title:
             raise ValueError("title is required when goal_id does not point to an existing goal")
         clean_state = self._normalize_goal_state(state or str((existing or {}).get("state", "in_progress")))
-        clean_owner = " ".join(str(owner or (existing or {}).get("owner", "") or agent).split())
-        clean_next_action = " ".join(
-            str(next_action or (existing or {}).get("next_action", "")).split()
+        clean_owner, _ = redact_capture_text(
+            " ".join(
+                str(owner or (existing or {}).get("owner", "") or agent).split()
+            )
         )
-        clean_evidence = " ".join(str(evidence or "").split())
+        clean_next_action, _ = redact_capture_text(
+            " ".join(
+                str(next_action or (existing or {}).get("next_action", "")).split()
+            )
+        )
+        clean_evidence, _ = redact_capture_text(
+            " ".join(str(evidence or "").split())
+        )
         root_goal_id = clean_goal_id or str((existing or {}).get("goal_id", ""))
         if not root_goal_id:
             root_goal_id = hashlib.sha256(f"{context}\x1f{clean_title}".encode("utf-8")).hexdigest()[:16]
@@ -2585,9 +3212,17 @@ class SpikingAttentionBackend:
         confirm: bool = False,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
-        clean_memory_id = str(memory_id or "").strip()
+        clean_memory_id = reject_sensitive_identifier(
+            memory_id,
+            field="memory_id",
+        ).strip()
         if not clean_memory_id:
             raise ValueError("memory_id is required")
+        clean_reason, _ = redact_capture_text(str(reason or ""))
+        clean_source_surface = reject_sensitive_identifier(
+            source_surface or "operator",
+            field="source_surface",
+        ).strip() or "operator"
         clean_action = str(action or "").strip().lower().replace("-", "_")
         if clean_action not in {"promote", "demote", "prune"}:
             raise ValueError("action must be promote, demote, or prune")
@@ -2605,8 +3240,8 @@ class SpikingAttentionBackend:
                 context_id=context,
                 target_type="memory",
                 memory_id=clean_memory_id,
-                reason=reason,
-                source_surface=source_surface,
+                reason=clean_reason,
+                source_surface=clean_source_surface,
                 publish_audit=True,
             )
             return {
@@ -2614,7 +3249,7 @@ class SpikingAttentionBackend:
                 "context_id": context,
                 "memory_id": clean_memory_id,
                 "moderation_action": clean_action,
-                "reason": str(reason or ""),
+                "reason": clean_reason,
                 "trace": self._summarize_cortex_memory(entry),
                 "prune": prune,
             }
@@ -2638,8 +3273,8 @@ class SpikingAttentionBackend:
         history.append(
             {
                 "action": clean_action,
-                "reason": str(reason or ""),
-                "source_surface": str(source_surface or "operator"),
+                "reason": clean_reason,
+                "source_surface": clean_source_surface,
                 "moderated_at": now,
             }
         )
@@ -2658,14 +3293,14 @@ class SpikingAttentionBackend:
         trace = self._summarize_cortex_memory(updated)
         audit = self.publish_context_event(
             context_id=context,
-            source_surface=str(source_surface or "operator"),
+            source_surface=clean_source_surface,
             event_type="cortex-trace-moderated",
             summary=f"cortex trace {clean_action}: {trace.get('tag', clean_memory_id)}",
             payload={
                 "memory_id": clean_memory_id,
                 "tag": trace.get("tag", ""),
                 "moderation_action": clean_action,
-                "reason": str(reason or ""),
+                "reason": clean_reason,
                 "trace_type": trace.get("trace_type", ""),
                 "truth_posture": trace.get("truth_posture", ""),
                 "confidence": trace.get("confidence", 0.0),
@@ -2676,7 +3311,7 @@ class SpikingAttentionBackend:
             "context_id": context,
             "memory_id": clean_memory_id,
             "moderation_action": clean_action,
-            "reason": str(reason or ""),
+            "reason": clean_reason,
             "trace": trace,
             "agent_deployment": audit,
             "memory_db_path": str(self.memory_store.db_path),
@@ -3047,7 +3682,7 @@ class SpikingAttentionBackend:
         normalized: list[str] = []
         seen: set[str] = set()
         for item in raw_items:
-            text = " ".join(str(item or "").split())
+            text, _ = redact_capture_text(" ".join(str(item or "").split()))
             if not text:
                 continue
             text = text[:260]
@@ -3311,6 +3946,7 @@ class SpikingAttentionBackend:
         claim_events: bool = True,
         consumer_instance_id: str = "",
         lease_seconds: float = 60.0,
+        recall_mode: str = "neural",
     ) -> dict[str, Any]:
         """Compose the durable S2 context bus into an agent-ready briefing."""
         context = sanitize_context_id(context_id)
@@ -3325,6 +3961,11 @@ class SpikingAttentionBackend:
             )
         bounded_event_limit = min(max(int(event_limit), 1), 100)
         bounded_graph_limit = min(max(int(graph_limit), 1), 200)
+        normalized_recall_mode = self._normalize_agent_recall_mode(recall_mode)
+        if self.control_plane_only and normalized_recall_mode == "neural":
+            raise BackendUnavailable(
+                "neural recall is unavailable in the control-plane backend"
+            )
         start_event_id = (
             self._agent_cursor_event_id(context=context, agent_id=agent)
             if since_event_id is None
@@ -3363,15 +4004,24 @@ class SpikingAttentionBackend:
         )
         graph = self.list_memory_graph(context_id=context, limit=bounded_graph_limit)
 
-        prompt_text = str(prompt or "").strip()
+        prompt_text, prompt_redactions = redact_capture_text(
+            str(prompt or "").strip()
+        )
         recall_result = ""
         recall_items: list[str] = []
         if prompt_text:
-            recall_result = self.query(
-                self.embed_text(prompt_text),
-                context_id=context,
-            )
-            recall_items = self._split_recall_result(recall_result)
+            if normalized_recall_mode == "neural":
+                recall_result = self.query(
+                    self.embed_text(prompt_text),
+                    context_id=context,
+                )
+                recall_items = self._split_recall_result(recall_result)
+            elif normalized_recall_mode == "surface":
+                recall_items = self._surface_bootstrap_recall(
+                    context=context,
+                    prompt_text=prompt_text,
+                )
+                recall_result = " / ".join(recall_items)
 
         graph_entries = [
             self._summarize_agent_graph_entry(entry)
@@ -3418,8 +4068,18 @@ class SpikingAttentionBackend:
             "has_more_events": bool(deployments.get("has_more", False)),
             "claim_events": bool(claim_events),
             "recall_prompt": prompt_text,
+            "input_redaction_count": int(prompt_redactions),
+            "raw_input_stored": False,
             "recall_result": recall_result,
             "recall_items": recall_items,
+            "recall_mode": normalized_recall_mode,
+            "recall_provenance": (
+                "mlx-spiking-neural"
+                if normalized_recall_mode == "neural"
+                else "sqlite-surface-bootstrap"
+                if normalized_recall_mode == "surface"
+                else "disabled"
+            ),
             "graph_summary": graph_summary,
             "graph_entries": graph_entries,
             "graph_relationships": graph_relationships,
@@ -3430,6 +4090,41 @@ class SpikingAttentionBackend:
         }
         payload["briefing_markdown"] = self._render_agent_context_briefing(payload)
         return payload
+
+    @staticmethod
+    def _normalize_agent_recall_mode(recall_mode: str) -> str:
+        normalized = str(recall_mode or "neural").strip().lower().replace("_", "-")
+        aliases = {
+            "full": "neural",
+            "spiking": "neural",
+            "surface-bootstrap": "surface",
+            "lexical": "surface",
+            "off": "none",
+            "disabled": "none",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"neural", "surface", "none"}:
+            raise ValueError("recall_mode must be neural, surface, or none")
+        return normalized
+
+    def _surface_bootstrap_recall(
+        self,
+        *,
+        context: str,
+        prompt_text: str,
+    ) -> list[str]:
+        candidates = self._surface_text_recall_candidates(
+            context=context,
+            prompt_text=prompt_text,
+            recall_scope="local",
+        )
+        return [
+            self._format_recall_entry(
+                candidate,
+                score=float(candidate.get("score", 0.0) or 0.0),
+            )
+            for candidate in candidates[: max(1, self.recall_count)]
+        ]
 
     def _agent_cursor_event_id(self, *, context: str, agent_id: str) -> int:
         cursors = self.memory_store.list_context_cursors(
@@ -3681,13 +4376,28 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         source = sanitize_tag(source_tag).replace(" ", "-")
+        safe_text, input_redactions = redact_capture_text(str(text or ""))
+        safe_metadata = self._json_safe_metadata(metadata)
+        if input_redactions:
+            safe_metadata = {
+                **safe_metadata,
+                "redaction_count": int(
+                    input_redactions
+                    + int(safe_metadata.get("redaction_count", 0) or 0)
+                ),
+                "raw_text_stored": False,
+            }
         surprise_model = self._surprise_model_info()
         segmenter = BayesianSurpriseEventSegmenter(
             surprise_threshold=surprise_threshold,
             min_segment_sentences=min_segment_sentences,
             embedding_fn=self._embed_sentence_for_surprise,
         )
-        segments = segmenter.segment(text, context_id=context, source_tag=source)
+        segments = segmenter.segment(
+            safe_text,
+            context_id=context,
+            source_tag=source,
+        )
         registrations: list[dict[str, Any]] = []
         relationships: list[dict[str, Any]] = []
         try:
@@ -3703,7 +4413,7 @@ class SpikingAttentionBackend:
                     safe_segment["raw_text_stored"] = False
                 event_metadata = self._json_safe_metadata(
                     {
-                        **(metadata or {}),
+                        **safe_metadata,
                         "event_segment": True,
                         "segment_id": safe_segment["segment_id"],
                         "sequence_id": safe_segment["sequence_id"],
@@ -3836,7 +4546,7 @@ class SpikingAttentionBackend:
         text: str,
         metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        source_text = str(text or "")
+        source_text, _ = redact_capture_text(str(text or ""))
         metadata = metadata if isinstance(metadata, dict) else {}
         label = self._surface_label_from_fields(
             tag=tag,
@@ -4007,35 +4717,13 @@ class SpikingAttentionBackend:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("capture metadata must be finite JSON-safe data") from exc
-        redacted_serialized, serialized_redactions = redact_capture_text(serialized)
-        try:
-            decoded = json.loads(redacted_serialized)
-        except json.JSONDecodeError as exc:  # pragma: no cover - defensive boundary
-            raise ValueError("redacted capture metadata was not valid JSON") from exc
-
-        def strip_untrusted_digests(value: Any) -> Any:
-            if isinstance(value, dict):
-                clean: dict[str, Any] = {}
-                for raw_key, item in value.items():
-                    key = str(raw_key)
-                    folded = key.strip().casefold().replace("-", "_")
-                    if (
-                        folded in CAPTURE_UNTRUSTED_DIGEST_KEYS
-                        or (folded.startswith("raw_") and "sha" in folded)
-                    ):
-                        continue
-                    clean[key] = strip_untrusted_digests(item)
-                return clean
-            if isinstance(value, list):
-                return [strip_untrusted_digests(item) for item in value]
-            return value
-
-        stripped = strip_untrusted_digests(decoded)
+        decoded = json.loads(serialized)
+        stripped, _removed_digest_count = strip_untrusted_raw_digest_fields(decoded)
         if not isinstance(stripped, dict):  # pragma: no cover - source is a dict
             stripped = {}
         return (
             self._json_safe_metadata(stripped),
-            int(value_redactions + serialized_redactions),
+            int(value_redactions),
         )
 
     def _capture_request_fingerprint(
@@ -5127,17 +5815,28 @@ class SpikingAttentionBackend:
         publish_audit: bool = True,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
+        clean_reason, _ = redact_capture_text(str(reason or ""))
+        clean_source_surface = reject_sensitive_identifier(
+            source_surface or "operator",
+            field="source_surface",
+        ).strip() or "operator"
         normalized_target = str(target_type or "").strip().lower().replace("-", "_")
         if normalized_target in {"node", "memory", "trace", "event"}:
             result = self.memory_store.delete_entry(
                 context_id=context,
-                memory_id=str(memory_id or "").strip() or None,
+                memory_id=(
+                    reject_sensitive_identifier(memory_id, field="memory_id").strip()
+                    or None
+                ),
                 tag=sanitize_tag(tag) if str(tag or "").strip() else None,
             )
             self._refresh_registered_traces()
             self._persist_runtime_state()
         elif normalized_target in {"relationship", "edge"}:
-            clean_relationship_id = str(relationship_id or "").strip()
+            clean_relationship_id = reject_sensitive_identifier(
+                relationship_id,
+                field="relationship_id",
+            ).strip()
             if not clean_relationship_id:
                 raise ValueError("relationship_id is required for relationship pruning")
             result = self.memory_store.delete_relationship(
@@ -5167,14 +5866,14 @@ class SpikingAttentionBackend:
         payload = {
             "context_id": context,
             "target_type": normalized_target,
-            "reason": str(reason or ""),
+            "reason": clean_reason,
             "result": safe_result,
         }
         audit_event = None
         if publish_audit:
             audit_event = self.publish_context_event(
                 context_id=context,
-                source_surface=str(source_surface or "operator"),
+                source_surface=clean_source_surface,
                 event_type="prune-memory",
                 summary=(
                     f"{normalized_target} prune "
@@ -5187,7 +5886,7 @@ class SpikingAttentionBackend:
             "action": "prune-memory",
             "context_id": context,
             "target_type": normalized_target,
-            "reason": str(reason or ""),
+            "reason": clean_reason,
             "result": safe_result,
             "agent_deployment": audit_event,
             "memory_db_path": str(self.memory_store.db_path),
@@ -6408,6 +7107,7 @@ class SpikingAttentionBackend:
         target_min_mb: float = DEFAULT_RESOURCE_TARGET_MIN_MB,
         target_max_mb: float = DEFAULT_RESOURCE_TARGET_MAX_MB,
     ) -> dict[str, Any]:
+        self._require_neural_substrate()
         arrays = {
             "W_syn": self._array_profile(self.W_syn),
             "W_lateral": self._array_profile(self.W_lateral),
@@ -6562,14 +7262,11 @@ class SpikingAttentionBackend:
             "embedding_provider": status["embedding_provider"],
         }
         if output_path:
+            reject_sensitive_identifier(output_path, field="output_path")
             path = Path(output_path).expanduser().resolve()
-            path.parent.mkdir(parents=True, exist_ok=True)
             evidence_path = str(path)
             payload["evidence_path"] = evidence_path
-            path.write_text(
-                json.dumps(payload, indent=2, sort_keys=True, default=str),
-                encoding="utf-8",
-            )
+            _atomic_write_private_json(path, payload)
         else:
             payload["evidence_path"] = evidence_path
         return payload
@@ -6998,27 +7695,57 @@ class SpikingAttentionBackend:
 
 
 _ENGINE_INSTANCE: SpikingAttentionBackend | None = None
+_CONTROL_PLANE_INSTANCE: SpikingAttentionBackend | None = None
+_ENGINE_INSTANCE_LOCK = threading.RLock()
 
 
 def get_backend() -> SpikingAttentionBackend:
     global _ENGINE_INSTANCE
     if _ENGINE_INSTANCE is None:
-        _ENGINE_INSTANCE = SpikingAttentionBackend(
-            dimension=int(os.getenv("SYNAPSE_S2_DIMENSION", "1024")),
-            num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", str(DEFAULT_NUM_NEURONS))),
-            default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "256")),
-            recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "10")),
-            quick_pruning_interval_seconds=float(
-                os.getenv("SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS", "300")
-            ),
-            idle_deep_sleep_seconds=float(
-                os.getenv("SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS", "1800")
-            ),
-            embedding_provider_name=os.getenv("SYNAPSE_S2_EMBEDDING_PROVIDER", "auto"),
-            require_native=os.getenv("SYNAPSE_S2_REQUIRE_NATIVE", "").lower()
-            in {"1", "true", "yes", "on"},
-        )
+        with _ENGINE_INSTANCE_LOCK:
+            if _ENGINE_INSTANCE is None:
+                _ENGINE_INSTANCE = _build_environment_backend(control_plane_only=False)
     return _ENGINE_INSTANCE
+
+
+def get_control_plane_backend() -> SpikingAttentionBackend:
+    """Return the lightweight durable control plane without neural matrices.
+
+    Short-lived MCP discovery/status clients use this lane so protocol
+    availability does not depend on dense MLX initialization. Neural tools keep
+    using :func:`get_backend` and therefore retain the full runtime contract.
+    """
+
+    global _CONTROL_PLANE_INSTANCE
+    if _CONTROL_PLANE_INSTANCE is None:
+        with _ENGINE_INSTANCE_LOCK:
+            if _CONTROL_PLANE_INSTANCE is None:
+                _CONTROL_PLANE_INSTANCE = _build_environment_backend(
+                    control_plane_only=True
+                )
+    return _CONTROL_PLANE_INSTANCE
+
+
+def _build_environment_backend(*, control_plane_only: bool) -> SpikingAttentionBackend:
+    return SpikingAttentionBackend(
+        dimension=int(os.getenv("SYNAPSE_S2_DIMENSION", "1024")),
+        num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", str(DEFAULT_NUM_NEURONS))),
+        default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "256")),
+        recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "10")),
+        quick_pruning_interval_seconds=float(
+            os.getenv("SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS", "300")
+        ),
+        idle_deep_sleep_seconds=float(
+            os.getenv("SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS", "1800")
+        ),
+        embedding_provider_name=os.getenv("SYNAPSE_S2_EMBEDDING_PROVIDER", "auto"),
+        require_native=(
+            not control_plane_only
+            and os.getenv("SYNAPSE_S2_REQUIRE_NATIVE", "").lower()
+            in {"1", "true", "yes", "on"}
+        ),
+        control_plane_only=control_plane_only,
+    )
 
 
 def simulate_spiking_retrieval(
@@ -7082,7 +7809,8 @@ def set_enabled(enabled: bool, context_id: str | None = None) -> dict[str, Any]:
 
 
 def get_status(context_id: str = "default") -> dict[str, Any]:
-    return get_backend().status(context_id=context_id)
+    backend = _ENGINE_INSTANCE or get_control_plane_backend()
+    return backend.status(context_id=context_id)
 
 
 def list_memory(

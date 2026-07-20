@@ -8,15 +8,42 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
-import mlx_backend
-from mlx_backend import (
-    DEFAULT_NUM_NEURONS,
-    DEFAULT_RESOURCE_TARGET_MAX_MB,
-    DEFAULT_RESOURCE_TARGET_MIN_MB,
-)
-from transcript_capture import TranscriptCaptureManager
-from memory_store import DurableMemoryStore
+from redaction import reject_sensitive_identifier, safe_public_error
+
+
+_STARTUP_IMPORT_ERROR: Exception | None = None
+try:
+    from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
+    import mlx_backend
+    from mlx_backend import (
+        DEFAULT_NUM_NEURONS,
+        DEFAULT_RESOURCE_TARGET_MAX_MB,
+        DEFAULT_RESOURCE_TARGET_MIN_MB,
+    )
+    from transcript_capture import TranscriptCaptureManager
+    from memory_store import DurableMemoryStore
+except Exception as startup_exc:  # pragma: no cover - dependency/environment specific
+    _STARTUP_IMPORT_ERROR = startup_exc
+
+
+class SafeArgumentParseError(ValueError):
+    """An argparse failure whose public representation is safe to emit."""
+
+    def __init__(self, *, prog: str, usage: str, message: str) -> None:
+        super().__init__(message)
+        self.prog = prog
+        self.usage = usage
+
+
+class SafeArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that never writes attacker-controlled values itself."""
+
+    def error(self, message: str) -> None:
+        raise SafeArgumentParseError(
+            prog=self.prog,
+            usage=self.format_usage(),
+            message=safe_public_error(message, fallback="invalid command arguments"),
+        )
 
 
 def _json_default(value: Any) -> str:
@@ -88,6 +115,16 @@ def parse_string_list(raw: str | None, *, field_name: str) -> list[str]:
         if text:
             values.append(text)
     return values
+
+
+def _optional_public_output_path(value: Any, *, field: str) -> str | None:
+    """Reject credential-shaped output paths before runtime initialization."""
+
+    if value is None:
+        return None
+    raw = str(value)
+    reject_sensitive_identifier(raw, field=field)
+    return raw
 
 
 def build_backend(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBackend:
@@ -302,18 +339,47 @@ def command_capture_inbox_drop(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _capture_daemon_from_args(args: argparse.Namespace) -> CaptureInboxDaemon:
-    return CaptureInboxDaemon(root=args.capture_root, backend=build_backend(args))
+def _capture_daemon_from_args(
+    args: argparse.Namespace,
+    *,
+    require_backend: bool = True,
+) -> CaptureInboxDaemon:
+    return CaptureInboxDaemon(
+        root=args.capture_root,
+        backend=build_backend(args) if require_backend else None,
+    )
 
 
 def command_capture_inbox_status(args: argparse.Namespace) -> dict[str, Any]:
-    return _capture_daemon_from_args(args).status()
+    return _capture_daemon_from_args(args, require_backend=False).status()
 
 
 def command_capture_inbox_process(args: argparse.Namespace) -> dict[str, Any]:
     if args.confirm is not True:
         raise ValueError("--confirm is required to process capture inbox files")
     return _capture_daemon_from_args(args).process_once(max_files=args.max_files)
+
+
+def command_capture_error_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    return _capture_daemon_from_args(
+        args,
+        require_backend=False,
+    ).error_resolution_preflight(
+        reason=args.reason,
+        include_historical=bool(args.include_historical),
+    )
+
+
+def command_capture_error_resolve(args: argparse.Namespace) -> dict[str, Any]:
+    return _capture_daemon_from_args(
+        args,
+        require_backend=False,
+    ).resolve_error_artifacts(
+        preflight_token=args.preflight_token,
+        reason=args.reason,
+        include_historical=bool(args.include_historical),
+        confirm=bool(args.confirm),
+    )
 
 
 def _transcript_manager_from_args(args: argparse.Namespace) -> TranscriptCaptureManager:
@@ -751,6 +817,10 @@ def command_wrap_session(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_certify_runtime(args: argparse.Namespace) -> dict[str, Any]:
+    output_path = _optional_public_output_path(
+        args.output,
+        field="runtime certification output path",
+    )
     backend = build_backend(args)
     return backend.certify_runtime(
         strict_native=args.strict_native,
@@ -759,7 +829,7 @@ def command_certify_runtime(args: argparse.Namespace) -> dict[str, Any]:
         require_resource_envelope=args.require_resource_envelope,
         target_min_mb=args.target_min_mb,
         target_max_mb=args.target_max_mb,
-        output_path=args.output,
+        output_path=output_path,
     )
 
 
@@ -788,13 +858,21 @@ def command_list_memory(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_export_memory(args: argparse.Namespace) -> dict[str, Any]:
+    output_path = _optional_public_output_path(
+        args.output,
+        field="memory export output path",
+    )
     backend = build_backend(args)
-    return backend.export_memory(path=args.output, context_id=args.context)
+    return backend.export_memory(path=output_path, context_id=args.context)
 
 
 def command_backup_memory(args: argparse.Namespace) -> dict[str, Any]:
+    output_path = _optional_public_output_path(
+        args.output,
+        field="memory backup output path",
+    )
     backend = build_backend(args)
-    return backend.backup_memory(path=args.output)
+    return backend.backup_memory(path=output_path)
 
 
 def command_memory_integrity(args: argparse.Namespace) -> dict[str, Any]:
@@ -931,7 +1009,7 @@ def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = SafeArgumentParser(
         prog="synapse_cli.py",
         description="Operate the local SYNAPSE-S2 spiking attention MCP backend.",
     )
@@ -1075,6 +1153,24 @@ def build_parser() -> argparse.ArgumentParser:
     capture_inbox_process.add_argument("--max-files", type=int, default=50)
     capture_inbox_process.add_argument("--confirm", action="store_true")
     capture_inbox_process.set_defaults(func=command_capture_inbox_process)
+
+    capture_error_preflight = subparsers.add_parser("capture-error-preflight")
+    capture_error_preflight.add_argument("--capture-root", default=None)
+    capture_error_preflight.add_argument("--reason", required=True)
+    capture_error_preflight.add_argument(
+        "--include-historical",
+        action="store_true",
+        help="Include sanitized legacy diagnostics in addition to terminal evidence.",
+    )
+    capture_error_preflight.set_defaults(func=command_capture_error_preflight)
+
+    capture_error_resolve = subparsers.add_parser("capture-error-resolve")
+    capture_error_resolve.add_argument("--capture-root", default=None)
+    capture_error_resolve.add_argument("--preflight-token", required=True)
+    capture_error_resolve.add_argument("--reason", required=True)
+    capture_error_resolve.add_argument("--include-historical", action="store_true")
+    capture_error_resolve.add_argument("--confirm", action="store_true")
+    capture_error_resolve.set_defaults(func=command_capture_error_resolve)
 
     transcript_source_add = subparsers.add_parser("transcript-source-add")
     add_context(transcript_source_add)
@@ -1510,14 +1606,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if _STARTUP_IMPORT_ERROR is not None:
+        emit(
+            {
+                "error": safe_public_error(
+                    _STARTUP_IMPORT_ERROR,
+                    fallback="startup import failed",
+                )
+            },
+            as_json="--json" in raw_argv,
+        )
+        return 1
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(raw_argv)
+    except SafeArgumentParseError as exc:
+        if "--json" in raw_argv:
+            emit({"error": str(exc)}, as_json=True)
+        else:
+            sys.stderr.write(exc.usage)
+            sys.stderr.write(f"{exc.prog}: error: {exc}\n")
+        return 2
     try:
         payload = args.func(args)
         emit(payload, as_json=args.json)
         return 0
     except Exception as exc:
-        emit({"error": str(exc)}, as_json=args.json)
+        emit(
+            {"error": safe_public_error(exc, fallback="command failed")},
+            as_json=args.json,
+        )
         return 1
 
 

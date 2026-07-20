@@ -24,13 +24,16 @@ WARNING_TOKENS = (
 )
 
 
+HTTP_TIMEOUT_SECONDS = 30
+
+
 def fetch_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=10) as response:
+    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
 def fetch_text(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=10) as response:
+    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return response.read().decode("utf-8")
 
 
@@ -45,7 +48,18 @@ def main() -> int:
         index = fetch_text(f"{base_url}/")
         app_js = fetch_text(f"{base_url}/app.js")
         styles = fetch_text(f"{base_url}/styles.css")
-        snapshot = fetch_json(f"{base_url}/api/snapshot?context_id={context}&limit=8")
+        # The browser intentionally hydrates its shell without the graph first,
+        # then loads graph/galaxy data through their bounded endpoints.  Mirror
+        # that production contract here so a cold MLX process cannot make the
+        # readiness probe look hung while still proving every visual data lane.
+        snapshot = fetch_json(
+            f"{base_url}/api/snapshot?context_id={context}&limit=8&include_graph=false"
+        )
+        graph = fetch_json(f"{base_url}/api/graph?context_id={context}&limit=8")
+        namespace_map = fetch_json(
+            f"{base_url}/api/namespace-map?context_id={context}"
+            "&limit=50&suggestion_limit=0&include_suggestions=false"
+        )
         warnings = []
         for token in WARNING_TOKENS:
             if token in index or token in app_js or token in styles:
@@ -75,6 +89,12 @@ def main() -> int:
             "context_id": snapshot["context_id"],
             "memory_entries": snapshot["status"]["memory_context_entry_count"],
             "relationships": snapshot["status"]["memory_context_relationship_count"],
+            "graph_loaded": isinstance(graph.get("entries"), list)
+            and isinstance(graph.get("relationships"), list),
+            "graph_entries": int(graph.get("entry_count", 0) or 0),
+            "namespace_map_loaded": isinstance(namespace_map.get("nodes"), list)
+            and isinstance(namespace_map.get("links"), list),
+            "namespace_count": int(namespace_map.get("node_count", 0) or 0),
             "resource_mb": snapshot["profile"]["estimated_total_mb"],
             "warnings": warnings,
             "js_syntax_ok": js_syntax_ok,
@@ -87,6 +107,8 @@ def main() -> int:
             and result["app_js_loaded"]
             and result["styles_loaded"]
             and result["ready"]
+            and result["graph_loaded"]
+            and result["namespace_map_loaded"]
             and not warnings
             else 1
         )

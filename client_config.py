@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import re
-import shutil
+import secrets
+import stat
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from redaction import (
+    SecretSafeArgumentParser,
+    redact_capture_text,
+    reject_sensitive_identifier,
+)
 
 
 SERVER_NAME = "synapse-s2"
@@ -32,9 +43,10 @@ def build_server_definition(
     launcher = launcher_path.expanduser()
     agent = _sanitize_agent_id(client_agent_id)
     context = _sanitize_context_id(context_id)
-    prompt = startup_prompt or (
+    raw_prompt = startup_prompt or (
         f"Hydrate SYNAPSE-S2 context for {agent} local MCP client startup."
     )
+    prompt, _ = redact_capture_text(raw_prompt)
     return {
         "type": "stdio",
         "command": str(launcher),
@@ -59,6 +71,7 @@ def build_server_definition(
             "SYNAPSE_S2_CLIENT_SESSION_BRIDGE": "1",
             "SYNAPSE_S2_CLIENT_CORTEX": "1",
             "SYNAPSE_S2_CLIENT_CORTEX_MODE": "strict",
+            "SYNAPSE_S2_CLIENT_STARTUP_RECALL_MODE": "surface",
             "SYNAPSE_S2_CLIENT_SESSION_SOURCE_TAG": "client-session-boundary",
             "SYNAPSE_S2_CLIENT_STARTUP_PROMPT": prompt,
         },
@@ -245,6 +258,7 @@ def _write_json_if_changed(
 
 
 def _write_text_if_changed(path: Path, next_text: str, *, dry_run: bool) -> dict[str, Any]:
+    original_exists = path.exists() or path.is_symlink()
     current = _read_text(path)
     changed = current != next_text
     status = {
@@ -255,14 +269,187 @@ def _write_text_if_changed(path: Path, next_text: str, *, dry_run: bool) -> dict
     }
     if not changed or dry_run:
         return status
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        backup_path = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(path, backup_path)
-        status["backup_path"] = str(backup_path)
-    path.write_text(next_text, encoding="utf-8")
+    _ensure_private_directory(path.parent)
+    with _exclusive_config_lock(path):
+        locked_exists = path.exists() or path.is_symlink()
+        if locked_exists != original_exists or _read_text(path) != current:
+            raise RuntimeError(
+                f"client config changed during update; refusing to overwrite: {path}"
+            )
+        expected_identity: tuple[int, int, int, int, int] | None = None
+        if locked_exists:
+            current_stat = path.lstat()
+            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISREG(current_stat.st_mode):
+                raise OSError(f"refusing to replace non-regular client config: {path}")
+            expected_identity = _file_identity(current_stat)
+            backup_path = _create_exclusive_private_backup(path)
+            status["backup_path"] = str(backup_path)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        temp_path = Path(temp_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(next_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            current_exists = path.exists() or path.is_symlink()
+            if current_exists != original_exists or _read_text(path) != current:
+                raise RuntimeError(
+                    f"client config changed during update; refusing to overwrite: {path}"
+                )
+            if current_exists:
+                before_replace = path.lstat()
+                if (
+                    stat.S_ISLNK(before_replace.st_mode)
+                    or not stat.S_ISREG(before_replace.st_mode)
+                    or _file_identity(before_replace) != expected_identity
+                ):
+                    raise RuntimeError(
+                        f"client config identity changed during update; refusing to overwrite: {path}"
+                    )
+            os.replace(temp_path, path)
+            path.chmod(0o600)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
     status["changed"] = True
     return status
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+@contextmanager
+def _exclusive_config_lock(path: Path):
+    lock_path = path.with_name(f".{path.name}.synapse-config.lock")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"client config lock must be a regular file: {lock_path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _create_exclusive_private_backup(path: Path) -> Path:
+    """Copy an existing regular config without ever replacing an older backup."""
+
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(path, source_flags)
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError(f"refusing to back up non-regular client config: {path}")
+
+        backup_path: Path | None = None
+        backup_fd = -1
+        for _attempt in range(64):
+            candidate = path.with_name(
+                f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(6)}"
+            )
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                backup_fd = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue
+            backup_path = candidate
+            break
+        if backup_path is None or backup_fd < 0:
+            raise FileExistsError(f"could not reserve a unique backup path for {path}")
+
+        completed = False
+        try:
+            os.fchmod(backup_fd, 0o600)
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(backup_fd, view)
+                    if written <= 0:
+                        raise OSError("client config backup write made no progress")
+                    view = view[written:]
+            os.fsync(backup_fd)
+            completed = True
+        finally:
+            os.close(backup_fd)
+            if not completed:
+                try:
+                    backup_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return backup_path
+    finally:
+        os.close(source_fd)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create missing config directories at 0700; preserve existing modes."""
+
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            if not directory.is_dir():
+                raise
 
 
 def _toml_string(value: str) -> str:
@@ -285,17 +472,19 @@ def _remove_toml_sections(text: str, section_names: set[str]) -> str:
 
 
 def _sanitize_agent_id(agent_id: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.:@-]+", "_", str(agent_id or "").strip()).strip("._-:@")
+    raw = reject_sensitive_identifier(agent_id or "", field="client_agent_id")
+    cleaned = re.sub(r"[^A-Za-z0-9_.:@-]+", "_", raw.strip()).strip("._-:@")
     return (cleaned or "local-mcp-client")[:128]
 
 
 def _sanitize_context_id(context_id: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(context_id or "").strip()).strip("._-:")
+    raw = reject_sensitive_identifier(context_id or "", field="context_id")
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "_", raw.strip()).strip("._-:")
     return (cleaned or "default")[:128]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = SecretSafeArgumentParser(
         description="Install SYNAPSE-S2 MCP client configuration for Codex and Claude.",
     )
     parser.add_argument("--home", type=Path, default=Path.home())

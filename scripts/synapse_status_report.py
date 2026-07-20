@@ -5,15 +5,89 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from redaction import (
+    SecretSafeArgumentParser,
+    redact_capture_text,
+    reject_sensitive_identifier,
+)
+
+
 DEFAULT_OUTPUT = ROOT / "docs" / "CURRENT_STATUS.md"
+
+
+def ensure_private_directory(path: Path) -> None:
+    """Create missing private directories without chmodding caller parents."""
+
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            if not directory.is_dir():
+                raise
+
+
+def validate_status_output_path(value: Any) -> Path:
+    raw = reject_sensitive_identifier(value, field="status report output path")
+    if not raw.strip():
+        raise ValueError("status report output path must not be empty")
+    requested = Path(raw).expanduser()
+    canonical = requested.parent.resolve() / requested.name
+    reject_sensitive_identifier(
+        canonical,
+        field="status report output path",
+    )
+    return canonical
+
+
+def write_private_status_report(path: Path, text: str) -> None:
+    ensure_private_directory(path.parent)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        path.chmod(0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 FEATURE_INVENTORY = (
@@ -248,7 +322,7 @@ def collect_live_report(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate docs/CURRENT_STATUS.md from live SYNAPSE-S2 state.")
+    parser = SecretSafeArgumentParser(description="Generate docs/CURRENT_STATUS.md from live SYNAPSE-S2 state.")
     parser.add_argument("--context", default="default")
     parser.add_argument("--agent-id", default="codex-desktop")
     parser.add_argument("--embedding-provider", default="mlx-neural")
@@ -260,11 +334,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    output = validate_status_output_path(args.output)
+    args.context = reject_sensitive_identifier(
+        args.context,
+        field="status report context_id",
+    )
+    args.agent_id = reject_sensitive_identifier(
+        args.agent_id,
+        field="status report agent_id",
+    )
+    args.embedding_provider = reject_sensitive_identifier(
+        args.embedding_provider,
+        field="status report embedding provider",
+    )
     report = collect_live_report(args)
     markdown = render_status_markdown(report)
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(markdown, encoding="utf-8")
+    markdown, _ = redact_capture_text(markdown)
+    write_private_status_report(output, markdown)
     if args.print_report:
         print(markdown)
     else:

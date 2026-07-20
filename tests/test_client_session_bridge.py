@@ -172,6 +172,7 @@ class ClientSessionBridgeTests(unittest.TestCase):
         self.assertTrue(bridge.config.enabled)
         self.assertTrue(bridge.config.cortex_enabled)
         self.assertEqual(bridge.config.cortex_mode, "strict")
+        self.assertEqual(bridge.config.startup_recall_mode, "surface")
         self.assertEqual(bridge.config.agent_id, "codex-desktop")
         self.assertEqual(bridge.config.context_id, "demo")
         self.assertEqual(bridge.config.capture_root, Path("/tmp/synapse-capture"))
@@ -187,6 +188,43 @@ class ClientSessionBridgeTests(unittest.TestCase):
 
         self.assertEqual(bridge.config.event_limit, 20)
         self.assertEqual(bridge.config.graph_limit, 1)
+
+    def test_default_bridge_uses_control_plane_surface_bootstrap(self):
+        with TemporaryDirectory() as tmp:
+            backend = mlx_backend.SpikingAttentionBackend(
+                dimension=32,
+                num_neurons=24,
+                default_top_k=4,
+                recall_count=4,
+                compile_graph=False,
+                state_path=Path(tmp) / "state.json",
+                memory_path=Path(tmp) / "memory.sqlite3",
+                control_plane_only=True,
+            )
+            bridge = ClientSessionBridge(
+                ClientSessionBridgeConfig(
+                    context_id="demo",
+                    agent_id="codex-desktop",
+                    startup_prompt="hydrate local client context",
+                    capture_root=Path(tmp),
+                ),
+                backend=backend,
+            )
+
+            hydration = bridge.start()
+            finished = bridge.finish(reason="unit-test")
+
+            self.assertEqual(hydration["recall_mode"], "surface")
+            self.assertEqual(
+                hydration["recall_provenance"],
+                "sqlite-surface-bootstrap",
+            )
+            self.assertTrue(backend.control_plane_only)
+            self.assertTrue(finished["cortex_queued"])
+            self.assertFalse(finished["cortex_committed"])
+            payload = json.loads(Path(finished["drop_path"]).read_text(encoding="utf-8"))
+            self.assertTrue(payload["metadata"]["cortex_governor"])
+            self.assertEqual(payload["metadata"]["trace_type"], "follow_up")
 
 
 if __name__ == "__main__":

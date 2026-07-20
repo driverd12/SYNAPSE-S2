@@ -17,6 +17,16 @@ from transcript_capture import (
 
 
 class TranscriptCaptureManagerTests(unittest.TestCase):
+    def test_capture_root_rejects_credential_shaped_path(self):
+        with TemporaryDirectory() as tmp:
+            marker = "SYNTHETIC_TRANSCRIPT_ROOT_SECRET_42"
+            unsafe = Path(tmp) / f"password={marker}"
+            with self.assertRaises(ValueError) as raised:
+                TranscriptCaptureManager(root=unsafe)
+
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertFalse(unsafe.exists())
+
     def make_backend(self, tmp: str) -> SpikingAttentionBackend:
         return SpikingAttentionBackend(
             dimension=32,
@@ -57,6 +67,709 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
                     speaker="codex",
                     confirmed=True,
                 )
+
+    def test_file_source_metadata_is_redacted_before_durable_state(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            transcript = Path(tmp) / "ordinary-session.log"
+            transcript.write_text("ordinary transcript\n", encoding="utf-8")
+            marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+
+            manager.register_file_source(
+                source_id="metadata-boundary",
+                path=transcript,
+                context_id="demo",
+                metadata={
+                    "apiKey": marker,
+                    "safe": "preserved",
+                    "input_sha256": "raw-input-equality-oracle",
+                    "nested": {"payload_sha256": "nested-equality-oracle"},
+                    "sha256": "verified-operational-checksum",
+                },
+                confirmed=True,
+            )
+            state_text = manager.paths()["source_state_path"].read_text(
+                encoding="utf-8"
+            )
+            state = json.loads(state_text)
+            metadata = state["sources"]["metadata-boundary"]["metadata"]
+
+        self.assertNotIn(marker, state_text)
+        self.assertEqual(metadata["apiKey"], "[REDACTED_SECRET]")
+        self.assertEqual(metadata["safe"], "preserved")
+        self.assertNotIn("input_sha256", metadata)
+        self.assertNotIn("payload_sha256", metadata["nested"])
+        self.assertEqual(metadata["sha256"], "verified-operational-checksum")
+
+    def test_registered_source_fails_closed_when_ancestor_is_replaced_by_symlink(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            parent = Path(tmp) / "watched"
+            parent.mkdir()
+            transcript = parent / "session.log"
+            transcript.write_text("registered line\n", encoding="utf-8")
+            manager.register_file_source(
+                source_id="ancestor-boundary",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+                start_at_end=True,
+            )
+
+            original_parent = Path(tmp) / "watched-original"
+            parent.rename(original_parent)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            marker = "SYNTHETIC_OUTSIDE_SENTINEL_42"
+            (outside / "session.log").write_text(marker, encoding="utf-8")
+            parent.symlink_to(outside, target_is_directory=True)
+
+            result = manager.poll_sources(source_id="ancestor-boundary")
+            database_text = (Path(tmp) / "memory.sqlite3").read_bytes()
+
+        self.assertEqual(result["captured_source_count"], 0)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertNotIn(marker.encode("utf-8"), database_text)
+
+    def test_credential_shaped_source_path_is_never_persisted_or_echoed(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            marker = "SYNTHETIC_PATH_SECRET_42"
+            parent = Path(tmp) / f"password={marker}"
+            parent.mkdir()
+            transcript = parent / "session.log"
+            transcript.write_text("ordinary line\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError) as raised:
+                manager.register_file_source(
+                    source_id="unsafe-path",
+                    path=transcript,
+                    context_id="demo",
+                    confirmed=True,
+                )
+            durable = "".join(
+                candidate.read_text(encoding="utf-8", errors="replace")
+                for candidate in root.rglob("*")
+                if candidate.is_file()
+            ) if root.exists() else ""
+
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertNotIn(marker, durable)
+
+    def test_legacy_source_with_secret_identity_is_dropped_with_lineage(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            root.mkdir(mode=0o700)
+            marker = "SYNTHETIC_LEGACY_SOURCE_SECRET_42"
+            source_id = "legacy-safe-id"
+            state = {
+                "version": 3,
+                "sources": {
+                    source_id: {
+                        "source_id": source_id,
+                        "path": f"/tmp/password={marker}/session.log",
+                        "context_id": "default",
+                        "source_tag": "transcript-source",
+                        "speaker": "operator",
+                    }
+                },
+            }
+            state_path = root / "transcript_sources.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            lineage_digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:32]
+            lineage_path = (
+                root / "transcript_source_lineages" / f"{lineage_digest}.json"
+            )
+            lineage_path.parent.mkdir(parents=True)
+            lineage_path.write_text(json.dumps({"source_id": source_id}), encoding="utf-8")
+
+            manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            listed = manager.list_sources()
+            rewritten = state_path.read_text(encoding="utf-8")
+            first_migration = state_path.read_bytes()
+            TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            second_migration = state_path.read_bytes()
+            state_mode = state_path.stat().st_mode & 0o777
+            retained_backups = list(root.glob("*.bak"))
+
+        self.assertEqual(listed["source_count"], 0)
+        self.assertNotIn(marker, rewritten)
+        self.assertFalse(lineage_path.exists())
+        self.assertEqual(first_migration, second_migration)
+        self.assertEqual(state_mode, 0o600)
+        self.assertFalse(retained_backups)
+
+    def test_legacy_source_migration_rolls_back_without_retained_raw_backup(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            root.mkdir(mode=0o700)
+            marker = "SYNTHETIC_ROLLBACK_SECRET_42"
+            source_id = "legacy-rollback"
+            state_path = root / "transcript_sources.json"
+            original_state = json.dumps(
+                {
+                    "version": 3,
+                    "sources": {
+                        source_id: {
+                            "source_id": source_id,
+                            "path": f"/tmp/password={marker}/session.log",
+                            "context_id": "default",
+                            "source_tag": "transcript-source",
+                            "speaker": "operator",
+                        }
+                    },
+                }
+            ).encode("utf-8")
+            state_path.write_bytes(original_state)
+            lineage_digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:32]
+            lineage_path = (
+                root / "transcript_source_lineages" / f"{lineage_digest}.json"
+            )
+            lineage_path.parent.mkdir(parents=True)
+            original_lineage = b'{"source_id":"legacy-rollback"}'
+            lineage_path.write_bytes(original_lineage)
+
+            from transcript_capture import _atomic_write_json as real_atomic_write_json
+
+            def write_then_fail(path, payload):
+                real_atomic_write_json(path, payload)
+                raise OSError("injected post-replace migration failure")
+
+            with patch(
+                "transcript_capture._atomic_write_json",
+                side_effect=write_then_fail,
+            ):
+                with self.assertRaisesRegex(OSError, "post-replace"):
+                    TranscriptCaptureManager(
+                        root=root,
+                        backend=self.make_backend(tmp),
+                    )
+
+            restored_state = state_path.read_bytes()
+            restored_lineage = lineage_path.read_bytes()
+            retained_backups = [
+                candidate
+                for candidate in root.rglob("*")
+                if candidate.suffix in {".bak", ".tmp"}
+            ]
+
+        self.assertEqual(restored_state, original_state)
+        self.assertEqual(restored_lineage, original_lineage)
+        self.assertFalse(retained_backups)
+
+    def test_existing_capture_root_permissions_are_not_changed(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "shared-capture-root"
+            root.mkdir(mode=0o755)
+            root.chmod(0o755)
+            manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            transcript = Path(tmp) / "ordinary-session.log"
+            transcript.write_text("ordinary transcript\n", encoding="utf-8")
+            manager.register_file_source(
+                source_id="permission-boundary",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+            )
+            mode = root.stat().st_mode & 0o777
+
+        self.assertEqual(mode, 0o755)
+
+    def test_app_metadata_and_legacy_state_are_redacted_before_echo(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            manager = TranscriptCaptureManager(
+                root=root,
+                backend=self.make_backend(tmp),
+                running_app_provider=lambda: [
+                    {
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "pid": 4242,
+                    }
+                ],
+            )
+            marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
+            attached = manager.connect_running_app(
+                app_name="Codex",
+                bundle_id="com.openai.codex",
+                pid=4242,
+                context_id="demo",
+                metadata={"clientSecret": marker, "safe": "preserved"},
+                confirmed=True,
+            )
+            state_path = manager.paths()["app_state_path"]
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            persisted["connections"][attached["connection_id"]]["metadata"][
+                "authorization"
+            ] = marker
+            persisted["connections"][attached["connection_id"]]["metadata"][
+                "raw_text_sha256"
+            ] = "legacy-raw-equality-oracle"
+            state_path.write_text(json.dumps(persisted), encoding="utf-8")
+
+            migrated_manager = TranscriptCaptureManager(
+                root=root,
+                backend=self.make_backend(tmp),
+                running_app_provider=manager.running_app_provider,
+            )
+            listed = migrated_manager.list_app_connections()
+            scrubbed_text = state_path.read_text(encoding="utf-8")
+            rendered = json.dumps({"attached": attached, "listed": listed})
+            state_mode = state_path.stat().st_mode & 0o777
+            first_migration = state_path.read_bytes()
+            TranscriptCaptureManager(
+                root=root,
+                backend=self.make_backend(tmp),
+                running_app_provider=manager.running_app_provider,
+            )
+            second_migration = state_path.read_bytes()
+
+        self.assertNotIn(marker, rendered)
+        self.assertNotIn(marker, scrubbed_text)
+        metadata = listed["connections"][0]["metadata"]
+        self.assertEqual(metadata["clientSecret"], "[REDACTED_SECRET]")
+        self.assertEqual(metadata["authorization"], "[REDACTED_SECRET]")
+        self.assertEqual(metadata["safe"], "preserved")
+        self.assertNotIn("raw_text_sha256", metadata)
+        self.assertEqual(state_mode, 0o600)
+        self.assertEqual(first_migration, second_migration)
+
+    def test_state_reads_are_side_effect_free_until_explicit_initialization_migration(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            marker = "SYNTHETIC_LEGACY_READ_SECRET_42"
+            source_id = "legacy-read-only"
+            source_state = {
+                "version": 3,
+                "sources": {
+                    source_id: {
+                        "source_id": source_id,
+                        "path": f"/tmp/password={marker}/session.log",
+                        "context_id": "default",
+                        "source_tag": "transcript-source",
+                        "speaker": "operator",
+                        "metadata": {"input_sha256": "legacy-source-oracle"},
+                    }
+                },
+            }
+            source_path = manager.paths()["source_state_path"]
+            source_path.write_text(json.dumps(source_state), encoding="utf-8")
+            lineage_path = manager._source_lineage_path(source_id)
+            lineage_path.parent.mkdir(parents=True, exist_ok=True)
+            lineage_path.write_text("legacy lineage", encoding="utf-8")
+
+            app_id = "app_legacy_read"
+            app_state = {
+                "version": 1,
+                "connections": {
+                    app_id: {
+                        "connection_id": app_id,
+                        "app_name": "Codex",
+                        "bundle_id": "com.openai.codex",
+                        "context_id": "default",
+                        "source_tag": "app-connect",
+                        "speaker": "operator",
+                        "metadata": {
+                            "authorization": marker,
+                            "payload_sha256": "legacy-app-oracle",
+                        },
+                    }
+                },
+            }
+            app_path = manager.paths()["app_state_path"]
+            app_path.write_text(json.dumps(app_state), encoding="utf-8")
+            source_before = source_path.read_bytes()
+            app_before = app_path.read_bytes()
+
+            read_sources = manager._read_state()
+            read_apps = manager._read_app_state()
+
+            source_after = source_path.read_bytes()
+            app_after = app_path.read_bytes()
+            lineage_still_exists = lineage_path.exists()
+
+        self.assertEqual(source_before, source_after)
+        self.assertEqual(app_before, app_after)
+        self.assertTrue(lineage_still_exists)
+        self.assertEqual(read_sources["sources"], {})
+        app_metadata = read_apps["connections"][app_id]["metadata"]
+        self.assertEqual(app_metadata["authorization"], "[REDACTED_SECRET]")
+        self.assertNotIn("payload_sha256", app_metadata)
+
+    def test_state_files_reject_symlink_targets_at_initialization(self):
+        with TemporaryDirectory() as tmp:
+            for state_name in ("transcript_sources.json", "app_connections.json"):
+                with self.subTest(state_name=state_name):
+                    root = Path(tmp) / state_name.replace(".", "-")
+                    root.mkdir()
+                    target = Path(tmp) / f"target-{state_name}"
+                    original = b'{"version": 1, "sentinel": "outside"}'
+                    target.write_bytes(original)
+                    (root / state_name).symlink_to(target)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "regular non-symlink file",
+                    ):
+                        TranscriptCaptureManager(
+                            root=root,
+                            backend=self.make_backend(tmp),
+                        )
+
+                    self.assertEqual(target.read_bytes(), original)
+
+    def test_stale_state_reader_cannot_overwrite_new_registration_or_cursor(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            backend = self.make_backend(tmp)
+            stale_manager = TranscriptCaptureManager(root=root, backend=backend)
+            writer_manager = TranscriptCaptureManager(root=root, backend=backend)
+            transcript = Path(tmp) / "stale-reader.log"
+            transcript.write_text("existing\n", encoding="utf-8")
+            initial = writer_manager.register_file_source(
+                source_id="stale-reader",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+                start_at_end=True,
+            )
+            state_path = writer_manager.paths()["source_state_path"]
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy["sources"]["stale-reader"]["metadata"] = {
+                "input_sha256": "stale-reader-equality-oracle"
+            }
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            snapshot_read = threading.Event()
+            release_reader = threading.Event()
+            original_canonicalize = stale_manager._canonicalize_source_state
+
+            def block_after_stale_read(parsed):
+                canonical = original_canonicalize(parsed)
+                snapshot_read.set()
+                if not release_reader.wait(timeout=5):
+                    raise RuntimeError("test timed out waiting to release stale reader")
+                return canonical
+
+            stale_manager._canonicalize_source_state = block_after_stale_read  # type: ignore[method-assign]
+            reader_result: dict[str, object] = {}
+
+            def run_stale_reader():
+                try:
+                    reader_result["value"] = stale_manager.list_sources()
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    reader_result["error"] = exc
+
+            reader = threading.Thread(target=run_stale_reader, daemon=True)
+            reader.start()
+            self.assertTrue(snapshot_read.wait(timeout=5))
+
+            replacement = writer_manager.register_file_source(
+                source_id="stale-reader",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+            )
+            transcript.write_text("existing\nnew durable delta\n", encoding="utf-8")
+            writer_manager.poll_sources(source_id="stale-reader")
+            committed_before_release = writer_manager.list_sources()["sources"][0]
+
+            release_reader.set()
+            reader.join(timeout=5)
+            self.assertFalse(reader.is_alive())
+            if "error" in reader_result:
+                raise reader_result["error"]  # type: ignore[misc]
+            committed_after_release = writer_manager.list_sources()["sources"][0]
+
+        self.assertNotEqual(initial["source_instance_id"], replacement["source_instance_id"])
+        self.assertEqual(
+            committed_after_release["source_instance_id"],
+            replacement["source_instance_id"],
+        )
+        self.assertEqual(
+            committed_after_release["registration_generation"],
+            replacement["registration_generation"],
+        )
+        self.assertGreater(committed_after_release["cursor"], replacement["cursor"])
+        self.assertEqual(committed_after_release, committed_before_release)
+
+    def test_concurrent_app_connect_commits_do_not_lose_connections(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            backend = self.make_backend(tmp)
+            apps = [
+                {"app_name": "Codex", "bundle_id": "com.openai.codex", "pid": 4242},
+                {"app_name": "Terminal", "bundle_id": "com.apple.Terminal", "pid": 4343},
+            ]
+            first_manager = TranscriptCaptureManager(
+                root=root,
+                backend=backend,
+                running_app_provider=lambda: apps,
+            )
+            second_manager = TranscriptCaptureManager(
+                root=root,
+                backend=backend,
+                running_app_provider=lambda: apps,
+            )
+            first_write_entered = threading.Event()
+            release_first_write = threading.Event()
+            second_call_started = threading.Event()
+            second_read_entered = threading.Event()
+            original_first_write = first_manager._write_app_state
+            original_second_read = second_manager._read_app_state
+
+            def block_first_write(state):
+                first_write_entered.set()
+                if not release_first_write.wait(timeout=5):
+                    raise RuntimeError("test timed out waiting to release app commit")
+                return original_first_write(state)
+
+            def observe_second_read():
+                second_read_entered.set()
+                return original_second_read()
+
+            first_manager._write_app_state = block_first_write  # type: ignore[method-assign]
+            second_manager._read_app_state = observe_second_read  # type: ignore[method-assign]
+            results: dict[str, object] = {}
+
+            def connect(manager, key, app_name, bundle_id, pid):
+                try:
+                    if key == "second":
+                        second_call_started.set()
+                    results[key] = manager.connect_running_app(
+                        app_name=app_name,
+                        bundle_id=bundle_id,
+                        pid=pid,
+                        confirmed=True,
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    results[f"{key}_error"] = exc
+
+            first = threading.Thread(
+                target=connect,
+                args=(first_manager, "first", "Codex", "com.openai.codex", 4242),
+                daemon=True,
+            )
+            second = threading.Thread(
+                target=connect,
+                args=(second_manager, "second", "Terminal", "com.apple.Terminal", 4343),
+                daemon=True,
+            )
+            first.start()
+            self.assertTrue(first_write_entered.wait(timeout=5))
+            second.start()
+            try:
+                self.assertTrue(second_call_started.wait(timeout=5))
+                self.assertFalse(second_read_entered.wait(timeout=0.1))
+            finally:
+                release_first_write.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            for key in ("first_error", "second_error"):
+                if key in results:
+                    raise results[key]  # type: ignore[misc]
+            listed = first_manager.list_app_connections()
+
+        self.assertEqual(listed["connection_count"], 2)
+        self.assertEqual(
+            {item["app_name"] for item in listed["connections"]},
+            {"Codex", "Terminal"},
+        )
+
+    def test_secret_shaped_app_identifiers_are_skipped_and_rejected(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            marker = "SYNTHETIC_APP_SECRET_42"
+            manager = TranscriptCaptureManager(
+                root=root,
+                backend=self.make_backend(tmp),
+                running_app_provider=lambda: [
+                    {
+                        "app_name": f"password={marker}",
+                        "bundle_id": "com.example.safe",
+                        "pid": 4242,
+                    }
+                ],
+            )
+
+            detected = manager.detect_running_apps()
+            with self.assertRaises(ValueError) as raised:
+                manager.connect_running_app(
+                    app_name=f"password={marker}",
+                    bundle_id="com.example.safe",
+                    pid=4242,
+                    confirmed=True,
+                    allow_manual=True,
+                )
+            durable = "".join(
+                candidate.read_text(encoding="utf-8", errors="replace")
+                for candidate in root.rglob("*")
+                if candidate.is_file()
+            ) if root.exists() else ""
+
+        self.assertEqual(detected["app_count"], 0)
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertNotIn(marker, durable)
+
+    def test_file_tail_source_rejects_common_credential_store_paths(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            sensitive_paths = [
+                Path(tmp) / ".docker" / "config.json",
+                Path(tmp) / ".kube" / "audit.log",
+                Path(tmp) / ".config" / "gcloud" / "application_default_credentials.json",
+                Path(tmp) / ".azure" / "accessTokens.json",
+                Path(tmp) / ".aws" / "operator.log",
+            ]
+            for path in sensitive_paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("synthetic credential-store sentinel\n", encoding="utf-8")
+
+            for index, path in enumerate(sensitive_paths):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(ValueError, "sensitive-looking path"):
+                        manager.register_file_source(
+                            source_id=f"sensitive-store-{index}",
+                            path=path,
+                            context_id="demo",
+                            confirmed=True,
+                        )
+
+            ordinary = Path(tmp) / "cloud-platform-notes" / "aws-azure-gcloud.log"
+            ordinary.parent.mkdir()
+            ordinary.write_text("ordinary transcript\n", encoding="utf-8")
+            registered = manager.register_file_source(
+                source_id="ordinary-cloud-notes",
+                path=ordinary,
+                context_id="demo",
+                confirmed=True,
+            )
+
+        self.assertEqual(registered["path"], str(ordinary.resolve()))
+
+    def test_file_tail_poll_rejects_source_replaced_by_symlink(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(root=root, backend=backend)
+            transcript = Path(tmp) / "registered.log"
+            transcript.write_text("existing\n", encoding="utf-8")
+            registered = manager.register_file_source(
+                source_id="symlink-swap",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+                start_at_end=True,
+            )
+            replacement = Path(tmp) / "replacement.log"
+            replacement.write_text("synthetic replacement sentinel\n", encoding="utf-8")
+            transcript.unlink()
+            transcript.symlink_to(replacement)
+
+            result = manager.poll_sources(source_id="symlink-swap")
+            saved = manager.list_sources()["sources"][0]
+
+        self.assertEqual(result["captured_source_count"], 0)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(saved["cursor"], registered["cursor"])
+
+    def test_file_tail_poll_rejects_file_changed_between_validation_and_open(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(root=root, backend=backend)
+            transcript = Path(tmp) / "racing.log"
+            transcript.write_text("existing\n", encoding="utf-8")
+            registered = manager.register_file_source(
+                source_id="racing-source",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+                start_at_end=True,
+            )
+            transcript.write_text("existing\nlegitimate delta\n", encoding="utf-8")
+            canonical_transcript = transcript.resolve()
+            replacement = Path(tmp) / "racing-replacement.log"
+            replacement.write_text("synthetic replacement sentinel\n", encoding="utf-8")
+            real_open = os.open
+            swapped = False
+            source_open_flags = 0
+
+            def swap_then_open(path, flags, *args, **kwargs):
+                nonlocal source_open_flags, swapped
+                if (
+                    not swapped
+                    and str(path) == canonical_transcript.name
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    source_open_flags = int(flags)
+                    replacement.replace(transcript)
+                    swapped = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch("transcript_capture.os.open", side_effect=swap_then_open):
+                result = manager.poll_sources(source_id="racing-source")
+            saved = manager.list_sources()["sources"][0]
+
+        self.assertTrue(swapped)
+        if hasattr(os, "O_NOFOLLOW"):
+            self.assertTrue(source_open_flags & os.O_NOFOLLOW)
+        self.assertEqual(result["captured_source_count"], 0)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(saved["cursor"], registered["cursor"])
+
+    def test_file_tail_poll_rejects_size_change_between_validation_and_open(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(root=root, backend=backend)
+            transcript = Path(tmp) / "growing-race.log"
+            transcript.write_text("existing\n", encoding="utf-8")
+            registered = manager.register_file_source(
+                source_id="growing-race",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+                start_at_end=True,
+            )
+            transcript.write_text("existing\nfirst delta\n", encoding="utf-8")
+            canonical_transcript = transcript.resolve()
+            original_inode = transcript.stat().st_ino
+            real_open = os.open
+            changed = False
+
+            def grow_then_open(path, flags, *args, **kwargs):
+                nonlocal changed
+                if (
+                    not changed
+                    and str(path) == canonical_transcript.name
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    transcript.write_text(
+                        "existing\nfirst delta\nsecond racing delta\n",
+                        encoding="utf-8",
+                    )
+                    changed = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch("transcript_capture.os.open", side_effect=grow_then_open):
+                result = manager.poll_sources(source_id="growing-race")
+            saved = manager.list_sources()["sources"][0]
+            after_inode = transcript.stat().st_ino
+
+        self.assertTrue(changed)
+        self.assertEqual(after_inode, original_inode)
+        self.assertEqual(result["captured_source_count"], 0)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(saved["cursor"], registered["cursor"])
 
     def test_file_tail_source_captures_only_new_redacted_transcript_delta(self):
         with TemporaryDirectory() as tmp:
@@ -187,6 +900,126 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
             len(after_replay["relationships"]),
             len(after_lost_response["relationships"]),
         )
+
+    def test_fresh_manager_repairs_crash_after_aggregate_before_lineage_commit(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(root=root, backend=backend)
+            transcript = Path(tmp) / "lineage-crash.log"
+            transcript.write_text("existing\n", encoding="utf-8")
+            initial = manager.register_file_source(
+                source_id="lineage-crash",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+                start_at_end=True,
+            )
+            original_persist = manager._persist_source_lineage
+
+            def fail_after_aggregate(_source):
+                raise OSError("injected crash after aggregate commit")
+
+            manager._persist_source_lineage = fail_after_aggregate  # type: ignore[method-assign]
+            with self.assertRaisesRegex(OSError, "after aggregate"):
+                manager.register_file_source(
+                    source_id="lineage-crash",
+                    path=transcript,
+                    context_id="demo",
+                    confirmed=True,
+                )
+            manager._persist_source_lineage = original_persist  # type: ignore[method-assign]
+
+            committed_state = json.loads(
+                manager.paths()["source_state_path"].read_text(encoding="utf-8")
+            )["sources"]["lineage-crash"]
+            stale_lineage = json.loads(
+                manager._source_lineage_path("lineage-crash").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertNotEqual(
+                committed_state["source_instance_id"],
+                stale_lineage["source_instance_id"],
+            )
+
+            repaired_manager = TranscriptCaptureManager(root=root, backend=backend)
+            repaired_lineage = json.loads(
+                repaired_manager._source_lineage_path("lineage-crash").read_text(
+                    encoding="utf-8"
+                )
+            )
+            repaired_lineage_mode = (
+                repaired_manager._source_lineage_path("lineage-crash").stat().st_mode
+                & 0o777
+            )
+            transcript.write_text("existing\nresumed after repair\n", encoding="utf-8")
+            resumed = repaired_manager.poll_sources(source_id="lineage-crash")
+            final_source = repaired_manager.list_sources()["sources"][0]
+            final_lineage = json.loads(
+                repaired_manager._source_lineage_path("lineage-crash").read_text(
+                    encoding="utf-8"
+                )
+            )
+            repaired_state_mode = (
+                repaired_manager.paths()["source_state_path"].stat().st_mode & 0o777
+            )
+
+        self.assertNotEqual(
+            initial["source_instance_id"],
+            committed_state["source_instance_id"],
+        )
+        self.assertEqual(
+            repaired_lineage["source_instance_id"],
+            committed_state["source_instance_id"],
+        )
+        self.assertEqual(
+            repaired_lineage["registration_generation"],
+            committed_state["registration_generation"],
+        )
+        self.assertEqual(resumed["captured_source_count"], 1)
+        self.assertEqual(
+            final_lineage["source_instance_id"],
+            final_source["source_instance_id"],
+        )
+        self.assertEqual(final_lineage["cursor"], final_source["cursor"])
+        self.assertEqual(final_lineage["stream_generation"], final_source["stream_generation"])
+        self.assertEqual(repaired_state_mode, 0o600)
+        self.assertEqual(repaired_lineage_mode, 0o600)
+
+    def test_initialization_privately_scrubs_legacy_lineage_raw_digests(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture-root"
+            backend = self.make_backend(tmp)
+            manager = TranscriptCaptureManager(root=root, backend=backend)
+            transcript = Path(tmp) / "legacy-lineage.log"
+            transcript.write_text("existing\n", encoding="utf-8")
+            registered = manager.register_file_source(
+                source_id="legacy-lineage",
+                path=transcript,
+                context_id="demo",
+                confirmed=True,
+                start_at_end=True,
+            )
+            lineage_path = manager._source_lineage_path("legacy-lineage")
+            legacy_lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+            legacy_lineage["input_sha256"] = "legacy-lineage-equality-oracle"
+            lineage_path.write_text(json.dumps(legacy_lineage), encoding="utf-8")
+            lineage_path.chmod(0o644)
+
+            repaired_manager = TranscriptCaptureManager(root=root, backend=backend)
+            repaired_text = lineage_path.read_text(encoding="utf-8")
+            repaired_source = repaired_manager.list_sources()["sources"][0]
+            repaired_mode = lineage_path.stat().st_mode & 0o777
+
+        self.assertNotIn("input_sha256", repaired_text)
+        self.assertNotIn("legacy-lineage-equality-oracle", repaired_text)
+        self.assertEqual(repaired_mode, 0o600)
+        self.assertEqual(
+            repaired_source["source_instance_id"],
+            registered["source_instance_id"],
+        )
+        self.assertEqual(repaired_source["cursor"], registered["cursor"])
 
     def test_file_tail_rotation_advances_stream_generation(self):
         with TemporaryDirectory() as tmp:
