@@ -484,6 +484,11 @@ class OperatorReadinessCertifier:
             },
             "launcher": str(self.launcher),
             "embedding_provider": self.args.embedding_provider,
+            "topology": {
+                "dimension": int(self.args.dimension),
+                "neurons": int(self.args.neurons),
+                "top_k": int(self.args.top_k),
+            },
             "neural_model": self.args.neural_model,
             "neural_local_files_only": bool(self.args.neural_local_files_only),
             "memory_db": str((ROOT / ".synapse_s2" / "memory.sqlite3").resolve()),
@@ -511,9 +516,9 @@ class OperatorReadinessCertifier:
         env = dict(os.environ)
         env.setdefault("MLX_DEVICE", "gpu")
         env["SYNAPSE_S2_EMBEDDING_PROVIDER"] = str(self.args.embedding_provider)
-        env.setdefault("SYNAPSE_S2_DIMENSION", "1024")
-        env.setdefault("SYNAPSE_S2_NEURONS", "8192")
-        env.setdefault("SYNAPSE_S2_TOP_K", "256")
+        env["SYNAPSE_S2_DIMENSION"] = str(self.args.dimension)
+        env["SYNAPSE_S2_NEURONS"] = str(self.args.neurons)
+        env["SYNAPSE_S2_TOP_K"] = str(self.args.top_k)
         env.setdefault("SYNAPSE_S2_RECALL_COUNT", "10")
         env.setdefault("SYNAPSE_S2_STATE_PATH", str(ROOT / ".synapse_s2" / "runtime_state.json"))
         env.setdefault("SYNAPSE_S2_MEMORY_DB", str(ROOT / ".synapse_s2" / "memory.sqlite3"))
@@ -534,6 +539,12 @@ class OperatorReadinessCertifier:
             "--json",
             "--embedding-provider",
             str(self.args.embedding_provider),
+            "--dimension",
+            str(self.args.dimension),
+            "--neurons",
+            str(self.args.neurons),
+            "--top-k",
+            str(self.args.top_k),
             *parts,
         ]
 
@@ -1458,6 +1469,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=str(ROOT / ".synapse_s2" / "evidence_packs"))
     parser.add_argument("--launcher", default=str(DEFAULT_LAUNCHER))
     parser.add_argument("--embedding-provider", default="mlx-neural")
+    parser.add_argument("--dimension", type=int, default=1024)
+    parser.add_argument("--neurons", type=int, default=8192)
+    parser.add_argument("--top-k", type=int, default=256)
     parser.add_argument("--neural-model", default=DEFAULT_NEURAL_MODEL)
     parser.add_argument("--neural-cache-dir", default=str(ROOT / ".synapse_s2" / "models"))
     parser.add_argument("--neural-local-files-only", action=argparse.BooleanOptionalAction, default=True)

@@ -32,6 +32,9 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             "output_dir": str(default_output_dir),
             "launcher": str(default_output_dir / "synapse-s2-mcp"),
             "embedding_provider": "semantic-hash",
+            "dimension": 1024,
+            "neurons": 8192,
+            "top_k": 256,
             "neural_model": "safe-local-model",
             "neural_cache_dir": str(default_output_dir / "models"),
             "neural_local_files_only": True,
@@ -41,6 +44,27 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         }
         values.update(overrides)
         return argparse.Namespace(**values)
+
+    def test_cli_commands_are_bound_to_certified_topology(self):
+        with TemporaryDirectory() as tmp:
+            certifier = OperatorReadinessCertifier(
+                self._args(
+                    Path(tmp),
+                    dimension=768,
+                    neurons=6800,
+                    top_k=192,
+                )
+            )
+
+            command = certifier._cli_command("doctor", "--context", "default")
+            env = certifier._base_env()
+
+        self.assertEqual(command[command.index("--dimension") + 1], "768")
+        self.assertEqual(command[command.index("--neurons") + 1], "6800")
+        self.assertEqual(command[command.index("--top-k") + 1], "192")
+        self.assertEqual(env["SYNAPSE_S2_DIMENSION"], "768")
+        self.assertEqual(env["SYNAPSE_S2_NEURONS"], "6800")
+        self.assertEqual(env["SYNAPSE_S2_TOP_K"], "192")
 
     def test_private_evidence_writer_preserves_existing_parent_mode(self):
         with TemporaryDirectory() as tmp:
