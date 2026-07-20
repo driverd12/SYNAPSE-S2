@@ -1811,6 +1811,7 @@ name = "synapse-s2"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "fastmcp" },
     { name = "huggingface-hub" },
     { name = "mlx" },
@@ -1824,6 +1825,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=49.0.0" },
     { name = "fastmcp", specifier = ">=2.0.0" },
     { name = "huggingface-hub", specifier = ">=1.21.0" },
     { name = "mlx", specifier = ">=0.25.0" },

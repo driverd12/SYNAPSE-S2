@@ -8,12 +8,108 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from scripts import operator_readiness_certify as readiness
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class OperationalScriptTests(unittest.TestCase):
+    @staticmethod
+    def _capture_ledger_binding(*, revision: str = "a" * 64) -> dict:
+        return {
+            "schema": "synapse-s2.capture-ledger-binding-proof.v1",
+            "verified": True,
+            "verified_capture_count": 7,
+            "revision": revision,
+        }
+
+    def _run_recovery_readiness_scenario(
+        self,
+        *,
+        backup_binding: object,
+        verify_binding: object,
+        restore_binding: object,
+    ) -> tuple[dict[str, readiness.CheckResult], list[str]]:
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        temp_root = Path(temporary.name)
+        certifier = object.__new__(readiness.OperatorReadinessCertifier)
+        certifier.results = []
+        certifier.run_id = "capture-ledger-binding-test"
+        certifier.artifact_dir = temp_root / "artifacts"
+        certifier.artifact_dir.mkdir(mode=0o700)
+        certifier._cli_command = lambda *parts: list(parts)
+
+        valid_audit = {
+            "action": "capture-ledger-audit",
+            "status": "ready",
+            "verification_passed": True,
+            "audit_revision": "f" * 64,
+            "processed_v2_capture_count": 7,
+            "ledger_capture_count": 7,
+            "missing_authoritative_ledger_count": 0,
+            "ledger_binding_mismatch_count": 0,
+            "blocked_capture_count": 0,
+        }
+        payloads = {
+            "capture_ledger_audit": valid_audit,
+            "recovery_backup": {
+                "bundle_verified": True,
+                "cutover_ready": True,
+                "bundle_receipt_path": str(temp_root / "bundle.receipt.json"),
+                "capture_ledger_binding": backup_binding,
+            },
+            "recovery_verify": {
+                "verified": True,
+                "cutover_ready": True,
+                "capture_ledger_binding": verify_binding,
+            },
+            "recovery_restore": {
+                "verified": True,
+                "cutover_ready": True,
+                "capture_ledger_binding": restore_binding,
+                "recovery_proof_path": str(temp_root / "missing-proof.json"),
+            },
+        }
+        executed: list[str] = []
+
+        def run_command(
+            check_id: str,
+            *,
+            label: str,
+            command: list[str],
+            required: bool,
+            timeout: float,
+            evaluator,
+            env=None,
+        ) -> readiness.CheckResult:
+            del timeout, env
+            executed.append(check_id)
+            parsed = payloads[check_id]
+            status, detail, repair, metrics = evaluator(0, parsed, "", "")
+            result = readiness.CheckResult(
+                check_id=check_id,
+                label=label,
+                status=status,
+                required=required,
+                detail=detail,
+                repair=repair,
+                command=command,
+                returncode=0,
+                parsed=parsed,
+                metrics=metrics,
+            )
+            certifier.results.append(result)
+            return result
+
+        certifier._run_command = run_command
+        with patch.object(readiness, "ROOT", temp_root):
+            certifier._check_recovery()
+        return {result.check_id: result for result in certifier.results}, executed
+
     def _run_launch_agent_installer(
         self,
         script_name: str,
@@ -525,11 +621,134 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             "app_preview",
             "wrap_session",
             "dashboard",
+            "recovery_backup",
+            "recovery_verify",
+            "recovery_restore",
             "evidence_packs",
         ):
             self.assertIn(token, script)
         self.assertIn("mlx-neural", script)
         self.assertIn("writes_memory=false", script)
+
+    def test_readiness_recovery_rejects_missing_or_malformed_binding_at_every_stage(self):
+        valid = self._capture_ledger_binding()
+        invalid_proofs = {
+            "missing": None,
+            "malformed": {
+                **valid,
+                "revision": "not-a-canonical-revision",
+            },
+        }
+
+        for stage in ("backup", "verify", "restore"):
+            for proof_name, invalid in invalid_proofs.items():
+                with self.subTest(stage=stage, proof=proof_name):
+                    bindings = {
+                        "backup": valid,
+                        "verify": valid,
+                        "restore": valid,
+                    }
+                    bindings[stage] = invalid
+                    results, executed = self._run_recovery_readiness_scenario(
+                        backup_binding=bindings["backup"],
+                        verify_binding=bindings["verify"],
+                        restore_binding=bindings["restore"],
+                    )
+
+                    self.assertEqual(results[f"recovery_{stage}"].status, "blocked")
+                    self.assertNotEqual(
+                        results[f"recovery_{stage}"].metrics.get(
+                            "capture_ledger_binding"
+                        ),
+                        valid,
+                    )
+                    if stage == "backup":
+                        self.assertEqual(
+                            executed,
+                            ["capture_ledger_audit", "recovery_backup"],
+                        )
+                        self.assertEqual(results["recovery_verify"].status, "blocked")
+                        self.assertEqual(results["recovery_restore"].status, "blocked")
+                    elif stage == "verify":
+                        self.assertEqual(
+                            executed,
+                            [
+                                "capture_ledger_audit",
+                                "recovery_backup",
+                                "recovery_verify",
+                            ],
+                        )
+                        self.assertEqual(results["recovery_restore"].status, "blocked")
+                    else:
+                        self.assertEqual(
+                            executed,
+                            [
+                                "capture_ledger_audit",
+                                "recovery_backup",
+                                "recovery_verify",
+                                "recovery_restore",
+                            ],
+                        )
+
+    def test_readiness_recovery_rejects_binding_drift_between_stages(self):
+        original = self._capture_ledger_binding(revision="a" * 64)
+        changed = self._capture_ledger_binding(revision="b" * 64)
+
+        for changed_stage in ("verify", "restore"):
+            with self.subTest(changed_stage=changed_stage):
+                results, executed = self._run_recovery_readiness_scenario(
+                    backup_binding=original,
+                    verify_binding=(changed if changed_stage == "verify" else original),
+                    restore_binding=(changed if changed_stage == "restore" else original),
+                )
+
+                self.assertEqual(
+                    results[f"recovery_{changed_stage}"].status,
+                    "blocked",
+                )
+                self.assertEqual(
+                    results[f"recovery_{changed_stage}"].metrics[
+                        "capture_ledger_binding"
+                    ],
+                    changed,
+                )
+                if changed_stage == "verify":
+                    self.assertNotIn("recovery_restore", executed)
+                    self.assertEqual(results["recovery_restore"].status, "blocked")
+                else:
+                    self.assertEqual(results["recovery_verify"].status, "ready")
+                    self.assertIn("recovery_restore", executed)
+
+    def test_readiness_recovery_accepts_stable_valid_binding_across_stages(self):
+        binding = self._capture_ledger_binding()
+
+        results, executed = self._run_recovery_readiness_scenario(
+            backup_binding=binding,
+            verify_binding=dict(binding),
+            restore_binding=dict(binding),
+        )
+
+        self.assertEqual(
+            executed,
+            [
+                "capture_ledger_audit",
+                "recovery_backup",
+                "recovery_verify",
+                "recovery_restore",
+            ],
+        )
+        for check_id in (
+            "capture_ledger_audit",
+            "recovery_backup",
+            "recovery_verify",
+            "recovery_restore",
+        ):
+            self.assertEqual(results[check_id].status, "ready", check_id)
+        for check_id in ("recovery_backup", "recovery_verify", "recovery_restore"):
+            self.assertEqual(
+                results[check_id].metrics["capture_ledger_binding"],
+                binding,
+            )
 
 
 if __name__ == "__main__":

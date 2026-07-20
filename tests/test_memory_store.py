@@ -12,6 +12,7 @@ from memory_store import (
     LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS,
     LEGACY_SECRET_CONTENT_COLUMNS,
     LEGACY_SECRET_IDENTIFIER_COLUMNS,
+    SQLITE_APPLICATION_ID,
     DurableMemoryStore,
 )
 
@@ -1693,6 +1694,52 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 conn.commit()
             with self.assertRaisesRegex(RuntimeError, "schema validation"):
                 DurableMemoryStore(db_path)
+
+    def test_failed_startup_integrity_does_not_publish_schema_markers(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            plan = self._capture_plan(store)
+            store.commit_capture_plan(**plan)
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("UPDATE capture_operations SET result_json = '{}'")
+                conn.execute("PRAGMA application_id = 0")
+                conn.execute("PRAGMA user_version = 1")
+                conn.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "integrity validation"):
+                DurableMemoryStore(db_path)
+
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+                self.assertEqual(
+                    (
+                        int(conn.execute("PRAGMA application_id").fetchone()[0]),
+                        int(conn.execute("PRAGMA user_version").fetchone()[0]),
+                    ),
+                    (0, 1),
+                )
+
+    def test_foreign_application_id_is_rejected_without_mutation(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            DurableMemoryStore(db_path)
+            foreign_application_id = SQLITE_APPLICATION_ID ^ 1
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(f"PRAGMA application_id = {foreign_application_id}")
+                conn.execute("PRAGMA user_version = 1")
+                conn.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "application_id"):
+                DurableMemoryStore(db_path)
+
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+                self.assertEqual(
+                    (
+                        int(conn.execute("PRAGMA application_id").fetchone()[0]),
+                        int(conn.execute("PRAGMA user_version").fetchone()[0]),
+                    ),
+                    (foreign_application_id, 1),
+                )
 
     def test_secret_content_migration_scrubs_legacy_rows_and_reads_fail_safe(self):
         marker = "SYNTHETIC_ONLY_LEGACY_DB_SECRET_42"

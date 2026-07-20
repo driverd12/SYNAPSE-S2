@@ -21,7 +21,12 @@ from typing import Any
 
 from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
 from event_segmenter import BayesianSurpriseEventSegmenter
-from memory_store import CAPTURE_ID_RE, CAPTURE_PROTOCOL_VERSION, DurableMemoryStore
+from memory_store import (
+    CAPTURE_ID_RE,
+    CAPTURE_PROTOCOL_VERSION,
+    DurableMemoryStore,
+    capture_request_fingerprint,
+)
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
     SecretRedactingFormatter,
@@ -4737,23 +4742,15 @@ class SpikingAttentionBackend:
         min_segment_sentences: int,
         metadata: dict[str, Any],
     ) -> str:
-        request = {
-            "protocol": CAPTURE_PROTOCOL_VERSION,
-            "text": str(text),
-            "context_id": str(context_id),
-            "source_tag": str(source_tag),
-            "speaker": str(speaker),
-            "surprise_threshold": float(surprise_threshold),
-            "min_segment_sentences": int(min_segment_sentences),
-            "metadata": metadata,
-        }
-        canonical = json.dumps(
-            request,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
+        return capture_request_fingerprint(
+            text=text,
+            context_id=context_id,
+            source_tag=source_tag,
+            speaker=speaker,
+            surprise_threshold=surprise_threshold,
+            min_segment_sentences=min_segment_sentences,
+            metadata=metadata,
         )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def _capture_operation_matches(
         self,
@@ -7364,6 +7361,156 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         return self.memory_store.backup(path)
 
+    def backup_recovery_bundle(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        capture_root: str | os.PathLike[str] | None = None,
+        purpose: str = "operator",
+        pinned: bool = False,
+        allow_noncanonical_capture_root: bool = False,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            capture_root=capture_root,
+            allow_noncanonical_capture_root=allow_noncanonical_capture_root,
+        ).create_bundle(path, purpose=purpose, pinned=pinned)
+
+    def audit_capture_ledger(
+        self,
+        *,
+        capture_root: str | os.PathLike[str] | None = None,
+        sample_limit: int = 20,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        authoritative_capture_root = (
+            self.memory_store.db_path.parent
+            if capture_root is None
+            else capture_root
+        )
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            capture_root=authoritative_capture_root,
+        ).audit_capture_ledger(sample_limit=sample_limit)
+
+    def repair_capture_ledger(
+        self,
+        *,
+        capture_root: str | os.PathLike[str] | None = None,
+        confirm: bool = False,
+        expected_revision: str | None = None,
+        sample_limit: int = 20,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        authoritative_capture_root = (
+            self.memory_store.db_path.parent
+            if capture_root is None
+            else capture_root
+        )
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            capture_root=authoritative_capture_root,
+        ).repair_capture_ledger(
+            confirm=confirm,
+            expected_revision=expected_revision,
+            sample_limit=sample_limit,
+        )
+
+    def verify_recovery_bundle(
+        self,
+        receipt_path: str | os.PathLike[str],
+        *,
+        capture_root: str | os.PathLike[str] | None = None,
+        expected_database_sha256: str | None = None,
+        expected_capture_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            capture_root=capture_root,
+        ).verify_bundle(
+            receipt_path,
+            expected_database_sha256=expected_database_sha256,
+            expected_capture_sha256=expected_capture_sha256,
+        )
+
+    def restore_recovery_bundle_isolated(
+        self,
+        receipt_path: str | os.PathLike[str],
+        output_root: str | os.PathLike[str],
+        *,
+        capture_root: str | os.PathLike[str] | None = None,
+        expected_database_sha256: str | None = None,
+        expected_capture_sha256: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            capture_root=capture_root,
+        ).restore_bundle_isolated(
+            receipt_path,
+            output_root,
+            expected_database_sha256=expected_database_sha256,
+            expected_capture_sha256=expected_capture_sha256,
+            confirm=confirm,
+        )
+
+    def plan_recovery_retention(
+        self,
+        *,
+        directory: str | os.PathLike[str] | None = None,
+        keep_latest: int = 7,
+        max_age_days: float = 30.0,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        return VerifiedRecoveryManager(self.memory_store).plan_retention(
+            directory,
+            keep_latest=keep_latest,
+            max_age_days=max_age_days,
+        )
+
+    def apply_recovery_retention(
+        self,
+        *,
+        plan_token: str,
+        cutoff_created_at: float,
+        directory: str | os.PathLike[str] | None = None,
+        keep_latest: int = 7,
+        max_age_days: float = 30.0,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        return VerifiedRecoveryManager(self.memory_store).apply_retention(
+            plan_token=plan_token,
+            cutoff_created_at=cutoff_created_at,
+            directory=directory,
+            keep_latest=keep_latest,
+            max_age_days=max_age_days,
+            confirm=confirm,
+        )
+
+    def restore_retired_recovery(
+        self,
+        *,
+        plan_token: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        from recovery_manager import VerifiedRecoveryManager
+
+        return VerifiedRecoveryManager(self.memory_store).restore_retired(
+            plan_token=plan_token,
+            confirm=confirm,
+        )
+
     def _mark_activity(self) -> None:
         self.last_activity_monotonic = time.monotonic()
 
@@ -8330,6 +8477,126 @@ def export_memory(
 
 def backup_memory(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     return get_backend().backup_memory(path=path)
+
+
+def backup_recovery_bundle(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    capture_root: str | os.PathLike[str] | None = None,
+    purpose: str = "operator",
+    pinned: bool = False,
+    allow_noncanonical_capture_root: bool = False,
+) -> dict[str, Any]:
+    return get_backend().backup_recovery_bundle(
+        path=path,
+        capture_root=capture_root,
+        purpose=purpose,
+        pinned=pinned,
+        allow_noncanonical_capture_root=allow_noncanonical_capture_root,
+    )
+
+
+def audit_capture_ledger(
+    *,
+    capture_root: str | os.PathLike[str] | None = None,
+    sample_limit: int = 20,
+) -> dict[str, Any]:
+    return get_control_plane_backend().audit_capture_ledger(
+        capture_root=capture_root,
+        sample_limit=sample_limit,
+    )
+
+
+def repair_capture_ledger(
+    *,
+    capture_root: str | os.PathLike[str] | None = None,
+    confirm: bool = False,
+    expected_revision: str | None = None,
+    sample_limit: int = 20,
+) -> dict[str, Any]:
+    return get_control_plane_backend().repair_capture_ledger(
+        capture_root=capture_root,
+        confirm=confirm,
+        expected_revision=expected_revision,
+        sample_limit=sample_limit,
+    )
+
+
+def verify_recovery_bundle(
+    receipt_path: str | os.PathLike[str],
+    *,
+    capture_root: str | os.PathLike[str] | None = None,
+    expected_database_sha256: str | None = None,
+    expected_capture_sha256: str | None = None,
+) -> dict[str, Any]:
+    return get_backend().verify_recovery_bundle(
+        receipt_path,
+        capture_root=capture_root,
+        expected_database_sha256=expected_database_sha256,
+        expected_capture_sha256=expected_capture_sha256,
+    )
+
+
+def restore_recovery_bundle_isolated(
+    receipt_path: str | os.PathLike[str],
+    output_root: str | os.PathLike[str],
+    *,
+    capture_root: str | os.PathLike[str] | None = None,
+    expected_database_sha256: str | None = None,
+    expected_capture_sha256: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return get_backend().restore_recovery_bundle_isolated(
+        receipt_path,
+        output_root,
+        capture_root=capture_root,
+        expected_database_sha256=expected_database_sha256,
+        expected_capture_sha256=expected_capture_sha256,
+        confirm=confirm,
+    )
+
+
+def plan_recovery_retention(
+    *,
+    directory: str | os.PathLike[str] | None = None,
+    keep_latest: int = 7,
+    max_age_days: float = 30.0,
+) -> dict[str, Any]:
+    return get_backend().plan_recovery_retention(
+        directory=directory,
+        keep_latest=keep_latest,
+        max_age_days=max_age_days,
+    )
+
+
+def apply_recovery_retention(
+    *,
+    plan_token: str,
+    cutoff_created_at: float,
+    directory: str | os.PathLike[str] | None = None,
+    keep_latest: int = 7,
+    max_age_days: float = 30.0,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return get_backend().apply_recovery_retention(
+        plan_token=plan_token,
+        cutoff_created_at=cutoff_created_at,
+        directory=directory,
+        keep_latest=keep_latest,
+        max_age_days=max_age_days,
+        confirm=confirm,
+    )
+
+
+def restore_retired_recovery(
+    *,
+    plan_token: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return get_backend().restore_retired_recovery(
+        plan_token=plan_token,
+        confirm=confirm,
+    )
 
 
 def run_quick_pruning() -> dict[str, Any]:

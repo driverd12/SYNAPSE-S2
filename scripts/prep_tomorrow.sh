@@ -283,9 +283,12 @@ echo "=== proposal lifecycle smoke ==="
 .venv/bin/python synapse_cli.py --json quick-prune
 .venv/bin/python synapse_cli.py --json idle-maintenance --force-deep-sleep
 
-echo "=== backup durable memory ==="
-.venv/bin/python synapse_cli.py --json backup-memory \
-  --output "$SYNAPSE_S2_EXPORT_DIR/preflight-memory-$STAMP.sqlite3"
+echo "=== create verified paired recovery point ==="
+.venv/bin/python synapse_cli.py --json backup-recovery \
+  --output "$SYNAPSE_S2_EXPORT_DIR/preflight-recovery-$STAMP.sqlite3" \
+  --capture-root "$SYNAPSE_S2_CAPTURE_ROOT" \
+  --purpose preflight \
+  --pinned
 
 echo "=== ready ==="
 .venv/bin/python synapse_cli.py --json status --context "$CONTEXT"

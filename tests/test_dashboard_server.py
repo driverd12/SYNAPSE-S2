@@ -958,12 +958,21 @@ class DashboardRuntimeTests(unittest.TestCase):
 
             report_path = Path(pack_payload["report_path"])
             backup_path = Path(pack_payload["backup"]["backup_path"])
+            capture_path = Path(pack_payload["backup"]["capture_archive_path"])
+            receipt_path = Path(pack_payload["backup"]["bundle_receipt_path"])
 
             self.assertEqual(pack_status, 200)
             self.assertEqual(pack_payload["context_id"], "demo")
             self.assertEqual(pack_payload["action"], "evidence-pack")
             self.assertTrue(report_path.exists())
             self.assertTrue(backup_path.exists())
+            self.assertTrue(capture_path.exists())
+            self.assertTrue(receipt_path.exists())
+            self.assertTrue(pack_payload["backup"]["bundle_verified"])
+            self.assertTrue(pack_payload["backup"]["cutover_ready"])
+            self.assertTrue(
+                pack_payload["backup"]["capture_ledger_binding"]["verified"]
+            )
             self.assertEqual(report_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(report_path.parent.stat().st_mode & 0o777, 0o700)
@@ -971,6 +980,47 @@ class DashboardRuntimeTests(unittest.TestCase):
             self.assertIn("sha256", pack_payload)
             self.assertGreaterEqual(pack_payload["snapshot"]["graph"]["relationship_count"], 1)
             self.assertEqual(pack_payload["snapshot"]["status"]["runtime"], "ready")
+
+    def test_backup_endpoint_creates_verified_paired_recovery_point(self):
+        with TemporaryDirectory() as tmp:
+            previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
+            previous_capture_root = os.environ.get("SYNAPSE_S2_CAPTURE_ROOT")
+            os.environ["SYNAPSE_S2_EXPORT_DIR"] = tmp
+            os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = tmp
+            try:
+                runtime = self.make_runtime(tmp)
+                status, payload = self.decode(
+                    runtime.handle("POST", "/api/backup", b"{}")
+                )
+                artifacts_exist = all(
+                    Path(payload[key]).exists()
+                    for key in (
+                        "backup_path",
+                        "receipt_path",
+                        "capture_archive_path",
+                        "bundle_receipt_path",
+                    )
+                )
+            finally:
+                if previous_export_dir is None:
+                    os.environ.pop("SYNAPSE_S2_EXPORT_DIR", None)
+                else:
+                    os.environ["SYNAPSE_S2_EXPORT_DIR"] = previous_export_dir
+                if previous_capture_root is None:
+                    os.environ.pop("SYNAPSE_S2_CAPTURE_ROOT", None)
+                else:
+                    os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = previous_capture_root
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["action"], "backup-recovery-bundle")
+        self.assertTrue(payload["bundle_verified"])
+        self.assertTrue(payload["cutover_ready"])
+        self.assertTrue(payload["capture_ledger_binding"]["verified"])
+        self.assertRegex(
+            payload["capture_ledger_binding"]["revision"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertTrue(artifacts_exist)
 
     def test_static_paths_cannot_escape_web_root(self):
         with TemporaryDirectory() as tmp:

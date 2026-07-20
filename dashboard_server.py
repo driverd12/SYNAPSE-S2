@@ -1166,8 +1166,15 @@ class DashboardRuntime:
             export_root = self._export_root()
             stamp = time.strftime("%Y%m%d-%H%M%S")
             nonce = uuid.uuid4().hex[:12]
-            backup_path = export_root / f"dashboard-memory-{stamp}-{nonce}.sqlite3"
-            return self._json_response(self.backend.backup_memory(path=backup_path))
+            backup_path = export_root / f"dashboard-recovery-{stamp}-{nonce}.sqlite3"
+            self.capture_daemon().status()
+            return self._json_response(
+                self.backend.backup_recovery_bundle(
+                    path=backup_path,
+                    capture_root=self._capture_root(),
+                    purpose="dashboard",
+                )
+            )
         if method == "POST" and path == "/api/readiness-audit":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
@@ -2875,10 +2882,16 @@ class DashboardRuntime:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         nonce = uuid.uuid4().hex[:12]
         report_path = export_root / f"evidence-pack-{context}-{stamp}-{nonce}.json"
-        backup_path = export_root / f"evidence-memory-{context}-{stamp}-{nonce}.sqlite3"
+        backup_path = export_root / f"evidence-recovery-{context}-{stamp}-{nonce}.sqlite3"
         snapshot = self.snapshot(context_id=context, limit=250, include_graph=True)
         audit = self.readiness_audit(context_id=context)
-        backup = self.backend.backup_memory(path=backup_path)
+        self.capture_daemon().status()
+        backup = self.backend.backup_recovery_bundle(
+            path=backup_path,
+            capture_root=self._capture_root(),
+            purpose="evidence-pack",
+            pinned=True,
+        )
         payload: dict[str, Any] = {
             "action": "evidence-pack",
             "context_id": context,

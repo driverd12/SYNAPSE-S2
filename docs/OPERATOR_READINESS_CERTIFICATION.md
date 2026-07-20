@@ -1,11 +1,11 @@
 # SYNAPSE-S2 Operator Readiness Certification
 
-This runbook is the Monday trust gate. It is not a demo seeder and it does not use example datasets. It runs real local SYNAPSE-S2 commands against the selected context, writes one factual readiness trace, recalls that same trace, previews a real running app, wraps the session into durable memory, and packages the raw evidence into one local artifact.
+This runbook is the Monday trust gate. It is not a demo seeder and it does not use example datasets. It runs real local SYNAPSE-S2 commands against the selected context, writes and recalls one factual readiness trace, previews a real running app, wraps the session, proves processed capture authority, creates and re-verifies a signed paired recovery point, proves an isolated restore, and packages the evidence into one local artifact.
 
 ## Run
 
 ```bash
-cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture"
+cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
 .venv/bin/python scripts/operator_readiness_certify.py \
   --context default \
   --agent-id codex-desktop \
@@ -36,6 +36,10 @@ Exit code `0` means every required proof returned `ready`. Any `degraded` or `bl
 | Recall | `query-text` returns the same unique readiness trace by run id, tag, or memory id. |
 | App Connect preview | A real running app is attached and previewed without writing memory. Quality and capability badges must be present even if Accessibility is blocked. |
 | Wrap Session | A factual handoff is persisted as durable session memory. |
+| Capture ledger audit | Every processed `capture.v2` record has an exact authoritative SQLite ledger binding; missing, ambiguous, or mismatched evidence blocks backup. |
+| Paired recovery backup | SQLite and exactly-once capture transport are bound by signed receipts with no replay debt. |
+| Recovery verification | The database, schema contract, capture archive, provenance, reconciliation, and canonical processed-request ledger-binding proof reverify from durable artifacts. |
+| Isolated recovery drill | A paired restore materializes outside live state and independently reproduces the same content-free capture-ledger binding count and revision. |
 | Dashboard smoke | The loopback dashboard page, `app.js`, `styles.css`, and snapshot API load without known warning/error text. |
 
 ## Interpreting Results
@@ -64,10 +68,14 @@ Only `Operator trustworthy: true` is acceptable for "ready to use with coworkers
 | `recall` | Verify the readiness memory id exists in `list-memory`; then rerun with the same embedding provider. |
 | `app_preview` | Open a visible app, grant macOS Accessibility/Automation where appropriate, or use selected-text capture when preview reports low signal. |
 | `wrap_session` | Run `wrap-session --preview`, confirm text is non-empty, then rerun certification. |
+| `capture_ledger_audit` | Review `finding_samples` and `audit_revision`. Only when `repairable: true`, run `capture-ledger-integrity --repair --confirm --expected-revision '<audit_revision>'`, then rerun the read-only audit and certification. Never replay captures or synthesize receipts. |
+| `recovery_backup` | Resolve disk space, SQLite integrity, capture errors, signing-key permissions, or replay-required transport files. |
+| `recovery_verify` | Inspect the four bundle artifacts and signed receipt; never substitute a database-only copy. |
+| `recovery_restore` | Inspect the isolated restore proof and capture-ledger reconciliation before any cutover planning. |
 | `dashboard` | Run `.venv/bin/python scripts/smoke_dashboard.py default` and fix static asset/API warnings. |
 
 ## Why This Exists
 
 `scripts/prep_tomorrow.sh` is still the broad install and preflight path. It refreshes launchers, client configs, sidecars, tests, maintenance, MCP smoke checks, dashboard smoke, and backups.
 
-`scripts/operator_readiness_certify.py` is narrower and stricter. It answers one operator question: can SYNAPSE-S2 be trusted right now for real work? It fails closed when required evidence is missing, writes the proof into one pack, and preserves the raw stdout/stderr needed to debug failures without guessing.
+`scripts/operator_readiness_certify.py` is narrower and stricter. It answers one operator question: can SYNAPSE-S2 be trusted right now for real work? It fails closed when required evidence is missing, writes the proof into one pack, and preserves the raw stdout/stderr needed to debug failures without guessing. It never auto-repairs a capture-ledger gap: the operator must separately review the bounded findings, explicitly confirm the exact revision, and rerun the audit before the certifier will write a paired recovery bundle.

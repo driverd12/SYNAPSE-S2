@@ -11,13 +11,14 @@ from unittest import mock
 
 import mlx_backend
 import mcp_server
+from capture_daemon import CaptureInboxDaemon
 
 
 class McpServerTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
-        mlx_backend._ENGINE_INSTANCE = mlx_backend.SpikingAttentionBackend(
+        test_backend = mlx_backend.SpikingAttentionBackend(
             dimension=6,
             num_neurons=10,
             default_top_k=2,
@@ -26,7 +27,12 @@ class McpServerTests(unittest.TestCase):
             state_path=Path(self.tmpdir.name) / "state.json",
             memory_path=Path(self.tmpdir.name) / "memory.sqlite3",
         )
+        mlx_backend._ENGINE_INSTANCE = test_backend
+        mlx_backend._CONTROL_PLANE_INSTANCE = test_backend
         self.addCleanup(lambda: setattr(mlx_backend, "_ENGINE_INSTANCE", None))
+        self.addCleanup(
+            lambda: setattr(mlx_backend, "_CONTROL_PLANE_INSTANCE", None)
+        )
         self.previous_export_dir = os.environ.get("SYNAPSE_S2_EXPORT_DIR")
         self.previous_capture_root = os.environ.get("SYNAPSE_S2_CAPTURE_ROOT")
         self.previous_client_agent_id = os.environ.get(
@@ -390,6 +396,154 @@ class McpServerTests(unittest.TestCase):
         self.assertNotIn("neuron_indices", listing["entries"][0])
         self.assertEqual(exported["entries"][0]["source_text"], "Real memory is inspectable through MCP.")
         self.assertTrue(Path(backup["backup_path"]).exists())
+
+    def test_mcp_database_only_backup_rejects_verified_bundle_lane(self):
+        verified_directory = Path(self.tmpdir.name) / "backups" / "verified"
+        verified_directory.mkdir(mode=0o700, parents=True)
+        output = verified_directory / "database-only.sqlite3"
+
+        result = json.loads(
+            mcp_server.backup_spiking_memory(output_path=str(output))
+        )
+
+        self.assertIn("error", result)
+        self.assertRegex(
+            json.dumps(result, sort_keys=True).lower(),
+            r"verified|paired|reserved|database-only|recovery lane",
+        )
+        self.assertFalse(output.exists())
+        self.assertFalse(output.with_name(output.name + ".receipt.json").exists())
+
+    def test_capture_ledger_tools_require_a_reviewed_repair(self):
+        CaptureInboxDaemon(root=self.tmpdir.name).status()
+        audit = json.loads(
+            mcp_server.audit_capture_ledger_integrity(sample_limit=7)
+        )
+        unconfirmed = json.loads(
+            mcp_server.repair_capture_ledger_integrity(
+                expected_revision=audit["audit_revision"],
+                sample_limit=7,
+            )
+        )
+        missing_revision = json.loads(
+            mcp_server.repair_capture_ledger_integrity(
+                expected_revision="",
+                confirm=True,
+                sample_limit=7,
+            )
+        )
+        repaired = json.loads(
+            mcp_server.repair_capture_ledger_integrity(
+                expected_revision=audit["audit_revision"],
+                confirm=True,
+                sample_limit=7,
+            )
+        )
+
+        self.assertEqual(audit["action"], "capture-ledger-audit")
+        self.assertEqual(audit["status"], "ready")
+        self.assertEqual(audit["sample_limit"], 7)
+        rendered_audit = json.dumps(audit, sort_keys=True)
+        for private_field in (
+            '"_candidates"',
+            '"file_sha256"',
+            '"relative_path"',
+            '"request_fingerprint"',
+        ):
+            self.assertNotIn(private_field, rendered_audit)
+
+        self.assertIn("requires confirm=True", unconfirmed["error"])
+        self.assertIn(
+            "reviewed 64-character audit revision",
+            missing_revision["error"],
+        )
+        self.assertEqual(repaired["action"], "capture-ledger-repair")
+        self.assertEqual(repaired["state"], "no-repair-needed")
+        self.assertTrue(repaired["repair_confirmed"])
+        self.assertEqual(repaired["expected_revision"], audit["audit_revision"])
+
+    def test_capture_ledger_tool_errors_redact_secrets_and_local_paths(self):
+        secret = "sk-capture-ledger-secret-1234567890"
+        local_path = "/Users/dan.driver/private/capture-ledger.json"
+        with mock.patch.object(
+            mcp_server,
+            "_load_backend",
+            side_effect=RuntimeError(f"token={secret} at {local_path}"),
+        ):
+            audit = json.loads(mcp_server.audit_capture_ledger_integrity())
+            repair = json.loads(
+                mcp_server.repair_capture_ledger_integrity(
+                    expected_revision="a" * 64,
+                    confirm=True,
+                )
+            )
+
+        for payload in (audit, repair):
+            with self.subTest(payload=payload):
+                rendered = json.dumps(payload, sort_keys=True)
+                self.assertIn("[REDACTED_SECRET]", rendered)
+                self.assertIn("[LOCAL_PATH]", rendered)
+                self.assertNotIn(secret, rendered)
+                self.assertNotIn(local_path, rendered)
+
+    def test_paired_recovery_tools_create_verify_and_restore_isolated_proof(self):
+        capture_root = Path(self.tmpdir.name)
+        os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = str(capture_root)
+        CaptureInboxDaemon(root=capture_root).status()
+        bundle = json.loads(
+            mcp_server.backup_spiking_recovery(
+                output_path=str(capture_root / "paired.sqlite3"),
+                purpose="mcp-test",
+                pinned=True,
+            )
+        )
+
+        verified = json.loads(
+            mcp_server.verify_spiking_recovery(bundle["bundle_receipt_path"])
+        )
+        rejected = json.loads(
+            mcp_server.restore_spiking_recovery_proof(
+                bundle["bundle_receipt_path"],
+                str(capture_root / "restore-rejected"),
+            )
+        )
+        restored = json.loads(
+            mcp_server.restore_spiking_recovery_proof(
+                bundle["bundle_receipt_path"],
+                str(capture_root / "restore-proof"),
+                confirm=True,
+            )
+        )
+
+        self.assertTrue(bundle["bundle_verified"])
+        self.assertTrue(bundle["cutover_ready"])
+        self.assertTrue(bundle["capture_ledger_binding"]["verified"])
+        self.assertTrue(verified["verified"])
+        self.assertTrue(verified["cutover_ready"])
+        self.assertEqual(
+            verified["capture_ledger_binding"],
+            bundle["capture_ledger_binding"],
+        )
+        self.assertIn("confirm", rejected["error"])
+        self.assertTrue(restored["verified"])
+        self.assertTrue(restored["cutover_ready"])
+        self.assertEqual(
+            restored["capture_ledger_binding"],
+            bundle["capture_ledger_binding"],
+        )
+        self.assertTrue(Path(restored["recovery_proof_path"]).exists())
+
+    def test_recovery_restore_tool_rejects_output_outside_export_root(self):
+        payload = json.loads(
+            mcp_server.restore_spiking_recovery_proof(
+                str(Path(self.tmpdir.name) / "missing.bundle.receipt.json"),
+                "/tmp/synapse-recovery-outside-export",
+                confirm=True,
+            )
+        )
+
+        self.assertIn("error", payload)
+        self.assertIn("export root", payload["error"])
 
     def test_memory_list_tool_can_include_vector_details_when_requested(self):
         mcp_server.remember_spiking_context(

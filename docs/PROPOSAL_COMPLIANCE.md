@@ -28,8 +28,10 @@ This matrix maps the supplied proposal documents to the current implementation. 
 | Recurrent SNN execution loop | Implemented | `run_snn_cycle()` |
 | Addition/subtraction STDP update with asymmetric temporal constants | Implemented | `_apply_stdp()` |
 | Contextual focus gating | Implemented | global and per-context enable toggles in `set_enabled()` and MCP/CLI controls |
-| Persistent associative memory substrate | Implemented | `memory_store.py` SQLite store, `remember_spiking_context`, `list_spiking_memory`, export, backup |
+| Persistent associative memory substrate | Implemented | `memory_store.py` SQLite store, `remember_spiking_context`, `list_spiking_memory`, export, and segregated diagnostics |
 | Atomic persistence and repair | Implemented | FULL-durability transactions, fsynced atomic runtime/export publication, no-overwrite verified backup, read-only revision-bound integrity audit, and confirmed repair in `memory_store.py` / `mlx_backend.py` |
+| Governed legacy capture-ledger reconciliation | Implemented | Exact processed-payload/graph/deployment binding, projected canonical fingerprint, deployment-derived commit time, verified safety backup, revision-bound confirmed repair, no graph replay, and no synthetic transport receipt in `recovery_manager.py`, CLI/MCP/readiness surfaces, and `tests/test_capture_ledger_reconciliation.py` |
+| Verified paired recovery and reversible retention | Implemented | Ed25519-signed SQLite plus exactly-once capture bundles, schema/provenance/replay reconciliation, independently derived processed-request ledger-binding proofs, isolated restore proof, repository locking, signed exact-inventory plans, atomic quarantine, crash journals, and idempotent restoration in `memory_store.py`, `recovery_manager.py`, CLI/MCP/dashboard/readiness surfaces, and `tests/test_backup_recovery.py` |
 | Exactly-once capture | Implemented | Canonical request digests, unique capture-operation ledger, atomic graph mutation, private durable receipts, restart reconciliation, and concurrent duplicate fencing in `capture_daemon.py` and `memory_store.py` |
 | Indexed spike-overlap recall | Implemented | `memory_spikes` durable inverted index in `memory_store.py`, migration/backfill, atomic upsert maintenance, and indexed recall tests |
 | Indexed surface/facet text recall | Implemented | `memory_surface_terms` durable term index in `memory_store.py`, migration/backfill, atomic upsert maintenance, indexed query path in `mlx_backend.py`, and memory-store/backend tests |
@@ -141,4 +143,4 @@ These items are present in the architecture document as longer-horizon research 
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Current result: run `scripts/prep_tomorrow.sh` before the presentation. The readiness script runs the full unit suite, compile check, CLI graph/profile/preflight gates, MCP smoke calls, consolidation lifecycle smoke, and a SQLite backup.
+Current result: run `scripts/prep_tomorrow.sh` before the presentation. The readiness script runs the full unit suite, compile check, CLI graph/profile/preflight gates, MCP smoke calls, consolidation lifecycle smoke, an authoritative capture-ledger audit, and a signed paired recovery-point gate with reverification plus isolated restore proof.

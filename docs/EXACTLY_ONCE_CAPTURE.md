@@ -132,11 +132,73 @@ previously failed suffix can commit. Never assign new IDs to records listed as
 committed merely to bypass a conflict. Legacy pre-v2 error files remain manual
 review items and are never auto-requeued.
 
+## Governed historical ledger reconciliation
+
+A bounded hot-runtime cutover can leave a narrow legacy state: the old daemon
+may have archived a processed record and committed its memory graph plus
+conversation-capture deployment after the new ledger schema was installed, but
+before the ledger-aware process took over. Treat that state as missing authority,
+not as permission to replay the capture.
+
+Run the read-only audit first:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2
+```
+
+The audit binds processed payload identity, the normalized redacted request,
+namespace entries, relationship identities and endpoints, the unique durable
+deployment, deployment target records, and existing ledger-backed fingerprints.
+Its public findings contain bounded IDs, reason codes, and effect counts; raw
+content, internal file digests, paths, and request fingerprints remain private.
+
+Only a fully evidenced historical cohort reports `repairable: true`. Review the
+finding samples and preserve the exact `audit_revision`. The repair is an
+explicit second action:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2 \
+  --repair --confirm \
+  --expected-revision '<audit_revision>'
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2
+```
+
+The revision binds both missing-row evidence and every processed ledger-backed
+record, so any intervening capture or evidence change makes the plan stale. The
+repair re-reads and re-hashes each source under the global capture lock, creates
+a verified SQLite safety backup, and commits all missing rows plus one
+content-free maintenance receipt in one transaction. For each historical row,
+the request fingerprint is a deterministic projection from the current
+canonical redacted payload; it is not represented as a recovered historical
+transport fingerprint. `committed_at` and deployment publication time come from
+the already durable conversation-capture deployment timestamp.
+
+The repair never replays capture text, inserts memory nodes or relationships,
+publishes another deployment, recreates a capture receipt file, or synthesizes a
+context-delivery ACK. A modern canonical v2 ledger loss, duplicate capture ID,
+changed payload, ambiguous deployment, incomplete graph binding, or conflicting
+deployment ownership is blocked and must be resolved from authoritative evidence
+or a verified paired restore. After repair, require a fresh audit with
+`status: "ready"` before backup or deployment.
+
+Paired-bundle verification does not trust archive membership alone. It
+re-canonicalizes every processed v2 payload against the signed SQLite
+snapshot's protocol, request fingerprint, context, source, and speaker, then
+returns only a content-free binding count and revision. The isolated restore
+derives that proof again from the restored database and files and must match it
+before publishing recovery proof. `cutover_ready` is false without this binding
+proof even when capture IDs and replay-debt counts appear consistent.
+
 ## Safe deployment and rollback
 
 Deploy in this order:
 
-1. back up and verify the SQLite store and capture root;
+1. require a ready `capture-ledger-integrity` audit, create a signed
+   `backup-recovery` bundle, then prove `verify-recovery` and an isolated
+   `restore-recovery-proof`; require `cutover_ready: true`;
 2. stop the capture LaunchAgent and verify its process exited;
 3. migrate the store and deploy the ledger-aware daemon while v1 compatibility
    remains enabled;
@@ -147,7 +209,8 @@ Deploy in this order:
 
 Do not roll the daemon binary back by itself after v2 files exist. Old code can
 ignore the new fields and replay them without consulting the ledger. Safe
-rollback restores the paired pre-deployment database and capture-root backup, or
+rollback restores the exact signed pre-deployment database and capture archive as
+one governed pair, or
 rolls forward with capture projection disabled until repair completes.
 
 ## Privacy boundary

@@ -177,12 +177,12 @@ const WIZARD_FLOWS = {
   {
     selector: "#evidencePackButton",
     title: "Package evidence before sharing claims",
-    body: "Evidence Pack writes a report and SQLite backup so another operator can inspect what was true at the time.",
-    capability: "Operational evidence: readiness audit, snapshot, report, memory backup, and operation log.",
+    body: "Evidence Pack writes a report and signed paired recovery bundle so another operator can verify memory and capture state together.",
+    capability: "Operational evidence: readiness audit, snapshot, report, paired recovery proof, and operation log.",
     items: [
       "Run this after a successful first-use flow or before a handoff.",
       "Use the Operation Log to inspect backend responses.",
-      "Backups stay local inside the SYNAPSE-S2 export root.",
+      "Signed recovery points stay local inside the SYNAPSE-S2 export root.",
     ],
   },
   {
@@ -6937,7 +6937,7 @@ elements.sleepButton.addEventListener("click", () => {
 });
 
 elements.backupButton.addEventListener("click", () => {
-  withBusy(elements.backupButton, "Backup", () => (
+  withBusy(elements.backupButton, "Recovery point", () => (
     requestJson("/api/backup", { method: "POST", body: {} })
   ));
 });

@@ -215,20 +215,92 @@ Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode
 SQLite maintains a durable sparse spike index and a durable surface-term index for prompt recall. The surface index is built from tags, display labels, display summaries, semantic facets, detail badges, keywords, and bounded source text, and existing memory databases are backfilled automatically on startup.
 Compound entry/index/event writes use explicit SQLite transactions with `FULL` synchronous durability by default. Set `SYNAPSE_S2_SQLITE_DURABILITY=balanced` only when measured throughput is more important than retaining the latest committed transaction through sudden power loss.
 
-Inspect, export, and back up the memory store:
+Inspect and export the memory store:
 
 ```bash
 .venv/bin/python synapse_cli.py --json list-memory --context default --limit 20
 .venv/bin/python synapse_cli.py --json export-memory \
   --context default \
   --output .synapse_s2/default-memory-export.json
-.venv/bin/python synapse_cli.py --json backup-memory \
-  --output ".synapse_s2/default-memory-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
 ```
 
 Exports publish through a private same-directory temporary file and atomic
-rename. Backups are integrity-checked, fsynced, hashed, and published without
-overwriting an existing path; choose a fresh destination for every backup run.
+rename. Paired recovery points are integrity-checked, fsynced, Ed25519-signed,
+and published without overwriting existing paths. They bind SQLite to the
+exactly-once capture transport and expose signed replay reconciliation plus a
+separate `cutover_ready` decision. Verification re-canonicalizes every archived
+processed v2 request against the snapshot ledger and returns a content-free
+`capture_ledger_binding` count/revision proof; an isolated restore derives the
+same proof again from the restored files and database. `backup-memory` is retained as a segregated
+database-only diagnostic; it is not sufficient for recovery.
+
+Before creating a paired recovery point, prove that every processed
+`capture.v2` record is bound to the authoritative SQLite capture ledger:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2
+```
+
+`status: "ready"`, `verification_passed: true`, and zero missing, blocked, or
+mismatched records are required. A paired backup runs this authority gate again
+before publishing any bundle artifacts. If a read-only audit reports a bounded
+historical cutover cohort as `repairable`, review its finding samples and retain
+the exact `audit_revision`, then make the separate confirmed repair and re-audit:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2 \
+  --repair --confirm \
+  --expected-revision '<audit_revision>'
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2
+```
+
+After the fresh audit is ready, create the complete recovery point:
+
+```bash
+.venv/bin/python synapse_cli.py --json backup-recovery \
+  --output ".synapse_s2/backups/verified/default-recovery-$(date +%Y%m%d-%H%M%S).sqlite3" \
+  --capture-root .synapse_s2 \
+  --purpose operator \
+  --pinned
+```
+
+This governed legacy reconciliation does not replay a processed capture, create
+memory/relationship/deployment graph effects, or synthesize a capture transport
+receipt or context-delivery acknowledgement. It projects the canonical request
+fingerprint from the surviving redacted processed payload and uses the already
+durable conversation-capture deployment timestamp as the historical commit
+time. Only the missing compact ledger rows and one content-free maintenance
+receipt are written, after a verified safety backup. Stale revisions, modern-v2
+ledger loss, ambiguous deployment ownership, changed evidence, or incomplete
+graph bindings fail closed and require evidence repair or a verified restore.
+`cutover_ready: true` additionally requires a verified capture-ledger binding
+proof; matching capture IDs or reconciliation counts alone are not sufficient.
+
+Retention is a signed two-step contract. Planning is read-only and binds the
+exact identity of every protected and retiring artifact; applying requires the
+same policy, the unexpired plan token, and explicit confirmation. Apply moves
+whole verified bundles by atomic rename into a private same-filesystem
+quarantine. It never deletes them, and the matching restore command is
+idempotent:
+
+```bash
+.venv/bin/python synapse_cli.py --json recovery-retention-plan \
+  --keep-latest 7 --max-age-days 30
+.venv/bin/python synapse_cli.py --json recovery-retention-apply \
+  --plan-token "<plan_token>" \
+  --cutoff-created-at "<cutoff_created_at>" \
+  --keep-latest 7 --max-age-days 30 --confirm
+.venv/bin/python synapse_cli.py --json recovery-retention-restore \
+  --plan-token "<plan_token>" --confirm
+```
+
+Quarantine is deliberately reversible and does not reclaim disk space. There is
+no purge command. Restore proof is isolated and never overwrites the live store;
+a live cutover must be performed later through a separately quiesced,
+authoritative service workflow.
 
 Audit derived recall indexes before relying on Doctor or after any interrupted,
 disk-full, or legacy write. Audit mode opens the existing database read-only,
@@ -466,7 +538,15 @@ The MCP server exposes these tools:
 | `profile_spiking_resources` | Report actual topology array memory estimates and optional quick-pruning timing. |
 | `certify_spiking_runtime` | Emit native runtime certification evidence for MLX, mlxsnn, envelope, provider, and quick-prune checks. |
 | `export_spiking_memory` | Export persisted memory entries as JSON, optionally to a local file. |
-| `backup_spiking_memory` | Create a SQLite backup of the durable memory store. |
+| `backup_spiking_memory` | Create a segregated SQLite-only diagnostic snapshot. |
+| `audit_capture_ledger_integrity` | Read-only audit of processed capture.v2 evidence against authoritative SQLite ledger bindings. |
+| `repair_capture_ledger_integrity` | Apply a reviewed, revision-bound legacy ledger reconciliation without replaying graph effects or synthesizing transport receipts. |
+| `backup_spiking_recovery` | Create and immediately verify a signed paired database plus capture recovery point. |
+| `verify_spiking_recovery` | Reverify all four bound recovery artifacts and signed replay reconciliation. |
+| `restore_spiking_recovery_proof` | Materialize an isolated paired restore proof without touching live state. |
+| `plan_spiking_recovery_retention` | Produce and persist a signed, expiring, exact-inventory retention plan. |
+| `apply_spiking_recovery_retention` | Atomically quarantine only the exact planned stale bundles; requires confirmation. |
+| `restore_retired_spiking_recovery` | Reversibly restore quarantined bundle sets and reverify them; requires confirmation. |
 | `trigger_sleep_consolidation` | Run deep-sleep consolidation and semantic hierarchy extraction. |
 | `trigger_idle_maintenance` | Run due maintenance or force idle deep-sleep consolidation. |
 
@@ -519,7 +599,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and backups.
+The dashboard is a loopback-only threaded operator surface for the same runtime and memory store used by MCP and the CLI, so heavier local graph/certification actions do not monopolize status or static asset requests. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and signed paired recovery points.
 
 ### Connected namespace recall and neural galaxy
 

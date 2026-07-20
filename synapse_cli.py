@@ -875,6 +875,113 @@ def command_backup_memory(args: argparse.Namespace) -> dict[str, Any]:
     return backend.backup_memory(path=output_path)
 
 
+def command_backup_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    output_path = _optional_public_output_path(
+        args.output,
+        field="recovery bundle database output path",
+    )
+    backend = build_backend(args)
+    return backend.backup_recovery_bundle(
+        path=output_path,
+        capture_root=args.capture_root,
+        purpose=args.purpose,
+        pinned=bool(args.pinned),
+        allow_noncanonical_capture_root=bool(
+            args.allow_noncanonical_capture_root
+        ),
+    )
+
+
+def command_capture_ledger_integrity(args: argparse.Namespace) -> dict[str, Any]:
+    from recovery_manager import VerifiedRecoveryManager
+
+    store = DurableMemoryStore.open_existing_for_audit(args.memory_db)
+    capture_root = args.capture_root or store.db_path.parent
+    manager = VerifiedRecoveryManager(store, capture_root=capture_root)
+    if args.repair:
+        return manager.repair_capture_ledger(
+            confirm=bool(args.confirm),
+            expected_revision=args.expected_revision,
+            sample_limit=args.sample_limit,
+        )
+    return manager.audit_capture_ledger(sample_limit=args.sample_limit)
+
+
+def command_verify_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    receipt_path = _optional_public_output_path(
+        args.receipt,
+        field="recovery bundle receipt path",
+    )
+    if receipt_path is None:
+        raise ValueError("recovery bundle receipt path is required")
+    backend = build_backend(args)
+    return backend.verify_recovery_bundle(
+        receipt_path,
+        capture_root=args.capture_root,
+        expected_database_sha256=args.expected_database_sha256,
+        expected_capture_sha256=args.expected_capture_sha256,
+    )
+
+
+def command_restore_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    receipt_path = _optional_public_output_path(
+        args.receipt,
+        field="recovery bundle receipt path",
+    )
+    output_root = _optional_public_output_path(
+        args.output_root,
+        field="recovery proof output root",
+    )
+    if receipt_path is None or output_root is None:
+        raise ValueError("receipt and output root are required")
+    backend = build_backend(args)
+    return backend.restore_recovery_bundle_isolated(
+        receipt_path,
+        output_root,
+        capture_root=args.capture_root,
+        expected_database_sha256=args.expected_database_sha256,
+        expected_capture_sha256=args.expected_capture_sha256,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_plan_recovery_retention(args: argparse.Namespace) -> dict[str, Any]:
+    directory = _optional_public_output_path(
+        args.directory,
+        field="recovery retention directory",
+    )
+    backend = build_backend(args)
+    return backend.plan_recovery_retention(
+        directory=directory,
+        keep_latest=args.keep_latest,
+        max_age_days=args.max_age_days,
+    )
+
+
+def command_apply_recovery_retention(args: argparse.Namespace) -> dict[str, Any]:
+    directory = _optional_public_output_path(
+        args.directory,
+        field="recovery retention directory",
+    )
+    backend = build_backend(args)
+    return backend.apply_recovery_retention(
+        plan_token=args.plan_token,
+        cutoff_created_at=args.cutoff_created_at,
+        directory=directory,
+        keep_latest=args.keep_latest,
+        max_age_days=args.max_age_days,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_restore_retired_recovery(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.restore_retired_recovery(
+        plan_token=args.plan_token,
+        confirm=bool(args.confirm),
+    )
+
+
 def command_memory_integrity(args: argparse.Namespace) -> dict[str, Any]:
     context_id = str(args.context).strip() if args.context is not None else None
     store = DurableMemoryStore.open_existing_for_audit(args.memory_db)
@@ -1542,6 +1649,74 @@ def build_parser() -> argparse.ArgumentParser:
     backup_memory = subparsers.add_parser("backup-memory")
     backup_memory.add_argument("--output", default=None)
     backup_memory.set_defaults(func=command_backup_memory)
+
+    capture_ledger = subparsers.add_parser(
+        "capture-ledger-integrity",
+        help=(
+            "Audit processed capture.v2 payloads against the authoritative "
+            "SQLite ledger, or apply a reviewed historical reconciliation."
+        ),
+    )
+    capture_ledger.add_argument("--capture-root", default=None)
+    capture_ledger.add_argument("--sample-limit", type=int, default=20)
+    capture_ledger.add_argument("--repair", action="store_true")
+    capture_ledger.add_argument("--confirm", action="store_true")
+    capture_ledger.add_argument("--expected-revision", default=None)
+    capture_ledger.set_defaults(func=command_capture_ledger_integrity)
+
+    backup_recovery = subparsers.add_parser(
+        "backup-recovery",
+        help="Create a signed paired database and exactly-once capture recovery bundle.",
+    )
+    backup_recovery.add_argument("--output", default=None)
+    backup_recovery.add_argument("--capture-root", default=None)
+    backup_recovery.add_argument("--purpose", default="operator")
+    backup_recovery.add_argument("--pinned", action="store_true")
+    backup_recovery.add_argument(
+        "--allow-noncanonical-capture-root",
+        action="store_true",
+        help=(
+            "Explicitly permit a pre-existing private capture root outside the "
+            "memory-store directory; the signed receipt records this exception."
+        ),
+    )
+    backup_recovery.set_defaults(func=command_backup_recovery_bundle)
+
+    verify_recovery = subparsers.add_parser("verify-recovery")
+    verify_recovery.add_argument("--receipt", required=True)
+    verify_recovery.add_argument("--capture-root", default=None)
+    verify_recovery.add_argument("--expected-database-sha256", default=None)
+    verify_recovery.add_argument("--expected-capture-sha256", default=None)
+    verify_recovery.set_defaults(func=command_verify_recovery_bundle)
+
+    restore_recovery = subparsers.add_parser("restore-recovery-proof")
+    restore_recovery.add_argument("--receipt", required=True)
+    restore_recovery.add_argument("--output-root", required=True)
+    restore_recovery.add_argument("--capture-root", default=None)
+    restore_recovery.add_argument("--expected-database-sha256", default=None)
+    restore_recovery.add_argument("--expected-capture-sha256", default=None)
+    restore_recovery.add_argument("--confirm", action="store_true")
+    restore_recovery.set_defaults(func=command_restore_recovery_bundle)
+
+    retention_plan = subparsers.add_parser("recovery-retention-plan")
+    retention_plan.add_argument("--directory", default=None)
+    retention_plan.add_argument("--keep-latest", type=int, default=7)
+    retention_plan.add_argument("--max-age-days", type=float, default=30.0)
+    retention_plan.set_defaults(func=command_plan_recovery_retention)
+
+    retention_apply = subparsers.add_parser("recovery-retention-apply")
+    retention_apply.add_argument("--directory", default=None)
+    retention_apply.add_argument("--keep-latest", type=int, default=7)
+    retention_apply.add_argument("--max-age-days", type=float, default=30.0)
+    retention_apply.add_argument("--plan-token", required=True)
+    retention_apply.add_argument("--cutoff-created-at", type=float, required=True)
+    retention_apply.add_argument("--confirm", action="store_true")
+    retention_apply.set_defaults(func=command_apply_recovery_retention)
+
+    retention_restore = subparsers.add_parser("recovery-retention-restore")
+    retention_restore.add_argument("--plan-token", required=True)
+    retention_restore.add_argument("--confirm", action="store_true")
+    retention_restore.set_defaults(func=command_restore_retired_recovery)
 
     memory_integrity = subparsers.add_parser(
         "memory-integrity",

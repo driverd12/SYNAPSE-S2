@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -10,6 +11,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -17,6 +19,13 @@ import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
@@ -36,6 +45,47 @@ if not LOGGER.handlers:
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
+
+
+BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v2"
+BACKUP_RESTORE_RECEIPT_SCHEMA = "synapse-s2.memory-restore.v1"
+BACKUP_RESTORE_PLAN_SCHEMA = "synapse-s2.memory-restore-plan.v1"
+BACKUP_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+SQLITE_APPLICATION_ID = 0x53324442  # ASCII "S2DB"
+SQLITE_USER_VERSION = 5
+BACKUP_SCHEMA_CONTRACT_VERSION = "s2-schema-v5"
+BACKUP_RECOVERY_RUNTIME_ID = "synapse-s2/0.1.0+schema-v5"
+BACKUP_SCHEMA_COMPATIBILITY_REGISTRY: dict[str, dict[str, Any]] = {
+    BACKUP_SCHEMA_CONTRACT_VERSION: {
+        "schema_sha256": "861746736fae070d4ccd2765cedb0d049892385158846b1ea8272aa890c59685",
+        "table_count": 19,
+        "index_count": 28,
+        "migration_set_sha256": "ff16d292fa470cd97a9a6cb2e88dd2f801824ce6c3ee640d7546e08b3191c228",
+        "migration_count": 12,
+        "application_id": SQLITE_APPLICATION_ID,
+        "user_version": SQLITE_USER_VERSION,
+    }
+}
+_CANONICAL_BACKUP_CONTRACT: dict[str, Any] | None = None
+BACKUP_CRITICAL_TABLES = frozenset(
+    {
+        "memory_entries",
+        "memory_events",
+        "memory_relationships",
+        "memory_spikes",
+        "memory_surface_terms",
+        "agent_context_events",
+        "agent_context_event_targets",
+        "capture_operations",
+        "agent_context_deliveries",
+        "agent_context_delivery_receipts",
+        "agent_context_delivery_ack_tombstones",
+        "agent_context_delivery_cursors",
+        "store_migrations",
+        "store_metadata",
+        "store_maintenance_receipts",
+    }
+)
 
 
 CONTEXT_EVENT_TARGET_GROUPS = frozenset(
@@ -1182,6 +1232,41 @@ def _capture_json_dumps(value: Any, *, field: str) -> str:
         raise ValueError(f"{field} must be finite, JSON-safe data") from exc
 
 
+def capture_request_fingerprint(
+    *,
+    text: str,
+    context_id: str,
+    source_tag: str,
+    speaker: str,
+    surprise_threshold: float,
+    min_segment_sentences: int,
+    metadata: dict[str, Any],
+) -> str:
+    """Return the durable capture.v2 request identity used by the ledger.
+
+    The capture ID deliberately is not part of this digest: it is the
+    idempotency key stored beside the digest.  Keeping this function in the
+    persistence module gives normal capture and governed historical repair one
+    authoritative byte contract instead of two similar implementations.
+    """
+
+    request = {
+        "protocol": CAPTURE_PROTOCOL_VERSION,
+        "text": str(text),
+        "context_id": str(context_id),
+        "source_tag": str(source_tag),
+        "speaker": str(speaker),
+        "surprise_threshold": float(surprise_threshold),
+        "min_segment_sentences": int(min_segment_sentences),
+        "metadata": metadata,
+    }
+    canonical = _capture_json_dumps(
+        request,
+        field="capture request fingerprint input",
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _json_list(values: Iterable[int]) -> str:
     safe_values = [int(value) for value in values]
     return json.dumps(safe_values, separators=(",", ":"))
@@ -1238,6 +1323,7 @@ class DurableMemoryStore:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 10000")
             conn.execute("PRAGMA foreign_keys = ON")
+            self._validate_existing_schema_compatibility_markers(conn)
             durability = str(
                 os.getenv("SYNAPSE_S2_SQLITE_DURABILITY", "full")
             ).strip().lower()
@@ -1258,10 +1344,59 @@ class DurableMemoryStore:
             finally:
                 self._release_file_lock(schema_gate_fd)
             self._run_migrations(conn)
+            self._publish_schema_compatibility_markers(conn)
             return conn
         except BaseException:
             conn.close()
             raise
+
+    @staticmethod
+    def _schema_compatibility_markers(
+        conn: sqlite3.Connection,
+    ) -> tuple[int, int]:
+        return (
+            int(conn.execute("PRAGMA application_id").fetchone()[0]),
+            int(conn.execute("PRAGMA user_version").fetchone()[0]),
+        )
+
+    def _validate_existing_schema_compatibility_markers(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Reject foreign or newer stores before any schema claim is written."""
+
+        application_id, user_version = self._schema_compatibility_markers(conn)
+        if application_id not in {0, SQLITE_APPLICATION_ID}:
+            raise RuntimeError(
+                "SQLite application_id does not identify a SYNAPSE-S2 store"
+            )
+        if user_version < 0 or user_version > SQLITE_USER_VERSION:
+            raise RuntimeError(
+                "SQLite user_version is newer than this SYNAPSE-S2 runtime"
+            )
+
+    def _publish_schema_compatibility_markers(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Publish the schema identity only after every migration gate succeeds."""
+
+        if self._schema_compatibility_markers(conn) == (
+            SQLITE_APPLICATION_ID,
+            SQLITE_USER_VERSION,
+        ):
+            return
+        with self._transaction(conn, immediate=True):
+            self._validate_existing_schema_compatibility_markers(conn)
+            conn.execute(f"PRAGMA application_id = {SQLITE_APPLICATION_ID}")
+            conn.execute(f"PRAGMA user_version = {SQLITE_USER_VERSION}")
+            if self._schema_compatibility_markers(conn) != (
+                SQLITE_APPLICATION_ID,
+                SQLITE_USER_VERSION,
+            ):
+                raise RuntimeError(
+                    "failed to publish SYNAPSE-S2 schema compatibility markers"
+                )
 
     def _connect_read_only(self) -> sqlite3.Connection:
         if not self.db_path.is_file():
@@ -10266,6 +10401,7 @@ class DurableMemoryStore:
         temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
         fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(fd)
+        published = False
         try:
             with closing(sqlite3.connect(temp_path)) as destination:
                 source.backup(destination)
@@ -10273,6 +10409,10 @@ class DurableMemoryStore:
                 quick_check = [
                     str(row[0])
                     for row in destination.execute("PRAGMA quick_check").fetchall()
+                ]
+                integrity_check = [
+                    str(row[0])
+                    for row in destination.execute("PRAGMA integrity_check").fetchall()
                 ]
                 foreign_key_errors = [
                     list(row)
@@ -10310,6 +10450,7 @@ class DurableMemoryStore:
             )
             if (
                 quick_check != ["ok"]
+                or integrity_check != ["ok"]
                 or foreign_key_error_keys != allowed_foreign_key_error_keys
             ):
                 raise RuntimeError(
@@ -10317,8 +10458,17 @@ class DurableMemoryStore:
                 )
             with temp_path.open("rb") as handle:
                 os.fsync(handle.fileno())
-            temp_path.replace(output_path)
-            self._protect_path(output_path, directory=False)
+            os.link(temp_path, output_path, follow_symlinks=False)
+            published = True
+            temp_metadata = os.lstat(temp_path)
+            output_metadata = os.lstat(output_path)
+            if self._regular_file_identity(temp_metadata) != self._regular_file_identity(
+                output_metadata
+            ):
+                raise RuntimeError("safety backup publication identity mismatch")
+            os.chmod(output_path, 0o600, follow_symlinks=False)
+            self._fsync_file(output_path)
+            temp_path.unlink()
             dir_fd = os.open(backup_dir, os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
@@ -10333,6 +10483,7 @@ class DurableMemoryStore:
                 "sha256": digest.hexdigest(),
                 "size_bytes": output_path.stat().st_size,
                 "quick_check": quick_check,
+                "integrity_check": integrity_check,
                 "foreign_key_error_count": len(foreign_key_errors),
                 "allowed_foreign_key_error_count": len(
                     allowed_foreign_key_error_keys
@@ -10347,7 +10498,10 @@ class DurableMemoryStore:
                 "created_at": time.time(),
             }
         except BaseException:
-            for incomplete_path in (temp_path, output_path):
+            incomplete_paths = [temp_path]
+            if published:
+                incomplete_paths.append(output_path)
+            for incomplete_path in incomplete_paths:
                 try:
                     incomplete_path.unlink(missing_ok=True)
                 except OSError:
@@ -11876,104 +12030,1233 @@ class DurableMemoryStore:
             payload["export_path"] = str(output_path)
         return payload
 
-    def backup(self, path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    @staticmethod
+    def _backup_receipt_path(path: Path) -> Path:
+        return path.with_name(path.name + ".receipt.json")
+
+    @staticmethod
+    def _restore_receipt_path(path: Path) -> Path:
+        return path.with_name(path.name + ".restore.receipt.json")
+
+    def _backup_verification_staging_dir(self) -> Path:
+        path = self.db_path.parent / "recovery-staging"
+        self._ensure_directory(path, owned=True)
+        return path
+
+    @staticmethod
+    def _canonical_payload_digest(payload: dict[str, Any]) -> str:
+        canonical = {
+            key: value
+            for key, value in payload.items()
+            if key
+            not in {
+                "receipt_digest",
+                "receipt_authenticator",
+                "receipt_signature",
+            }
+        }
+        return hashlib.sha256(_json_dumps(canonical).encode("utf-8")).hexdigest()
+
+    def _write_private_bytes_exclusive(self, path: Path, value: bytes) -> bool:
+        temporary = self._unique_private_temp_path(path.parent, prefix=f".{path.name}.")
+        published = False
+        try:
+            flags = os.O_WRONLY | os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temporary, flags)
+            try:
+                offset = 0
+                while offset < len(value):
+                    offset += os.write(descriptor, value[offset:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+                published = True
+            except FileExistsError:
+                pass
+            if published:
+                os.chmod(path, 0o600, follow_symlinks=False)
+                self._fsync_file(path)
+                self._fsync_directory(path.parent)
+            return published
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _backup_receipt_signing_key(
+        self,
+        *,
+        create: bool,
+    ) -> tuple[Ed25519PrivateKey | None, bytes | None, str | None]:
+        key_dir = self.db_path.parent / "recovery-keys"
+        private_path = key_dir / "backup-receipt-ed25519.private"
+        public_path = key_dir / "backup-receipt-ed25519.public"
+        if create:
+            self._ensure_directory(key_dir, owned=True)
+            if not private_path.exists() and not private_path.is_symlink():
+                generated = Ed25519PrivateKey.generate()
+                raw_private = generated.private_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PrivateFormat.Raw,
+                    serialization.NoEncryption(),
+                )
+                self._write_private_bytes_exclusive(private_path, raw_private)
+        if private_path.is_symlink() or public_path.is_symlink():
+            raise ValueError("backup receipt authority keys must not be symlinks")
+        private_key: Ed25519PrivateKey | None = None
+        public_bytes: bytes | None = None
+        if private_path.exists():
+            descriptor, metadata = self._open_regular_nofollow(private_path)
+            try:
+                if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+                    raise PermissionError("backup receipt private key is not private")
+                raw_private = os.read(descriptor, 33)
+            finally:
+                os.close(descriptor)
+            if len(raw_private) != 32:
+                raise RuntimeError("backup receipt private key has an invalid size")
+            private_key = Ed25519PrivateKey.from_private_bytes(raw_private)
+            public_bytes = private_key.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            if create and not public_path.exists():
+                self._write_private_bytes_exclusive(public_path, public_bytes)
+            if public_path.exists():
+                public_descriptor, public_metadata = self._open_regular_nofollow(
+                    public_path
+                )
+                try:
+                    if (
+                        public_metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(public_metadata.st_mode) & 0o022
+                    ):
+                        raise PermissionError(
+                            "backup receipt public key is not owner-controlled"
+                        )
+                    persisted_public = os.read(public_descriptor, 33)
+                finally:
+                    os.close(public_descriptor)
+                if not secrets.compare_digest(persisted_public, public_bytes):
+                    raise RuntimeError(
+                        "backup receipt public and private authority keys disagree"
+                    )
+        elif public_path.exists():
+            descriptor, metadata = self._open_regular_nofollow(public_path)
+            try:
+                if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+                    raise PermissionError("backup receipt public key is not owner-controlled")
+                public_bytes = os.read(descriptor, 33)
+            finally:
+                os.close(descriptor)
+            if len(public_bytes) != 32:
+                raise RuntimeError("backup receipt public key has an invalid size")
+        elif create:
+            raise RuntimeError("backup receipt signing authority could not be created")
+        key_id = hashlib.sha256(public_bytes).hexdigest() if public_bytes else None
+        return private_key, public_bytes, key_id
+
+    def _authenticate_receipt(self, payload: dict[str, Any]) -> None:
+        private_key, public_bytes, key_id = self._backup_receipt_signing_key(
+            create=True
+        )
+        if private_key is None or public_bytes is None or key_id is None:
+            raise RuntimeError("backup receipt signing authority is unavailable")
+        payload["auth_algorithm"] = "ed25519"
+        payload["auth_key_id"] = key_id
+        payload["signing_public_key"] = base64.b64encode(public_bytes).decode("ascii")
+        payload["receipt_digest"] = self._canonical_payload_digest(payload)
+        signed_payload = {
+            key: value for key, value in payload.items() if key != "receipt_signature"
+        }
+        payload["receipt_signature"] = base64.b64encode(
+            private_key.sign(_json_dumps(signed_payload).encode("utf-8"))
+        ).decode("ascii")
+
+    def _verify_receipt_authenticator(self, payload: dict[str, Any]) -> bool:
+        if payload.get("auth_algorithm") != "ed25519":
+            raise ValueError("backup receipt authentication algorithm is not supported")
+        try:
+            public_bytes = base64.b64decode(
+                str(payload.get("signing_public_key") or ""), validate=True
+            )
+            signature = base64.b64decode(
+                str(payload.get("receipt_signature") or ""), validate=True
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError("backup receipt signature encoding is invalid") from exc
+        if len(public_bytes) != 32 or len(signature) != 64:
+            raise ValueError("backup receipt signature is invalid")
+        key_id = hashlib.sha256(public_bytes).hexdigest()
+        if not secrets.compare_digest(str(payload.get("auth_key_id") or ""), key_id):
+            raise ValueError("backup receipt signing key identifier is invalid")
+        signed_payload = {
+            key: value for key, value in payload.items() if key != "receipt_signature"
+        }
+        try:
+            Ed25519PublicKey.from_public_bytes(public_bytes).verify(
+                signature,
+                _json_dumps(signed_payload).encode("utf-8"),
+            )
+        except InvalidSignature as exc:
+            raise ValueError("backup receipt signature verification failed") from exc
+        _private, local_public, local_key_id = self._backup_receipt_signing_key(
+            create=False
+        )
+        locally_trusted = bool(
+            local_public is not None
+            and local_key_id is not None
+            and secrets.compare_digest(local_key_id, key_id)
+        )
+        configured_ids = {
+            value.strip().lower()
+            for value in os.getenv("SYNAPSE_S2_TRUSTED_BACKUP_KEY_IDS", "").split(",")
+            if BACKUP_DIGEST_RE.fullmatch(value.strip().lower())
+        }
+        return locally_trusted or key_id in configured_ids
+
+    @staticmethod
+    def _regular_file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+            int(value.st_ctime_ns),
+        )
+
+    @staticmethod
+    def _validate_backup_artifact_name(value: Any, *, field: str) -> str:
+        name = str(value or "").strip()
+        if (
+            not name
+            or len(name) > 255
+            or name in {".", ".."}
+            or Path(name).name != name
+            or "/" in name
+            or "\\" in name
+        ):
+            raise ValueError(f"{field} must be a single local file name")
+        reject_sensitive_identifier(name, field=field)
+        return name
+
+    @staticmethod
+    def _open_regular_nofollow(path: Path) -> tuple[int, os.stat_result]:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("backup artifact must be a regular file")
+            if metadata.st_size <= 0:
+                raise ValueError("backup artifact must not be empty")
+            return descriptor, metadata
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _hash_stable_regular_file(self, path: Path) -> tuple[str, int, os.stat_result]:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ValueError("backup artifact must be a non-symlink regular file")
+        descriptor, opened = self._open_regular_nofollow(path)
+        digest = hashlib.sha256()
+        try:
+            if self._regular_file_identity(before) != self._regular_file_identity(opened):
+                raise RuntimeError("backup artifact changed while it was opened")
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after_fd = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after_path = os.lstat(path)
+        identity = self._regular_file_identity(opened)
+        if (
+            self._regular_file_identity(after_fd) != identity
+            or self._regular_file_identity(after_path) != identity
+        ):
+            raise RuntimeError("backup artifact changed during verification")
+        return digest.hexdigest(), int(opened.st_size), opened
+
+    def _copy_stable_regular_file(self, source: Path, destination: Path) -> dict[str, Any]:
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(source) + suffix)
+            if sidecar.exists() or sidecar.is_symlink():
+                raise RuntimeError("backup artifact has an ambiguous SQLite sidecar")
+        maximum_bytes = int(
+            os.getenv("SYNAPSE_S2_BACKUP_MAX_BYTES", str(64 * 1024 * 1024 * 1024))
+        )
+        if maximum_bytes <= 0:
+            raise ValueError("SYNAPSE_S2_BACKUP_MAX_BYTES must be positive")
+        source_fd, source_metadata = self._open_regular_nofollow(source)
+        destination_flags = os.O_WRONLY | os.O_TRUNC
+        if hasattr(os, "O_CLOEXEC"):
+            destination_flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            destination_flags |= os.O_NOFOLLOW
+        destination_fd = os.open(destination, destination_flags)
+        digest = hashlib.sha256()
+        try:
+            source_path_metadata = os.lstat(source)
+            if self._regular_file_identity(source_path_metadata) != self._regular_file_identity(
+                source_metadata
+            ):
+                raise RuntimeError("backup artifact changed while it was opened")
+            if source_metadata.st_size > maximum_bytes:
+                raise ValueError("backup artifact exceeds the configured size limit")
+            free_bytes = int(shutil.disk_usage(destination.parent).free)
+            copy_reserve = int(
+                os.getenv("SYNAPSE_S2_BACKUP_COPY_RESERVE_BYTES", str(64 * 1024 * 1024))
+            )
+            if copy_reserve < 0:
+                raise ValueError("SYNAPSE_S2_BACKUP_COPY_RESERVE_BYTES must be non-negative")
+            if free_bytes < int(source_metadata.st_size) + copy_reserve:
+                raise OSError("insufficient free space for isolated backup verification")
+            copied = 0
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(destination_fd, chunk[offset:])
+                copied += len(chunk)
+                if copied > maximum_bytes:
+                    raise ValueError("backup artifact exceeds the configured size limit")
+            os.fsync(destination_fd)
+            source_after = os.fstat(source_fd)
+            destination_after = os.fstat(destination_fd)
+        finally:
+            os.close(destination_fd)
+            os.close(source_fd)
+        source_path_after = os.lstat(source)
+        source_identity = self._regular_file_identity(source_metadata)
+        if (
+            self._regular_file_identity(source_after) != source_identity
+            or self._regular_file_identity(source_path_after) != source_identity
+        ):
+            raise RuntimeError("backup artifact changed during isolated copy")
+        if int(destination_after.st_size) != int(source_metadata.st_size):
+            raise RuntimeError("isolated backup copy has an unexpected size")
+        return {
+            "sha256": digest.hexdigest(),
+            "size_bytes": int(destination_after.st_size),
+        }
+
+    def _write_private_json_exclusive(self, path: Path, payload: dict[str, Any]) -> None:
+        if path.exists() or path.is_symlink():
+            raise FileExistsError("receipt path already exists; refusing to overwrite it")
+        temporary = self._unique_private_temp_path(path.parent, prefix=f".{path.name}.")
+        published = False
+        try:
+            flags = os.O_WRONLY | os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temporary, flags)
+            try:
+                encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(
+                    "utf-8"
+                )
+                offset = 0
+                while offset < len(encoded):
+                    offset += os.write(descriptor, encoded[offset:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.link(temporary, path, follow_symlinks=False)
+            published = True
+            temporary_metadata = os.lstat(temporary)
+            published_metadata = os.lstat(path)
+            if self._regular_file_identity(temporary_metadata) != self._regular_file_identity(
+                published_metadata
+            ):
+                raise RuntimeError("receipt publication identity mismatch")
+            os.chmod(path, 0o600, follow_symlinks=False)
+            self._fsync_file(path)
+            temporary.unlink()
+            self._fsync_directory(path.parent)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            if published:
+                path.unlink(missing_ok=True)
+            self._fsync_directory(path.parent)
+            raise
+
+    def _read_trusted_backup_receipt(
+        self,
+        path: Path,
+        *,
+        artifact: Path,
+    ) -> tuple[dict[str, Any], bool]:
+        descriptor, metadata = self._open_regular_nofollow(path)
+        try:
+            if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise PermissionError("backup receipt must be private and owned by this user")
+            if metadata.st_size > 1024 * 1024:
+                raise ValueError("backup receipt exceeds the size limit")
+            raw = b""
+            while len(raw) <= 1024 * 1024:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            os.close(descriptor)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("backup receipt is not valid JSON") from exc
+        if not isinstance(payload, dict) or payload.get("schema") != BACKUP_RECEIPT_SCHEMA:
+            raise ValueError("backup receipt schema is not supported")
+        expected_keys = {
+            "schema",
+            "artifact_name",
+            "artifact_sha256",
+            "artifact_size_bytes",
+            "schema_sha256",
+            "schema_contract_version",
+            "recovery_runtime_id",
+            "snapshot_revision",
+            "critical_counts",
+            "highwaters",
+            "semantic_index_revision",
+            "purpose",
+            "pinned",
+            "restore_eligible",
+            "created_at",
+            "source_store_name",
+            "auth_algorithm",
+            "auth_key_id",
+            "signing_public_key",
+            "receipt_digest",
+            "receipt_signature",
+        }
+        if set(payload) != expected_keys:
+            raise ValueError("backup receipt fields do not match the supported contract")
+        artifact_name = self._validate_backup_artifact_name(
+            payload.get("artifact_name"), field="receipt artifact_name"
+        )
+        if artifact_name != artifact.name or artifact.parent != path.parent:
+            raise ValueError("backup receipt does not identify this artifact")
+        artifact_digest = str(payload.get("artifact_sha256") or "").lower()
+        if not BACKUP_DIGEST_RE.fullmatch(artifact_digest):
+            raise ValueError("backup receipt artifact digest is invalid")
+        if (
+            type(payload.get("artifact_size_bytes")) is not int
+            or int(payload["artifact_size_bytes"]) <= 0
+            or type(payload.get("pinned")) is not bool
+            or payload.get("restore_eligible") is not True
+            or not isinstance(payload.get("critical_counts"), dict)
+            or not isinstance(payload.get("highwaters"), dict)
+            or not isinstance(payload.get("created_at"), (int, float))
+            or not math.isfinite(float(payload["created_at"]))
+        ):
+            raise ValueError("backup receipt field types are invalid")
+        for count_map_name in ("critical_counts", "highwaters"):
+            count_map = payload[count_map_name]
+            if any(
+                not isinstance(key, str)
+                or type(value) is not int
+                or int(value) < 0
+                for key, value in count_map.items()
+            ):
+                raise ValueError("backup receipt count fields are invalid")
+        receipt_digest = str(payload.get("receipt_digest") or "").lower()
+        if (
+            not BACKUP_DIGEST_RE.fullmatch(receipt_digest)
+            or not secrets.compare_digest(receipt_digest, self._canonical_payload_digest(payload))
+        ):
+            raise ValueError("backup receipt digest validation failed")
+        identity_trusted = self._verify_receipt_authenticator(payload)
+        return payload, identity_trusted
+
+    @staticmethod
+    def _sqlite_schema_fingerprint(conn: sqlite3.Connection) -> dict[str, Any]:
+        rows = conn.execute(
+            """
+            SELECT type, name, tbl_name, COALESCE(sql, '') AS sql
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name, tbl_name, sql
+            """
+        ).fetchall()
+        canonical = [
+            [str(row["type"]), str(row["name"]), str(row["tbl_name"]), str(row["sql"])]
+            for row in rows
+        ]
+        tables = sorted(row[1] for row in canonical if row[0] == "table")
+        indexes = sorted(row[1] for row in canonical if row[0] == "index")
+        return {
+            "sha256": hashlib.sha256(_json_dumps(canonical).encode("utf-8")).hexdigest(),
+            "table_count": len(tables),
+            "index_count": len(indexes),
+            "missing_critical_table_count": len(BACKUP_CRITICAL_TABLES - set(tables)),
+        }
+
+    @classmethod
+    def _canonical_backup_contract(cls) -> dict[str, Any]:
+        """Build the exact code-owned schema/migration allowlist once per process."""
+
+        global _CANONICAL_BACKUP_CONTRACT
+        if _CANONICAL_BACKUP_CONTRACT is not None:
+            return dict(_CANONICAL_BACKUP_CONTRACT)
+        with tempfile.TemporaryDirectory(prefix="synapse-s2-schema-contract-") as raw_root:
+            canonical_store = cls(Path(raw_root) / "canonical.sqlite3")
+            with closing(sqlite3.connect(canonical_store.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                schema = cls._sqlite_schema_fingerprint(conn)
+                migrations = sorted(
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT key FROM store_migrations ORDER BY key"
+                    ).fetchall()
+                )
+                contract = {
+                    "schema_sha256": str(schema["sha256"]),
+                    "table_count": int(schema["table_count"]),
+                    "index_count": int(schema["index_count"]),
+                    "migration_set_sha256": hashlib.sha256(
+                        _json_dumps(migrations).encode("utf-8")
+                    ).hexdigest(),
+                    "migration_count": len(migrations),
+                    "application_id": int(
+                        conn.execute("PRAGMA application_id").fetchone()[0]
+                    ),
+                    "user_version": int(
+                        conn.execute("PRAGMA user_version").fetchone()[0]
+                    ),
+                }
+        _CANONICAL_BACKUP_CONTRACT = dict(contract)
+        registered_current = BACKUP_SCHEMA_COMPATIBILITY_REGISTRY.get(
+            BACKUP_SCHEMA_CONTRACT_VERSION
+        )
+        if registered_current != contract:
+            raise RuntimeError(
+                "code-owned backup schema registry is stale; update it with the migration"
+            )
+        return dict(contract)
+
+    def _backup_secret_audit(self, conn: sqlite3.Connection) -> dict[str, int]:
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        classified = (
+            set(LEGACY_SECRET_CONTENT_COLUMNS)
+            | set(LEGACY_SECRET_IDENTIFIER_COLUMNS)
+            | set(LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS)
+        )
+        text_columns: set[tuple[str, str]] = set()
+        for table_name in tables:
+            for row in conn.execute(f'PRAGMA table_xinfo("{table_name}")').fetchall():
+                column_type = str(row[2] or "").upper()
+                if any(marker in column_type for marker in ("CHAR", "CLOB", "TEXT")):
+                    text_columns.add((table_name, str(row[1])))
+        unclassified = text_columns - classified
+        scan_limit = int(os.getenv("SYNAPSE_S2_BACKUP_SECRET_SCAN_MAX_CELLS", "2000000"))
+        scan_byte_limit = int(
+            os.getenv("SYNAPSE_S2_BACKUP_SECRET_SCAN_MAX_BYTES", str(2 * 1024**3))
+        )
+        value_byte_limit = int(
+            os.getenv("SYNAPSE_S2_BACKUP_SCAN_MAX_VALUE_BYTES", str(16 * 1024**2))
+        )
+        if scan_limit <= 0:
+            raise ValueError("SYNAPSE_S2_BACKUP_SECRET_SCAN_MAX_CELLS must be positive")
+        if scan_byte_limit <= 0 or value_byte_limit <= 0:
+            raise ValueError("backup secret scan byte limits must be positive")
+        scanned = 0
+        scanned_bytes = 0
+        distinct_identifier_cells = 0
+        redaction_changes = 0
+        digest_changes = 0
+        derived_identifier_tables = {"memory_spikes", "memory_surface_terms"}
+        content_columns = text_columns & set(LEGACY_SECRET_CONTENT_COLUMNS)
+        identifier_columns = (
+            text_columns
+            & (
+                set(LEGACY_SECRET_IDENTIFIER_COLUMNS)
+                | set(LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS)
+            )
+        ) - {
+            column
+            for column in text_columns
+            if column[0] in derived_identifier_tables
+        }
+        for table_name, column_name in sorted(content_columns | identifier_columns):
+            is_content = (table_name, column_name) in content_columns
+            distinct_sql = "" if is_content else "DISTINCT "
+            cursor = conn.execute(
+                f'SELECT {distinct_sql}"{column_name}" FROM "{table_name}" '
+                f'WHERE "{column_name}" IS NOT NULL'
+            )
+            for row in cursor:
+                scanned += 1
+                if not is_content:
+                    distinct_identifier_cells += 1
+                if scanned > scan_limit:
+                    raise RuntimeError("backup secret audit exceeded its bounded scan limit")
+                raw_value = str(row[0])
+                value_bytes = len(raw_value.encode("utf-8"))
+                scanned_bytes += value_bytes
+                if value_bytes > value_byte_limit or scanned_bytes > scan_byte_limit:
+                    raise RuntimeError("backup secret audit exceeded its bounded byte limit")
+                safe_value, _ = redact_capture_text(raw_value)
+                digest_safe, _ = strip_untrusted_raw_digest_text(safe_value)
+                if safe_value != raw_value:
+                    redaction_changes += 1
+                if digest_safe != safe_value:
+                    digest_changes += 1
+        return {
+            "scanned_cell_count": scanned,
+            "scanned_byte_count": scanned_bytes,
+            "scanned_distinct_identifier_cell_count": distinct_identifier_cells,
+            "derived_identifier_table_count": len(derived_identifier_tables),
+            "redaction_changing_cell_count": redaction_changes,
+            "raw_digest_changing_cell_count": digest_changes,
+            "unclassified_text_column_count": len(unclassified),
+        }
+
+    def _inspect_backup_snapshot(self, path: Path) -> dict[str, Any]:
+        uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as conn:
+            conn.row_factory = sqlite3.Row
+            inspection_seconds = float(
+                os.getenv("SYNAPSE_S2_BACKUP_INSPECTION_TIMEOUT_SECONDS", "120")
+            )
+            inspection_steps = int(
+                os.getenv("SYNAPSE_S2_BACKUP_INSPECTION_MAX_VM_STEPS", "500000000")
+            )
+            if (
+                not math.isfinite(inspection_seconds)
+                or inspection_seconds <= 0
+                or inspection_steps <= 0
+            ):
+                raise ValueError("backup inspection limits must be positive and finite")
+            deadline = time.monotonic() + inspection_seconds
+            progress_calls = 0
+            steps_per_callback = 10_000
+
+            def inspection_progress() -> int:
+                nonlocal progress_calls
+                progress_calls += 1
+                return int(
+                    time.monotonic() >= deadline
+                    or progress_calls * steps_per_callback > inspection_steps
+                )
+
+            conn.set_progress_handler(inspection_progress, steps_per_callback)
+            if hasattr(conn, "setlimit") and hasattr(sqlite3, "SQLITE_LIMIT_LENGTH"):
+                conn.setlimit(
+                    sqlite3.SQLITE_LIMIT_LENGTH,
+                    int(
+                        os.getenv(
+                            "SYNAPSE_S2_BACKUP_SQLITE_MAX_VALUE_BYTES",
+                            str(64 * 1024**2),
+                        )
+                    ),
+                )
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            quick_check = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
+            integrity_check = [str(row[0]) for row in conn.execute("PRAGMA integrity_check")]
+            foreign_key_error_count = sum(1 for _ in conn.execute("PRAGMA foreign_key_check"))
+            schema = self._sqlite_schema_fingerprint(conn)
+            migrations = sorted(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT key FROM store_migrations ORDER BY key"
+                ).fetchall()
+            )
+            schema_contract = {
+                "schema_sha256": str(schema["sha256"]),
+                "table_count": int(schema["table_count"]),
+                "index_count": int(schema["index_count"]),
+                "migration_set_sha256": hashlib.sha256(
+                    _json_dumps(migrations).encode("utf-8")
+                ).hexdigest(),
+                "migration_count": len(migrations),
+                "application_id": int(conn.execute("PRAGMA application_id").fetchone()[0]),
+                "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+            }
+            canonical_contract = self._canonical_backup_contract()
+            matching_contract_versions = sorted(
+                version
+                for version, registered in BACKUP_SCHEMA_COMPATIBILITY_REGISTRY.items()
+                if all(
+                    schema_contract.get(key) == expected_value
+                    for key, expected_value in registered.items()
+                )
+            )
+            schema_contract_error_count = 0 if matching_contract_versions else sum(
+                1
+                for key, expected_value in canonical_contract.items()
+                if schema_contract.get(key) != expected_value
+            )
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table'"
+                ).fetchall()
+            }
+            counts = {
+                table_name: int(conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
+                for table_name in sorted(BACKUP_CRITICAL_TABLES & tables)
+            }
+            json_error_count = 0
+            json_scanned_bytes = 0
+            json_scan_byte_limit = int(
+                os.getenv("SYNAPSE_S2_BACKUP_JSON_SCAN_MAX_BYTES", str(2 * 1024**3))
+            )
+            json_value_byte_limit = int(
+                os.getenv("SYNAPSE_S2_BACKUP_SCAN_MAX_VALUE_BYTES", str(16 * 1024**2))
+            )
+            if json_scan_byte_limit <= 0 or json_value_byte_limit <= 0:
+                raise ValueError("backup JSON scan byte limits must be positive")
+            for table_name in sorted(tables):
+                if table_name.startswith("sqlite_"):
+                    continue
+                for row in conn.execute(f'PRAGMA table_xinfo("{table_name}")').fetchall():
+                    column_name = str(row[1])
+                    if not (column_name.endswith("_json") or (table_name, column_name) == ("store_metadata", "value_json")):
+                        continue
+                    for value_row in conn.execute(
+                        f'SELECT "{column_name}" FROM "{table_name}" WHERE "{column_name}" IS NOT NULL'
+                    ):
+                        raw_json = str(value_row[0])
+                        raw_json_bytes = len(raw_json.encode("utf-8"))
+                        json_scanned_bytes += raw_json_bytes
+                        if (
+                            raw_json_bytes > json_value_byte_limit
+                            or json_scanned_bytes > json_scan_byte_limit
+                        ):
+                            raise RuntimeError(
+                                "backup JSON audit exceeded its bounded byte limit"
+                            )
+                        try:
+                            json.loads(raw_json)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            json_error_count += 1
+            semantic = self._semantic_index_audit(
+                conn,
+                context_id=None,
+                sample_limit=1,
+                include_integrity_checks=False,
+            )
+            capture_error_count, _ = self._capture_operation_integrity_audit(
+                conn, sample_limit=1
+            )
+            delivery_schema_errors = self._context_delivery_v2_table_errors(conn) + (
+                self._context_delivery_v2_index_errors(conn)
+            )
+            delivery_data_errors = self._context_delivery_data_errors(conn)
+            target_error_count, _, _, _ = self._context_event_target_integrity_audit(
+                conn, sample_limit=1
+            )
+            event_error_count, _ = self._context_event_ledger_integrity_audit(
+                conn, sample_limit=1
+            )
+            highwater_error_count, _ = self._context_event_target_highwater_audit(conn)
+            secret_audit = self._backup_secret_audit(conn)
+            highwaters = {
+                "memory_event_id": int(
+                    conn.execute("SELECT COALESCE(MAX(event_id), 0) FROM memory_events").fetchone()[0]
+                ),
+                "context_event_id": int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
+                    ).fetchone()[0]
+                ),
+                "capture_committed_at_micros": int(
+                    float(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(committed_at), 0) FROM capture_operations"
+                        ).fetchone()[0]
+                    )
+                    * 1_000_000
+                ),
+            }
+        blocking_error_count = sum(
+            (
+                0 if quick_check == ["ok"] else 1,
+                0 if integrity_check == ["ok"] else 1,
+                foreign_key_error_count,
+                int(schema["missing_critical_table_count"]),
+                schema_contract_error_count,
+                json_error_count,
+                0 if semantic.get("status") == "ready" else 1,
+                capture_error_count,
+                len(delivery_schema_errors),
+                len(delivery_data_errors),
+                target_error_count,
+                event_error_count,
+                highwater_error_count,
+                int(secret_audit["redaction_changing_cell_count"]),
+                int(secret_audit["raw_digest_changing_cell_count"]),
+                int(secret_audit["unclassified_text_column_count"]),
+            )
+        )
+        revision_seed = {
+            "schema_sha256": schema["sha256"],
+            "critical_counts": counts,
+            "highwaters": highwaters,
+            "semantic_source_revision": str(semantic.get("source_revision") or ""),
+        }
+        return {
+            "quick_check": quick_check,
+            "integrity_check": integrity_check,
+            "foreign_key_error_count": foreign_key_error_count,
+            "schema": schema,
+            "schema_contract": schema_contract,
+            "schema_contract_version": (
+                matching_contract_versions[-1] if matching_contract_versions else ""
+            ),
+            "schema_contract_error_count": schema_contract_error_count,
+            "critical_counts": counts,
+            "highwaters": highwaters,
+            "snapshot_revision": hashlib.sha256(
+                _json_dumps(revision_seed).encode("utf-8")
+            ).hexdigest(),
+            "semantic_index_status": str(semantic.get("status") or "blocked"),
+            "semantic_index_revision": str(semantic.get("audit_revision") or ""),
+            "semantic_index_mismatch_count": int(
+                semantic.get("mismatched_memory_count") or 0
+            ),
+            "capture_integrity_error_count": capture_error_count,
+            "delivery_integrity_error_count": len(delivery_schema_errors)
+            + len(delivery_data_errors)
+            + target_error_count
+            + event_error_count
+            + highwater_error_count,
+            "canonical_json_error_count": json_error_count,
+            "canonical_json_scanned_bytes": json_scanned_bytes,
+            "secret_audit": secret_audit,
+            "blocking_error_count": int(blocking_error_count),
+            "restore_eligible": blocking_error_count == 0,
+        }
+
+    def verify_backup(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        expected_sha256: str | None = None,
+        receipt_path: str | os.PathLike[str] | None = None,
+    ) -> dict[str, Any]:
+        reject_sensitive_identifier(path, field="backup_path")
+        artifact = Path(path).expanduser().absolute()
+        if artifact == self.db_path.expanduser().absolute():
+            raise ValueError("backup verification requires a non-live artifact")
+        if artifact.is_symlink() or not artifact.is_file():
+            raise ValueError("backup_path must be a non-symlink regular file")
+        live_metadata = os.lstat(self.db_path)
+        artifact_metadata = os.lstat(artifact)
+        if (int(live_metadata.st_dev), int(live_metadata.st_ino)) == (
+            int(artifact_metadata.st_dev),
+            int(artifact_metadata.st_ino),
+        ):
+            raise ValueError("backup artifact must not alias the live memory database")
+        expected = str(expected_sha256 or "").strip().lower()
+        expected_was_supplied = bool(expected)
+        if expected and not BACKUP_DIGEST_RE.fullmatch(expected):
+            raise ValueError("expected_sha256 must be a lowercase SHA-256 digest")
+        receipt_file = (
+            Path(receipt_path).expanduser().absolute()
+            if receipt_path is not None
+            else self._backup_receipt_path(artifact)
+        )
+        receipt: dict[str, Any] | None = None
+        receipt_identity_trusted = False
+        if receipt_file.exists() or receipt_file.is_symlink():
+            if receipt_file.is_symlink():
+                raise ValueError("backup receipt must not be a symlink")
+            receipt, receipt_identity_trusted = self._read_trusted_backup_receipt(
+                receipt_file,
+                artifact=artifact,
+            )
+            receipt_expected = str(receipt["artifact_sha256"])
+            if expected and not secrets.compare_digest(expected, receipt_expected):
+                raise ValueError("expected SHA-256 does not match the backup receipt")
+            expected = receipt_expected
+        elif not expected:
+            raise ValueError("verification requires a trusted receipt or expected SHA-256")
+        if receipt is not None and not receipt_identity_trusted and not expected_was_supplied:
+            raise ValueError(
+                "backup signer is not trusted locally; provide a reviewed expected SHA-256"
+            )
+        staging_dir = self._backup_verification_staging_dir()
+        temporary = self._unique_private_temp_path(
+            staging_dir, prefix=f".{artifact.name}.verify."
+        )
+        try:
+            copied = self._copy_stable_regular_file(artifact, temporary)
+            if not secrets.compare_digest(str(copied["sha256"]), expected):
+                raise RuntimeError("backup artifact digest verification failed")
+            if receipt is not None and int(receipt.get("artifact_size_bytes") or -1) != int(
+                copied["size_bytes"]
+            ):
+                raise RuntimeError("backup artifact size does not match its receipt")
+            inspection = self._inspect_backup_snapshot(temporary)
+            if not inspection["restore_eligible"]:
+                raise RuntimeError("backup artifact failed SYNAPSE recovery invariants")
+            if receipt is not None:
+                if str(receipt.get("schema_sha256") or "") != str(
+                    inspection["schema"]["sha256"]
+                ):
+                    raise RuntimeError("backup schema fingerprint does not match its receipt")
+                if str(receipt.get("snapshot_revision") or "") != str(
+                    inspection["snapshot_revision"]
+                ):
+                    raise RuntimeError("backup snapshot revision does not match its receipt")
+                if receipt.get("critical_counts") != inspection["critical_counts"]:
+                    raise RuntimeError("backup critical counts do not match its receipt")
+                if receipt.get("highwaters") != inspection["highwaters"]:
+                    raise RuntimeError("backup highwaters do not match its receipt")
+                if str(receipt.get("semantic_index_revision") or "") != str(
+                    inspection["semantic_index_revision"]
+                ):
+                    raise RuntimeError("backup semantic revision does not match its receipt")
+                if str(receipt.get("schema_contract_version") or "") != str(
+                    inspection["schema_contract_version"]
+                ):
+                    raise RuntimeError("backup schema contract version does not match its receipt")
+            return {
+                "action": "verify-backup",
+                "backup_path": str(artifact),
+                "receipt_path": str(receipt_file) if receipt is not None else None,
+                "receipt_verified": receipt is not None,
+                "receipt_identity_trusted": receipt_identity_trusted,
+                "expected_sha256_verified": expected_was_supplied,
+                "sha256": str(copied["sha256"]),
+                "size_bytes": int(copied["size_bytes"]),
+                "snapshot_revision": str(inspection["snapshot_revision"]),
+                "schema_sha256": str(inspection["schema"]["sha256"]),
+                "schema_contract_version": str(
+                    inspection["schema_contract_version"]
+                ),
+                "recovery_runtime_id": BACKUP_RECOVERY_RUNTIME_ID,
+                "entry_count": int(inspection["critical_counts"].get("memory_entries", 0)),
+                "event_count": int(inspection["critical_counts"].get("memory_events", 0)),
+                "quick_check": inspection["quick_check"],
+                "integrity_check": inspection["integrity_check"],
+                "foreign_key_error_count": int(inspection["foreign_key_error_count"]),
+                "semantic_index_status": str(inspection["semantic_index_status"]),
+                "capture_integrity_error_count": int(
+                    inspection["capture_integrity_error_count"]
+                ),
+                "delivery_integrity_error_count": int(
+                    inspection["delivery_integrity_error_count"]
+                ),
+                "secret_audit": inspection["secret_audit"],
+                "restore_eligible": True,
+                "verified": True,
+                "verified_at": time.time(),
+            }
+        finally:
+            temporary.unlink(missing_ok=True)
+            self._fsync_directory(staging_dir)
+
+    def backup(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        purpose: str = "operator",
+        pinned: bool = False,
+        _paired_recovery: bool = False,
+    ) -> dict[str, Any]:
+        safe_purpose = re.sub(r"[^a-z0-9_.-]+", "-", str(purpose).lower()).strip("-")
+        if not safe_purpose or len(safe_purpose) > 64:
+            raise ValueError("backup purpose must contain 1 to 64 safe characters")
         if path is None:
+            # Database-only snapshots are intentionally segregated from paired
+            # recovery bundles.  Retention and cutover must never mistake an
+            # unpaired SQLite file for a complete exactly-once recovery point.
+            backup_dir = self.db_path.parent / "backups" / "database-only"
+            self._ensure_directory(backup_dir, owned=True)
             stamp = time.strftime("%Y%m%d-%H%M%S")
             nonce = uuid.uuid4().hex[:12]
-            output_path = self.db_path.with_name(
-                f"{self.db_path.stem}-{stamp}-{nonce}.sqlite3"
+            output_path = backup_dir / (
+                f"{self.db_path.stem}-{safe_purpose}-{stamp}-{nonce}.sqlite3"
             )
         else:
             reject_sensitive_identifier(path, field="backup_path")
-            output_path = Path(path).expanduser()
+            output_path = Path(path).expanduser().absolute()
+        store_root = self.db_path.parent.expanduser().resolve()
+        backups_root = store_root / "backups"
+        resolved_output_parent = output_path.parent.resolve()
+        try:
+            backups_relative = resolved_output_parent.relative_to(backups_root)
+        except ValueError:
+            backups_relative = None
+        lane = (
+            backups_relative.parts[0]
+            if backups_relative is not None and backups_relative.parts
+            else ""
+        )
+        if _paired_recovery:
+            if lane == "database-only":
+                raise ValueError(
+                    "paired recovery bundles must not use the database-only lane"
+                )
+        elif backups_relative is not None and lane != "database-only":
+            raise ValueError(
+                "SQLite-only diagnostics must use backups/database-only, not the paired verified recovery lane"
+            )
         self._ensure_directory(output_path.parent, owned=False)
-        if output_path.exists() or output_path.is_symlink():
-            raise FileExistsError("backup_path already exists; refusing to overwrite it")
+        receipt_path = self._backup_receipt_path(output_path)
+        if (
+            output_path.exists()
+            or output_path.is_symlink()
+            or receipt_path.exists()
+            or receipt_path.is_symlink()
+        ):
+            raise FileExistsError("backup artifact or receipt already exists; refusing overwrite")
+        if output_path == self.db_path.expanduser().absolute():
+            raise ValueError("backup_path must not be the live memory database")
         temp_path = self._unique_private_temp_path(
-            output_path.parent,
-            prefix=f".{output_path.name}.",
+            output_path.parent, prefix=f".{output_path.name}."
         )
         published = False
+        receipt_published = False
         try:
             with closing(self._connect()) as source:
+                page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
+                page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
+                estimated_bytes = max(int(self.db_path.stat().st_size), page_count * page_size)
+                reserve_bytes = int(
+                    os.getenv("SYNAPSE_S2_BACKUP_MIN_FREE_BYTES", str(512 * 1024 * 1024))
+                )
+                if reserve_bytes < 0:
+                    raise ValueError("SYNAPSE_S2_BACKUP_MIN_FREE_BYTES must be non-negative")
+                free_bytes = int(shutil.disk_usage(output_path.parent).free)
+                if free_bytes < (estimated_bytes * 2) + reserve_bytes:
+                    raise OSError("insufficient free space for verified backup")
                 with closing(sqlite3.connect(temp_path)) as destination:
                     source.backup(destination)
                     destination.commit()
-                    quick_check = [
-                        str(row[0])
-                        for row in destination.execute("PRAGMA quick_check").fetchall()
-                    ]
-                    foreign_key_errors = [
-                        list(row)
-                        for row in destination.execute(
-                            "PRAGMA foreign_key_check"
-                        ).fetchall()
-                    ]
-                    backup_tables = {
-                        str(row[0])
-                        for row in destination.execute(
-                            "SELECT name FROM sqlite_master WHERE type = 'table'"
-                        ).fetchall()
-                    }
-                    entry_count = (
-                        int(
-                            destination.execute(
-                                "SELECT COUNT(*) FROM memory_entries"
-                            ).fetchone()[0]
-                        )
-                        if "memory_entries" in backup_tables
-                        else 0
-                    )
-                    event_count = (
-                        int(
-                            destination.execute(
-                                "SELECT COUNT(*) FROM memory_events"
-                            ).fetchone()[0]
-                        )
-                        if "memory_events" in backup_tables
-                        else 0
-                    )
-            if quick_check != ["ok"] or foreign_key_errors:
-                raise RuntimeError("backup failed SQLite integrity verification")
             self._fsync_file(temp_path)
-            digest = hashlib.sha256()
-            with temp_path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            size_bytes = int(temp_path.stat().st_size)
+            inspection = self._inspect_backup_snapshot(temp_path)
+            if not inspection["restore_eligible"]:
+                raise RuntimeError("backup failed SYNAPSE recovery invariants")
+            temp_digest, temp_size, _ = self._hash_stable_regular_file(temp_path)
             os.link(temp_path, output_path, follow_symlinks=False)
             published = True
-            self._protect_path(output_path, directory=False)
+            temp_metadata = os.lstat(temp_path)
+            final_metadata = os.lstat(output_path)
+            if self._regular_file_identity(temp_metadata) != self._regular_file_identity(
+                final_metadata
+            ):
+                raise RuntimeError("published backup identity does not match verified snapshot")
+            os.chmod(output_path, 0o600, follow_symlinks=False)
             self._fsync_file(output_path)
+            temp_metadata = os.lstat(temp_path)
+            final_digest, final_size, final_opened = self._hash_stable_regular_file(output_path)
+            if (
+                self._regular_file_identity(final_opened)
+                != self._regular_file_identity(temp_metadata)
+                or not secrets.compare_digest(temp_digest, final_digest)
+                or temp_size != final_size
+            ):
+                raise RuntimeError("published backup changed after verification")
+            created_at = time.time()
+            receipt = {
+                "schema": BACKUP_RECEIPT_SCHEMA,
+                "artifact_name": output_path.name,
+                "artifact_sha256": final_digest,
+                "artifact_size_bytes": final_size,
+                "schema_sha256": str(inspection["schema"]["sha256"]),
+                "schema_contract_version": str(
+                    inspection["schema_contract_version"]
+                ),
+                "recovery_runtime_id": BACKUP_RECOVERY_RUNTIME_ID,
+                "snapshot_revision": str(inspection["snapshot_revision"]),
+                "critical_counts": inspection["critical_counts"],
+                "highwaters": inspection["highwaters"],
+                "semantic_index_revision": str(inspection["semantic_index_revision"]),
+                "purpose": safe_purpose,
+                "pinned": bool(pinned),
+                "restore_eligible": True,
+                "created_at": created_at,
+                "source_store_name": self.db_path.name,
+            }
+            self._authenticate_receipt(receipt)
+            self._write_private_json_exclusive(receipt_path, receipt)
+            receipt_published = True
             temp_path.unlink()
             self._fsync_directory(output_path.parent)
+            verified = self.verify_backup(output_path, receipt_path=receipt_path)
             return {
-                "backup_path": str(output_path),
+                **verified,
+                "action": "backup-memory",
                 "memory_db_path": str(self.db_path),
-                "entry_count": entry_count,
-                "event_count": event_count,
-                "size_bytes": size_bytes,
-                "sha256": digest.hexdigest(),
-                "quick_check": quick_check,
-                "foreign_key_error_count": len(foreign_key_errors),
-                "verified": True,
-                "created_at": time.time(),
+                "backup_path": str(output_path),
+                "receipt_path": str(receipt_path),
+                "receipt_schema": BACKUP_RECEIPT_SCHEMA,
+                "receipt_digest": str(receipt["receipt_digest"]),
+                "purpose": safe_purpose,
+                "pinned": bool(pinned),
+                "created_at": created_at,
             }
         except BaseException:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                LOGGER.exception("failed to remove incomplete backup temporary file")
+            temp_path.unlink(missing_ok=True)
+            if receipt_published:
+                receipt_path.unlink(missing_ok=True)
             if published:
-                try:
-                    output_path.unlink(missing_ok=True)
-                except OSError:
-                    LOGGER.exception("failed to remove incomplete published backup")
+                output_path.unlink(missing_ok=True)
             try:
                 self._fsync_directory(output_path.parent)
             except OSError:
                 LOGGER.exception("failed to fsync backup directory after cleanup")
-            LOGGER.exception("failed to back up memory store from %s to %s", self.db_path, output_path)
+            LOGGER.exception("failed to create verified memory backup")
+            raise
+
+    def restore_backup(
+        self,
+        path: str | os.PathLike[str],
+        output_path: str | os.PathLike[str],
+        *,
+        expected_sha256: str | None = None,
+        receipt_path: str | os.PathLike[str] | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Materialize a verified backup as an isolated, no-overwrite database.
+
+        Live cutover is intentionally not hidden inside this primitive.  A live
+        restore must coordinate the capture transport and runtime drain through
+        the governed recovery-bundle workflow; copying over the database alone
+        would violate exactly-once capture.
+        """
+
+        if not confirm:
+            raise ValueError("confirm=true is required to materialize a restore")
+        reject_sensitive_identifier(path, field="backup_path")
+        reject_sensitive_identifier(output_path, field="restore_path")
+        source = Path(path).expanduser().absolute()
+        target = Path(output_path).expanduser().absolute()
+        live_path = self.db_path.expanduser().absolute()
+        if target == live_path:
+            raise ValueError(
+                "live database restore requires the governed paired recovery workflow"
+            )
+        if source == target:
+            raise ValueError("restore_path must differ from backup_path")
+        self._ensure_directory(target.parent, owned=False)
+        restore_receipt_path = self._restore_receipt_path(target)
+        if (
+            target.exists()
+            or target.is_symlink()
+            or restore_receipt_path.exists()
+            or restore_receipt_path.is_symlink()
+        ):
+            raise FileExistsError("restore artifact or receipt already exists; refusing overwrite")
+        verification = self.verify_backup(
+            source,
+            expected_sha256=expected_sha256,
+            receipt_path=receipt_path,
+        )
+        if not verification.get("receipt_verified"):
+            raise ValueError("restore requires a trusted immutable backup receipt")
+        temporary = self._unique_private_temp_path(
+            target.parent, prefix=f".{target.name}.restore."
+        )
+        published = False
+        receipt_published = False
+        try:
+            copied = self._copy_stable_regular_file(source, temporary)
+            if not secrets.compare_digest(
+                str(copied["sha256"]), str(verification["sha256"])
+            ):
+                raise RuntimeError("restore candidate digest changed after verification")
+            inspection = self._inspect_backup_snapshot(temporary)
+            if (
+                not inspection["restore_eligible"]
+                or str(inspection["snapshot_revision"])
+                != str(verification["snapshot_revision"])
+            ):
+                raise RuntimeError("restore candidate failed post-copy verification")
+            os.link(temporary, target, follow_symlinks=False)
+            published = True
+            temporary_metadata = os.lstat(temporary)
+            target_metadata = os.lstat(target)
+            if self._regular_file_identity(temporary_metadata) != self._regular_file_identity(
+                target_metadata
+            ):
+                raise RuntimeError("restore publication identity mismatch")
+            os.chmod(target, 0o600, follow_symlinks=False)
+            self._fsync_file(target)
+            temporary_metadata = os.lstat(temporary)
+            final_digest, final_size, final_metadata = self._hash_stable_regular_file(target)
+            if (
+                self._regular_file_identity(final_metadata)
+                != self._regular_file_identity(temporary_metadata)
+                or not secrets.compare_digest(final_digest, str(verification["sha256"]))
+            ):
+                raise RuntimeError("published restore does not match the verified backup")
+            created_at = time.time()
+            backup_receipt_file = Path(str(verification["receipt_path"]))
+            trusted_backup_receipt, _identity_trusted = self._read_trusted_backup_receipt(
+                backup_receipt_file,
+                artifact=source,
+            )
+            restore_receipt = {
+                "schema": BACKUP_RESTORE_RECEIPT_SCHEMA,
+                "artifact_name": target.name,
+                "artifact_sha256": final_digest,
+                "artifact_size_bytes": final_size,
+                "source_backup_name": source.name,
+                "source_backup_receipt_digest": str(
+                    trusted_backup_receipt["receipt_digest"]
+                ),
+                "snapshot_revision": str(inspection["snapshot_revision"]),
+                "mode": "isolated-candidate",
+                "verified": True,
+                "created_at": created_at,
+            }
+            self._authenticate_receipt(restore_receipt)
+            self._write_private_json_exclusive(
+                restore_receipt_path,
+                restore_receipt,
+            )
+            receipt_published = True
+            temporary.unlink()
+            self._fsync_directory(target.parent)
+            return {
+                "action": "restore-backup",
+                "mode": "isolated-candidate",
+                "backup_path": str(source),
+                "restore_path": str(target),
+                "restore_receipt_path": str(restore_receipt_path),
+                "restore_receipt_schema": BACKUP_RESTORE_RECEIPT_SCHEMA,
+                "sha256": final_digest,
+                "size_bytes": final_size,
+                "snapshot_revision": str(inspection["snapshot_revision"]),
+                "quick_check": inspection["quick_check"],
+                "integrity_check": inspection["integrity_check"],
+                "verified": True,
+                "created_at": created_at,
+            }
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            if receipt_published:
+                restore_receipt_path.unlink(missing_ok=True)
+            if published:
+                target.unlink(missing_ok=True)
+            try:
+                self._fsync_directory(target.parent)
+            except OSError:
+                LOGGER.exception("failed to fsync restore directory after cleanup")
+            LOGGER.exception("failed to materialize verified backup restore")
             raise
 
     def _row_to_entry(self, row: sqlite3.Row) -> dict[str, Any]:

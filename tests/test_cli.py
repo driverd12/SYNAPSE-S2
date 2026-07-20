@@ -10,6 +10,7 @@ from unittest import mock
 
 from memory_store import DurableMemoryStore
 from mlx_backend import SpikingAttentionBackend
+from capture_daemon import CaptureInboxDaemon
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -314,6 +315,84 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(json.loads(repaired.stdout)["repaired_memory_count"], 1)
         self.assertEqual(verified.returncode, 0, verified.stderr)
         self.assertEqual(json.loads(verified.stdout)["status"], "ready")
+
+    def test_cli_capture_ledger_integrity_requires_a_reviewed_repair(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state.json"
+            memory_path = root / "memory.sqlite3"
+            DurableMemoryStore(memory_path)
+            CaptureInboxDaemon(root=root).status()
+
+            audit = self.run_cli(
+                "capture-ledger-integrity",
+                "--capture-root",
+                str(root),
+                "--sample-limit",
+                "7",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            audit_payload = json.loads(audit.stdout)
+            unconfirmed = self.run_cli(
+                "capture-ledger-integrity",
+                "--capture-root",
+                str(root),
+                "--repair",
+                "--expected-revision",
+                audit_payload["audit_revision"],
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            missing_revision = self.run_cli(
+                "capture-ledger-integrity",
+                "--capture-root",
+                str(root),
+                "--repair",
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            repaired = self.run_cli(
+                "capture-ledger-integrity",
+                "--capture-root",
+                str(root),
+                "--sample-limit",
+                "7",
+                "--repair",
+                "--confirm",
+                "--expected-revision",
+                audit_payload["audit_revision"],
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(audit.returncode, 0, audit.stderr)
+        self.assertEqual(audit_payload["action"], "capture-ledger-audit")
+        self.assertEqual(audit_payload["status"], "ready")
+        self.assertEqual(audit_payload["sample_limit"], 7)
+        rendered_audit = json.dumps(audit_payload, sort_keys=True)
+        for private_field in (
+            '"_candidates"',
+            '"file_sha256"',
+            '"relative_path"',
+            '"request_fingerprint"',
+        ):
+            self.assertNotIn(private_field, rendered_audit)
+
+        self.assertEqual(unconfirmed.returncode, 1, unconfirmed.stderr)
+        self.assertIn("requires confirm=True", unconfirmed.stdout)
+        self.assertEqual(missing_revision.returncode, 1, missing_revision.stderr)
+        self.assertIn("reviewed 64-character audit revision", missing_revision.stdout)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        repaired_payload = json.loads(repaired.stdout)
+        self.assertEqual(repaired_payload["action"], "capture-ledger-repair")
+        self.assertEqual(repaired_payload["state"], "no-repair-needed")
+        self.assertTrue(repaired_payload["repair_confirmed"])
+        self.assertEqual(
+            repaired_payload["expected_revision"],
+            audit_payload["audit_revision"],
+        )
 
     def test_cli_remembers_queries_and_toggles_text_context(self):
         with TemporaryDirectory() as tmp:
@@ -808,6 +887,71 @@ class SynapseCliTests(unittest.TestCase):
         self.assertTrue(all(result.returncode == 1 for result in results))
         self.assertNotIn(marker, rendered)
         self.assertTrue(all(not output.exists() for output in outputs))
+
+    def test_cli_database_only_backup_rejects_verified_bundle_lane(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state.json"
+            memory_path = root / "memory.sqlite3"
+            verified_directory = root / "backups" / "verified"
+            verified_directory.mkdir(mode=0o700, parents=True)
+            output = verified_directory / "database-only.sqlite3"
+
+            result = self.run_cli(
+                "backup-memory",
+                "--output",
+                str(output),
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            rendered = result.stdout + result.stderr
+            self.assertRegex(
+                rendered.lower(),
+                r"verified|paired|reserved|database-only|recovery lane",
+            )
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_name(output.name + ".receipt.json").exists())
+
+    def test_cli_paired_recovery_and_retention_plan_are_operational(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state.json"
+            memory_path = root / "memory.sqlite3"
+            CaptureInboxDaemon(root=root).status()
+            backup = self.run_cli(
+                "backup-recovery",
+                "--capture-root",
+                str(root),
+                "--purpose",
+                "cli-test",
+                "--pinned",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            plan = self.run_cli(
+                "recovery-retention-plan",
+                "--keep-latest",
+                "1",
+                "--max-age-days",
+                "0",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(backup.returncode, 0, backup.stderr)
+        self.assertEqual(plan.returncode, 0, plan.stderr)
+        backup_payload = json.loads(backup.stdout)
+        plan_payload = json.loads(plan.stdout)
+        self.assertTrue(backup_payload["bundle_verified"])
+        self.assertTrue(backup_payload["cutover_ready"])
+        self.assertTrue(
+            backup_payload["capture_ledger_binding"]["verified"]
+        )
+        self.assertEqual(plan_payload["verified_bundle_count"], 1)
+        self.assertEqual(plan_payload["retire_bundle_count"], 0)
+        self.assertTrue(plan_payload["apply_permitted"])
 
     def test_cli_preflight_can_require_native_certification(self):
         with TemporaryDirectory() as tmp:

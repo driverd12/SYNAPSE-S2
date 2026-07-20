@@ -241,6 +241,32 @@ def _optional_output_path(
     return str(resolved_candidate)
 
 
+def _required_output_directory(output_path: str | None) -> str:
+    value = str(output_path or "").strip()
+    if not value:
+        raise ValueError("output_directory is required")
+    if len(value) > 4096:
+        raise ValueError("output_directory exceeds 4096 characters")
+    value = reject_sensitive_identifier(value, field="output_directory")
+    export_root = Path(os.getenv("SYNAPSE_S2_EXPORT_DIR", ".synapse_s2")).expanduser()
+    if not export_root.is_absolute():
+        export_root = Path.cwd() / export_root
+    resolved_root = export_root.resolve()
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    resolved_candidate = candidate.resolve()
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"output_directory must stay within export root {resolved_root}"
+        ) from exc
+    if resolved_candidate == resolved_root:
+        raise ValueError("output_directory must be a new child of the export root")
+    return str(resolved_candidate)
+
+
 def _load_backend():
     import mlx.core as mx
     import mlx_backend
@@ -1845,7 +1871,7 @@ def export_spiking_memory(
 
 @mcp.tool()
 def backup_spiking_memory(output_path: str = "") -> str:
-    """Create a SQLite backup of the durable SYNAPSE-S2 memory store."""
+    """Create a segregated SQLite-only diagnostic, not a recovery point."""
     try:
         path = _optional_output_path(
             output_path,
@@ -1860,6 +1886,251 @@ def backup_spiking_memory(output_path: str = "") -> str:
     except Exception as exc:
         LOGGER.exception("memory backup failed")
         return json.dumps({"error": _public_error("memory backup failed", exc)}, sort_keys=True)
+
+
+@mcp.tool()
+def audit_capture_ledger_integrity(sample_limit: int = 20) -> str:
+    """Audit processed capture.v2 payloads against the authoritative SQLite ledger."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.audit_capture_ledger(sample_limit=sample_limit)
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid capture ledger audit request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid capture ledger audit request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("capture ledger audit failed")
+        return json.dumps(
+            {"error": _public_error("capture ledger audit failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def repair_capture_ledger_integrity(
+    expected_revision: str,
+    confirm: bool = False,
+    sample_limit: int = 20,
+) -> str:
+    """Apply a reviewed historical ledger projection without replaying captures."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.repair_capture_ledger(
+            confirm=bool(confirm),
+            expected_revision=expected_revision,
+            sample_limit=sample_limit,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid capture ledger repair request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid capture ledger repair request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("capture ledger repair failed")
+        return json.dumps(
+            {"error": _public_error("capture ledger repair failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def backup_spiking_recovery(
+    output_path: str = "",
+    purpose: str = "operator",
+    pinned: bool = False,
+) -> str:
+    """Create and verify a signed SQLite plus exactly-once capture recovery bundle."""
+    try:
+        path = _optional_output_path(
+            output_path,
+            allowed_suffixes={".db", ".sqlite", ".sqlite3"},
+        )
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.backup_recovery_bundle(
+            path=path,
+            purpose=purpose,
+            pinned=bool(pinned),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid recovery backup request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid recovery backup request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("recovery backup failed")
+        return json.dumps(
+            {"error": _public_error("recovery backup failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def verify_spiking_recovery(
+    receipt_path: str,
+    expected_database_sha256: str = "",
+    expected_capture_sha256: str = "",
+) -> str:
+    """Cryptographically verify a paired recovery bundle without restoring it."""
+    try:
+        receipt = _optional_output_path(
+            receipt_path,
+            allowed_suffixes={".json"},
+        )
+        if receipt is None:
+            raise ValueError("receipt_path is required")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.verify_recovery_bundle(
+            receipt,
+            expected_database_sha256=expected_database_sha256 or None,
+            expected_capture_sha256=expected_capture_sha256 or None,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid recovery verification request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid recovery verification request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("recovery verification failed")
+        return json.dumps(
+            {"error": _public_error("recovery verification failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def restore_spiking_recovery_proof(
+    receipt_path: str,
+    output_directory: str,
+    expected_database_sha256: str = "",
+    expected_capture_sha256: str = "",
+    confirm: bool = False,
+) -> str:
+    """Materialize an isolated paired restore proof; never overwrite live state."""
+    try:
+        receipt = _optional_output_path(
+            receipt_path,
+            allowed_suffixes={".json"},
+        )
+        if receipt is None:
+            raise ValueError("receipt_path is required")
+        output_root = _required_output_directory(output_directory)
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.restore_recovery_bundle_isolated(
+            receipt,
+            output_root,
+            expected_database_sha256=expected_database_sha256 or None,
+            expected_capture_sha256=expected_capture_sha256 or None,
+            confirm=bool(confirm),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid recovery restore request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid recovery restore request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("recovery restore failed")
+        return json.dumps(
+            {"error": _public_error("recovery restore failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def plan_spiking_recovery_retention(
+    keep_latest: int = 7,
+    max_age_days: float = 30.0,
+) -> str:
+    """Plan safe retention for verified default recovery bundles without moving files."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.plan_recovery_retention(
+            keep_latest=keep_latest,
+            max_age_days=max_age_days,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid recovery retention plan request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid recovery retention plan request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("recovery retention planning failed")
+        return json.dumps(
+            {"error": _public_error("recovery retention planning failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def apply_spiking_recovery_retention(
+    plan_token: str,
+    cutoff_created_at: float,
+    keep_latest: int = 7,
+    max_age_days: float = 30.0,
+    confirm: bool = False,
+) -> str:
+    """Move only a previously planned stale recovery set into signed quarantine."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.apply_recovery_retention(
+            plan_token=plan_token,
+            cutoff_created_at=cutoff_created_at,
+            keep_latest=keep_latest,
+            max_age_days=max_age_days,
+            confirm=bool(confirm),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid recovery retention apply request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid recovery retention apply request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("recovery retention apply failed")
+        return json.dumps(
+            {"error": _public_error("recovery retention apply failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool()
+def restore_retired_spiking_recovery(
+    plan_token: str,
+    confirm: bool = False,
+) -> str:
+    """Restore a quarantined recovery bundle set without overwriting live state."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.restore_retired_recovery(
+            plan_token=plan_token,
+            confirm=bool(confirm),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid retired recovery restore request: %s", exc)
+        return json.dumps(
+            {"error": _public_error("invalid retired recovery restore request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("retired recovery restore failed")
+        return json.dumps(
+            {"error": _public_error("retired recovery restore failed", exc)},
+            sort_keys=True,
+        )
 
 
 @mcp.tool()

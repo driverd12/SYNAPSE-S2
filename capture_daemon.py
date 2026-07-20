@@ -540,10 +540,22 @@ def write_capture_drop(
         f"{canonical_capture_id}-{secrets.token_hex(6)}.json"
     )
     output_path = inbox_dir / filename
-    _atomic_write_private_text(
-        output_path,
-        json.dumps(payload, indent=2, sort_keys=True),
-    )
+    lock_dir = capture_root / "capture_locks"
+    _ensure_private_dir(lock_dir, tighten_existing=True)
+    # Recovery bundles take the same exclusive gate as the daemon.  Producers
+    # must join that gate too, otherwise an inbox payload can appear between
+    # the database snapshot and capture-transport manifest.
+    daemon = CaptureInboxDaemon(root=capture_root)
+    with daemon._exclusive_lock(
+        lock_dir / GLOBAL_CAPTURE_LOCK,
+        blocking=True,
+    ) as acquired:
+        if not acquired:
+            raise RuntimeError("capture maintenance lock is unavailable")
+        _atomic_write_private_text(
+            output_path,
+            json.dumps(payload, indent=2, sort_keys=True),
+        )
     return output_path
 
 

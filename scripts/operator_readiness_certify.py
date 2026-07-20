@@ -48,6 +48,10 @@ REQUIRED_PROOFS = [
     "recall",
     "app_preview",
     "wrap_session",
+    "capture_ledger_audit",
+    "recovery_backup",
+    "recovery_verify",
+    "recovery_restore",
     "dashboard",
 ]
 
@@ -462,6 +466,7 @@ class OperatorReadinessCertifier:
         self._check_recall(memory)
         self._check_app_preview()
         self._check_wrap_session()
+        self._check_recovery()
         self._check_dashboard()
         return self._finalize()
 
@@ -1212,6 +1217,344 @@ class OperatorReadinessCertifier:
             evaluator=evaluate,
         )
 
+    def _check_recovery(self) -> None:
+        def binding_proof(parsed: dict[str, Any]) -> dict[str, Any]:
+            value = parsed.get("capture_ledger_binding")
+            return dict(value) if isinstance(value, dict) else {}
+
+        def binding_proof_ready(value: dict[str, Any]) -> bool:
+            count = value.get("verified_capture_count")
+            return (
+                value.get("schema")
+                == "synapse-s2.capture-ledger-binding-proof.v1"
+                and value.get("verified") is True
+                and type(count) is int
+                and int(count) >= 0
+                and re.fullmatch(r"[0-9a-f]{64}", str(value.get("revision") or ""))
+                is not None
+            )
+
+        def ledger_audit_evaluate(
+            returncode: int,
+            parsed: Any,
+            stdout: str,
+            stderr: str,
+        ):
+            if returncode != 0 or not isinstance(parsed, dict):
+                return (
+                    "blocked",
+                    compact_text(
+                        stderr or stdout or "capture ledger integrity audit failed"
+                    ),
+                    "Run capture-ledger-integrity directly and resolve its read-only audit failure before creating a recovery point.",
+                    {},
+                )
+            missing_count = int(
+                parsed.get("missing_authoritative_ledger_count") or 0
+            )
+            mismatch_count = int(parsed.get("ledger_binding_mismatch_count") or 0)
+            blocked_count = int(parsed.get("blocked_capture_count") or 0)
+            audit_revision = str(parsed.get("audit_revision") or "")
+            ready = (
+                parsed.get("action") == "capture-ledger-audit"
+                and parsed.get("status") == "ready"
+                and bool(parsed.get("verification_passed"))
+                and re.fullmatch(r"[0-9a-f]{64}", audit_revision) is not None
+                and missing_count == 0
+                and mismatch_count == 0
+                and blocked_count == 0
+            )
+            if ready:
+                return (
+                    "ready",
+                    "Processed capture.v2 evidence matches the authoritative SQLite capture ledger.",
+                    "",
+                    {
+                        "status": "ready",
+                        "audit_revision": audit_revision,
+                        "processed_v2_capture_count": int(
+                            parsed.get("processed_v2_capture_count") or 0
+                        ),
+                        "ledger_capture_count": int(
+                            parsed.get("ledger_capture_count") or 0
+                        ),
+                        "missing_authoritative_ledger_count": 0,
+                        "ledger_binding_mismatch_count": 0,
+                        "blocked_capture_count": 0,
+                    },
+                )
+            if bool(parsed.get("repairable")) and missing_count > 0:
+                repair = (
+                    "Review this check's finding samples and audit_revision, then run "
+                    "capture-ledger-integrity --repair --confirm --expected-revision "
+                    "'<audit_revision>'; rerun the read-only audit before certification."
+                )
+            else:
+                repair = (
+                    "Do not replay capture files or synthesize receipts. Resolve ambiguous "
+                    "evidence or restore a verified paired recovery point, then rerun the audit."
+                )
+            return (
+                "blocked",
+                (
+                    "Capture ledger is not authoritative: "
+                    f"missing={missing_count}, mismatched={mismatch_count}, "
+                    f"blocked={blocked_count}."
+                ),
+                repair,
+                {
+                    "status": parsed.get("status"),
+                    "audit_revision": audit_revision,
+                    "repairable": bool(parsed.get("repairable")),
+                    "repairable_capture_count": int(
+                        parsed.get("repairable_capture_count") or 0
+                    ),
+                    "missing_authoritative_ledger_count": missing_count,
+                    "ledger_binding_mismatch_count": mismatch_count,
+                    "blocked_capture_count": blocked_count,
+                },
+            )
+
+        ledger_audit = self._run_command(
+            "capture_ledger_audit",
+            label="Capture ledger integrity audit",
+            command=self._cli_command(
+                "capture-ledger-integrity",
+                "--capture-root",
+                str(ROOT / ".synapse_s2"),
+                "--sample-limit",
+                "20",
+            ),
+            required=True,
+            timeout=300,
+            evaluator=ledger_audit_evaluate,
+        )
+        if ledger_audit.status != "ready":
+            for check_id, label in (
+                ("recovery_backup", "Paired recovery backup"),
+                ("recovery_verify", "Recovery bundle verification"),
+                ("recovery_restore", "Isolated recovery drill"),
+            ):
+                self._record_manual(
+                    check_id,
+                    label=label,
+                    status="blocked",
+                    required=True,
+                    detail=(
+                        "Skipped because capture-ledger integrity did not pass its "
+                        "read-only authority gate."
+                    ),
+                    repair="Repair and re-audit the capture ledger before creating recovery artifacts.",
+                )
+            return
+
+        recovery_root = ROOT / ".synapse_s2" / "backups" / "verified"
+        ensure_private_directory(recovery_root)
+        database_path = recovery_root / (
+            f"readiness-{safe_filename(self.run_id)}.sqlite3"
+        )
+
+        def backup_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
+            if returncode != 0 or not isinstance(parsed, dict):
+                return (
+                    "blocked",
+                    compact_text(stderr or stdout or "paired recovery backup failed"),
+                    "Resolve backup integrity, capture transport, free-space, and signing-authority errors.",
+                    {},
+                )
+            binding = binding_proof(parsed)
+            if (
+                not parsed.get("bundle_verified")
+                or not parsed.get("cutover_ready")
+                or not binding_proof_ready(binding)
+            ):
+                return (
+                    "blocked",
+                    "Recovery artifacts were created but are not verified and immediately cutover-ready.",
+                    "Drain or reconcile replay-required capture files, then rerun certification.",
+                    {
+                        "bundle_verified": bool(parsed.get("bundle_verified")),
+                        "cutover_ready": bool(parsed.get("cutover_ready")),
+                        "capture_ledger_binding": binding,
+                        "reconciliation": parsed.get("reconciliation", {}),
+                    },
+                )
+            return (
+                "ready",
+                "Created a signed paired SQLite and exactly-once capture recovery point.",
+                "",
+                {
+                    "bundle_verified": True,
+                    "cutover_ready": True,
+                    "capture_file_count": int(parsed.get("capture_file_count") or 0),
+                    "capture_ledger_binding": binding,
+                    "reconciliation": parsed.get("reconciliation", {}),
+                },
+            )
+
+        backup_result = self._run_command(
+            "recovery_backup",
+            label="Paired recovery backup",
+            command=self._cli_command(
+                "backup-recovery",
+                "--output",
+                str(database_path),
+                "--capture-root",
+                str(ROOT / ".synapse_s2"),
+                "--purpose",
+                "operator-readiness",
+                "--pinned",
+            ),
+            required=True,
+            timeout=300,
+            evaluator=backup_evaluate,
+        )
+        backup = backup_result.parsed if isinstance(backup_result.parsed, dict) else {}
+        expected_binding_proof = binding_proof(backup)
+        receipt_path = str(backup.get("bundle_receipt_path") or "")
+        if backup_result.status != "ready" or not receipt_path:
+            for check_id, label in (
+                ("recovery_verify", "Recovery bundle verification"),
+                ("recovery_restore", "Isolated recovery drill"),
+            ):
+                self._record_manual(
+                    check_id,
+                    label=label,
+                    status="blocked",
+                    required=True,
+                    detail="Skipped because paired recovery backup did not produce a trusted receipt.",
+                    repair="Repair the paired recovery backup gate first.",
+                )
+            return
+
+        def verify_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
+            if returncode != 0 or not isinstance(parsed, dict):
+                return (
+                    "blocked",
+                    compact_text(stderr or stdout or "recovery verification failed"),
+                    "Inspect the signed bundle receipt and all four bound artifacts.",
+                    {},
+                )
+            binding = binding_proof(parsed)
+            ready = (
+                bool(parsed.get("verified"))
+                and bool(parsed.get("cutover_ready"))
+                and binding_proof_ready(binding)
+                and binding == expected_binding_proof
+            )
+            return (
+                "ready" if ready else "blocked",
+                (
+                    "Reverified the signed database, capture archive, schema contract, and replay state."
+                    if ready
+                    else "Recovery bundle verification did not prove immediate cutover readiness."
+                ),
+                "" if ready else "Inspect signed reconciliation and replay-required files.",
+                {
+                    "verified": bool(parsed.get("verified")),
+                    "cutover_ready": bool(parsed.get("cutover_ready")),
+                    "reconciliation": parsed.get("reconciliation", {}),
+                    "capture_ledger_binding": binding,
+                },
+            )
+
+        verify_result = self._run_command(
+            "recovery_verify",
+            label="Recovery bundle verification",
+            command=self._cli_command(
+                "verify-recovery",
+                "--receipt",
+                receipt_path,
+                "--capture-root",
+                str(ROOT / ".synapse_s2"),
+            ),
+            required=True,
+            timeout=300,
+            evaluator=verify_evaluate,
+        )
+        if verify_result.status != "ready":
+            self._record_manual(
+                "recovery_restore",
+                label="Isolated recovery drill",
+                status="blocked",
+                required=True,
+                detail="Skipped because cryptographic recovery verification failed.",
+                repair="Repair the recovery verification gate first.",
+            )
+            return
+
+        staging_root = ROOT / ".synapse_s2" / "recovery-staging"
+        ensure_private_directory(staging_root)
+
+        def restore_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
+            if returncode != 0 or not isinstance(parsed, dict):
+                return (
+                    "blocked",
+                    compact_text(stderr or stdout or "isolated recovery drill failed"),
+                    "Inspect restore proof, capture ledger reconciliation, and available disk space.",
+                    {},
+                )
+            binding = binding_proof(parsed)
+            ready = (
+                bool(parsed.get("verified"))
+                and bool(parsed.get("cutover_ready"))
+                and binding_proof_ready(binding)
+                and binding == expected_binding_proof
+            )
+            return (
+                "ready" if ready else "blocked",
+                (
+                    "Materialized and verified an isolated paired restore without touching live state."
+                    if ready
+                    else "Isolated restore completed but is not immediately cutover-ready."
+                ),
+                "" if ready else "Resolve replay-required capture debt before cutover.",
+                {
+                    "verified": bool(parsed.get("verified")),
+                    "cutover_ready": bool(parsed.get("cutover_ready")),
+                    "capture_file_count": int(parsed.get("capture_file_count") or 0),
+                    "missing_transport_ledger_count": int(
+                        parsed.get("missing_transport_ledger_count") or 0
+                    ),
+                    "reconciliation": parsed.get("reconciliation", {}),
+                    "capture_ledger_binding": binding,
+                },
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix=f"readiness-{safe_filename(self.run_id)}-",
+            dir=staging_root,
+        ) as temporary:
+            restore_root = Path(temporary) / "isolated-restore"
+            restore_result = self._run_command(
+                "recovery_restore",
+                label="Isolated recovery drill",
+                command=self._cli_command(
+                    "restore-recovery-proof",
+                    "--receipt",
+                    receipt_path,
+                    "--output-root",
+                    str(restore_root),
+                    "--capture-root",
+                    str(ROOT / ".synapse_s2"),
+                    "--confirm",
+                ),
+                required=True,
+                timeout=300,
+                evaluator=restore_evaluate,
+            )
+            if restore_result.status == "ready" and isinstance(
+                restore_result.parsed, dict
+            ):
+                proof_path = Path(
+                    str(restore_result.parsed.get("recovery_proof_path") or "")
+                )
+                if proof_path.is_file() and not proof_path.is_symlink():
+                    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+                    durable_proof = self.artifact_dir / "recovery_restore_proof.receipt.json"
+                    self._write_json(durable_proof, proof)
+                    restore_result.artifact_paths["recovery_proof"] = str(durable_proof)
+
     def _check_dashboard(self) -> None:
         def smoke_eval(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0 or not isinstance(parsed, dict):
@@ -1452,6 +1795,8 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         "- Recall finds that same readiness trace.",
         "- App Connect attach and preview produce quality/capability badges without writing memory.",
         "- Wrap Session persists a factual handoff memory.",
+        "- Processed capture.v2 evidence passes a read-only audit against the authoritative SQLite capture ledger.",
+        "- A signed paired database plus capture recovery point is created, reverified, and restored into an isolated staging directory.",
         "- The loopback dashboard page, assets, and snapshot API load without known warning text.",
         "",
         "If the overall status is not `ready`, open `summary.md`, complete the repair plan, and rerun this command. Do not treat a degraded pack as a success claim.",

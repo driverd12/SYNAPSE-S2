@@ -7,7 +7,7 @@ This is the fast operator path for using SYNAPSE-S2 from this Mac tomorrow.
 Run this first when the question is "can we trust SYNAPSE-S2 for real work right now?"
 
 ```bash
-cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture"
+cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
 .venv/bin/python scripts/operator_readiness_certify.py \
   --context default \
   --agent-id codex-desktop \
@@ -21,11 +21,11 @@ The detailed certification runbook is `docs/OPERATOR_READINESS_CERTIFICATION.md`
 ## One-command install and preflight
 
 ```bash
-cd "/Users/dan.driver/Documents/Neuromorphic Spiking Attention Plugin for Local AI Clients: An Apple Silicon Optimized MCP Architecture"
+cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
 scripts/prep_tomorrow.sh
 ```
 
-The prep script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, writes a native certification evidence payload, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a SQLite backup into `.synapse_s2`.
+The prep script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, writes a native certification evidence payload, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a signed paired SQLite plus exactly-once capture recovery point into `.synapse_s2/backups/verified`.
 
 For an audit pass that avoids installs, memory writes, inbox processing, MCP wrapper launches, dashboard smoke, maintenance, and backup writes:
 
@@ -363,17 +363,89 @@ Embedding provider provenance:
 
 The benchmark should report `embedding_provider.provider: mlx-neural-v1`, `model_id: mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`, and `native_mlx: true`. First run may include model download or cache load cost; warm in-process runs should show the steady-state embedding latency. The memory entry metadata should carry the same neural provider provenance. For deterministic no-model fallback, set `--embedding-provider semantic-hash`; for an IT-managed local encoder, set `--embedding-provider python:/absolute/path/encoder.py:embed` or `SYNAPSE_S2_EMBEDDING_PROVIDER` to the same value.
 
-Backup:
+Audit capture-ledger authority before backup:
 
 ```bash
-.venv/bin/python synapse_cli.py --json backup-memory \
-  --output ".synapse_s2/manual-memory-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2
 ```
 
-Backup destinations are exclusive: an existing file is never replaced. Every
-successful receipt includes a SHA-256 digest, size, `quick_check: ["ok"]`, and
-zero foreign-key errors. Restore proof is a separate Phase 5 gate; a copied file
-alone is not a verified recovery.
+Proceed only when the result is `ready`, `verification_passed` is true, and the
+missing, mismatch, and blocked counts are zero. If the audit reports a bounded
+legacy cohort with `repairable: true`, review the samples and exact revision,
+then run the separately confirmed repair and repeat the read-only audit:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2 \
+  --repair --confirm \
+  --expected-revision '<audit_revision>'
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root .synapse_s2
+```
+
+This repair does not replay capture text or graph effects and does not synthesize
+a capture receipt or context-delivery acknowledgement. It projects the canonical
+request fingerprint from the surviving redacted payload, uses the durable
+conversation-capture deployment timestamp for historical completion, and writes
+only missing compact ledger rows plus one content-free maintenance receipt after
+a verified safety backup. Any stale revision or ambiguous/modern-v2 loss fails
+closed.
+
+Create the recovery point only after that gate is ready:
+
+```bash
+.venv/bin/python synapse_cli.py --json backup-recovery \
+  --output ".synapse_s2/backups/verified/manual-recovery-$(date +%Y%m%d-%H%M%S).sqlite3" \
+  --capture-root .synapse_s2 \
+  --purpose manual \
+  --pinned
+```
+
+Recovery destinations are exclusive: existing files are never replaced. A
+successful result binds and verifies four artifacts—the SQLite snapshot, its
+signed receipt, the exactly-once capture archive, and the signed bundle receipt.
+`cutover_ready: true` means the signed reconciliation found no replay-required
+transport debt and independent verification reproduced the processed-request
+ledger binding. Review `capture_ledger_binding.verified`,
+`verified_capture_count`, and `revision`; matching IDs/counts without that proof
+do not qualify. `backup-memory` remains a database-only diagnostic and is not a
+complete recovery point.
+
+Before relying on a recovery point, run both read-only verification and an
+isolated restore drill:
+
+```bash
+.venv/bin/python synapse_cli.py --json verify-recovery \
+  --receipt ".synapse_s2/backups/verified/<bundle>.bundle.receipt.json"
+.venv/bin/python synapse_cli.py --json restore-recovery-proof \
+  --receipt ".synapse_s2/backups/verified/<bundle>.bundle.receipt.json" \
+  --output-root ".synapse_s2/recovery-staging/manual-proof-$(date +%Y%m%d-%H%M%S)" \
+  --confirm
+```
+
+The restore proof must reproduce the same content-free
+`capture_ledger_binding` count/revision returned by `verify-recovery`; raw
+request fingerprints, metadata, and archive paths are never exposed in it.
+
+To retire old verified bundles, first persist a signed exact-inventory plan,
+review every protected/retiring disposition, and then apply that same plan with
+confirmation:
+
+```bash
+.venv/bin/python synapse_cli.py --json recovery-retention-plan \
+  --keep-latest 7 --max-age-days 30
+.venv/bin/python synapse_cli.py --json recovery-retention-apply \
+  --plan-token "<plan_token>" \
+  --cutoff-created-at "<cutoff_created_at>" \
+  --keep-latest 7 --max-age-days 30 --confirm
+```
+
+Apply only moves complete bundles into private same-filesystem quarantine. It
+never deletes them, so it does not reclaim disk space. Reverse a committed plan
+with `recovery-retention-restore --plan-token <plan_token> --confirm`. Isolated
+restore proof never overwrites live state; do not improvise a live cutover while
+independent writers are running.
 
 Proposal lifecycle smoke:
 
@@ -472,7 +544,15 @@ Useful tool calls:
 | `get_spiking_cortex_state` | Shows active governed sessions and typed cortical memory. |
 | `profile_spiking_resources` | Shows topology footprint and optional quick-pruning benchmark. |
 | `certify_spiking_runtime` | Emits native MLX/mlxsnn/provider/envelope certification evidence. |
-| `backup_spiking_memory` | Writes a guarded SQLite backup under `.synapse_s2`. |
+| `backup_spiking_memory` | Writes a segregated SQLite-only diagnostic snapshot; not a complete recovery point. |
+| `audit_capture_ledger_integrity` | Audits processed capture.v2 evidence against authoritative SQLite ledger bindings without mutation. |
+| `repair_capture_ledger_integrity` | Applies only a reviewed, revision-bound legacy ledger projection; never replays graph effects or synthesizes transport receipts. |
+| `backup_spiking_recovery` | Creates and verifies a signed paired SQLite plus exactly-once capture recovery point. |
+| `verify_spiking_recovery` | Reverifies all four bound artifacts and the signed reconciliation. |
+| `restore_spiking_recovery_proof` | Materializes an isolated restore proof without touching live state. |
+| `plan_spiking_recovery_retention` | Persists a signed, expiring, exact-inventory retention plan. |
+| `apply_spiking_recovery_retention` | Reversibly quarantines the exact planned stale bundles after confirmation. |
+| `restore_retired_spiking_recovery` | Restores a quarantined plan and reverifies every bundle. |
 | `trigger_idle_maintenance` | Forces or checks maintenance from MCP Inspector. |
 
 ## Proposal compliance
@@ -496,5 +576,9 @@ The matrix maps each proposal requirement to implementation evidence and separat
 | `.synapse_s2/capture_error_archive` | Private governed archive of reviewed terminal or sanitized historical error evidence. |
 | `.synapse_s2/capture_error_resolutions` | Private crash-recoverable manifests for capture-error archival operations. |
 | `.synapse_s2/capture-daemon.log` | Capture sidecar stderr/stdout log. |
-| `.synapse_s2/*backup*.sqlite3` | Local backups. |
+| `.synapse_s2/backups/verified` | Signed paired recovery bundles eligible for verification and isolated restore proof. |
+| `.synapse_s2/backups/database-only` | SQLite-only diagnostic snapshots; never substitute these for paired recovery. |
+| `.synapse_s2/backups/retired` | Reversible per-plan quarantine; no automatic purge or disk reclamation. |
+| `.synapse_s2/backups/retention-plans` | Signed expiring exact-inventory retention plans. |
+| `.synapse_s2/backups/retirement-journals` | Signed prepared/completed/recovered/restore receipts for crash recovery and idempotency. |
 | `/Users/dan.driver/.local/bin/synapse-s2-mcp` | Launcher used by Codex, FastMCP, and inspector tools. |
