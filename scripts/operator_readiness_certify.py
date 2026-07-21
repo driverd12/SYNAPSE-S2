@@ -8,7 +8,9 @@ import math
 import os
 import platform
 import re
+import secrets
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -239,16 +241,246 @@ def write_private_text(path: Path, text: str) -> None:
             pass
 
 
+def _private_file_identity(observed: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(observed.st_dev),
+        int(observed.st_ino),
+        int(observed.st_mode),
+        int(observed.st_uid),
+        int(observed.st_nlink),
+        int(observed.st_size),
+        int(observed.st_mtime_ns),
+        int(observed.st_ctime_ns),
+    )
+
+
+def _open_private_parent_nofollow(path: Path) -> tuple[Path, int]:
+    """Anchor every path component and return an owner-private parent fd."""
+
+    candidate = Path(path)
+    if (
+        not candidate.is_absolute()
+        or "\x00" in str(candidate)
+        or ".." in candidate.parts
+        or Path(os.path.normpath(str(candidate))) != candidate
+        or len(candidate.parts) < 2
+    ):
+        raise ValueError("signed evidence path must be normal and absolute")
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("signed evidence requires no-follow directory opens")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+    )
+    descriptor = os.open(candidate.anchor, directory_flags)
+    try:
+        for component in candidate.parts[1:-1]:
+            next_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        parent = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid()
+            or stat.S_IMODE(parent.st_mode) != 0o700
+        ):
+            raise ValueError("signed evidence parent must be owner-private")
+        return candidate, descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def read_private_regular_bytes(path: Path, *, max_bytes: int) -> bytes:
+    """Read one exact-0600 file through anchored, stable no-follow fds."""
+
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("signed evidence size limit must be positive")
+    candidate, parent_descriptor = _open_private_parent_nofollow(path)
+    descriptor = -1
+    try:
+        before = os.stat(
+            candidate.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size < 0
+            or before.st_size > max_bytes
+        ):
+            raise ValueError(
+                "signed evidence source must be one bounded private regular file"
+            )
+        descriptor = os.open(
+            candidate.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        identity = _private_file_identity(before)
+        if _private_file_identity(opened) != identity:
+            raise ValueError("signed evidence source changed before open")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after_descriptor = os.fstat(descriptor)
+        after_path = os.stat(
+            candidate.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            len(payload) != before.st_size
+            or len(payload) > max_bytes
+            or _private_file_identity(after_descriptor) != identity
+            or _private_file_identity(after_path) != identity
+        ):
+            raise ValueError("signed evidence source changed during read")
+        return payload
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def write_private_bytes(path: Path, payload: bytes) -> None:
+    """Publish exact bytes once through an anchored owner-private directory."""
+
+    candidate = Path(path)
+    ensure_private_directory(candidate.parent)
+    candidate, parent_descriptor = _open_private_parent_nofollow(candidate)
+    temporary_name = f".{candidate.name}.{secrets.token_hex(16)}.tmp"
+    descriptor = -1
+    published = False
+    completed = False
+    staged: os.stat_result | None = None
+    try:
+        try:
+            os.stat(
+                candidate.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                "signed evidence artifact already exists; refusing to overwrite it"
+            )
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("signed evidence artifact write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        staged = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(staged.st_mode)
+            or staged.st_uid != os.getuid()
+            or staged.st_nlink != 1
+            or stat.S_IMODE(staged.st_mode) != 0o600
+            or staged.st_size != len(payload)
+        ):
+            raise ValueError("signed evidence staging file is not private and exact")
+        os.link(
+            temporary_name,
+            candidate.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        published = True
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        published_stat = os.stat(
+            candidate.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(published_stat.st_mode)
+            or published_stat.st_uid != os.getuid()
+            or published_stat.st_nlink != 1
+            or stat.S_IMODE(published_stat.st_mode) != 0o600
+            or published_stat.st_size != len(payload)
+            or (published_stat.st_dev, published_stat.st_ino)
+            != (staged.st_dev, staged.st_ino)
+        ):
+            raise ValueError("signed evidence artifact publication is not exact")
+        os.fsync(parent_descriptor)
+        completed = True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        if published and not completed and staged is not None:
+            try:
+                visible = os.stat(
+                    candidate.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (visible.st_dev, visible.st_ino) == (
+                    staged.st_dev,
+                    staged.st_ino,
+                ):
+                    os.unlink(candidate.name, dir_fd=parent_descriptor)
+                    os.fsync(parent_descriptor)
+            except FileNotFoundError:
+                pass
+        os.close(parent_descriptor)
+
+
 def write_private_evidence_zip(
     archive_path: Path,
     *,
     pack_dir: Path,
     members: set[Path],
+    opaque_members: set[Path] | None = None,
     virtual_json_members: dict[str, Any] | None = None,
 ) -> None:
     """Atomically create a private ZIP from explicit and staged JSON members."""
 
     root = pack_dir.resolve()
+    opaque_resolved = {
+        member.resolve(strict=True) for member in (opaque_members or set())
+    }
+    if not opaque_resolved.issubset(
+        {member.resolve(strict=True) for member in members}
+    ):
+        raise ValueError("opaque evidence ZIP members must be explicit members")
     ensure_private_directory(archive_path.parent)
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{archive_path.name}.",
@@ -282,21 +514,30 @@ def write_private_evidence_zip(
                 archived_names.add(info.filename)
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o600 << 16
-                source_text = resolved.read_text(encoding="utf-8")
-                if resolved.suffix == ".json":
+                if resolved in opaque_resolved:
+                    archived_bytes = read_private_regular_bytes(
+                        resolved,
+                        max_bytes=1024 * 1024,
+                    )
+                else:
+                    source_text = resolved.read_text(encoding="utf-8")
+                    archived_bytes = b""
+                if resolved not in opaque_resolved and resolved.suffix == ".json":
                     source_payload = json.loads(source_text)
                     archived_text = json.dumps(
                         json_safe(source_payload),
                         indent=2,
                         sort_keys=True,
                     ) + "\n"
-                elif resolved.suffix in {".txt", ".md"}:
+                    archived_bytes = archived_text.encode("utf-8")
+                elif resolved not in opaque_resolved and resolved.suffix in {".txt", ".md"}:
                     archived_text = sanitize_evidence_text(source_text)
-                else:
+                    archived_bytes = archived_text.encode("utf-8")
+                elif resolved not in opaque_resolved:
                     raise ValueError(
                         "evidence ZIP members must use JSON, text, or Markdown"
                     )
-                archive.writestr(info, archived_text.encode("utf-8"))
+                archive.writestr(info, archived_bytes)
             for relative_name, payload in sorted(
                 (virtual_json_members or {}).items()
             ):
@@ -1065,6 +1306,7 @@ class OperatorReadinessCertifier:
         self.artifact_dir = self.pack_dir / "artifacts"
         self.archive_path = self.output_root / f"{self.run_id}.zip"
         self._evidence_files: set[Path] = set()
+        self._opaque_evidence_files: set[Path] = set()
         # Keep the venv shim path intact. Resolving it follows uv's interpreter
         # symlink and bypasses the virtualenv site-packages.
         self.python = str(ROOT / ".venv" / "bin" / "python")
@@ -2974,10 +3216,15 @@ class OperatorReadinessCertifier:
         restore_reconciliation = dict(restore.get("reconciliation") or {})
         proof_source = Path(str(restore.get("recovery_proof_path") or ""))
         proof: dict[str, Any] = {}
+        proof_source_bytes = b""
         proof_ready = False
         if proof_source.is_file() and not proof_source.is_symlink():
             try:
-                loaded = json.loads(proof_source.read_text(encoding="utf-8"))
+                proof_source_bytes = read_private_regular_bytes(
+                    proof_source,
+                    max_bytes=1024 * 1024,
+                )
+                loaded = json.loads(proof_source_bytes.decode("utf-8"))
                 if isinstance(loaded, dict):
                     proof = loaded
                     proof_ready = (
@@ -2999,8 +3246,27 @@ class OperatorReadinessCertifier:
                             proof.get("reconciliation")
                         )
                     )
-            except (OSError, ValueError, json.JSONDecodeError):
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
                 proof_ready = False
+        extra_artifacts: dict[str, str] = {}
+        if proof_ready:
+            durable_proof = (
+                self.artifact_dir / "recovery_restore_proof.receipt.json"
+            )
+            try:
+                self._write_signed_json_artifact(
+                    durable_proof,
+                    source_bytes=proof_source_bytes,
+                    expected_payload=proof,
+                )
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                proof_ready = False
+                try:
+                    durable_proof.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                extra_artifacts["recovery_proof"] = str(durable_proof)
         restore_ready = (
             verify_ready
             and restore.get("verified") is True
@@ -3011,13 +3277,6 @@ class OperatorReadinessCertifier:
             and self._reconciliation_ready(restore_reconciliation)
             and proof_ready
         )
-        extra_artifacts: dict[str, str] = {}
-        if proof_ready:
-            durable_proof = (
-                self.artifact_dir / "recovery_restore_proof.receipt.json"
-            )
-            self._write_json(durable_proof, proof)
-            extra_artifacts["recovery_proof"] = str(durable_proof)
         self._record_in_process_check(
             "recovery_restore",
             label="Isolated recovery drill",
@@ -3417,6 +3676,7 @@ class OperatorReadinessCertifier:
                     self.archive_path,
                     pack_dir=self.pack_dir,
                     members=set(self._evidence_files),
+                    opaque_members=set(self._opaque_evidence_files),
                     virtual_json_members={"manifest.json": manifest},
                 )
             self._write_json(manifest_path, manifest)
@@ -3467,6 +3727,41 @@ class OperatorReadinessCertifier:
             path,
             json.dumps(json_safe(payload), indent=2, sort_keys=True) + "\n",
         )
+
+    def _write_signed_json_artifact(
+        self,
+        path: Path,
+        *,
+        source_bytes: bytes,
+        expected_payload: dict[str, Any],
+    ) -> None:
+        """Publish one verified signed receipt without altering its bytes."""
+
+        candidate = Path(path)
+        if (
+            not candidate.is_absolute()
+            or "\x00" in str(candidate)
+            or ".." in candidate.parts
+            or Path(os.path.normpath(str(candidate))) != candidate
+        ):
+            raise ValueError("signed evidence artifact path must be normal and absolute")
+        try:
+            relative = candidate.relative_to(self.pack_dir)
+        except ValueError as exc:
+            raise ValueError("signed evidence artifact escapes the run directory") from exc
+        if not relative.parts:
+            raise ValueError("signed evidence artifact path must name a file")
+        loaded = json.loads(source_bytes.decode("utf-8"))
+        if not isinstance(loaded, dict) or loaded != expected_payload:
+            raise ValueError("signed evidence payload changed before publication")
+        write_private_bytes(candidate, source_bytes)
+        if (
+            read_private_regular_bytes(candidate, max_bytes=1024 * 1024)
+            != source_bytes
+        ):
+            raise ValueError("signed evidence artifact changed after publication")
+        self._evidence_files.add(candidate)
+        self._opaque_evidence_files.add(candidate)
 
     def _write_text(self, path: Path, text: str) -> None:
         self._write_artifact(path, sanitize_evidence_text(text))

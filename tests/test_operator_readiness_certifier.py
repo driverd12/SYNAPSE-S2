@@ -19,6 +19,10 @@ from core_client_binding import (
 )
 from core_authority import CoreAuthorityLease
 from core_service import CoreConfig, write_core_config
+from capture_daemon import CaptureInboxDaemon
+from memory_store import DurableMemoryStore
+from recovery_manager import VerifiedRecoveryManager
+from scripts import core_cutover_preflight as preflight
 
 from scripts.operator_readiness_certify import (
     CAPTURE_DRAIN_BATCH_SIZE,
@@ -37,6 +41,7 @@ from scripts.operator_readiness_certify import (
     classify_overall,
     json_safe,
     mcp_compact_contract_probe_status,
+    read_private_regular_bytes,
     render_runbook_markdown,
     render_summary_markdown,
     runtime_status_from_mcp_envelope,
@@ -304,6 +309,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
 
     @staticmethod
     def _guarded_recovery_evidence(*, recovery_proof_path: Path):
+        recovery_proof_path = recovery_proof_path.resolve()
         binding = {
             "schema": "synapse-s2.capture-ledger-binding-proof.v1",
             "verified": True,
@@ -338,13 +344,21 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     "mode": "isolated-recovery-proof",
                     "verified": True,
                     "cutover_ready": True,
+                    "auth_algorithm": "ed25519",
+                    "auth_key_id": "unit-test-public-key-id",
+                    "signing_public_key": "unit-test-public-key-material",
+                    "receipt_digest": "c" * 64,
+                    "receipt_signature": "unit-test-signature",
                     "missing_transport_ledger_count": 0,
                     "capture_ledger_binding": binding,
                     "reconciliation": reconciliation,
-                }
+                },
+                indent=2,
+                sort_keys=True,
             ),
             encoding="utf-8",
         )
+        recovery_proof_path.chmod(0o600)
         return {
             "verified": True,
             "capture_ledger_before": copy.deepcopy(audit),
@@ -1993,6 +2007,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             certifier, _, core_paths = self._bound_certifier(root)
+            certifier.args.zip = True
             certifier.pack_dir.mkdir(parents=True, mode=0o700)
             certifier.artifact_dir.mkdir(mode=0o700)
             certifier.metadata = {
@@ -2100,6 +2115,14 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             self.assertTrue(json.loads(verify_path.read_text())["verified"])
             self.assertEqual(restore_path.parent, certifier.artifact_dir)
             self.assertTrue(json.loads(restore_path.read_text())["verified"])
+            self.assertEqual(restore_path.read_bytes(), proof_source.read_bytes())
+            with zipfile.ZipFile(certifier.archive_path) as archive:
+                self.assertEqual(
+                    archive.read(
+                        "artifacts/recovery_restore_proof.receipt.json"
+                    ),
+                    proof_source.read_bytes(),
+                )
             self.assertEqual(result["overall_status"], "blocked")
             with CoreAuthorityLease.acquire_local(core_paths.memory_db):
                 pass
@@ -2181,6 +2204,151 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             store.close.assert_called_once_with()
             with CoreAuthorityLease.acquire_local(core_paths.memory_db):
                 pass
+
+    def test_signed_recovery_proof_requires_owner_only_source(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifier, _, _ = self._bound_certifier(root)
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            proof_source = root / "isolated-proof.json"
+            evidence = self._guarded_recovery_evidence(
+                recovery_proof_path=proof_source
+            )
+            proof_source.chmod(0o644)
+
+            certifier._record_guarded_recovery_evidence(
+                evidence,
+                duration_ms=1.0,
+            )
+
+            by_id = {result.check_id: result for result in certifier.results}
+            self.assertEqual(by_id["recovery_restore"].status, "blocked")
+            self.assertNotIn(
+                "recovery_proof",
+                by_id["recovery_restore"].artifact_paths,
+            )
+            self.assertFalse(
+                (
+                    certifier.artifact_dir
+                    / "recovery_restore_proof.receipt.json"
+                ).exists()
+            )
+
+            private_parent = root / "private-proof-parent"
+            private_parent.mkdir(mode=0o700)
+            private_source = private_parent / "proof.receipt.json"
+            private_source.write_bytes(b"{}\n")
+            private_source.chmod(0o600)
+            linked_parent = root / "linked-proof-parent"
+            linked_parent.symlink_to(private_parent, target_is_directory=True)
+            with self.assertRaises(OSError):
+                read_private_regular_bytes(
+                    linked_parent / private_source.name,
+                    max_bytes=1024,
+                )
+
+    def test_signed_recovery_proof_destination_is_no_clobber_and_no_follow(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            certifier, _, _ = self._bound_certifier(root)
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            payload = {
+                "schema": "synapse-s2.recovery-bundle-restore.v2",
+                "verified": True,
+            }
+            source_bytes = (
+                json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            destination = certifier.artifact_dir / "signed.receipt.json"
+            destination.write_bytes(b"existing-private-artifact")
+            destination.chmod(0o600)
+
+            with self.assertRaises(FileExistsError):
+                certifier._write_signed_json_artifact(
+                    destination,
+                    source_bytes=source_bytes,
+                    expected_payload=payload,
+                )
+            self.assertEqual(destination.read_bytes(), b"existing-private-artifact")
+
+            destination.unlink()
+            protected = certifier.artifact_dir / "protected.receipt.json"
+            protected.write_bytes(b"protected-private-artifact")
+            protected.chmod(0o600)
+            destination.symlink_to(protected.name)
+            with self.assertRaises(FileExistsError):
+                certifier._write_signed_json_artifact(
+                    destination,
+                    source_bytes=source_bytes,
+                    expected_payload=payload,
+                )
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(protected.read_bytes(), b"protected-private-artifact")
+
+    def test_exact_copied_real_signed_proof_passes_preflight_signature(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            database = root / "memory.sqlite3"
+            store = DurableMemoryStore(database)
+            try:
+                store.upsert_entry(
+                    tag="readiness-signed-copy",
+                    context_id="certifier-tests",
+                    source_text="Synthetic signed-copy integration proof.",
+                    metadata={"fixture": True},
+                    embedding_dimensions=8,
+                    spike_indices=[1, 3],
+                    neuron_indices=[2, 4],
+                    registered_at=100.0,
+                )
+                daemon = CaptureInboxDaemon(root=root)
+                daemon._ensure_transport_dirs(daemon.paths())
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                bundle = manager.create_bundle(
+                    root / "readiness-copy.sqlite3",
+                    purpose="readiness-signed-copy-test",
+                    pinned=False,
+                )
+                verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+                restored = manager.restore_bundle_isolated(
+                    bundle["bundle_receipt_path"],
+                    root / "isolated-restore",
+                    confirm=True,
+                )
+            finally:
+                store.close()
+
+            source = Path(restored["recovery_proof_path"])
+            source_bytes = read_private_regular_bytes(
+                source,
+                max_bytes=1024 * 1024,
+            )
+            signed_payload = json.loads(source_bytes.decode("utf-8"))
+            self.assertNotEqual(json_safe(signed_payload), signed_payload)
+
+            certifier, _, _ = self._bound_certifier(root / "certifier")
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            copied = certifier.artifact_dir / "recovery_restore_proof.receipt.json"
+            certifier._write_signed_json_artifact(
+                copied,
+                source_bytes=source_bytes,
+                expected_payload=signed_payload,
+            )
+
+            self.assertEqual(copied.read_bytes(), source_bytes)
+            result = preflight.verify_recovery_binding(
+                parsed=verified,
+                receipt_path=Path(bundle["bundle_receipt_path"]),
+                restore_proof=signed_payload,
+                restore_proof_path=copied,
+                memory_db=database,
+                capture_root=root,
+            )
+            self.assertTrue(result["isolated_restore_verified"])
+            self.assertTrue(result["restore_eligible"])
 
     def test_guard_exit_failure_never_publishes_authoritative_manifest(self):
         with TemporaryDirectory() as tmp:
