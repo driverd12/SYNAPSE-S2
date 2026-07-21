@@ -1772,7 +1772,6 @@ class DurableMemoryStore:
             raise CoreAuthorityError(
                 "interrupted runtime publication requires an unbound core lease"
             )
-        path_digest = self.runtime_state_path_sha256(runtime_state_path)
         with closing(self._connect_read_only()) as conn:
             live_marker = self._core_authority_marker(conn)
             self._validate_core_authority_version_pair(conn, live_marker)
@@ -1781,21 +1780,67 @@ class DurableMemoryStore:
             live_marker != marker
             or live_publication != publication
             or live_publication is None
-            or live_publication["status"] != "pending"
-            or live_publication["runtime_state_path_sha256"] != path_digest
-            or marker["lock_generation_id"] != lease.lock_generation_id
-            or marker["config_fingerprint"] != expected_config_fingerprint
-            or marker["build_id"] != expected_build_id
-            or marker["protocol_version"] != expected_protocol_version
-            or marker["root_generation_id"] != expected_root_generation_id
-            or marker["embedding_space_identity"]
+        ):
+            raise CoreAuthorityError(
+                "interrupted runtime publication is not recoverable by this core"
+            )
+        binding = self.validate_interrupted_runtime_publication_binding(
+            marker=live_marker,
+            publication=live_publication,
+            runtime_state_path=runtime_state_path,
+            expected_lock_generation_id=lease.lock_generation_id,
+            expected_config_fingerprint=expected_config_fingerprint,
+            expected_build_id=expected_build_id,
+            expected_protocol_version=expected_protocol_version,
+            expected_root_generation_id=expected_root_generation_id,
+            expected_embedding_space_identity=expected_embedding_space_identity,
+        )
+        self._assert_filesystem_authority()
+        return binding
+
+    @classmethod
+    def validate_interrupted_runtime_publication_binding(
+        cls,
+        *,
+        marker: dict[str, Any],
+        publication: dict[str, Any],
+        runtime_state_path: str | os.PathLike[str],
+        expected_lock_generation_id: str,
+        expected_config_fingerprint: str,
+        expected_build_id: str,
+        expected_protocol_version: str,
+        expected_root_generation_id: str,
+        expected_embedding_space_identity: str,
+    ) -> dict[str, Any]:
+        """Purely validate one same-generation interrupted publication."""
+
+        if (
+            publication.get("status") != "pending"
+            or publication.get("marker_sha256")
+            != cls._core_authority_marker_sha256(marker)
+            or publication.get("authority_epoch_number") != marker.get("epoch")
+            or publication.get("lock_generation_id")
+            != marker.get("lock_generation_id")
+            or publication.get("instance_id") != marker.get("instance_id")
+            or publication.get("config_fingerprint")
+            != marker.get("config_fingerprint")
+            or publication.get("build_id") != marker.get("build_id")
+            or publication.get("protocol_version")
+            != marker.get("protocol_version")
+            or publication.get("runtime_state_path_sha256")
+            != cls.runtime_state_path_sha256(runtime_state_path)
+            or marker.get("lock_generation_id") != expected_lock_generation_id
+            or marker.get("config_fingerprint") != expected_config_fingerprint
+            or marker.get("build_id") != expected_build_id
+            or marker.get("protocol_version") != expected_protocol_version
+            or marker.get("root_generation_id") != expected_root_generation_id
+            or marker.get("embedding_space_identity")
             != expected_embedding_space_identity
         ):
             raise CoreAuthorityError(
                 "interrupted runtime publication is not recoverable by this core"
             )
-        self._assert_filesystem_authority()
-        return self.runtime_state_authority_binding_for_marker(live_marker)
+        return cls.runtime_state_authority_binding_for_marker(marker)
 
     def complete_runtime_state_authority_publication(
         self,
@@ -1975,43 +2020,24 @@ class DurableMemoryStore:
                 "are inconsistent"
             )
 
-    def inspect_core_authority_preclaim(self) -> dict[str, Any]:
-        """Return one coherent, WAL-aware read-only authority snapshot.
-
-        The returned logical digest and epoch are inputs to
-        :meth:`claim_core_authority`; that method recomputes both inside its
-        ``BEGIN IMMEDIATE`` transaction before publishing any v6 state.
-        """
-
-        lease = self._assert_filesystem_authority()
-        if lease.role != "core" or lease.durable_epoch is not None:
+    def _inspect_core_authority_preclaim_transaction(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        self._validate_existing_schema_compatibility_markers(conn)
+        marker = self._core_authority_marker(conn)
+        self._validate_core_authority_version_pair(conn, marker)
+        runtime_publication = self._core_runtime_publication(conn, marker)
+        user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if user_version not in {5, SQLITE_USER_VERSION}:
             raise CoreAuthorityError(
-                "preclaim inspection requires one unbound authoritative core lease"
+                "core preclaim inspection requires an authoritative v5 or v6 store"
             )
-        with closing(self._connect_read_only()) as conn:
-            conn.execute("PRAGMA trusted_schema = OFF")
-            conn.execute("BEGIN")
-            try:
-                self._validate_existing_schema_compatibility_markers(conn)
-                marker = self._core_authority_marker(conn)
-                self._validate_core_authority_version_pair(conn, marker)
-                runtime_publication = self._core_runtime_publication(conn, marker)
-                user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-                if user_version not in {5, SQLITE_USER_VERSION}:
-                    raise CoreAuthorityError(
-                        "core preclaim inspection requires an authoritative v5 or v6 store"
-                    )
-                self._assert_exact_schema_contract(
-                    conn,
-                    user_version=user_version,
-                )
-                logical_snapshot = self._canonical_logical_snapshot_digest(
-                    conn,
-                    install_progress_handler=False,
-                )
-            finally:
-                conn.execute("ROLLBACK")
-        self._assert_filesystem_authority()
+        self._assert_exact_schema_contract(conn, user_version=user_version)
+        logical_snapshot = self._canonical_logical_snapshot_digest(
+            conn,
+            install_progress_handler=False,
+        )
         previous_epoch = int(marker["epoch"]) if marker is not None else 0
         if previous_epoch >= (2**63 - 1):
             raise CoreAuthorityError("authoritative core epoch is exhausted")
@@ -2036,6 +2062,166 @@ class DurableMemoryStore:
                 marker is None and self._database_created_for_initialization
             ),
         }
+
+    def inspect_core_authority_preclaim(self) -> dict[str, Any]:
+        """Return one coherent, WAL-aware read-only authority snapshot.
+
+        The returned logical digest and epoch are inputs to
+        :meth:`claim_core_authority`; that method recomputes both inside its
+        ``BEGIN IMMEDIATE`` transaction before publishing any v6 state.
+        """
+
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "preclaim inspection requires one unbound authoritative core lease"
+            )
+        with closing(self._connect_read_only()) as conn:
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("BEGIN")
+            try:
+                result = self._inspect_core_authority_preclaim_transaction(conn)
+            finally:
+                conn.execute("ROLLBACK")
+        self._assert_filesystem_authority()
+        return result
+
+    def inspect_core_authority_preclaim_immutable(self) -> dict[str, Any]:
+        """Inspect a quiescent standalone main database without side effects.
+
+        This narrow audit lane accepts either no sidecars or the normal sealed
+        clean-close pair of a zero-byte WAL and a bounded 32-KiB-aligned SHM. It never opens
+        the live path in ordinary WAL-aware read-only mode.
+        """
+
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "preclaim inspection requires one unbound authoritative core lease"
+            )
+        observed = self._assert_private_database_identity()
+
+        def clean_close_sidecars() -> tuple[tuple[Any, ...], ...]:
+            rollback = Path(f"{self.db_path}-journal")
+            wal = Path(f"{self.db_path}-wal")
+            shm = Path(f"{self.db_path}-shm")
+            if rollback.exists() or rollback.is_symlink():
+                raise CoreAuthorityError(
+                    "immutable core inspection found rollback state"
+                )
+            wal_present = wal.exists() or wal.is_symlink()
+            shm_present = shm.exists() or shm.is_symlink()
+            if wal_present != shm_present:
+                raise CoreAuthorityError(
+                    "immutable core inspection found incomplete sidecar state"
+                )
+            if not wal_present:
+                return ()
+
+            snapshots: list[tuple[Any, ...]] = []
+            for path in (wal, shm):
+                before = os.lstat(path)
+                observed_size = int(before.st_size)
+                size_valid = (
+                    observed_size == 0
+                    if path == wal
+                    else (
+                        32_768 <= observed_size <= 8 * 1024 * 1024
+                        and observed_size % 32_768 == 0
+                    )
+                )
+                if (
+                    stat.S_ISLNK(before.st_mode)
+                    or not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != os.getuid()
+                    or int(before.st_nlink) != 1
+                    or stat.S_IMODE(before.st_mode) != 0o600
+                    or not size_valid
+                ):
+                    raise CoreAuthorityError(
+                        "immutable core inspection found unsafe sidecar state"
+                    )
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(path, flags)
+                digest = hashlib.sha256()
+                try:
+                    opened = os.fstat(descriptor)
+                    while True:
+                        chunk = os.read(descriptor, 65_536)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    finished = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+                visible = os.lstat(path)
+
+                def identity(value: os.stat_result) -> tuple[int, ...]:
+                    return (
+                        int(value.st_dev),
+                        int(value.st_ino),
+                        int(value.st_size),
+                        int(value.st_mtime_ns),
+                        int(value.st_ctime_ns),
+                        int(value.st_uid),
+                        int(value.st_nlink),
+                        stat.S_IMODE(value.st_mode),
+                    )
+
+                identities = {
+                    identity(value) for value in (before, opened, finished, visible)
+                }
+                if len(identities) != 1:
+                    raise CoreAuthorityError(
+                        "immutable core sidecar changed while being sealed"
+                    )
+                snapshots.append((*identity(before), digest.hexdigest()))
+            return tuple(snapshots)
+
+        sidecars_before = clean_close_sidecars()
+        uri = self.db_path.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("BEGIN")
+            try:
+                quick = conn.execute("PRAGMA quick_check(1)").fetchone()
+                integrity = conn.execute("PRAGMA integrity_check(1)").fetchone()
+                foreign_key_violation = conn.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchone()
+                if (
+                    quick is None
+                    or str(quick[0]) != "ok"
+                    or integrity is None
+                    or str(integrity[0]) != "ok"
+                    or foreign_key_violation is not None
+                ):
+                    raise CoreAuthorityError(
+                        "memory database failed immutable integrity verification"
+                    )
+                result = self._inspect_core_authority_preclaim_transaction(conn)
+            finally:
+                conn.execute("ROLLBACK")
+        self._assert_filesystem_authority()
+        visible = self._assert_private_database_identity()
+        if (
+            self._regular_file_identity(visible)
+            != self._regular_file_identity(observed)
+            or visible.st_uid != observed.st_uid
+            or int(visible.st_nlink) != int(observed.st_nlink)
+            or stat.S_IMODE(visible.st_mode) != stat.S_IMODE(observed.st_mode)
+        ):
+            raise CoreAuthorityError(
+                "memory database changed during immutable core inspection"
+            )
+        if clean_close_sidecars() != sidecars_before:
+            raise CoreAuthorityError(
+                "memory database sidecar changed during immutable core inspection"
+            )
+        return result
 
     def claim_core_authority(
         self,

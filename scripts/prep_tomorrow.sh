@@ -271,7 +271,8 @@ echo "=== capture inbox smoke ==="
   --tag "production-capture-inbox" \
   --speaker "codex" \
   --text "SYNAPSE-S2 capture inbox sidecar accepts explicit session payloads, redacts common secret patterns like api_key=sk-preflight-redaction-test123, and ingests cleaned temporal events into the same local graph."
-.venv/bin/python synapse_cli.py --json capture-inbox-process
+.venv/bin/python synapse_cli.py --json capture-inbox-process \
+  --confirm
 .venv/bin/python synapse_cli.py --json capture-inbox-status
 
 echo "=== cortex governor smoke ==="

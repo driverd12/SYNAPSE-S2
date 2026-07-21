@@ -54,7 +54,7 @@ At inference time, active spike operations are dominated by additions, threshold
 ## **Operational Quickstart**
 
 This repository now includes one authoritative local core, a SQLite-backed persistent memory store, runtime toggle controls, and lightweight CLI, MCP, dashboard, and capture adapters. The core alone owns the neural arrays, runtime state, durable writes, recovery lane, and embedded capture worker. Installed MCP client definitions carry only the path to an owner-only core binding and never fall back to a second local backend after schema v6 is claimed. That binding pins the reviewed layout, private canonical CoreConfig path and digest, exact candidate configuration fingerprint, embedding-space identity, authority mode, and private socket path. Candidate publication writes and rereads the `0600` canonical config before atomically publishing the binding; a missing, malformed, or drifted config makes every bound client fail closed.
-Text recall inside the core is routed through a pluggable local embedding provider. The production provider is `mlx-neural-v1`, backed by the local MLX model `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`; it runs on Apple Silicon through `mlx-lm`, stores weights under `.synapse_s2/models`, and emits provider provenance on every text memory. `semantic-hash-v1` remains available for explicit offline v5 maintenance and tests.
+Text recall inside the core is routed through a pluggable local embedding provider. The production provider is `mlx-neural-v1`, backed by the local MLX model `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ` at immutable revision `6c3ae70858513f1a78e9cdca3cae330d9075cd2a`; it runs on the Apple GPU through `mlx-lm`, stores weights under `.synapse_s2/models`, requires the pinned snapshot to be available locally, and emits provider provenance on every text memory. The authoritative-core installer publishes that closed neural contract by default. `semantic-hash-v1` remains available only through an explicit provider override for offline v5 maintenance and tests.
 
 ### 1. Install Runtime Dependencies
 
@@ -65,14 +65,27 @@ scripts/install_core_agent.sh status
 ```
 
 First cutover is deliberately separate from everyday setup. While the database
-is still local-v5, publish the reviewed candidate binding, install the
-lightweight launcher/client configs, and certify that exact candidate:
+is still local-v5, publish the reviewed candidate binding and install the
+lightweight launcher/client configs:
 
 ```bash
 scripts/install_core_agent.sh publish-binding
 scripts/install_local_launcher.sh
 .venv/bin/python scripts/install_client_configs.py
+```
+
+Before producing final evidence, process and reconcile capture debt, gracefully
+close every persistent MCP wrapper and wait for its `finish()` writes, let the
+capture worker drain, stop the exact legacy writer labels/PIDs, and prove the
+zero-writer inventory. Then certify that exact candidate:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-inbox-status
+.venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
+.venv/bin/python synapse_cli.py --json capture-inbox-status
+scripts/core_cutover_preflight.sh --inventory-only --require-quiescent
 .venv/bin/python scripts/operator_readiness_certify.py \
+  --json \
   --context default \
   --agent-id codex-desktop \
   --expect-embedding-provider mlx-neural
@@ -85,9 +98,9 @@ the explicit backup, quiescence, attestation, install, and stabilized-health
 procedure below when cutover is approved.
 
 The evidence manifest embeds `synapse-s2.core-config-evidence.v1`, including the
-same configuration fingerprint the installer will require. After the last
-accepted write, quiesce the exact legacy writer PIDs and install with that fresh
-manifest. The installer publishes the `authoritative-core-v6` binding only after
+same configuration fingerprint the installer will require. Treat it as
+immediately perishable and proceed directly through the final quiescence gate
+and install. The installer publishes the `authoritative-core-v6` binding only after
 stable authenticated health and capture readiness; confirm
 `client_binding.ready: true` in `scripts/install_core_agent.sh status`. A v6
 replacement keeps the existing authoritative binding—`publish-binding` is only

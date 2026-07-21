@@ -367,6 +367,11 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             apply_stage.index("scripts/install_dashboard_agent.sh"),
         )
         self.assertIn('binding.get("ready") is not True', apply_stage)
+        capture_process = apply_stage.split(
+            "synapse_cli.py --json capture-inbox-process",
+            1,
+        )[1].split("synapse_cli.py --json capture-inbox-status", 1)[0]
+        self.assertIn("--confirm", capture_process)
         cortex_commit = apply_stage.split(
             "synapse_cli.py --json commit-cortex",
             1,
@@ -1301,6 +1306,27 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
                 results[check_id].metrics["capture_ledger_binding"],
                 binding,
             )
+
+    def test_cutover_docs_quiesce_persistent_wrappers_before_final_certifier(self):
+        operations = (
+            ROOT / "docs" / "AUTHORITATIVE_CORE_OPERATIONS.md"
+        ).read_text(encoding="utf-8")
+        cutover = operations.split("## First cutover or replacement", 1)[1].split(
+            "The installer unloads", 1
+        )[0]
+        ordered_markers = (
+            "scripts/install_core_agent.sh publish-binding",
+            "capture-inbox-process --confirm",
+            "mcp_client_wrapper.py",
+            "--inventory-only --require-quiescent",
+            "scripts/operator_readiness_certify.py",
+            "--evidence-manifest /absolute/path/to/evidence-pack/manifest.json",
+            "scripts/install_core_agent.sh install",
+        )
+        positions = [cutover.index(marker) for marker in ordered_markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("process_findings_truncated: false", cutover)
+        self.assertIn("--json", cutover)
 
 
 if __name__ == "__main__":

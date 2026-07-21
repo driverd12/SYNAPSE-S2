@@ -58,7 +58,7 @@ _SECRET_PATTERNS = (
     re.compile(r"\bBearer[A-Za-z0-9._~+:/=-]{12,}\b", re.IGNORECASE),
 )
 _TERMINAL_STATES = ("completed", "failed")
-_SAFE_ERROR_CODES = frozenset(
+SAFE_ERROR_CODES = frozenset(
     {
         "authentication_failed",
         "deadline_exceeded",
@@ -72,6 +72,7 @@ _SAFE_ERROR_CODES = frozenset(
         "service_unavailable",
     }
 )
+_SAFE_ERROR_CODES = SAFE_ERROR_CODES
 
 _REQUEST_JOURNAL_TABLE_SQL = """
 CREATE TABLE request_journal (

@@ -18,6 +18,15 @@ config created by `write_core_config`.
 Authentication remains in the owner-only socket token sidecar and is never put
 in argv, launchd environment, logs, or JSON output.
 
+The canonical installer default is the production Apple-Silicon contract:
+`mlx-neural-v1`, model
+`mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`, immutable revision
+`6c3ae70858513f1a78e9cdca3cae330d9075cd2a`, cache
+`.synapse_s2/models`, local-files-only loading, and `MLX_DEVICE=gpu`. An
+operator may deliberately publish another closed CPU/GPU/provider contract
+through the documented environment overrides, but absence of overrides never
+silently selects the semantic-hash maintenance provider.
+
 Rollout status is separate from repository capability: the live local
 production instance has not yet been cut over to this authoritative-core lane.
 It remains on the legacy v5 runtime until the fresh backup, quiescence,
@@ -247,11 +256,43 @@ changing permissions on an existing caller-owned directory.
    to `publish-binding`, readiness, and install. If the standalone preflight is
    also run, pass the exact memory and capture paths enumerated by that reviewed
    manifest through its `--memory-db` and `--capture-root` inventory arguments.
-2. Produce a fresh, clean-HEAD operator-readiness evidence pack through the
-   binding-backed launcher:
+2. Resolve capture/replay debt, then quiesce every persistent writer before
+   producing final evidence. First inspect and drain the governed inbox while
+   the legacy capture worker is still available:
+
+   ```bash
+   .venv/bin/python synapse_cli.py --json capture-inbox-status
+   .venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
+   .venv/bin/python synapse_cli.py --json capture-inbox-status
+   ```
+
+   Reconcile every reported capture error, ambiguous request, or
+   replay-required artifact; never delete or replay it to make the count zero.
+   Gracefully close each exact persistent MCP client first and wait for its
+   `mcp_client_wrapper.py` process to exit. Its `finish()` path writes the final
+   session-boundary capture and Cortex trace, so killing it after certification
+   would invalidate the evidence. Let the capture worker drain those final
+   writes, check the inbox again, then stop the exact legacy capture, dashboard,
+   and prior core LaunchAgents. Review exact PIDs and labels; never use `pkill`,
+   `killall`, or a broad command match.
+
+   Run a separate read-only inventory before certification:
+
+   ```bash
+   scripts/core_cutover_preflight.sh --inventory-only --require-quiescent
+   ```
+
+   Continue only when its JSON reports `ready: true`, an empty
+   `process_findings` array, `process_findings_truncated: false`, and an empty
+   `quiescence_loaded_categories` array. A capped inventory is not proof of
+   absence. Do not reopen a persistent MCP client or legacy worker after this
+   gate.
+3. Produce a fresh, clean-HEAD operator-readiness evidence pack through the
+   binding-backed launcher only after the preceding zero-writer proof:
 
    ```bash
    .venv/bin/python scripts/operator_readiness_certify.py \
+     --json \
      --context default \
      --agent-id codex-desktop \
      --expect-embedding-provider mlx-neural
@@ -264,12 +305,11 @@ changing permissions on an existing caller-owned directory.
    `synapse-s2.core-config-evidence.v1` contract and exact configuration
    fingerprint. `--expect-*` flags are assertions only; they cannot select a
    different backend. Recovery backup, signed verification, isolated restore,
-   and every required proof must be ready and replay-free.
-3. After the certifier's last accepted write, stop the legacy capture and
-   dashboard LaunchAgents, the exact prior core
-   label, and every reported `mcp_client_wrapper.py` process through its owning
-   client. Review exact PIDs; never use `pkill`, `killall`, or a broad command
-   match.
+   and every required proof must be ready and replay-free. The certifier's own
+   bounded client processes complete their `finish()` writes before its later
+   signed recovery comparison; those transient processes do not authorize
+   reopening an external persistent wrapper. Treat the returned manifest as
+   immediately perishable and proceed directly to the next two commands.
 4. Run the read-only inventory and recovery binding gate:
 
    ```bash
@@ -331,6 +371,57 @@ binding. The activation result and later `status` calls must report
 failed activation unloads and disables the new core and does not publish an
 active binding. Reinstalling an already healthy exact build repairs the active
 binding idempotently.
+
+If activation fails only after schema v6 has been durably claimed, the original
+v5 evidence pack describes bytes that no longer exist and must never be reused.
+After correcting the non-identity-changing startup cause, use the dedicated
+same-installation recovery action without an evidence argument:
+
+```bash
+scripts/install_core_agent.sh recover-existing
+scripts/install_core_agent.sh status
+```
+
+`recover-existing` is not a replacement, restore-adoption, journal reset, or
+general repair command. Before touching launchd it requires the exact existing
+owner-only config, authentication token, current-build plist, candidate or
+authoritative binding, unloaded label, exclusive existing authority and journal
+locks, authoritative-v6 marker, store/root/lock/journal/embedding identities,
+request-journal logical and row-state integrity, and either the exact complete
+runtime-state binding or the core's already-supported same-generation pending
+runtime publication. It accepts no cutover evidence and creates no second
+recovery ticket; the core revalidates all identities again under its authority
+lease. Only stable authenticated health plus embedded capture readiness permits
+publication of `authoritative-core-v6`. Any activation failure attempts exact-
+label bootout and disable; the result reports explicitly if cleanup could not be
+verified, and every artifact is preserved. Repeating the action against the
+same already-healthy service is idempotent. Any config, build, protocol,
+embedding, root, lock, store, journal, runtime, binding, token, or restored-
+target drift requires the ordinary fresh attested replacement or restore-
+adoption procedure instead.
+
+The recovery admission proof requires both SQLite main databases to be sealed.
+A rollback journal, incomplete WAL/SHM pair, nonzero WAL, nonprivate sidecar, or
+sidecar drift fails closed. The only tolerated clean-close residue is an exact
+owner-only pair consisting of a zero-byte WAL and a positive 32-KiB-aligned SHM
+no larger than 8 MiB; both files are sealed by identity, metadata, and SHA-256 before and after immutable-main
+inspection and are never opened by SQLite. `recover-existing` never checkpoints,
+deletes, replays, or repairs residue. A crash that leaves a data-bearing WAL must
+go through verified offline backup/recovery so frames are not silently discarded
+or incorporated without an attested comparison.
+
+After the first successful v6 cutover, exercise the exact restart lane while the
+deployment window is still open and retain the JSON results:
+
+```bash
+scripts/install_core_agent.sh status
+scripts/install_core_agent.sh stop
+scripts/install_core_agent.sh recover-existing
+scripts/install_core_agent.sh status
+```
+
+The final status must again report stable authenticated health, capture ready,
+the expected numeric authority epoch, and `client_binding.ready: true`.
 
 Before authority claim/startup, the core-side verifier rereads the canonical
 private attestation, requires a clean matching Git HEAD plus exact build,

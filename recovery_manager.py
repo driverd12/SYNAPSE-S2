@@ -18,7 +18,7 @@ import unicodedata
 import uuid
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 import fcntl
 
@@ -33,6 +33,7 @@ from core_request_journal import (
     JOURNAL_BINDING_SCHEMA,
     JOURNAL_SCHEMA_IDENTITY,
     JOURNAL_SCHEMA_VERSION,
+    SAFE_ERROR_CODES as REQUEST_JOURNAL_SAFE_ERROR_CODES,
 )
 from memory_store import (
     BACKUP_DIGEST_RE,
@@ -127,6 +128,20 @@ LEGACY_EVENT_DERIVED_METADATA_FIELDS = frozenset(
         "temporal",
     }
 )
+
+
+@contextmanager
+def _immutable_read_transaction(
+    connection: sqlite3.Connection,
+) -> Iterator[None]:
+    connection.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+
+
 MAINTENANCE_RECEIPT_COLUMN_SIGNATURE = (
     ("operation_id", "TEXT", 0, None, 1),
     ("operation_type", "TEXT", 1, None, 0),
@@ -606,23 +621,115 @@ class VerifiedRecoveryManager:
             for row in conn.execute("PRAGMA table_xinfo(request_journal)").fetchall()
         )
 
-    def _inspect_request_journal_snapshot(
+    def inspect_request_journal_snapshot(
         self,
         path: Path,
         *,
         maximum_authority_epoch: int,
     ) -> dict[str, Any]:
+        """Inspect one sealed standalone journal without SQLite side effects.
+
+        The caller must quiesce the writer. This verifier accepts no sidecars or
+        only the normal sealed clean-close pair of a zero-byte WAL and one
+        bounded 32-KiB-aligned SHM, then opens only the main database immutable.
+        """
+
         if maximum_authority_epoch <= 0:
             raise ValueError("request-journal binding requires a governed store epoch")
-        uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
-        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as conn:
+        source = Path(path).expanduser().absolute()
+        reject_sensitive_identifier(source, field="request journal path")
+        observed = os.lstat(source)
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or int(observed.st_nlink) != 1
+        ):
+            raise PermissionError("request journal is not one private regular file")
+        def clean_close_sidecars() -> tuple[tuple[Any, ...], ...]:
+            rollback = Path(f"{source}-journal")
+            wal = Path(f"{source}-wal")
+            shm = Path(f"{source}-shm")
+            if rollback.exists() or rollback.is_symlink():
+                raise RuntimeError("request journal has rollback state")
+            wal_present = wal.exists() or wal.is_symlink()
+            shm_present = shm.exists() or shm.is_symlink()
+            if wal_present != shm_present:
+                raise RuntimeError("request journal has incomplete sidecar state")
+            if not wal_present:
+                return ()
+            snapshots: list[tuple[Any, ...]] = []
+            for sidecar in (wal, shm):
+                before = os.lstat(sidecar)
+                observed_size = int(before.st_size)
+                size_valid = (
+                    observed_size == 0
+                    if sidecar == wal
+                    else (
+                        32_768 <= observed_size <= 8 * 1024 * 1024
+                        and observed_size % 32_768 == 0
+                    )
+                )
+                if (
+                    stat.S_ISLNK(before.st_mode)
+                    or not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != os.getuid()
+                    or int(before.st_nlink) != 1
+                    or stat.S_IMODE(before.st_mode) != 0o600
+                    or not size_valid
+                ):
+                    raise RuntimeError("request journal sidecar is unsafe")
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(sidecar, flags)
+                digest = hashlib.sha256()
+                try:
+                    opened = os.fstat(descriptor)
+                    while True:
+                        chunk = os.read(descriptor, 65_536)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    finished = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+                visible = os.lstat(sidecar)
+
+                def identity(value: os.stat_result) -> tuple[int, ...]:
+                    return (
+                        int(value.st_dev),
+                        int(value.st_ino),
+                        int(value.st_size),
+                        int(value.st_mtime_ns),
+                        int(value.st_ctime_ns),
+                        int(value.st_uid),
+                        int(value.st_nlink),
+                        stat.S_IMODE(value.st_mode),
+                    )
+
+                identities = {
+                    identity(value) for value in (before, opened, finished, visible)
+                }
+                if len(identities) != 1:
+                    raise RuntimeError("request journal sidecar changed while sealed")
+                snapshots.append((*identity(before), digest.hexdigest()))
+            return tuple(snapshots)
+
+        sidecars_before = clean_close_sidecars()
+        uri = source.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(
+            sqlite3.connect(uri, uri=True, isolation_level=None)
+        ) as conn, _immutable_read_transaction(conn):
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only = ON")
             conn.execute("PRAGMA trusted_schema = OFF")
-            quick_check = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
-            integrity_check = [
-                str(row[0]) for row in conn.execute("PRAGMA integrity_check")
-            ]
+            quick_row = conn.execute("PRAGMA quick_check(1)").fetchone()
+            integrity_row = conn.execute("PRAGMA integrity_check(1)").fetchone()
+            quick_check = [] if quick_row is None else [str(quick_row[0])]
+            integrity_check = (
+                [] if integrity_row is None else [str(integrity_row[0])]
+            )
             application_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
             user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             schema = self.store._sqlite_schema_fingerprint(conn)
@@ -711,14 +818,8 @@ class VerifiedRecoveryManager:
                 "array",
                 "object",
             }
-            terminal_errors = {
-                "authentication_failed",
-                "deadline_exceeded",
-                "operation_failed",
-                "operation_unavailable",
-                "protocol_violation",
-                "request_conflict",
-                "service_unavailable",
+            terminal_errors = set(REQUEST_JOURNAL_SAFE_ERROR_CODES) - {
+                "outcome_unknown"
             }
             cursor = conn.execute(
                 "SELECT caller, request_id, operation, request_fingerprint, "
@@ -811,6 +912,17 @@ class VerifiedRecoveryManager:
                     state_counts[state] += 1
             if streamed_row_count != row_count:
                 raise RuntimeError("request journal changed during bounded inspection")
+        visible = os.lstat(source)
+        if (
+            self.store._regular_file_identity(visible)
+            != self.store._regular_file_identity(observed)
+            or visible.st_uid != observed.st_uid
+            or int(visible.st_nlink) != int(observed.st_nlink)
+            or stat.S_IMODE(visible.st_mode) != stat.S_IMODE(observed.st_mode)
+        ):
+            raise RuntimeError("request journal changed during immutable inspection")
+        if clean_close_sidecars() != sidecars_before:
+            raise RuntimeError("request journal sidecar changed during inspection")
         return {
             "application_id": application_id,
             "schema_version": user_version,
@@ -1044,7 +1156,7 @@ class VerifiedRecoveryManager:
             ):
                 raise RuntimeError("request journal changed identity during snapshot")
             self.store._fsync_file(temporary)
-            inspection = self._inspect_request_journal_snapshot(
+            inspection = self.inspect_request_journal_snapshot(
                 temporary,
                 maximum_authority_epoch=maximum_authority_epoch,
             )
@@ -1105,7 +1217,7 @@ class VerifiedRecoveryManager:
             copied = self.store._copy_stable_regular_file(path, temporary)
             if not secrets.compare_digest(str(copied["sha256"]), expected_sha256):
                 raise RuntimeError("request-journal artifact digest verification failed")
-            inspection = self._inspect_request_journal_snapshot(
+            inspection = self.inspect_request_journal_snapshot(
                 temporary,
                 maximum_authority_epoch=maximum_authority_epoch,
             )

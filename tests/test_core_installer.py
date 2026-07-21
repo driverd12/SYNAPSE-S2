@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from contextlib import closing, redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -25,7 +26,8 @@ from scripts import core_cutover_preflight as preflight
 from memory_store import DurableMemoryStore
 from recovery_manager import VerifiedRecoveryManager
 from capture_daemon import CaptureInboxDaemon, write_capture_drop
-from core_authority import CoreAuthorityLease
+from core_authority import CoreAuthorityError, CoreAuthorityLease
+from core_protocol import canonical_json_bytes
 from core_request_journal import CoreRequestJournal
 from core_service import AuthoritativeCoreService
 
@@ -101,6 +103,11 @@ elif command == 'enable':
     disabled.unlink(missing_ok=True)
 elif command == 'disable':
     disabled.write_text('disabled', encoding='utf-8')
+elif command == 'print-disabled':
+    value = 'disabled' if disabled.exists() else 'enabled'
+    print('{{')
+    print('  "aero.boom.synapse-s2.core.test" => ' + value)
+    print('}}')
 elif command == 'kickstart':
     if not state.exists():
         raise SystemExit(4)
@@ -118,6 +125,48 @@ else:
             uid=os.getuid(),
             label="aero.boom.synapse-s2.core.test",
         )
+
+    @staticmethod
+    def _seal_sqlite_fixture(path: Path) -> None:
+        with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if checkpoint is None or int(checkpoint[0]) != 0:
+                raise AssertionError("fixture SQLite WAL could not be checkpointed")
+        for suffix in ("-journal", "-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+    def _filesystem_snapshot(
+        self,
+        *extra_roots: Path,
+    ) -> dict[str, tuple[object, ...]]:
+        snapshot: dict[str, tuple[object, ...]] = {}
+        for root in (self.base, *extra_roots):
+            paths = [root, *sorted(root.rglob("*"))]
+            for path in paths:
+                observed = path.lstat()
+                key = str(path)
+                digest: str | None = None
+                link_target: str | None = None
+                if stat.S_ISREG(observed.st_mode):
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                elif stat.S_ISLNK(observed.st_mode):
+                    link_target = os.readlink(path)
+                snapshot[key] = (
+                    int(observed.st_dev),
+                    int(observed.st_ino),
+                    int(observed.st_mode),
+                    int(observed.st_uid),
+                    int(observed.st_gid),
+                    int(observed.st_nlink),
+                    int(observed.st_size),
+                    int(observed.st_mtime_ns),
+                    int(observed.st_ctime_ns),
+                    digest,
+                    link_target,
+                )
+        return snapshot
 
     @staticmethod
     def _health() -> dict[str, object]:
@@ -144,6 +193,174 @@ else:
             wait_seconds=2,
             force_restart=force_restart,
         )
+
+    def _prepare_recoverable_v6(self) -> object:
+        self.memory_db.unlink()
+        bootstrap = DurableMemoryStore(self.memory_db)
+        bootstrap.close()
+        self.core.mkdir(mode=0o700, exist_ok=True)
+        environment = {
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+            "SYNAPSE_S2_TRANSCRIPT_POLL": "false",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+            "MLX_DEVICE": "cpu",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = installer.build_config(self.paths)
+        installer.write_core_config(self.paths.config, config)
+        token_path = self.paths.socket.with_name(self.paths.socket.name + ".token")
+        token_path.write_bytes(b"a" * 64)
+        token_path.chmod(0o600)
+        root_generation_id = "generation-" + ("d" * 24)
+        root_generation_path = self.core / "store-generation.json"
+        root_generation_path.write_bytes(
+            canonical_json_bytes(
+                {
+                    "schema": installer.STORE_GENERATION_SCHEMA,
+                    "root_generation_id": root_generation_id,
+                    "store_identity": installer._store_identity(self.memory_db),
+                }
+            )
+        )
+        root_generation_path.chmod(0o600)
+        installer._atomic_private_bytes(
+            self.paths.plist,
+            installer.plist_payload(
+                label="aero.boom.synapse-s2.core.test",
+                paths=self.paths,
+                config=config,
+            ),
+        )
+        installer.publish_client_binding(
+            paths=self.paths,
+            label="aero.boom.synapse-s2.core.test",
+            config=config,
+            authority_mode="candidate-local-v5",
+        )
+
+        authority = CoreAuthorityLease.acquire_core(
+            self.memory_db,
+            timeout_seconds=0.0,
+            instance_id="core-recover-existing-fixture",
+        )
+        store: DurableMemoryStore | None = None
+        journal: CoreRequestJournal | None = None
+        try:
+            store = DurableMemoryStore(self.memory_db, authority_lease=authority)
+            inspection = store.inspect_core_authority_preclaim()
+            journal = CoreRequestJournal(
+                self.core / "requests.sqlite3",
+                authority_epoch="epoch-1",
+                store_identity=str(inspection["store_identity"]),
+            )
+            journal_binding = journal.binding()
+            store.claim_core_authority(
+                instance_id=authority.instance_id,
+                config_fingerprint=config.fingerprint,
+                build_id=installer._manifest_build_id(ROOT),
+                protocol_version=installer.PROTOCOL_VERSION,
+                expected_store_identity=str(inspection["store_identity"]),
+                request_journal_id=str(journal_binding["journal_id"]),
+                request_journal_binding_schema=str(journal_binding["schema"]),
+                request_journal_schema_version=int(
+                    journal_binding["journal_schema_version"]
+                ),
+                expected_preclaim_logical_snapshot_sha256=str(
+                    inspection["logical_snapshot"]["sha256"]
+                ),
+                expected_previous_epoch=0,
+                expected_next_epoch=1,
+                root_generation_id=root_generation_id,
+                embedding_space_identity=config.embedding_space_identity,
+                attestation_receipt_digest="a" * 64,
+                attestation_expires_at_unix_ms=int(time.time() * 1000) + 60_000,
+            )
+            runtime_payload = {
+                "version": 3,
+                "global_enabled": True,
+                "context_overrides": {},
+                "cortex_sessions": {},
+                "runtime_state_repair": {},
+                "memory_db_path": str(self.memory_db),
+                "updated_at": time.time(),
+                "authority_binding": store.runtime_state_authority_binding(),
+            }
+            self.paths.state.write_text(
+                json.dumps(
+                    runtime_payload,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.paths.state.chmod(0o600)
+            store.complete_runtime_state_authority_publication(
+                runtime_state_path=self.paths.state,
+            )
+        finally:
+            if journal is not None:
+                journal.close()
+            if store is not None:
+                store.close()
+            authority.close()
+        self._seal_sqlite_fixture(self.memory_db)
+        self._seal_sqlite_fixture(self.core / "requests.sqlite3")
+        return config
+
+    def _advance_recoverable_v6_epoch_pending(self, config: object) -> None:
+        authority = CoreAuthorityLease.acquire_core(
+            self.memory_db,
+            timeout_seconds=0.0,
+            instance_id="core-recover-existing-successor-fixture",
+        )
+        store: DurableMemoryStore | None = None
+        journal: CoreRequestJournal | None = None
+        try:
+            store = DurableMemoryStore(self.memory_db, authority_lease=authority)
+            inspection = store.inspect_core_authority_preclaim()
+            marker = inspection["marker"]
+            journal = CoreRequestJournal(
+                self.core / "requests.sqlite3",
+                authority_epoch=f"epoch-{int(inspection['next_epoch'])}",
+                require_existing=True,
+                prune_on_open=False,
+                allow_migration=False,
+                store_identity=str(inspection["store_identity"]),
+                expected_journal_id=str(marker["request_journal_id"]),
+            )
+            journal_binding = journal.binding()
+            store.claim_core_authority(
+                instance_id=authority.instance_id,
+                config_fingerprint=config.fingerprint,
+                build_id=installer._manifest_build_id(ROOT),
+                protocol_version=installer.PROTOCOL_VERSION,
+                expected_store_identity=str(inspection["store_identity"]),
+                request_journal_id=str(journal_binding["journal_id"]),
+                request_journal_binding_schema=str(journal_binding["schema"]),
+                request_journal_schema_version=int(
+                    journal_binding["journal_schema_version"]
+                ),
+                expected_preclaim_logical_snapshot_sha256=str(
+                    inspection["logical_snapshot"]["sha256"]
+                ),
+                expected_previous_epoch=int(inspection["previous_epoch"]),
+                expected_next_epoch=int(inspection["next_epoch"]),
+                root_generation_id=str(marker["root_generation_id"]),
+                embedding_space_identity=config.embedding_space_identity,
+            )
+        finally:
+            if journal is not None:
+                journal.close()
+            if store is not None:
+                store.close()
+            authority.close()
+        self._seal_sqlite_fixture(self.memory_db)
+        self._seal_sqlite_fixture(self.core / "requests.sqlite3")
 
     def test_install_writes_private_config_and_secret_free_minimal_plist(self) -> None:
         canary = "sk-do-not-copy-this-secret-canary-12345678"
@@ -191,7 +408,7 @@ else:
             plist["EnvironmentVariables"],
             {
                 "SYNAPSE_S2_BUILD_ID": installer._manifest_build_id(ROOT),
-                "MLX_DEVICE": "default",
+                "MLX_DEVICE": "gpu",
             },
         )
         self.assertNotIn(canary, self.paths.plist.read_text(encoding="utf-8"))
@@ -200,6 +417,55 @@ else:
         self.assertIn("bootstrap", log)
         self.assertIn("kickstart", log)
         self.assertNotIn(canary, log)
+
+    def test_build_config_defaults_to_closed_production_neural_contract(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            config = installer.build_config(self.paths)
+
+        self.assertEqual(config.embedding_provider_name, "mlx-neural")
+        self.assertEqual(
+            config.embedding_neural_model_id,
+            installer.DEFAULT_PRODUCTION_NEURAL_MODEL,
+        )
+        self.assertEqual(
+            config.embedding_neural_revision,
+            installer.DEFAULT_PRODUCTION_NEURAL_REVISION,
+        )
+        self.assertEqual(
+            config.embedding_neural_cache_dir,
+            self.data / "models",
+        )
+        self.assertEqual(config.embedding_neural_pooling, "mean")
+        self.assertEqual(config.embedding_neural_max_tokens, 512)
+        self.assertTrue(config.embedding_neural_normalize)
+        self.assertTrue(config.embedding_neural_local_files_only)
+        self.assertEqual(config.mlx_device, "gpu")
+        self.assertTrue(config.require_native)
+
+    def test_build_config_keeps_offline_semantic_hash_explicit(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash"},
+            clear=True,
+        ):
+            config = installer.build_config(self.paths)
+
+        self.assertEqual(config.embedding_provider_name, "semantic-hash")
+        self.assertIsNone(config.embedding_neural_model_id)
+        self.assertIsNone(config.embedding_neural_revision)
+        self.assertIsNone(config.embedding_neural_cache_dir)
+        self.assertIsNone(config.embedding_neural_local_files_only)
+
+    def test_build_config_requires_revision_for_custom_neural_model(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SYNAPSE_S2_EMBEDDING_PROVIDER": "mlx-neural",
+                "SYNAPSE_S2_NEURAL_MODEL": "mlx-community/custom-model",
+            },
+            clear=True,
+        ), self.assertRaises(installer.CoreInstallerError):
+            installer.build_config(self.paths)
 
     def test_build_config_closes_nondefault_topology_and_canonical_neural_model(self) -> None:
         environment = {
@@ -275,7 +541,8 @@ else:
         with mock.patch.dict(
             os.environ,
             {
-                "MLX_DEVICE": "gpu",
+                "MLX_DEVICE": "cpu",
+                "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
                 "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
             },
             clear=True,
@@ -289,7 +556,7 @@ else:
             )
         )
         launch_environment = dict(plist["EnvironmentVariables"])
-        self.assertEqual(launch_environment["MLX_DEVICE"], "gpu")
+        self.assertEqual(launch_environment["MLX_DEVICE"], "cpu")
 
         backend = mock.sentinel.backend
         service = AuthoritativeCoreService(config)
@@ -403,6 +670,702 @@ else:
         calls = (self.base / "launchctl.log").read_text(encoding="utf-8")
         self.assertIn("bootout gui/", calls)
         self.assertIn("disable gui/", calls)
+
+    def test_recover_existing_is_identity_bound_and_idempotent(self) -> None:
+        config = self._prepare_recoverable_v6()
+        config_before = self.paths.config.read_bytes()
+        config_identity_before = self.paths.config.stat()
+        plist_before = self.paths.plist.read_bytes()
+        plist_identity_before = self.paths.plist.stat()
+        with mock.patch.object(
+            installer,
+            "wait_for_health",
+            return_value={**self._health(), "pid": 4242},
+        ):
+            first = installer.recover_existing(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+            )
+            first_log = (self.base / "launchctl.log").read_text(encoding="utf-8")
+            second = installer.recover_existing(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+            )
+            second_log = (self.base / "launchctl.log").read_text(encoding="utf-8")
+
+        self.assertEqual(first["status"], "healthy")
+        self.assertTrue(first["recovery_admission"]["verified"])
+        self.assertEqual(second["status"], "already-healthy")
+        self.assertEqual(first_log.count("bootstrap"), 1)
+        self.assertEqual(second_log.count("bootstrap"), 1)
+        self.assertEqual(self.paths.config.read_bytes(), config_before)
+        self.assertEqual(self.paths.plist.read_bytes(), plist_before)
+        self.assertEqual(self.paths.config.stat().st_ino, config_identity_before.st_ino)
+        self.assertEqual(self.paths.plist.stat().st_ino, plist_identity_before.st_ino)
+        binding = installer.load_core_client_binding(
+            installer.default_binding_path(self.home)
+        )
+        self.assertEqual(binding.authority_mode, "authoritative-core-v6")
+        self.assertEqual(binding.config_fingerprint, config.fingerprint)
+
+    def test_recovery_admission_is_observation_only(self) -> None:
+        config = self._prepare_recoverable_v6()
+        # SQLite header bytes 18/19 are the read/write format versions; 2/2
+        # proves this is a WAL-mode main database even though every transient
+        # sidecar has been sealed away for immutable admission.
+        self.assertEqual(self.memory_db.read_bytes()[18:20], b"\x02\x02")
+        before = self._filesystem_snapshot()
+        result = installer._verify_recovery_admission(
+            paths=self.paths,
+            config=config,
+        )
+        after = self._filesystem_snapshot()
+        self.assertTrue(result["verified"])
+        self.assertEqual(after, before)
+        self.assertFalse((self.base / "launchctl.log").exists())
+
+    def test_recovery_rejects_unsafe_sqlite_sidecars_without_touching_them(self) -> None:
+        config = self._prepare_recoverable_v6()
+        for database in (self.memory_db, self.core / "requests.sqlite3"):
+            for suffix in ("-journal", "-wal", "-shm"):
+                with self.subTest(database=database.name, suffix=suffix):
+                    sidecar = Path(f"{database}{suffix}")
+                    sidecar.write_bytes((database.name + suffix).encode("utf-8"))
+                    sidecar.chmod(0o600)
+                    before = self._filesystem_snapshot()
+                    with self.assertRaisesRegex(
+                        installer.CoreInstallerError,
+                        "SQLite sidecar",
+                    ):
+                        installer._verify_recovery_admission(
+                            paths=self.paths,
+                            config=config,
+                        )
+                    self.assertEqual(self._filesystem_snapshot(), before)
+                    if suffix == "-wal":
+                        self.assertFalse(Path(f"{database}-shm").exists())
+                    sidecar.unlink()
+
+    def test_recovery_accepts_sealed_zero_wal_pair_without_touching_it(self) -> None:
+        config = self._prepare_recoverable_v6()
+        for database in (self.memory_db, self.core / "requests.sqlite3"):
+            for shm_size in (32_768, 65_536):
+                with self.subTest(database=database.name, shm_size=shm_size):
+                    wal = Path(f"{database}-wal")
+                    shm = Path(f"{database}-shm")
+                    wal.write_bytes(b"")
+                    shm.write_bytes(b"\0" * shm_size)
+                    wal.chmod(0o600)
+                    shm.chmod(0o600)
+                    before = self._filesystem_snapshot()
+                    result = installer._verify_recovery_admission(
+                        paths=self.paths,
+                        config=config,
+                    )
+                    self.assertTrue(result["verified"])
+                    self.assertEqual(self._filesystem_snapshot(), before)
+                    wal.unlink()
+                    shm.unlink()
+
+    def test_recovery_rejects_nonzero_wal_and_invalid_shm_bounds(self) -> None:
+        self._prepare_recoverable_v6()
+        database = self.memory_db
+        wal = Path(f"{database}-wal")
+        shm = Path(f"{database}-shm")
+        cases = (
+            (b"frame", 32_768),
+            (b"", 0),
+            (b"", 32_769),
+            (b"", (8 * 1024 * 1024) + 32_768),
+        )
+        for wal_bytes, shm_size in cases:
+            with self.subTest(wal_size=len(wal_bytes), shm_size=shm_size):
+                wal.write_bytes(wal_bytes)
+                shm.write_bytes(b"\0" * shm_size)
+                wal.chmod(0o600)
+                shm.chmod(0o600)
+                before = self._filesystem_snapshot()
+                with self.assertRaisesRegex(
+                    installer.CoreInstallerError,
+                    "unsafe size",
+                ):
+                    installer._validate_sqlite_transients(
+                        database,
+                        kind="test database",
+                    )
+                self.assertEqual(self._filesystem_snapshot(), before)
+                wal.unlink()
+                shm.unlink()
+
+    def test_launchctl_disabled_policy_parser_is_exact_and_bounded(self) -> None:
+        launchctl = self._launchctl()
+        for value, expected in (
+            ("disabled", True),
+            ("enabled", False),
+            ("true", True),
+            ("false", False),
+        ):
+            completed = mock.Mock(
+                returncode=0,
+                stdout=(
+                    "{\n"
+                    f'  "aero.boom.synapse-s2.core.test" => {value}\n'
+                    "}\n"
+                ),
+                stderr="",
+            )
+            with self.subTest(value=value), mock.patch.object(
+                launchctl,
+                "_run",
+                return_value=completed,
+            ):
+                self.assertIs(launchctl.disabled(), expected)
+        for output in (
+            "{}\n",
+            '"aero.boom.synapse-s2.core.test" => disabled\n'
+            '"aero.boom.synapse-s2.core.test" => enabled\n',
+            '"aero.boom.synapse-s2.core.other" => disabled\n',
+            '"aero.boom.synapse-s2.core.test" => maybe\n',
+            "x" * ((1024 * 1024) + 1),
+            '"aero.boom.synapse-s2.core.test" => disabled\x00\n',
+        ):
+            with self.subTest(output_size=len(output)), mock.patch.object(
+                launchctl,
+                "_run",
+                return_value=mock.Mock(returncode=0, stdout=output, stderr=""),
+            ), self.assertRaises(installer.CoreInstallerError):
+                launchctl.disabled()
+        with mock.patch.object(
+            launchctl,
+            "_run",
+            return_value=mock.Mock(
+                returncode=0,
+                stdout='"aero.boom.synapse-s2.core.test" => disabled\n',
+                stderr="x" * ((1024 * 1024) + 1),
+            ),
+        ), self.assertRaises(installer.CoreInstallerError):
+            launchctl.disabled()
+
+    def test_recovery_identity_failures_never_mutate_launchd(self) -> None:
+        self._prepare_recoverable_v6()
+
+        def assert_no_launch_mutation() -> None:
+            log_path = self.base / "launchctl.log"
+            verbs = {
+                line.split()[0]
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            } if log_path.exists() else set()
+            self.assertTrue(
+                verbs.isdisjoint(
+                    {"enable", "disable", "bootstrap", "bootout", "kickstart"}
+                ),
+                verbs,
+            )
+
+        token = self.paths.socket.with_name(self.paths.socket.name + ".token")
+        token.write_bytes(b"a" * 63)
+        with self.assertRaises(installer.CoreInstallerError):
+            installer.recover_existing(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+            )
+        assert_no_launch_mutation()
+        token.write_bytes(b"a" * 64)
+        (self.base / "launchctl.log").unlink(missing_ok=True)
+
+        restored = self.core / "requests.sqlite3.binding.receipt.json"
+        restored.write_bytes(b"{}\n")
+        restored.chmod(0o600)
+        with self.assertRaises(installer.CoreInstallerError):
+            installer.recover_existing(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+            )
+        assert_no_launch_mutation()
+        restored.unlink()
+        (self.base / "launchctl.log").unlink(missing_ok=True)
+
+        lease = CoreAuthorityLease.acquire_core(
+            self.memory_db,
+            timeout_seconds=0.0,
+            instance_id="active-authority-recovery-test",
+        )
+        try:
+            with self.assertRaises(installer.CoreInstallerError):
+                installer.recover_existing(
+                    paths=self.paths,
+                    label="aero.boom.synapse-s2.core.test",
+                    launchctl=self._launchctl(),
+                    wait_seconds=2,
+                )
+        finally:
+            lease.close()
+        assert_no_launch_mutation()
+
+    def test_recovery_activation_error_runs_verified_exact_label_cleanup(self) -> None:
+        self._prepare_recoverable_v6()
+        launchctl = mock.Mock()
+        launchctl.snapshot.side_effect = [
+            {"loaded": False, "running": False},
+            {"loaded": False, "running": False},
+            {"loaded": False, "running": False},
+        ]
+        launchctl.enable.side_effect = installer.CoreInstallerError(
+            "enable applied then response failed"
+        )
+        launchctl.disabled.return_value = True
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "verified unloaded and disabled",
+        ):
+            installer.recover_existing(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=launchctl,
+                wait_seconds=2,
+            )
+        launchctl.bootout.assert_called_once_with(wait_seconds=2)
+        launchctl.disable.assert_called_once_with()
+        launchctl.disabled.assert_called_once_with()
+        launchctl.bootstrap.assert_not_called()
+
+    def test_recovery_never_claims_cleanup_when_any_readback_fails(self) -> None:
+        self._prepare_recoverable_v6()
+        cases = (
+            "bootout",
+            "disable",
+            "snapshot-error",
+            "still-loaded",
+            "disabled-error",
+            "disabled-false",
+            "unexpected-error",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                launchctl = mock.Mock()
+                cleanup_snapshot: object = {
+                    "loaded": case == "still-loaded",
+                    "running": False,
+                }
+                if case == "snapshot-error":
+                    cleanup_snapshot = installer.CoreInstallerError(
+                        "snapshot unavailable"
+                    )
+                launchctl.snapshot.side_effect = [
+                    {"loaded": False, "running": False},
+                    {"loaded": False, "running": False},
+                    cleanup_snapshot,
+                ]
+                launchctl.enable.side_effect = (
+                    KeyboardInterrupt()
+                    if case == "unexpected-error"
+                    else installer.CoreInstallerError("activation failed")
+                )
+                if case == "bootout":
+                    launchctl.bootout.side_effect = installer.CoreInstallerError(
+                        "bootout failed"
+                    )
+                if case == "disable":
+                    launchctl.disable.side_effect = installer.CoreInstallerError(
+                        "disable failed"
+                    )
+                if case == "disabled-error":
+                    launchctl.disabled.side_effect = installer.CoreInstallerError(
+                        "readback failed"
+                    )
+                else:
+                    launchctl.disabled.return_value = case not in {
+                        "disabled-false",
+                        "unexpected-error",
+                    }
+                with self.assertRaisesRegex(
+                    installer.CoreInstallerError,
+                    "cleanup could not be verified",
+                ):
+                    installer.recover_existing(
+                        paths=self.paths,
+                        label="aero.boom.synapse-s2.core.test",
+                        launchctl=launchctl,
+                        wait_seconds=2,
+                    )
+                launchctl.bootout.assert_called_once_with(wait_seconds=2)
+                launchctl.disable.assert_called_once_with()
+                launchctl.disabled.assert_called_once_with()
+
+    def test_clean_authoritative_service_close_is_recoverable_without_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="s2r-", dir="/tmp") as raw_short:
+            short_root = Path(raw_short).resolve()
+            self.data = short_root / "data"
+            self.core = self.data / "core"
+            self.capture = self.data
+            self.memory_db = self.data / "memory.sqlite3"
+            self.data.mkdir(mode=0o700)
+            self.memory_db.write_bytes(b"temporary test database")
+            self.memory_db.chmod(0o600)
+            self.paths = replace(
+                self.paths,
+                data_root=self.data,
+                core_root=self.core,
+                config=self.core / "service.json",
+                socket=self.core / "service.sock",
+                state=self.data / "runtime_state.json",
+                memory_db=self.memory_db,
+                capture_root=self.capture,
+                log=self.core / "service.log",
+            )
+            config = self._prepare_recoverable_v6()
+            service = AuthoritativeCoreService(config)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"MLX_DEVICE": "cpu"},
+                    clear=False,
+                ):
+                    service.start()
+            finally:
+                service.close()
+            memory_wal = Path(f"{self.memory_db}-wal")
+            memory_shm = Path(f"{self.memory_db}-shm")
+            self.assertTrue(memory_wal.is_file())
+            self.assertEqual(memory_wal.stat().st_size, 0)
+            self.assertTrue(memory_shm.is_file())
+            self.assertEqual(memory_shm.stat().st_size, 32_768)
+            before = self._filesystem_snapshot(short_root)
+            result = installer._verify_recovery_admission(
+                paths=self.paths,
+                config=config,
+            )
+            self.assertTrue(result["verified"])
+            self.assertEqual(self._filesystem_snapshot(short_root), before)
+
+    def test_recovery_accepts_valid_path_not_authorized_terminal_row(self) -> None:
+        config = self._prepare_recoverable_v6()
+        journal_path = self.core / "requests.sqlite3"
+        with closing(sqlite3.connect(journal_path)) as connection:
+            journal_id = str(
+                connection.execute(
+                    "SELECT value FROM request_journal_metadata WHERE key = 'journal_id'"
+                ).fetchone()[0]
+            )
+        journal = CoreRequestJournal(
+            journal_path,
+            authority_epoch="epoch-1",
+            require_existing=True,
+            prune_on_open=False,
+            allow_migration=False,
+            store_identity=installer._store_identity(self.memory_db),
+            expected_journal_id=journal_id,
+        )
+        try:
+            request = {
+                "caller": "recovery-test",
+                "request_id": "path-policy-1",
+                "operation": "capture",
+                "request_fingerprint": "b" * 64,
+            }
+            self.assertEqual(journal.accept(**request).disposition, "accepted")
+            journal.finish(
+                **request,
+                result=None,
+                safe_error_code="path_not_authorized",
+            )
+        finally:
+            journal.close()
+        self._seal_sqlite_fixture(journal_path)
+        result = installer._verify_recovery_admission(
+            paths=self.paths,
+            config=config,
+        )
+        self.assertTrue(result["verified"])
+
+    def test_recovery_rejects_inconsistent_request_journal_row(self) -> None:
+        config = self._prepare_recoverable_v6()
+        journal_path = self.core / "requests.sqlite3"
+        now_ms = int(time.time() * 1000)
+        with closing(sqlite3.connect(journal_path)) as connection:
+            connection.execute(
+                "INSERT INTO request_journal ("
+                "caller, request_id, operation, request_fingerprint, "
+                "authority_epoch, state, result_kind, safe_error_code, "
+                "accepted_at_unix_ms, finished_at_unix_ms"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "recovery-test",
+                    "invalid-terminal-1",
+                    "capture",
+                    "c" * 64,
+                    "epoch-1",
+                    "failed",
+                    None,
+                    "not_a_safe_error",
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            connection.commit()
+        self._seal_sqlite_fixture(journal_path)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "admission proof failed",
+        ):
+            installer._verify_recovery_admission(
+                paths=self.paths,
+                config=config,
+            )
+
+    def test_immutable_memory_admission_runs_integrity_checks_first(self) -> None:
+        self._prepare_recoverable_v6()
+        uri = self.memory_db.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            root_page = int(
+                connection.execute(
+                    "SELECT rootpage FROM sqlite_schema "
+                    "WHERE type = 'index' AND rootpage > 0 ORDER BY rootpage LIMIT 1"
+                ).fetchone()[0]
+            )
+        with self.memory_db.open("r+b") as handle:
+            handle.seek((root_page - 1) * page_size)
+            handle.write(b"\0" * 32)
+            handle.flush()
+            os.fsync(handle.fileno())
+        lease = CoreAuthorityLease.acquire_core(
+            self.memory_db,
+            timeout_seconds=0.0,
+            instance_id="immutable-integrity-test",
+        )
+        store = DurableMemoryStore.open_existing_for_audit(self.memory_db)
+        store._authority_lease = lease
+        try:
+            with self.assertRaisesRegex(
+                CoreAuthorityError,
+                "integrity verification",
+            ):
+                store.inspect_core_authority_preclaim_immutable()
+        finally:
+            store.close()
+            lease.close()
+
+    def test_pending_runtime_publication_pure_validator_is_identity_closed(self) -> None:
+        config = self._prepare_recoverable_v6()
+        self._advance_recoverable_v6_epoch_pending(config)
+        lease = CoreAuthorityLease.acquire_core(
+            self.memory_db,
+            timeout_seconds=0.0,
+            instance_id="pending-validator-test",
+        )
+        store = DurableMemoryStore.open_existing_for_audit(self.memory_db)
+        store._authority_lease = lease
+        try:
+            inspection = store.inspect_core_authority_preclaim_immutable()
+            marker = dict(inspection["marker"])
+            publication = dict(inspection["runtime_publication"])
+            kwargs = {
+                "marker": marker,
+                "publication": publication,
+                "runtime_state_path": self.paths.state,
+                "expected_lock_generation_id": lease.lock_generation_id,
+                "expected_config_fingerprint": config.fingerprint,
+                "expected_build_id": installer._manifest_build_id(ROOT),
+                "expected_protocol_version": installer.PROTOCOL_VERSION,
+                "expected_root_generation_id": str(marker["root_generation_id"]),
+                "expected_embedding_space_identity": (
+                    config.embedding_space_identity
+                ),
+            }
+            binding = (
+                DurableMemoryStore.validate_interrupted_runtime_publication_binding(
+                    **kwargs
+                )
+            )
+            self.assertEqual(binding["authority_epoch_number"], 2)
+            tampered = dict(publication)
+            tampered["runtime_state_path_sha256"] = "f" * 64
+            with self.assertRaises(CoreAuthorityError):
+                DurableMemoryStore.validate_interrupted_runtime_publication_binding(
+                    **{**kwargs, "publication": tampered}
+                )
+            with self.assertRaises(CoreAuthorityError):
+                DurableMemoryStore.validate_interrupted_runtime_publication_binding(
+                    **{**kwargs, "expected_root_generation_id": "generation-" + "e" * 24}
+                )
+        finally:
+            store.close()
+            lease.close()
+
+    def test_recovery_rejects_semantically_invalid_canonical_runtime(self) -> None:
+        config = self._prepare_recoverable_v6()
+        runtime = json.loads(self.paths.state.read_text(encoding="utf-8"))
+        runtime["global_enabled"] = "true"
+        self.paths.state.write_text(
+            json.dumps(runtime, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        self.paths.state.chmod(0o600)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "runtime state is invalid",
+        ):
+            installer._verify_recovery_admission(
+                paths=self.paths,
+                config=config,
+            )
+
+    def test_recover_existing_rejects_static_plist_and_binding_drift(self) -> None:
+        config = self._prepare_recoverable_v6()
+        self.paths.plist.write_bytes(self.paths.plist.read_bytes() + b"\n")
+        self.paths.plist.chmod(0o600)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "plist does not match",
+        ):
+            installer.recover_existing(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+            )
+        self.assertFalse((self.base / "launchctl.log").exists())
+
+        installer._atomic_private_bytes(
+            self.paths.plist,
+            installer.plist_payload(
+                label="aero.boom.synapse-s2.core.test",
+                paths=self.paths,
+                config=config,
+            ),
+        )
+        wrong = installer.binding_for_config(
+            repo_root=self.paths.root,
+            data_root=self.paths.data_root,
+            config=config,
+            core_label="aero.boom.synapse-s2.core.other",
+            authority_mode="candidate-local-v5",
+        )
+        installer.write_core_client_binding(
+            installer.default_binding_path(self.home),
+            wrong,
+        )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "binding does not identify",
+        ):
+            installer.recover_existing(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+            )
+        self.assertFalse((self.base / "launchctl.log").exists())
+
+    def test_recovery_admission_rejects_config_and_build_drift(self) -> None:
+        config = self._prepare_recoverable_v6()
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "durable v6 marker",
+        ):
+            installer._verify_recovery_admission(
+                paths=self.paths,
+                config=replace(config, dimension=config.dimension + 1),
+            )
+        with mock.patch.object(
+            installer,
+            "_manifest_build_id",
+            return_value="source-" + ("f" * 24),
+        ), self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "durable v6 marker",
+        ):
+            installer._verify_recovery_admission(
+                paths=self.paths,
+                config=config,
+            )
+
+    def test_recovery_admission_rejects_root_journal_and_runtime_drift(self) -> None:
+        config = self._prepare_recoverable_v6()
+        root_path = self.core / "store-generation.json"
+        root_payload = json.loads(root_path.read_text(encoding="utf-8"))
+        root_payload["root_generation_id"] = "generation-" + ("e" * 24)
+        root_path.write_bytes(canonical_json_bytes(root_payload))
+        root_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "root generation",
+        ):
+            installer._verify_recovery_admission(
+                paths=self.paths,
+                config=config,
+            )
+
+        root_payload["root_generation_id"] = "generation-" + ("d" * 24)
+        root_path.write_bytes(canonical_json_bytes(root_payload))
+        with closing(
+            sqlite3.connect(self.core / "requests.sqlite3")
+        ) as connection:
+            original_journal_id = str(
+                connection.execute(
+                    "SELECT value FROM request_journal_metadata WHERE key = ?",
+                    ("journal_id",),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "UPDATE request_journal_metadata SET value = ? WHERE key = ?",
+                ("journal-" + ("e" * 24), "journal_id"),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "request journal",
+        ):
+            installer._verify_recovery_admission(
+                paths=self.paths,
+                config=config,
+            )
+
+        with closing(
+            sqlite3.connect(self.core / "requests.sqlite3")
+        ) as connection:
+            connection.execute(
+                "UPDATE request_journal_metadata SET value = ? WHERE key = ?",
+                (original_journal_id, "journal_id"),
+            )
+            connection.commit()
+        runtime = json.loads(self.paths.state.read_text(encoding="utf-8"))
+        runtime["authority_binding"]["marker_sha256"] = "f" * 64
+        self.paths.state.write_text(
+            json.dumps(runtime, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "runtime state",
+        ):
+            installer._verify_recovery_admission(
+                paths=self.paths,
+                config=config,
+            )
+
+    def test_recovery_admission_accepts_same_identity_successor_pending_epoch(self) -> None:
+        config = self._prepare_recoverable_v6()
+        self._advance_recoverable_v6_epoch_pending(config)
+        result = installer._verify_recovery_admission(
+            paths=self.paths,
+            config=config,
+        )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["authority_epoch_number"], 2)
+        self.assertEqual(result["runtime_publication_status"], "pending")
 
     def test_uninstall_is_idempotent_and_preserves_data_config_token_and_logs(self) -> None:
         self.core.mkdir(mode=0o700)

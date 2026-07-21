@@ -247,12 +247,16 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 / "core"
                 / "service.sock"
             )
-            certifier = OperatorReadinessCertifier(
-                self._args(
-                    Path(tmp),
-                    core_socket=str(socket_path),
+            with mock.patch(
+                "scripts.operator_readiness_certify.default_binding_path",
+                return_value=Path(tmp) / "missing-core-binding.json",
+            ):
+                certifier = OperatorReadinessCertifier(
+                    self._args(
+                        Path(tmp),
+                        core_socket=str(socket_path),
+                    )
                 )
-            )
 
             command = certifier._cli_command("doctor", "--context", "default")
             env = certifier._base_env()
