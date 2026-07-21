@@ -61,7 +61,7 @@ class CoreAgentInstallerTests(unittest.TestCase):
             state=self.data / "runtime_state.json",
             memory_db=self.memory_db,
             capture_root=self.capture,
-            log=self.core / "service.log",
+            log=self.home / "Library" / "Logs" / "SYNAPSE-S2" / "core-service.log",
             plist=self.plist,
             python=Path(sys.executable),
             service_program=ROOT / "core_service.py",
@@ -419,6 +419,12 @@ else:
                 "SYNAPSE_S2_BUILD_ID": installer._manifest_build_id(ROOT),
                 "MLX_DEVICE": "gpu",
             },
+        )
+        self.assertEqual(plist["StandardOutPath"], str(self.paths.log))
+        self.assertEqual(plist["StandardErrorPath"], str(self.paths.log))
+        self.assertEqual(
+            self.paths.log,
+            self.home / "Library" / "Logs" / "SYNAPSE-S2" / "core-service.log",
         )
         self.assertNotIn(canary, self.paths.plist.read_text(encoding="utf-8"))
         self.assertNotIn(canary, self.paths.config.read_text(encoding="utf-8"))
@@ -1379,6 +1385,7 @@ else:
     def test_uninstall_is_idempotent_and_preserves_data_config_token_and_logs(self) -> None:
         self.core.mkdir(mode=0o700)
         self.plist.parent.mkdir(mode=0o700, parents=True)
+        installer.ensure_private_directory(self.paths.log.parent)
         self.plist.write_bytes(b"plist")
         self.plist.chmod(0o600)
         for path, content in (
@@ -1425,7 +1432,7 @@ else:
         self.assertIn("umask 077", combined)
 
     def test_resolved_paths_share_router_socket_and_existing_runtime_state_layout(self) -> None:
-        layout = installer._canonical_layout(self.data)
+        layout = installer._canonical_layout(self.data, home=self.home)
         manifest = self.base / "layout.json"
         manifest.write_text(
             json.dumps(
@@ -1454,6 +1461,10 @@ else:
         self.assertEqual(paths.socket, self.data / "core" / "service.sock")
         self.assertEqual(paths.socket.parent.parent, paths.data_root)
         self.assertEqual(paths.state, self.data / "runtime_state.json")
+        self.assertEqual(
+            paths.log,
+            self.home / "Library" / "Logs" / "SYNAPSE-S2" / "core-service.log",
+        )
         with mock.patch.dict(
             os.environ,
             {
@@ -1468,6 +1479,18 @@ else:
                     label="aero.boom.synapse-s2.core.test",
                     noncanonical_layout_manifest=manifest,
                 )
+
+    def test_resolved_paths_reject_protected_documents_log_override(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.home),
+                "SYNAPSE_S2_CORE_LOG": str(self.core / "service.log"),
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(installer.CoreInstallerError, "canonical layout"):
+                installer.resolve_paths(label="aero.boom.synapse-s2.core.test")
 
     def test_noncanonical_layout_requires_exact_reviewed_private_manifest(self) -> None:
         with mock.patch.dict(
@@ -1503,7 +1526,6 @@ else:
                 "state": linked / "runtime_state.json",
                 "memory_db": linked / "memory.sqlite3",
                 "capture_root": linked,
-                "log": linked / "core" / "service.log",
             }
         )
         with self.assertRaisesRegex(installer.CoreInstallerError, "symlink"):

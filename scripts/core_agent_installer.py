@@ -106,7 +106,7 @@ def _env_path(name: str, default: Path) -> Path:
     return _normal_absolute(raw if raw is not None else default, name=name.lower())
 
 
-def _canonical_layout(data_root: Path) -> dict[str, Path]:
+def _canonical_layout(data_root: Path, *, home: Path) -> dict[str, Path]:
     core_root = data_root / "core"
     return {
         "data_root": data_root,
@@ -116,7 +116,12 @@ def _canonical_layout(data_root: Path) -> dict[str, Path]:
         "state": data_root / "runtime_state.json",
         "memory_db": data_root / "memory.sqlite3",
         "capture_root": data_root,
-        "log": core_root / "service.log",
+        # launchd opens stdout/stderr before Python starts. On current macOS,
+        # a newly-created log below Documents can be denied by protected-folder
+        # admission even though the interactive operator can write it. Keep the
+        # durable store in its reviewed layout and put only process output in
+        # the user's canonical Logs directory.
+        "log": home / "Library" / "Logs" / "SYNAPSE-S2" / "core-service.log",
     }
 
 
@@ -201,7 +206,10 @@ def resolve_paths(
         state=_env_path("SYNAPSE_S2_CORE_STATE", data_root / "runtime_state.json"),
         memory_db=_env_path("SYNAPSE_S2_MEMORY_DB", data_root / "memory.sqlite3"),
         capture_root=_env_path("SYNAPSE_S2_CAPTURE_ROOT", data_root),
-        log=_env_path("SYNAPSE_S2_CORE_LOG", core_root / "service.log"),
+        log=_env_path(
+            "SYNAPSE_S2_CORE_LOG",
+            home / "Library" / "Logs" / "SYNAPSE-S2" / "core-service.log",
+        ),
         plist=home / "Library" / "LaunchAgents" / f"{label}.plist",
         python=_env_path("SYNAPSE_S2_CORE_PYTHON", ROOT / ".venv" / "bin" / "python"),
         service_program=ROOT / "core_service.py",
@@ -209,13 +217,13 @@ def resolve_paths(
     for field, path in values.__dict__.items():
         if isinstance(path, Path) and contains_secret_shape(str(path)):
             raise CoreInstallerError(f"{field} contains a credential-shaped value")
-    expected = _canonical_layout(values.data_root)
+    expected = _canonical_layout(values.data_root, home=values.home)
     for field, expected_path in expected.items():
         if getattr(values, field) != expected_path:
             raise CoreInstallerError(
                 "core data paths must use one internally canonical layout"
             )
-    canonical = _canonical_layout(ROOT / ".synapse_s2")
+    canonical = _canonical_layout(ROOT / ".synapse_s2", home=values.home)
     observed_layout = {field: getattr(values, field) for field in canonical}
     if observed_layout != canonical:
         manifest_path = noncanonical_layout_manifest
@@ -281,7 +289,7 @@ def _assert_no_symlink_components(path: Path) -> None:
 
 
 def _assert_layout(paths: InstallPaths) -> None:
-    expected = _canonical_layout(paths.data_root)
+    expected = _canonical_layout(paths.data_root, home=paths.home)
     if any(getattr(paths, field) != value for field, value in expected.items()):
         raise CoreInstallerError("authoritative-core paths do not share one canonical layout")
     broad = {

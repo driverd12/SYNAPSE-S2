@@ -72,6 +72,7 @@ class OperationalScriptTests(unittest.TestCase):
         certifier.artifact_dir = temp_root / "artifacts"
         certifier.artifact_dir.mkdir(mode=0o700)
         certifier._evidence_files = set()
+        certifier._opaque_evidence_files = set()
 
         reconciliation = {
             "missing_authoritative_ledger_count": 0,

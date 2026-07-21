@@ -101,7 +101,9 @@ shutdown is bounded.
 
 ## Files and ownership
 
-The default installation is repository-relative:
+The default durable installation is repository-relative; launchd process output
+uses the user's canonical Logs directory so current macOS protected-folder
+admission cannot stop the daemon before Python starts:
 
 | Purpose | Path | Mode |
 | --- | --- | --- |
@@ -115,7 +117,7 @@ The default installation is repository-relative:
 | Request-journal lock | `.synapse_s2/core/requests.sqlite3.lock` | `0600` |
 | Cutover attestation | `.synapse_s2/core/cutover-attestation.json` | `0600` |
 | Runtime state | `.synapse_s2/runtime_state.json` | `0600` |
-| Core log | `.synapse_s2/core/service.log` | `0600` |
+| Core log | `~/Library/Logs/SYNAPSE-S2/core-service.log` | `0600` |
 | Durable memory | `.synapse_s2/memory.sqlite3` | `0600` |
 | Capture transport root | `.synapse_s2/` | `0700` |
 | Core runtime directory | `.synapse_s2/core/` | `0700` |
@@ -223,12 +225,15 @@ malformed receipt, or stale state paired with an already `complete` receipt is
 not auto-repaired. Thus crash recovery is narrow and same-generation; unrelated
 mismatches still stop startup and health.
 
-That repository-relative layout is mandatory by default. A different data root
-requires `--noncanonical-layout-manifest /absolute/private/manifest.json`. The
-owner-only manifest must use schema
+That repository-relative durable-data layout and the separate fixed
+`~/Library/Logs/SYNAPSE-S2/core-service.log` path are mandatory by default. A
+different data root requires
+`--noncanonical-layout-manifest /absolute/private/manifest.json`. The owner-only
+manifest must use schema
 `synapse-s2.noncanonical-core-layout.v1`, set `reviewed=true`, name a
 `reviewed_by` operator, and enumerate every exact internal path. Individual
-socket, database, capture, state, config, or log paths cannot be scattered.
+socket, database, capture, state, or config paths cannot be scattered, and the
+log cannot be redirected away from its canonical Logs path.
 Installers walk existing path components without following application-owned
 symlinks, reject foreign or hard-linked targets, and never repair safety by
 changing permissions on an existing caller-owned directory.
