@@ -220,7 +220,17 @@ import json, sys
 payload = json.load(sys.stdin)
 if payload.get("ok") is not True:
     raise SystemExit(1)
-if not all(payload.get(key) is True for key in ("loaded", "running", "healthy", "capture_ready")):
+if not all(
+    payload.get(key) is True
+    for key in (
+        "loaded",
+        "running",
+        "healthy",
+        "runtime_healthy",
+        "production_ready",
+        "capture_ready",
+    )
+):
     raise SystemExit(1)
 binding = payload.get("client_binding")
 if not isinstance(binding, dict) or binding.get("ready") is not True:

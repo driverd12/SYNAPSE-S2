@@ -27,12 +27,11 @@ operator may deliberately publish another closed CPU/GPU/provider contract
 through the documented environment overrides, but absence of overrides never
 silently selects the semantic-hash maintenance provider.
 
-Rollout status is separate from repository capability: the live local
-production instance has not yet been cut over to this authoritative-core lane.
-It remains on the legacy v5 runtime until the fresh backup, quiescence,
-attestation, install, and stabilized-health gates below are deliberately run.
-Nothing in this document by itself proves that cutover or remote publication
-has happened.
+Rollout status is separate from repository capability. Nothing in this document
+by itself proves live cutover or remote publication. Verify the installed state
+with `install_core_agent.sh status` and require `healthy`, `runtime_healthy`,
+`production_ready`, `capture_ready`, and `client_binding.ready` to be true,
+`provisional` to be false, and `deployment_mode` to be `authoritative`.
 
 ## Adapter and browser boundary
 
@@ -317,7 +316,11 @@ changing permissions on an existing caller-owned directory.
    and its manifest must contain the canonical
    `synapse-s2.core-config-evidence.v1` contract and exact configuration
    fingerprint. `--expect-*` flags are assertions only; they cannot select a
-   different backend. Recovery backup, signed verification, isolated restore,
+   different backend. Before any functional probe, the required runtime-build
+   proof compares the service health build ID and configuration fingerprint to
+   the deterministic build of the current clean source tree; a mismatch ends
+   the run as a diagnostic-only blocked pack. Recovery backup, signed
+   verification, isolated restore,
    and every required proof must be ready and replay-free. The certifier's own
    bounded client processes complete their `finish()` writes before its later
    bounded capture drain. It then acquires exclusive core authority and the
@@ -327,7 +330,7 @@ changing permissions on an existing caller-owned directory.
    held. The recovery manager, temporary restore, store, and authority lease
    must then unwind successfully; only afterward is the optional ZIP built from
    the staged manifest and `manifest.json` atomically published last. The
-   versioned 20-proof contract rejects missing, duplicate, optional-shadow, or
+   versioned 21-proof contract rejects missing, duplicate, optional-shadow, or
    non-ready rows, and the manifest binds the exact versioned quiescence policy
    digest. Probe children receive only a minimal allowlisted environment, not
    ambient GitHub, OpenAI, Hugging Face, Python, or DYLD credentials/settings.
@@ -350,6 +353,67 @@ changing permissions on an existing caller-owned directory.
    returns a verified maintenance receipt, complete checkpoint, `quick_check`,
    zero foreign-key errors, verified backup, and a final `ready` audit. Neither
    flag is a way to make an unhealthy Phase-A probe pass.
+
+   If the incumbent v6 build is too old to satisfy the current live contract,
+   do not restart it and do not reuse an older evidence pack. After the exact
+   core label is disabled and unloaded, first run the content-free delivery
+   audit and review its exact revision. Then use the one-shot replacement
+   certification lane:
+
+   ```bash
+   scripts/install_core_agent.sh stage-replacement \
+     --confirm \
+     --expected-revision '<exact ready audit revision>'
+   .venv/bin/python scripts/operator_readiness_certify.py \
+     --json \
+     --context default \
+     --agent-id codex-desktop \
+     --expect-embedding-provider mlx-neural \
+     --handoff-running-core
+   ```
+
+   `stage-replacement` accepts only a build-only successor with unchanged
+   configuration, protocol, root generation, lock inode, embedding space,
+   store, and request journal. Under one exclusive authority and capture lock
+   scope it creates and verifies a fresh signed backup plus isolated restore,
+   binds the ready delivery audit and clean current Git build into a private
+   ten-minute admission, and starts the candidate from a separate
+   non-`KeepAlive` plist. Health reports
+   `deployment_mode: replacement-certification`; the process self-fences when
+   that admission expires. Its durable authority marker remains explicitly
+   provisional, so a crash or manual restart without fresh final cutover
+   evidence fails closed. It publishes neither a persistent LaunchAgent nor a
+   client binding. The certifier must prove that exact runtime build, disable
+   and unload it, and publish a completely fresh 21-proof pack. Only the normal
+   `install --evidence-manifest ...` command below may then create the
+   persistent production service. On candidate activation failure the installer
+   attempts exact-label cleanup and verifies both the loaded/running snapshot
+   and disabled policy before saying the label is safe. If either readback or
+   cleanup fails, cutover stops with an unverified-cleanup error and the signed
+   candidate self-fences at admission expiry; never fall back to the predecessor
+   build or continue promotion from that state.
+
+   The existing authoritative client binding is deliberately retained so the
+   certifier can exercise the staged service. It also means another already
+   configured same-user MCP client could connect during this window. Close all
+   persistent wrappers, disable their exact respawners, and keep them closed
+   from the reviewed audit through final installation. Any unexpected client
+   invalidates the certification run. During staging,
+   `install_core_agent.sh status` reports `runtime_healthy: true`,
+   `provisional: true`, `deployment_mode: replacement-certification`, and
+   `production_ready: false`; do not interpret the retained binding as a live
+   promotion. Staging also requires at least five minutes of signed admission
+   life to remain after stabilized health so certification and final promotion
+   cannot begin inside an unsafe expiry window.
+
+   If a provisional candidate crashes, expires, or is interrupted before the
+   final evidence pack exists, its durable marker intentionally prevents an
+   ordinary restart. Stop the exact label so it is disabled and unloaded, run
+   `context-delivery-integrity` again, review the new ready audit revision, and
+   rerun `stage-replacement --confirm --expected-revision ...`. A fresh signed
+   recovery point may resume the same build only when the predecessor marker
+   is already explicitly provisional; an ordinary same-build marker remains
+   ineligible. Never reuse the expired admission or a partial evidence pack.
 4. Run the read-only inventory and recovery binding gate immediately after the
    certifier. This is also the post-backup quiescence proof: it must still show
    no writer process or loaded legacy category, and the exact recovery binding

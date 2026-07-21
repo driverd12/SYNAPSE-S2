@@ -55,13 +55,14 @@ from core_path_policy import (
 )
 from core_request_journal import (
     JOURNAL_BINDING_SCHEMA,
+    JOURNAL_SCHEMA_IDENTITY,
     JOURNAL_SCHEMA_VERSION,
     CoreRequestJournal,
     CoreRequestJournalCapacityError,
     CoreRequestJournalError,
     repair_empty_preclaim_journal_residue,
 )
-from memory_store import ContextDeliveryRejected
+from memory_store import ContextDeliveryRejected, LOGICAL_SNAPSHOT_DIGEST_SCHEMA
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
     SecretRedactingFormatter,
@@ -91,6 +92,10 @@ STORE_GENERATION_SCHEMA = "synapse-s2.root-generation.v1"
 STORE_GENERATION_ID_RE = re.compile(r"generation-[0-9a-f]{24}")
 CUTOVER_MINIMUM_REMAINING_SECONDS = 30.0
 CUTOVER_COMMIT_SAFETY_MARGIN_MS = 1_000
+REPLACEMENT_ADMISSION_ENV = "SYNAPSE_S2_REPLACEMENT_ADMISSION"
+REPLACEMENT_CERTIFICATION_MODE = "replacement-certification"
+REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX = "replacement-certification:"
+AUTHORITATIVE_DEPLOYMENT_MODE = "authoritative"
 BACKEND_LANE_CAPTURE_TIMEOUT_SECONDS = 60.0
 BACKEND_LANE_CAPTURE_FILE_SECONDS = 5.0
 BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
@@ -2576,6 +2581,10 @@ class AuthoritativeCoreService:
             "last_error_code": None,
         }
         self._build_id = _source_build_id()
+        self._deployment_mode = AUTHORITATIVE_DEPLOYMENT_MODE
+        self._replacement_admission_receipt_digest: str | None = None
+        self._replacement_admission_expires_at_unix_ms: int | None = None
+        self._replacement_admission_deadline_monotonic: float | None = None
         self._close_lock = threading.Lock()
         self._shutdown_teardown_thread: threading.Thread | None = None
         self._shutdown_teardown_complete = threading.Event()
@@ -2633,6 +2642,19 @@ class AuthoritativeCoreService:
                 raise CoreAuthorityError("authoritative core process is poisoned")
             if authority is None:
                 raise CoreAuthorityError("authoritative core lease is unavailable")
+            if self._deployment_mode == REPLACEMENT_CERTIFICATION_MODE:
+                expires_at = self._replacement_admission_expires_at_unix_ms
+                deadline = self._replacement_admission_deadline_monotonic
+                if (
+                    type(expires_at) is not int
+                    or not isinstance(deadline, float)
+                    or not math.isfinite(deadline)
+                    or int(time.time() * 1000) >= expires_at
+                    or time.monotonic() >= deadline
+                ):
+                    raise CoreAuthorityError(
+                        "replacement admission expired before certification"
+                    )
             authority.assert_core_for(self.config.memory_path)
             if (
                 type(authority.durable_epoch) is not int
@@ -3058,6 +3080,302 @@ class AuthoritativeCoreService:
             raise CoreServiceError("service_unavailable")
         return dict(verification)
 
+    @staticmethod
+    def _replacement_admission_requested() -> bool:
+        """Recognize only the installer-owned provisional launch signal."""
+
+        configured = os.getenv(REPLACEMENT_ADMISSION_ENV)
+        if configured is None:
+            return False
+        if configured != "1":
+            raise CoreServiceError("service_unavailable")
+        return True
+
+    @staticmethod
+    def _replacement_certification_pending(
+        marker: Mapping[str, Any] | None,
+    ) -> bool:
+        """Return whether the durable marker still awaits final certification."""
+
+        return bool(
+            isinstance(marker, Mapping)
+            and isinstance(marker.get("instance_id"), str)
+            and str(marker["instance_id"]).startswith(
+                REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+            )
+        )
+
+    def _assert_build_only_replacement_candidate(
+        self,
+        *,
+        inspection: Mapping[str, Any],
+        marker: Mapping[str, Any] | None,
+        authority: CoreAuthorityLease,
+    ) -> None:
+        """Admit only an exact-layout, build-only successor of live v6."""
+
+        data_root = self.config.memory_path.parent
+        logical_snapshot = inspection.get("logical_snapshot")
+        runtime_publication = inspection.get("runtime_publication")
+        if (
+            not isinstance(marker, Mapping)
+            or inspection.get("governance_mode") != "authoritative-v6"
+            or inspection.get("schema_identity") != CORE_STORE_SCHEMA_IDENTITY
+            or inspection.get("new_empty_bootstrap") is not False
+            or self.config.socket_path != data_root / "core" / "service.sock"
+            or self.config.state_path != data_root / "runtime_state.json"
+            or self.config.capture_root != data_root
+            or (
+                marker.get("build_id") == self._build_id
+                and not self._replacement_certification_pending(marker)
+            )
+            or marker.get("config_fingerprint") != self.config.fingerprint
+            or marker.get("protocol_version") != PROTOCOL_VERSION
+            or marker.get("root_generation_id") != self._root_generation_id
+            or marker.get("lock_generation_id") != authority.lock_generation_id
+            or marker.get("embedding_space_identity")
+            != self.config.embedding_space_identity
+            or marker.get("store_identity") != inspection.get("store_identity")
+            or type(marker.get("epoch")) is not int
+            or inspection.get("previous_epoch") != marker.get("epoch")
+            or inspection.get("next_epoch") != int(marker["epoch"]) + 1
+            or not isinstance(logical_snapshot, Mapping)
+            or not isinstance(logical_snapshot.get("schema"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(logical_snapshot.get("sha256") or ""),
+            )
+            is None
+            or not isinstance(runtime_publication, Mapping)
+            or runtime_publication.get("status") != "complete"
+            or runtime_publication.get("build_id") != marker.get("build_id")
+            or runtime_publication.get("authority_epoch_number")
+            != marker.get("epoch")
+        ):
+            raise CoreServiceError("service_unavailable")
+
+    @staticmethod
+    def _assert_ready_replacement_delivery_audit(
+        audit: Mapping[str, Any] | None,
+    ) -> None:
+        zero_fields = (
+            "cursor_mismatch_count",
+            "delivery_schema_error_count",
+            "unrelated_delivery_error_count",
+            "target_integrity_error_count",
+            "event_ledger_integrity_error_count",
+            "target_highwater_error_count",
+            "highwater_contract_error_count",
+            "repair_receipt_integrity_error_count",
+            "repair_receipt_semantic_error_count",
+            "pending_repair_receipt_semantic_error_count",
+            "verified_repair_receipt_semantic_error_count",
+            "pending_repair_receipt_count",
+        )
+        nonnegative_fields = (
+            "derivation_source_row_count",
+            "target_highwater",
+            "latest_event_id",
+        )
+        if (
+            not isinstance(audit, Mapping)
+            or audit.get("protocol_version")
+            != "context-delivery-publication-repair.v1"
+            or audit.get("status") != "ready"
+            or audit.get("repair_required") is not False
+            or audit.get("repairable") is not True
+            or audit.get("target_reconciliation_needed") is not False
+            or audit.get("target_canonicalization_needed") is not False
+            or any(type(audit.get(field)) is not int for field in zero_fields)
+            or any(int(audit[field]) != 0 for field in zero_fields)
+            or any(
+                type(audit.get(field)) is not int
+                for field in nonnegative_fields
+            )
+            or any(int(audit[field]) < 0 for field in nonnegative_fields)
+            or audit.get("target_highwater") != audit.get("latest_event_id")
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(audit.get("audit_revision") or "")
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(audit.get("settled_audit_revision") or ""),
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(audit.get("derivation_source_sha256") or ""),
+            )
+            is None
+        ):
+            raise CoreServiceError("service_unavailable")
+
+    def _verify_required_replacement_admission(
+        self,
+        *,
+        inspection: Mapping[str, Any],
+        delivery_audit: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.config.capture_root is None:
+            raise CoreServiceError("service_unavailable")
+        try:
+            from scripts.core_cutover_preflight import (
+                REPLACEMENT_ADMISSION_NAME,
+                REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA,
+                verify_replacement_admission_for_core,
+            )
+
+            attestation_path = (
+                self.config.memory_path.parent
+                / "core"
+                / REPLACEMENT_ADMISSION_NAME
+            )
+
+            verification = verify_replacement_admission_for_core(
+                root=Path(__file__).resolve().parent,
+                memory_db=self.config.memory_path,
+                capture_root=self.config.capture_root,
+                attestation_path=attestation_path,
+                expected_build_id=self._build_id,
+                expected_config_fingerprint=self.config.fingerprint,
+                inspection=inspection,
+                delivery_audit=delivery_audit,
+                minimum_remaining_seconds=CUTOVER_MINIMUM_REMAINING_SECONDS,
+            )
+        except Exception as exc:
+            raise CoreServiceError("service_unavailable") from exc
+
+        logical_snapshot = inspection.get("logical_snapshot")
+        marker = inspection.get("marker")
+        runtime_publication = inspection.get("runtime_publication")
+        try:
+            predecessor_marker_sha256 = hashlib.sha256(
+                canonical_json_bytes(dict(marker))
+            ).hexdigest()
+            predecessor_runtime_publication_sha256 = hashlib.sha256(
+                canonical_json_bytes(dict(runtime_publication))
+            ).hexdigest()
+            delivery_audit_sha256 = hashlib.sha256(
+                canonical_json_bytes(dict(delivery_audit))
+            ).hexdigest()
+        except (CoreProtocolError, TypeError, ValueError) as exc:
+            raise CoreServiceError("service_unavailable") from exc
+        signed_sha256_fields = (
+            "capture_manifest_sha256",
+            "runtime_state_canonical_sha256",
+            "request_journal_logical_snapshot_sha256",
+            "request_journal_binding_receipt_digest",
+            "recovery_bundle_receipt_digest",
+            "recovery_restore_proof_receipt_digest",
+        )
+        if (
+            not isinstance(verification, dict)
+            or verification.get("schema")
+            != REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA
+            or verification.get("verified") is not True
+            or verification.get("candidate_build_id") != self._build_id
+            or verification.get("candidate_config_fingerprint")
+            != self.config.fingerprint
+            or verification.get("governance_mode") != "authoritative-v6"
+            or verification.get("store_identity") != inspection.get("store_identity")
+            or not isinstance(marker, Mapping)
+            or verification.get("authority_epoch_number") != marker.get("epoch")
+            or verification.get("next_authority_epoch_number")
+            != inspection.get("next_epoch")
+            or verification.get("store_generation")
+            != f"epoch-{marker.get('epoch')}"
+            or verification.get("database_schema_identity")
+            != inspection.get("schema_identity")
+            or not isinstance(logical_snapshot, Mapping)
+            or not isinstance(runtime_publication, Mapping)
+            or verification.get("database_logical_snapshot_schema")
+            != logical_snapshot.get("schema")
+            or not secrets.compare_digest(
+                str(verification.get("database_logical_snapshot_sha256") or ""),
+                str(logical_snapshot.get("sha256") or ""),
+            )
+            or re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                str(verification.get("git_head") or ""),
+            )
+            is None
+            or any(
+                re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(verification.get(field) or ""),
+                )
+                is None
+                for field in signed_sha256_fields
+            )
+            or verification.get("runtime_state_required") is not True
+            or verification.get("runtime_state_present") is not True
+            or verification.get("request_journal_id")
+            != marker.get("request_journal_id")
+            or verification.get("request_journal_schema_identity")
+            != JOURNAL_SCHEMA_IDENTITY
+            or verification.get("request_journal_logical_snapshot_schema")
+            != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(verification.get("receipt_digest") or ""),
+            )
+            is None
+            or type(verification.get("expires_at_unix_ms")) is not int
+            or int(verification["expires_at_unix_ms"])
+            <= int(time.time() * 1000) + CUTOVER_COMMIT_SAFETY_MARGIN_MS
+            or verification.get("restored_target_binding_receipt_digest")
+            is not None
+            or verification.get("restored_target") is not False
+            or verification.get("predecessor_marker_sha256")
+            != predecessor_marker_sha256
+            or verification.get("predecessor_marker_schema_version")
+            != marker.get("schema_version")
+            or verification.get("predecessor_service_required") is not True
+            or verification.get("predecessor_instance_id")
+            != marker.get("instance_id")
+            or verification.get("predecessor_build_id")
+            != marker.get("build_id")
+            or verification.get("predecessor_config_fingerprint")
+            != marker.get("config_fingerprint")
+            or verification.get("predecessor_protocol_version")
+            != marker.get("protocol_version")
+            or verification.get("predecessor_lock_generation_id")
+            != marker.get("lock_generation_id")
+            or verification.get("predecessor_root_generation_id")
+            != marker.get("root_generation_id")
+            or verification.get("predecessor_embedding_space_identity")
+            != marker.get("embedding_space_identity")
+            or verification.get("predecessor_request_journal_id")
+            != marker.get("request_journal_id")
+            or verification.get("predecessor_request_journal_binding_schema")
+            != marker.get("request_journal_binding_schema")
+            or verification.get("predecessor_request_journal_schema_version")
+            != marker.get("request_journal_schema_version")
+            or verification.get(
+                "predecessor_restored_target_binding_receipt_digest"
+            )
+            != marker.get("restored_target_binding_receipt_digest")
+            or verification.get("predecessor_runtime_publication_sha256")
+            != predecessor_runtime_publication_sha256
+            or verification.get("delivery_audit_sha256")
+            != delivery_audit_sha256
+            or verification.get("delivery_audit_revision")
+            != delivery_audit.get("audit_revision")
+            or verification.get("delivery_settled_audit_revision")
+            != delivery_audit.get("settled_audit_revision")
+            or verification.get("delivery_derivation_source_sha256")
+            != delivery_audit.get("derivation_source_sha256")
+            or verification.get("delivery_derivation_source_row_count")
+            != delivery_audit.get("derivation_source_row_count")
+            or verification.get("delivery_target_highwater")
+            != delivery_audit.get("target_highwater")
+            or verification.get("delivery_latest_event_id")
+            != delivery_audit.get("latest_event_id")
+        ):
+            raise CoreServiceError("service_unavailable")
+        return dict(verification)
+
     def _verify_existing_restored_target_binding(
         self,
         *,
@@ -3204,6 +3522,15 @@ class AuthoritativeCoreService:
             return
         if self._stop_event.is_set():
             raise CoreServiceError("service_unavailable")
+        replacement_admission_requested = self._replacement_admission_requested()
+        if replacement_admission_requested:
+            # Persist the provisional state in the existing durable authority
+            # marker.  A crash, expiry, logout, or manual restart therefore
+            # cannot silently turn an admitted candidate into production.
+            self._identity["authority_id"] = (
+                REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+                + uuid.uuid4().hex
+            )
         self._assert_database_bootstrap_is_not_silent_data_loss()
         _ensure_private_directory(self.config.socket_path.parent)
         authority = CoreAuthorityLease.acquire_core(
@@ -3396,8 +3723,49 @@ class AuthoritativeCoreService:
                 or root_generation_changed
                 or lock_generation_changed
                 or restored_adoption_required
+                or self._replacement_certification_pending(marker)
             )
-            if attestation_required:
+            if replacement_admission_requested:
+                self._assert_build_only_replacement_candidate(
+                    inspection=inspection,
+                    marker=marker,
+                    authority=authority,
+                )
+                delivery_audit_method = getattr(
+                    store,
+                    "audit_context_delivery_publication_repair",
+                    None,
+                )
+                if not callable(delivery_audit_method):
+                    raise CoreServiceError("service_unavailable")
+                try:
+                    delivery_audit = delivery_audit_method()
+                except Exception as exc:
+                    raise CoreServiceError("service_unavailable") from exc
+                self._assert_ready_replacement_delivery_audit(delivery_audit)
+                attestation = self._verify_required_replacement_admission(
+                    inspection=inspection,
+                    delivery_audit=delivery_audit,
+                )
+                self._deployment_mode = REPLACEMENT_CERTIFICATION_MODE
+                self._replacement_admission_receipt_digest = str(
+                    attestation["receipt_digest"]
+                )
+                self._replacement_admission_expires_at_unix_ms = int(
+                    attestation["expires_at_unix_ms"]
+                )
+                remaining_seconds = (
+                    self._replacement_admission_expires_at_unix_ms
+                    - int(time.time() * 1000)
+                ) / 1000.0
+                if remaining_seconds <= 0.0 or not math.isfinite(
+                    remaining_seconds
+                ):
+                    raise CoreServiceError("service_unavailable")
+                self._replacement_admission_deadline_monotonic = (
+                    time.monotonic() + remaining_seconds
+                )
+            elif attestation_required:
                 attestation = self._verify_required_cutover_attestation(
                     inspection=inspection
                 )
@@ -4404,11 +4772,20 @@ class AuthoritativeCoreService:
             "operational_state": (
                 "unavailable"
                 if not ready
+                else REPLACEMENT_CERTIFICATION_MODE
+                if self._deployment_mode == REPLACEMENT_CERTIFICATION_MODE
                 else "maintenance"
                 if lane_health["maintenance"]
                 else "ready"
             ),
             "protocol_version": PROTOCOL_VERSION,
+            "deployment_mode": self._deployment_mode,
+            "replacement_admission_receipt_digest": (
+                self._replacement_admission_receipt_digest
+            ),
+            "replacement_admission_expires_at_unix_ms": (
+                self._replacement_admission_expires_at_unix_ms
+            ),
             "authority": {
                 "ready": authority_ready,
                 "blocker": None if authority_ready else "authority_lost",

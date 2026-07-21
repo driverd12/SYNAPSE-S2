@@ -433,6 +433,286 @@ else:
         self.assertIn("kickstart", log)
         self.assertNotIn(canary, log)
 
+    def test_stage_replacement_is_signed_temporary_and_nonpersistent(self) -> None:
+        environment = {
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+            "SYNAPSE_S2_TRANSCRIPT_POLL": "false",
+            "MLX_DEVICE": "cpu",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = installer.build_config(self.paths)
+        revision = "a" * 64
+        marker = {
+            "service_required": True,
+            "lock_generation_id": "lockfs-v1-1-2",
+            "config_fingerprint": config.fingerprint,
+            "build_id": "source-" + ("b" * 24),
+            "root_generation_id": "generation-" + ("c" * 24),
+        }
+        inspection = {
+            "governance_mode": "authoritative-v6",
+            "schema_identity": installer.EXPECTED_SCHEMA_IDENTITY,
+            "marker": marker,
+            "store_identity": "store-" + ("d" * 24),
+        }
+        audit = {
+            "status": "ready",
+            "repair_required": False,
+            "audit_revision": revision,
+        }
+        capture = {
+            "transport_ready": True,
+            "pending_file_count": 0,
+            "processing_file_count": 0,
+            "processing_empty_claim_count": 0,
+            "processing_malformed_claim_count": 0,
+            "error_file_count": 0,
+            "unresolved_error_count": 0,
+            "terminal_error_evidence_count": 0,
+            "historical_error_evidence_count": 0,
+            "unsafe_error_artifact_count": 0,
+            "error_resolution_pending_count": 0,
+            "error_resolution_failed_count": 0,
+        }
+        guarded = {
+            "verified": True,
+            "cutover_ready": True,
+            "bundle": {"bundle_receipt_path": str(self.base / "bundle.json")},
+            "restore": {"recovery_proof_path": str(self.base / "proof.json")},
+        }
+
+        class FakeLease:
+            lock_generation_id = marker["lock_generation_id"]
+
+            def assert_core_for(self, path: Path) -> None:
+                self.asserted_path = path
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeStore:
+            def inspect_core_authority_preclaim(self) -> dict[str, object]:
+                return dict(inspection)
+
+            def audit_context_delivery_publication_repair(self) -> dict[str, object]:
+                return dict(audit)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakePublication:
+            evidence = guarded
+
+            def publish(self, callback: object) -> dict[str, object]:
+                return callback(self.evidence)
+
+        class FakeGuard:
+            def __enter__(self) -> FakePublication:
+                return FakePublication()
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        manager = mock.Mock()
+        manager.daemon.status.return_value = capture
+        manager.guarded_recovery_transaction.return_value = FakeGuard()
+        admission = {
+            "receipt_digest": "e" * 64,
+            "expires_at_unix_ms": int(time.time() * 1000) + 600_000,
+            "candidate_build_id": installer._manifest_build_id(ROOT),
+            "candidate_config_fingerprint": config.fingerprint,
+            "delivery_audit_revision": revision,
+        }
+        (self.base / "launchctl-disabled").write_text("disabled", encoding="utf-8")
+        lease = FakeLease()
+        store = FakeStore()
+        with mock.patch.object(
+            installer,
+            "_validate_install_sources",
+        ), mock.patch.object(
+            installer,
+            "build_config",
+            return_value=config,
+        ), mock.patch.object(
+            installer,
+            "_load_recovery_root_generation",
+            return_value=marker["root_generation_id"],
+        ), mock.patch.object(
+            CoreAuthorityLease,
+            "acquire_core",
+            return_value=lease,
+        ), mock.patch.object(
+            DurableMemoryStore,
+            "open_existing_for_core_maintenance",
+            return_value=store,
+        ), mock.patch(
+            "recovery_manager.VerifiedRecoveryManager",
+            return_value=manager,
+        ), mock.patch.object(
+            installer,
+            "publish_replacement_admission",
+            return_value=admission,
+        ) as publisher, mock.patch.object(
+            installer,
+            "wait_for_health",
+            return_value={
+                **self._health(),
+                "pid": 4242,
+                "deployment_mode": "replacement-certification",
+            },
+        ) as health:
+            result = installer.stage_replacement(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+                maximum_evidence_age_seconds=7200,
+                confirm=True,
+                expected_revision=revision,
+            )
+
+        self.assertEqual(result["status"], "staged-healthy")
+        self.assertTrue(result["provisional"])
+        self.assertFalse(result["persistent"])
+        self.assertFalse(self.paths.plist.exists())
+        staged_plist = Path(result["staged_plist"])
+        payload = plistlib.loads(staged_plist.read_bytes())
+        self.assertFalse(payload["KeepAlive"])
+        self.assertEqual(
+            payload["EnvironmentVariables"][
+                "SYNAPSE_S2_REPLACEMENT_ADMISSION"
+            ],
+            "1",
+        )
+        self.assertFalse(
+            installer.default_binding_path(self.home).exists()
+        )
+        publisher.assert_called_once()
+        health.assert_called_once_with(
+            launchctl=mock.ANY,
+            config=config,
+            prior_pid=None,
+            wait_seconds=2,
+            expected_deployment_mode="replacement-certification",
+        )
+        launch_log = (self.base / "launchctl.log").read_text(encoding="utf-8")
+        self.assertIn(str(staged_plist), launch_log)
+
+    def test_stage_replacement_refuses_unreviewed_or_enabled_service(self) -> None:
+        with self.assertRaisesRegex(installer.CoreInstallerError, "--confirm"):
+            installer.stage_replacement(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+                maximum_evidence_age_seconds=7200,
+                confirm=False,
+                expected_revision="a" * 64,
+            )
+        with self.assertRaisesRegex(installer.CoreInstallerError, "disabled"):
+            installer.stage_replacement(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+                maximum_evidence_age_seconds=7200,
+                confirm=True,
+                expected_revision="a" * 64,
+            )
+
+    def test_replacement_certification_requires_post_health_time_budget(self) -> None:
+        now = 1_000_000.0
+        with mock.patch.object(installer.time, "time", return_value=now):
+            self.assertEqual(
+                installer.replacement_certification_seconds_remaining(
+                    {
+                        "expires_at_unix_ms": int(now * 1000)
+                        + int(
+                            (
+                                installer.REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS
+                                + 17
+                            )
+                            * 1000
+                        )
+                    }
+                ),
+                int(installer.REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS)
+                + 17,
+            )
+            with self.assertRaisesRegex(
+                installer.CoreInstallerError,
+                "too little signed time",
+            ):
+                installer.replacement_certification_seconds_remaining(
+                    {
+                        "expires_at_unix_ms": int(now * 1000)
+                        + int(
+                            (
+                                installer.REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS
+                                - 1
+                            )
+                            * 1000
+                        )
+                    }
+                )
+            with self.assertRaisesRegex(
+                installer.CoreInstallerError,
+                "expiry is invalid",
+            ):
+                installer.replacement_certification_seconds_remaining(None)
+
+    def test_exact_label_cleanup_requires_both_launchd_readbacks(self) -> None:
+        cases = (
+            "clean",
+            "bootout",
+            "disable",
+            "snapshot-error",
+            "still-running",
+            "disabled-error",
+            "disabled-false",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                launchctl = mock.Mock()
+                if case == "bootout":
+                    launchctl.bootout.side_effect = installer.CoreInstallerError(
+                        "bootout failed"
+                    )
+                if case == "disable":
+                    launchctl.disable.side_effect = installer.CoreInstallerError(
+                        "disable failed"
+                    )
+                if case == "snapshot-error":
+                    launchctl.snapshot.side_effect = installer.CoreInstallerError(
+                        "snapshot failed"
+                    )
+                else:
+                    launchctl.snapshot.return_value = {
+                        "loaded": False,
+                        "running": case == "still-running",
+                    }
+                if case == "disabled-error":
+                    launchctl.disabled.side_effect = installer.CoreInstallerError(
+                        "disabled readback failed"
+                    )
+                else:
+                    launchctl.disabled.return_value = case != "disabled-false"
+
+                errors = installer.verified_exact_label_cleanup(
+                    launchctl=launchctl,
+                    wait_seconds=2.0,
+                )
+
+                self.assertEqual(errors == [], case == "clean")
+                launchctl.bootout.assert_called_once_with(wait_seconds=2.0)
+                launchctl.disable.assert_called_once_with()
+                launchctl.snapshot.assert_called_once_with()
+                launchctl.disabled.assert_called_once_with()
+
     def test_build_config_defaults_to_closed_production_neural_contract(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             config = installer.build_config(self.paths)
@@ -685,6 +965,56 @@ else:
         calls = (self.base / "launchctl.log").read_text(encoding="utf-8")
         self.assertIn("bootout gui/", calls)
         self.assertIn("disable gui/", calls)
+
+    def test_failed_install_never_claims_unverified_exact_label_cleanup(self) -> None:
+        launchctl = mock.Mock()
+        launchctl.snapshot.return_value = {
+            "loaded": False,
+            "running": False,
+            "pid": None,
+        }
+        environment = {
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "0",
+        }
+        with mock.patch.dict(
+            os.environ,
+            environment,
+            clear=False,
+        ), mock.patch.object(
+            installer,
+            "_preflight",
+            return_value={"ready": True},
+        ), mock.patch.object(
+            installer,
+            "wait_for_health",
+            side_effect=installer.CoreInstallerError("health failed"),
+        ), mock.patch.object(
+            installer,
+            "verified_exact_label_cleanup",
+            return_value=["bootout"],
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                installer.CoreInstallerError,
+                "cleanup could not be verified",
+            ):
+                installer.install(
+                    paths=self.paths,
+                    label="aero.boom.synapse-s2.core.test",
+                    launchctl=launchctl,
+                    launchctl_bin=str(self.launchctl_path),
+                    ps_bin="/bin/false",
+                    evidence_manifest=self.base / "evidence" / "manifest.json",
+                    maximum_evidence_age_seconds=7200,
+                    wait_seconds=2,
+                    force_restart=True,
+                )
+        cleanup.assert_called_once_with(launchctl=launchctl, wait_seconds=2)
+        launchctl.enable.assert_called_once_with()
+        launchctl.bootstrap.assert_called_once_with(self.paths.plist)
+        launchctl.kickstart.assert_called_once_with()
 
     def test_recover_existing_is_identity_bound_and_idempotent(self) -> None:
         config = self._prepare_recoverable_v6()
@@ -1613,8 +1943,60 @@ else:
     def test_status_does_not_create_install_paths(self) -> None:
         result = installer.status(paths=self.paths, launchctl=self._launchctl())
         self.assertFalse(result["loaded"])
+        self.assertFalse(result["runtime_healthy"])
+        self.assertFalse(result["production_ready"])
+        self.assertFalse(result["provisional"])
+        self.assertIsNone(result["deployment_mode"])
         self.assertFalse(self.home.exists())
         self.assertFalse(self.core.exists())
+
+    def test_status_reports_provisional_runtime_without_production_readiness(
+        self,
+    ) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+                "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+                "MLX_DEVICE": "cpu",
+            },
+            clear=True,
+        ):
+            config = installer.build_config(self.paths)
+        installer.write_core_config(self.paths.config, config)
+        (self.base / "launchctl-loaded").write_text("loaded", encoding="utf-8")
+        provisional_health = {
+            **self._health(),
+            "ready": True,
+            "capture_ready": True,
+            "deployment_mode": "replacement-certification",
+        }
+        with mock.patch.object(
+            installer,
+            "probe_health",
+            side_effect=[
+                installer.CoreInstallerError("not authoritative"),
+                provisional_health,
+            ],
+        ) as probe:
+            result = installer.status(paths=self.paths, launchctl=self._launchctl())
+
+        self.assertTrue(result["loaded"])
+        self.assertTrue(result["running"])
+        self.assertFalse(result["healthy"])
+        self.assertTrue(result["runtime_healthy"])
+        self.assertFalse(result["production_ready"])
+        self.assertTrue(result["provisional"])
+        self.assertTrue(result["capture_ready"])
+        self.assertEqual(
+            result["deployment_mode"],
+            "replacement-certification",
+        )
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(
+            probe.call_args_list[1].kwargs["expected_deployment_mode"],
+            "replacement-certification",
+        )
 
     def test_symlinked_plist_is_refused(self) -> None:
         self.plist.parent.mkdir(mode=0o700, parents=True)
@@ -1759,6 +2141,7 @@ else:
         client.health.return_value = {
             "ready": True,
             "protocol_version": installer.PROTOCOL_VERSION,
+            "deployment_mode": "authoritative",
             "capture": {"enabled": True, "ready": True, "iteration_count": 1},
         }
         type(client).authority_identity = mock.PropertyMock(return_value=identity)
@@ -1767,6 +2150,21 @@ else:
             "_private_socket",
         ), mock.patch.object(installer, "_private_token"):
             self.assertTrue(installer.probe_health(config)["ready"])
+            client.health.return_value["deployment_mode"] = (
+                "replacement-certification"
+            )
+            with self.assertRaisesRegex(
+                installer.CoreInstallerError,
+                "not ready",
+            ):
+                installer.probe_health(config)
+            self.assertTrue(
+                installer.probe_health(
+                    config,
+                    expected_deployment_mode="replacement-certification",
+                )["ready"]
+            )
+            client.health.return_value["deployment_mode"] = "authoritative"
             identity["schema_identity"] = "sqlite-test-v6"
             with self.assertRaisesRegex(installer.CoreInstallerError, "exact v6"):
                 installer.probe_health(config)
@@ -1805,6 +2203,7 @@ else:
         client.health.return_value = {
             "ready": True,
             "protocol_version": installer.PROTOCOL_VERSION,
+            "deployment_mode": "authoritative",
             "capture": {"enabled": True, "ready": True, "iteration_count": 2},
         }
         type(client).authority_identity = mock.PropertyMock(return_value=identity)
@@ -2194,19 +2593,35 @@ class CoreCutoverPreflightTests(unittest.TestCase):
     @staticmethod
     def _complete_ready_proofs(
         recovery_checks: list[dict],
+        *,
+        config: installer.CoreConfig,
     ) -> tuple[list[dict], dict[str, dict]]:
         recovery_by_id = {
             str(check["check_id"]): check for check in recovery_checks
         }
         checks: list[dict] = []
         for check_id in OPERATOR_READINESS_REQUIRED_PROOF_IDS:
+            runtime_metrics = {
+                "schema": preflight.RUNTIME_BUILD_IDENTITY_SCHEMA,
+                "proof_mode": "candidate-local-source",
+                "authority_mode": "candidate-local-v5",
+                "expected_source_build_id": installer._manifest_build_id(ROOT),
+                "observed_runtime_build_id": installer._manifest_build_id(ROOT),
+                "expected_config_fingerprint": config.fingerprint,
+                "observed_config_fingerprint": config.fingerprint,
+                "matched": True,
+            }
             check = recovery_by_id.get(
                 check_id,
                 {
                     "check_id": check_id,
                     "required": True,
                     "status": "ready",
-                    "metrics": {},
+                    "metrics": (
+                        runtime_metrics
+                        if check_id == "runtime_build_identity"
+                        else {}
+                    ),
                     "artifact_paths": {},
                 },
             )
@@ -2267,7 +2682,8 @@ class CoreCutoverPreflightTests(unittest.TestCase):
             },
         ]
         checks, proofs = CoreCutoverPreflightTests._complete_ready_proofs(
-            recovery_checks
+            recovery_checks,
+            config=config,
         )
         manifest = pack / "manifest.json"
         manifest.write_text(
@@ -2277,9 +2693,14 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                     "operator_trustworthy": True,
                     "created_at": time.time(),
                     "git": {"head": git_head, "status_short": ""},
+                    "expected_source_build_id": installer._manifest_build_id(ROOT),
                     "core_config_contract": (
                         preflight.core_config_evidence_contract(config)
                     ),
+                    "authority_route": {
+                        "mode": "candidate-local-v5",
+                        "candidate_config_fingerprint": config.fingerprint,
+                    },
                     "quiescence_policy_contract": quiescence_policy_contract(),
                     "quiescence_policy_digest": quiescence_policy_digest(),
                     "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
@@ -2869,6 +3290,47 @@ raise SystemExit(3)
                 with self.assertRaises(preflight.CutoverPreflightError):
                     preflight._validate_operator_readiness_proof_contract(forged)
 
+    def test_runtime_build_identity_consumer_rejects_different_source_build(self) -> None:
+        build_id = installer._manifest_build_id(ROOT)
+        config_fingerprint = "c" * 64
+        check = {
+            "metrics": {
+                "schema": preflight.RUNTIME_BUILD_IDENTITY_SCHEMA,
+                "proof_mode": "authoritative-core-health",
+                "authority_mode": "authoritative-core-v6",
+                "expected_source_build_id": build_id,
+                "observed_runtime_build_id": build_id,
+                "expected_config_fingerprint": config_fingerprint,
+                "observed_config_fingerprint": config_fingerprint,
+                "matched": True,
+                "exact_matches": {
+                    "command_succeeded": True,
+                    "health_ready": True,
+                    "build_id_shape": True,
+                    "source_build": True,
+                    "config_fingerprint": True,
+                },
+            }
+        }
+        preflight._validate_runtime_build_identity_proof(
+            check,
+            root=ROOT,
+            expected_config_fingerprint=config_fingerprint,
+            expected_authority_mode="authoritative-core-v6",
+        )
+
+        check["metrics"]["observed_runtime_build_id"] = "source-" + "0" * 24
+        with self.assertRaisesRegex(
+            preflight.CutoverPreflightError,
+            "does not match the current deterministic source",
+        ):
+            preflight._validate_runtime_build_identity_proof(
+                check,
+                root=ROOT,
+                expected_config_fingerprint=config_fingerprint,
+                expected_authority_mode="authoritative-core-v6",
+            )
+
     def test_identifierless_replay_debt_is_rejected_at_every_consumer(self) -> None:
         reconciliation = {
             "missing_authoritative_ledger_count": 0,
@@ -3090,8 +3552,11 @@ raise SystemExit(3)
                         "recovery_proof": str(restore_proof)
                     }
                 recovery_checks.append(check)
-            checks, proofs = self._complete_ready_proofs(recovery_checks)
             candidate_config = self._core_config(evidence_root)
+            checks, proofs = self._complete_ready_proofs(
+                recovery_checks,
+                config=candidate_config,
+            )
             manifest = pack / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -3100,9 +3565,16 @@ raise SystemExit(3)
                         "operator_trustworthy": True,
                         "created_at": time.time(),
                         "git": {"head": "0" * 40, "status_short": ""},
+                        "expected_source_build_id": installer._manifest_build_id(ROOT),
                         "core_config_contract": (
                             preflight.core_config_evidence_contract(candidate_config)
                         ),
+                        "authority_route": {
+                            "mode": "candidate-local-v5",
+                            "candidate_config_fingerprint": (
+                                candidate_config.fingerprint
+                            ),
+                        },
                         "quiescence_policy_contract": quiescence_policy_contract(),
                         "quiescence_policy_digest": quiescence_policy_digest(),
                         "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
@@ -3144,9 +3616,16 @@ raise SystemExit(3)
                         "operator_trustworthy": True,
                         "created_at": time.time(),
                         "git": {"head": "0" * 40, "status_short": ""},
+                        "expected_source_build_id": installer._manifest_build_id(ROOT),
                         "core_config_contract": (
                             preflight.core_config_evidence_contract(candidate_config)
                         ),
+                        "authority_route": {
+                            "mode": "candidate-local-v5",
+                            "candidate_config_fingerprint": (
+                                candidate_config.fingerprint
+                            ),
+                        },
                         "quiescence_policy_contract": quiescence_policy_contract(),
                         "quiescence_policy_digest": quiescence_policy_digest(),
                         "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),

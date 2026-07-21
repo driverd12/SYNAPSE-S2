@@ -35,6 +35,7 @@ from scripts.operator_readiness_certify import (
     MCP_SAFETY_SCHEMA,
     OperatorReadinessCertifier,
     REQUIRED_PROOFS,
+    RUNTIME_BUILD_IDENTITY_SCHEMA,
     app_preview_status,
     build_parser,
     choose_app,
@@ -1111,6 +1112,76 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertEqual(command[command.index("--timeout") + 1], "30")
         self.assertEqual(probe.kwargs["timeout"], 60)
 
+    def test_authoritative_runtime_build_identity_requires_exact_current_build(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(
+                Path(tmp),
+                authority_mode="authoritative-core-v6",
+            )
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_runtime_build_identity()
+
+        call = run_command.call_args
+        self.assertEqual(call.args[0], "runtime_build_identity")
+        self.assertTrue(call.kwargs["required"])
+        command = call.kwargs["command"]
+        self.assertIn("health", command)
+        evaluator = call.kwargs["evaluator"]
+        valid = {
+            "health": {"ready": True},
+            "identity": {
+                "build_id": certifier.expected_source_build_id,
+                "config_fingerprint": certifier.candidate_config.fingerprint,
+            },
+        }
+        status, _, _, metrics = evaluator(0, valid, "", "")
+        self.assertEqual(status, "ready")
+        self.assertEqual(metrics["schema"], RUNTIME_BUILD_IDENTITY_SCHEMA)
+        self.assertEqual(metrics["proof_mode"], "authoritative-core-health")
+        self.assertTrue(metrics["matched"])
+
+        mismatched = copy.deepcopy(valid)
+        mismatched["identity"]["build_id"] = "source-" + "0" * 24
+        status, _, repair, metrics = evaluator(0, mismatched, "", "")
+        self.assertEqual(status, "blocked")
+        self.assertTrue(repair)
+        self.assertFalse(metrics["matched"])
+        self.assertFalse(metrics["exact_matches"]["source_build"])
+
+    def test_run_stops_before_live_functional_probes_on_build_mismatch(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(
+                Path(tmp),
+                authority_mode="authoritative-core-v6",
+            )
+            blocked = CheckResult(
+                check_id="runtime_build_identity",
+                label="Runtime build identity",
+                status="blocked",
+                required=True,
+                detail="Synthetic runtime build mismatch.",
+            )
+            certifier._run_metadata = mock.Mock(return_value={})
+            certifier._write_json = mock.Mock()
+            certifier._check_runtime_build_identity = mock.Mock(
+                return_value=blocked
+            )
+            certifier._check_mcp_connect = mock.Mock()
+            certifier._check_memory_write = mock.Mock()
+            certifier._guarded_recovery_and_finalize = mock.Mock()
+            certifier._finalize = mock.Mock(
+                return_value={"overall_status": "blocked"}
+            )
+
+            result = certifier.run()
+
+            self.assertEqual(result["overall_status"], "blocked")
+            certifier._check_runtime_build_identity.assert_called_once_with()
+            certifier._check_mcp_connect.assert_not_called()
+            certifier._check_memory_write.assert_not_called()
+            certifier._guarded_recovery_and_finalize.assert_not_called()
+            certifier._finalize.assert_called_once_with()
+
     def test_recall_check_requires_structured_read_only_retrieval_v2(self):
         with TemporaryDirectory() as tmp:
             certifier = OperatorReadinessCertifier(self._args(Path(tmp)))
@@ -1939,6 +2010,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             )
             certifier._write_json = mock.Mock()
             ordered_methods = (
+                "_check_runtime_build_identity",
                 "_check_local_launcher",
                 "_check_client_config",
                 "_check_mcp_connect",
@@ -1954,6 +2026,14 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             )
             for method_name in ordered_methods:
                 value = {} if method_name == "_check_memory_write" else None
+                if method_name == "_check_runtime_build_identity":
+                    value = CheckResult(
+                        check_id="runtime_build_identity",
+                        label="Runtime build identity",
+                        status="ready",
+                        required=True,
+                        detail="Synthetic current-build proof.",
+                    )
                 setattr(
                     certifier,
                     method_name,
@@ -1970,6 +2050,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             self.assertEqual(
                 events,
                 [
+                    "runtime_build_identity",
                     "local_launcher",
                     "client_config",
                     "mcp_connect",

@@ -94,7 +94,9 @@ journal acceptance or dispatch. Confirm the transition:
 
 ```bash
 scripts/install_core_agent.sh status
-# Require healthy=true, capture_ready=true, and client_binding.ready=true.
+# Require healthy=true, runtime_healthy=true, production_ready=true,
+# capture_ready=true, provisional=false, deployment_mode=authoritative,
+# and client_binding.ready=true.
 ```
 
 The prep command is certification-only by default:

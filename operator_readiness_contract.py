@@ -14,10 +14,11 @@ from typing import Any
 
 
 OPERATOR_READINESS_PROOF_CONTRACT_SCHEMA = (
-    "synapse-s2.operator-readiness-proof-contract.v1"
+    "synapse-s2.operator-readiness-proof-contract.v2"
 )
-OPERATOR_READINESS_PROOF_CONTRACT_VERSION = 1
+OPERATOR_READINESS_PROOF_CONTRACT_VERSION = 2
 OPERATOR_READINESS_REQUIRED_PROOF_IDS = (
+    "runtime_build_identity",
     "client_config",
     "local_launcher",
     "mcp_connect",

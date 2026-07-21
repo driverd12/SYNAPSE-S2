@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -36,12 +36,27 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memory_store import (  # noqa: E402
+    CORE_AUTHORITY_MARKER_FIELDS,
     CORE_AUTHORITY_METADATA_KEY,
+    CORE_ROOT_GENERATION_ID_RE,
+    CORE_RUNTIME_PUBLICATION_SCHEMA,
     LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
+    SQLITE_APPLICATION_ID,
+    SQLITE_USER_VERSION,
     DurableMemoryStore,
 )
+from core_authority import (  # noqa: E402
+    CORE_AUTHORITY_INSTANCE_RE,
+    CORE_AUTHORITY_LOCK_GENERATION_RE,
+    CORE_AUTHORITY_SCHEMA_VERSION,
+)
 from core_protocol import contains_secret_shape  # noqa: E402
-from core_request_journal import JOURNAL_SCHEMA_IDENTITY  # noqa: E402
+from capture_daemon import GLOBAL_CAPTURE_LOCK  # noqa: E402
+from core_request_journal import (  # noqa: E402
+    JOURNAL_BINDING_SCHEMA,
+    JOURNAL_SCHEMA_IDENTITY,
+    JOURNAL_SCHEMA_VERSION,
+)
 from recovery_manager import (  # noqa: E402
     LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
     RECOVERY_BUNDLE_SCHEMA,
@@ -84,11 +99,21 @@ CUTOVER_ATTESTATION_NAME = "cutover-attestation.json"
 CUTOVER_ATTESTATION_MAX_BYTES = 64 * 1024
 CUTOVER_ATTESTATION_MAX_TTL_SECONDS = 600.0
 CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS = 120.0
+REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v1"
+REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA = (
+    "synapse-s2.replacement-admission-verification.v1"
+)
+REPLACEMENT_ADMISSION_NAME = "replacement-admission.json"
+REPLACEMENT_ADMISSION_MAX_BYTES = 64 * 1024
+REPLACEMENT_ADMISSION_MAX_TTL_SECONDS = 600.0
+REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS = 120.0
+REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX = "replacement-certification:"
 MAXIMUM_EVIDENCE_AGE_SECONDS = 86_400.0
 MAXIMUM_UNIX_TIMESTAMP_SECONDS = 253_402_300_799.0
 MAXIMUM_UNIX_TIMESTAMP_MILLISECONDS = 253_402_300_799_000
 MAXIMUM_CLOCK_SKEW_SECONDS = 60.0
 CORE_CONFIG_EVIDENCE_SCHEMA = "synapse-s2.core-config-evidence.v1"
+RUNTIME_BUILD_IDENTITY_SCHEMA = "synapse-s2.runtime-build-identity-proof.v1"
 _SCHEMA_IDENTITY = re.compile(r"^sqlite-[0-9a-f]+-v(?:5|6)$")
 _CUTOVER_ATTESTATION_CONTENT_KEYS = {
     "schema",
@@ -126,6 +151,86 @@ _CUTOVER_ATTESTATION_AUTH_KEYS = {
     "signing_public_key",
     "receipt_digest",
     "receipt_signature",
+}
+_REPLACEMENT_ADMISSION_CONTENT_KEYS = {
+    "schema",
+    "created_at_unix_ms",
+    "expires_at_unix_ms",
+    "git_head",
+    "candidate_build_id",
+    "candidate_config_fingerprint",
+    "governance_mode",
+    "store_identity",
+    "store_generation",
+    "authority_epoch_number",
+    "next_authority_epoch_number",
+    "database_schema_identity",
+    "database_logical_snapshot_schema",
+    "database_logical_snapshot_sha256",
+    "capture_manifest_sha256",
+    "runtime_state_required",
+    "runtime_state_present",
+    "runtime_state_canonical_sha256",
+    "request_journal_id",
+    "request_journal_schema_identity",
+    "request_journal_logical_snapshot_schema",
+    "request_journal_logical_snapshot_sha256",
+    "request_journal_binding_receipt_digest",
+    "restored_target",
+    "restored_target_binding_receipt_digest",
+    "recovery_bundle_receipt_path",
+    "recovery_bundle_receipt_digest",
+    "recovery_restore_proof_path",
+    "recovery_restore_proof_receipt_digest",
+    "predecessor_marker_sha256",
+    "predecessor_marker_schema_version",
+    "predecessor_service_required",
+    "predecessor_instance_id",
+    "predecessor_build_id",
+    "predecessor_config_fingerprint",
+    "predecessor_protocol_version",
+    "predecessor_lock_generation_id",
+    "predecessor_root_generation_id",
+    "predecessor_embedding_space_identity",
+    "predecessor_request_journal_id",
+    "predecessor_request_journal_binding_schema",
+    "predecessor_request_journal_schema_version",
+    "predecessor_restored_target_binding_receipt_digest",
+    "predecessor_runtime_publication_sha256",
+    "delivery_audit_sha256",
+    "delivery_audit_revision",
+    "delivery_settled_audit_revision",
+    "delivery_derivation_source_sha256",
+    "delivery_derivation_source_row_count",
+    "delivery_target_highwater",
+    "delivery_latest_event_id",
+}
+_REPLACEMENT_ADMISSION_AUTH_KEYS = set(_CUTOVER_ATTESTATION_AUTH_KEYS)
+_DELIVERY_AUDIT_KEYS = {
+    "protocol_version",
+    "status",
+    "audit_revision",
+    "settled_audit_revision",
+    "repair_required",
+    "repairable",
+    "cursor_mismatch_count",
+    "target_reconciliation_needed",
+    "target_highwater",
+    "latest_event_id",
+    "delivery_schema_error_count",
+    "unrelated_delivery_error_count",
+    "target_canonicalization_needed",
+    "target_integrity_error_count",
+    "event_ledger_integrity_error_count",
+    "target_highwater_error_count",
+    "highwater_contract_error_count",
+    "derivation_source_sha256",
+    "derivation_source_row_count",
+    "repair_receipt_integrity_error_count",
+    "repair_receipt_semantic_error_count",
+    "pending_repair_receipt_semantic_error_count",
+    "verified_repair_receipt_semantic_error_count",
+    "pending_repair_receipt_count",
 }
 
 
@@ -221,6 +326,14 @@ def _freshness_age_seconds(
     return timestamp
 
 
+def _manifest_build_id(root: Path) -> str:
+    """Resolve the deterministic source identity without a module import cycle."""
+
+    from core_service import _manifest_build_id as manifest_build_id
+
+    return manifest_build_id(root)
+
+
 def core_config_evidence_contract(config: Any) -> dict[str, Any]:
     """Return the exact, self-verifying candidate configuration contract."""
 
@@ -296,6 +409,14 @@ class CutoverAttestationRequest:
     config_fingerprint: str
     ttl_seconds: float = CUTOVER_ATTESTATION_MAX_TTL_SECONDS
     restored_target: bool = False
+
+
+@dataclass(frozen=True)
+class ReplacementAdmissionRequest:
+    path: Path
+    build_id: str
+    config_fingerprint: str
+    ttl_seconds: float = REPLACEMENT_ADMISSION_MAX_TTL_SECONDS
 
 
 def _normal_absolute(path: str | os.PathLike[str], *, name: str) -> Path:
@@ -440,10 +561,16 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_private_json_replace(path: Path, payload: Mapping[str, Any]) -> str:
+def _atomic_private_json_replace(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    name: str = "cutover attestation",
+    max_bytes: int = CUTOVER_ATTESTATION_MAX_BYTES,
+) -> str:
     """Durably replace one exact private attestation without following links."""
 
-    _assert_no_symlink_components(path, name="cutover attestation")
+    _assert_no_symlink_components(path, name=name)
     _fsync_directory(path.parent)
     encoded = (
         json.dumps(
@@ -454,8 +581,8 @@ def _atomic_private_json_replace(path: Path, payload: Mapping[str, Any]) -> str:
         )
         + "\n"
     ).encode("utf-8")
-    if len(encoded) > CUTOVER_ATTESTATION_MAX_BYTES:
-        raise CutoverPreflightError("cutover attestation exceeds its size limit")
+    if len(encoded) > max_bytes:
+        raise CutoverPreflightError(f"{name} exceeds its size limit")
     existing = None
     try:
         existing = path.lstat()
@@ -468,7 +595,7 @@ def _atomic_private_json_replace(path: Path, payload: Mapping[str, Any]) -> str:
         or existing.st_nlink != 1
         or stat.S_IMODE(existing.st_mode) != 0o600
     ):
-        raise CutoverPreflightError("existing cutover attestation is unsafe")
+        raise CutoverPreflightError(f"existing {name} is unsafe")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -481,7 +608,7 @@ def _atomic_private_json_replace(path: Path, payload: Mapping[str, Any]) -> str:
         while view:
             written = os.write(descriptor, view)
             if written <= 0:
-                raise OSError("cutover attestation write made no progress")
+                raise OSError(f"{name} write made no progress")
             view = view[written:]
         os.fsync(descriptor)
         staged = os.fstat(descriptor)
@@ -494,9 +621,7 @@ def _atomic_private_json_replace(path: Path, payload: Mapping[str, Any]) -> str:
             pass
         if existing is None:
             if current is not None:
-                raise CutoverPreflightError(
-                    "cutover attestation appeared during publication"
-                )
+                raise CutoverPreflightError(f"{name} appeared during publication")
         elif current is None or (
             current.st_dev,
             current.st_ino,
@@ -516,9 +641,7 @@ def _atomic_private_json_replace(path: Path, payload: Mapping[str, Any]) -> str:
             existing.st_nlink,
             stat.S_IMODE(existing.st_mode),
         ):
-            raise CutoverPreflightError(
-                "cutover attestation changed during publication"
-            )
+            raise CutoverPreflightError(f"{name} changed during publication")
         os.replace(temporary, path)
         published = path.lstat()
         if (
@@ -540,9 +663,7 @@ def _atomic_private_json_replace(path: Path, payload: Mapping[str, Any]) -> str:
                 staged.st_mtime_ns,
             )
         ):
-            raise CutoverPreflightError(
-                "cutover attestation publication identity changed"
-            )
+            raise CutoverPreflightError(f"{name} publication identity changed")
         _fsync_directory(path.parent)
     finally:
         if descriptor >= 0:
@@ -717,6 +838,778 @@ def _validate_cutover_attestation(
         or not store._verify_receipt_authenticator(dict(payload))
     ):
         raise CutoverPreflightError("cutover attestation signature is invalid")
+    return receipt_digest
+
+
+def _canonical_mapping_sha256(value: Mapping[str, Any], *, name: str) -> str:
+    try:
+        encoded = json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CutoverPreflightError(f"{name} is not canonical JSON") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_ready_delivery_audit(
+    audit: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(audit, Mapping) or set(audit) != _DELIVERY_AUDIT_KEYS:
+        raise CutoverPreflightError("replacement delivery audit contract is invalid")
+    zero_fields = {
+        "cursor_mismatch_count",
+        "delivery_schema_error_count",
+        "unrelated_delivery_error_count",
+        "target_integrity_error_count",
+        "event_ledger_integrity_error_count",
+        "target_highwater_error_count",
+        "highwater_contract_error_count",
+        "repair_receipt_integrity_error_count",
+        "repair_receipt_semantic_error_count",
+        "pending_repair_receipt_semantic_error_count",
+        "verified_repair_receipt_semantic_error_count",
+        "pending_repair_receipt_count",
+    }
+    nonnegative_fields = {
+        "target_highwater",
+        "latest_event_id",
+        "derivation_source_row_count",
+    }
+    if (
+        audit.get("protocol_version")
+        != "context-delivery-publication-repair.v1"
+        or audit.get("status") != "ready"
+        or audit.get("repair_required") is not False
+        or audit.get("repairable") is not True
+        or audit.get("target_reconciliation_needed") is not False
+        or audit.get("target_canonicalization_needed") is not False
+        or _SHA256.fullmatch(str(audit.get("audit_revision") or "")) is None
+        or _SHA256.fullmatch(
+            str(audit.get("settled_audit_revision") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(audit.get("derivation_source_sha256") or "")
+        )
+        is None
+        or any(type(audit.get(field)) is not int for field in zero_fields)
+        or any(int(audit[field]) != 0 for field in zero_fields)
+        or any(type(audit.get(field)) is not int for field in nonnegative_fields)
+        or any(int(audit[field]) < 0 for field in nonnegative_fields)
+        or audit.get("target_highwater") != audit.get("latest_event_id")
+    ):
+        raise CutoverPreflightError("replacement delivery audit is not ready")
+    canonical = dict(audit)
+    canonical["sha256"] = _canonical_mapping_sha256(
+        audit,
+        name="replacement delivery audit",
+    )
+    return canonical
+
+
+def _validate_replacement_inspection(
+    inspection: Mapping[str, Any],
+    *,
+    recovery: Mapping[str, Any],
+    candidate_build_id: str,
+    candidate_config_fingerprint: str,
+) -> dict[str, Any]:
+    expected_inspection_keys = {
+        "governance_mode",
+        "schema_identity",
+        "previous_epoch",
+        "next_epoch",
+        "logical_snapshot",
+        "marker",
+        "runtime_publication",
+        "store_identity",
+        "new_empty_bootstrap",
+    }
+    if not isinstance(inspection, Mapping) or set(inspection) != expected_inspection_keys:
+        raise CutoverPreflightError(
+            "replacement authority inspection contract is invalid"
+        )
+    marker = inspection.get("marker")
+    logical = inspection.get("logical_snapshot")
+    publication = inspection.get("runtime_publication")
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != set(CORE_AUTHORITY_MARKER_FIELDS)
+        or not isinstance(logical, dict)
+        or not isinstance(publication, dict)
+    ):
+        raise CutoverPreflightError(
+            "replacement requires an exact authoritative v6 predecessor"
+        )
+    try:
+        marker_sha256 = DurableMemoryStore._core_authority_marker_sha256(marker)
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "replacement predecessor marker is invalid"
+        ) from exc
+    logical_count_fields = {
+        "table_count",
+        "column_count",
+        "row_count",
+        "value_bytes",
+    }
+    expected_schema_identity = (
+        f"sqlite-{SQLITE_APPLICATION_ID:x}-v{SQLITE_USER_VERSION}"
+    )
+    epoch = marker.get("epoch")
+    restored_binding = marker.get("restored_target_binding_receipt_digest")
+    if (
+        inspection.get("governance_mode") != "authoritative-v6"
+        or inspection.get("schema_identity") != expected_schema_identity
+        or inspection.get("new_empty_bootstrap") is not False
+        or type(epoch) is not int
+        or epoch < 1
+        or inspection.get("previous_epoch") != epoch
+        or inspection.get("next_epoch") != epoch + 1
+        or marker.get("schema_version") != CORE_AUTHORITY_SCHEMA_VERSION
+        or marker.get("service_required") is not True
+        or CORE_AUTHORITY_INSTANCE_RE.fullmatch(
+            str(marker.get("instance_id") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(marker.get("config_fingerprint") or "")
+        )
+        is None
+        or _BUILD_ID.fullmatch(str(marker.get("build_id") or "")) is None
+        or CORE_AUTHORITY_INSTANCE_RE.fullmatch(
+            str(marker.get("protocol_version") or "")
+        )
+        is None
+        or CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(
+            str(marker.get("lock_generation_id") or "")
+        )
+        is None
+        or _STORE_IDENTITY.fullmatch(str(marker.get("store_identity") or ""))
+        is None
+        or _REQUEST_JOURNAL_ID.fullmatch(
+            str(marker.get("request_journal_id") or "")
+        )
+        is None
+        or marker.get("request_journal_binding_schema")
+        != JOURNAL_BINDING_SCHEMA
+        or marker.get("request_journal_schema_version") != JOURNAL_SCHEMA_VERSION
+        or CORE_ROOT_GENERATION_ID_RE.fullmatch(
+            str(marker.get("root_generation_id") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(marker.get("embedding_space_identity") or "")
+        )
+        is None
+        or (
+            restored_binding is not None
+            and _SHA256.fullmatch(str(restored_binding)) is None
+        )
+        or any(
+            type(marker.get(field)) not in {int, float}
+            or isinstance(marker.get(field), bool)
+            or not math.isfinite(float(marker[field]))
+            or float(marker[field]) <= 0.0
+            for field in ("claimed_at", "updated_at")
+        )
+        or float(marker["claimed_at"]) > float(marker["updated_at"])
+        or logical.get("schema") != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+        or _SHA256.fullmatch(str(logical.get("sha256") or "")) is None
+        or _SHA256.fullmatch(str(logical.get("schema_sha256") or "")) is None
+        or logical.get("application_id") != SQLITE_APPLICATION_ID
+        or logical.get("user_version") != SQLITE_USER_VERSION
+        or any(type(logical.get(field)) is not int for field in logical_count_fields)
+        or any(int(logical[field]) < 0 for field in logical_count_fields)
+    ):
+        raise CutoverPreflightError(
+            "replacement predecessor identity is invalid"
+        )
+    publication_keys = {
+        "schema",
+        "status",
+        "marker_sha256",
+        "authority_epoch_number",
+        "lock_generation_id",
+        "instance_id",
+        "config_fingerprint",
+        "build_id",
+        "protocol_version",
+        "runtime_state_path_sha256",
+        "started_at",
+        "completed_at",
+        "updated_at",
+    }
+    if (
+        set(publication) != publication_keys
+        or publication.get("schema") != CORE_RUNTIME_PUBLICATION_SCHEMA
+        or publication.get("status") != "complete"
+        or publication.get("marker_sha256") != marker_sha256
+        or publication.get("authority_epoch_number") != epoch
+        or publication.get("lock_generation_id")
+        != marker.get("lock_generation_id")
+        or publication.get("instance_id") != marker.get("instance_id")
+        or publication.get("config_fingerprint")
+        != marker.get("config_fingerprint")
+        or publication.get("build_id") != marker.get("build_id")
+        or publication.get("protocol_version")
+        != marker.get("protocol_version")
+        or _SHA256.fullmatch(
+            str(publication.get("runtime_state_path_sha256") or "")
+        )
+        is None
+        or any(
+            type(publication.get(field)) not in {int, float}
+            or isinstance(publication.get(field), bool)
+            or not math.isfinite(float(publication[field]))
+            or float(publication[field]) <= 0.0
+            for field in ("started_at", "completed_at", "updated_at")
+        )
+        or float(publication["started_at"]) > float(publication["completed_at"])
+        or float(publication["completed_at"]) != float(publication["updated_at"])
+    ):
+        raise CutoverPreflightError(
+            "replacement predecessor runtime publication is incomplete"
+        )
+    provisional_resume = (
+        candidate_build_id == marker.get("build_id")
+        and str(marker.get("instance_id") or "").startswith(
+            REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+        )
+    )
+    if (
+        _BUILD_ID.fullmatch(candidate_build_id) is None
+        or _SHA256.fullmatch(candidate_config_fingerprint) is None
+        or (
+            candidate_build_id == marker.get("build_id")
+            and not provisional_resume
+        )
+        or candidate_config_fingerprint != marker.get("config_fingerprint")
+    ):
+        raise CutoverPreflightError(
+            "replacement admission requires a new build or an exact provisional "
+            "resume with unchanged configuration"
+        )
+    if (
+        recovery.get("governance_mode") != "authoritative-v6"
+        or recovery.get("store_identity") != inspection.get("store_identity")
+        or recovery.get("store_identity") != marker.get("store_identity")
+        or recovery.get("store_generation") != f"epoch-{epoch}"
+        or recovery.get("authority_epoch_number") != epoch
+        or recovery.get("database_schema_identity") != expected_schema_identity
+        or recovery.get("database_logical_snapshot_schema")
+        != logical.get("schema")
+        or recovery.get("database_logical_snapshot_sha256")
+        != logical.get("sha256")
+        or _SHA256.fullmatch(
+            str(recovery.get("capture_manifest_sha256") or "")
+        )
+        is None
+        or recovery.get("runtime_state_required") is not True
+        or recovery.get("runtime_state_present") is not True
+        or _SHA256.fullmatch(
+            str(recovery.get("runtime_state_canonical_sha256") or "")
+        )
+        is None
+        or recovery.get("request_journal_id")
+        != marker.get("request_journal_id")
+        or recovery.get("request_journal_schema_identity")
+        != JOURNAL_SCHEMA_IDENTITY
+        or recovery.get("request_journal_logical_snapshot_schema")
+        != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+        or _SHA256.fullmatch(
+            str(
+                recovery.get("request_journal_logical_snapshot_sha256") or ""
+            )
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(recovery.get("request_journal_binding_receipt_digest") or "")
+        )
+        is None
+        or recovery.get("restored_target") is not False
+        or recovery.get("restored_target_binding_receipt_digest") is not None
+        or _SHA256.fullmatch(
+            str(recovery.get("recovery_bundle_receipt_digest") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(recovery.get("recovery_restore_proof_receipt_digest") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(recovery.get("recovery_auth_key_id") or "")
+        )
+        is None
+    ):
+        raise CutoverPreflightError(
+            "verified recovery does not match the replacement predecessor"
+        )
+    return {
+        "predecessor_marker_sha256": marker_sha256,
+        "predecessor_marker_schema_version": int(marker["schema_version"]),
+        "predecessor_service_required": True,
+        "predecessor_instance_id": str(marker["instance_id"]),
+        "predecessor_build_id": str(marker["build_id"]),
+        "predecessor_config_fingerprint": str(marker["config_fingerprint"]),
+        "predecessor_protocol_version": str(marker["protocol_version"]),
+        "predecessor_lock_generation_id": str(marker["lock_generation_id"]),
+        "predecessor_root_generation_id": str(marker["root_generation_id"]),
+        "predecessor_embedding_space_identity": str(
+            marker["embedding_space_identity"]
+        ),
+        "predecessor_request_journal_id": str(marker["request_journal_id"]),
+        "predecessor_request_journal_binding_schema": str(
+            marker["request_journal_binding_schema"]
+        ),
+        "predecessor_request_journal_schema_version": int(
+            marker["request_journal_schema_version"]
+        ),
+        "predecessor_restored_target_binding_receipt_digest": restored_binding,
+        "predecessor_runtime_publication_sha256": _canonical_mapping_sha256(
+            publication,
+            name="predecessor runtime publication",
+        ),
+    }
+
+
+def _replacement_recovery_binding(
+    *,
+    memory_db: Path,
+    capture_root: Path,
+    receipt_path: Path,
+    restore_proof_path: Path,
+    maximum_evidence_age_seconds: float,
+    guarded_recovery_locks_held: bool = False,
+) -> tuple[dict[str, Any], float]:
+    maximum_age = _maximum_evidence_age(maximum_evidence_age_seconds)
+    if type(guarded_recovery_locks_held) is not bool:
+        raise CutoverPreflightError(
+            "replacement guarded-recovery lock ownership is invalid"
+        )
+    for path, name in (
+        (memory_db, "live memory database"),
+        (capture_root, "capture source root"),
+        (receipt_path, "recovery bundle receipt"),
+        (restore_proof_path, "isolated restore proof"),
+    ):
+        _assert_no_symlink_components(path, name=name)
+    store = DurableMemoryStore.open_existing_for_audit(memory_db)
+    try:
+        manager = VerifiedRecoveryManager(store, capture_root=capture_root)
+        repository_lock_path = (
+            memory_db.parent / "recovery-locks" / "repository.lock"
+        )
+        if not guarded_recovery_locks_held:
+            _assert_no_symlink_components(
+                repository_lock_path,
+                name="recovery repository lock",
+            )
+        lock_scope = (
+            nullcontext()
+            if guarded_recovery_locks_held
+            else manager._existing_private_file_lock(
+                repository_lock_path,
+                mode=fcntl.LOCK_SH,
+                timeout_seconds=30.0,
+            )
+        )
+        # Use only the verification half of verify_bundle. Its public wrapper
+        # may repair incomplete publication journals. Admission is read-only:
+        # the publisher already owns GuardedRecoveryPublication's exclusive
+        # lock, while core startup takes this existing lock shared.
+        with lock_scope:
+            parsed = manager._verify_bundle_locked(receipt_path)
+            receipt, identity_trusted = manager._read_bundle_receipt(receipt_path)
+            restore_proof = _read_json(
+                restore_proof_path,
+                name="isolated restore proof",
+            )
+            observed_now = _current_unix_timestamp_seconds()
+            receipt_created = _freshness_age_seconds(
+                receipt.get("created_at"),
+                name="replacement recovery bundle creation time",
+                now=observed_now,
+                maximum_age_seconds=maximum_age,
+            )
+            restore_created = _freshness_age_seconds(
+                restore_proof.get("created_at"),
+                name="replacement isolated restore time",
+                now=observed_now,
+                maximum_age_seconds=maximum_age,
+            )
+            if (
+                identity_trusted is not True
+                or parsed.get("receipt_identity_trusted") is not True
+                or parsed.get("verified") is not True
+                or parsed.get("cutover_ready") is not True
+                or parsed.get("bundle_receipt_path") != str(receipt_path)
+            ):
+                raise CutoverPreflightError(
+                    "replacement requires trusted cutover-ready recovery evidence"
+                )
+            recovery = verify_recovery_binding(
+                parsed=parsed,
+                receipt_path=receipt_path,
+                restore_proof=restore_proof,
+                restore_proof_path=restore_proof_path,
+                memory_db=memory_db,
+                capture_root=capture_root,
+                restored_target=False,
+                repository_lock_held=True,
+                capture_maintenance_lock_held=(
+                    guarded_recovery_locks_held
+                ),
+            )
+            return recovery, min(receipt_created, restore_created) + maximum_age
+    except CutoverPreflightError:
+        raise
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "replacement recovery bundle verification failed"
+        ) from exc
+    finally:
+        store.close()
+
+
+def _replacement_delivery_binding(
+    *,
+    memory_db: Path,
+    delivery_audit: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = _validate_ready_delivery_audit(delivery_audit)
+    store = DurableMemoryStore.open_existing_for_audit(memory_db)
+    try:
+        observed = store.audit_context_delivery_publication_repair()
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "live replacement delivery audit failed"
+        ) from exc
+    finally:
+        store.close()
+    actual = _validate_ready_delivery_audit(observed)
+    if actual != expected:
+        raise CutoverPreflightError(
+            "replacement delivery audit changed during admission"
+        )
+    return dict(delivery_audit)
+
+
+def _replacement_admission_content(
+    *,
+    created_at_unix_ms: int,
+    expires_at_unix_ms: int,
+    git_head: str,
+    candidate_build_id: str,
+    candidate_config_fingerprint: str,
+    receipt_path: Path,
+    restore_proof_path: Path,
+    inspection: Mapping[str, Any],
+    delivery_audit: Mapping[str, Any],
+    recovery: Mapping[str, Any],
+) -> dict[str, Any]:
+    predecessor = _validate_replacement_inspection(
+        inspection,
+        recovery=recovery,
+        candidate_build_id=candidate_build_id,
+        candidate_config_fingerprint=candidate_config_fingerprint,
+    )
+    delivery = _validate_ready_delivery_audit(delivery_audit)
+    return {
+        "schema": REPLACEMENT_ADMISSION_SCHEMA,
+        "created_at_unix_ms": created_at_unix_ms,
+        "expires_at_unix_ms": expires_at_unix_ms,
+        "git_head": git_head,
+        "candidate_build_id": candidate_build_id,
+        "candidate_config_fingerprint": candidate_config_fingerprint,
+        "governance_mode": recovery.get("governance_mode"),
+        "store_identity": recovery.get("store_identity"),
+        "store_generation": recovery.get("store_generation"),
+        "authority_epoch_number": recovery.get("authority_epoch_number"),
+        "next_authority_epoch_number": inspection.get("next_epoch"),
+        "database_schema_identity": recovery.get("database_schema_identity"),
+        "database_logical_snapshot_schema": recovery.get(
+            "database_logical_snapshot_schema"
+        ),
+        "database_logical_snapshot_sha256": recovery.get(
+            "database_logical_snapshot_sha256"
+        ),
+        "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
+        "runtime_state_required": recovery.get("runtime_state_required"),
+        "runtime_state_present": recovery.get("runtime_state_present"),
+        "runtime_state_canonical_sha256": recovery.get(
+            "runtime_state_canonical_sha256"
+        ),
+        "request_journal_id": recovery.get("request_journal_id"),
+        "request_journal_schema_identity": recovery.get(
+            "request_journal_schema_identity"
+        ),
+        "request_journal_logical_snapshot_schema": recovery.get(
+            "request_journal_logical_snapshot_schema"
+        ),
+        "request_journal_logical_snapshot_sha256": recovery.get(
+            "request_journal_logical_snapshot_sha256"
+        ),
+        "request_journal_binding_receipt_digest": recovery.get(
+            "request_journal_binding_receipt_digest"
+        ),
+        "restored_target": False,
+        "restored_target_binding_receipt_digest": None,
+        "recovery_bundle_receipt_path": str(receipt_path),
+        "recovery_bundle_receipt_digest": recovery.get(
+            "recovery_bundle_receipt_digest"
+        ),
+        "recovery_restore_proof_path": str(restore_proof_path),
+        "recovery_restore_proof_receipt_digest": recovery.get(
+            "recovery_restore_proof_receipt_digest"
+        ),
+        **predecessor,
+        "delivery_audit_sha256": delivery["sha256"],
+        "delivery_audit_revision": delivery["audit_revision"],
+        "delivery_settled_audit_revision": delivery[
+            "settled_audit_revision"
+        ],
+        "delivery_derivation_source_sha256": delivery[
+            "derivation_source_sha256"
+        ],
+        "delivery_derivation_source_row_count": delivery[
+            "derivation_source_row_count"
+        ],
+        "delivery_target_highwater": delivery["target_highwater"],
+        "delivery_latest_event_id": delivery["latest_event_id"],
+    }
+
+
+def _validate_replacement_admission(
+    payload: Mapping[str, Any],
+    *,
+    store: DurableMemoryStore,
+    expected_content: Mapping[str, Any] | None = None,
+    expected_auth_key_id: str | None = None,
+    now_unix_ms: int | None = None,
+    minimum_remaining_seconds: float = 0.0,
+) -> str:
+    minimum_remaining = _bounded_finite_number(
+        minimum_remaining_seconds,
+        name="replacement admission minimum validity",
+        minimum=0.0,
+        maximum=REPLACEMENT_ADMISSION_MAX_TTL_SECONDS,
+    )
+    if set(payload) != (
+        _REPLACEMENT_ADMISSION_CONTENT_KEYS | _REPLACEMENT_ADMISSION_AUTH_KEYS
+    ):
+        raise CutoverPreflightError(
+            "replacement admission contract is unsupported"
+        )
+    if expected_content is not None and (
+        set(expected_content) != _REPLACEMENT_ADMISSION_CONTENT_KEYS
+        or any(payload.get(key) != value for key, value in expected_content.items())
+    ):
+        raise CutoverPreflightError("replacement admission content binding changed")
+    created = payload.get("created_at_unix_ms")
+    expires = payload.get("expires_at_unix_ms")
+    if now_unix_ms is None:
+        observed_now = int(_current_unix_timestamp_seconds() * 1000)
+    elif (
+        type(now_unix_ms) is not int
+        or now_unix_ms <= 0
+        or now_unix_ms > MAXIMUM_UNIX_TIMESTAMP_MILLISECONDS
+    ):
+        raise CutoverPreflightError(
+            "replacement admission observation time is invalid"
+        )
+    else:
+        observed_now = now_unix_ms
+    if (
+        payload.get("schema") != REPLACEMENT_ADMISSION_SCHEMA
+        or type(created) is not int
+        or type(expires) is not int
+        or created <= 0
+        or created > MAXIMUM_UNIX_TIMESTAMP_MILLISECONDS
+        or expires <= created
+        or expires > MAXIMUM_UNIX_TIMESTAMP_MILLISECONDS
+        or expires - created
+        > int(REPLACEMENT_ADMISSION_MAX_TTL_SECONDS * 1000)
+        or created > observed_now + 60_000
+        or expires <= observed_now
+        or expires - observed_now < int(minimum_remaining * 1000)
+        or _GIT_OBJECT_ID.fullmatch(str(payload.get("git_head") or "")) is None
+        or _BUILD_ID.fullmatch(
+            str(payload.get("candidate_build_id") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(payload.get("candidate_config_fingerprint") or "")
+        )
+        is None
+        or payload.get("governance_mode") != "authoritative-v6"
+        or _STORE_IDENTITY.fullmatch(str(payload.get("store_identity") or ""))
+        is None
+        or _STORE_GENERATION.fullmatch(
+            str(payload.get("store_generation") or "")
+        )
+        is None
+        or type(payload.get("authority_epoch_number")) is not int
+        or int(payload["authority_epoch_number"]) < 1
+        or payload.get("store_generation")
+        != f"epoch-{payload['authority_epoch_number']}"
+        or payload.get("next_authority_epoch_number")
+        != int(payload["authority_epoch_number"]) + 1
+        or payload.get("database_schema_identity")
+        != f"sqlite-{SQLITE_APPLICATION_ID:x}-v{SQLITE_USER_VERSION}"
+        or payload.get("database_logical_snapshot_schema")
+        != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+        or _SHA256.fullmatch(
+            str(payload.get("database_logical_snapshot_sha256") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(payload.get("capture_manifest_sha256") or "")
+        )
+        is None
+        or payload.get("runtime_state_required") is not True
+        or payload.get("runtime_state_present") is not True
+        or _SHA256.fullmatch(
+            str(payload.get("runtime_state_canonical_sha256") or "")
+        )
+        is None
+        or _REQUEST_JOURNAL_ID.fullmatch(
+            str(payload.get("request_journal_id") or "")
+        )
+        is None
+        or payload.get("request_journal_schema_identity")
+        != JOURNAL_SCHEMA_IDENTITY
+        or payload.get("request_journal_logical_snapshot_schema")
+        != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+        or _SHA256.fullmatch(
+            str(
+                payload.get("request_journal_logical_snapshot_sha256") or ""
+            )
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(payload.get("request_journal_binding_receipt_digest") or "")
+        )
+        is None
+        or payload.get("restored_target") is not False
+        or payload.get("restored_target_binding_receipt_digest") is not None
+        or _SHA256.fullmatch(
+            str(payload.get("recovery_bundle_receipt_digest") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(payload.get("recovery_restore_proof_receipt_digest") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(payload.get("predecessor_marker_sha256") or "")
+        )
+        is None
+        or payload.get("predecessor_marker_schema_version")
+        != CORE_AUTHORITY_SCHEMA_VERSION
+        or payload.get("predecessor_service_required") is not True
+        or CORE_AUTHORITY_INSTANCE_RE.fullmatch(
+            str(payload.get("predecessor_instance_id") or "")
+        )
+        is None
+        or _BUILD_ID.fullmatch(
+            str(payload.get("predecessor_build_id") or "")
+        )
+        is None
+        or (
+            payload.get("candidate_build_id")
+            == payload.get("predecessor_build_id")
+            and not str(payload.get("predecessor_instance_id") or "").startswith(
+                REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+            )
+        )
+        or _SHA256.fullmatch(
+            str(payload.get("predecessor_config_fingerprint") or "")
+        )
+        is None
+        or payload.get("candidate_config_fingerprint")
+        != payload.get("predecessor_config_fingerprint")
+        or CORE_AUTHORITY_INSTANCE_RE.fullmatch(
+            str(payload.get("predecessor_protocol_version") or "")
+        )
+        is None
+        or CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(
+            str(payload.get("predecessor_lock_generation_id") or "")
+        )
+        is None
+        or CORE_ROOT_GENERATION_ID_RE.fullmatch(
+            str(payload.get("predecessor_root_generation_id") or "")
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(payload.get("predecessor_embedding_space_identity") or "")
+        )
+        is None
+        or payload.get("predecessor_request_journal_id")
+        != payload.get("request_journal_id")
+        or payload.get("predecessor_request_journal_binding_schema")
+        != JOURNAL_BINDING_SCHEMA
+        or payload.get("predecessor_request_journal_schema_version")
+        != JOURNAL_SCHEMA_VERSION
+        or (
+            payload.get("predecessor_restored_target_binding_receipt_digest")
+            is not None
+            and _SHA256.fullmatch(
+                str(
+                    payload.get(
+                        "predecessor_restored_target_binding_receipt_digest"
+                    )
+                )
+            )
+            is None
+        )
+        or _SHA256.fullmatch(
+            str(payload.get("predecessor_runtime_publication_sha256") or "")
+        )
+        is None
+        or any(
+            _SHA256.fullmatch(str(payload.get(field) or "")) is None
+            for field in (
+                "delivery_audit_sha256",
+                "delivery_audit_revision",
+                "delivery_settled_audit_revision",
+                "delivery_derivation_source_sha256",
+            )
+        )
+        or any(
+            type(payload.get(field)) is not int or int(payload[field]) < 0
+            for field in (
+                "delivery_derivation_source_row_count",
+                "delivery_target_highwater",
+                "delivery_latest_event_id",
+            )
+        )
+        or payload.get("delivery_target_highwater")
+        != payload.get("delivery_latest_event_id")
+    ):
+        raise CutoverPreflightError("replacement admission values are invalid")
+    for field, name in (
+        ("recovery_bundle_receipt_path", "recovery bundle receipt"),
+        ("recovery_restore_proof_path", "isolated restore proof"),
+    ):
+        _normal_absolute(str(payload.get(field) or ""), name=name)
+    receipt_digest = str(payload.get("receipt_digest") or "")
+    if (
+        _SHA256.fullmatch(receipt_digest) is None
+        or not secrets.compare_digest(
+            receipt_digest,
+            store._canonical_payload_digest(dict(payload)),
+        )
+        or not store._verify_receipt_authenticator(dict(payload))
+        or (
+            expected_auth_key_id is not None
+            and payload.get("auth_key_id") != expected_auth_key_id
+        )
+    ):
+        raise CutoverPreflightError("replacement admission signature is invalid")
     return receipt_digest
 
 
@@ -1106,6 +1999,349 @@ def verify_cutover_attestation_for_core(
         "recovery_restore_proof_receipt_digest": recovery[
             "recovery_restore_proof_receipt_digest"
         ],
+    }
+
+
+def publish_replacement_admission(
+    *,
+    request: ReplacementAdmissionRequest,
+    root: Path,
+    memory_db: Path,
+    capture_root: Path,
+    recovery_bundle_receipt: Path,
+    recovery_restore_proof: Path,
+    inspection: Mapping[str, Any],
+    delivery_audit: Mapping[str, Any],
+    maximum_evidence_age_seconds: float = 7200.0,
+) -> dict[str, Any]:
+    """Publish one signed, short-lived build-only v6 successor admission."""
+
+    canonical_path = memory_db.parent / "core" / REPLACEMENT_ADMISSION_NAME
+    for path, name in (
+        (root, "repository root"),
+        (memory_db, "live memory database"),
+        (capture_root, "capture source root"),
+        (recovery_bundle_receipt, "recovery bundle receipt"),
+        (recovery_restore_proof, "isolated restore proof"),
+        (request.path, "replacement admission"),
+    ):
+        _assert_no_symlink_components(path, name=name)
+    if request.path != canonical_path:
+        raise CutoverPreflightError(
+            "replacement admission must use the canonical core path"
+        )
+    ttl_seconds = _bounded_finite_number(
+        request.ttl_seconds,
+        name="replacement admission TTL",
+        minimum=REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS,
+        maximum=REPLACEMENT_ADMISSION_MAX_TTL_SECONDS,
+    )
+    if (
+        _BUILD_ID.fullmatch(request.build_id) is None
+        or _SHA256.fullmatch(request.config_fingerprint) is None
+    ):
+        raise CutoverPreflightError("replacement candidate identity is invalid")
+    head, dirty = _git_snapshot(root)
+    if dirty:
+        raise CutoverPreflightError(
+            "replacement admission requires a clean repository"
+        )
+    try:
+        current_build_id = _manifest_build_id(root)
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "current deterministic source build could not be verified"
+        ) from exc
+    if not secrets.compare_digest(current_build_id, request.build_id):
+        raise CutoverPreflightError(
+            "replacement candidate build does not match current source"
+        )
+    recovery, recovery_expires_at = _replacement_recovery_binding(
+        memory_db=memory_db,
+        capture_root=capture_root,
+        receipt_path=recovery_bundle_receipt,
+        restore_proof_path=recovery_restore_proof,
+        maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+        guarded_recovery_locks_held=True,
+    )
+    delivery = _replacement_delivery_binding(
+        memory_db=memory_db,
+        delivery_audit=delivery_audit,
+    )
+    observed_now = _current_unix_timestamp_seconds()
+    created_at_unix_ms = int(observed_now * 1000)
+    expires_at_unix_ms = min(
+        created_at_unix_ms + int(ttl_seconds * 1000),
+        int(recovery_expires_at * 1000),
+    )
+    if (
+        expires_at_unix_ms - created_at_unix_ms
+        < int(REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS * 1000)
+    ):
+        raise CutoverPreflightError(
+            "verified replacement recovery expires too soon for admission"
+        )
+    expected_content = _replacement_admission_content(
+        created_at_unix_ms=created_at_unix_ms,
+        expires_at_unix_ms=expires_at_unix_ms,
+        git_head=head,
+        candidate_build_id=request.build_id,
+        candidate_config_fingerprint=request.config_fingerprint,
+        receipt_path=recovery_bundle_receipt,
+        restore_proof_path=recovery_restore_proof,
+        inspection=inspection,
+        delivery_audit=delivery,
+        recovery=recovery,
+    )
+    store = DurableMemoryStore.open_existing_for_audit(memory_db)
+    try:
+        private_key, public_key, existing_key_id = (
+            store._backup_receipt_signing_key(create=False)
+        )
+        expected_auth_key = recovery.get("recovery_auth_key_id")
+        if (
+            private_key is None
+            or public_key is None
+            or not isinstance(existing_key_id, str)
+            or not isinstance(expected_auth_key, str)
+            or _SHA256.fullmatch(expected_auth_key) is None
+            or existing_key_id != expected_auth_key
+        ):
+            raise CutoverPreflightError(
+                "existing recovery signing authority is unavailable"
+            )
+        admission = dict(expected_content)
+        store._authenticate_receipt(admission)
+        receipt_digest = _validate_replacement_admission(
+            admission,
+            store=store,
+            expected_content=expected_content,
+            expected_auth_key_id=expected_auth_key,
+            now_unix_ms=created_at_unix_ms,
+            minimum_remaining_seconds=(
+                REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS
+            ),
+        )
+        artifact_sha256 = _atomic_private_json_replace(
+            request.path,
+            admission,
+            name="replacement admission",
+            max_bytes=REPLACEMENT_ADMISSION_MAX_BYTES,
+        )
+        persisted = _read_json(request.path, name="replacement admission")
+        persisted_digest = _validate_replacement_admission(
+            persisted,
+            store=store,
+            expected_content=expected_content,
+            expected_auth_key_id=expected_auth_key,
+            minimum_remaining_seconds=(
+                REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS
+            ),
+        )
+        persisted_sha256, _persisted_size = _stable_sha256(
+            request.path,
+            name="replacement admission",
+        )
+        if (
+            persisted != admission
+            or persisted_digest != receipt_digest
+            or persisted_sha256 != artifact_sha256
+        ):
+            raise CutoverPreflightError(
+                "replacement admission changed after publication"
+            )
+        return {
+            "schema": REPLACEMENT_ADMISSION_SCHEMA,
+            "path": str(request.path),
+            "receipt_digest": receipt_digest,
+            "artifact_sha256": artifact_sha256,
+            "expires_at_unix_ms": expires_at_unix_ms,
+            "candidate_build_id": request.build_id,
+            "candidate_config_fingerprint": request.config_fingerprint,
+            "predecessor_build_id": expected_content[
+                "predecessor_build_id"
+            ],
+            "authority_epoch_number": expected_content[
+                "authority_epoch_number"
+            ],
+            "next_authority_epoch_number": expected_content[
+                "next_authority_epoch_number"
+            ],
+            "delivery_audit_revision": expected_content[
+                "delivery_audit_revision"
+            ],
+            "verified": True,
+        }
+    except CutoverPreflightError:
+        raise
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "replacement admission signing or publication failed"
+        ) from exc
+    finally:
+        store.close()
+
+
+def verify_replacement_admission_for_core(
+    *,
+    root: Path,
+    memory_db: Path,
+    capture_root: Path,
+    attestation_path: Path,
+    expected_build_id: str,
+    expected_config_fingerprint: str,
+    inspection: Mapping[str, Any],
+    delivery_audit: Mapping[str, Any],
+    maximum_evidence_age_seconds: float = 7200.0,
+    minimum_remaining_seconds: float = 0.0,
+) -> dict[str, Any]:
+    """Reverify a signed successor admission under the acquired core lease."""
+
+    canonical_path = memory_db.parent / "core" / REPLACEMENT_ADMISSION_NAME
+    for path, name in (
+        (root, "repository root"),
+        (memory_db, "live memory database"),
+        (capture_root, "capture source root"),
+        (attestation_path, "replacement admission"),
+    ):
+        _assert_no_symlink_components(path, name=name)
+    if attestation_path != canonical_path:
+        raise CutoverPreflightError(
+            "core startup requires the canonical replacement admission"
+        )
+    if (
+        _BUILD_ID.fullmatch(expected_build_id) is None
+        or _SHA256.fullmatch(expected_config_fingerprint) is None
+    ):
+        raise CutoverPreflightError("expected replacement identity is invalid")
+    head, dirty = _git_snapshot(root)
+    try:
+        current_build_id = _manifest_build_id(root)
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "current deterministic source build could not be verified"
+        ) from exc
+    payload = _read_json(attestation_path, name="replacement admission")
+    if (
+        dirty
+        or current_build_id != expected_build_id
+        or payload.get("git_head") != head
+        or payload.get("candidate_build_id") != expected_build_id
+        or payload.get("candidate_config_fingerprint")
+        != expected_config_fingerprint
+    ):
+        raise CutoverPreflightError(
+            "replacement admission does not match current source or configuration"
+        )
+    signature_store = DurableMemoryStore.open_existing_for_audit(memory_db)
+    try:
+        receipt_digest = _validate_replacement_admission(
+            payload,
+            store=signature_store,
+            minimum_remaining_seconds=minimum_remaining_seconds,
+        )
+    finally:
+        signature_store.close()
+    receipt_path = _normal_absolute(
+        str(payload["recovery_bundle_receipt_path"]),
+        name="recovery bundle receipt",
+    )
+    restore_proof_path = _normal_absolute(
+        str(payload["recovery_restore_proof_path"]),
+        name="isolated restore proof",
+    )
+    recovery, _recovery_expires_at = _replacement_recovery_binding(
+        memory_db=memory_db,
+        capture_root=capture_root,
+        receipt_path=receipt_path,
+        restore_proof_path=restore_proof_path,
+        maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+    )
+    delivery = _replacement_delivery_binding(
+        memory_db=memory_db,
+        delivery_audit=delivery_audit,
+    )
+    expected_content = _replacement_admission_content(
+        created_at_unix_ms=int(payload["created_at_unix_ms"]),
+        expires_at_unix_ms=int(payload["expires_at_unix_ms"]),
+        git_head=head,
+        candidate_build_id=expected_build_id,
+        candidate_config_fingerprint=expected_config_fingerprint,
+        receipt_path=receipt_path,
+        restore_proof_path=restore_proof_path,
+        inspection=inspection,
+        delivery_audit=delivery,
+        recovery=recovery,
+    )
+    verification_store = DurableMemoryStore.open_existing_for_audit(memory_db)
+    try:
+        verified_digest = _validate_replacement_admission(
+            payload,
+            store=verification_store,
+            expected_content=expected_content,
+            expected_auth_key_id=str(recovery["recovery_auth_key_id"]),
+            minimum_remaining_seconds=minimum_remaining_seconds,
+        )
+    finally:
+        verification_store.close()
+    if not secrets.compare_digest(verified_digest, receipt_digest):
+        raise CutoverPreflightError(
+            "replacement admission identity changed during verification"
+        )
+    result_keys = (
+        "git_head",
+        "candidate_build_id",
+        "candidate_config_fingerprint",
+        "governance_mode",
+        "store_identity",
+        "store_generation",
+        "authority_epoch_number",
+        "next_authority_epoch_number",
+        "database_schema_identity",
+        "database_logical_snapshot_schema",
+        "database_logical_snapshot_sha256",
+        "capture_manifest_sha256",
+        "runtime_state_required",
+        "runtime_state_present",
+        "runtime_state_canonical_sha256",
+        "request_journal_id",
+        "request_journal_schema_identity",
+        "request_journal_logical_snapshot_schema",
+        "request_journal_logical_snapshot_sha256",
+        "request_journal_binding_receipt_digest",
+        "restored_target",
+        "restored_target_binding_receipt_digest",
+        "recovery_bundle_receipt_digest",
+        "recovery_restore_proof_receipt_digest",
+        "predecessor_marker_sha256",
+        "predecessor_marker_schema_version",
+        "predecessor_service_required",
+        "predecessor_instance_id",
+        "predecessor_build_id",
+        "predecessor_config_fingerprint",
+        "predecessor_protocol_version",
+        "predecessor_lock_generation_id",
+        "predecessor_root_generation_id",
+        "predecessor_embedding_space_identity",
+        "predecessor_request_journal_id",
+        "predecessor_request_journal_binding_schema",
+        "predecessor_request_journal_schema_version",
+        "predecessor_restored_target_binding_receipt_digest",
+        "predecessor_runtime_publication_sha256",
+        "delivery_audit_sha256",
+        "delivery_audit_revision",
+        "delivery_settled_audit_revision",
+        "delivery_derivation_source_sha256",
+        "delivery_derivation_source_row_count",
+        "delivery_target_highwater",
+        "delivery_latest_event_id",
+    )
+    return {
+        "schema": REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA,
+        "verified": True,
+        "receipt_digest": receipt_digest,
+        "expires_at_unix_ms": int(payload["expires_at_unix_ms"]),
+        **{key: expected_content[key] for key in result_keys},
     }
 
 
@@ -1502,6 +2738,99 @@ def _validate_operator_readiness_proof_contract(
     return by_id
 
 
+def _validate_runtime_build_identity_proof(
+    check: Mapping[str, Any],
+    *,
+    root: Path,
+    expected_config_fingerprint: str,
+    expected_authority_mode: str,
+) -> str:
+    """Reject a ready pack whose functional probes came from another build."""
+
+    metrics = check.get("metrics")
+    if not isinstance(metrics, dict):
+        raise CutoverPreflightError("runtime build identity proof is invalid")
+    expected_keys = {
+        "schema",
+        "proof_mode",
+        "authority_mode",
+        "expected_source_build_id",
+        "observed_runtime_build_id",
+        "expected_config_fingerprint",
+        "observed_config_fingerprint",
+        "matched",
+    }
+    allowed_keys = expected_keys | {"exact_matches"}
+    metric_keys = frozenset(metrics)
+    if metric_keys not in {frozenset(expected_keys), frozenset(allowed_keys)}:
+        raise CutoverPreflightError("runtime build identity proof is invalid")
+    try:
+        # Keep the preflight module import-light: the wrapper imports
+        # core_service only at proof-validation time.
+        current_build_id = _manifest_build_id(root)
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "current deterministic source build could not be verified"
+        ) from exc
+    if (
+        metrics.get("schema") != RUNTIME_BUILD_IDENTITY_SCHEMA
+        or metrics.get("proof_mode")
+        not in {"authoritative-core-health", "candidate-local-source"}
+        or not isinstance(metrics.get("authority_mode"), str)
+        or metrics.get("authority_mode") != expected_authority_mode
+        or _BUILD_ID.fullmatch(
+            str(metrics.get("expected_source_build_id") or "")
+        )
+        is None
+        or _BUILD_ID.fullmatch(
+            str(metrics.get("observed_runtime_build_id") or "")
+        )
+        is None
+        or metrics.get("matched") is not True
+        or not secrets.compare_digest(
+            str(metrics.get("expected_source_build_id")), current_build_id
+        )
+        or not secrets.compare_digest(
+            str(metrics.get("observed_runtime_build_id")), current_build_id
+        )
+        or not secrets.compare_digest(
+            str(metrics.get("expected_config_fingerprint") or ""),
+            expected_config_fingerprint,
+        )
+        or not secrets.compare_digest(
+            str(metrics.get("observed_config_fingerprint") or ""),
+            expected_config_fingerprint,
+        )
+    ):
+        raise CutoverPreflightError(
+            "runtime build identity does not match the current deterministic source"
+        )
+    exact_matches = metrics.get("exact_matches")
+    if metrics.get("proof_mode") == "authoritative-core-health":
+        if (
+            expected_authority_mode == "candidate-local-v5"
+            or not isinstance(exact_matches, dict)
+            or set(exact_matches)
+            != {
+                "command_succeeded",
+                "health_ready",
+                "build_id_shape",
+                "source_build",
+                "config_fingerprint",
+            }
+            or any(value is not True for value in exact_matches.values())
+        ):
+            raise CutoverPreflightError(
+                "authoritative runtime build identity proof is incomplete"
+            )
+    elif (
+        expected_authority_mode != "candidate-local-v5"
+        or exact_matches is not None
+    ):
+        raise CutoverPreflightError("runtime build identity proof is invalid")
+    return current_build_id
+
+
 def _validate_zero_replay_debt(
     reconciliation: Any,
     *,
@@ -1684,7 +3013,7 @@ def validate_evidence_contract(
         head, dirty = _git_snapshot(root)
         if dirty or git.get("head") != head:
             raise CutoverPreflightError("evidence is not bound to the current clean HEAD")
-    validate_core_config_evidence_contract(
+    core_config_contract = validate_core_config_evidence_contract(
         manifest.get("core_config_contract"),
         expected_config_fingerprint=expected_config_fingerprint,
     )
@@ -1697,7 +3026,35 @@ def validate_evidence_contract(
         raise CutoverPreflightError(
             "operator-readiness quiescence policy binding is invalid"
         )
-    _validate_operator_readiness_proof_contract(manifest)
+    by_id = _validate_operator_readiness_proof_contract(manifest)
+    authority_route = manifest.get("authority_route")
+    if (
+        not isinstance(authority_route, dict)
+        or authority_route.get("mode")
+        not in {
+            "candidate-local-v5",
+            "authoritative-core-v6",
+            "explicit-socket",
+            "durable-marker",
+        }
+        or authority_route.get("candidate_config_fingerprint")
+        != core_config_contract["config_fingerprint"]
+    ):
+        raise CutoverPreflightError(
+            "operator-readiness authority route binding is invalid"
+        )
+    current_build_id = _validate_runtime_build_identity_proof(
+        by_id["runtime_build_identity"],
+        root=root,
+        expected_config_fingerprint=str(
+            core_config_contract["config_fingerprint"]
+        ),
+        expected_authority_mode=str(authority_route["mode"]),
+    )
+    if manifest.get("expected_source_build_id") != current_build_id:
+        raise CutoverPreflightError(
+            "operator-readiness source build binding is invalid"
+        )
 
     backup = _check_by_id(manifest, "recovery_backup")
     verify = _check_by_id(manifest, "recovery_verify")
@@ -1963,6 +3320,123 @@ def _inspect_database_contract_wal_aware(
     }
 
 
+def _recompute_live_capture_manifest_with_held_repository_lock(
+    manager: VerifiedRecoveryManager,
+    *,
+    database_binding: Mapping[str, Any],
+    capture_maintenance_lock_held: bool,
+) -> dict[str, Any]:
+    """Recompute live capture state without reacquiring the repository lock.
+
+    Replacement publication runs inside ``guarded_recovery_transaction`` and
+    therefore already owns both the repository and capture-maintenance locks.
+    Replacement verification owns the repository lock shared and acquires only
+    the existing capture-maintenance lock here.  Keeping those two ownership
+    modes explicit avoids a self-deadlock while preserving repository-before-
+    capture lock ordering.
+    """
+
+    if type(capture_maintenance_lock_held) is not bool:
+        raise CutoverPreflightError(
+            "capture-maintenance lock ownership is invalid"
+        )
+    expected_binding_keys = {
+        "artifact_sha256",
+        "receipt_digest",
+        "auth_key_id",
+        "schema_contract_version",
+        "snapshot_revision",
+        "logical_snapshot_schema",
+        "logical_snapshot_sha256",
+        "capture_operation_count",
+        "capture_operation_highwater_micros",
+        "capture_root_provenance",
+        "capture_root_identity_digest",
+    }
+    binding = dict(database_binding) if isinstance(database_binding, Mapping) else {}
+    if (
+        set(binding) != expected_binding_keys
+        or binding.get("logical_snapshot_schema")
+        != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+        or any(
+            _SHA256.fullmatch(str(binding.get(field) or "")) is None
+            for field in (
+                "artifact_sha256",
+                "receipt_digest",
+                "auth_key_id",
+                "snapshot_revision",
+                "logical_snapshot_sha256",
+                "capture_root_identity_digest",
+            )
+        )
+    ):
+        raise CutoverPreflightError(
+            "capture attestation database binding is invalid"
+        )
+
+    paths = manager.daemon.paths()
+    capture_lock = paths["lock_dir"] / GLOBAL_CAPTURE_LOCK
+    if not capture_maintenance_lock_held:
+        _assert_no_symlink_components(
+            capture_lock,
+            name="capture maintenance lock",
+        )
+    capture_scope = (
+        nullcontext()
+        if capture_maintenance_lock_held
+        else manager._existing_private_file_lock(
+            capture_lock,
+            mode=fcntl.LOCK_EX,
+            timeout_seconds=30.0,
+        )
+    )
+    with capture_scope:
+        root_provenance = manager._validate_capture_source_root()
+        if (
+            root_provenance["capture_root_provenance"]
+            != binding["capture_root_provenance"]
+            or root_provenance["capture_root_identity_digest"]
+            != binding["capture_root_identity_digest"]
+        ):
+            raise CutoverPreflightError(
+                "live capture root does not match its signed database binding"
+            )
+        with closing(manager.store._connect_read_only()) as conn:
+            with manager.store._transaction(conn):
+                ledger_bindings = manager._snapshot_capture_ledger_bindings(conn)
+        capture_highwater_micros = int(
+            max(
+                (
+                    float(item["committed_at"])
+                    for item in ledger_bindings.values()
+                ),
+                default=0.0,
+            )
+            * 1_000_000
+        )
+        if (
+            int(binding["capture_operation_count"]) != len(ledger_bindings)
+            or int(binding["capture_operation_highwater_micros"])
+            != capture_highwater_micros
+        ):
+            raise CutoverPreflightError(
+                "live capture ledger is newer than its signed database binding"
+            )
+        manifest = manager._capture_inventory(
+            ledger_ids=set(ledger_bindings),
+            database_binding=binding,
+            initialize_transport=False,
+        )
+    return {
+        "manifest_sha256": str(manifest["manifest_sha256"]),
+        "file_count": int(manifest["file_count"]),
+        "total_bytes": int(manifest["total_bytes"]),
+        "database_binding": dict(manifest["database_binding"]),
+        "reconciliation": dict(manifest["reconciliation"]),
+        "verified": True,
+    }
+
+
 def verify_recovery_binding(
     *,
     parsed: Mapping[str, Any],
@@ -1972,9 +3446,17 @@ def verify_recovery_binding(
     memory_db: Path,
     capture_root: Path,
     restored_target: bool = False,
+    repository_lock_held: bool = False,
+    capture_maintenance_lock_held: bool = False,
 ) -> dict[str, Any]:
     if type(restored_target) is not bool:
         raise CutoverPreflightError("restored-target request must be boolean")
+    if (
+        type(repository_lock_held) is not bool
+        or type(capture_maintenance_lock_held) is not bool
+        or (capture_maintenance_lock_held and not repository_lock_held)
+    ):
+        raise CutoverPreflightError("recovery lock ownership is invalid")
     for path, name in (
         (receipt_path, "recovery bundle receipt"),
         (restore_proof_path, "isolated restore proof"),
@@ -2131,8 +3613,16 @@ def verify_recovery_binding(
             raise CutoverPreflightError(
                 "verified capture manifest has the wrong database binding"
             )
-        live_capture = manager.recompute_live_capture_manifest(
-            database_binding=dict(parsed_capture_binding),
+        live_capture = (
+            _recompute_live_capture_manifest_with_held_repository_lock(
+                manager,
+                database_binding=dict(parsed_capture_binding),
+                capture_maintenance_lock_held=capture_maintenance_lock_held,
+            )
+            if repository_lock_held
+            else manager.recompute_live_capture_manifest(
+                database_binding=dict(parsed_capture_binding),
+            )
         )
         if (
             live_capture.get("manifest_sha256")

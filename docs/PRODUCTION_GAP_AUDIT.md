@@ -2,11 +2,10 @@
 
 This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fixes, and current disposition so operators do not mistake demo scaffolding or research extensions for production guarantees.
 
-Deployment status is also intentionally separate from code disposition. These
-Phase 7 fixes are implemented in the current hardening worktree, but the live
-local production instance remains on legacy v5 and has not been cut over to the
-authoritative core. No row below claims remote publication, live cutover,
-bridge governance, or multi-Mac replication.
+Deployment status is also intentionally separate from code disposition. No row
+below claims remote publication, live cutover, bridge governance, or multi-Mac
+replication; determine those states through their explicit runtime, Git, and
+replication evidence contracts.
 
 ## Closed In Latest Hardening Pass
 

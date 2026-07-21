@@ -14,11 +14,12 @@ import secrets
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -45,6 +46,7 @@ from core_client_binding import (  # noqa: E402
 from core_service import (  # noqa: E402
     CoreConfig,
     CoreServiceError,
+    REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX,
     STORE_GENERATION_ID_RE,
     STORE_GENERATION_SCHEMA,
     _manifest_build_id,
@@ -57,8 +59,10 @@ from scripts.core_cutover_preflight import (  # noqa: E402
     CUTOVER_ATTESTATION_NAME,
     CutoverAttestationRequest,
     CutoverPreflightError,
+    ReplacementAdmissionRequest,
     _normal_absolute,
     launchctl_service_snapshot,
+    publish_replacement_admission,
     run_preflight,
 )
 from redaction import SecretSafeArgumentParser  # noqa: E402
@@ -73,6 +77,7 @@ DEFAULT_PRODUCTION_NEURAL_MODEL = (
 )
 DEFAULT_PRODUCTION_NEURAL_REVISION = "6c3ae70858513f1a78e9cdca3cae330d9075cd2a"
 DEFAULT_PRODUCTION_MLX_DEVICE = "gpu"
+REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS = 300.0
 LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 LAYOUT_MANIFEST_SCHEMA = "synapse-s2.noncanonical-core-layout.v1"
 EXPECTED_SCHEMA_IDENTITY = "sqlite-53324442-v6"
@@ -853,6 +858,8 @@ def plist_payload(
     label: str,
     paths: InstallPaths,
     config: CoreConfig,
+    keep_alive: bool = True,
+    replacement_admission: bool = False,
 ) -> bytes:
     try:
         closed_config = config_from_wire(config.to_wire())
@@ -867,6 +874,25 @@ def plist_payload(
         raise CoreInstallerError(
             "LaunchAgent configuration does not match the reviewed layout"
         )
+    if type(keep_alive) is not bool or type(replacement_admission) is not bool:
+        raise CoreInstallerError("LaunchAgent staging policy is invalid")
+    if replacement_admission and keep_alive:
+        raise CoreInstallerError(
+            "replacement admission must use a non-persistent LaunchAgent"
+        )
+    environment = {
+        # Pin the exact source manifest used by the installer. Do not let
+        # an inherited shell override make health compare unlike builds.
+        "SYNAPSE_S2_BUILD_ID": _manifest_build_id(paths.root),
+        # MLX selects its device from process environment.  Publish the
+        # exact closed CoreConfig value so launchd cannot silently fall
+        # back to "default" for a reviewed cpu/gpu configuration.
+        "MLX_DEVICE": closed_config.mlx_device,
+    }
+    if replacement_admission:
+        # This narrowly selects the signed, short-lived successor-admission
+        # verifier.  It is never present in the persistent production plist.
+        environment["SYNAPSE_S2_REPLACEMENT_ADMISSION"] = "1"
     payload = {
         "Label": label,
         "ProgramArguments": [
@@ -877,18 +903,10 @@ def plist_payload(
             str(paths.config),
         ],
         "RunAtLoad": True,
-        "KeepAlive": True,
+        "KeepAlive": keep_alive,
         "ProcessType": "Interactive",
         "Umask": 0o077,
-        "EnvironmentVariables": {
-            # Pin the exact source manifest used by the installer. Do not let
-            # an inherited shell override make health compare unlike builds.
-            "SYNAPSE_S2_BUILD_ID": _manifest_build_id(paths.root),
-            # MLX selects its device from process environment.  Publish the
-            # exact closed CoreConfig value so launchd cannot silently fall
-            # back to "default" for a reviewed cpu/gpu configuration.
-            "MLX_DEVICE": closed_config.mlx_device,
-        },
+        "EnvironmentVariables": environment,
         "StandardOutPath": str(paths.log),
         "StandardErrorPath": str(paths.log),
         "WorkingDirectory": str(paths.root),
@@ -1038,6 +1056,7 @@ def probe_health(
     config: CoreConfig,
     *,
     restored_target: bool = False,
+    expected_deployment_mode: str = "authoritative",
 ) -> dict[str, Any]:
     from core_client import CoreClient
 
@@ -1064,6 +1083,7 @@ def probe_health(
         not isinstance(result, dict)
         or result.get("ready") is not True
         or result.get("protocol_version") != PROTOCOL_VERSION
+        or result.get("deployment_mode") != expected_deployment_mode
         or not isinstance(capture, dict)
         or capture.get("enabled") is not True
         or capture.get("ready") is not True
@@ -1113,6 +1133,7 @@ def probe_health(
         "neural_epoch": identity["neural_epoch"],
         "build_id": identity["build_id"],
         "schema_identity": identity["schema_identity"],
+        "deployment_mode": result["deployment_mode"],
         "config_identity_verified": True,
         "store_identity_verified": True,
     }
@@ -1125,6 +1146,7 @@ def wait_for_health(
     prior_pid: int | None,
     wait_seconds: float,
     restored_target: bool = False,
+    expected_deployment_mode: str = "authoritative",
 ) -> dict[str, Any]:
     deadline = time.monotonic() + wait_seconds
     last_pid = None
@@ -1137,6 +1159,7 @@ def wait_for_health(
                 health = probe_health(
                     config,
                     restored_target=restored_target,
+                    expected_deployment_mode=expected_deployment_mode,
                 )
             except Exception:
                 health = None
@@ -1154,6 +1177,56 @@ def wait_for_health(
             consecutive = 0
         time.sleep(0.25)
     raise CoreInstallerError("authoritative-core did not pass its stabilized health gate")
+
+
+def replacement_certification_seconds_remaining(
+    admission: Mapping[str, Any] | None,
+) -> int:
+    """Require enough signed life for a full live certification attempt."""
+
+    expires_at = (
+        None if not isinstance(admission, Mapping) else admission.get("expires_at_unix_ms")
+    )
+    if type(expires_at) is not int:
+        raise CoreInstallerError("replacement admission expiry is invalid")
+    remaining_milliseconds = int(expires_at) - int(time.time() * 1000)
+    if remaining_milliseconds < int(
+        REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS * 1000
+    ):
+        raise CoreInstallerError(
+            "replacement candidate has too little signed time remaining for certification"
+        )
+    return remaining_milliseconds // 1000
+
+
+def verified_exact_label_cleanup(
+    *,
+    launchctl: "LaunchCtl",
+    wait_seconds: float,
+) -> list[str]:
+    """Best-effort cleanup with explicit readback of both launchd states."""
+
+    cleanup_errors: list[str] = []
+    try:
+        launchctl.bootout(wait_seconds=wait_seconds)
+    except Exception:
+        cleanup_errors.append("bootout")
+    try:
+        launchctl.disable()
+    except Exception:
+        cleanup_errors.append("disable")
+    try:
+        cleanup_snapshot = launchctl.snapshot()
+        if cleanup_snapshot.get("loaded") or cleanup_snapshot.get("running"):
+            cleanup_errors.append("launch-state")
+    except Exception:
+        cleanup_errors.append("launch-state")
+    try:
+        if not launchctl.disabled():
+            cleanup_errors.append("disabled-policy")
+    except Exception:
+        cleanup_errors.append("disabled-policy")
+    return cleanup_errors
 
 
 @contextmanager
@@ -1841,25 +1914,10 @@ def recover_existing(
     except BaseException as exc:
         cleanup_errors: list[str] = []
         if launch_mutation_attempted:
-            try:
-                launchctl.bootout(wait_seconds=wait_seconds)
-            except Exception:
-                cleanup_errors.append("bootout")
-            try:
-                launchctl.disable()
-            except Exception:
-                cleanup_errors.append("disable")
-            try:
-                cleanup_snapshot = launchctl.snapshot()
-                if cleanup_snapshot.get("loaded") or cleanup_snapshot.get("running"):
-                    cleanup_errors.append("launch-state")
-            except Exception:
-                cleanup_errors.append("launch-state")
-            try:
-                if not launchctl.disabled():
-                    cleanup_errors.append("disabled-policy")
-            except Exception:
-                cleanup_errors.append("disabled-policy")
+            cleanup_errors = verified_exact_label_cleanup(
+                launchctl=launchctl,
+                wait_seconds=wait_seconds,
+            )
         if cleanup_errors:
             raise CoreInstallerError(
                 "recover-existing activation failed; exact-label cleanup "
@@ -2103,19 +2161,21 @@ def install(
             authority_mode="authoritative-core-v6",
         )
     except BaseException as exc:
-        try:
-            launchctl.bootout(wait_seconds=wait_seconds)
-        except Exception:
-            pass
-        try:
-            launchctl.disable()
-        except Exception:
-            pass
+        cleanup_errors = verified_exact_label_cleanup(
+            launchctl=launchctl,
+            wait_seconds=wait_seconds,
+        )
+        if cleanup_errors:
+            raise CoreInstallerError(
+                "authoritative-core activation failed; exact-label cleanup "
+                "could not be verified; state and recovery evidence were "
+                "preserved and the system must be treated as fail-closed"
+            ) from exc
         if isinstance(exc, CoreInstallerError):
             raise CoreInstallerError(
-                "authoritative-core activation failed; it is unloaded and disabled; "
-                "state, config, plist, token, logs, database, and captures were preserved; "
-                "if schema v6 was claimed the system remains fail-closed"
+                "authoritative-core activation failed; it is verified unloaded and "
+                "disabled; state, config, plist, token, logs, database, and captures "
+                "were preserved; if schema v6 was claimed the system remains fail-closed"
             ) from exc
         raise
     if not activated:
@@ -2248,6 +2308,318 @@ def context_delivery_integrity(
                 lease.close()
 
 
+def stage_replacement(
+    *,
+    paths: InstallPaths,
+    label: str,
+    launchctl: LaunchCtl,
+    wait_seconds: float,
+    maximum_evidence_age_seconds: float,
+    confirm: bool,
+    expected_revision: str | None,
+) -> dict[str, Any]:
+    """Admit one exact current build long enough to certify it live.
+
+    This lane is intentionally narrower than installation.  It requires an
+    already-disabled and unloaded incumbent, proves a fresh paired recovery
+    point under exclusive authority, publishes one short-lived signed
+    build-only successor admission, and launches a non-KeepAlive service.  It
+    never publishes a production client binding or persistent LaunchAgent.
+    """
+
+    if confirm is not True:
+        raise CoreInstallerError("replacement staging requires --confirm")
+    reviewed_revision = str(expected_revision or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", reviewed_revision) is None:
+        raise CoreInstallerError(
+            "replacement staging requires one exact reviewed delivery revision"
+        )
+    initial_service = launchctl.snapshot()
+    initial_disabled = launchctl.disabled()
+    if (
+        initial_service.get("loaded")
+        or initial_service.get("running")
+        or not initial_disabled
+    ):
+        raise CoreInstallerError(
+            "replacement staging requires the exact core LaunchAgent to be "
+            "disabled and unloaded"
+        )
+
+    _validate_install_sources(paths)
+    config = build_config(paths)
+    candidate_build_id = _manifest_build_id(paths.root)
+    staged_plist = paths.core_root / f"{label}.replacement-stage.plist"
+    expected_plist = plist_payload(
+        label=label,
+        paths=paths,
+        config=config,
+        keep_alive=False,
+        replacement_admission=True,
+    )
+    for directory in {
+        paths.data_root,
+        paths.core_root,
+        paths.capture_root,
+        paths.config.parent,
+        paths.socket.parent,
+        paths.state.parent,
+        paths.log.parent,
+        paths.data_root / "recovery",
+    }:
+        ensure_private_directory(directory)
+
+    from memory_store import DurableMemoryStore
+    from recovery_manager import VerifiedRecoveryManager
+
+    admission: dict[str, Any] | None = None
+    guarded_evidence: dict[str, Any] | None = None
+    with tempfile.TemporaryDirectory(
+        prefix="replacement-admission-",
+        dir=paths.data_root / "recovery",
+    ) as temporary:
+        lease: CoreAuthorityLease | None = None
+        store: DurableMemoryStore | None = None
+        try:
+            lease = CoreAuthorityLease.acquire_core(
+                paths.memory_db,
+                timeout_seconds=min(float(wait_seconds), 30.0),
+                instance_id="core-installer-replacement-admission",
+            )
+            store = DurableMemoryStore.open_existing_for_core_maintenance(
+                paths.memory_db,
+                authority_lease=lease,
+            )
+            inspection = store.inspect_core_authority_preclaim()
+            marker = inspection.get("marker")
+            if (
+                inspection.get("governance_mode") != "authoritative-v6"
+                or inspection.get("schema_identity") != EXPECTED_SCHEMA_IDENTITY
+                or not isinstance(marker, dict)
+                or marker.get("service_required") is not True
+                or marker.get("lock_generation_id")
+                != lease.lock_generation_id
+                or marker.get("config_fingerprint") != config.fingerprint
+                or (
+                    marker.get("build_id") == candidate_build_id
+                    and not str(marker.get("instance_id") or "").startswith(
+                        REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+                    )
+                )
+                or marker.get("root_generation_id")
+                != _load_recovery_root_generation(
+                    paths,
+                    expected_store_identity=str(inspection["store_identity"]),
+                )
+            ):
+                raise CoreInstallerError(
+                    "replacement staging requires one exact build-only v6 successor"
+                )
+            audit = store.audit_context_delivery_publication_repair()
+            if (
+                audit.get("status") != "ready"
+                or audit.get("repair_required") is not False
+                or audit.get("audit_revision") != reviewed_revision
+            ):
+                raise CoreInstallerError(
+                    "replacement staging delivery audit changed or is not ready"
+                )
+            manager = VerifiedRecoveryManager(
+                store,
+                capture_root=paths.capture_root,
+                runtime_state_path=paths.state,
+            )
+            capture = manager.daemon.status()
+            capture_zero_fields = (
+                "pending_file_count",
+                "processing_file_count",
+                "processing_empty_claim_count",
+                "processing_malformed_claim_count",
+                "error_file_count",
+                "unresolved_error_count",
+                "terminal_error_evidence_count",
+                "historical_error_evidence_count",
+                "unsafe_error_artifact_count",
+                "error_resolution_pending_count",
+                "error_resolution_failed_count",
+            )
+            if (
+                capture.get("transport_ready") is not True
+                or any(
+                    type(capture.get(field)) is not int
+                    or int(capture[field]) != 0
+                    for field in capture_zero_fields
+                )
+            ):
+                raise CoreInstallerError(
+                    "replacement staging requires a clean capture transport"
+                )
+            restore_root = Path(temporary) / "isolated-restore"
+            with manager.guarded_recovery_transaction(
+                restore_root,
+                purpose="replacement-admission",
+                pinned=True,
+            ) as publication:
+
+                def publish(
+                    evidence: dict[str, Any],
+                ) -> dict[str, Any]:
+                    nonlocal guarded_evidence
+                    guarded_evidence = evidence
+                    live_inspection = store.inspect_core_authority_preclaim()
+                    live_audit = store.audit_context_delivery_publication_repair()
+                    if (
+                        dict(live_inspection) != dict(inspection)
+                        or dict(live_audit) != dict(audit)
+                        or live_audit.get("audit_revision") != reviewed_revision
+                    ):
+                        raise CoreInstallerError(
+                            "replacement predecessor changed before signed publication"
+                        )
+                    bundle = evidence.get("bundle")
+                    restore = evidence.get("restore")
+                    if not isinstance(bundle, dict) or not isinstance(restore, dict):
+                        raise CoreInstallerError(
+                            "replacement recovery evidence is incomplete"
+                        )
+                    return publish_replacement_admission(
+                        request=ReplacementAdmissionRequest(
+                            path=paths.core_root / "replacement-admission.json",
+                            build_id=candidate_build_id,
+                            config_fingerprint=config.fingerprint,
+                        ),
+                        root=paths.root,
+                        memory_db=paths.memory_db,
+                        capture_root=paths.capture_root,
+                        recovery_bundle_receipt=Path(
+                            str(bundle.get("bundle_receipt_path") or "")
+                        ),
+                        recovery_restore_proof=Path(
+                            str(restore.get("recovery_proof_path") or "")
+                        ),
+                        inspection=live_inspection,
+                        delivery_audit=live_audit,
+                        maximum_evidence_age_seconds=(
+                            maximum_evidence_age_seconds
+                        ),
+                    )
+
+                admission = publication.publish(publish)
+            lease.assert_core_for(paths.memory_db)
+        except CoreInstallerError:
+            raise
+        except Exception as exc:
+            raise CoreInstallerError(
+                "replacement admission proof or publication failed"
+            ) from exc
+        finally:
+            try:
+                if store is not None:
+                    store.close()
+            finally:
+                if lease is not None:
+                    lease.close()
+
+        before_activation = launchctl.snapshot()
+        if (
+            before_activation.get("loaded")
+            or before_activation.get("running")
+            or not launchctl.disabled()
+        ):
+            raise CoreInstallerError(
+                "exact core LaunchAgent changed before replacement activation"
+            )
+        prepare_private_regular(paths.log)
+        write_core_config(paths.config, config)
+        _assert_owner_controlled(
+            paths.config,
+            kind="core service config",
+            require_mode=0o600,
+        )
+        _atomic_private_bytes(staged_plist, expected_plist)
+        _assert_owner_controlled(
+            staged_plist,
+            kind="replacement staging LaunchAgent plist",
+            require_mode=0o600,
+        )
+        activated = False
+        certification_seconds_remaining: int | None = None
+        try:
+            launchctl.enable()
+            launchctl.bootstrap(staged_plist)
+            launchctl.kickstart()
+            activated = True
+            health = wait_for_health(
+                launchctl=launchctl,
+                config=config,
+                prior_pid=None,
+                wait_seconds=wait_seconds,
+                expected_deployment_mode="replacement-certification",
+            )
+            certification_seconds_remaining = (
+                replacement_certification_seconds_remaining(admission)
+            )
+        except BaseException as exc:
+            cleanup_errors = verified_exact_label_cleanup(
+                launchctl=launchctl,
+                wait_seconds=wait_seconds,
+            )
+            if cleanup_errors:
+                raise CoreInstallerError(
+                    "replacement candidate activation failed; exact-label "
+                    "cleanup could not be verified; the signed admission will "
+                    "self-expire and live cutover must not continue"
+                ) from exc
+            if isinstance(exc, CoreInstallerError):
+                raise CoreInstallerError(
+                    "replacement candidate activation failed; the exact label "
+                    "was verified disabled and unloaded"
+                ) from exc
+            raise
+        if not activated or admission is None or guarded_evidence is None:
+            raise CoreInstallerError("replacement candidate activation did not begin")
+        if certification_seconds_remaining is None:
+            raise CoreInstallerError(
+                "replacement certification time budget was not established"
+            )
+        bundle = guarded_evidence.get("bundle")
+        restore = guarded_evidence.get("restore")
+        return _safe_result(
+            "stage-replacement",
+            status="staged-healthy",
+            provisional=True,
+            persistent=False,
+            certification_seconds_remaining=certification_seconds_remaining,
+            staged_plist=str(staged_plist),
+            admission={
+                "receipt_digest": admission.get("receipt_digest"),
+                "expires_at_unix_ms": admission.get("expires_at_unix_ms"),
+                "candidate_build_id": admission.get("candidate_build_id"),
+                "candidate_config_fingerprint": admission.get(
+                    "candidate_config_fingerprint"
+                ),
+                "delivery_audit_revision": admission.get(
+                    "delivery_audit_revision"
+                ),
+            },
+            recovery={
+                "verified": guarded_evidence.get("verified"),
+                "cutover_ready": guarded_evidence.get("cutover_ready"),
+                "isolated_restore_verified": (
+                    restore.get("verified")
+                    if isinstance(restore, dict)
+                    else False
+                ),
+                "bundle_receipt_path": (
+                    bundle.get("bundle_receipt_path")
+                    if isinstance(bundle, dict)
+                    else None
+                ),
+            },
+            **health,
+        )
+
+
 def _unlink_exact_private(path: Path) -> bool:
     observed = _lstat(path)
     if observed is None:
@@ -2283,7 +2655,10 @@ def uninstall(*, paths: InstallPaths, launchctl: LaunchCtl, wait_seconds: float)
 def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
     snapshot = launchctl.snapshot()
     healthy = False
+    runtime_healthy = False
     capture_ready = False
+    deployment_mode: str | None = None
+    provisional = False
     binding_path = default_binding_path(paths.home)
     binding_ready = False
     binding_digest = None
@@ -2291,9 +2666,23 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
         try:
             health = probe_health(load_core_config(paths.config))
             healthy = bool(health.get("ready"))
+            runtime_healthy = healthy
             capture_ready = bool(health.get("capture_ready"))
+            deployment_mode = str(health.get("deployment_mode") or "") or None
         except Exception:
-            pass
+            try:
+                health = probe_health(
+                    load_core_config(paths.config),
+                    expected_deployment_mode="replacement-certification",
+                )
+                runtime_healthy = bool(health.get("ready"))
+                capture_ready = bool(health.get("capture_ready"))
+                deployment_mode = str(
+                    health.get("deployment_mode") or ""
+                ) or None
+                provisional = runtime_healthy
+            except Exception:
+                pass
     if paths.config.exists() and not paths.config.is_symlink():
         try:
             config = load_core_config(paths.config)
@@ -2315,6 +2704,10 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
         running=bool(snapshot.get("running")),
         pid=snapshot.get("pid"),
         healthy=healthy,
+        runtime_healthy=runtime_healthy,
+        production_ready=bool(healthy and binding_ready),
+        deployment_mode=deployment_mode,
+        provisional=provisional,
         capture_ready=capture_ready,
         plist_present=paths.plist.is_file() and not paths.plist.is_symlink(),
         config_present=paths.config.is_file() and not paths.config.is_symlink(),
@@ -2335,6 +2728,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         choices=(
             "install",
+            "stage-replacement",
             "recover-existing",
             "context-delivery-integrity",
             "publish-binding",
@@ -2357,12 +2751,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm",
         action="store_true",
-        help="explicitly confirm the reviewed delivery-publication repair",
+        help="explicitly confirm the reviewed repair or replacement staging action",
     )
     parser.add_argument(
         "--expected-revision",
         default="",
-        help="exact 64-hex audit revision reviewed immediately before repair",
+        help="exact 64-hex delivery audit revision reviewed immediately before action",
     )
     parser.add_argument(
         "--restored-target",
@@ -2388,16 +2782,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CoreInstallerError("maximum evidence age must be between 60 and 86400 seconds")
         if args.restored_target and args.action != "install":
             raise CoreInstallerError("restored-target is valid only for install")
-        delivery_integrity_flags = bool(
-            args.repair or args.confirm or args.expected_revision
-        )
-        if (
-            delivery_integrity_flags
-            and args.action != "context-delivery-integrity"
-        ):
+        delivery_integrity_flags = bool(args.repair or args.confirm or args.expected_revision)
+        if delivery_integrity_flags and args.action not in {
+            "context-delivery-integrity",
+            "stage-replacement",
+        }:
             raise CoreInstallerError(
-                "delivery integrity repair flags are valid only for "
-                "context-delivery-integrity"
+                "reviewed delivery flags are valid only for delivery integrity "
+                "or replacement staging"
+            )
+        if args.action == "stage-replacement" and args.repair:
+            raise CoreInstallerError(
+                "replacement staging never repairs delivery publication"
             )
         if args.action == "context-delivery-integrity" and (
             args.evidence_manifest or args.force_restart
@@ -2405,6 +2801,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CoreInstallerError(
                 "context-delivery-integrity does not accept cutover evidence "
                 "or restart flags"
+            )
+        if args.action == "stage-replacement" and (
+            args.evidence_manifest or args.force_restart
+        ):
+            raise CoreInstallerError(
+                "replacement staging does not accept cutover evidence or restart flags"
             )
         if args.action == "recover-existing" and args.evidence_manifest:
             raise CoreInstallerError(
@@ -2450,6 +2852,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                         wait_seconds=args.wait_seconds,
                         force_restart=args.force_restart,
                         restored_target=args.restored_target,
+                    )
+                elif args.action == "stage-replacement":
+                    result = stage_replacement(
+                        paths=paths,
+                        label=args.label,
+                        launchctl=launchctl,
+                        wait_seconds=args.wait_seconds,
+                        maximum_evidence_age_seconds=(
+                            args.maximum_evidence_age_seconds
+                        ),
+                        confirm=bool(args.confirm),
+                        expected_revision=(
+                            str(args.expected_revision).strip().lower()
+                            if args.expected_revision
+                            else None
+                        ),
                     )
                 elif args.action == "recover-existing":
                     result = recover_existing(

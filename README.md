@@ -99,7 +99,7 @@ drain, then acquires exclusive core authority and the existing global capture
 lock. Backup, signed verification, isolated restore, and the final
 process/LaunchAgent inventory occur in-process under that one guard. The guard,
 temporary restore, store, and lease must unwind cleanly before the optional ZIP
-is built and `manifest.json` is atomically published last. The shared 20-proof
+is built and `manifest.json` is atomically published last. The shared 21-proof
 contract rejects missing, duplicate, optional-shadow, or non-ready proof rows.
 The shared quiescence policy also requires
 `com.master-mold.imprint.inboxworker` to be both absent and positively disabled;
@@ -107,11 +107,12 @@ a temporarily empty process list is insufficient. No recovery CLI child may
 reopen local authority during the guarded phase, and child probes receive only
 a minimal credential-free environment.
 
-Current rollout status: the live local production instance has not yet been cut
-over from legacy v5 to this authoritative-core lane. Repository implementation,
-tests, or documentation are not proof of deployment or remote publication; use
-the explicit backup, quiescence, attestation, install, and stabilized-health
-procedure below when cutover is approved.
+Deployment status is never inferred from repository implementation, tests, or
+documentation. Run `scripts/install_core_agent.sh status` and require
+`healthy`, `runtime_healthy`, `production_ready`, `capture_ready`, and
+`client_binding.ready` to be true, `provisional` to be false, and
+`deployment_mode` to be `authoritative`. Use the explicit backup, quiescence,
+attestation, install, and stabilized-health procedure below for every cutover.
 
 The evidence manifest embeds `synapse-s2.core-config-evidence.v1`, including the
 same configuration fingerprint the installer will require. Treat it as

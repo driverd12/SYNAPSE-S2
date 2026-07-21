@@ -39,6 +39,9 @@ from core_service import (
     CORE_OPERATION_CONTRACTS,
     LOGGER,
     MAX_ACTIVE_CONNECTIONS,
+    REPLACEMENT_ADMISSION_ENV,
+    REPLACEMENT_CERTIFICATION_MODE,
+    REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX,
     REPLICATION_MAINTENANCE_LANE_SECONDS,
     REPLICATION_OPERATIONS,
     SAFE_READ_OPERATIONS,
@@ -3228,6 +3231,293 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                     ).fetchone()[0]
                 )
             self.assertEqual(after, before)
+
+    def test_build_only_replacement_admission_is_one_claim_and_provisional(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            data_root = config.memory_path.parent
+            config = CoreConfig(
+                **{
+                    **config.__dict__,
+                    "capture_root": data_root,
+                }
+            )
+            first = AuthoritativeCoreService(config)
+            first.start()
+            first.close()
+            with closing(sqlite3.connect(config.memory_path)) as connection:
+                predecessor = json.loads(
+                    connection.execute(
+                        "SELECT value_json FROM store_metadata "
+                        "WHERE key = 'core_authority'"
+                    ).fetchone()[0]
+                )
+
+            admission_path = data_root / "core" / "replacement-admission.json"
+            admission_path.write_text("{}\n", encoding="utf-8")
+            admission_path.chmod(0o600)
+            predecessor_lock = str(predecessor["lock_generation_id"])
+            successor_build = "source-" + ("d" * 24)
+            expires_at = int(time.time() * 1000) + 60_000
+            admission = {
+                "receipt_digest": "a" * 64,
+                "expires_at_unix_ms": expires_at,
+                "restored_target_binding_receipt_digest": None,
+            }
+
+            with mock.patch(
+                "core_service._source_build_id",
+                return_value=successor_build,
+            ):
+                replacement = AuthoritativeCoreService(config)
+
+                def verify_replacement(
+                    *,
+                    inspection: Any,
+                    delivery_audit: Any,
+                ) -> dict[str, Any]:
+                    self.assertEqual(
+                        inspection["marker"]["build_id"],
+                        predecessor["build_id"],
+                    )
+                    self.assertEqual(
+                        inspection["previous_epoch"],
+                        predecessor["epoch"],
+                    )
+                    self.assertEqual(
+                        replacement._authority_lease.lock_generation_id,
+                        predecessor_lock,
+                    )
+                    self.assertEqual(delivery_audit["status"], "ready")
+                    return dict(admission)
+
+                with mock.patch.dict(
+                    os.environ,
+                    {REPLACEMENT_ADMISSION_ENV: "1"},
+                ), mock.patch.object(
+                    replacement,
+                    "_verify_required_replacement_admission",
+                    side_effect=verify_replacement,
+                ) as verifier:
+                    replacement.start()
+                verifier.assert_called_once()
+                try:
+                    health = replacement._health_result()
+                    self.assertTrue(health["ready"])
+                    self.assertEqual(
+                        health["deployment_mode"],
+                        REPLACEMENT_CERTIFICATION_MODE,
+                    )
+                    self.assertEqual(
+                        health["operational_state"],
+                        REPLACEMENT_CERTIFICATION_MODE,
+                    )
+                    self.assertEqual(
+                        health["replacement_admission_receipt_digest"],
+                        admission["receipt_digest"],
+                    )
+                    self.assertEqual(
+                        health["replacement_admission_expires_at_unix_ms"],
+                        expires_at,
+                    )
+                    with closing(sqlite3.connect(config.memory_path)) as connection:
+                        provisional_marker = json.loads(
+                            connection.execute(
+                                "SELECT value_json FROM store_metadata "
+                                "WHERE key = 'core_authority'"
+                            ).fetchone()[0]
+                        )
+                    self.assertEqual(
+                        provisional_marker["epoch"],
+                        predecessor["epoch"] + 1,
+                    )
+                    self.assertEqual(
+                        provisional_marker["build_id"],
+                        successor_build,
+                    )
+                    self.assertTrue(
+                        provisional_marker["instance_id"].startswith(
+                            REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+                        )
+                    )
+                    replacement._replacement_admission_deadline_monotonic = (
+                        time.monotonic() - 1.0
+                    )
+                    with self.assertRaises(CoreServiceError):
+                        replacement._assert_live_authority()
+                    expired_health = replacement._health_result()
+                    self.assertFalse(expired_health["ready"])
+                    self.assertEqual(
+                        expired_health["deployment_mode"],
+                        REPLACEMENT_CERTIFICATION_MODE,
+                    )
+                finally:
+                    replacement.close()
+
+                resumed_admission = {
+                    **admission,
+                    "receipt_digest": "b" * 64,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                }
+                resumed = AuthoritativeCoreService(config)
+                with mock.patch.dict(
+                    os.environ,
+                    {REPLACEMENT_ADMISSION_ENV: "1"},
+                ), mock.patch.object(
+                    resumed,
+                    "_verify_required_replacement_admission",
+                    return_value=resumed_admission,
+                ) as resume_gate:
+                    resumed.start()
+                resume_gate.assert_called_once()
+                try:
+                    resumed_health = resumed._health_result()
+                    self.assertTrue(resumed_health["ready"])
+                    self.assertEqual(
+                        resumed_health["deployment_mode"],
+                        REPLACEMENT_CERTIFICATION_MODE,
+                    )
+                    with closing(sqlite3.connect(config.memory_path)) as connection:
+                        resumed_marker = json.loads(
+                            connection.execute(
+                                "SELECT value_json FROM store_metadata "
+                                "WHERE key = 'core_authority'"
+                            ).fetchone()[0]
+                        )
+                    self.assertEqual(
+                        resumed_marker["epoch"],
+                        predecessor["epoch"] + 2,
+                    )
+                    self.assertEqual(resumed_marker["build_id"], successor_build)
+                    self.assertTrue(
+                        resumed_marker["instance_id"].startswith(
+                            REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+                        )
+                    )
+                finally:
+                    resumed.close()
+
+                unapproved_restart = AuthoritativeCoreService(config)
+                with mock.patch.object(
+                    unapproved_restart,
+                    "_verify_required_cutover_attestation",
+                    side_effect=CoreServiceError("service_unavailable"),
+                ) as final_gate:
+                    with self.assertRaises(CoreServiceError):
+                        unapproved_restart.start()
+                final_gate.assert_called_once()
+                unapproved_restart.close()
+
+                final_attestation = {
+                    "receipt_digest": "f" * 64,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                    "restored_target_binding_receipt_digest": None,
+                }
+                restarted = AuthoritativeCoreService(config)
+                with mock.patch.object(
+                    restarted,
+                    "_verify_required_cutover_attestation",
+                    return_value=final_attestation,
+                ) as final_gate:
+                    restarted.start()
+                final_gate.assert_called_once()
+                try:
+                    health = restarted._health_result()
+                    self.assertTrue(health["ready"])
+                    self.assertEqual(
+                        health["deployment_mode"],
+                        "authoritative",
+                    )
+                    self.assertEqual(health["operational_state"], "ready")
+                    self.assertIsNone(
+                        health["replacement_admission_receipt_digest"]
+                    )
+                finally:
+                    restarted.close()
+
+            with closing(sqlite3.connect(config.memory_path)) as connection:
+                successor = json.loads(
+                    connection.execute(
+                        "SELECT value_json FROM store_metadata "
+                        "WHERE key = 'core_authority'"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(successor["build_id"], successor_build)
+            self.assertEqual(successor["epoch"], predecessor["epoch"] + 3)
+            self.assertFalse(
+                successor["instance_id"].startswith(
+                    REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
+                )
+            )
+
+    def test_replacement_admission_rejects_config_drift_before_verification(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            data_root = config.memory_path.parent
+            config = CoreConfig(
+                **{
+                    **config.__dict__,
+                    "capture_root": data_root,
+                }
+            )
+            first = AuthoritativeCoreService(config)
+            first.start()
+            first.close()
+            with closing(sqlite3.connect(config.memory_path)) as connection:
+                predecessor = json.loads(
+                    connection.execute(
+                        "SELECT value_json FROM store_metadata "
+                        "WHERE key = 'core_authority'"
+                    ).fetchone()[0]
+                )
+            malformed_env = AuthoritativeCoreService(config)
+            with mock.patch.dict(
+                os.environ,
+                {REPLACEMENT_ADMISSION_ENV: "true"},
+            ):
+                with self.assertRaises(CoreServiceError):
+                    malformed_env.start()
+            malformed_env.close()
+            same_build = AuthoritativeCoreService(config)
+            with mock.patch.dict(
+                os.environ,
+                {REPLACEMENT_ADMISSION_ENV: "1"},
+            ), mock.patch.object(
+                same_build,
+                "_verify_required_replacement_admission",
+            ) as verifier:
+                with self.assertRaises(CoreServiceError):
+                    same_build.start()
+            verifier.assert_not_called()
+            same_build.close()
+            changed = CoreConfig(**{**config.__dict__, "recall_count": 3})
+            with mock.patch(
+                "core_service._source_build_id",
+                return_value="source-" + ("e" * 24),
+            ):
+                rejected = AuthoritativeCoreService(changed)
+            with mock.patch.dict(
+                os.environ,
+                {REPLACEMENT_ADMISSION_ENV: "1"},
+            ), mock.patch.object(
+                rejected,
+                "_verify_required_replacement_admission",
+            ) as verifier:
+                with self.assertRaises(CoreServiceError):
+                    rejected.start()
+            verifier.assert_not_called()
+            with closing(sqlite3.connect(config.memory_path)) as connection:
+                after = json.loads(
+                    connection.execute(
+                        "SELECT value_json FROM store_metadata "
+                        "WHERE key = 'core_authority'"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(after, predecessor)
 
     def test_embedding_space_change_is_rejected_even_with_cutover_attestation(self) -> None:
         with TemporaryDirectory() as temporary:

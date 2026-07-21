@@ -142,6 +142,8 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                     "recovery_restore",
                 )
             }
+            config_fingerprint = "f" * 64
+            build_id = preflight._manifest_build_id(ROOT)
             checks = [
                 recovery_checks.get(
                     check_id,
@@ -149,7 +151,20 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                         "check_id": check_id,
                         "required": True,
                         "status": "ready",
-                        "metrics": {},
+                        "metrics": (
+                            {
+                                "schema": preflight.RUNTIME_BUILD_IDENTITY_SCHEMA,
+                                "proof_mode": "candidate-local-source",
+                                "authority_mode": "candidate-local-v5",
+                                "expected_source_build_id": build_id,
+                                "observed_runtime_build_id": build_id,
+                                "expected_config_fingerprint": config_fingerprint,
+                                "observed_config_fingerprint": config_fingerprint,
+                                "matched": True,
+                            }
+                            if check_id == "runtime_build_identity"
+                            else {}
+                        ),
                         "artifact_paths": {},
                     },
                 )
@@ -164,7 +179,12 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                         "operator_trustworthy": True,
                         "created_at": time.time(),
                         "git": {"head": "0" * 40, "status_short": ""},
+                        "expected_source_build_id": build_id,
                         "core_config_contract": {},
+                        "authority_route": {
+                            "mode": "candidate-local-v5",
+                            "candidate_config_fingerprint": config_fingerprint,
+                        },
                         "quiescence_policy_contract": quiescence_policy_contract(),
                         "quiescence_policy_digest": quiescence_policy_digest(),
                         "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
@@ -181,7 +201,7 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
             with mock.patch.object(
                 preflight,
                 "validate_core_config_evidence_contract",
-                return_value={},
+                return_value={"config_fingerprint": config_fingerprint},
             ), self.assertRaisesRegex(
                 preflight.CutoverPreflightError,
                 "^recovery verification artifact is not valid JSON$",

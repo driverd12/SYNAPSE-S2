@@ -35,6 +35,7 @@ from redaction import (
 )
 from backend_router import database_requires_core
 from core_authority import CoreAuthorityLease
+from core_service import _manifest_build_id
 from core_client_binding import (
     BINDING_ENV,
     CoreClientBinding,
@@ -95,6 +96,8 @@ CHILD_ENV_ALLOWLIST = frozenset(
     }
 )
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+BUILD_ID_RE = re.compile(r"^source-[0-9a-f]{24}$")
+RUNTIME_BUILD_IDENTITY_SCHEMA = "synapse-s2.runtime-build-identity-proof.v1"
 RAW_DIGEST_TEXT_RE = re.compile(
     r"(?i)(?:['\"]?)(?:input_sha256|raw_input_sha256|raw_sha256|"
     r"raw_text_sha256|payload_sha256|source_text_sha256|"
@@ -1377,6 +1380,15 @@ class OperatorReadinessCertifier:
         self._validate_candidate_expectations(args)
         if self.core_binding is not None:
             self._validate_core_binding(self.core_binding)
+        self.runtime_authority_mode = (
+            self.core_binding.authority_mode
+            if self.core_binding is not None
+            else "explicit-socket"
+            if self.args.core_socket
+            else "durable-marker"
+            if database_requires_core(self.candidate_config.memory_path)
+            else "candidate-local-v5"
+        )
         self.core_config_attestation = {
             "source": "core-binding" if self.core_binding is not None else "legacy",
             "observed_effective_config_fingerprint": (
@@ -1412,6 +1424,7 @@ class OperatorReadinessCertifier:
             self.args.core_socket = ""
         self.results: list[CheckResult] = []
         self.metadata: dict[str, Any] = {}
+        self.expected_source_build_id = _manifest_build_id(ROOT)
 
     @staticmethod
     def _discover_core_binding(args: argparse.Namespace) -> Path | None:
@@ -1624,6 +1637,13 @@ class OperatorReadinessCertifier:
         self.metadata = self._run_metadata()
         self._write_json(self.artifact_dir / "run_metadata.json", self.metadata)
 
+        runtime_build = self._check_runtime_build_identity()
+        if runtime_build.status != "ready":
+            # Do not let any MCP, neural, write, capture, dashboard, handoff, or
+            # recovery probe attest a different executable than the source
+            # tree that will consume this pack.  The intentionally incomplete
+            # proof set makes the resulting diagnostic manifest fail closed.
+            return self._finalize()
         self._check_local_launcher()
         self._check_client_config()
         self._check_mcp_connect()
@@ -1656,6 +1676,7 @@ class OperatorReadinessCertifier:
             "created_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "repo_root": str(ROOT),
             "git": self._git_metadata(),
+            "expected_source_build_id": self.expected_source_build_id,
             "platform": {
                 "system": platform.system(),
                 "release": platform.release(),
@@ -1687,11 +1708,7 @@ class OperatorReadinessCertifier:
             "neural_local_files_only": config.embedding_neural_local_files_only,
             "authority_route": {
                 "mode": (
-                    self.core_binding.authority_mode
-                    if self.core_binding is not None
-                    else "explicit-socket"
-                    if self.args.core_socket
-                    else "durable-marker"
+                    self.runtime_authority_mode
                 ),
                 "source": "core-binding" if self.core_binding is not None else "legacy",
                 "socket": str(config.socket_path),
@@ -1703,6 +1720,110 @@ class OperatorReadinessCertifier:
                 ),
             },
         }
+
+    def _check_runtime_build_identity(self) -> CheckResult:
+        """Bind every later live probe to this source tree's deterministic build."""
+
+        expected_build_id = self.expected_source_build_id
+        config = self.candidate_config
+        authority_mode = self.runtime_authority_mode
+        authoritative = authority_mode != "candidate-local-v5"
+        if not authoritative:
+            # Candidate-local-v5 has no separate service executable: every
+            # Python/CLI probe below is launched from ROOT with this exact
+            # interpreter and source tree.  Record that closed execution mode
+            # explicitly so the cutover consumer can distinguish it from a
+            # remotely observed authoritative-core identity.
+            return self._record_manual(
+                "runtime_build_identity",
+                label="Runtime build identity",
+                status="ready",
+                required=True,
+                detail=(
+                    "Candidate-local probes are bound to the current deterministic "
+                    f"source build {expected_build_id}."
+                ),
+                metrics={
+                    "schema": RUNTIME_BUILD_IDENTITY_SCHEMA,
+                    "proof_mode": "candidate-local-source",
+                    "authority_mode": authority_mode,
+                    "expected_source_build_id": expected_build_id,
+                    "observed_runtime_build_id": expected_build_id,
+                    "expected_config_fingerprint": config.fingerprint,
+                    "observed_config_fingerprint": config.fingerprint,
+                    "matched": True,
+                },
+            )
+
+        def evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
+            health = parsed.get("health") if isinstance(parsed, dict) else None
+            identity = parsed.get("identity") if isinstance(parsed, dict) else None
+            observed_build_id = (
+                identity.get("build_id") if isinstance(identity, dict) else None
+            )
+            observed_fingerprint = (
+                identity.get("config_fingerprint")
+                if isinstance(identity, dict)
+                else None
+            )
+            exact_matches = {
+                "command_succeeded": returncode == 0,
+                "health_ready": (
+                    isinstance(health, dict) and health.get("ready") is True
+                ),
+                "build_id_shape": (
+                    isinstance(observed_build_id, str)
+                    and BUILD_ID_RE.fullmatch(observed_build_id) is not None
+                ),
+                "source_build": observed_build_id == expected_build_id,
+                "config_fingerprint": observed_fingerprint == config.fingerprint,
+            }
+            ready = all(exact_matches.values())
+            return (
+                "ready" if ready else "blocked",
+                (
+                    "Authoritative-core runtime build and configuration exactly "
+                    "match the current deterministic source."
+                    if ready
+                    else "Authoritative-core runtime identity does not match the current deterministic source."
+                ),
+                (
+                    ""
+                    if ready
+                    else "Install and start the exact current build, then create a new readiness pack before running live functional probes."
+                ),
+                {
+                    "schema": RUNTIME_BUILD_IDENTITY_SCHEMA,
+                    "proof_mode": "authoritative-core-health",
+                    "authority_mode": authority_mode,
+                    "expected_source_build_id": expected_build_id,
+                    "observed_runtime_build_id": observed_build_id,
+                    "expected_config_fingerprint": config.fingerprint,
+                    "observed_config_fingerprint": observed_fingerprint,
+                    "matched": ready,
+                    "exact_matches": exact_matches,
+                },
+            )
+
+        command = [
+            self.python,
+            str(ROOT / "core_service.py"),
+            "health",
+            "--timeout",
+            "2",
+        ]
+        if self.core_paths.config.is_file():
+            command.extend(["--config", str(self.core_paths.config)])
+        else:
+            command.extend(["--socket", str(config.socket_path)])
+        return self._run_command(
+            "runtime_build_identity",
+            label="Runtime build identity",
+            command=command,
+            required=True,
+            timeout=10,
+            evaluator=evaluate,
+        )
 
     def _git_metadata(self) -> dict[str, Any]:
         def git(*parts: str) -> str:

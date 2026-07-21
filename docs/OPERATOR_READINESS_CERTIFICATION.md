@@ -2,9 +2,9 @@
 
 This runbook is the Monday trust gate. It is not a demo seeder and it does not use example datasets. It derives the exact candidate core configuration through the same installer path used for cutover, runs real local SYNAPSE-S2 commands against the selected context, verifies the installed compact MCP contract through both output channels, writes and recalls one factual readiness trace, previews a real running app, wraps the session, proves processed capture authority, creates and re-verifies a signed paired recovery point, proves an isolated restore, and packages the evidence into one local artifact.
 
-Certification is evidence, not deployment. Live local production remains
-untouched on legacy v5 until a separately approved cutover; this document makes
-no internal-remote or public-GitHub publication claim.
+Certification is evidence, not deployment. Determine live status only through
+the authoritative installer status contract; this document makes no
+internal-remote or public-GitHub publication claim.
 
 ## Binding prerequisite
 

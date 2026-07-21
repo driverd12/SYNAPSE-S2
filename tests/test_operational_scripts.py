@@ -361,6 +361,8 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn('mkdir -p "$SYNAPSE_S2_EXPORT_DIR"', apply_stage)
         self.assertIn("scripts/install_core_agent.sh install", apply_stage)
         self.assertIn('echo "=== authoritative core status ==="', apply_stage)
+        self.assertIn('"runtime_healthy"', apply_stage)
+        self.assertIn('"production_ready"', apply_stage)
         self.assertIn("scripts/install_dashboard_agent.sh", apply_stage)
         self.assertLess(
             apply_stage.index("scripts/install_core_agent.sh install"),

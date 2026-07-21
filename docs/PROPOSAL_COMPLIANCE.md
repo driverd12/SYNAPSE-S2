@@ -2,9 +2,9 @@
 
 This matrix maps the supplied proposal documents to the current implementation. It is intentionally strict: implemented items point to working files and tests; research-grade extensions are called out separately instead of being implied.
 
-Implementation status is not deployment status. The live local production
-service remains untouched on legacy v5; this worktree has not been cut over or
-claimed published to either remote.
+Implementation status is not deployment status. Determine live status through
+the authoritative installer status contract and remote publication through Git;
+this matrix makes neither claim.
 
 ## Reviewed Sources
 

@@ -1,10 +1,10 @@
 # SYNAPSE-S2 Retrieval v2 Validation Contract
 
 This document defines what Retrieval v2 does, how to validate it, and what it
-does **not** prove. Implementation status is separate from deployment status:
-the hardening worktree contains these surfaces, while the live local service
-remains on legacy v5 until an independently reviewed authoritative-core cutover.
-Nothing here claims an internal-remote or public-GitHub publication.
+does **not** prove. Implementation status is separate from deployment status;
+determine live authority through the installer status contract and publication
+through Git. Nothing here claims an internal-remote or public-GitHub
+publication.
 
 ## Supported recall surfaces
 
