@@ -17,9 +17,12 @@ from core_client_binding import (
     binding_for_config,
     write_core_client_binding,
 )
+from core_authority import CoreAuthorityLease
 from core_service import CoreConfig, write_core_config
 
 from scripts.operator_readiness_certify import (
+    CAPTURE_DRAIN_BATCH_SIZE,
+    CAPTURE_DRAIN_MAX_PASSES,
     CheckResult,
     MCP_COMPACT_BUDGET,
     MCP_CONTRACT_SCHEMA,
@@ -27,6 +30,7 @@ from scripts.operator_readiness_certify import (
     MCP_SAFETY_PREFIX,
     MCP_SAFETY_SCHEMA,
     OperatorReadinessCertifier,
+    REQUIRED_PROOFS,
     app_preview_status,
     build_parser,
     choose_app,
@@ -35,6 +39,7 @@ from scripts.operator_readiness_certify import (
     mcp_compact_contract_probe_status,
     render_runbook_markdown,
     render_summary_markdown,
+    runtime_status_from_mcp_envelope,
     sanitize_evidence_text,
     write_private_text,
 )
@@ -239,6 +244,140 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         write_core_client_binding(binding_path, binding)
         return binding_path, binding, core_paths
 
+    def _bound_certifier(
+        self,
+        root: Path,
+        *,
+        run_id: str = "operator-readiness-guard-test",
+    ):
+        root = root.resolve()
+        binding_path, binding, core_paths = self._write_candidate_binding(root)
+        with (
+            mock.patch(
+                "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                return_value=core_paths,
+            ),
+            mock.patch(
+                "scripts.operator_readiness_certify.database_requires_core",
+                return_value=False,
+            ),
+        ):
+            certifier = OperatorReadinessCertifier(
+                self._args(
+                    root / "evidence",
+                    run_id=run_id,
+                    core_binding=str(binding_path),
+                )
+            )
+        return certifier, binding, core_paths
+
+    @staticmethod
+    def _capture_status(*, pending: int = 0, processing: int = 0):
+        return {
+            "transport_ready": True,
+            "missing_transport_directories": [],
+            "unsafe_transport_directories": [],
+            "pending_file_count": pending,
+            "processing_file_count": processing,
+            "inbox_temp_file_count": 0,
+            "processing_empty_claim_count": 0,
+            "processing_malformed_claim_count": 0,
+            "error_file_count": 0,
+            "unresolved_error_count": 0,
+            "unsafe_error_artifact_count": 0,
+            "error_resolution_pending_count": 0,
+            "error_resolution_failed_count": 0,
+        }
+
+    @staticmethod
+    def _required_ready_results():
+        return [
+            CheckResult(
+                check_id=check_id,
+                label=check_id.replace("_", " ").title(),
+                status="ready",
+                required=True,
+                detail="Synthetic unit-test readiness evidence.",
+            )
+            for check_id in REQUIRED_PROOFS
+        ]
+
+    @staticmethod
+    def _guarded_recovery_evidence(*, recovery_proof_path: Path):
+        binding = {
+            "schema": "synapse-s2.capture-ledger-binding-proof.v1",
+            "verified": True,
+            "verified_capture_count": 7,
+            "revision": "a" * 64,
+        }
+        reconciliation = {
+            "missing_authoritative_ledger_count": 0,
+            "replay_required_capture_count": 0,
+            "replay_required_file_count": 0,
+            "identifierless_replay_file_count": 0,
+            "unclassified_file_count": 0,
+        }
+        audit = {
+            "action": "capture-ledger-audit",
+            "status": "ready",
+            "verification_passed": True,
+            "audit_revision": "b" * 64,
+            "processed_file_count": 7,
+            "processed_total_bytes": 700,
+            "processed_v2_capture_count": 7,
+            "ledger_capture_count": 7,
+            "missing_authoritative_ledger_count": 0,
+            "ledger_binding_mismatch_count": 0,
+            "repairable_capture_count": 0,
+            "blocked_capture_count": 0,
+        }
+        recovery_proof_path.write_text(
+            json.dumps(
+                {
+                    "schema": "synapse-s2.recovery-bundle-restore.v2",
+                    "mode": "isolated-recovery-proof",
+                    "verified": True,
+                    "cutover_ready": True,
+                    "missing_transport_ledger_count": 0,
+                    "capture_ledger_binding": binding,
+                    "reconciliation": reconciliation,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "verified": True,
+            "capture_ledger_before": copy.deepcopy(audit),
+            "capture_ledger_after": copy.deepcopy(audit),
+            "capture_transport_at_publication": {
+                "ledger_verification_passed": True,
+                "ledger_audit_revision": "b" * 64,
+            },
+            "bundle": {
+                "bundle_verified": True,
+                "cutover_ready": True,
+                "capture_file_count": 7,
+                "capture_ledger_binding": binding,
+                "reconciliation": reconciliation,
+            },
+            "verification": {
+                "verified": True,
+                "cutover_ready": True,
+                "receipt_identity_trusted": True,
+                "capture_ledger_binding": binding,
+                "reconciliation": reconciliation,
+            },
+            "restore": {
+                "verified": True,
+                "cutover_ready": True,
+                "capture_file_count": 7,
+                "missing_transport_ledger_count": 0,
+                "capture_ledger_binding": binding,
+                "reconciliation": reconciliation,
+                "recovery_proof_path": str(recovery_proof_path),
+            },
+        }
+
     def test_cli_commands_use_core_route_without_local_topology(self):
         with TemporaryDirectory() as tmp:
             socket_path = (
@@ -316,6 +455,102 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             "SYNAPSE_S2_DIMENSION",
         ):
             self.assertNotIn(name, env)
+
+    def test_probe_environment_drops_ambient_credentials_and_injection_controls(self):
+        with TemporaryDirectory() as tmp:
+            canaries = {
+                "GITHUB_TOKEN": "synthetic-github-canary",
+                "OPENAI_API_KEY": "synthetic-openai-canary",
+                "HF_TOKEN": "synthetic-hf-canary",
+                "PYTHONPATH": "/synthetic/injection",
+                "PYTHONHOME": "/synthetic/python-home",
+                "DYLD_INSERT_LIBRARIES": "/synthetic/library.dylib",
+            }
+            with mock.patch.dict(os.environ, canaries, clear=False):
+                certifier = OperatorReadinessCertifier(self._args(Path(tmp)))
+                env = certifier._base_env()
+
+            self.assertTrue(set(canaries).isdisjoint(env))
+            self.assertEqual(env["PYTHONNOUSERSITE"], "1")
+            self.assertIn("PATH", env)
+            self.assertIn("HOME", env)
+
+            certifier.artifact_dir.mkdir(parents=True, exist_ok=True)
+            observed = {}
+
+            def run(*_args, **kwargs):
+                observed["env"] = kwargs["env"]
+                return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+            with mock.patch(
+                "scripts.operator_readiness_certify.subprocess.run",
+                side_effect=run,
+            ):
+                certifier._run_command(
+                    "empty-env",
+                    label="Explicit empty environment",
+                    command=["/usr/bin/true"],
+                    required=False,
+                    timeout=1,
+                    evaluator=lambda *_args: ("ready", "ok", "", {}),
+                    env={},
+                )
+            self.assertEqual(observed["env"], {})
+
+    def test_runtime_status_envelope_rejects_error_and_ambiguous_channels(self):
+        runtime = {
+            "runtime": "ready",
+            "dimension": 8,
+            "num_neurons": 16,
+            "embedding_provider": {},
+        }
+        text_channel = {
+            "isError": False,
+            "content": [{"type": "text", "text": json.dumps(runtime)}],
+        }
+        self.assertEqual(runtime_status_from_mcp_envelope(text_channel), runtime)
+        self.assertEqual(
+            runtime_status_from_mcp_envelope(
+                {"isError": False, "structuredContent": runtime}
+            ),
+            runtime,
+        )
+        self.assertEqual(
+            runtime_status_from_mcp_envelope(
+                {
+                    **text_channel,
+                    "structured_content": {"result": json.dumps(runtime)},
+                }
+            ),
+            runtime,
+        )
+        rejected = (
+            {**text_channel, "isError": True},
+            {**text_channel, "error": "outer failure"},
+            {
+                **text_channel,
+                "structuredContent": copy.deepcopy(runtime),
+            },
+            {
+                "isError": False,
+                "content": [
+                    {"type": "text", "text": json.dumps(runtime)},
+                    {"type": "text", "text": json.dumps(runtime)},
+                ],
+            },
+            {
+                "isError": False,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"error": "failed", "old": runtime}),
+                    }
+                ],
+            },
+        )
+        for payload in rejected:
+            with self.subTest(payload=payload):
+                self.assertIsNone(runtime_status_from_mcp_envelope(payload))
 
     def test_explicit_binding_rejects_candidate_fingerprint_drift(self):
         with TemporaryDirectory() as tmp:
@@ -411,8 +646,20 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         )
         self.assertEqual(
             certifier.candidate_config.embedding_provider_name,
-            "semantic-hash",
+            "mlx-neural",
         )
+        self.assertEqual(
+            certifier.candidate_config.embedding_neural_model_id,
+            "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+        )
+        self.assertEqual(
+            certifier.candidate_config.embedding_neural_revision,
+            "6c3ae70858513f1a78e9cdca3cae330d9075cd2a",
+        )
+        self.assertTrue(
+            certifier.candidate_config.embedding_neural_local_files_only
+        )
+        self.assertEqual(certifier.candidate_config.mlx_device, "gpu")
 
     def test_candidate_expectation_mismatch_is_rejected_before_evidence_write(self):
         with TemporaryDirectory() as tmp, self.assertRaisesRegex(
@@ -425,7 +672,21 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
 
     def test_semantic_benchmark_must_match_exact_candidate_provider_and_dimensions(self):
         with TemporaryDirectory() as tmp:
-            certifier = OperatorReadinessCertifier(self._args(Path(tmp)))
+            root = Path(tmp).resolve()
+            binding_path, _, core_paths = self._write_candidate_binding(root)
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+            ):
+                certifier = OperatorReadinessCertifier(
+                    self._args(root / "run", core_binding=str(binding_path))
+                )
             observed = []
 
             def run_command(_check_id, **kwargs):
@@ -892,13 +1153,19 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     "provider_type": "semantic-hash",
                 },
             }
-            envelope = {"content": [{"type": "text", "text": json.dumps(runtime)}]}
+            envelope = {
+                "isError": False,
+                "content": [{"type": "text", "text": json.dumps(runtime)}],
+            }
 
             ready = evaluator(0, envelope, "", "")
             runtime["dimension"] += 1
             drifted = evaluator(
                 0,
-                {"content": [{"type": "text", "text": json.dumps(runtime)}]},
+                {
+                    "isError": False,
+                    "content": [{"type": "text", "text": json.dumps(runtime)}],
+                },
                 "",
                 "",
             )
@@ -916,6 +1183,175 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertEqual(ready[3]["config_digest"], binding.config_digest)
         self.assertTrue(ready[3]["exact_matches"]["dimension"])
         self.assertFalse(drifted[3]["exact_matches"]["dimension"])
+
+    def test_neural_launcher_status_uses_canonical_runtime_config_and_rejects_conflicts(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, _, core_paths = self._write_candidate_binding(root)
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+            ):
+                certifier = OperatorReadinessCertifier(
+                    self._args(root / "run", core_binding=str(binding_path))
+                )
+            config = dataclasses.replace(
+                certifier.candidate_config,
+                embedding_provider_name="mlx-neural",
+                embedding_neural_model_id=(
+                    "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+                ),
+                embedding_neural_revision=(
+                    "6c3ae70858513f1a78e9cdca3cae330d9075cd2a"
+                ),
+                embedding_neural_cache_dir=root / "models",
+                embedding_neural_pooling="mean",
+                embedding_neural_max_tokens=512,
+                embedding_neural_normalize=True,
+                embedding_neural_local_files_only=True,
+                mlx_device="gpu",
+                require_native=True,
+            )
+            certifier.candidate_config = config
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_mcp_connect()
+            evaluator = run_command.call_args_list[1].kwargs["evaluator"]
+            runtime_config = {
+                "schema": "synapse-s2.embedding-runtime-config.v1",
+                "provider": "mlx-neural-v1",
+                "model_id": config.embedding_neural_model_id,
+                "revision": config.embedding_neural_revision,
+                "cache_dir": str(config.embedding_neural_cache_dir),
+                "pooling": config.embedding_neural_pooling,
+                "max_tokens": config.embedding_neural_max_tokens,
+                "normalize": config.embedding_neural_normalize,
+                "local_files_only": config.embedding_neural_local_files_only,
+            }
+            provider = {
+                "provider": "mlx-neural-v1",
+                "provider_type": "mlx-neural",
+                "model_id": runtime_config["model_id"],
+                "revision": runtime_config["revision"],
+                "cache_dir": runtime_config["cache_dir"],
+                "pooling": runtime_config["pooling"],
+                "max_tokens": runtime_config["max_tokens"],
+                "normalized": runtime_config["normalize"],
+                "local_files_only": runtime_config["local_files_only"],
+                "runtime_config": runtime_config,
+            }
+            runtime = {
+                "runtime": "ready",
+                "dimension": config.dimension,
+                "num_neurons": config.num_neurons,
+                "default_top_k": config.default_top_k,
+                "recall_count": config.recall_count,
+                "quick_pruning_interval_seconds": (
+                    config.quick_pruning_interval_seconds
+                ),
+                "idle_deep_sleep_seconds": config.idle_deep_sleep_seconds,
+                "mlx_device": config.mlx_device,
+                "mlx_available": True,
+                "embedding_provider": provider,
+            }
+
+            def evaluate(payload):
+                envelope = {
+                    "isError": False,
+                    "content": [
+                        {"type": "text", "text": json.dumps(payload)}
+                    ]
+                }
+                return evaluator(0, envelope, "", "")
+
+            ready = evaluate(runtime)
+            legacy_details = copy.deepcopy(runtime)
+            legacy_details["embedding_provider"]["details"] = {
+                "revision": "legacy-value-must-not-override-canonical",
+                "max_tokens": 1,
+                "local_files_only": False,
+            }
+            still_ready = evaluate(legacy_details)
+            top_level_conflict = copy.deepcopy(runtime)
+            top_level_conflict["embedding_provider"]["revision"] = "d" * 40
+            blocked_top_level = evaluate(top_level_conflict)
+            canonical_conflict = copy.deepcopy(runtime)
+            canonical_conflict["embedding_provider"]["runtime_config"][
+                "max_tokens"
+            ] += 1
+            blocked_canonical = evaluate(canonical_conflict)
+            missing_canonical = copy.deepcopy(runtime)
+            missing_canonical["embedding_provider"].pop("runtime_config")
+            blocked_missing = evaluate(missing_canonical)
+
+        self.assertEqual(ready[0], "ready")
+        self.assertEqual(still_ready[0], "ready")
+        self.assertTrue(
+            ready[3]["exact_matches"]["neural_runtime_config"]
+        )
+        self.assertTrue(
+            ready[3]["exact_matches"]["neural_top_level_consistent"]
+        )
+        self.assertEqual(blocked_top_level[0], "blocked")
+        self.assertFalse(
+            blocked_top_level[3]["exact_matches"][
+                "neural_top_level_consistent"
+            ]
+        )
+        self.assertEqual(blocked_canonical[0], "blocked")
+        self.assertFalse(
+            blocked_canonical[3]["exact_matches"]["neural_max_tokens"]
+        )
+        self.assertEqual(blocked_missing[0], "blocked")
+        self.assertFalse(
+            blocked_missing[3]["exact_matches"]["neural_runtime_config"]
+        )
+
+    def test_doctor_timeout_is_bounded_and_candidate_aware(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, _, core_paths = self._write_candidate_binding(root)
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+            ):
+                certifier = OperatorReadinessCertifier(
+                    self._args(root / "run", core_binding=str(binding_path))
+                )
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_doctor()
+            semantic_timeout = run_command.call_args.kwargs["timeout"]
+
+            certifier.candidate_config = dataclasses.replace(
+                certifier.candidate_config,
+                embedding_provider_name="mlx-neural",
+                embedding_neural_model_id="unit/pinned-neural-model",
+                embedding_neural_revision="a" * 40,
+                embedding_neural_cache_dir=root / "models",
+                embedding_neural_pooling="mean",
+                embedding_neural_max_tokens=512,
+                embedding_neural_normalize=True,
+                embedding_neural_local_files_only=True,
+            )
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_doctor()
+            neural_timeout = run_command.call_args.kwargs["timeout"]
+
+        self.assertEqual(semantic_timeout, 60)
+        self.assertEqual(neural_timeout, 300)
+        self.assertGreater(neural_timeout, semantic_timeout)
+        self.assertLessEqual(neural_timeout, 300)
 
     def test_private_evidence_writer_preserves_existing_parent_mode(self):
         with TemporaryDirectory() as tmp:
@@ -1191,6 +1627,630 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     stat.S_IMODE(evidence_path.stat().st_mode),
                     0o600,
                 )
+
+    def test_finalize_builds_archive_before_authoritative_manifest(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(
+                Path(tmp),
+                run_id="manifest-last",
+            )
+            certifier.args.zip = True
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            certifier.metadata = {
+                "run_id": certifier.run_id,
+                "context_id": certifier.context,
+                "agent_id": certifier.agent_id,
+                "git": {"head": "unit-test", "status_short": ""},
+                "embedding_provider": "semantic-hash",
+            }
+            certifier.results = self._required_ready_results()
+            manifest_path = certifier.pack_dir / "manifest.json"
+
+            def fail_archive(*_args, **kwargs):
+                self.assertFalse(manifest_path.exists())
+                self.assertIn("manifest.json", kwargs["virtual_json_members"])
+                raise RuntimeError("synthetic archive failure")
+
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.write_private_evidence_zip",
+                    side_effect=fail_archive,
+                ),
+                self.assertRaisesRegex(RuntimeError, "synthetic archive failure"),
+            ):
+                certifier._finalize()
+            self.assertFalse(manifest_path.exists())
+
+    def test_finalize_blocks_missing_and_duplicate_required_proofs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cases = {
+                "missing": (
+                    [
+                        result
+                        for result in self._required_ready_results()
+                        if result.check_id != "dashboard"
+                    ],
+                    "dashboard",
+                ),
+                "duplicate": (
+                    self._required_ready_results()
+                    + [
+                        CheckResult(
+                            check_id="dashboard",
+                            label="Duplicate dashboard proof",
+                            status="ready",
+                            required=True,
+                            detail="A duplicate must never inflate readiness.",
+                        )
+                    ],
+                    "dashboard",
+                ),
+                "optional-shadow": (
+                    self._required_ready_results()
+                    + [
+                        CheckResult(
+                            check_id="dashboard",
+                            label="Optional shadow dashboard proof",
+                            status="ready",
+                            required=False,
+                            detail="A nonrequired shadow must still block ambiguity.",
+                        )
+                    ],
+                    "dashboard",
+                ),
+            }
+            for case_name, (results, expected_id) in cases.items():
+                with self.subTest(case=case_name):
+                    certifier, _, _ = self._bound_certifier(
+                        root / case_name,
+                        run_id=f"proof-contract-{case_name}",
+                    )
+                    certifier.pack_dir.mkdir(parents=True, mode=0o700)
+                    certifier.artifact_dir.mkdir(mode=0o700)
+                    certifier.metadata = {
+                        "run_id": certifier.run_id,
+                        "context_id": certifier.context,
+                        "agent_id": certifier.agent_id,
+                        "git": {"head": "unit-test", "status_short": ""},
+                        "embedding_provider": "semantic-hash",
+                    }
+                    certifier.results = results
+
+                    result = certifier._finalize()
+                    manifest = json.loads(
+                        Path(result["manifest_path"]).read_text(encoding="utf-8")
+                    )
+
+                    self.assertEqual(result["overall_status"], "blocked")
+                    self.assertFalse(result["operator_trustworthy"])
+                    self.assertFalse(manifest["required_proof_contract"]["valid"])
+                    self.assertIn(expected_id, result["failed_required"])
+                    self.assertIn(
+                        expected_id,
+                        manifest["required_proof_contract"][
+                            "missing" if case_name == "missing" else "duplicates"
+                        ],
+                    )
+                    self.assertEqual(result["required_total"], len(REQUIRED_PROOFS))
+
+    def test_capture_drain_is_bounded_and_stops_on_no_progress(self):
+        def run_scenario(
+            root: Path,
+            *,
+            statuses: list[dict],
+            drains: list[dict],
+        ):
+            certifier, _, _ = self._bound_certifier(root)
+            status_iter = iter(statuses)
+            drain_iter = iter(drains)
+            calls: list[tuple[str, list[str]]] = []
+
+            def run_command(
+                check_id,
+                *,
+                label,
+                command,
+                required,
+                timeout,
+                evaluator,
+                env=None,
+            ):
+                del timeout, env
+                payload = (
+                    next(drain_iter)
+                    if check_id.startswith("capture_inbox_drain_")
+                    else next(status_iter)
+                )
+                status, detail, repair, metrics = evaluator(
+                    0,
+                    payload,
+                    json.dumps(payload),
+                    "",
+                )
+                result = CheckResult(
+                    check_id=check_id,
+                    label=label,
+                    status=status,
+                    required=required,
+                    detail=detail,
+                    repair=repair,
+                    command=command,
+                    returncode=0,
+                    parsed=payload,
+                    metrics=metrics,
+                )
+                certifier.results.append(result)
+                calls.append((check_id, command))
+                return result
+
+            with mock.patch.object(certifier, "_run_command", side_effect=run_command):
+                final = certifier._check_capture_inbox()
+            return certifier, final, calls
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifier, ready, calls = run_scenario(
+                root / "progress",
+                statuses=[
+                    self._capture_status(pending=501),
+                    self._capture_status(pending=251),
+                    self._capture_status(pending=1),
+                    self._capture_status(pending=0),
+                    self._capture_status(pending=0),
+                ],
+                drains=[
+                    {"processed_file_count": 250, "error_file_count": 0},
+                    {"processed_file_count": 250, "error_file_count": 0},
+                    {"processed_file_count": 1, "error_file_count": 0},
+                ],
+            )
+            drain_calls = [
+                command
+                for check_id, command in calls
+                if check_id.startswith("capture_inbox_drain_")
+            ]
+            self.assertEqual(ready.status, "ready")
+            self.assertEqual(ready.metrics["drain_passes"], 3)
+            self.assertEqual(ready.metrics["processed_file_count"], 501)
+            self.assertEqual(len(drain_calls), 3)
+            for command in drain_calls:
+                self.assertEqual(
+                    command[command.index("--max-files") + 1],
+                    str(CAPTURE_DRAIN_BATCH_SIZE),
+                )
+                self.assertIn("--confirm", command)
+            required_capture = [
+                result
+                for result in certifier.results
+                if result.required and result.check_id == "capture_inbox"
+            ]
+            self.assertEqual(len(required_capture), 1)
+
+            certifier, blocked, _ = run_scenario(
+                root / "stalled",
+                statuses=[
+                    self._capture_status(pending=1),
+                    self._capture_status(pending=1),
+                    self._capture_status(pending=1),
+                ],
+                drains=[
+                    {
+                        "processed_file_count": 0,
+                        "deferred_file_count": 1,
+                        "error_file_count": 0,
+                    }
+                ],
+            )
+            self.assertEqual(blocked.status, "blocked")
+            self.assertEqual(blocked.metrics["drain_passes"], 1)
+            self.assertLess(
+                blocked.metrics["drain_passes"],
+                CAPTURE_DRAIN_MAX_PASSES,
+            )
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.CoreAuthorityLease.acquire_core"
+                ) as acquire_core,
+                mock.patch.object(
+                    certifier,
+                    "_finalize",
+                    return_value={"overall_status": "blocked"},
+                ),
+            ):
+                certifier._guarded_recovery_and_finalize()
+            acquire_core.assert_not_called()
+
+    def test_run_orders_dashboard_and_capture_before_guard(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(Path(tmp))
+            events: list[str] = []
+
+            def record(name, value=None):
+                def invoke(*_args, **_kwargs):
+                    events.append(name)
+                    return value
+
+                return mock.Mock(side_effect=invoke)
+
+            certifier._run_metadata = mock.Mock(
+                return_value={
+                    "run_id": certifier.run_id,
+                    "context_id": certifier.context,
+                    "agent_id": certifier.agent_id,
+                }
+            )
+            certifier._write_json = mock.Mock()
+            ordered_methods = (
+                "_check_local_launcher",
+                "_check_client_config",
+                "_check_mcp_connect",
+                "_check_neural_embedding",
+                "_check_doctor",
+                "_check_start_work",
+                "_check_memory_write",
+                "_check_recall",
+                "_check_app_preview",
+                "_check_wrap_session",
+                "_check_dashboard",
+                "_check_capture_inbox",
+            )
+            for method_name in ordered_methods:
+                value = {} if method_name == "_check_memory_write" else None
+                setattr(
+                    certifier,
+                    method_name,
+                    record(method_name.removeprefix("_check_"), value),
+                )
+            certifier._guarded_recovery_and_finalize = record(
+                "guard",
+                {"overall_status": "ready"},
+            )
+
+            result = certifier.run()
+
+            self.assertEqual(result["overall_status"], "ready")
+            self.assertEqual(
+                events,
+                [
+                    "local_launcher",
+                    "client_config",
+                    "mcp_connect",
+                    "neural_embedding",
+                    "doctor",
+                    "start_work",
+                    "memory_write",
+                    "recall",
+                    "app_preview",
+                    "wrap_session",
+                    "dashboard",
+                    "capture_inbox",
+                    "guard",
+                ],
+            )
+
+    def test_concurrent_local_lease_blocks_guarded_recovery_without_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifier, _, core_paths = self._bound_certifier(root)
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            certifier.metadata = {
+                "run_id": certifier.run_id,
+                "context_id": certifier.context,
+                "agent_id": certifier.agent_id,
+                "git": {"head": "unit-test", "status_short": ""},
+                "embedding_provider": "semantic-hash",
+            }
+            certifier.results = [
+                CheckResult(
+                    check_id="capture_inbox",
+                    label="Capture inbox",
+                    status="ready",
+                    required=True,
+                    detail="Phase A was clean.",
+                )
+            ]
+            local_lease = CoreAuthorityLease.acquire_local(core_paths.memory_db)
+            try:
+                with (
+                    mock.patch(
+                        "scripts.operator_readiness_certify.AUTHORITY_GUARD_TIMEOUT_SECONDS",
+                        0.0,
+                    ),
+                    mock.patch(
+                        "scripts.operator_readiness_certify.VerifiedRecoveryManager"
+                    ) as recovery_manager,
+                ):
+                    result = certifier._guarded_recovery_and_finalize()
+            finally:
+                local_lease.close()
+
+            by_id = {result.check_id: result for result in certifier.results}
+            self.assertEqual(result["overall_status"], "blocked")
+            self.assertEqual(by_id["authority_guard"].status, "blocked")
+            self.assertEqual(by_id["guarded_quiescence"].status, "blocked")
+            for check_id in (
+                "capture_ledger_audit",
+                "recovery_backup",
+                "recovery_verify",
+                "recovery_restore",
+            ):
+                self.assertEqual(by_id[check_id].status, "blocked")
+            recovery_manager.assert_not_called()
+            self.assertFalse(
+                (certifier.artifact_dir / "recovery_verify.parsed.json").exists()
+            )
+            self.assertFalse(
+                (
+                    certifier.artifact_dir
+                    / "recovery_restore_proof.receipt.json"
+                ).exists()
+            )
+
+    def test_guarded_manager_uses_no_recovery_subprocess_and_publishes_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifier, _, core_paths = self._bound_certifier(root)
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            certifier.metadata = {
+                "run_id": certifier.run_id,
+                "context_id": certifier.context,
+                "agent_id": certifier.agent_id,
+                "git": {"head": "unit-test", "status_short": ""},
+                "embedding_provider": "semantic-hash",
+            }
+            certifier.results = [
+                CheckResult(
+                    check_id="capture_inbox",
+                    label="Capture inbox",
+                    status="ready",
+                    required=True,
+                    detail="Phase A was clean.",
+                )
+            ]
+            proof_source = root / "isolated-proof.json"
+            proof_source.write_text(
+                json.dumps({"verified": True, "mode": "isolated-recovery-proof"}),
+                encoding="utf-8",
+            )
+            evidence = self._guarded_recovery_evidence(
+                recovery_proof_path=proof_source
+            )
+            state = {
+                "active": False,
+                "exited": False,
+                "manifest_existed_on_exit": False,
+            }
+
+            class Publication:
+                def publish(self, callback):
+                    if not state["active"]:
+                        raise AssertionError("publication escaped the capture guard")
+                    return callback(evidence)
+
+            class Transaction:
+                def __enter__(self):
+                    state["active"] = True
+                    return Publication()
+
+                def __exit__(self, _exc_type, _exc, _traceback):
+                    state["manifest_existed_on_exit"] = (
+                        certifier.pack_dir / "manifest.json"
+                    ).is_file()
+                    state["active"] = False
+                    state["exited"] = True
+                    return False
+
+            manager = mock.Mock()
+            manager.guarded_recovery_transaction.return_value = Transaction()
+            store = mock.Mock()
+            inventory = {
+                "inventory_available": True,
+                "process_findings": [],
+                "process_findings_truncated": False,
+                "loaded_categories": [],
+                "launch_agents": {},
+            }
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.DurableMemoryStore.open_existing_for_core_maintenance",
+                    return_value=store,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.VerifiedRecoveryManager",
+                    return_value=manager,
+                ),
+                mock.patch.object(
+                    certifier,
+                    "_collect_quiescence_inventory",
+                    return_value=(True, inventory),
+                ),
+                mock.patch.object(
+                    certifier,
+                    "_run_command",
+                    side_effect=AssertionError(
+                        "guarded recovery must not use a subprocess"
+                    ),
+                ),
+            ):
+                result = certifier._guarded_recovery_and_finalize()
+
+            by_id = {result.check_id: result for result in certifier.results}
+            self.assertTrue(state["exited"])
+            self.assertFalse(state["manifest_existed_on_exit"])
+            self.assertTrue((certifier.pack_dir / "manifest.json").is_file())
+            store.close.assert_called_once_with()
+            manager.guarded_recovery_transaction.assert_called_once()
+            for check_id in (
+                "capture_ledger_audit",
+                "recovery_backup",
+                "recovery_verify",
+                "recovery_restore",
+            ):
+                self.assertEqual(by_id[check_id].status, "ready", check_id)
+                self.assertEqual(by_id[check_id].command, [])
+            verify_path = Path(by_id["recovery_verify"].artifact_paths["parsed"])
+            restore_path = Path(
+                by_id["recovery_restore"].artifact_paths["recovery_proof"]
+            )
+            self.assertEqual(verify_path.parent, certifier.artifact_dir)
+            self.assertTrue(json.loads(verify_path.read_text())["verified"])
+            self.assertEqual(restore_path.parent, certifier.artifact_dir)
+            self.assertTrue(json.loads(restore_path.read_text())["verified"])
+            self.assertEqual(result["overall_status"], "blocked")
+            with CoreAuthorityLease.acquire_local(core_paths.memory_db):
+                pass
+
+    def test_finalize_failure_releases_authority_and_guard_context(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifier, _, core_paths = self._bound_certifier(root)
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            certifier.results = [
+                CheckResult(
+                    check_id="capture_inbox",
+                    label="Capture inbox",
+                    status="ready",
+                    required=True,
+                    detail="Phase A was clean.",
+                )
+            ]
+            proof_source = root / "isolated-proof.json"
+            proof_source.write_text(
+                json.dumps({"verified": True, "mode": "isolated-recovery-proof"}),
+                encoding="utf-8",
+            )
+            evidence = self._guarded_recovery_evidence(
+                recovery_proof_path=proof_source
+            )
+            state = {"active": False, "exited": False}
+
+            class Publication:
+                def publish(self, callback):
+                    return callback(evidence)
+
+            class Transaction:
+                def __enter__(self):
+                    state["active"] = True
+                    return Publication()
+
+                def __exit__(self, _exc_type, _exc, _traceback):
+                    state["active"] = False
+                    state["exited"] = True
+                    return False
+
+            manager = mock.Mock()
+            manager.guarded_recovery_transaction.return_value = Transaction()
+            store = mock.Mock()
+            inventory = {
+                "inventory_available": True,
+                "process_findings": [],
+                "process_findings_truncated": False,
+                "loaded_categories": [],
+                "launch_agents": {},
+            }
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.DurableMemoryStore.open_existing_for_core_maintenance",
+                    return_value=store,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.VerifiedRecoveryManager",
+                    return_value=manager,
+                ),
+                mock.patch.object(
+                    certifier,
+                    "_collect_quiescence_inventory",
+                    return_value=(True, inventory),
+                ),
+                mock.patch.object(
+                    certifier,
+                    "_finalize",
+                    side_effect=RuntimeError("synthetic finalize failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "synthetic finalize failure"),
+            ):
+                certifier._guarded_recovery_and_finalize()
+
+            self.assertTrue(state["exited"])
+            self.assertFalse(state["active"])
+            store.close.assert_called_once_with()
+            with CoreAuthorityLease.acquire_local(core_paths.memory_db):
+                pass
+
+    def test_guard_exit_failure_never_publishes_authoritative_manifest(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifier, _, core_paths = self._bound_certifier(root)
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            certifier.results = [
+                CheckResult(
+                    check_id="capture_inbox",
+                    label="Capture inbox",
+                    status="ready",
+                    required=True,
+                    detail="Phase A was clean.",
+                )
+            ]
+            proof_source = root / "isolated-proof.json"
+            evidence = self._guarded_recovery_evidence(
+                recovery_proof_path=proof_source
+            )
+            state = {"callback": False, "exited": False}
+
+            class Publication:
+                def publish(self, callback):
+                    state["callback"] = True
+                    return callback(evidence)
+
+            class Transaction:
+                def __enter__(self):
+                    return Publication()
+
+                def __exit__(self, _exc_type, _exc, _traceback):
+                    state["exited"] = True
+                    raise RuntimeError("synthetic guard exit failure")
+
+            manager = mock.Mock()
+            manager.guarded_recovery_transaction.return_value = Transaction()
+            store = mock.Mock()
+            inventory = {
+                "inventory_available": True,
+                "process_findings": [],
+                "process_findings_truncated": False,
+                "loaded_categories": [],
+                "quiescence_policy_blockers": [],
+                "launch_agents": {},
+            }
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.DurableMemoryStore.open_existing_for_core_maintenance",
+                    return_value=store,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.VerifiedRecoveryManager",
+                    return_value=manager,
+                ),
+                mock.patch.object(
+                    certifier,
+                    "_collect_quiescence_inventory",
+                    return_value=(True, inventory),
+                ),
+                self.assertRaisesRegex(RuntimeError, "synthetic guard exit failure"),
+            ):
+                certifier._guarded_recovery_and_finalize()
+
+            self.assertTrue(state["callback"])
+            self.assertTrue(state["exited"])
+            self.assertFalse((certifier.pack_dir / "manifest.json").exists())
+            store.close.assert_called_once_with()
+            with CoreAuthorityLease.acquire_local(core_paths.memory_db):
+                pass
 
     def test_choose_app_prefers_requested_then_high_signal_defaults(self):
         apps = [

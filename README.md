@@ -75,9 +75,12 @@ scripts/install_local_launcher.sh
 ```
 
 Before producing final evidence, process and reconcile capture debt, gracefully
-close every persistent MCP wrapper and wait for its `finish()` writes, let the
+close every persistent MCP wrapper and wait for its `finish()` writes, pause the
+exact automations or LaunchAgents that can relaunch those wrappers, let the
 capture worker drain, stop the exact legacy writer labels/PIDs, and prove the
-zero-writer inventory. Then certify that exact candidate:
+zero-writer inventory. Keep all respawners paused through accepted core health;
+if any client returns, drain again and discard the old evidence. Then certify
+that exact candidate:
 
 ```bash
 .venv/bin/python synapse_cli.py --json capture-inbox-status
@@ -90,6 +93,19 @@ scripts/core_cutover_preflight.sh --inventory-only --require-quiescent
   --agent-id codex-desktop \
   --expect-embedding-provider mlx-neural
 ```
+
+The certifier runs every live functional probe first, performs a bounded inbox
+drain, then acquires exclusive core authority and the existing global capture
+lock. Backup, signed verification, isolated restore, and the final
+process/LaunchAgent inventory occur in-process under that one guard. The guard,
+temporary restore, store, and lease must unwind cleanly before the optional ZIP
+is built and `manifest.json` is atomically published last. The shared 20-proof
+contract rejects missing, duplicate, optional-shadow, or non-ready proof rows.
+The shared quiescence policy also requires
+`com.master-mold.imprint.inboxworker` to be both absent and positively disabled;
+a temporarily empty process list is insufficient. No recovery CLI child may
+reopen local authority during the guarded phase, and child probes receive only
+a minimal credential-free environment.
 
 Current rollout status: the live local production instance has not yet been cut
 over from legacy v5 to this authoritative-core lane. Repository implementation,

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,12 +28,13 @@ from redaction import (
     redact_capture_text,
     redact_sensitive_value,
     reject_sensitive_identifier,
+    safe_public_error,
     strip_untrusted_raw_digest_fields,
 )
-from backend_router import LEGACY_CORE_CONFIG_ENV, database_requires_core
+from backend_router import database_requires_core
+from core_authority import CoreAuthorityLease
 from core_client_binding import (
     BINDING_ENV,
-    EXPECTED_CONFIG_ENV,
     CoreClientBinding,
     default_binding_path,
     load_bound_core_config,
@@ -43,7 +45,24 @@ from scripts.core_agent_installer import (
     build_config as build_candidate_core_config,
     resolve_paths as resolve_candidate_core_paths,
 )
-from scripts.core_cutover_preflight import core_config_evidence_contract
+from memory_store import DurableMemoryStore
+from recovery_manager import VerifiedRecoveryManager
+from operator_readiness_contract import (
+    OPERATOR_READINESS_REQUIRED_PROOF_IDS,
+    QUIESCENCE_POLICY_SCHEMA,
+    quiescence_policy_contract,
+    quiescence_policy_digest,
+    ready_operator_proof_contract,
+)
+from scripts.core_cutover_preflight import (
+    DEFAULT_CAPTURE_LABEL,
+    DEFAULT_DASHBOARD_LABEL,
+    MAX_PROCESS_FINDINGS,
+    collect_launchagent_inventory,
+    collect_process_inventory,
+    core_config_evidence_contract,
+    launchagent_quiescence_blockers,
+)
 
 
 DEFAULT_LAUNCHER = Path.home() / ".local" / "bin" / "synapse-s2-mcp"
@@ -53,6 +72,25 @@ MCP_SAFETY_SCHEMA = "synapse-s2.mcp-safety-summary.v1"
 MCP_SAFETY_PREFIX = "SYNAPSE-S2 safety summary: "
 MCP_COMPACT_BUDGET = 12_288
 MCP_SAFETY_BUDGET = 4_096
+EMBEDDING_RUNTIME_CONFIG_SCHEMA = "synapse-s2.embedding-runtime-config.v1"
+DOCTOR_TIMEOUT_SECONDS = 60
+NEURAL_DOCTOR_TIMEOUT_SECONDS = 300
+CAPTURE_DRAIN_BATCH_SIZE = 250
+CAPTURE_DRAIN_MAX_PASSES = 12
+AUTHORITY_GUARD_TIMEOUT_SECONDS = 30.0
+CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "TMPDIR",
+        "USER",
+    }
+)
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RAW_DIGEST_TEXT_RE = re.compile(
     r"(?i)(?:['\"]?)(?:input_sha256|raw_input_sha256|raw_sha256|"
@@ -69,23 +107,7 @@ _PROVIDER_EXPECTATIONS = {
     "mlx-neural": ("mlx-neural-v1", "mlx-neural"),
     "mlx-neural-v1": ("mlx-neural-v1", "mlx-neural"),
 }
-REQUIRED_PROOFS = [
-    "client_config",
-    "mcp_connect",
-    "mcp_contract_probe",
-    "neural_embedding",
-    "doctor",
-    "start_work",
-    "memory_write",
-    "recall",
-    "app_preview",
-    "wrap_session",
-    "capture_ledger_audit",
-    "recovery_backup",
-    "recovery_verify",
-    "recovery_restore",
-    "dashboard",
-]
+REQUIRED_PROOFS = list(OPERATOR_READINESS_REQUIRED_PROOF_IDS)
 
 
 @dataclasses.dataclass
@@ -222,8 +244,9 @@ def write_private_evidence_zip(
     *,
     pack_dir: Path,
     members: set[Path],
+    virtual_json_members: dict[str, Any] | None = None,
 ) -> None:
-    """Atomically create a private ZIP from this run's explicit file set."""
+    """Atomically create a private ZIP from explicit and staged JSON members."""
 
     root = pack_dir.resolve()
     ensure_private_directory(archive_path.parent)
@@ -242,6 +265,7 @@ def write_private_evidence_zip(
             mode="w",
             compression=zipfile.ZIP_DEFLATED,
         ) as archive:
+            archived_names: set[str] = set()
             for member in sorted(members, key=lambda item: str(item)):
                 if member.is_symlink() or not member.is_file():
                     raise ValueError("evidence ZIP members must be regular files")
@@ -253,6 +277,9 @@ def write_private_evidence_zip(
                         "evidence ZIP member escapes the run directory"
                     ) from exc
                 info = zipfile.ZipInfo(str(relative))
+                if info.filename in archived_names:
+                    raise ValueError("evidence ZIP member name is duplicated")
+                archived_names.add(info.filename)
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o600 << 16
                 source_text = resolved.read_text(encoding="utf-8")
@@ -270,6 +297,33 @@ def write_private_evidence_zip(
                         "evidence ZIP members must use JSON, text, or Markdown"
                     )
                 archive.writestr(info, archived_text.encode("utf-8"))
+            for relative_name, payload in sorted(
+                (virtual_json_members or {}).items()
+            ):
+                relative = Path(relative_name)
+                if (
+                    relative.is_absolute()
+                    or relative.suffix != ".json"
+                    or not relative.parts
+                    or any(part in {"", ".", ".."} for part in relative.parts)
+                    or relative.as_posix() in archived_names
+                ):
+                    raise ValueError("virtual evidence ZIP member is invalid")
+                info = zipfile.ZipInfo(relative.as_posix())
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o600 << 16
+                archive.writestr(
+                    info,
+                    (
+                        json.dumps(
+                            json_safe(payload),
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    ).encode("utf-8"),
+                )
+                archived_names.add(info.filename)
         with temp_path.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temp_path, archive_path)
@@ -854,35 +908,72 @@ def choose_app(apps: list[dict[str, Any]], preferred: str = "") -> dict[str, Any
     return sorted(apps, key=lambda item: str(item.get("app_name") or "").lower())[0]
 
 
-def find_runtime_status(value: Any, *, _depth: int = 0) -> dict[str, Any] | None:
-    """Find the bounded runtime payload inside FastMCP's transport envelope."""
+def runtime_status_from_mcp_envelope(value: Any) -> dict[str, Any] | None:
+    """Decode exactly one non-error FastMCP result channel.
 
-    if _depth > 8:
+    Status is intentionally a string-returning MCP tool today, but accepting a
+    single structured channel keeps this validator compatible with a future
+    typed result.  Recursive searching is forbidden: an outer error envelope
+    must never be rescued by a stale nested runtime object.
+    """
+
+    if not isinstance(value, dict) or value.get("error") not in {None, ""}:
         return None
-    if isinstance(value, dict):
-        required = {"runtime", "dimension", "num_neurons", "embedding_provider"}
-        if required.issubset(value):
-            return value
-        for child in list(value.values())[:128]:
-            found = find_runtime_status(child, _depth=_depth + 1)
-            if found is not None:
-                return found
+    error_keys = [key for key in ("is_error", "isError") if key in value]
+    if len(error_keys) != 1 or value.get(error_keys[0]) is not False:
         return None
-    if isinstance(value, list):
-        for child in value[:128]:
-            found = find_runtime_status(child, _depth=_depth + 1)
-            if found is not None:
-                return found
+    structured_keys = [
+        key
+        for key in ("structured_content", "structuredContent")
+        if key in value
+    ]
+    if len(structured_keys) > 1:
         return None
-    if isinstance(value, str) and len(value.encode("utf-8")) <= 1_048_576:
-        candidate = value.strip()
-        if candidate.startswith("{") or candidate.startswith("["):
+    candidates: list[Any] = []
+    mirrored_result = False
+    if structured_keys:
+        structured = value.get(structured_keys[0])
+        if (
+            isinstance(structured, dict)
+            and set(structured) == {"result"}
+            and isinstance(structured.get("result"), str)
+            and len(structured["result"].encode("utf-8")) <= 1_048_576
+        ):
             try:
-                decoded = json.loads(candidate)
+                candidates.append(json.loads(structured["result"]))
             except (TypeError, ValueError, json.JSONDecodeError):
                 return None
-            return find_runtime_status(decoded, _depth=_depth + 1)
-    return None
+            mirrored_result = True
+        else:
+            candidates.append(structured)
+    if "content" in value:
+        content = value.get("content")
+        if not isinstance(content, list) or len(content) != 1:
+            return None
+        item = content[0]
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "text"
+            or not isinstance(item.get("text"), str)
+            or len(item["text"].encode("utf-8")) > 1_048_576
+        ):
+            return None
+        text_payload = item["text"].strip()
+        try:
+            candidates.append(json.loads(text_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    if mirrored_result and len(candidates) == 2:
+        if candidates[0] != candidates[1]:
+            return None
+        candidates.pop()
+    if len(candidates) != 1 or not isinstance(candidates[0], dict):
+        return None
+    runtime = candidates[0]
+    required = {"runtime", "dimension", "num_neurons", "embedding_provider"}
+    if not required.issubset(runtime) or runtime.get("error") not in {None, ""}:
+        return None
+    return runtime
 
 
 def app_preview_status(parsed: Any) -> tuple[str, str, str, dict[str, Any]]:
@@ -1280,9 +1371,9 @@ class OperatorReadinessCertifier:
         self._check_recall(memory)
         self._check_app_preview()
         self._check_wrap_session()
-        self._check_recovery()
         self._check_dashboard()
-        return self._finalize()
+        self._check_capture_inbox()
+        return self._guarded_recovery_and_finalize()
 
     def _run_metadata(self) -> dict[str, Any]:
         config = self.candidate_config
@@ -1304,6 +1395,8 @@ class OperatorReadinessCertifier:
             },
             "launcher": str(self.launcher),
             "core_config_contract": self.core_config_contract,
+            "quiescence_policy_contract": quiescence_policy_contract(),
+            "quiescence_policy_digest": quiescence_policy_digest(),
             "embedding_provider": config.embedding_provider_name,
             "topology": {
                 "dimension": config.dimension,
@@ -1354,20 +1447,17 @@ class OperatorReadinessCertifier:
         }
 
     def _base_env(self) -> dict[str, str]:
-        env = dict(os.environ)
-        for name in (
-            BINDING_ENV,
-            EXPECTED_CONFIG_ENV,
-            "MLX_DEVICE",
-            "SYNAPSE_S2_CORE_SOCKET",
-            "SYNAPSE_S2_STATE_PATH",
-            "SYNAPSE_S2_MEMORY_DB",
-            "SYNAPSE_S2_EXPORT_DIR",
-            "SYNAPSE_S2_CAPTURE_ROOT",
-        ):
-            env.pop(name, None)
-        for name in LEGACY_CORE_CONFIG_ENV:
-            env.pop(name, None)
+        # Probes execute a broad dependency surface (FastMCP, Python, MLX).
+        # Start from a small operating environment instead of inheriting cloud
+        # credentials or Python/DYLD injection controls from the operator shell.
+        env = {
+            name: value
+            for name in CHILD_ENV_ALLOWLIST
+            if (value := os.environ.get(name)) is not None
+        }
+        env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        env.setdefault("HOME", str(Path.home()))
+        env["PYTHONNOUSERSITE"] = "1"
         if self.core_binding is not None:
             env[BINDING_ENV] = str(self.core_binding_path)
         elif self.args.core_socket:
@@ -1433,7 +1523,7 @@ class OperatorReadinessCertifier:
             completed = subprocess.run(
                 command,
                 cwd=ROOT,
-                env=env or self._base_env(),
+                env=env if env is not None else self._base_env(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1620,7 +1710,7 @@ class OperatorReadinessCertifier:
                     "Open the parsed artifact and fix the launcher or MCP server import error.",
                     {},
                 )
-            runtime = find_runtime_status(parsed)
+            runtime = runtime_status_from_mcp_envelope(parsed)
             if runtime is None:
                 return (
                     "blocked",
@@ -1649,28 +1739,82 @@ class OperatorReadinessCertifier:
                 == config.mlx_device,
                 "embedding_provider": provider.get("provider")
                 == expected_provider_id,
+                "embedding_provider_type": provider.get("provider_type")
+                == _provider_type,
             }
             if config.embedding_provider_name.strip().lower() in {
                 "mlx-neural",
                 "mlx-neural-v1",
             }:
-                details = dict(provider.get("details") or {})
+                # ``runtime_config`` is the closed, canonical neural wire
+                # contract.  Status also repeats its operator-facing fields at
+                # the provider top level; those copies are useful only when
+                # they agree exactly with the canonical object.  Do not fall
+                # back to embedding-result ``details`` provenance here: the
+                # status surface does not emit it, and accepting it would make
+                # contradictory wire shapes order-dependent.
+                runtime_config_wire = provider.get("runtime_config")
+                runtime_config = (
+                    runtime_config_wire
+                    if type(runtime_config_wire) is dict
+                    else {}
+                )
+                expected_cache_dir = (
+                    ""
+                    if config.embedding_neural_cache_dir is None
+                    else str(config.embedding_neural_cache_dir)
+                )
+                expected_runtime_config = {
+                    "schema": EMBEDDING_RUNTIME_CONFIG_SCHEMA,
+                    "provider": expected_provider_id,
+                    "model_id": config.embedding_neural_model_id,
+                    "revision": config.embedding_neural_revision or "",
+                    "cache_dir": expected_cache_dir,
+                    "pooling": config.embedding_neural_pooling,
+                    "max_tokens": config.embedding_neural_max_tokens,
+                    "normalize": config.embedding_neural_normalize,
+                    "local_files_only": (
+                        config.embedding_neural_local_files_only
+                    ),
+                }
                 exact_matches.update(
                     {
-                        "neural_model_id": provider.get("model_id")
+                        "neural_runtime_config": runtime_config
+                        == expected_runtime_config,
+                        "neural_model_id": runtime_config.get("model_id")
                         == config.embedding_neural_model_id,
-                        "neural_revision": details.get("revision")
+                        "neural_revision": runtime_config.get("revision")
                         == (config.embedding_neural_revision or ""),
-                        "neural_pooling": provider.get("pooling")
+                        "neural_cache_dir": runtime_config.get("cache_dir")
+                        == expected_cache_dir,
+                        "neural_pooling": runtime_config.get("pooling")
                         == config.embedding_neural_pooling,
-                        "neural_max_tokens": details.get("max_tokens")
+                        "neural_max_tokens": runtime_config.get("max_tokens")
                         == config.embedding_neural_max_tokens,
-                        "neural_normalize": provider.get("normalized")
+                        "neural_normalize": runtime_config.get("normalize")
                         is config.embedding_neural_normalize,
-                        "neural_local_files_only": details.get(
+                        "neural_local_files_only": runtime_config.get(
                             "local_files_only"
                         )
                         is config.embedding_neural_local_files_only,
+                        "neural_top_level_consistent": all(
+                            (
+                                provider.get("model_id")
+                                == runtime_config.get("model_id"),
+                                provider.get("revision")
+                                == runtime_config.get("revision"),
+                                provider.get("cache_dir")
+                                == runtime_config.get("cache_dir"),
+                                provider.get("pooling")
+                                == runtime_config.get("pooling"),
+                                provider.get("max_tokens")
+                                == runtime_config.get("max_tokens"),
+                                provider.get("normalized")
+                                is runtime_config.get("normalize"),
+                                provider.get("local_files_only")
+                                is runtime_config.get("local_files_only"),
+                            )
+                        ),
                     }
                 )
             if config.require_native:
@@ -1928,12 +2072,20 @@ class OperatorReadinessCertifier:
                 {"overall_status": overall, "check_count": len(checks), "repair_plan": repair_plan},
             )
 
+        provider_type = _PROVIDER_EXPECTATIONS[
+            self.candidate_config.embedding_provider_name.strip().lower()
+        ][1]
+        timeout = (
+            NEURAL_DOCTOR_TIMEOUT_SECONDS
+            if provider_type == "mlx-neural"
+            else DOCTOR_TIMEOUT_SECONDS
+        )
         self._run_command(
             "doctor",
             label="SYNAPSE Doctor",
             command=self._cli_command("doctor", "--context", self.context, "--include-apps", "--repair-plan"),
             required=True,
-            timeout=60,
+            timeout=timeout,
             evaluator=evaluate,
         )
 
@@ -2339,257 +2491,591 @@ class OperatorReadinessCertifier:
             evaluator=evaluate,
         )
 
-    def _check_recovery(self) -> None:
-        def binding_proof(parsed: dict[str, Any]) -> dict[str, Any]:
-            value = parsed.get("capture_ledger_binding")
-            return dict(value) if isinstance(value, dict) else {}
-
-        def binding_proof_ready(value: dict[str, Any]) -> bool:
-            count = value.get("verified_capture_count")
-            return (
-                value.get("schema")
-                == "synapse-s2.capture-ledger-binding-proof.v1"
-                and value.get("verified") is True
-                and type(count) is int
-                and int(count) >= 0
-                and re.fullmatch(r"[0-9a-f]{64}", str(value.get("revision") or ""))
-                is not None
-            )
-
-        def ledger_audit_evaluate(
-            returncode: int,
-            parsed: Any,
-            stdout: str,
-            stderr: str,
-        ):
-            if returncode != 0 or not isinstance(parsed, dict):
-                return (
-                    "blocked",
-                    compact_text(
-                        stderr or stdout or "capture ledger integrity audit failed"
-                    ),
-                    "Run capture-ledger-integrity directly and resolve its read-only audit failure before creating a recovery point.",
-                    {},
-                )
-            missing_count = int(
-                parsed.get("missing_authoritative_ledger_count") or 0
-            )
-            mismatch_count = int(parsed.get("ledger_binding_mismatch_count") or 0)
-            blocked_count = int(parsed.get("blocked_capture_count") or 0)
-            audit_revision = str(parsed.get("audit_revision") or "")
-            ready = (
-                parsed.get("action") == "capture-ledger-audit"
-                and parsed.get("status") == "ready"
-                and bool(parsed.get("verification_passed"))
-                and re.fullmatch(r"[0-9a-f]{64}", audit_revision) is not None
-                and missing_count == 0
-                and mismatch_count == 0
-                and blocked_count == 0
-            )
-            if ready:
-                return (
-                    "ready",
-                    "Processed capture.v2 evidence matches the authoritative SQLite capture ledger.",
-                    "",
-                    {
-                        "status": "ready",
-                        "audit_revision": audit_revision,
-                        "processed_v2_capture_count": int(
-                            parsed.get("processed_v2_capture_count") or 0
-                        ),
-                        "ledger_capture_count": int(
-                            parsed.get("ledger_capture_count") or 0
-                        ),
-                        "missing_authoritative_ledger_count": 0,
-                        "ledger_binding_mismatch_count": 0,
-                        "blocked_capture_count": 0,
-                    },
-                )
-            if bool(parsed.get("repairable")) and missing_count > 0:
-                repair = (
-                    "Review this check's finding samples and audit_revision, then run "
-                    "capture-ledger-integrity --repair --confirm --expected-revision "
-                    "'<audit_revision>'; rerun the read-only audit before certification."
-                )
-            else:
-                repair = (
-                    "Do not replay capture files or synthesize receipts. Resolve ambiguous "
-                    "evidence or restore a verified paired recovery point, then rerun the audit."
-                )
-            return (
-                "blocked",
-                (
-                    "Capture ledger is not authoritative: "
-                    f"missing={missing_count}, mismatched={mismatch_count}, "
-                    f"blocked={blocked_count}."
-                ),
-                repair,
-                {
-                    "status": parsed.get("status"),
-                    "audit_revision": audit_revision,
-                    "repairable": bool(parsed.get("repairable")),
-                    "repairable_capture_count": int(
-                        parsed.get("repairable_capture_count") or 0
-                    ),
-                    "missing_authoritative_ledger_count": missing_count,
-                    "ledger_binding_mismatch_count": mismatch_count,
-                    "blocked_capture_count": blocked_count,
-                },
-            )
-
-        ledger_audit = self._run_command(
-            "capture_ledger_audit",
-            label="Capture ledger integrity audit",
-            command=self._cli_command(
-                "capture-ledger-integrity",
-                "--sample-limit",
-                "20",
-            ),
-            required=True,
-            timeout=300,
-            evaluator=ledger_audit_evaluate,
+    @staticmethod
+    def _capture_status_ready(parsed: Any) -> tuple[bool, dict[str, Any]]:
+        status = dict(parsed) if isinstance(parsed, dict) else {}
+        zero_fields = (
+            "pending_file_count",
+            "processing_file_count",
+            "inbox_temp_file_count",
+            "processing_empty_claim_count",
+            "processing_malformed_claim_count",
+            "error_file_count",
+            "unresolved_error_count",
+            "unsafe_error_artifact_count",
+            "error_resolution_pending_count",
+            "error_resolution_failed_count",
         )
-        if ledger_audit.status != "ready":
-            for check_id, label in (
-                ("recovery_backup", "Paired recovery backup"),
-                ("recovery_verify", "Recovery bundle verification"),
-                ("recovery_restore", "Isolated recovery drill"),
-            ):
-                self._record_manual(
-                    check_id,
-                    label=label,
-                    status="blocked",
-                    required=True,
-                    detail=(
-                        "Skipped because capture-ledger integrity did not pass its "
-                        "read-only authority gate."
-                    ),
-                    repair="Repair and re-audit the capture ledger before creating recovery artifacts.",
-                )
-            return
+        counts: dict[str, int] = {}
+        counts_valid = True
+        for field in zero_fields:
+            value = status.get(field)
+            if type(value) is not int or int(value) < 0:
+                counts_valid = False
+                counts[field] = -1
+            else:
+                counts[field] = int(value)
+        ready = (
+            bool(status)
+            and status.get("transport_ready") is True
+            and status.get("missing_transport_directories") == []
+            and status.get("unsafe_transport_directories") == []
+            and counts_valid
+            and all(value == 0 for value in counts.values())
+        )
+        return ready, {
+            "transport_ready": status.get("transport_ready") is True,
+            "missing_transport_directories": list(
+                status.get("missing_transport_directories") or []
+            )[:16],
+            "unsafe_transport_directories": list(
+                status.get("unsafe_transport_directories") or []
+            )[:16],
+            **counts,
+        }
 
-        def backup_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
+    def _check_capture_inbox(self) -> CheckResult:
+        """Drain Phase-A capture debt, then publish one exact required verdict."""
+
+        observed: dict[str, Any] = {}
+        total_processed = 0
+        drain_passes = 0
+
+        def observe_evaluator(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0 or not isinstance(parsed, dict):
                 return (
                     "blocked",
-                    compact_text(stderr or stdout or "paired recovery backup failed"),
-                    "Resolve backup integrity, capture transport, free-space, and signing-authority errors.",
+                    compact_text(stderr or stdout or "capture inbox status failed"),
+                    "Repair the capture transport before operator certification.",
                     {},
-                )
-            binding = binding_proof(parsed)
-            if (
-                not parsed.get("bundle_verified")
-                or not parsed.get("cutover_ready")
-                or not binding_proof_ready(binding)
-            ):
-                return (
-                    "blocked",
-                    "Recovery artifacts were created but are not verified and immediately cutover-ready.",
-                    "Drain or reconcile replay-required capture files, then rerun certification.",
-                    {
-                        "bundle_verified": bool(parsed.get("bundle_verified")),
-                        "cutover_ready": bool(parsed.get("cutover_ready")),
-                        "capture_ledger_binding": binding,
-                        "reconciliation": parsed.get("reconciliation", {}),
-                    },
                 )
             return (
                 "ready",
-                "Created a signed paired SQLite and exactly-once capture recovery point.",
+                "Observed the capture inbox before or during its bounded drain.",
                 "",
                 {
-                    "bundle_verified": True,
-                    "cutover_ready": True,
-                    "capture_file_count": int(parsed.get("capture_file_count") or 0),
-                    "capture_ledger_binding": binding,
-                    "reconciliation": parsed.get("reconciliation", {}),
+                    "pending_file_count": int(parsed.get("pending_file_count") or 0),
+                    "processing_file_count": int(
+                        parsed.get("processing_file_count") or 0
+                    ),
                 },
             )
 
-        backup_result = self._run_command(
-            "recovery_backup",
-            label="Paired recovery backup",
-            command=self._cli_command(
-                "backup-recovery",
-                "--purpose",
-                "operator-readiness",
-                "--pinned",
-            ),
-            required=True,
-            timeout=300,
-            evaluator=backup_evaluate,
+        initial = self._run_command(
+            "capture_inbox_observe_00",
+            label="Capture inbox pre-drain observation",
+            command=self._cli_command("capture-inbox-status"),
+            required=False,
+            timeout=30,
+            evaluator=observe_evaluator,
         )
-        backup = backup_result.parsed if isinstance(backup_result.parsed, dict) else {}
-        expected_binding_proof = binding_proof(backup)
-        receipt_path = str(backup.get("bundle_receipt_path") or "")
-        if backup_result.status != "ready" or not receipt_path:
-            for check_id, label in (
-                ("recovery_verify", "Recovery bundle verification"),
-                ("recovery_restore", "Isolated recovery drill"),
+        if isinstance(initial.parsed, dict):
+            observed = dict(initial.parsed)
+
+        while (
+            type(observed.get("pending_file_count")) is int
+            and int(observed["pending_file_count"]) > 0
+            and drain_passes < CAPTURE_DRAIN_MAX_PASSES
+        ):
+            before_pending = int(observed["pending_file_count"])
+            drain_passes += 1
+
+            def drain_evaluator(
+                returncode: int,
+                parsed: Any,
+                stdout: str,
+                stderr: str,
             ):
+                if returncode != 0 or not isinstance(parsed, dict):
+                    return (
+                        "blocked",
+                        compact_text(
+                            stderr or stdout or "capture inbox processing failed"
+                        ),
+                        "Repair capture processing without deleting or relocating pending drops.",
+                        {},
+                    )
+                error_count = int(parsed.get("error_file_count") or 0)
+                return (
+                    "ready" if error_count == 0 else "blocked",
+                    (
+                        "Processed one bounded capture-inbox batch."
+                        if error_count == 0
+                        else "Capture processing produced terminal error evidence."
+                    ),
+                    (
+                        "Resolve capture error evidence through the governed workflow."
+                        if error_count
+                        else ""
+                    ),
+                    {
+                        "processed_file_count": int(
+                            parsed.get("processed_file_count") or 0
+                        ),
+                        "deferred_file_count": int(
+                            parsed.get("deferred_file_count") or 0
+                        ),
+                        "error_file_count": error_count,
+                    },
+                )
+
+            processed = self._run_command(
+                f"capture_inbox_drain_{drain_passes:02d}",
+                label=f"Capture inbox drain pass {drain_passes}",
+                command=self._cli_command(
+                    "capture-inbox-process",
+                    "--max-files",
+                    str(CAPTURE_DRAIN_BATCH_SIZE),
+                    "--confirm",
+                ),
+                required=False,
+                timeout=300,
+                evaluator=drain_evaluator,
+            )
+            processed_count = (
+                int(processed.parsed.get("processed_file_count") or 0)
+                if isinstance(processed.parsed, dict)
+                else 0
+            )
+            total_processed += processed_count
+            observed_result = self._run_command(
+                f"capture_inbox_observe_{drain_passes:02d}",
+                label=f"Capture inbox observation {drain_passes}",
+                command=self._cli_command("capture-inbox-status"),
+                required=False,
+                timeout=30,
+                evaluator=observe_evaluator,
+            )
+            if not isinstance(observed_result.parsed, dict):
+                observed = {}
+                break
+            observed = dict(observed_result.parsed)
+            after_pending = observed.get("pending_file_count")
+            if (
+                type(after_pending) is int
+                and int(after_pending) >= before_pending
+                and processed_count == 0
+            ):
+                break
+
+        def final_evaluator(returncode: int, parsed: Any, stdout: str, stderr: str):
+            ready, metrics = self._capture_status_ready(parsed)
+            metrics.update(
+                {
+                    "drain_passes": drain_passes,
+                    "processed_file_count": total_processed,
+                    "maximum_drain_passes": CAPTURE_DRAIN_MAX_PASSES,
+                    "batch_size": CAPTURE_DRAIN_BATCH_SIZE,
+                }
+            )
+            if returncode != 0 or not isinstance(parsed, dict):
+                return (
+                    "blocked",
+                    compact_text(stderr or stdout or "capture inbox status failed"),
+                    "Repair the capture transport and rerun a completely new evidence pack.",
+                    metrics,
+                )
+            return (
+                "ready" if ready else "blocked",
+                (
+                    "Capture transport is fully drained with no processing, temporary, or unresolved error debt."
+                    if ready
+                    else "Capture transport is not quiescent after its bounded drain."
+                ),
+                (
+                    "Keep respawners paused; process replay-required files through the governed inbox and rerun certification."
+                    if not ready
+                    else ""
+                ),
+                metrics,
+            )
+
+        return self._run_command(
+            "capture_inbox",
+            label="Capture inbox drain and quiescence",
+            command=self._cli_command("capture-inbox-status"),
+            required=True,
+            timeout=30,
+            evaluator=final_evaluator,
+        )
+
+    @staticmethod
+    def _reconciliation_ready(value: Any) -> bool:
+        reconciliation = dict(value) if isinstance(value, dict) else {}
+        return all(
+            type(reconciliation.get(field)) is int
+            and int(reconciliation[field]) == 0
+            for field in (
+                "missing_authoritative_ledger_count",
+                "replay_required_capture_count",
+                "replay_required_file_count",
+                "identifierless_replay_file_count",
+                "unclassified_file_count",
+            )
+        )
+
+    @staticmethod
+    def _capture_binding_ready(value: Any) -> bool:
+        binding = dict(value) if isinstance(value, dict) else {}
+        count = binding.get("verified_capture_count")
+        return (
+            binding.get("schema")
+            == "synapse-s2.capture-ledger-binding-proof.v1"
+            and binding.get("verified") is True
+            and type(count) is int
+            and int(count) >= 0
+            and re.fullmatch(r"[0-9a-f]{64}", str(binding.get("revision") or ""))
+            is not None
+        )
+
+    def _collect_quiescence_inventory(self) -> tuple[bool, dict[str, Any]]:
+        try:
+            findings = collect_process_inventory()
+            launch_agents = collect_launchagent_inventory(
+                labels={
+                    "capture": DEFAULT_CAPTURE_LABEL,
+                    "dashboard": DEFAULT_DASHBOARD_LABEL,
+                    "core": self.args.core_label,
+                }
+            )
+        except Exception as exc:
+            return False, {
+                "inventory_available": False,
+                "error": safe_public_error(
+                    exc,
+                    fallback="read-only quiescence inventory failed",
+                ),
+                "process_findings": [],
+                "process_findings_truncated": False,
+                "loaded_categories": [],
+                "quiescence_policy_schema": QUIESCENCE_POLICY_SCHEMA,
+                "quiescence_policy_digest": quiescence_policy_digest(),
+                "quiescence_policy_blockers": ["inventory-unavailable"],
+                "launch_agents": {},
+            }
+        process_findings = [finding.to_wire() for finding in findings]
+        truncated = len(findings) >= MAX_PROCESS_FINDINGS
+        loaded = sorted(
+            category
+            for category, snapshot in launch_agents.items()
+            if snapshot.get("loaded") is True
+        )
+        policy_blockers = launchagent_quiescence_blockers(launch_agents)
+        ready = not process_findings and not truncated and not policy_blockers
+        return ready, {
+            "inventory_available": True,
+            "process_findings": process_findings,
+            "process_findings_truncated": truncated,
+            "loaded_categories": loaded,
+            "quiescence_policy_schema": QUIESCENCE_POLICY_SCHEMA,
+            "quiescence_policy_digest": quiescence_policy_digest(),
+            "quiescence_policy_blockers": policy_blockers,
+            "launch_agents": launch_agents,
+        }
+
+    def _record_in_process_check(
+        self,
+        check_id: str,
+        *,
+        label: str,
+        status: str,
+        detail: str,
+        repair: str,
+        parsed: dict[str, Any],
+        metrics: dict[str, Any],
+        duration_ms: float,
+        artifact_paths: dict[str, str] | None = None,
+    ) -> CheckResult:
+        parsed_path = self.artifact_dir / f"{safe_filename(check_id)}.parsed.json"
+        self._write_json(parsed_path, parsed)
+        paths = {"parsed": str(parsed_path), **(artifact_paths or {})}
+        result = CheckResult(
+            check_id=check_id,
+            label=label,
+            status=status,
+            required=True,
+            detail=sanitize_evidence_text(detail),
+            repair=sanitize_evidence_text(repair),
+            command=[],
+            returncode=0 if status == "ready" else 1,
+            duration_ms=round(float(duration_ms), 3),
+            artifact_paths=paths,
+            parsed=json_safe(parsed),
+            metrics=json_safe(metrics),
+        )
+        self.results.append(result)
+        return result
+
+    def _record_recovery_skips(self, *, detail: str, repair: str) -> None:
+        existing = {result.check_id for result in self.results}
+        for check_id, label in (
+            ("capture_ledger_audit", "Capture ledger integrity audit"),
+            ("recovery_backup", "Paired recovery backup"),
+            ("recovery_verify", "Recovery bundle verification"),
+            ("recovery_restore", "Isolated recovery drill"),
+        ):
+            if check_id not in existing:
                 self._record_manual(
                     check_id,
                     label=label,
                     status="blocked",
                     required=True,
-                    detail="Skipped because paired recovery backup did not produce a trusted receipt.",
-                    repair="Repair the paired recovery backup gate first.",
+                    detail=detail,
+                    repair=repair,
                 )
-            return
 
-        def verify_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
-            if returncode != 0 or not isinstance(parsed, dict):
-                return (
-                    "blocked",
-                    compact_text(stderr or stdout or "recovery verification failed"),
-                    "Inspect the signed bundle receipt and all four bound artifacts.",
-                    {},
-                )
-            binding = binding_proof(parsed)
-            ready = (
-                bool(parsed.get("verified"))
-                and bool(parsed.get("cutover_ready"))
-                and binding_proof_ready(binding)
-                and binding == expected_binding_proof
+    def _record_guarded_recovery_evidence(
+        self,
+        evidence: dict[str, Any],
+        *,
+        duration_ms: float,
+    ) -> None:
+        before = dict(evidence.get("capture_ledger_before") or {})
+        after = dict(evidence.get("capture_ledger_after") or {})
+        publication_state = dict(
+            evidence.get("capture_transport_at_publication") or {}
+        )
+        ledger_revision = str(before.get("audit_revision") or "")
+        audited_count_fields = (
+            "processed_file_count",
+            "processed_total_bytes",
+            "processed_v2_capture_count",
+            "ledger_capture_count",
+            "missing_authoritative_ledger_count",
+            "ledger_binding_mismatch_count",
+            "repairable_capture_count",
+            "blocked_capture_count",
+        )
+        ledger_ready = bool(
+            evidence.get("verified") is True
+            and before.get("status") == "ready"
+            and after.get("status") == "ready"
+            and before.get("verification_passed") is True
+            and after.get("verification_passed") is True
+            and re.fullmatch(r"[0-9a-f]{64}", ledger_revision) is not None
+            and ledger_revision == str(after.get("audit_revision") or "")
+            and all(
+                type(before.get(field)) is int
+                and type(after.get(field)) is int
+                and before[field] == after[field]
+                for field in audited_count_fields
             )
-            return (
-                "ready" if ready else "blocked",
-                (
-                    "Reverified the signed database, capture archive, schema contract, and replay state."
-                    if ready
-                    else "Recovery bundle verification did not prove immediate cutover readiness."
+            and publication_state.get("ledger_verification_passed") is True
+            and ledger_revision
+            == str(publication_state.get("ledger_audit_revision") or "")
+        )
+        ledger_payload = dict(before)
+        ledger_payload.update(
+            {
+                "status": "ready" if ledger_ready else "blocked",
+                "verification_passed": ledger_ready,
+                "guarded": True,
+                "publication_ledger_audit_revision": str(
+                    publication_state.get("ledger_audit_revision") or ""
                 ),
-                "" if ready else "Inspect signed reconciliation and replay-required files.",
-                {
-                    "verified": bool(parsed.get("verified")),
-                    "cutover_ready": bool(parsed.get("cutover_ready")),
-                    "reconciliation": parsed.get("reconciliation", {}),
-                    "capture_ledger_binding": binding,
-                },
-            )
+            }
+        )
+        self._record_in_process_check(
+            "capture_ledger_audit",
+            label="Capture ledger integrity audit",
+            status="ready" if ledger_ready else "blocked",
+            detail=(
+                "Capture ledger and transport revision remained exact through guarded publication."
+                if ledger_ready
+                else "Guarded capture-ledger evidence was incomplete or drifted."
+            ),
+            repair=(
+                ""
+                if ledger_ready
+                else "Reconcile the ledger and capture transport, then create a new evidence pack."
+            ),
+            parsed=ledger_payload,
+            metrics=ledger_payload,
+            duration_ms=duration_ms,
+        )
 
-        verify_result = self._run_command(
+        bundle = dict(evidence.get("bundle") or {})
+        bundle_binding = dict(bundle.get("capture_ledger_binding") or {})
+        bundle_reconciliation = dict(bundle.get("reconciliation") or {})
+        backup_ready = (
+            bundle.get("bundle_verified") is True
+            and bundle.get("cutover_ready") is True
+            and self._capture_binding_ready(bundle_binding)
+            and self._reconciliation_ready(bundle_reconciliation)
+        )
+        self._record_in_process_check(
+            "recovery_backup",
+            label="Paired recovery backup",
+            status="ready" if backup_ready else "blocked",
+            detail=(
+                "Created a signed paired SQLite and exactly-once capture recovery point under the exclusive guard."
+                if backup_ready
+                else "Guarded paired recovery backup was not immediately cutover-ready."
+            ),
+            repair=(
+                ""
+                if backup_ready
+                else "Resolve capture, ledger, runtime, or backup integrity debt before cutover."
+            ),
+            parsed=bundle,
+            metrics={
+                "bundle_verified": bool(bundle.get("bundle_verified")),
+                "cutover_ready": bool(bundle.get("cutover_ready")),
+                "capture_file_count": int(bundle.get("capture_file_count") or 0),
+                "capture_ledger_binding": bundle_binding,
+                "reconciliation": bundle_reconciliation,
+                "guarded": True,
+            },
+            duration_ms=duration_ms,
+        )
+
+        verification = dict(evidence.get("verification") or {})
+        verify_binding = dict(verification.get("capture_ledger_binding") or {})
+        verify_reconciliation = dict(verification.get("reconciliation") or {})
+        verify_ready = (
+            backup_ready
+            and verification.get("verified") is True
+            and verification.get("cutover_ready") is True
+            and verification.get("receipt_identity_trusted") is True
+            and self._capture_binding_ready(verify_binding)
+            and verify_binding == bundle_binding
+            and self._reconciliation_ready(verify_reconciliation)
+        )
+        self._record_in_process_check(
             "recovery_verify",
             label="Recovery bundle verification",
-            command=self._cli_command(
-                "verify-recovery",
-                "--receipt",
-                receipt_path,
+            status="ready" if verify_ready else "blocked",
+            detail=(
+                "Reverified the signed database, capture archive, schema, replay state, and signer under the guard."
+                if verify_ready
+                else "Guarded recovery verification was incomplete or untrusted."
             ),
-            required=True,
-            timeout=300,
-            evaluator=verify_evaluate,
+            repair=(
+                ""
+                if verify_ready
+                else "Inspect the signed recovery receipt and exact bound artifacts."
+            ),
+            parsed=verification,
+            metrics={
+                "verified": bool(verification.get("verified")),
+                "cutover_ready": bool(verification.get("cutover_ready")),
+                "receipt_identity_trusted": bool(
+                    verification.get("receipt_identity_trusted")
+                ),
+                "capture_ledger_binding": verify_binding,
+                "reconciliation": verify_reconciliation,
+                "guarded": True,
+            },
+            duration_ms=duration_ms,
         )
-        if verify_result.status != "ready":
+
+        restore = dict(evidence.get("restore") or {})
+        restore_binding = dict(restore.get("capture_ledger_binding") or {})
+        restore_reconciliation = dict(restore.get("reconciliation") or {})
+        proof_source = Path(str(restore.get("recovery_proof_path") or ""))
+        proof: dict[str, Any] = {}
+        proof_ready = False
+        if proof_source.is_file() and not proof_source.is_symlink():
+            try:
+                loaded = json.loads(proof_source.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    proof = loaded
+                    proof_ready = (
+                        proof.get("schema")
+                        in {
+                            "synapse-s2.recovery-bundle-restore.v1",
+                            "synapse-s2.recovery-bundle-restore.v2",
+                        }
+                        and proof.get("mode") == "isolated-recovery-proof"
+                        and proof.get("verified") is True
+                        and proof.get("cutover_ready") is True
+                        and int(
+                            proof.get("missing_transport_ledger_count") or 0
+                        )
+                        == 0
+                        and proof.get("capture_ledger_binding")
+                        == restore_binding
+                        and self._reconciliation_ready(
+                            proof.get("reconciliation")
+                        )
+                    )
+            except (OSError, ValueError, json.JSONDecodeError):
+                proof_ready = False
+        restore_ready = (
+            verify_ready
+            and restore.get("verified") is True
+            and restore.get("cutover_ready") is True
+            and int(restore.get("missing_transport_ledger_count") or 0) == 0
+            and self._capture_binding_ready(restore_binding)
+            and restore_binding == bundle_binding
+            and self._reconciliation_ready(restore_reconciliation)
+            and proof_ready
+        )
+        extra_artifacts: dict[str, str] = {}
+        if proof_ready:
+            durable_proof = (
+                self.artifact_dir / "recovery_restore_proof.receipt.json"
+            )
+            self._write_json(durable_proof, proof)
+            extra_artifacts["recovery_proof"] = str(durable_proof)
+        self._record_in_process_check(
+            "recovery_restore",
+            label="Isolated recovery drill",
+            status="ready" if restore_ready else "blocked",
+            detail=(
+                "Materialized and verified an isolated paired restore without touching live state."
+                if restore_ready
+                else "Guarded isolated restore proof was incomplete or not cutover-ready."
+            ),
+            repair=(
+                ""
+                if restore_ready
+                else "Inspect the isolated proof and resolve replay or ledger debt."
+            ),
+            parsed=restore,
+            metrics={
+                "verified": bool(restore.get("verified")),
+                "cutover_ready": bool(restore.get("cutover_ready")),
+                "capture_file_count": int(restore.get("capture_file_count") or 0),
+                "missing_transport_ledger_count": int(
+                    restore.get("missing_transport_ledger_count") or 0
+                ),
+                "capture_ledger_binding": restore_binding,
+                "reconciliation": restore_reconciliation,
+                "guarded": True,
+            },
+            duration_ms=duration_ms,
+            artifact_paths=extra_artifacts,
+        )
+
+    def _guarded_recovery_and_finalize(self) -> dict[str, Any]:
+        capture_results = [
+            result
+            for result in self.results
+            if result.required and result.check_id == "capture_inbox"
+        ]
+        if len(capture_results) != 1 or capture_results[0].status != "ready":
             self._record_manual(
-                "recovery_restore",
-                label="Isolated recovery drill",
+                "authority_guard",
+                label="Exclusive authority guard",
                 status="blocked",
                 required=True,
-                detail="Skipped because cryptographic recovery verification failed.",
-                repair="Repair the recovery verification gate first.",
+                detail="Skipped because Phase-A capture quiescence did not pass.",
+                repair="Drain capture debt and rerun a completely new evidence pack.",
             )
-            return
+            self._record_manual(
+                "guarded_quiescence",
+                label="Quiescence under exclusive guard",
+                status="blocked",
+                required=True,
+                detail="No guarded certification was attempted with capture debt present.",
+                repair="Keep respawners paused, drain capture, and retry.",
+            )
+            self._record_recovery_skips(
+                detail="Skipped because capture inbox quiescence was not ready.",
+                repair="Repair the capture transport before recovery certification.",
+            )
+            return self._finalize()
 
         staging_root = (
             self.core_binding.recovery_root
@@ -2597,73 +3083,176 @@ class OperatorReadinessCertifier:
             else self.core_paths.data_root / "recovery"
         )
         ensure_private_directory(staging_root)
-
-        def restore_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
-            if returncode != 0 or not isinstance(parsed, dict):
-                return (
-                    "blocked",
-                    compact_text(stderr or stdout or "isolated recovery drill failed"),
-                    "Inspect restore proof, capture ledger reconciliation, and available disk space.",
-                    {},
-                )
-            binding = binding_proof(parsed)
-            ready = (
-                bool(parsed.get("verified"))
-                and bool(parsed.get("cutover_ready"))
-                and binding_proof_ready(binding)
-                and binding == expected_binding_proof
+        lease: CoreAuthorityLease | None = None
+        store: DurableMemoryStore | None = None
+        try:
+            lease = CoreAuthorityLease.acquire_core(
+                self.candidate_config.memory_path,
+                timeout_seconds=AUTHORITY_GUARD_TIMEOUT_SECONDS,
+                instance_id="readiness-certifier",
             )
-            return (
-                "ready" if ready else "blocked",
-                (
-                    "Materialized and verified an isolated paired restore without touching live state."
-                    if ready
-                    else "Isolated restore completed but is not immediately cutover-ready."
-                ),
-                "" if ready else "Resolve replay-required capture debt before cutover.",
-                {
-                    "verified": bool(parsed.get("verified")),
-                    "cutover_ready": bool(parsed.get("cutover_ready")),
-                    "capture_file_count": int(parsed.get("capture_file_count") or 0),
-                    "missing_transport_ledger_count": int(
-                        parsed.get("missing_transport_ledger_count") or 0
+            store = DurableMemoryStore.open_existing_for_core_maintenance(
+                self.candidate_config.memory_path,
+                authority_lease=lease,
+            )
+            self._record_manual(
+                "authority_guard",
+                label="Exclusive authority guard",
+                status="ready",
+                required=True,
+                detail="Exclusive core authority fenced all cooperating local writers.",
+                metrics={
+                    "exclusive": True,
+                    "role": "core",
+                    "database_identity_bound": (
+                        lease.database_device is not None
+                        and lease.database_inode is not None
                     ),
-                    "reconciliation": parsed.get("reconciliation", {}),
-                    "capture_ledger_binding": binding,
                 },
             )
-
-        with tempfile.TemporaryDirectory(
-            prefix=f"readiness-{safe_filename(self.run_id)}-",
-            dir=staging_root,
-        ) as temporary:
-            restore_root = Path(temporary) / "isolated-restore"
-            restore_result = self._run_command(
-                "recovery_restore",
-                label="Isolated recovery drill",
-                command=self._cli_command(
-                    "restore-recovery-proof",
-                    "--receipt",
-                    receipt_path,
-                    "--output-root",
-                    str(restore_root),
-                    "--confirm",
-                ),
+        except Exception as exc:
+            if store is not None:
+                store.close()
+            if lease is not None:
+                lease.close()
+            self._record_manual(
+                "authority_guard",
+                label="Exclusive authority guard",
+                status="blocked",
                 required=True,
-                timeout=300,
-                evaluator=restore_evaluate,
+                detail=safe_public_error(
+                    exc,
+                    fallback="exclusive authority acquisition failed",
+                ),
+                repair="Close exact local clients and disable their respawners before retrying.",
             )
-            if restore_result.status == "ready" and isinstance(
-                restore_result.parsed, dict
-            ):
-                proof_path = Path(
-                    str(restore_result.parsed.get("recovery_proof_path") or "")
+            self._record_manual(
+                "guarded_quiescence",
+                label="Quiescence under exclusive guard",
+                status="blocked",
+                required=True,
+                detail="Quiescence could not be proven without exclusive authority.",
+                repair="Resolve the reported authority owner and rerun a new evidence pack.",
+            )
+            self._record_recovery_skips(
+                detail="Skipped because exclusive authority was unavailable.",
+                repair="Establish durable zero-writer quiescence first.",
+            )
+            return self._finalize()
+
+        try:
+            initial_ready, initial_inventory = self._collect_quiescence_inventory()
+            if not initial_ready:
+                self._record_manual(
+                    "guarded_quiescence",
+                    label="Quiescence under exclusive guard",
+                    status="blocked",
+                    required=True,
+                    detail="A writer process or loaded SYNAPSE-S2 service remained after exclusive authority acquisition.",
+                    repair="Stop the exact reported PID or label; never use a broad kill command.",
+                    metrics={"initial": initial_inventory},
                 )
-                if proof_path.is_file() and not proof_path.is_symlink():
-                    proof = json.loads(proof_path.read_text(encoding="utf-8"))
-                    durable_proof = self.artifact_dir / "recovery_restore_proof.receipt.json"
-                    self._write_json(durable_proof, proof)
-                    restore_result.artifact_paths["recovery_proof"] = str(durable_proof)
+                self._record_recovery_skips(
+                    detail="Skipped because guarded process inventory was not empty.",
+                    repair="Stop exact writers and rerun a completely new evidence pack.",
+                )
+            else:
+                manager = VerifiedRecoveryManager(
+                    store,
+                    capture_root=self.candidate_config.capture_root,
+                    runtime_state_path=self.candidate_config.state_path,
+                )
+                callback_started = False
+                transaction_started = time.perf_counter()
+                try:
+                    with tempfile.TemporaryDirectory(
+                        prefix=f"readiness-{safe_filename(self.run_id)}-",
+                        dir=staging_root,
+                    ) as temporary:
+                        restore_root = Path(temporary) / "isolated-restore"
+                        with manager.guarded_recovery_transaction(
+                            restore_root,
+                            purpose="operator-readiness",
+                            pinned=True,
+                        ) as publication:
+
+                            def publish(guarded_evidence: dict[str, Any]) -> None:
+                                nonlocal callback_started
+                                callback_started = True
+                                final_ready, final_inventory = (
+                                    self._collect_quiescence_inventory()
+                                )
+                                guarded_ready = initial_ready and final_ready
+                                self._record_manual(
+                                    "guarded_quiescence",
+                                    label="Quiescence under exclusive guard",
+                                    status=(
+                                        "ready" if guarded_ready else "blocked"
+                                    ),
+                                    required=True,
+                                    detail=(
+                                        "Process, LaunchAgent, authority, capture, and replay inventories remained empty through guarded publication."
+                                        if guarded_ready
+                                        else "A writer process or loaded service appeared before guarded publication."
+                                    ),
+                                    repair=(
+                                        ""
+                                        if guarded_ready
+                                        else "Stop the exact reported process or label, drain capture, and create a new evidence pack."
+                                    ),
+                                    metrics={
+                                        "initial": initial_inventory,
+                                        "at_publication": final_inventory,
+                                        "capture_transport_at_publication": dict(
+                                            guarded_evidence.get(
+                                                "capture_transport_at_publication"
+                                            )
+                                            or {}
+                                        ),
+                                    },
+                                )
+                                duration_ms = (
+                                    time.perf_counter() - transaction_started
+                                ) * 1000.0
+                                self._record_guarded_recovery_evidence(
+                                    guarded_evidence,
+                                    duration_ms=duration_ms,
+                                )
+
+                            publication.publish(publish)
+                except Exception as exc:
+                    if callback_started:
+                        # No authoritative manifest has been published yet.
+                        # Let guard/temp/lease teardown finish, then fail closed.
+                        raise
+                    self._record_manual(
+                        "guarded_quiescence",
+                        label="Quiescence under exclusive guard",
+                        status="blocked",
+                        required=True,
+                        detail=safe_public_error(
+                            exc,
+                            fallback="guarded recovery transaction failed",
+                        ),
+                        repair="Resolve the exact capture, runtime, ledger, or recovery drift and rerun a new evidence pack.",
+                        metrics={"initial": initial_inventory},
+                    )
+                    self._record_recovery_skips(
+                        detail="Skipped because the guarded recovery transaction did not reach publication.",
+                        repair="Repair the guarded recovery failure before cutover.",
+                    )
+        finally:
+            try:
+                if store is not None:
+                    store.close()
+            finally:
+                if lease is not None:
+                    lease.close()
+
+        # manifest.json is the cutover authority.  It must not exist until the
+        # recovery manager, temporary restore, store, and lease contexts have
+        # all unwound successfully.
+        return self._finalize()
 
     def _check_dashboard(self) -> None:
         def smoke_eval(returncode: int, parsed: Any, stdout: str, stderr: str):
@@ -2713,19 +3302,74 @@ class OperatorReadinessCertifier:
         )
 
     def _finalize(self) -> dict[str, Any]:
-        overall_status = classify_overall(self.results)
+        expected_ids = tuple(OPERATOR_READINESS_REQUIRED_PROOF_IDS)
+        expected_set = set(expected_ids)
+        all_counts = Counter(result.check_id for result in self.results)
         required = [result for result in self.results if result.required]
-        failed_required = [result for result in required if result.status != "ready"]
+        required_counts = Counter(result.check_id for result in required)
+        missing_required = sorted(
+            check_id for check_id in expected_ids if all_counts[check_id] == 0
+        )
+        duplicate_required = sorted(
+            check_id for check_id, count in all_counts.items() if count != 1
+        )
+        unexpected_required = sorted(set(required_counts) - expected_set)
+        failed_required_ids = sorted(
+            {
+                *unexpected_required,
+                *(
+                    check_id
+                    for check_id in expected_ids
+                    if all_counts[check_id] != 1
+                    or next(
+                        (
+                            result.required is True
+                            and result.status == "ready"
+                            for result in self.results
+                            if result.check_id == check_id
+                        ),
+                        False,
+                    )
+                    is not True
+                ),
+            }
+        )
+        proof_contract_valid = not (
+            missing_required or duplicate_required or unexpected_required
+        )
+        overall_status = classify_overall(self.results)
+        if not proof_contract_valid:
+            overall_status = "blocked"
+        required_total = len(expected_ids)
+        required_ready = sum(
+            1
+            for check_id in expected_ids
+            if all_counts[check_id] == 1
+            and next(
+                result.required is True and result.status == "ready"
+                for result in self.results
+                if result.check_id == check_id
+            )
+        )
+        proof_contract = ready_operator_proof_contract()
+        if not proof_contract_valid:
+            proof_contract.update(
+                {
+                    "valid": False,
+                    "missing": missing_required,
+                    "duplicates": duplicate_required,
+                    "unexpected_required": unexpected_required,
+                }
+            )
         manifest = json_safe(
             {
                 **self.metadata,
                 "overall_status": overall_status,
                 "operator_trustworthy": overall_status == "ready",
-                "required_ready": len(required) - len(failed_required),
-                "required_total": len(required),
-                "failed_required": [
-                    result.check_id for result in failed_required
-                ],
+                "required_ready": required_ready,
+                "required_total": required_total,
+                "failed_required": failed_required_ids,
+                "required_proof_contract": proof_contract,
                 "checks": [result.to_manifest() for result in self.results],
                 "proofs": self._proof_summary(),
             }
@@ -2735,12 +3379,6 @@ class OperatorReadinessCertifier:
         manifest_path = self.pack_dir / "manifest.json"
         summary_path = self.pack_dir / "summary.md"
         runbook_path = self.pack_dir / "runbook.md"
-        self._write_json(manifest_path, manifest)
-        self._write_text(
-            summary_path,
-            render_summary_markdown(manifest, self.results),
-        )
-        self._write_text(runbook_path, render_runbook_markdown(manifest))
         archive_path = str(self.archive_path) if self.args.zip else ""
         result = json_safe(
             {
@@ -2761,13 +3399,57 @@ class OperatorReadinessCertifier:
         )
         if not isinstance(result, dict):  # pragma: no cover - static shape
             raise RuntimeError("readiness result sanitization failed")
-        self._write_json(self.pack_dir / "result.json", result)
-        if self.args.zip:
-            write_private_evidence_zip(
-                self.archive_path,
-                pack_dir=self.pack_dir,
-                members=set(self._evidence_files),
+        result_path = self.pack_dir / "result.json"
+        try:
+            # The manifest is the cutover authority. Supporting artifacts and
+            # the optional ZIP are made durable first. The ZIP receives the
+            # staged in-memory manifest so no authoritative ready file exists
+            # during archive creation. manifest.json is atomically published
+            # last, after every guarded/temporary context has already exited.
+            self._write_text(
+                summary_path,
+                render_summary_markdown(manifest, self.results),
             )
+            self._write_text(runbook_path, render_runbook_markdown(manifest))
+            self._write_json(result_path, result)
+            if self.args.zip:
+                write_private_evidence_zip(
+                    self.archive_path,
+                    pack_dir=self.pack_dir,
+                    members=set(self._evidence_files),
+                    virtual_json_members={"manifest.json": manifest},
+                )
+            self._write_json(manifest_path, manifest)
+        except BaseException:
+            # A failed pre-manifest publication can leave only non-authoritative
+            # artifacts. Remove the optional archive because its staged
+            # manifest must never be mistaken for a completed evidence pack.
+            if manifest_path.is_file() and not manifest_path.is_symlink():
+                try:
+                    manifest_path.unlink()
+                    directory_fd = os.open(self.pack_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+            if (
+                not manifest_path.exists()
+                and self.args.zip
+                and self.archive_path.is_file()
+                and not self.archive_path.is_symlink()
+            ):
+                try:
+                    self.archive_path.unlink()
+                    directory_fd = os.open(self.archive_path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+            raise
         return result
 
     def _proof_summary(self) -> dict[str, Any]:
@@ -2908,6 +3590,7 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         "- Recall finds that same readiness trace.",
         "- App Connect attach and preview produce quality/capability badges without writing memory.",
         "- Wrap Session persists a factual handoff memory.",
+        "- The bounded capture drain reaches zero debt, then exclusive core authority and the global capture lock remain held through final evidence publication.",
         "- Processed capture.v2 evidence passes a read-only audit against the authoritative SQLite capture ledger.",
         "- A signed paired database plus capture recovery point is created, reverified, and restored into an isolated staging directory.",
         "- The loopback dashboard page, assets, and snapshot API load without known warning text.",

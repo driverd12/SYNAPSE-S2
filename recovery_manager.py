@@ -76,6 +76,9 @@ LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v1"
 RECOVERY_RETENTION_PLAN_SCHEMA = "synapse-s2.recovery-retention-plan.v1"
 RECOVERY_RETIREMENT_RECEIPT_SCHEMA = "synapse-s2.recovery-retirement.v1"
 RECOVERY_PUBLICATION_RECEIPT_SCHEMA = "synapse-s2.recovery-publication.v1"
+GUARDED_RECOVERY_TRANSACTION_SCHEMA = (
+    "synapse-s2.guarded-recovery-transaction.v1"
+)
 CAPTURE_LEDGER_RECONCILIATION_SCHEMA = (
     "synapse-s2.capture-ledger-reconciliation.v1"
 )
@@ -177,6 +180,47 @@ CAPTURE_TRANSPORT_DIR_KEYS = (
 )
 
 
+class GuardedRecoveryPublication:
+    """One-shot publication gate owned by a guarded recovery context."""
+
+    def __init__(
+        self,
+        evidence: dict[str, Any],
+        *,
+        prepublish: Callable[[], dict[str, Any]],
+    ) -> None:
+        self.evidence = evidence
+        self._prepublish = prepublish
+        self._publication_attempted = False
+        self._published = False
+
+    @property
+    def publication_attempted(self) -> bool:
+        return self._publication_attempted
+
+    @property
+    def published(self) -> bool:
+        return self._published
+
+    def publish(
+        self,
+        callback: Callable[[dict[str, Any]], Any],
+    ) -> Any:
+        """Run the last fallible gate, then publish while both locks remain held."""
+
+        if not callable(callback):
+            raise TypeError("guarded recovery publication callback must be callable")
+        if self._publication_attempted:
+            raise RuntimeError("guarded recovery publication is one-shot")
+        self._publication_attempted = True
+        release_state = self._prepublish()
+        self.evidence["capture_transport_at_publication"] = release_state
+        self.evidence["publication_gate_completed_at"] = time.time()
+        result = callback(self.evidence)
+        self._published = True
+        return result
+
+
 class VerifiedRecoveryManager:
     """Create and prove a paired SQLite + exactly-once capture recovery point."""
 
@@ -207,14 +251,18 @@ class VerifiedRecoveryManager:
         self._repository_lock_owner: int | None = None
         self._repository_lock_depth = 0
         self._repository_lock_descriptor: int | None = None
+        self._capture_maintenance_thread_lock = threading.RLock()
+        self._capture_maintenance_lock_owner: int | None = None
+        self._capture_maintenance_lock_token: object | None = None
 
     @contextmanager
     def _repository_lock(self) -> Iterable[None]:
         """Serialize bundle publication, retirement, restore proof, and future import.
 
-        Lock order is repository -> capture global -> memory-store/SQLite.  Keeping
-        that order explicit prevents recovery maintenance from deadlocking capture
-        producers or a future authoritative core service.
+        Global lock order is authority -> repository -> capture global ->
+        memory-store/SQLite. Keeping that order explicit prevents recovery
+        maintenance from deadlocking capture producers or the authoritative
+        core service.
         """
 
         thread_id = threading.get_ident()
@@ -250,12 +298,99 @@ class VerifiedRecoveryManager:
         finally:
             self._repository_thread_lock.release()
 
+    def _require_repository_lock(self) -> None:
+        if (
+            self._repository_lock_owner != threading.get_ident()
+            or self._repository_lock_depth <= 0
+            or self._repository_lock_descriptor is None
+        ):
+            raise RuntimeError("recovery repository lock is not held by this thread")
+
+    @contextmanager
+    def _capture_maintenance_lock(
+        self,
+        *,
+        existing_only: bool = False,
+    ) -> Iterator[object]:
+        """Own the global capture lock once, after the repository lock.
+
+        This manager deliberately rejects same-thread re-entry instead of relying
+        on platform-specific ``flock`` behavior.  Guarded recovery calls the
+        capture-locked helpers directly, so no nested file-lock acquisition is
+        required anywhere in the create/verify/restore transaction.
+        """
+
+        self._require_repository_lock()
+        thread_id = threading.get_ident()
+        self._capture_maintenance_thread_lock.acquire()
+        try:
+            if self._capture_maintenance_lock_owner is not None:
+                raise RuntimeError("capture maintenance lock must not be reacquired")
+            paths = self.daemon.paths()
+            if existing_only:
+                try:
+                    with self._existing_private_file_lock(
+                        paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
+                        mode=fcntl.LOCK_EX,
+                        timeout_seconds=0.0,
+                    ):
+                        token = object()
+                        self._capture_maintenance_lock_owner = thread_id
+                        self._capture_maintenance_lock_token = token
+                        try:
+                            yield token
+                        finally:
+                            self._capture_maintenance_lock_token = None
+                            self._capture_maintenance_lock_owner = None
+                except BlockingIOError as exc:
+                    raise RuntimeError(
+                        "capture maintenance lock is busy; guarded recovery "
+                        "will not wait while holding core authority"
+                    ) from exc
+                return
+            with self.daemon._exclusive_lock(
+                paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
+                blocking=True,
+            ) as acquired:
+                if not acquired:
+                    raise RuntimeError("capture maintenance lock is unavailable")
+                token = object()
+                self._capture_maintenance_lock_owner = thread_id
+                self._capture_maintenance_lock_token = token
+                try:
+                    yield token
+                finally:
+                    self._capture_maintenance_lock_token = None
+                    self._capture_maintenance_lock_owner = None
+        finally:
+            self._capture_maintenance_thread_lock.release()
+
+    @contextmanager
+    def _held_capture_maintenance_lock(self, token: object) -> Iterator[None]:
+        """Assert capture-lock ownership without acquiring another lock."""
+
+        self._require_repository_lock()
+        if (
+            self._capture_maintenance_lock_owner != threading.get_ident()
+            or self._capture_maintenance_lock_token is not token
+        ):
+            raise RuntimeError("capture maintenance lock token is not owned")
+        try:
+            yield
+        finally:
+            if (
+                self._capture_maintenance_lock_owner != threading.get_ident()
+                or self._capture_maintenance_lock_token is not token
+            ):
+                raise RuntimeError("capture maintenance lock ownership changed")
+
     @contextmanager
     def _existing_private_file_lock(
         self,
         path: Path,
         *,
         mode: int,
+        timeout_seconds: float | None = None,
     ) -> Iterable[None]:
         """Acquire an already-established lock without creating or chmodding it."""
 
@@ -275,7 +410,18 @@ class VerifiedRecoveryManager:
                 != self.store._regular_file_identity(opened)
             ):
                 raise PermissionError("attestation lock is not private")
-            fcntl.flock(descriptor, mode)
+            if timeout_seconds is None:
+                fcntl.flock(descriptor, mode)
+            else:
+                deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+                while True:
+                    try:
+                        fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.02)
             acquired = True
             visible = os.lstat(path)
             held = os.fstat(descriptor)
@@ -5231,6 +5377,400 @@ class VerifiedRecoveryManager:
         identity_trusted = self.store._verify_receipt_authenticator(payload)
         return payload, identity_trusted
 
+    def _guarded_capture_state_locked(
+        self,
+        *,
+        capture_lock_token: object,
+    ) -> dict[str, Any]:
+        """Return strict content-bound capture/ledger state under both locks."""
+
+        with self._held_capture_maintenance_lock(capture_lock_token):
+            root_provenance = self._validate_capture_source_root()
+            status = self.daemon.status()
+            blocking_count_fields = (
+                "pending_file_count",
+                "inbox_temp_file_count",
+                "processing_file_count",
+                "processing_empty_claim_count",
+                "processing_malformed_claim_count",
+                "error_file_count",
+                "unresolved_error_count",
+                "unsafe_error_artifact_count",
+                "error_resolution_pending_count",
+                "error_resolution_failed_count",
+            )
+            blocking_counts = {
+                field: int(status.get(field) or 0)
+                for field in blocking_count_fields
+            }
+            if (
+                status.get("transport_ready") is not True
+                or status.get("missing_transport_directories")
+                or status.get("unsafe_transport_directories")
+                or any(blocking_counts.values())
+            ):
+                raise RuntimeError(
+                    "capture transport is not quiescent for guarded recovery "
+                    f"(blocking_counts={blocking_counts!r})"
+                )
+            with closing(self.store._connect_read_only()) as conn:
+                with self.store._transaction(conn):
+                    ledger_audit = self._capture_ledger_audit_locked(
+                        conn,
+                        sample_limit=20,
+                    )
+                    ledger_bindings = self._snapshot_capture_ledger_bindings(conn)
+            if ledger_audit["status"] != "ready":
+                raise RuntimeError(
+                    "capture ledger reconciliation is required before guarded recovery"
+                )
+            inventory = self._capture_inventory(
+                ledger_ids=set(ledger_bindings),
+                database_binding={"guarded_recovery_state": True},
+                initialize_transport=False,
+            )
+            reconciliation = dict(inventory["reconciliation"])
+            if any(
+                int(reconciliation.get(field) or 0)
+                for field in (
+                    "replay_required_capture_count",
+                    "replay_required_file_count",
+                    "identifierless_replay_file_count",
+                    "unclassified_file_count",
+                    "missing_authoritative_ledger_count",
+                )
+            ):
+                raise RuntimeError(
+                    "capture transport has replay-required work during guarded recovery"
+                )
+            transport_revision = self._exact_json_digest(
+                {
+                    "capture_root": root_provenance,
+                    "files": inventory["files"],
+                    "reconciliation": reconciliation,
+                    "ledger_audit_revision": ledger_audit["audit_revision"],
+                }
+            )
+            return {
+                "capture_root_provenance": str(
+                    root_provenance["capture_root_provenance"]
+                ),
+                "capture_root_identity_digest": str(
+                    root_provenance["capture_root_identity_digest"]
+                ),
+                "transport_revision": transport_revision,
+                "transport_ready": True,
+                "pending_file_count": 0,
+                "processing_file_count": 0,
+                "unresolved_error_count": 0,
+                "unsafe_error_artifact_count": 0,
+                "error_resolution_pending_count": 0,
+                "capture_file_count": int(inventory["file_count"]),
+                "capture_total_bytes": int(inventory["total_bytes"]),
+                "ledger_capture_count": len(ledger_bindings),
+                "ledger_audit_revision": str(ledger_audit["audit_revision"]),
+                "ledger_verification_passed": bool(
+                    ledger_audit["verification_passed"]
+                ),
+                "ledger_audit": self._public_capture_ledger_audit(ledger_audit),
+                "reconciliation": reconciliation,
+                "verified": True,
+                "checked_at": time.time(),
+            }
+
+    def _assert_guarded_recovery_authority(self) -> None:
+        """Require one active, unclaimed exclusive core lease for certification.
+
+        Guarded recovery is an offline certification lane.  A shared local
+        lease cannot fence sibling writers, while a claimed live-v6 lease may
+        still serve mutations in the same process.  The narrow maintenance
+        opener supplies the only accepted authority shape: an active core
+        lease bound to this exact database but not yet durably claimed.
+        """
+
+        lease = getattr(self.store, "_authority_lease", None)
+        if lease is None:
+            raise RuntimeError(
+                "guarded recovery requires an explicit exclusive core authority lease"
+            )
+        lease.assert_core_for(self.store.db_path)
+        if lease.durable_epoch is not None:
+            raise RuntimeError(
+                "guarded recovery requires an offline unclaimed core authority lease"
+            )
+        if getattr(self.store, "_owns_authority_lease", True):
+            raise RuntimeError(
+                "guarded recovery requires a caller-owned core authority lease"
+            )
+
+    @staticmethod
+    def _require_zero_replay_debt(
+        payload: dict[str, Any],
+        *,
+        stage: str,
+    ) -> None:
+        reconciliation = payload.get("reconciliation")
+        if not isinstance(reconciliation, dict):
+            raise RuntimeError(f"{stage} recovery evidence lost reconciliation")
+        blocking = {
+            field: int(reconciliation.get(field) or 0)
+            for field in (
+                "replay_required_capture_count",
+                "replay_required_file_count",
+                "identifierless_replay_file_count",
+                "unclassified_file_count",
+                "missing_authoritative_ledger_count",
+            )
+        }
+        if any(blocking.values()):
+            raise RuntimeError(
+                f"{stage} recovery evidence has replay debt {blocking!r}"
+            )
+
+    def _guarded_recovery_postflight_locked(
+        self,
+        *,
+        capture_lock_token: object,
+        before: dict[str, Any],
+        verification: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Prove live memory, journal, runtime, capture, and ledger did not drift."""
+
+        with self._held_capture_maintenance_lock(capture_lock_token):
+            if verification.get("verified") is not True:
+                raise RuntimeError("guarded recovery bundle verification is incomplete")
+            if verification.get("cutover_ready") is not True:
+                raise RuntimeError("guarded recovery bundle is not cutover ready")
+            self._require_zero_replay_debt(verification, stage="verified bundle")
+            self._assert_memory_snapshot_fence(
+                expected_logical_snapshot_sha256=str(
+                    verification["database"]["logical_snapshot_sha256"]
+                ),
+                expected_store_generation=str(verification["store_generation"]),
+            )
+            request_journal = verification.get("request_journal")
+            if verification["governance_mode"] == "authoritative-v6":
+                if not isinstance(request_journal, dict):
+                    raise RuntimeError(
+                        "guarded authoritative recovery lost request-journal evidence"
+                    )
+                live_journal = self.recompute_request_journal_logical_digest(
+                    maximum_authority_epoch=int(
+                        verification["database"]["authority_epoch_number"]
+                    )
+                )
+                if (
+                    not secrets.compare_digest(
+                        str(live_journal["logical_snapshot_sha256"]),
+                        str(request_journal["logical_snapshot_sha256"]),
+                    )
+                    or str(live_journal["journal_id"])
+                    != str(request_journal["journal_id"])
+                    or str(live_journal["store_identity"])
+                    != str(verification["store_identity"])
+                ):
+                    raise RuntimeError(
+                        "request journal changed during guarded recovery"
+                    )
+            runtime_state = verification.get("runtime_state")
+            live_runtime = self.recompute_live_runtime_state_binding(
+                required=verification["governance_mode"] == "authoritative-v6"
+            )
+            if runtime_state is None:
+                if live_runtime.get("present") is True:
+                    raise RuntimeError(
+                        "runtime-state presence changed during guarded recovery"
+                    )
+            elif (
+                live_runtime.get("present") is not True
+                or not secrets.compare_digest(
+                    str(live_runtime["artifact_sha256"]),
+                    str(runtime_state["sha256"]),
+                )
+                or not secrets.compare_digest(
+                    str(live_runtime["canonical_sha256"]),
+                    str(runtime_state["canonical_sha256"]),
+                )
+            ):
+                raise RuntimeError("runtime state changed during guarded recovery")
+
+            after = self._guarded_capture_state_locked(
+                capture_lock_token=capture_lock_token
+            )
+            if (
+                not secrets.compare_digest(
+                    str(after["transport_revision"]),
+                    str(before["transport_revision"]),
+                )
+                or not secrets.compare_digest(
+                    str(after["ledger_audit_revision"]),
+                    str(before["ledger_audit_revision"]),
+                )
+            ):
+                raise RuntimeError(
+                    "capture transport or ledger changed during guarded recovery"
+                )
+            with closing(self.store._connect_read_only()) as conn:
+                with self.store._transaction(conn):
+                    ledger_bindings = self._snapshot_capture_ledger_bindings(conn)
+            live_manifest = self._capture_inventory(
+                ledger_ids=set(ledger_bindings),
+                database_binding=dict(verification["capture_database_binding"]),
+                initialize_transport=False,
+            )
+            if not secrets.compare_digest(
+                str(live_manifest["manifest_sha256"]),
+                str(verification["capture_manifest_sha256"]),
+            ):
+                raise RuntimeError(
+                    "live capture state does not match the verified recovery bundle"
+                )
+            return after
+
+    @contextmanager
+    def guarded_recovery_transaction(
+        self,
+        output_root: str | os.PathLike[str],
+        *,
+        path: str | os.PathLike[str] | None = None,
+        purpose: str = "operator-certification",
+        pinned: bool = True,
+    ) -> Iterator[GuardedRecoveryPublication]:
+        """Create, verify, restore, and publish evidence under one lock scope.
+
+        The yielded publication gate runs one final postflight before invoking
+        its callback. Repository and global capture-maintenance locks remain
+        held through that callback, and no fallible validation runs after it.
+        Entry and prepublication both enforce a caller-owned, unclaimed,
+        exclusive :class:`CoreAuthorityLease` for the exact memory store.
+        """
+
+        self._assert_guarded_recovery_authority()
+        with self._repository_lock():
+            paths = self.daemon.paths()
+            missing, unsafe = self.daemon._observe_transport_dirs(paths)
+            if missing or unsafe:
+                raise RuntimeError(
+                    "guarded recovery requires an existing safe capture transport "
+                    f"(missing={missing!r}, unsafe={unsafe!r})"
+                )
+            root_provenance = self._validate_capture_source_root()
+            with self._capture_maintenance_lock(
+                existing_only=True,
+            ) as capture_lock_token:
+                before = self._guarded_capture_state_locked(
+                    capture_lock_token=capture_lock_token
+                )
+                bundle = self._create_bundle_capture_locked(
+                    path,
+                    purpose=purpose,
+                    pinned=pinned,
+                    paths=paths,
+                    root_provenance=root_provenance,
+                    capture_lock_token=capture_lock_token,
+                )
+                bundle_receipt, _identity_trusted = self._read_bundle_receipt(
+                    Path(str(bundle["bundle_receipt_path"]))
+                )
+                expected_journal_sha256 = (
+                    str(bundle_receipt["request_journal_sha256"])
+                    if bundle_receipt.get("request_journal_sha256")
+                    else None
+                )
+                expected_runtime_sha256 = (
+                    str(bundle_receipt["runtime_state_sha256"])
+                    if bundle_receipt.get("runtime_state_sha256")
+                    else None
+                )
+                verification = self._verify_bundle_locked(
+                    bundle["bundle_receipt_path"],
+                    expected_database_sha256=str(bundle["sha256"]),
+                    expected_capture_sha256=str(bundle["capture_archive_sha256"]),
+                    expected_request_journal_sha256=expected_journal_sha256,
+                    expected_runtime_state_sha256=expected_runtime_sha256,
+                )
+                restore = self._restore_bundle_isolated_locked(
+                    bundle["bundle_receipt_path"],
+                    output_root,
+                    expected_database_sha256=str(bundle["sha256"]),
+                    expected_capture_sha256=str(bundle["capture_archive_sha256"]),
+                    expected_request_journal_sha256=expected_journal_sha256,
+                    expected_runtime_state_sha256=expected_runtime_sha256,
+                    confirm=True,
+                )
+                self._require_zero_replay_debt(bundle, stage="created bundle")
+                self._require_zero_replay_debt(restore, stage="isolated restore")
+                if (
+                    restore.get("verified") is not True
+                    or restore.get("cutover_ready") is not True
+                ):
+                    raise RuntimeError("guarded isolated recovery proof is incomplete")
+                after = self._guarded_recovery_postflight_locked(
+                    capture_lock_token=capture_lock_token,
+                    before=before,
+                    verification=verification,
+                )
+                evidence = {
+                    "schema": GUARDED_RECOVERY_TRANSACTION_SCHEMA,
+                    "action": "guarded-recovery-transaction",
+                    "bundle": bundle,
+                    "verification": verification,
+                    "restore": restore,
+                    "capture_transport_before": before,
+                    "capture_transport_after": after,
+                    "capture_ledger_before": dict(before["ledger_audit"]),
+                    "capture_ledger_after": dict(after["ledger_audit"]),
+                    "lock_scope": {
+                        "repository": "held-through-context-exit",
+                        "capture_maintenance": "held-through-context-exit",
+                    },
+                    "replay_required_file_count": 0,
+                    "pending_file_count": 0,
+                    "processing_file_count": 0,
+                    "cutover_ready": True,
+                    "verified": True,
+                    "completed_at": time.time(),
+                }
+
+                def prepublish() -> dict[str, Any]:
+                    self._assert_guarded_recovery_authority()
+                    return self._guarded_recovery_postflight_locked(
+                        capture_lock_token=capture_lock_token,
+                        before=before,
+                        verification=verification,
+                    )
+
+                publication = GuardedRecoveryPublication(
+                    evidence,
+                    prepublish=prepublish,
+                )
+                try:
+                    yield publication
+                finally:
+                    if not publication.publication_attempted:
+                        release_state = prepublish()
+                        evidence["capture_transport_at_release"] = release_state
+                        evidence["released_at"] = time.time()
+
+    def create_verify_restore_guarded(
+        self,
+        output_root: str | os.PathLike[str],
+        *,
+        path: str | os.PathLike[str] | None = None,
+        purpose: str = "operator-certification",
+        pinned: bool = True,
+    ) -> dict[str, Any]:
+        """Consume :meth:`guarded_recovery_transaction` without a publish body."""
+
+        with self.guarded_recovery_transaction(
+            output_root,
+            path=path,
+            purpose=purpose,
+            pinned=pinned,
+        ) as publication:
+            publication.publish(lambda _evidence: None)
+            return publication.evidence
+
     def create_bundle(
         self,
         path: str | os.PathLike[str] | None = None,
@@ -5255,6 +5795,26 @@ class VerifiedRecoveryManager:
         paths = self.daemon.paths()
         self.daemon._ensure_transport_dirs(paths)
         root_provenance = self._validate_capture_source_root()
+        with self._capture_maintenance_lock() as capture_lock_token:
+            return self._create_bundle_capture_locked(
+                path,
+                purpose=purpose,
+                pinned=pinned,
+                paths=paths,
+                root_provenance=root_provenance,
+                capture_lock_token=capture_lock_token,
+            )
+
+    def _create_bundle_capture_locked(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        purpose: str,
+        pinned: bool,
+        paths: dict[str, Path],
+        root_provenance: dict[str, Any],
+        capture_lock_token: object,
+    ) -> dict[str, Any]:
         live_governance = self._live_store_governance()
         journal_required = (
             live_governance["governance_mode"] == "authoritative-v6"
@@ -5271,12 +5831,7 @@ class VerifiedRecoveryManager:
         runtime_state_artifact_path: Path | None = None
         publication_id: str | None = None
         publication_completed_path: Path | None = None
-        with self.daemon._exclusive_lock(
-            paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
-            blocking=True,
-        ) as acquired:
-            if not acquired:
-                raise RuntimeError("capture maintenance lock is unavailable")
+        with self._held_capture_maintenance_lock(capture_lock_token):
             locked_root_provenance = self._validate_capture_source_root()
             if locked_root_provenance != root_provenance:
                 raise RuntimeError(
@@ -5847,7 +6402,7 @@ class VerifiedRecoveryManager:
                 }
                 self.store._authenticate_receipt(receipt)
                 self.store._write_private_json_exclusive(bundle_receipt_path, receipt)
-                verified = self.verify_bundle(bundle_receipt_path)
+                verified = self._verify_bundle_locked(bundle_receipt_path)
                 publication_completed = {
                     "schema": RECOVERY_PUBLICATION_RECEIPT_SCHEMA,
                     "state": "completed",
@@ -6575,7 +7130,7 @@ class VerifiedRecoveryManager:
         target_root = Path(output_root).expanduser().absolute()
         if target_root.exists() or target_root.is_symlink():
             raise FileExistsError("recovery output root already exists")
-        verified = self.verify_bundle(
+        verified = self._verify_bundle_locked(
             receipt_path,
             expected_database_sha256=expected_database_sha256,
             expected_capture_sha256=expected_capture_sha256,

@@ -49,16 +49,30 @@ from recovery_manager import (  # noqa: E402
     VerifiedRecoveryManager,
 )
 from redaction import SecretSafeArgumentParser  # noqa: E402
+from operator_readiness_contract import (  # noqa: E402
+    OPERATOR_READINESS_REQUIRED_PROOF_IDS,
+    QUIESCENCE_POLICY_SCHEMA,
+    REPLAY_DEBT_COUNTERS,
+    quiescence_policy_contract,
+    quiescence_policy_digest,
+    quiescence_launch_agent_rules,
+    ready_operator_proof_contract,
+)
 
 
-DEFAULT_CAPTURE_LABEL = "aero.boom.synapse-s2.capture-daemon"
-DEFAULT_DASHBOARD_LABEL = "aero.boom.synapse-s2.dashboard"
-DEFAULT_CORE_LABEL = "aero.boom.synapse-s2.core"
+_QUIESCENCE_RULES = quiescence_launch_agent_rules()
+DEFAULT_CAPTURE_LABEL = _QUIESCENCE_RULES["capture"].label
+DEFAULT_DASHBOARD_LABEL = _QUIESCENCE_RULES["dashboard"].label
+DEFAULT_CORE_LABEL = _QUIESCENCE_RULES["core"].label
 MAX_PROCESS_FINDINGS = 12
 MAX_JSON_BYTES = 4 * 1024 * 1024
 _GIT_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _PID_LINE = re.compile(r"^\s*(\d+)\s+(.*)$")
 _LABEL = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+_DISABLED_SERVICE_LINE = re.compile(
+    r'^\s*"?(?P<label>[A-Za-z0-9._-]{1,160})"?\s*=>\s*'
+    r'(?P<disabled>true|false|enabled|disabled)\s*,?\s*$'
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _STORE_IDENTITY = re.compile(r"^store-[0-9a-f]{24}$")
 _STORE_GENERATION = re.compile(r"^epoch-[1-9][0-9]*$")
@@ -1188,6 +1202,62 @@ def _launchctl_domain_contains_label(text: str, *, label: str) -> bool:
     return False
 
 
+def _parse_launchctl_disabled_services(
+    text: str,
+    *,
+    labels: Iterable[str],
+) -> dict[str, bool | None]:
+    """Parse exact launchd disabled overrides without inferring absence."""
+
+    if len(text.encode("utf-8", errors="replace")) > MAX_JSON_BYTES:
+        raise CutoverPreflightError(
+            "launchd disabled-state inventory exceeds its size limit"
+        )
+    selected = set(labels)
+    states: dict[str, bool | None] = {label: None for label in selected}
+    observed: set[str] = set()
+    for raw_line in text.splitlines():
+        match = _DISABLED_SERVICE_LINE.fullmatch(raw_line)
+        if match is None:
+            continue
+        label = match.group("label")
+        if label not in selected:
+            continue
+        if label in observed:
+            raise CutoverPreflightError(
+                "launchd disabled-state inventory contains a duplicate service"
+            )
+        states[label] = match.group("disabled") in {"true", "disabled"}
+        observed.add(label)
+    return states
+
+
+def launchctl_disabled_service_states(
+    *,
+    launchctl_bin: str | os.PathLike[str],
+    uid: int,
+    labels: Iterable[str],
+) -> dict[str, bool | None]:
+    """Return exact disabled overrides; ``None`` means not positively disabled."""
+
+    selected = tuple(labels)
+    if any(
+        not isinstance(label, str)
+        or _LABEL.fullmatch(label) is None
+        or contains_secret_shape(label)
+        for label in selected
+    ):
+        raise CutoverPreflightError("LaunchAgent inventory label is invalid")
+    result = _run_read_only(
+        [str(launchctl_bin), "print-disabled", f"gui/{int(uid)}"]
+    )
+    if result.returncode != 0:
+        raise CutoverPreflightError(
+            "launchd disabled-state inventory is unavailable"
+        )
+    return _parse_launchctl_disabled_services(result.stdout, labels=selected)
+
+
 def launchctl_service_snapshot(
     *,
     launchctl_bin: str | os.PathLike[str],
@@ -1225,13 +1295,18 @@ def collect_launchagent_inventory(
     labels: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     uid_value = os.getuid() if uid is None else int(uid)
-    selected = dict(
-        labels
-        or {
-            "capture": DEFAULT_CAPTURE_LABEL,
-            "dashboard": DEFAULT_DASHBOARD_LABEL,
-            "core": DEFAULT_CORE_LABEL,
-        }
+    rules = quiescence_launch_agent_rules()
+    selected = {category: rule.label for category, rule in rules.items()}
+    if labels is not None:
+        selected.update(dict(labels))
+    # The reviewed external respawner cannot be renamed or omitted by a caller
+    # supplying test/deployment overrides for the three SYNAPSE-S2 labels.
+    respawner_category = "master_mold_capture_respawner"
+    selected[respawner_category] = rules[respawner_category].label
+    disabled_states = launchctl_disabled_service_states(
+        launchctl_bin=launchctl_bin,
+        uid=uid_value,
+        labels=selected.values(),
     )
     inventory: dict[str, dict[str, Any]] = {}
     for category, label in selected.items():
@@ -1240,8 +1315,33 @@ def collect_launchagent_inventory(
             uid=uid_value,
             label=label,
         )
-        inventory[category] = {"label": label, **snapshot}
+        disabled = disabled_states[label]
+        rule = rules.get(category)
+        inventory[category] = {
+            "label": label,
+            **snapshot,
+            "disabled": disabled,
+            "enabled": None if disabled is None else not disabled,
+            "quiescence_policy_schema": QUIESCENCE_POLICY_SCHEMA,
+            "require_disabled_when_unloaded": bool(
+                rule is not None and rule.require_disabled_when_unloaded
+            ),
+        }
     return inventory
+
+
+def launchagent_quiescence_blockers(
+    inventory: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Return loaded services and respawners not positively disabled."""
+
+    blockers: list[str] = []
+    for category, snapshot in inventory.items():
+        loaded = snapshot.get("loaded") is True
+        require_disabled = snapshot.get("require_disabled_when_unloaded") is True
+        if loaded or (require_disabled and snapshot.get("disabled") is not True):
+            blockers.append(category)
+    return sorted(blockers)
 
 
 @contextmanager
@@ -1336,6 +1436,85 @@ def _check_by_id(manifest: Mapping[str, Any], check_id: str) -> Mapping[str, Any
     return result
 
 
+def _validate_operator_readiness_proof_contract(
+    manifest: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    """Validate the complete producer/consumer proof contract exactly."""
+
+    checks = manifest.get("checks")
+    if not isinstance(checks, list):
+        raise CutoverPreflightError("evidence manifest checks are invalid")
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for item in checks:
+        if not isinstance(item, dict):
+            raise CutoverPreflightError("evidence manifest checks are invalid")
+        check_id = item.get("check_id")
+        if (
+            not isinstance(check_id, str)
+            or _LABEL.fullmatch(check_id) is None
+            or contains_secret_shape(check_id)
+        ):
+            raise CutoverPreflightError("evidence manifest check identity is invalid")
+        if type(item.get("required")) is not bool:
+            raise CutoverPreflightError("evidence manifest check requirement is invalid")
+        if check_id in by_id:
+            raise CutoverPreflightError(
+                "evidence manifest check identities are not unique"
+            )
+        by_id[check_id] = item
+
+    expected_ids = tuple(OPERATOR_READINESS_REQUIRED_PROOF_IDS)
+    expected_set = set(expected_ids)
+    required_set = {
+        check_id
+        for check_id, item in by_id.items()
+        if item.get("required") is True
+    }
+    if required_set != expected_set:
+        raise CutoverPreflightError(
+            "evidence manifest required proof set does not match its contract"
+        )
+    if any(by_id[check_id].get("status") != "ready" for check_id in expected_ids):
+        raise CutoverPreflightError("one or more required evidence checks are not ready")
+
+    if manifest.get("required_proof_contract") != ready_operator_proof_contract():
+        raise CutoverPreflightError(
+            "evidence manifest required proof contract is invalid"
+        )
+    expected_total = len(expected_ids)
+    if (
+        type(manifest.get("required_total")) is not int
+        or manifest.get("required_total") != expected_total
+        or type(manifest.get("required_ready")) is not int
+        or manifest.get("required_ready") != expected_total
+        or manifest.get("failed_required") != []
+    ):
+        raise CutoverPreflightError(
+            "evidence manifest required proof totals are invalid"
+        )
+    proofs = manifest.get("proofs")
+    if not isinstance(proofs, dict) or set(proofs) != expected_set:
+        raise CutoverPreflightError("evidence manifest proof summary is invalid")
+    if any(proofs[check_id] != by_id[check_id] for check_id in expected_ids):
+        raise CutoverPreflightError(
+            "evidence manifest proof summary does not match its checks"
+        )
+    return by_id
+
+
+def _validate_zero_replay_debt(
+    reconciliation: Any,
+    *,
+    name: str,
+) -> None:
+    if not isinstance(reconciliation, dict):
+        raise CutoverPreflightError(f"{name} is missing")
+    for key in REPLAY_DEBT_COUNTERS:
+        value = reconciliation.get(key)
+        if type(value) is not int or value != 0:
+            raise CutoverPreflightError(f"{name} contains unresolved work")
+
+
 def _validate_recovery_metrics(check: Mapping[str, Any], *, restore: bool = False) -> None:
     metrics = check.get("metrics")
     if not isinstance(metrics, dict):
@@ -1347,17 +1526,10 @@ def _validate_recovery_metrics(check: Mapping[str, Any], *, restore: bool = Fals
     binding = metrics.get("capture_ledger_binding")
     if not isinstance(binding, dict) or binding.get("verified") is not True:
         raise CutoverPreflightError("capture ledger binding is not verified")
-    reconciliation = metrics.get("reconciliation")
-    if not isinstance(reconciliation, dict):
-        raise CutoverPreflightError("recovery reconciliation is missing")
-    for key in (
-        "missing_authoritative_ledger_count",
-        "replay_required_capture_count",
-        "replay_required_file_count",
-        "unclassified_file_count",
-    ):
-        if type(reconciliation.get(key)) is not int or int(reconciliation[key]) != 0:
-            raise CutoverPreflightError("recovery reconciliation contains unresolved work")
+    _validate_zero_replay_debt(
+        metrics.get("reconciliation"),
+        name="recovery reconciliation",
+    )
 
 
 def _validate_restore_governance(proof: Mapping[str, Any]) -> str:
@@ -1516,14 +1688,16 @@ def validate_evidence_contract(
         manifest.get("core_config_contract"),
         expected_config_fingerprint=expected_config_fingerprint,
     )
-    all_checks = manifest.get("checks")
-    if not isinstance(all_checks, list) or any(
-        isinstance(item, dict)
-        and item.get("required") is True
-        and item.get("status") != "ready"
-        for item in all_checks
+    if (
+        manifest.get("quiescence_policy_contract")
+        != quiescence_policy_contract()
+        or manifest.get("quiescence_policy_digest")
+        != quiescence_policy_digest()
     ):
-        raise CutoverPreflightError("one or more required evidence checks are not ready")
+        raise CutoverPreflightError(
+            "operator-readiness quiescence policy binding is invalid"
+        )
+    _validate_operator_readiness_proof_contract(manifest)
 
     backup = _check_by_id(manifest, "recovery_backup")
     verify = _check_by_id(manifest, "recovery_verify")
@@ -1555,19 +1729,12 @@ def validate_evidence_contract(
         maximum_age_seconds=maximum_age,
     )
     parsed_binding = parsed.get("capture_ledger_binding")
-    parsed_reconciliation = parsed.get("reconciliation")
     if not isinstance(parsed_binding, dict) or parsed_binding.get("verified") is not True:
         raise CutoverPreflightError("verified capture ledger binding is missing")
-    if not isinstance(parsed_reconciliation, dict) or any(
-        int(parsed_reconciliation.get(key, -1)) != 0
-        for key in (
-            "missing_authoritative_ledger_count",
-            "replay_required_capture_count",
-            "replay_required_file_count",
-            "unclassified_file_count",
-        )
-    ):
-        raise CutoverPreflightError("verified recovery still requires replay or review")
+    _validate_zero_replay_debt(
+        parsed.get("reconciliation"),
+        name="verified recovery reconciliation",
+    )
     receipt_raw = parsed.get("bundle_receipt_path")
     if not isinstance(receipt_raw, str):
         raise CutoverPreflightError("verified recovery receipt path is missing")
@@ -1586,7 +1753,6 @@ def validate_evidence_contract(
     restore_proof = _read_json(restore_path, name="isolated restore proof")
     restore_governance = _validate_restore_governance(restore_proof)
     restore_binding = restore_proof.get("capture_ledger_binding")
-    restore_reconciliation = restore_proof.get("reconciliation")
     if (
         restore_proof.get("mode") != "isolated-recovery-proof"
         or restore_proof.get("verified") is not True
@@ -1594,18 +1760,12 @@ def validate_evidence_contract(
         or restore_proof.get("missing_transport_ledger_count") != 0
         or not isinstance(restore_binding, dict)
         or restore_binding.get("verified") is not True
-        or not isinstance(restore_reconciliation, dict)
-        or any(
-            int(restore_reconciliation.get(key, -1)) != 0
-            for key in (
-                "missing_authoritative_ledger_count",
-                "replay_required_capture_count",
-                "replay_required_file_count",
-                "unclassified_file_count",
-            )
-        )
     ):
         raise CutoverPreflightError("isolated restore proof is not cutover-ready")
+    _validate_zero_replay_debt(
+        restore_proof.get("reconciliation"),
+        name="isolated restore reconciliation",
+    )
     if (
         parsed.get("governance_mode") != restore_governance
         or parsed.get("store_identity") != restore_proof.get("store_identity")
@@ -2315,9 +2475,10 @@ def run_preflight(
     ]
     quiescence_loaded = [
         category
-        for category in ("capture", "dashboard", "core")
-        if bool(launch_agents.get(category, {}).get("loaded"))
+        for category, snapshot in launch_agents.items()
+        if snapshot.get("loaded") is True
     ]
+    quiescence_blockers = launchagent_quiescence_blockers(launch_agents)
     result: dict[str, Any] = {
         "schema": "synapse-s2.core-cutover-preflight.v1",
         "ready": False,
@@ -2327,13 +2488,17 @@ def run_preflight(
         "launch_agents": launch_agents,
         "legacy_loaded_categories": legacy_loaded,
         "quiescence_loaded_categories": quiescence_loaded,
+        "quiescence_policy_schema": QUIESCENCE_POLICY_SCHEMA,
+        "quiescence_policy_digest": quiescence_policy_digest(),
+        "quiescence_policy_blockers": quiescence_blockers,
     }
     if inventory_only:
-        result["ready"] = not processes and not quiescence_loaded
+        result["ready"] = not processes and not quiescence_blockers
         return result
-    if require_quiescent and (processes or quiescence_loaded):
+    if require_quiescent and (processes or quiescence_blockers):
         raise CutoverPreflightError(
-            "local writers remain; stop the reported exact PIDs and LaunchAgents"
+            "local writers or respawners remain; stop the reported exact PIDs "
+            "and disable the reported LaunchAgents"
         )
     if evidence_manifest is None:
         raise CutoverPreflightError("install requires an explicit evidence manifest")

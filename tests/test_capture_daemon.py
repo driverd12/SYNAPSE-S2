@@ -4,6 +4,7 @@ import hashlib
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -106,6 +107,47 @@ class FailProcessedMoveOnceDaemon(CaptureInboxDaemon):
 
 
 class CaptureInboxDaemonTests(unittest.TestCase):
+    def test_first_use_backend_initialization_occurs_outside_capture_lock(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daemon = CaptureInboxDaemon(root=root)
+            daemon.prepare_transport()
+            invalid = root / "capture_inbox" / "invalid.json"
+            invalid.write_text("{not-json", encoding="utf-8")
+            invalid.chmod(0o600)
+            original_lock = daemon._exclusive_lock
+            state = {"lock_depth": 0, "backend_calls": 0}
+
+            @contextmanager
+            def observed_lock(*args, **kwargs):
+                with original_lock(*args, **kwargs) as acquired:
+                    if acquired:
+                        state["lock_depth"] += 1
+                    try:
+                        yield acquired
+                    finally:
+                        if acquired:
+                            state["lock_depth"] -= 1
+
+            def backend_factory():
+                self.assertEqual(state["lock_depth"], 0)
+                state["backend_calls"] += 1
+                return RecordingBackend()
+
+            with (
+                patch.object(daemon, "_exclusive_lock", side_effect=observed_lock),
+                patch.object(
+                    capture_daemon.mlx_backend,
+                    "get_backend",
+                    side_effect=backend_factory,
+                ),
+            ):
+                result = daemon.process_once(max_files=1)
+
+            self.assertEqual(state["backend_calls"], 1)
+            self.assertEqual(state["lock_depth"], 0)
+            self.assertEqual(result["error_file_count"], 1)
+
     def test_capture_lock_rejects_wrong_mode_symlink_and_hardlink(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

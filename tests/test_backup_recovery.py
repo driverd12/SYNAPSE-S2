@@ -41,6 +41,7 @@ from memory_store import (
 from mlx_backend import SpikingAttentionBackend
 from recovery_manager import (
     CAPTURE_ARCHIVE_MANIFEST_SCHEMA,
+    GUARDED_RECOVERY_TRANSACTION_SCHEMA,
     LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
     RECOVERY_BUNDLE_RESTORE_SCHEMA,
     RECOVERY_BUNDLE_SCHEMA,
@@ -121,6 +122,35 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             pinned=True,
         )
         return manager, bundle, capture_id
+
+    @staticmethod
+    def _offline_guarded_manager(
+        manager: VerifiedRecoveryManager,
+        *,
+        capture_root: Path,
+    ) -> tuple[VerifiedRecoveryManager, DurableMemoryStore, CoreAuthorityLease]:
+        db_path = manager.store.db_path
+        runtime_state_path = manager.runtime_state_path
+        manager.store.close()
+        authority = CoreAuthorityLease.acquire_core(
+            db_path,
+            timeout_seconds=0.0,
+            instance_id="guarded-recovery-test",
+        )
+        try:
+            store = DurableMemoryStore.open_existing_for_core_maintenance(
+                db_path,
+                authority_lease=authority,
+            )
+            guarded = VerifiedRecoveryManager(
+                store,
+                capture_root=capture_root,
+                runtime_state_path=runtime_state_path,
+            )
+            return guarded, store, authority
+        except BaseException:
+            authority.close()
+            raise
 
     @staticmethod
     def _capture_manifest(path: str | Path) -> dict:
@@ -773,6 +803,397 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             )
             self.assertIn(capture_id, receipt_text)
             self.assertIn(capture_id, processed_text)
+
+    def test_guarded_recovery_transaction_holds_capture_lock_through_yield(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager, _bundle, _capture_id = self._capture_backed_bundle(root)
+            manager, maintenance_store, maintenance_authority = (
+                self._offline_guarded_manager(manager, capture_root=root)
+            )
+            producer_started = threading.Event()
+            producer_finished = threading.Event()
+            producer_errors: list[BaseException] = []
+            produced_paths: list[Path] = []
+
+            def produce() -> None:
+                producer_started.set()
+                try:
+                    produced_paths.append(
+                        write_capture_drop(
+                            root=root,
+                            context_id="recovery-tests",
+                            source_tag="guarded-recovery-lock",
+                            speaker="codex",
+                            text=(
+                                "The producer must remain fenced until operator "
+                                "evidence publication exits the guarded scope."
+                            ),
+                            capture_id=(
+                                "s2cap_81818181818181818181818181818181"
+                            ),
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - diagnostic path
+                    producer_errors.append(exc)
+                finally:
+                    producer_finished.set()
+
+            worker = threading.Thread(
+                target=produce,
+                name="guarded-recovery-producer",
+            )
+            try:
+                with mock.patch.object(
+                    subprocess,
+                    "run",
+                    side_effect=AssertionError(
+                        "guarded recovery must not spawn CLI child processes"
+                    ),
+                ), mock.patch.object(
+                    manager,
+                    "_guarded_recovery_postflight_locked",
+                    wraps=manager._guarded_recovery_postflight_locked,
+                ) as postflight:
+                    with manager.guarded_recovery_transaction(
+                        root / "guarded-restore",
+                        path=root / "guarded.sqlite3",
+                        purpose="unit-test",
+                    ) as publication:
+                        evidence = publication.evidence
+                        worker.start()
+                        self.assertTrue(producer_started.wait(timeout=2.0))
+                        self.assertFalse(producer_finished.wait(timeout=0.15))
+                        self.assertEqual(
+                            evidence["schema"],
+                            GUARDED_RECOVERY_TRANSACTION_SCHEMA,
+                        )
+                        self.assertTrue(evidence["verified"])
+                        self.assertTrue(evidence["cutover_ready"])
+                        self.assertEqual(evidence["pending_file_count"], 0)
+                        self.assertEqual(evidence["processing_file_count"], 0)
+                        self.assertEqual(evidence["replay_required_file_count"], 0)
+                        self.assertEqual(
+                            evidence["capture_ledger_before"]["audit_revision"],
+                            evidence["capture_ledger_after"]["audit_revision"],
+                        )
+                        self.assertEqual(
+                            evidence["capture_transport_before"][
+                                "transport_revision"
+                            ],
+                            evidence["capture_transport_after"][
+                                "transport_revision"
+                            ],
+                        )
+                        publication.publish(
+                            lambda published_evidence: (
+                                self.assertFalse(
+                                    producer_finished.wait(timeout=0.15)
+                                ),
+                                json.dumps(published_evidence, sort_keys=True),
+                            )
+                        )
+                self.assertEqual(postflight.call_count, 2)
+            finally:
+                maintenance_store.close()
+                maintenance_authority.close()
+
+            self.assertTrue(producer_finished.wait(timeout=5.0))
+            worker.join(timeout=5.0)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(producer_errors)
+            self.assertEqual(len(produced_paths), 1)
+            self.assertTrue(produced_paths[0].is_file())
+            self.assertIn("capture_transport_at_publication", evidence)
+            self.assertIn("publication_gate_completed_at", evidence)
+
+    def test_guarded_recovery_rejects_shared_local_authority_before_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager, _bundle, _capture_id = self._capture_backed_bundle(root)
+            target = root / "must-not-publish.sqlite3"
+            restore_root = root / "must-not-restore"
+            try:
+                with self.assertRaisesRegex(
+                    CoreAuthorityError,
+                    "authoritative core lease is not active",
+                ):
+                    with manager.guarded_recovery_transaction(
+                        restore_root,
+                        path=target,
+                        purpose="unit-test",
+                    ):
+                        self.fail("shared local authority must not enter the guard")
+                self.assertFalse(target.exists())
+                self.assertFalse(restore_root.exists())
+            finally:
+                manager.store.close()
+
+    def test_guarded_recovery_revalidates_core_lease_before_publication(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager, _bundle, _capture_id = self._capture_backed_bundle(root)
+            manager, maintenance_store, maintenance_authority = (
+                self._offline_guarded_manager(manager, capture_root=root)
+            )
+            try:
+                with self.assertRaisesRegex(
+                    CoreAuthorityError,
+                    "lease is not active",
+                ):
+                    with manager.guarded_recovery_transaction(
+                        root / "closed-lease-restore",
+                        path=root / "closed-lease.sqlite3",
+                        purpose="unit-test",
+                    ) as publication:
+                        maintenance_authority.close()
+                        publication.publish(lambda _evidence: None)
+                self.assertFalse(publication.published)
+            finally:
+                maintenance_store.close()
+                maintenance_authority.close()
+
+    def test_guarded_recovery_capture_lock_contention_fails_without_waiting(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager, _bundle, _capture_id = self._capture_backed_bundle(root)
+            manager, maintenance_store, maintenance_authority = (
+                self._offline_guarded_manager(manager, capture_root=root)
+            )
+            lock_path = manager.daemon.paths()["lock_dir"] / GLOBAL_CAPTURE_LOCK
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import fcntl,os,sys,time; "
+                        "fd=os.open(sys.argv[1],os.O_RDWR); "
+                        "fcntl.flock(fd,fcntl.LOCK_EX); "
+                        "print('locked',flush=True); time.sleep(10)"
+                    ),
+                    str(lock_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "locked")
+                started = time.monotonic()
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "capture maintenance lock is busy",
+                ):
+                    with manager.guarded_recovery_transaction(
+                        root / "contended-restore",
+                        path=root / "contended.sqlite3",
+                        purpose="unit-test",
+                    ):
+                        self.fail("contended capture guard must not yield")
+                self.assertLess(time.monotonic() - started, 1.0)
+            finally:
+                child.terminate()
+                child.wait(timeout=5.0)
+                if child.stdout is not None:
+                    child.stdout.close()
+                if child.stderr is not None:
+                    child.stderr.close()
+                maintenance_store.close()
+                maintenance_authority.close()
+
+    def test_guarded_recovery_transaction_covers_authoritative_v6(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _bundle, _capture_id = self._capture_backed_bundle(root)
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store, authority, journal, claim = self._claim_governed_store(
+                db_path,
+                instance_id="guarded-recovery-authority",
+            )
+            journal.close()
+            store.close()
+            authority.close()
+            maintenance_authority = CoreAuthorityLease.acquire_core(
+                db_path,
+                timeout_seconds=0.0,
+                instance_id="guarded-v6-maintenance",
+            )
+            try:
+                maintenance_store = (
+                    DurableMemoryStore.open_existing_for_core_maintenance(
+                        db_path,
+                        authority_lease=maintenance_authority,
+                    )
+                )
+                manager = VerifiedRecoveryManager(
+                    maintenance_store,
+                    capture_root=root,
+                )
+                with manager.guarded_recovery_transaction(
+                    root / "guarded-v6-restore",
+                    path=root / "guarded-v6.sqlite3",
+                    purpose="unit-test",
+                ) as publication:
+                    evidence = publication.evidence
+                    self.assertEqual(
+                        evidence["verification"]["governance_mode"],
+                        "authoritative-v6",
+                    )
+                    self.assertEqual(
+                        evidence["verification"]["store_generation"],
+                        claim["authority_epoch"],
+                    )
+                    self.assertTrue(
+                        evidence["verification"]["request_journal"]["verified"]
+                    )
+                    self.assertTrue(
+                        evidence["verification"]["runtime_state"]["verified"]
+                    )
+                    publication.publish(lambda published: json.dumps(published))
+                self.assertTrue(publication.published)
+                self.assertTrue(evidence["restore"]["cutover_ready"])
+            finally:
+                maintenance_store.close()
+                maintenance_authority.close()
+
+    def test_guarded_recovery_rejects_pending_and_processing_before_artifacts(self):
+        for state in ("pending", "processing"):
+            with self.subTest(state=state), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store, _db_path = self._seed_store(root)
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                paths = manager.daemon.paths()
+                manager.daemon._ensure_transport_dirs(paths)
+                pending_path = write_capture_drop(
+                    root=root,
+                    context_id="recovery-tests",
+                    source_tag="guarded-recovery-preflight",
+                    speaker="codex",
+                    text="Unconsumed capture work must block guarded recovery.",
+                    capture_id=(
+                        "s2cap_82828282828282828282828282828282"
+                        if state == "pending"
+                        else "s2cap_83838383838383838383838383838383"
+                    ),
+                )
+                if state == "processing":
+                    claimed = manager.daemon._claim_inbox_file(
+                        inbox_path=pending_path,
+                        inbox_dir=paths["inbox_dir"],
+                        processing_dir=paths["processing_dir"],
+                    )
+                    self.assertIsNotNone(claimed)
+                manager, maintenance_store, maintenance_authority = (
+                    self._offline_guarded_manager(
+                        manager,
+                        capture_root=root,
+                    )
+                )
+                bundle_path = root / f"guarded-{state}.sqlite3"
+                restore_root = root / f"guarded-{state}-restore"
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "capture transport is not quiescent",
+                    ):
+                        with manager.guarded_recovery_transaction(
+                            restore_root,
+                            path=bundle_path,
+                            purpose="unit-test",
+                        ):
+                            self.fail("non-quiescent guarded recovery must not yield")
+                    self.assertFalse(restore_root.exists())
+                    self.assertEqual(list(root.glob(bundle_path.name + "*")), [])
+                finally:
+                    maintenance_store.close()
+                    maintenance_authority.close()
+
+    def test_guarded_recovery_does_not_initialize_missing_capture_transport(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, _db_path = self._seed_store(root)
+            manager = VerifiedRecoveryManager(store, capture_root=root)
+            transport_paths = manager.daemon.paths()
+            self.assertFalse(transport_paths["inbox_dir"].exists())
+            manager, maintenance_store, maintenance_authority = (
+                self._offline_guarded_manager(manager, capture_root=root)
+            )
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires an existing safe capture transport",
+                ):
+                    with manager.guarded_recovery_transaction(
+                        root / "missing-transport-restore",
+                        path=root / "missing-transport.sqlite3",
+                        purpose="unit-test",
+                    ):
+                        self.fail("missing transport must not enter guarded recovery")
+                for key in (
+                    "inbox_dir",
+                    "processing_dir",
+                    "processed_dir",
+                    "error_dir",
+                    "error_archive_dir",
+                    "error_resolution_dir",
+                    "receipt_dir",
+                    "lock_dir",
+                ):
+                    self.assertFalse(transport_paths[key].exists())
+            finally:
+                maintenance_store.close()
+                maintenance_authority.close()
+
+    def test_guarded_recovery_detects_runtime_drift_before_lock_release(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager, _bundle, _capture_id = self._capture_backed_bundle(root)
+            manager, maintenance_store, maintenance_authority = (
+                self._offline_guarded_manager(manager, capture_root=root)
+            )
+            runtime_state_path = root / "runtime_state.json"
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime state changed during guarded recovery",
+                ):
+                    with manager.guarded_recovery_transaction(
+                        root / "guarded-drift-restore",
+                        path=root / "guarded-drift.sqlite3",
+                        purpose="unit-test",
+                    ) as publication:
+                        runtime_state = json.loads(
+                            runtime_state_path.read_text(encoding="utf-8")
+                        )
+                        runtime_state["updated_at"] = float(
+                            runtime_state["updated_at"]
+                        ) + 1.0
+                        runtime_state_path.write_text(
+                            json.dumps(runtime_state, indent=2, sort_keys=True)
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                        runtime_state_path.chmod(0o600)
+                        publication.publish(lambda _evidence: None)
+            finally:
+                maintenance_store.close()
+                maintenance_authority.close()
+
+    def test_capture_maintenance_lock_reentry_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, _db_path = self._seed_store(root)
+            manager = VerifiedRecoveryManager(store, capture_root=root)
+            manager.daemon._ensure_transport_dirs(manager.daemon.paths())
+            with manager._repository_lock():
+                with manager._capture_maintenance_lock():
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "must not be reacquired",
+                    ):
+                        with manager._capture_maintenance_lock():
+                            self.fail("capture maintenance lock reentry must fail")
 
     def test_governed_bundle_restores_exact_request_journal_and_binding_receipt(self):
         with TemporaryDirectory() as tmp:
@@ -1730,7 +2151,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                 DurableMemoryStore(foreign_root / "memory.sqlite3"),
                 capture_root=foreign_root / "capture-root",
             )
-            original_verify = foreign_manager.verify_bundle
+            original_verify = foreign_manager._verify_bundle_locked
 
             def verify_then_swap(*args, **kwargs):
                 verified = original_verify(*args, **kwargs)
@@ -1748,7 +2169,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             try:
                 with mock.patch.object(
                     foreign_manager,
-                    "verify_bundle",
+                    "_verify_bundle_locked",
                     side_effect=verify_then_swap,
                 ), self.assertRaisesRegex(RuntimeError, "receipt changed"):
                     foreign_manager.restore_bundle_isolated(

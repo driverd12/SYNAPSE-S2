@@ -271,9 +271,13 @@ changing permissions on an existing caller-owned directory.
    Gracefully close each exact persistent MCP client first and wait for its
    `mcp_client_wrapper.py` process to exit. Its `finish()` path writes the final
    session-boundary capture and Cortex trace, so killing it after certification
-   would invalidate the evidence. Let the capture worker drain those final
-   writes, check the inbox again, then stop the exact legacy capture, dashboard,
-   and prior core LaunchAgents. Review exact PIDs and labels; never use `pkill`,
+   would invalidate the evidence. Pause or disable every exact automation or
+   LaunchAgent that can relaunch those clients, record how it will be restored,
+   and keep it paused until the authoritative core has reached stable accepted
+   health. A momentarily empty process list is not durable quiescence when a
+   respawner remains active. Let the capture worker drain the final writes,
+   check the inbox again, then stop the exact legacy capture, dashboard, and
+   prior core LaunchAgents. Review exact PIDs and labels; never use `pkill`,
    `killall`, or a broad command match.
 
    Run a separate read-only inventory before certification:
@@ -283,10 +287,14 @@ changing permissions on an existing caller-owned directory.
    ```
 
    Continue only when its JSON reports `ready: true`, an empty
-   `process_findings` array, `process_findings_truncated: false`, and an empty
-   `quiescence_loaded_categories` array. A capped inventory is not proof of
-   absence. Do not reopen a persistent MCP client or legacy worker after this
-   gate.
+   `process_findings` array, `process_findings_truncated: false`, an empty
+   `quiescence_loaded_categories` array, and an empty
+   `quiescence_policy_blockers` array. The reviewed policy requires the exact
+   `com.master-mold.imprint.inboxworker` respawner to be positively disabled as
+   well as unloaded. A capped or unavailable inventory is not proof of absence.
+   Do not reopen a persistent MCP client or legacy worker after this gate, and
+   treat any automatically relaunched client as an invalidation that requires
+   another inbox drain and a completely new evidence run.
 3. Produce a fresh, clean-HEAD operator-readiness evidence pack through the
    binding-backed launcher only after the preceding zero-writer proof:
 
@@ -307,10 +315,24 @@ changing permissions on an existing caller-owned directory.
    different backend. Recovery backup, signed verification, isolated restore,
    and every required proof must be ready and replay-free. The certifier's own
    bounded client processes complete their `finish()` writes before its later
-   signed recovery comparison; those transient processes do not authorize
-   reopening an external persistent wrapper. Treat the returned manifest as
-   immediately perishable and proceed directly to the next two commands.
-4. Run the read-only inventory and recovery binding gate:
+   bounded capture drain. It then acquires exclusive core authority and the
+   existing global capture lock, rechecks process and LaunchAgent inventory,
+   and performs backup, verification, isolated restore, and final evidence
+   capture in-process. The final postflight completes while both locks are
+   held. The recovery manager, temporary restore, store, and authority lease
+   must then unwind successfully; only afterward is the optional ZIP built from
+   the staged manifest and `manifest.json` atomically published last. The
+   versioned 20-proof contract rejects missing, duplicate, optional-shadow, or
+   non-ready rows, and the manifest binds the exact versioned quiescence policy
+   digest. Probe children receive only a minimal allowlisted environment, not
+   ambient GitHub, OpenAI, Hugging Face, Python, or DYLD credentials/settings.
+   Those transient Phase-A processes do not authorize reopening an external
+   persistent wrapper. Treat the returned manifest as immediately perishable
+   and proceed directly to the next two commands.
+4. Run the read-only inventory and recovery binding gate immediately after the
+   certifier. This is also the post-backup quiescence proof: it must still show
+   no writer process or loaded legacy category, and the exact recovery binding
+   must still match the live database and runtime state.
 
    ```bash
    scripts/core_cutover_preflight.sh \

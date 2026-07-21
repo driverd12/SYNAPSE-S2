@@ -11,7 +11,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from core_authority import CoreAuthorityError, CoreAuthorityLease
-from memory_store import DurableMemoryStore
+from memory_store import DurableMemoryStore, SQLITE_APPLICATION_ID
+from recovery_manager import VerifiedRecoveryManager
 
 
 class CoreAuthorityLeaseTests(unittest.TestCase):
@@ -108,6 +109,290 @@ class CoreAuthorityLeaseTests(unittest.TestCase):
             core_store = DurableMemoryStore(database, authority_lease=core)
             self.addCleanup(core_store.close)
             self.assertEqual(core_store.list_entries(limit=1), [])
+
+    def test_core_maintenance_open_is_read_only_and_keeps_caller_owned_fence(self) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            bootstrap = DurableMemoryStore(database)
+            bootstrap.upsert_entry(
+                tag="maintenance-open-fixture",
+                context_id="default",
+                source_text="Existing v5 evidence must remain unchanged.",
+                metadata={},
+                embedding_dimensions=4,
+                spike_indices=[1],
+                neuron_indices=[2],
+            )
+            bootstrap.close()
+            with closing(sqlite3.connect(database)) as conn:
+                before_schema = conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+                ).fetchall()
+                before_migrations = conn.execute(
+                    "SELECT key, applied_at FROM store_migrations ORDER BY key"
+                ).fetchall()
+
+            authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-maintenance-read-only",
+            )
+            original_connect = sqlite3.connect
+            connect_calls: list[tuple[object, dict]] = []
+
+            def observe_connect(*args, **kwargs):
+                connect_calls.append((args[0], dict(kwargs)))
+                return original_connect(*args, **kwargs)
+
+            with (
+                patch(
+                    "memory_store.DurableMemoryStore._initialize",
+                    side_effect=AssertionError("maintenance open must skip initialization"),
+                ),
+                patch(
+                    "memory_store.DurableMemoryStore._ensure_directory",
+                    side_effect=AssertionError("maintenance open must not repair directories"),
+                ),
+                patch(
+                    "memory_store.CoreAuthorityLease.acquire_local",
+                    side_effect=AssertionError(
+                        "maintenance open must not take a shared local lease"
+                    ),
+                ),
+                patch(
+                    "memory_store.os.chmod",
+                    side_effect=AssertionError("maintenance open must not chmod"),
+                ),
+                patch(
+                    "memory_store.os.fchmod",
+                    side_effect=AssertionError("maintenance open must not fchmod"),
+                ),
+                patch("memory_store.sqlite3.connect", side_effect=observe_connect),
+            ):
+                store = DurableMemoryStore.open_existing_for_core_maintenance(
+                    database,
+                    authority_lease=authority,
+                )
+                self.assertEqual(
+                    store.inspect_core_authority_preclaim()["governance_mode"],
+                    "pre-governed-v5",
+                )
+                self.assertEqual(
+                    [row["tag"] for row in store.list_entries(limit=10)],
+                    ["maintenance-open-fixture"],
+                )
+
+            self.assertTrue(connect_calls)
+            self.assertTrue(
+                all(
+                    isinstance(target, str)
+                    and "mode=ro" in target
+                    and call_kwargs.get("uri") is True
+                    for target, call_kwargs in connect_calls
+                )
+            )
+            self.assertFalse(store._owns_authority_lease)
+            store.close()
+            self.assertTrue(authority.active)
+            with self.assertRaisesRegex(
+                CoreAuthorityError,
+                "route through the core client",
+            ):
+                CoreAuthorityLease.acquire_local(database)
+            authority.close()
+
+            with closing(sqlite3.connect(database)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+                    ).fetchall(),
+                    before_schema,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT key, applied_at FROM store_migrations ORDER BY key"
+                    ).fetchall(),
+                    before_migrations,
+                )
+
+    def test_core_maintenance_open_rejects_invalid_leases_without_taking_ownership(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "memory.sqlite3"
+            other_database = root / "other.sqlite3"
+            first = DurableMemoryStore(database)
+            first.close()
+            second = DurableMemoryStore(other_database)
+            second.close()
+
+            local = CoreAuthorityLease.acquire_local(database)
+            with self.assertRaisesRegex(CoreAuthorityError, "core lease is not active"):
+                DurableMemoryStore.open_existing_for_core_maintenance(
+                    database,
+                    authority_lease=local,
+                )
+            self.assertTrue(local.active)
+            local.close()
+
+            wrong = CoreAuthorityLease.acquire_core(
+                other_database,
+                timeout_seconds=0.0,
+                instance_id="core-maintenance-wrong-path",
+            )
+            with self.assertRaisesRegex(CoreAuthorityError, "does not match"):
+                DurableMemoryStore.open_existing_for_core_maintenance(
+                    database,
+                    authority_lease=wrong,
+                )
+            self.assertTrue(wrong.active)
+            wrong.close()
+
+            closed = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-maintenance-closed",
+            )
+            closed.close()
+            with self.assertRaisesRegex(CoreAuthorityError, "not active"):
+                DurableMemoryStore.open_existing_for_core_maintenance(
+                    database,
+                    authority_lease=closed,
+                )
+
+            bound = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-maintenance-bound",
+            )
+            bound.bind_durable_authority(
+                epoch=1,
+                config_fingerprint="a" * 64,
+                build_id="maintenance-test",
+                protocol_version="synapse-core.v1",
+            )
+            with self.assertRaisesRegex(CoreAuthorityError, "unclaimed"):
+                DurableMemoryStore.open_existing_for_core_maintenance(
+                    database,
+                    authority_lease=bound,
+                )
+            self.assertTrue(bound.active)
+            bound.close()
+
+    def test_core_maintenance_open_rejects_unclassified_stores_without_repair(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            missing = root / "missing.sqlite3"
+            missing_authority = CoreAuthorityLease.acquire_core(
+                missing,
+                timeout_seconds=0.0,
+                instance_id="core-maintenance-missing",
+            )
+            with self.assertRaises(FileNotFoundError):
+                DurableMemoryStore.open_existing_for_core_maintenance(
+                    missing,
+                    authority_lease=missing_authority,
+                )
+            self.assertFalse(missing.exists())
+            missing_authority.close()
+
+            cases = (
+                ("pre-v5.sqlite3", SQLITE_APPLICATION_ID, 4, 0o600, "v5 or v6"),
+                ("foreign.sqlite3", 12345, 5, 0o600, "application_id"),
+                (
+                    "malformed-v5.sqlite3",
+                    SQLITE_APPLICATION_ID,
+                    5,
+                    0o600,
+                    "contract is invalid",
+                ),
+                ("newer.sqlite3", SQLITE_APPLICATION_ID, 7, 0o600, "newer"),
+            )
+            for name, application_id, user_version, mode, error in cases:
+                with self.subTest(name=name):
+                    database = root / name
+                    with closing(sqlite3.connect(database)) as conn:
+                        conn.execute(f"PRAGMA application_id = {application_id}")
+                        conn.execute(f"PRAGMA user_version = {user_version}")
+                    database.chmod(mode)
+                    before = database.read_bytes()
+                    authority = CoreAuthorityLease.acquire_core(
+                        database,
+                        timeout_seconds=0.0,
+                        instance_id=f"core-maintenance-{name[:-8]}",
+                    )
+                    try:
+                        with self.assertRaisesRegex(
+                            (CoreAuthorityError, RuntimeError), error
+                        ):
+                            DurableMemoryStore.open_existing_for_core_maintenance(
+                                database,
+                                authority_lease=authority,
+                            )
+                        self.assertEqual(database.read_bytes(), before)
+                        self.assertEqual(database.stat().st_mode & 0o777, mode)
+                        self.assertTrue(authority.active)
+                    finally:
+                        authority.close()
+
+            unsafe = root / "unsafe.sqlite3"
+            unsafe_store = DurableMemoryStore(unsafe)
+            unsafe_store.close()
+            unsafe.chmod(0o644)
+            unsafe_authority = CoreAuthorityLease.acquire_core(
+                unsafe,
+                timeout_seconds=0.0,
+                instance_id="core-maintenance-unsafe",
+            )
+            with self.assertRaisesRegex(CoreAuthorityError, "private owner-controlled"):
+                DurableMemoryStore.open_existing_for_core_maintenance(
+                    unsafe,
+                    authority_lease=unsafe_authority,
+                )
+            self.assertEqual(unsafe.stat().st_mode & 0o777, 0o644)
+            self.assertTrue(unsafe_authority.active)
+            unsafe_authority.close()
+
+    def test_core_maintenance_store_can_publish_recovery_artifacts_without_live_write(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "memory.sqlite3"
+            bootstrap = DurableMemoryStore(database)
+            bootstrap.upsert_entry(
+                tag="maintenance-recovery-fixture",
+                context_id="default",
+                source_text="Recovery evidence is external to the live store.",
+                metadata={},
+                embedding_dimensions=4,
+                spike_indices=[0],
+                neuron_indices=[1],
+            )
+            bootstrap.close()
+            authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-maintenance-recovery",
+            )
+            store = DurableMemoryStore.open_existing_for_core_maintenance(
+                database,
+                authority_lease=authority,
+            )
+            before = store.inspect_core_authority_preclaim()["logical_snapshot"]
+            manager = VerifiedRecoveryManager(store, capture_root=root)
+            bundle = manager.create_bundle(
+                purpose="core-maintenance-test",
+                pinned=True,
+            )
+            verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+            after = store.inspect_core_authority_preclaim()["logical_snapshot"]
+
+            self.assertTrue(bundle["bundle_verified"])
+            self.assertTrue(verified["verified"])
+            self.assertEqual(after, before)
+            self.assertTrue(Path(bundle["bundle_receipt_path"]).is_file())
+            store.close()
+            self.assertTrue(authority.active)
+            authority.close()
 
     def test_core_lease_cannot_be_reused_for_another_store(self) -> None:
         with TemporaryDirectory() as temporary:

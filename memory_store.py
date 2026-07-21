@@ -1409,6 +1409,63 @@ class DurableMemoryStore:
             )
         return store
 
+    @classmethod
+    def open_existing_for_core_maintenance(
+        cls,
+        db_path: str | os.PathLike[str],
+        *,
+        authority_lease: CoreAuthorityLease,
+    ) -> "DurableMemoryStore":
+        """Bind an existing exact v5/v6 store to an unclaimed exclusive lease.
+
+        This is the narrow recovery-certification lane.  It deliberately skips
+        ``__init__`` so opening an unexpected target can never create a database,
+        configure WAL, run a migration, or repair permissions.  The supplied
+        authority remains caller-owned and is used only to fence the live path;
+        an unclaimed core lease makes every normal store connection read-only.
+        Recovery code may still publish new, signed artifacts outside the live
+        SQLite database while that fence is held.
+        """
+
+        if not isinstance(authority_lease, CoreAuthorityLease):
+            raise TypeError("core maintenance requires a CoreAuthorityLease")
+        store = cls.__new__(cls)
+        store.db_path = store._resolve_db_path(db_path)
+        authority_lease.assert_core_for(store.db_path)
+        if authority_lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "core maintenance requires an unclaimed authoritative core lease"
+            )
+        store._target_integrity_verified = False
+        store._capture_integrity_verified = False
+        store._initializing_authority_store = False
+        store._database_created_for_initialization = False
+        store._claimed_core_authority_marker_sha256 = None
+        store._authority_lease = authority_lease
+        store._owns_authority_lease = False
+        if not store.db_path.is_file():
+            raise FileNotFoundError(
+                f"SYNAPSE-S2 memory store does not exist: {store.db_path}"
+            )
+        store._assert_private_database_identity()
+        with closing(store._connect_read_only()) as conn:
+            store._validate_existing_schema_compatibility_markers(conn)
+            user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if user_version not in {5, SQLITE_USER_VERSION}:
+                raise CoreAuthorityError(
+                    "core maintenance requires an authoritative v5 or v6 store"
+                )
+        try:
+            store.inspect_core_authority_preclaim()
+        except CoreAuthorityError:
+            raise
+        except (sqlite3.DatabaseError, RuntimeError, ValueError) as exc:
+            raise CoreAuthorityError(
+                "core maintenance store contract is invalid"
+            ) from exc
+        authority_lease.assert_core_for(store.db_path)
+        return store
+
     def close(self) -> None:
         if self._owns_authority_lease and self._authority_lease is not None:
             self._authority_lease.close()

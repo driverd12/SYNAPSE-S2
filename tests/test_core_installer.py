@@ -30,6 +30,12 @@ from core_authority import CoreAuthorityError, CoreAuthorityLease
 from core_protocol import canonical_json_bytes
 from core_request_journal import CoreRequestJournal
 from core_service import AuthoritativeCoreService
+from operator_readiness_contract import (
+    OPERATOR_READINESS_REQUIRED_PROOF_IDS,
+    quiescence_policy_contract,
+    quiescence_policy_digest,
+    ready_operator_proof_contract,
+)
 
 
 class CoreAgentInstallerTests(unittest.TestCase):
@@ -107,6 +113,9 @@ elif command == 'print-disabled':
     value = 'disabled' if disabled.exists() else 'enabled'
     print('{{')
     print('  "aero.boom.synapse-s2.core.test" => ' + value)
+    print('  "aero.boom.synapse-s2.capture-daemon" => disabled')
+    print('  "aero.boom.synapse-s2.dashboard" => disabled')
+    print('  "com.master-mold.imprint.inboxworker" => disabled')
     print('}}')
 elif command == 'kickstart':
     if not state.exists():
@@ -1957,6 +1966,28 @@ class CoreCutoverPreflightTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _complete_ready_proofs(
+        recovery_checks: list[dict],
+    ) -> tuple[list[dict], dict[str, dict]]:
+        recovery_by_id = {
+            str(check["check_id"]): check for check in recovery_checks
+        }
+        checks: list[dict] = []
+        for check_id in OPERATOR_READINESS_REQUIRED_PROOF_IDS:
+            check = recovery_by_id.get(
+                check_id,
+                {
+                    "check_id": check_id,
+                    "required": True,
+                    "status": "ready",
+                    "metrics": {},
+                    "artifact_paths": {},
+                },
+            )
+            checks.append(check)
+        return checks, {str(check["check_id"]): check for check in checks}
+
+    @staticmethod
     def _write_cutover_evidence_pack(
         *,
         root: Path,
@@ -1986,7 +2017,7 @@ class CoreCutoverPreflightTests(unittest.TestCase):
             "capture_ledger_binding": dict(verified["capture_ledger_binding"]),
             "reconciliation": dict(verified["reconciliation"]),
         }
-        checks = [
+        recovery_checks = [
             {
                 "check_id": "recovery_backup",
                 "required": True,
@@ -2009,6 +2040,9 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                 "artifact_paths": {"recovery_proof": str(proof_path)},
             },
         ]
+        checks, proofs = CoreCutoverPreflightTests._complete_ready_proofs(
+            recovery_checks
+        )
         manifest = pack / "manifest.json"
         manifest.write_text(
             json.dumps(
@@ -2020,7 +2054,14 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                     "core_config_contract": (
                         preflight.core_config_evidence_contract(config)
                     ),
+                    "quiescence_policy_contract": quiescence_policy_contract(),
+                    "quiescence_policy_digest": quiescence_policy_digest(),
+                    "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                    "required_ready": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                    "failed_required": [],
+                    "required_proof_contract": ready_operator_proof_contract(),
                     "checks": checks,
+                    "proofs": proofs,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2433,6 +2474,14 @@ class CoreCutoverPreflightTests(unittest.TestCase):
 import pathlib
 import sys
 pathlib.Path({str(log)!r}).open('a').write(' '.join(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 'print-disabled':
+    print('disabled services = {{')
+    print('  "test.capture" => true')
+    print('  "test.dashboard" => true')
+    print('  "test.core" => true')
+    print('  "com.master-mold.imprint.inboxworker" => true')
+    print('}}')
+    raise SystemExit(0)
 if sys.argv[-1].endswith('.capture'):
     print('state = running')
     print('pid = 321')
@@ -2459,8 +2508,9 @@ raise SystemExit(3)
             self.assertTrue(result["capture"]["loaded"])
             self.assertFalse(result["dashboard"]["loaded"])
             calls = log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(calls), 5)
-            self.assertTrue(all(line.startswith("print gui/") for line in calls))
+            self.assertEqual(len(calls), 8)
+            self.assertTrue(all(line.startswith("print") for line in calls))
+            self.assertTrue(result["master_mold_capture_respawner"]["disabled"])
 
     def test_launchctl_inventory_fails_closed_when_domain_query_errors(self) -> None:
         with tempfile.TemporaryDirectory(prefix="synapse-preflight-launchctl-error-") as temporary:
@@ -2469,12 +2519,146 @@ raise SystemExit(3)
             fake.chmod(0o700)
             with self.assertRaisesRegex(
                 preflight.CutoverPreflightError,
-                "could not be proven",
+                "disabled-state inventory is unavailable",
             ):
                 preflight.collect_launchagent_inventory(
                     launchctl_bin=fake,
                     labels={"core": "test.core"},
                 )
+
+    def test_enabled_unloaded_respawner_is_a_quiescence_blocker(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="synapse-preflight-respawner-"
+        ) as temporary:
+            root = Path(temporary)
+            disabled_state = root / "respawner-disabled"
+            fake = root / "launchctl"
+            fake.write_text(
+                f"""#!{sys.executable}
+import pathlib
+import sys
+disabled = pathlib.Path({str(disabled_state)!r}).exists()
+if sys.argv[1] == 'print-disabled':
+    print('disabled services = {{')
+    print('  "aero.boom.synapse-s2.capture-daemon" => true')
+    print('  "aero.boom.synapse-s2.dashboard" => true')
+    print('  "aero.boom.synapse-s2.core" => true')
+    print('  "com.master-mold.imprint.inboxworker" => ' + ('true' if disabled else 'false'))
+    print('}}')
+    raise SystemExit(0)
+if sys.argv[1] == 'print' and sys.argv[2].count('/') == 1:
+    print('services = {{')
+    print('}}')
+    raise SystemExit(0)
+raise SystemExit(3)
+""",
+                encoding="utf-8",
+            )
+            fake.chmod(0o700)
+
+            enabled = preflight.collect_launchagent_inventory(
+                launchctl_bin=fake
+            )
+            self.assertFalse(
+                enabled["master_mold_capture_respawner"]["loaded"]
+            )
+            self.assertTrue(
+                enabled["master_mold_capture_respawner"]["enabled"]
+            )
+            self.assertIn(
+                "master_mold_capture_respawner",
+                preflight.launchagent_quiescence_blockers(enabled),
+            )
+
+            disabled_state.write_text("disabled", encoding="utf-8")
+            disabled = preflight.collect_launchagent_inventory(
+                launchctl_bin=fake
+            )
+            self.assertNotIn(
+                "master_mold_capture_respawner",
+                preflight.launchagent_quiescence_blockers(disabled),
+            )
+
+    def test_operator_proof_contract_rejects_gaps_shadows_and_forged_summaries(
+        self,
+    ) -> None:
+        checks = [
+            {
+                "check_id": check_id,
+                "required": True,
+                "status": "ready",
+                "metrics": {},
+                "artifact_paths": {},
+            }
+            for check_id in OPERATOR_READINESS_REQUIRED_PROOF_IDS
+        ]
+        valid = {
+            "checks": checks,
+            "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+            "required_ready": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+            "failed_required": [],
+            "required_proof_contract": ready_operator_proof_contract(),
+            "proofs": {str(check["check_id"]): check for check in checks},
+        }
+        self.assertEqual(
+            set(preflight._validate_operator_readiness_proof_contract(valid)),
+            set(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+        )
+
+        missing = json.loads(json.dumps(valid))
+        missing["checks"] = missing["checks"][:-1]
+        with self.assertRaisesRegex(
+            preflight.CutoverPreflightError,
+            "required proof set",
+        ):
+            preflight._validate_operator_readiness_proof_contract(missing)
+
+        shadow = json.loads(json.dumps(valid))
+        shadow["checks"].append(
+            {
+                "check_id": "local_launcher",
+                "required": False,
+                "status": "ready",
+            }
+        )
+        with self.assertRaisesRegex(
+            preflight.CutoverPreflightError,
+            "not unique",
+        ):
+            preflight._validate_operator_readiness_proof_contract(shadow)
+
+        for field in (
+            "required_total",
+            "required_proof_contract",
+            "proofs",
+        ):
+            with self.subTest(field=field):
+                forged = json.loads(json.dumps(valid))
+                if field == "required_total":
+                    forged[field] -= 1
+                elif field == "required_proof_contract":
+                    forged[field]["version"] += 1
+                else:
+                    forged[field]["dashboard"]["status"] = "blocked"
+                with self.assertRaises(preflight.CutoverPreflightError):
+                    preflight._validate_operator_readiness_proof_contract(forged)
+
+    def test_identifierless_replay_debt_is_rejected_at_every_consumer(self) -> None:
+        reconciliation = {
+            "missing_authoritative_ledger_count": 0,
+            "replay_required_capture_count": 0,
+            "replay_required_file_count": 0,
+            "identifierless_replay_file_count": 1,
+            "unclassified_file_count": 0,
+        }
+        with self.assertRaisesRegex(
+            preflight.CutoverPreflightError,
+            "unresolved work",
+        ):
+            preflight._validate_zero_replay_debt(
+                reconciliation,
+                name="unit-test reconciliation",
+            )
 
     def test_process_inventory_includes_exact_authoritative_core(self) -> None:
         finding = preflight.collect_process_inventory(
@@ -2618,6 +2802,7 @@ raise SystemExit(3)
                             "missing_authoritative_ledger_count": 0,
                             "replay_required_capture_count": 0,
                             "replay_required_file_count": 0,
+                            "identifierless_replay_file_count": 0,
                             "unclassified_file_count": 0,
                         },
                     }
@@ -2643,6 +2828,7 @@ raise SystemExit(3)
                             "missing_authoritative_ledger_count": 0,
                             "replay_required_capture_count": 0,
                             "replay_required_file_count": 0,
+                            "identifierless_replay_file_count": 0,
                             "unclassified_file_count": 0,
                         },
                     }
@@ -2658,10 +2844,11 @@ raise SystemExit(3)
                     "missing_authoritative_ledger_count": 0,
                     "replay_required_capture_count": 0,
                     "replay_required_file_count": 0,
+                    "identifierless_replay_file_count": 0,
                     "unclassified_file_count": 0,
                 },
             }
-            checks = []
+            recovery_checks = []
             for check_id in ("recovery_backup", "recovery_verify", "recovery_restore"):
                 check = {
                     "check_id": check_id,
@@ -2676,7 +2863,8 @@ raise SystemExit(3)
                     check["artifact_paths"] = {
                         "recovery_proof": str(restore_proof)
                     }
-                checks.append(check)
+                recovery_checks.append(check)
+            checks, proofs = self._complete_ready_proofs(recovery_checks)
             candidate_config = self._core_config(evidence_root)
             manifest = pack / "manifest.json"
             manifest.write_text(
@@ -2689,7 +2877,14 @@ raise SystemExit(3)
                         "core_config_contract": (
                             preflight.core_config_evidence_contract(candidate_config)
                         ),
+                        "quiescence_policy_contract": quiescence_policy_contract(),
+                        "quiescence_policy_digest": quiescence_policy_digest(),
+                        "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                        "required_ready": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                        "failed_required": [],
+                        "required_proof_contract": ready_operator_proof_contract(),
                         "checks": checks,
+                        "proofs": proofs,
                     }
                 ),
                 encoding="utf-8",
@@ -2710,7 +2905,12 @@ raise SystemExit(3)
             self.assertEqual(receipt_value, receipt)
             self.assertTrue(restore_value["verified"])
             self.assertEqual(restore_path, restore_proof)
-            checks[-1]["metrics"]["reconciliation"]["unclassified_file_count"] = 1
+            next(
+                check
+                for check in checks
+                if check["check_id"] == "recovery_restore"
+            )["metrics"]["reconciliation"]["unclassified_file_count"] = 1
+            proofs = {str(check["check_id"]): check for check in checks}
             manifest.write_text(
                 json.dumps(
                     {
@@ -2721,7 +2921,14 @@ raise SystemExit(3)
                         "core_config_contract": (
                             preflight.core_config_evidence_contract(candidate_config)
                         ),
+                        "quiescence_policy_contract": quiescence_policy_contract(),
+                        "quiescence_policy_digest": quiescence_policy_digest(),
+                        "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                        "required_ready": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                        "failed_required": [],
+                        "required_proof_contract": ready_operator_proof_contract(),
                         "checks": checks,
+                        "proofs": proofs,
                     }
                 ),
                 encoding="utf-8",

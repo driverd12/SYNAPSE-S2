@@ -2193,14 +2193,34 @@ class CaptureInboxDaemon:
     def process_once(self, *, max_files: int = 50) -> dict[str, Any]:
         paths = self.paths()
         self._ensure_transport_dirs(paths)
-        with self._exclusive_lock(
-            paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
-            blocking=True,
-        ) as acquired:
-            if not acquired:
-                raise RuntimeError("capture maintenance lock is unavailable")
-            self._repair_legacy_state(paths["state_path"])
-            return self._process_once_locked(paths=paths, max_files=max_files)
+        while True:
+            initialize_backend = False
+            with self._exclusive_lock(
+                paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
+                blocking=True,
+            ) as acquired:
+                if not acquired:
+                    raise RuntimeError("capture maintenance lock is unavailable")
+                # Never lazily acquire a backend/authority route while holding
+                # the global capture lock. If work appeared since the previous
+                # observation, release capture, initialize authority, and then
+                # reacquire capture in the canonical order.
+                if self._backend is None and any(
+                    any(directory.iterdir())
+                    for directory in (
+                        paths["inbox_dir"],
+                        paths["processing_dir"],
+                    )
+                ):
+                    initialize_backend = True
+                else:
+                    self._repair_legacy_state(paths["state_path"])
+                    return self._process_once_locked(
+                        paths=paths,
+                        max_files=max_files,
+                    )
+            if initialize_backend:
+                self.backend
 
     def _process_once_locked(
         self,

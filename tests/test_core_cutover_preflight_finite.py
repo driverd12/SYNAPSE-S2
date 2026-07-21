@@ -13,6 +13,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 
 from scripts import core_cutover_preflight as preflight
+from operator_readiness_contract import (
+    OPERATOR_READINESS_REQUIRED_PROOF_IDS,
+    quiescence_policy_contract,
+    quiescence_policy_digest,
+    ready_operator_proof_contract,
+)
 
 
 class CoreCutoverPreflightFiniteTests(unittest.TestCase):
@@ -109,6 +115,7 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                 "missing_authoritative_ledger_count": 0,
                 "replay_required_capture_count": 0,
                 "replay_required_file_count": 0,
+                "identifierless_replay_file_count": 0,
                 "unclassified_file_count": 0,
             }
             metrics = {
@@ -117,8 +124,8 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                 "capture_ledger_binding": {"verified": True},
                 "reconciliation": reconciliation,
             }
-            checks = [
-                {
+            recovery_checks = {
+                check_id: {
                     "check_id": check_id,
                     "required": True,
                     "status": "ready",
@@ -134,7 +141,21 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                     "recovery_verify",
                     "recovery_restore",
                 )
+            }
+            checks = [
+                recovery_checks.get(
+                    check_id,
+                    {
+                        "check_id": check_id,
+                        "required": True,
+                        "status": "ready",
+                        "metrics": {},
+                        "artifact_paths": {},
+                    },
+                )
+                for check_id in OPERATOR_READINESS_REQUIRED_PROOF_IDS
             ]
+            proofs = {str(check["check_id"]): check for check in checks}
             manifest = pack / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -144,7 +165,14 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                         "created_at": time.time(),
                         "git": {"head": "0" * 40, "status_short": ""},
                         "core_config_contract": {},
+                        "quiescence_policy_contract": quiescence_policy_contract(),
+                        "quiescence_policy_digest": quiescence_policy_digest(),
+                        "required_total": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                        "required_ready": len(OPERATOR_READINESS_REQUIRED_PROOF_IDS),
+                        "failed_required": [],
+                        "required_proof_contract": ready_operator_proof_contract(),
                         "checks": checks,
+                        "proofs": proofs,
                     }
                 ),
                 encoding="utf-8",

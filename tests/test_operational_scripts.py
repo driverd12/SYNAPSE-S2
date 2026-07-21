@@ -1,3 +1,4 @@
+import json
 import os
 import plistlib
 import sqlite3
@@ -63,81 +64,91 @@ class OperationalScriptTests(unittest.TestCase):
     ) -> tuple[dict[str, readiness.CheckResult], list[str]]:
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        temp_root = Path(temporary.name)
+        temp_root = Path(temporary.name).resolve()
         certifier = object.__new__(readiness.OperatorReadinessCertifier)
         certifier.results = []
         certifier.run_id = "capture-ledger-binding-test"
+        certifier.pack_dir = temp_root
         certifier.artifact_dir = temp_root / "artifacts"
         certifier.artifact_dir.mkdir(mode=0o700)
-        certifier.core_binding = None
-        certifier.core_paths = SimpleNamespace(data_root=temp_root)
-        certifier._cli_command = lambda *parts: list(parts)
+        certifier._evidence_files = set()
 
-        valid_audit = {
+        reconciliation = {
+            "missing_authoritative_ledger_count": 0,
+            "replay_required_capture_count": 0,
+            "replay_required_file_count": 0,
+            "identifierless_replay_file_count": 0,
+            "unclassified_file_count": 0,
+        }
+        audit = {
             "action": "capture-ledger-audit",
             "status": "ready",
             "verification_passed": True,
             "audit_revision": "f" * 64,
+            "processed_file_count": 7,
+            "processed_total_bytes": 700,
             "processed_v2_capture_count": 7,
             "ledger_capture_count": 7,
             "missing_authoritative_ledger_count": 0,
             "ledger_binding_mismatch_count": 0,
+            "repairable_capture_count": 0,
             "blocked_capture_count": 0,
         }
-        payloads = {
-            "capture_ledger_audit": valid_audit,
-            "recovery_backup": {
+        proof_path = temp_root / "isolated-proof.json"
+        proof_path.write_text(
+            json.dumps(
+                {
+                    "schema": "synapse-s2.recovery-bundle-restore.v1",
+                    "mode": "isolated-recovery-proof",
+                    "verified": True,
+                    "cutover_ready": True,
+                    "missing_transport_ledger_count": 0,
+                    "capture_ledger_binding": restore_binding,
+                    "reconciliation": reconciliation,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        proof_path.chmod(0o600)
+        evidence = {
+            "verified": True,
+            "bundle": {
                 "bundle_verified": True,
                 "cutover_ready": True,
-                "bundle_receipt_path": str(temp_root / "bundle.receipt.json"),
+                "capture_file_count": 7,
                 "capture_ledger_binding": backup_binding,
+                "reconciliation": reconciliation,
             },
-            "recovery_verify": {
+            "verification": {
                 "verified": True,
                 "cutover_ready": True,
+                "receipt_identity_trusted": True,
                 "capture_ledger_binding": verify_binding,
+                "reconciliation": reconciliation,
             },
-            "recovery_restore": {
+            "restore": {
                 "verified": True,
                 "cutover_ready": True,
+                "capture_file_count": 7,
+                "missing_transport_ledger_count": 0,
                 "capture_ledger_binding": restore_binding,
-                "recovery_proof_path": str(temp_root / "missing-proof.json"),
+                "reconciliation": reconciliation,
+                "recovery_proof_path": str(proof_path),
+            },
+            "capture_ledger_before": dict(audit),
+            "capture_ledger_after": dict(audit),
+            "capture_transport_at_publication": {
+                "ledger_audit_revision": "f" * 64,
+                "ledger_verification_passed": True,
             },
         }
-        executed: list[str] = []
 
-        def run_command(
-            check_id: str,
-            *,
-            label: str,
-            command: list[str],
-            required: bool,
-            timeout: float,
-            evaluator,
-            env=None,
-        ) -> readiness.CheckResult:
-            del timeout, env
-            executed.append(check_id)
-            parsed = payloads[check_id]
-            status, detail, repair, metrics = evaluator(0, parsed, "", "")
-            result = readiness.CheckResult(
-                check_id=check_id,
-                label=label,
-                status=status,
-                required=required,
-                detail=detail,
-                repair=repair,
-                command=command,
-                returncode=0,
-                parsed=parsed,
-                metrics=metrics,
-            )
-            certifier.results.append(result)
-            return result
-
-        certifier._run_command = run_command
-        with patch.object(readiness, "ROOT", temp_root):
-            certifier._check_recovery()
+        certifier._record_guarded_recovery_evidence(
+            evidence,
+            duration_ms=1.0,
+        )
+        executed = [result.check_id for result in certifier.results]
         return {result.check_id: result for result in certifier.results}, executed
 
     def _run_launch_agent_installer(
@@ -1219,33 +1230,24 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
                         ),
                         valid,
                     )
+                    self.assertEqual(
+                        executed,
+                        [
+                            "capture_ledger_audit",
+                            "recovery_backup",
+                            "recovery_verify",
+                            "recovery_restore",
+                        ],
+                    )
                     if stage == "backup":
-                        self.assertEqual(
-                            executed,
-                            ["capture_ledger_audit", "recovery_backup"],
-                        )
                         self.assertEqual(results["recovery_verify"].status, "blocked")
                         self.assertEqual(results["recovery_restore"].status, "blocked")
                     elif stage == "verify":
-                        self.assertEqual(
-                            executed,
-                            [
-                                "capture_ledger_audit",
-                                "recovery_backup",
-                                "recovery_verify",
-                            ],
-                        )
+                        self.assertEqual(results["recovery_backup"].status, "ready")
                         self.assertEqual(results["recovery_restore"].status, "blocked")
                     else:
-                        self.assertEqual(
-                            executed,
-                            [
-                                "capture_ledger_audit",
-                                "recovery_backup",
-                                "recovery_verify",
-                                "recovery_restore",
-                            ],
-                        )
+                        self.assertEqual(results["recovery_backup"].status, "ready")
+                        self.assertEqual(results["recovery_verify"].status, "ready")
 
     def test_readiness_recovery_rejects_binding_drift_between_stages(self):
         original = self._capture_ledger_binding(revision="a" * 64)
@@ -1270,7 +1272,7 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
                     changed,
                 )
                 if changed_stage == "verify":
-                    self.assertNotIn("recovery_restore", executed)
+                    self.assertIn("recovery_restore", executed)
                     self.assertEqual(results["recovery_restore"].status, "blocked")
                 else:
                     self.assertEqual(results["recovery_verify"].status, "ready")
@@ -1327,6 +1329,8 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
         self.assertEqual(positions, sorted(positions))
         self.assertIn("process_findings_truncated: false", cutover)
         self.assertIn("--json", cutover)
+        self.assertIn("A momentarily empty process list is not durable quiescence", cutover)
+        self.assertIn("post-backup quiescence proof", cutover)
 
 
 if __name__ == "__main__":
