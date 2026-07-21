@@ -33,6 +33,7 @@ while str(ROOT) in sys.path:
 sys.path.insert(0, str(ROOT))
 
 import memory_store as _memory_store_module  # noqa: E402
+from bridge_governance import BridgeGovernance  # noqa: E402
 from mlx_backend import SpikingAttentionBackend  # noqa: E402
 
 
@@ -319,23 +320,30 @@ def populate_fixture(
             )
         memory_ids[document_id] = str(entry["memory_id"])
 
+    fixture_governance = BridgeGovernance(
+        backend.memory_store,
+        require_distinct_reviewer=False,
+        allow_compatibility_approval=True,
+        allow_test_time=True,
+    )
     for index, link in enumerate(fixture.get("context_links", [])):
         timestamp = fixed_epoch + 1_000.0 + index
-        with patch.object(_memory_store_module.time, "time", return_value=timestamp):
-            backend.memory_store.upsert_context_link(
-                source_context_id=str(link["source_context_id"]),
-                target_context_id=str(link["target_context_id"]),
-                relation_type=str(link["relation_type"]),
-                direction=str(link["direction"]),
-                confidence=float(link["confidence"]),
-                evidence={
-                    "method": "retrieval-v2-synthetic-fixture",
-                    "fixture_schema": FIXTURE_SCHEMA,
-                },
-                approved_by=str(link["approved_by"]),
-                approved_at=timestamp,
-                enabled=True,
-            )
+        fixture_governance.approve_namespace_link_compat(
+            source_context_id=str(link["source_context_id"]),
+            target_context_id=str(link["target_context_id"]),
+            relation_type=str(link["relation_type"]),
+            direction=str(link["direction"]),
+            weight=float(link["confidence"]),
+            evidence={
+                "method": "retrieval-v2-synthetic-fixture",
+                "fixture_schema": FIXTURE_SCHEMA,
+            },
+            approved_by=str(link["approved_by"]),
+            reason="Fixed synthetic fixture approval.",
+            governance_request_id=f"retrieval-v2-fixture-link-{index:03d}",
+            confirm=True,
+            now=timestamp,
+        )
     for index, relationship in enumerate(fixture.get("relationships", [])):
         timestamp = fixed_epoch + 2_000.0 + index
         with patch.object(_memory_store_module.time, "time", return_value=timestamp):

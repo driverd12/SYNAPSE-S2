@@ -7353,7 +7353,7 @@ class DurableMemoryStore:
                 "context_id must be stripped, nonempty, and at most 128 characters"
             )
         timestamp = time.time() if observed_at is None else float(observed_at)
-        if not math.isfinite(timestamp) or timestamp <= 0.0:
+        if not self._context_delivery_timestamp_is_valid(timestamp):
             raise ValueError("namespace observation time must be a finite timestamp")
         key = f"{NAMESPACE_CATALOG_METADATA_PREFIX}{clean_context}"
         row = conn.execute(
@@ -7369,13 +7369,13 @@ class DurableMemoryStore:
                     candidate = float(existing.get("created_at", timestamp))
                 except (TypeError, ValueError, OverflowError):
                     candidate = timestamp
-                if math.isfinite(candidate) and candidate > 0.0:
+                if self._context_delivery_timestamp_is_valid(candidate):
                     created_at = min(candidate, timestamp)
                 try:
                     prior_last_seen = float(existing.get("last_seen_at", timestamp))
                 except (TypeError, ValueError, OverflowError):
                     prior_last_seen = timestamp
-                if math.isfinite(prior_last_seen) and prior_last_seen > 0.0:
+                if self._context_delivery_timestamp_is_valid(prior_last_seen):
                     last_seen_at = max(prior_last_seen, timestamp)
         payload = {
             "schema": NAMESPACE_CATALOG_SCHEMA,

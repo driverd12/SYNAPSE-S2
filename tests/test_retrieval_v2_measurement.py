@@ -105,6 +105,42 @@ class RetrievalV2MeasurementTests(unittest.TestCase):
                 self.assertIs(item["confidence"]["calibrated"], False)
                 self.assertIsNone(item["confidence"]["probability"])
 
+    def test_fixture_connected_scope_uses_governed_bridge_projection(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            backend = measurement._make_backend(root, self.fixture)
+            try:
+                measurement.populate_fixture(backend, self.fixture)
+                resolved = backend.resolve_recall_contexts(
+                    context_id="control-room",
+                    recall_scope="connected",
+                )
+                self.assertIn(
+                    "ptz-camera",
+                    {str(item["context_id"]) for item in resolved},
+                )
+                self.assertEqual(
+                    backend.bridge_governance.audit_integrity()["status"],
+                    "ready",
+                )
+                result = measurement._query_call(
+                    backend,
+                    self.fixture["queries"][0],
+                )
+                self.assertTrue(
+                    any(
+                        float(
+                            item["score_breakdown"]["signals"][
+                                "same_context_graph"
+                            ]
+                        )
+                        > 0.0
+                        for item in result["items"]
+                    )
+                )
+            finally:
+                backend.memory_store.close()
+
     def test_determinism_matrix_purity_and_over_cap_ties_are_proven(self) -> None:
         determinism = self.report["aggregate"]["determinism"]
         self.assertTrue(determinism["canonical_digest_all_equal"])

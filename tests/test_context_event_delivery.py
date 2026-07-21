@@ -2501,9 +2501,24 @@ class DurableContextEventDeliveryTests(unittest.TestCase):
                 agent_targets=["a"],
                 created_at=0.0,
             )
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                catalog_row = conn.execute(
+                    """
+                    SELECT value_json, updated_at
+                    FROM store_metadata
+                    WHERE key = ?
+                    """,
+                    ("namespace_catalog.v1:c",),
+                ).fetchone()
 
         self.assertEqual(epoch["context_id"], "c")
         self.assertEqual(epoch["created_at"], 0.0)
+        self.assertIsNotNone(catalog_row)
+        assert catalog_row is not None
+        catalog = json.loads(str(catalog_row[0]))
+        self.assertEqual(catalog["created_at"], 0.0)
+        self.assertEqual(catalog["last_seen_at"], 0.0)
+        self.assertEqual(float(catalog_row[1]), 0.0)
 
     def test_invalid_event_ledger_addressing_degrades_health_and_fails_reopen(self):
         corruptions = (
