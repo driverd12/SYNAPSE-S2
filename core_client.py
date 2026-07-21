@@ -136,6 +136,7 @@ class CoreClient:
         *,
         socket_path: str | os.PathLike[str] | None = None,
         state_path: str | os.PathLike[str] | None = None,
+        replication_inbox_root: str | os.PathLike[str] | None = None,
         caller: str | None = None,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         default_timeout_seconds: float = 15.0,
@@ -168,6 +169,19 @@ class CoreClient:
             if configured_state is not None
             else self.socket_path.parent.parent / "runtime_state.json"
         )
+        configured_replication_inbox = replication_inbox_root or os.getenv(
+            "SYNAPSE_S2_REPLICATION_INBOX_ROOT"
+        )
+        self.replication_inbox_root = (
+            None
+            if configured_replication_inbox is None
+            else Path(configured_replication_inbox).expanduser()
+        )
+        if self.replication_inbox_root is not None and (
+            not self.replication_inbox_root.is_absolute()
+            or ".." in self.replication_inbox_root.parts
+        ):
+            raise CoreUnavailable()
         self.delivery_instance_id = caller or (
             f"core-client-{os.getpid()}-{secrets.token_hex(6)}"
         )
@@ -613,6 +627,66 @@ class CoreClient:
 
     def restore_retired_recovery(self, **arguments: Any) -> dict[str, Any]:
         return self.call("restore_retired_recovery", arguments)
+
+    def replication_identity(self) -> dict[str, Any]:
+        return self.call("replication_identity")
+
+    def replication_status(self) -> dict[str, Any]:
+        return self.call("replication_status")
+
+    def replication_pair_peer(
+        self,
+        descriptor_path: str | os.PathLike[str],
+        expected_descriptor_digest: str,
+        **arguments: Any,
+    ) -> dict[str, Any]:
+        return self.call(
+            "replication_pair_peer",
+            {
+                "descriptor_path": str(descriptor_path),
+                "expected_descriptor_digest": expected_descriptor_digest,
+                **arguments,
+            },
+        )
+
+    def replication_revoke_peer(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("replication_revoke_peer", arguments)
+
+    def replication_create_checkpoint(
+        self,
+        peer_id: str,
+        *,
+        timeout_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        return self.call(
+            "replication_create_checkpoint",
+            {"peer_id": peer_id},
+            timeout_seconds=timeout_seconds,
+        )
+
+    def replication_stage_checkpoint(
+        self,
+        manifest_path: str | os.PathLike[str],
+        *,
+        timeout_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        return self.call(
+            "replication_stage_checkpoint",
+            {"manifest_path": str(manifest_path)},
+            timeout_seconds=timeout_seconds,
+        )
+
+    def replication_record_acknowledgement(
+        self,
+        acknowledgement_path: str | os.PathLike[str],
+        *,
+        timeout_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        return self.call(
+            "replication_record_acknowledgement",
+            {"acknowledgement_path": str(acknowledgement_path)},
+            timeout_seconds=timeout_seconds,
+        )
 
     def run_quick_pruning(self, **arguments: Any) -> dict[str, Any]:
         return self.call("run_quick_pruning", arguments)

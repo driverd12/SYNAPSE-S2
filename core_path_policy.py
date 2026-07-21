@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Literal, Mapping, NoReturn, Self
 
 
-ROOT_NAMES = frozenset({"export", "backup", "recovery", "capture"})
+ROOT_NAMES = frozenset({"export", "backup", "recovery", "replication", "capture"})
 PathKind = Literal["file", "directory", "any"]
 MAX_POLICY_PATH_BYTES = 4_096
 _DIRECTORY_OPEN_FLAGS = (
@@ -493,6 +493,7 @@ class CorePathPolicy:
         export_root: str | os.PathLike[str],
         backup_root: str | os.PathLike[str],
         recovery_root: str | os.PathLike[str],
+        replication_root: str | os.PathLike[str],
         capture_root: str | os.PathLike[str],
     ) -> None:
         _require_descriptor_primitives()
@@ -500,6 +501,7 @@ class CorePathPolicy:
             "export": _coerce_absolute_path(export_root),
             "backup": _coerce_absolute_path(backup_root),
             "recovery": _coerce_absolute_path(recovery_root),
+            "replication": _coerce_absolute_path(replication_root),
             "capture": _coerce_absolute_path(capture_root),
         }
         roots: dict[str, Path] = {}
@@ -794,6 +796,14 @@ class CorePathPolicy:
             value,
             allow_replacement=allow_replacement,
         )
+
+    def authorize_replication_input(
+        self,
+        value: str | os.PathLike[str],
+        *,
+        kind: PathKind = "file",
+    ) -> AuthorizedPath:
+        return self.authorize_existing_input("replication", value, kind=kind)
 
     def authorize_capture_root(
         self,

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-BINDING_SCHEMA = "synapse-s2.core-client-binding.v2"
+BINDING_SCHEMA = "synapse-s2.core-client-binding.v3"
 BINDING_ENV = "SYNAPSE_S2_CORE_BINDING"
 EXPECTED_CONFIG_ENV = "SYNAPSE_S2_EXPECTED_CORE_CONFIG_FINGERPRINT"
 MAX_BINDING_BYTES = 64 * 1024
@@ -58,6 +58,7 @@ _PATH_FIELDS = (
     "export_root",
     "backup_root",
     "recovery_root",
+    "replication_inbox_root",
 )
 _FIELDS = frozenset(
     {
@@ -134,6 +135,7 @@ class CoreClientBinding:
     export_root: Path
     backup_root: Path
     recovery_root: Path
+    replication_inbox_root: Path
     core_label: str
     config_digest: str
     config_fingerprint: str
@@ -154,6 +156,7 @@ class CoreClientBinding:
             "export_root": str(self.export_root),
             "backup_root": str(self.backup_root),
             "recovery_root": str(self.recovery_root),
+            "replication_inbox_root": str(self.replication_inbox_root),
             "core_label": self.core_label,
             "config_digest": self.config_digest,
             "config_fingerprint": self.config_fingerprint,
@@ -216,6 +219,7 @@ def validate_core_client_binding(value: Any) -> CoreClientBinding:
         "export_root": data / "exports",
         "backup_root": data / "backups",
         "recovery_root": data / "recovery",
+        "replication_inbox_root": data / "replication" / "inbox",
     }
     if any(paths[field] != path for field, path in expected.items()):
         _deny()
@@ -263,6 +267,9 @@ def binding_for_config(
         "export_root": str(Path(data_root) / "exports"),
         "backup_root": str(Path(data_root) / "backups"),
         "recovery_root": str(Path(data_root) / "recovery"),
+        "replication_inbox_root": str(
+            Path(data_root) / "replication" / "inbox"
+        ),
         "core_label": str(core_label),
         "config_digest": config_digest,
         "config_fingerprint": str(config.fingerprint),
@@ -569,6 +576,9 @@ def apply_binding_environment(
     expected = {
         "SYNAPSE_S2_EXPORT_DIR": str(binding.export_root),
         "SYNAPSE_S2_CAPTURE_ROOT": str(binding.capture_root),
+        "SYNAPSE_S2_REPLICATION_INBOX_ROOT": str(
+            binding.replication_inbox_root
+        ),
     }
     if binding.authority_mode == "authoritative-core-v6":
         expected.update(

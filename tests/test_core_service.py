@@ -39,12 +39,15 @@ from core_service import (
     CORE_OPERATION_CONTRACTS,
     LOGGER,
     MAX_ACTIVE_CONNECTIONS,
+    REPLICATION_MAINTENANCE_LANE_SECONDS,
+    REPLICATION_OPERATIONS,
     SAFE_READ_OPERATIONS,
     SERVICE_CONTROL_OPERATIONS,
     AuthoritativeCoreService,
     CoreConfig,
     CoreServiceError,
     _bind_default_backend_handlers,
+    _bind_replication_handlers,
     _ensure_private_directory,
     _load_or_create_authentication_key,
     _load_or_create_store_generation,
@@ -1374,6 +1377,44 @@ class CoreServiceTests(unittest.TestCase):
         )
         lease.close()
 
+    def test_replication_lane_is_bounded_and_health_reports_maintenance(self) -> None:
+        service = self.harness.service
+        floor = service._backend_lane_timeout_floor(
+            "replication_create_checkpoint"
+        )
+        self.assertEqual(floor, REPLICATION_MAINTENANCE_LANE_SECONDS)
+        self.assertEqual(floor, 300.0)
+        started = time.monotonic() - 31.0
+        acquired = service._acquire_backend_lane(
+            owner="replication-maintenance",
+            timeout=0.0,
+            deadline_monotonic=started + floor,
+        )
+        self.assertTrue(acquired)
+        try:
+            with service._backend_lane_state_lock:
+                service._backend_lane_started_monotonic = started
+            health = service._health_result()
+            self.assertTrue(health["ready"])
+            self.assertEqual(health["operational_state"], "maintenance")
+            self.assertTrue(health["backend_lane"]["ready"])
+            self.assertTrue(health["backend_lane"]["active"])
+            self.assertTrue(health["backend_lane"]["maintenance"])
+            self.assertTrue(health["backend_lane"]["degraded"])
+            self.assertFalse(
+                health["backend_lane"]["accepting_ordinary_operations"]
+            )
+            self.assertGreaterEqual(health["backend_lane"]["active_age_ms"], 30_000)
+            self.assertIsNone(health["backend_lane"]["blocker"])
+            reconciliation = self.harness.client().request_status(
+                caller="replication-timeout-check",
+                request_id="req-replication-timeout-check",
+            )
+            self.assertFalse(reconciliation["known"])
+            self.assertEqual(reconciliation["state"], "not_found")
+        finally:
+            service._release_backend_lane()
+
     def test_hanging_backend_close_is_bounded_and_retains_all_references(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -1745,6 +1786,7 @@ class CoreServiceTests(unittest.TestCase):
 
     def test_real_backend_surface_matches_closed_operation_contracts(self) -> None:
         from mlx_backend import SpikingAttentionBackend
+        from replication_manager import ReplicationManager
 
         # These backend-only parameters remain available for explicit offline-v5
         # maintenance. They are absent from the RPC contracts and are injected
@@ -1761,27 +1803,48 @@ class CoreServiceTests(unittest.TestCase):
             "apply_recovery_retention": frozenset({"directory"}),
         }
         uninitialized_backend = SpikingAttentionBackend.__new__(SpikingAttentionBackend)
-        handlers = _bind_default_backend_handlers(uninitialized_backend)
+        backend_handlers = _bind_default_backend_handlers(uninitialized_backend)
+        uninitialized_manager = ReplicationManager.__new__(ReplicationManager)
+        replication_handlers = _bind_replication_handlers(uninitialized_manager)
         self.assertEqual(
-            frozenset(handlers),
+            frozenset(backend_handlers),
+            frozenset(CORE_OPERATION_CONTRACTS)
+            - SERVICE_CONTROL_OPERATIONS
+            - REPLICATION_OPERATIONS,
+        )
+        self.assertEqual(
+            frozenset(replication_handlers),
+            REPLICATION_OPERATIONS,
+        )
+        self.assertEqual(
+            frozenset(backend_handlers) | frozenset(replication_handlers),
             frozenset(CORE_OPERATION_CONTRACTS) - SERVICE_CONTROL_OPERATIONS,
         )
         for operation, contract in CORE_OPERATION_CONTRACTS.items():
             if operation in SERVICE_CONTROL_OPERATIONS:
                 continue
-            method_name = (
-                "resource_profile"
-                if operation == "benchmark_resource_profile"
-                else operation
-            )
-            signature = inspect.signature(getattr(SpikingAttentionBackend, method_name))
-            parameters = {
-                name: parameter
-                for name, parameter in signature.parameters.items()
-                if name != "self"
-            }
-            if operation in {"resource_profile", "benchmark_resource_profile"}:
-                parameters.pop("benchmark_quick_prune")
+            if operation in REPLICATION_OPERATIONS:
+                signature = inspect.signature(replication_handlers[operation])
+                parameters = dict(signature.parameters)
+            else:
+                method_name = (
+                    "resource_profile"
+                    if operation == "benchmark_resource_profile"
+                    else operation
+                )
+                signature = inspect.signature(
+                    getattr(SpikingAttentionBackend, method_name)
+                )
+                parameters = {
+                    name: parameter
+                    for name, parameter in signature.parameters.items()
+                    if name != "self"
+                }
+                if operation in {
+                    "resource_profile",
+                    "benchmark_resource_profile",
+                }:
+                    parameters.pop("benchmark_quick_prune")
             self.assertEqual(
                 contract.allowed_arguments
                 | server_owned_arguments.get(operation, frozenset()),
@@ -1897,6 +1960,82 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 self.assertTrue(
                     (config.socket_path.parent / "store-generation.json").is_file()
                 )
+            finally:
+                service.close()
+                thread.join(timeout=5.0)
+
+    def test_replication_fingerprint_mismatch_is_rejected_before_journal(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary).resolve())
+            service = AuthoritativeCoreService(config)
+            failures: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    service.serve_forever()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not config.socket_path.exists():
+                if failures:
+                    break
+                time.sleep(0.02)
+            try:
+                self.assertEqual(failures, [])
+                client = CoreClient(
+                    socket_path=config.socket_path,
+                    caller="replication-prevalidation-test",
+                    default_timeout_seconds=3.0,
+                )
+                descriptor = client.replication_identity()
+                descriptor_path = (
+                    config.memory_path.parent
+                    / "replication"
+                    / "inbox"
+                    / "peer.json"
+                )
+                descriptor_path.write_text(
+                    json.dumps(descriptor, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.chmod(descriptor_path, 0o600)
+                journal = service._request_journal
+                self.assertIsNotNone(journal)
+                assert journal is not None
+
+                def journal_rows() -> int:
+                    with closing(sqlite3.connect(journal.path)) as connection:
+                        return int(
+                            connection.execute(
+                                "SELECT count(*) FROM request_journal"
+                            ).fetchone()[0]
+                        )
+
+                before = journal_rows()
+                request_id = "req-replication-bad-fingerprint"
+                with self.assertRaises(CoreRemoteError) as raised:
+                    client.call(
+                        "replication_pair_peer",
+                        {
+                            "descriptor_path": str(descriptor_path),
+                            "expected_descriptor_digest": "0" * 64,
+                            "lineage_id": "s2lineage_" + ("1" * 32),
+                            "direction": "send",
+                            "confirm": True,
+                        },
+                        request_id=request_id,
+                    )
+                self.assertEqual(raised.exception.code, "invalid_request")
+                self.assertEqual(journal_rows(), before)
+                reconciliation = client.request_status(
+                    caller=client.delivery_instance_id,
+                    request_id=request_id,
+                )
+                self.assertFalse(reconciliation["known"])
+                self.assertEqual(reconciliation["state"], "not_found")
             finally:
                 service.close()
                 thread.join(timeout=5.0)
@@ -2788,6 +2927,26 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
             self.assertFalse(config.memory_path.exists())
             self.assertEqual(journal_path.read_bytes(), journal_before)
 
+    def test_nonempty_replication_tree_blocks_missing_database_bootstrap(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            replication_inbox = (
+                config.memory_path.parent / "replication" / "inbox"
+            )
+            replication_inbox.mkdir(parents=True, mode=0o700)
+            os.chmod(replication_inbox.parent, 0o700)
+            os.chmod(replication_inbox, 0o700)
+            sentinel = replication_inbox / "checkpoint.json"
+            sentinel.write_text("{}\n", encoding="utf-8")
+            os.chmod(sentinel, 0o600)
+
+            service = AuthoritativeCoreService(config)
+            with self.assertRaises(CoreServiceError):
+                service.start()
+
+            self.assertFalse(config.memory_path.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "{}\n")
+
     def test_root_generation_blocks_empty_bootstrap_after_paired_state_loss(self) -> None:
         with TemporaryDirectory() as temporary:
             config = self.config(Path(temporary))
@@ -2827,6 +2986,9 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "synthetic init failure"):
                 service.start()
+            self.assertFalse(
+                (config.memory_path.parent / "replication").exists()
+            )
             connection = sqlite3.connect(config.memory_path)
             try:
                 self.assertEqual(

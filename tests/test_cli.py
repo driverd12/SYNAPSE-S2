@@ -12,13 +12,72 @@ from unittest import mock
 from memory_store import DurableMemoryStore
 from mlx_backend import SpikingAttentionBackend
 from capture_daemon import CaptureInboxDaemon
-from core_client import CoreOutcomeUnknown
+from core_client import CoreClient, CoreOutcomeUnknown
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
+    def test_replication_peer_add_uses_core_inbox_and_anti_tofu_digest(self):
+        import synapse_cli
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            core = CoreClient(
+                socket_path=root / "core" / "service.sock",
+                state_path=root / "runtime_state.json",
+                replication_inbox_root=root / "replication" / "inbox",
+            )
+            core.replication_pair_peer = mock.Mock(return_value={"paired": True})
+            arguments = mock.Mock(
+                descriptor="peer.json",
+                expected_descriptor_digest="a" * 64,
+                lineage_id="s2lineage_" + ("b" * 32),
+                direction="send",
+                confirm=True,
+            )
+            with mock.patch("synapse_cli.build_backend", return_value=core):
+                result = synapse_cli.command_replication_peer_add(arguments)
+
+        self.assertTrue(result["paired"])
+        core.replication_pair_peer.assert_called_once_with(
+            str(root / "replication" / "inbox" / "peer.json"),
+            "a" * 64,
+            lineage_id="s2lineage_" + ("b" * 32),
+            direction="send",
+            confirm=True,
+        )
+
+    def test_replication_relative_input_requires_explicit_core_binding(self):
+        import synapse_cli
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            core = CoreClient(
+                socket_path=root / "core" / "service.sock",
+                state_path=root / "runtime_state.json",
+            )
+            arguments = mock.Mock(
+                descriptor="peer.json",
+                expected_descriptor_digest="a" * 64,
+                lineage_id="s2lineage_" + ("b" * 32),
+                direction="send",
+                confirm=True,
+            )
+            with mock.patch("synapse_cli.build_backend", return_value=core):
+                with self.assertRaisesRegex(RuntimeError, "binding"):
+                    synapse_cli.command_replication_peer_add(arguments)
+
+    def test_replication_mutation_cli_refuses_local_backend(self):
+        import synapse_cli
+
+        with mock.patch("synapse_cli.build_backend", return_value=mock.Mock()):
+            with self.assertRaisesRegex(RuntimeError, "authoritative core"):
+                synapse_cli.command_replication_checkpoint_create(
+                    mock.Mock(peer_id="s2node_" + ("a" * 32))
+                )
+
     def test_recovery_commands_forward_expected_journal_and_runtime_digests(self):
         import synapse_cli
 

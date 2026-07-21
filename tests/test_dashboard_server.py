@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from unittest import mock
 
 from capture_daemon import write_capture_drop
-from core_client import CoreOutcomeUnknown
+from core_client import CoreClient, CoreOutcomeUnknown
 from core_client_binding import (
     BINDING_ENV,
     binding_for_config,
@@ -417,6 +417,35 @@ class DashboardRuntimeTests(unittest.TestCase):
         status, headers, body = response
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
         return status, json.loads(body.decode("utf-8"))
+
+    def test_replication_dashboard_surfaces_are_read_only_core_reads(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            core = CoreClient(
+                socket_path=root / "core" / "service.sock",
+                state_path=root / "runtime_state.json",
+            )
+            core.replication_identity = mock.Mock(
+                return_value={"schema": "synapse-s2.replication-node.v1"}
+            )
+            core.replication_status = mock.Mock(
+                return_value={"schema": "synapse-s2.replication-status.v1"}
+            )
+            runtime = DashboardRuntime(core)
+
+            identity_status, identity = self.decode(
+                runtime.handle("GET", "/api/replication/identity")
+            )
+            status_status, status = self.decode(
+                runtime.handle("GET", "/api/replication/status")
+            )
+
+        self.assertEqual(identity_status, 200)
+        self.assertEqual(status_status, 200)
+        self.assertEqual(identity["schema"], "synapse-s2.replication-node.v1")
+        self.assertEqual(status["schema"], "synapse-s2.replication-status.v1")
+        core.replication_identity.assert_called_once_with()
+        core.replication_status.assert_called_once_with()
 
     def bootstrap_credentials(
         self,

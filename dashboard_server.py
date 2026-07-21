@@ -230,6 +230,15 @@ class DashboardRuntime:
             return self._backend.state_path.parent
         return None
 
+    def _replication_core(self) -> CoreClient:
+        backend = self.backend
+        if not isinstance(backend, CoreClient):
+            raise DashboardError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "authoritative replication status is unavailable",
+            )
+        return backend
+
     def _refresh_semantic_audit(self) -> None:
         try:
             payload = self.backend.audit_semantic_indexes(
@@ -430,6 +439,14 @@ class DashboardRuntime:
                 )
             return self._json_response(
                 self.backend.resource_profile(benchmark_quick_prune=False)
+            )
+        if method == "GET" and path == "/api/replication/identity":
+            return self._json_response(
+                self._replication_core().replication_identity()
+            )
+        if method == "GET" and path == "/api/replication/status":
+            return self._json_response(
+                self._replication_core().replication_status()
             )
         if method == "GET" and path == "/api/graph":
             context = self._context_from_params(params)

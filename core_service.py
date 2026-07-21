@@ -94,6 +94,10 @@ CUTOVER_COMMIT_SAFETY_MARGIN_MS = 1_000
 BACKEND_LANE_CAPTURE_TIMEOUT_SECONDS = 60.0
 BACKEND_LANE_CAPTURE_FILE_SECONDS = 5.0
 BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
+# The protocol accepts deadlines no farther than 300 seconds into the future.
+# Replication remains synchronous, so any transport timeout is reconciled by
+# request_status rather than implying a longer hidden server-side contract.
+REPLICATION_MAINTENANCE_LANE_SECONDS = 300.0
 BACKEND_LANE_CLOSE_GRACE_SECONDS = 2.0
 CORE_STORE_SCHEMA_IDENTITY = "sqlite-53324442-v6"
 BUILD_SOURCE_MANIFEST = (
@@ -113,6 +117,9 @@ BUILD_SOURCE_MANIFEST = (
     "mlx_backend.py",
     "recovery_manager.py",
     "redaction.py",
+    "replication_manager.py",
+    "replication_protocol.py",
+    "replication_store.py",
     "scripts/core_cutover_preflight.py",
     "transcript_capture.py",
     "pyproject.toml",
@@ -649,6 +656,38 @@ _CONTRACT_LIST = (
         mutation=True,
     ),
     _contract("restore_retired_recovery", "plan_token confirm", "plan_token", mutation=True),
+    _contract("replication_identity", retry_safe=True),
+    _contract("replication_status", retry_safe=True),
+    _contract(
+        "replication_pair_peer",
+        "descriptor_path expected_descriptor_digest lineage_id direction confirm",
+        "descriptor_path expected_descriptor_digest lineage_id direction confirm",
+        mutation=True,
+    ),
+    _contract(
+        "replication_revoke_peer",
+        "peer_id reason confirm",
+        "peer_id reason confirm",
+        mutation=True,
+    ),
+    _contract(
+        "replication_create_checkpoint",
+        "peer_id",
+        "peer_id",
+        mutation=True,
+    ),
+    _contract(
+        "replication_stage_checkpoint",
+        "manifest_path",
+        "manifest_path",
+        mutation=True,
+    ),
+    _contract(
+        "replication_record_acknowledgement",
+        "acknowledgement_path",
+        "acknowledgement_path",
+        mutation=True,
+    ),
     _contract("run_quick_pruning", "trigger", mutation=True),
     _contract("run_idle_maintenance", "force_deep_sleep", mutation=True),
     _contract("run_deep_sleep_consolidation", "trigger", mutation=True),
@@ -660,6 +699,23 @@ SAFE_READ_OPERATIONS = frozenset(
     name for name, contract in CORE_OPERATION_CONTRACTS.items() if contract.retry_safe
 )
 SERVICE_CONTROL_OPERATIONS = frozenset({"health", "request_status"})
+REPLICATION_OPERATIONS = frozenset(
+    {
+        "replication_identity",
+        "replication_status",
+        "replication_pair_peer",
+        "replication_revoke_peer",
+        "replication_create_checkpoint",
+        "replication_stage_checkpoint",
+        "replication_record_acknowledgement",
+    }
+)
+LONG_REPLICATION_OPERATIONS = frozenset(
+    {
+        "replication_create_checkpoint",
+        "replication_stage_checkpoint",
+    }
+)
 DETERMINISTIC_DELIVERY_REJECTION_OPERATIONS = frozenset(
     {
         "ack_context_events",
@@ -883,6 +939,24 @@ _LINK_DIRECTION = _rule(
             "outbound",
         }
     ),
+)
+_REPLICATION_NODE_ID = _rule(
+    "string",
+    min_bytes=39,
+    max_bytes=39,
+    pattern=re.compile(r"s2node_[0-9a-f]{32}"),
+)
+_REPLICATION_LINEAGE_ID = _rule(
+    "string",
+    min_bytes=42,
+    max_bytes=42,
+    pattern=re.compile(r"s2lineage_[0-9a-f]{32}"),
+)
+_REPLICATION_DIRECTION = _rule(
+    "string",
+    min_bytes=4,
+    max_bytes=7,
+    allowed_values=frozenset({"send", "receive"}),
 )
 
 
@@ -1219,6 +1293,23 @@ MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingPr
             confirm=_TRUE,
         ),
         "restore_retired_recovery": _schema(plan_token=_DIGEST, confirm=_TRUE),
+        "replication_pair_peer": _schema(
+            descriptor_path=_PATH,
+            expected_descriptor_digest=_DIGEST,
+            lineage_id=_REPLICATION_LINEAGE_ID,
+            direction=_REPLICATION_DIRECTION,
+            confirm=_TRUE,
+        ),
+        "replication_revoke_peer": _schema(
+            peer_id=_REPLICATION_NODE_ID,
+            reason=_NONEMPTY_SHORT_STRING,
+            confirm=_TRUE,
+        ),
+        "replication_create_checkpoint": _schema(peer_id=_REPLICATION_NODE_ID),
+        "replication_stage_checkpoint": _schema(manifest_path=_PATH),
+        "replication_record_acknowledgement": _schema(
+            acknowledgement_path=_PATH,
+        ),
         "run_quick_pruning": _schema(trigger=_SHORT_STRING),
         "run_idle_maintenance": _schema(force_deep_sleep=_BOOL),
         "run_deep_sleep_consolidation": _schema(trigger=_SHORT_STRING),
@@ -1458,6 +1549,8 @@ def _validate_mutation_arguments(
         "restore_recovery_bundle_isolated",
         "apply_recovery_retention",
         "restore_retired_recovery",
+        "replication_pair_peer",
+        "replication_revoke_peer",
     } and arguments.get("confirm") is not True:
         raise CoreProtocolError()
     if operation in {"repair_semantic_indexes", "repair_capture_ledger"}:
@@ -2276,7 +2369,7 @@ def _bind_default_backend_handlers(backend: Any) -> dict[str, Callable[..., Any]
     static_method_names = {
         name: "resource_profile" if name == "benchmark_resource_profile" else name
         for name in CORE_OPERATION_CONTRACTS
-        if name not in SERVICE_CONTROL_OPERATIONS
+        if name not in (SERVICE_CONTROL_OPERATIONS | REPLICATION_OPERATIONS)
     }
     handlers: dict[str, Callable[..., Any]] = {}
     missing: list[str] = []
@@ -2296,6 +2389,119 @@ def _bind_default_backend_handlers(backend: Any) -> dict[str, Callable[..., Any]
     if missing:
         raise CoreServiceError("operation_unavailable")
     return handlers
+
+
+def _bind_replication_handlers(manager: Any) -> dict[str, Callable[..., Any]]:
+    """Bind the closed offline-replication API to one core-owned manager."""
+
+    def pair_peer(
+        *,
+        descriptor_path: str,
+        expected_descriptor_digest: str,
+        lineage_id: str,
+        direction: str,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        return manager.pair_peer(
+            descriptor_path,
+            expected_descriptor_digest=expected_descriptor_digest,
+            lineage_id=lineage_id,
+            direction=direction,
+            confirm=confirm,
+        )
+
+    return {
+        "replication_identity": manager.node_descriptor,
+        "replication_status": manager.status,
+        "replication_pair_peer": pair_peer,
+        "replication_revoke_peer": (
+            lambda *, peer_id, reason, confirm: manager.revoke_peer(
+                peer_id,
+                reason=reason,
+                confirm=confirm,
+            )
+        ),
+        "replication_create_checkpoint": (
+            lambda *, peer_id: manager.create_checkpoint(peer_id)
+        ),
+        "replication_stage_checkpoint": (
+            lambda *, manifest_path: manager.stage_checkpoint(manifest_path)
+        ),
+        "replication_record_acknowledgement": (
+            lambda *, acknowledgement_path: manager.record_acknowledgement(
+                acknowledgement_path
+            )
+        ),
+    }
+
+
+def _read_authorized_replication_json(
+    authorization: AuthorizedPath,
+    *,
+    maximum_bytes: int = 1024 * 1024,
+) -> dict[str, Any]:
+    """Read one already-authorized private file through its pinned vnode."""
+
+    descriptor = authorization.duplicate_target_fd()
+    try:
+        before = os.fstat(descriptor)
+        if before.st_size <= 0 or before.st_size > maximum_bytes:
+            raise CoreProtocolError("invalid_request")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, maximum_bytes + 1 - size),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > maximum_bytes:
+                raise CoreProtocolError("invalid_request")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise CoreProtocolError("invalid_request")
+    except (OSError, ValueError, OverflowError) as exc:
+        raise CoreProtocolError("invalid_request") from exc
+    finally:
+        os.close(descriptor)
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise CoreProtocolError("invalid_request")
+            value[key] = item
+        return value
+
+    try:
+        decoded = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                CoreProtocolError("invalid_request")
+            ),
+        )
+        if not isinstance(decoded, dict):
+            raise CoreProtocolError("invalid_request")
+        canonical_json_bytes(decoded)
+    except CoreProtocolError:
+        raise
+    except (UnicodeError, ValueError, OverflowError, RecursionError) as exc:
+        raise CoreProtocolError("invalid_request") from exc
+    return decoded
 
 
 class AuthoritativeCoreService:
@@ -2354,6 +2560,7 @@ class AuthoritativeCoreService:
         self._request_cache_bytes = 0
         self._request_journal: CoreRequestJournal | None = None
         self._path_policy: CorePathPolicy | None = None
+        self._replication_manager: Any = None
         self._capture_thread: threading.Thread | None = None
         self._capture_worker: Any = None
         self._capture_activation_event = threading.Event()
@@ -2481,6 +2688,11 @@ class AuthoritativeCoreService:
             self._backend_lane_deadline_monotonic = deadline_monotonic
         return True
 
+    def _backend_lane_timeout_floor(self, operation: str) -> float:
+        if operation in LONG_REPLICATION_OPERATIONS:
+            return REPLICATION_MAINTENANCE_LANE_SECONDS
+        return BACKEND_LANE_RPC_TIMEOUT_SECONDS
+
     def _release_backend_lane(self) -> None:
         with self._backend_lane_state_lock:
             self._backend_lane_owner = None
@@ -2503,9 +2715,15 @@ class AuthoritativeCoreService:
         if stale:
             self._fence_service("backend_lane_stalled")
             poisoned = "backend_lane_stalled"
+        maintenance = owner == "replication-maintenance"
         return {
             "ready": not stale and poisoned is None,
             "active": owner is not None,
+            "maintenance": maintenance,
+            "degraded": maintenance or stale or poisoned is not None,
+            "accepting_ordinary_operations": (
+                owner is None and not stale and poisoned is None
+            ),
             "active_age_ms": (
                 None
                 if owner is None or started is None
@@ -2949,6 +3167,7 @@ class AuthoritativeCoreService:
         evidence_directories = (
             data_root / "backups",
             data_root / "recovery",
+            data_root / "replication",
             *(
                 ()
                 if self.config.capture_root is None
@@ -3013,20 +3232,10 @@ class AuthoritativeCoreService:
                 _ensure_private_directory(managed_root)
             if self.config.capture_root is not None:
                 _ensure_private_directory(self.config.capture_root)
-            self._path_policy = CorePathPolicy(
-                export_root=data_root / "exports",
-                backup_root=data_root / "backups",
-                recovery_root=data_root / "recovery",
-                capture_root=self.config.capture_root or data_root,
-            )
             # Full backend construction precedes the durable service claim. An
             # OOM or native-init failure therefore cannot publish readiness.
             self._backend = self._backend_factory(authority)
             self._handlers = dict(self._operation_handlers_factory(self._backend))
-            if frozenset(self._handlers) != (
-                frozenset(self._contracts) - SERVICE_CONTROL_OPERATIONS
-            ):
-                raise CoreServiceError("operation_unavailable")
             store = getattr(self._backend, "memory_store", None)
             inspect_method = getattr(store, "inspect_core_authority_preclaim", None)
             claim_method = getattr(store, "claim_core_authority", None)
@@ -3036,6 +3245,15 @@ class AuthoritativeCoreService:
                 or not callable(claim_method)
             ):
                 raise CoreServiceError("service_unavailable")
+            requested_replication = REPLICATION_OPERATIONS.intersection(
+                self._contracts
+            )
+            if frozenset(self._handlers) != (
+                frozenset(self._contracts)
+                - SERVICE_CONTROL_OPERATIONS
+                - requested_replication
+            ):
+                raise CoreServiceError("operation_unavailable")
             inspection: Mapping[str, Any] | None = None
             attestation: Mapping[str, Any] | None = None
             attestation_required = False
@@ -3249,6 +3467,48 @@ class AuthoritativeCoreService:
                 != self._authority_lease.durable_epoch
             ):
                 raise CoreServiceError("service_unavailable")
+            # Replication is a v6-authoritative subsystem. Constructing its
+            # ledger creates durable files and rows, so it must occur only
+            # after the durable authority claim and runtime publication have
+            # both completed. A failed preclaim startup therefore cannot leave
+            # behind false replication deployment evidence.
+            if requested_replication:
+                try:
+                    from recovery_manager import VerifiedRecoveryManager
+                    from replication_manager import ReplicationManager
+
+                    recovery = VerifiedRecoveryManager(
+                        store,
+                        capture_root=self.config.capture_root or data_root,
+                    )
+                    self._replication_manager = ReplicationManager(
+                        store,
+                        recovery_manager=recovery,
+                    )
+                    replication_handlers = _bind_replication_handlers(
+                        self._replication_manager
+                    )
+                    self._handlers.update(
+                        {
+                            name: replication_handlers[name]
+                            for name in requested_replication
+                        }
+                    )
+                except Exception as exc:
+                    raise CoreServiceError("service_unavailable") from exc
+            _ensure_private_directory(data_root / "replication")
+            _ensure_private_directory(data_root / "replication" / "inbox")
+            self._path_policy = CorePathPolicy(
+                export_root=data_root / "exports",
+                backup_root=data_root / "backups",
+                recovery_root=data_root / "recovery",
+                replication_root=data_root / "replication" / "inbox",
+                capture_root=self.config.capture_root or data_root,
+            )
+            if frozenset(self._handlers) != (
+                frozenset(self._contracts) - SERVICE_CONTROL_OPERATIONS
+            ):
+                raise CoreServiceError("operation_unavailable")
             self._capture_activation_event.set()
             self._started_event.set()
         except BaseException:
@@ -3279,9 +3539,14 @@ class AuthoritativeCoreService:
             authorized[key] = str(token.path)
             tokens.append(token)
 
-        def existing(key: str, root: str, *, kind: str = "file") -> None:
+        def existing(
+            key: str,
+            root: str,
+            *,
+            kind: str = "file",
+        ) -> AuthorizedPath | None:
             if key not in authorized:
-                return
+                return None
             token = policy.authorize_existing_input(
                 root,
                 authorized[key],
@@ -3289,6 +3554,7 @@ class AuthoritativeCoreService:
             )
             authorized[key] = str(token.path)
             tokens.append(token)
+            return token
 
         try:
             if operation in {"certify_runtime", "export_memory"}:
@@ -3336,6 +3602,36 @@ class AuthoritativeCoreService:
                 )
                 authorized["directory"] = str(backup_root.path)
                 tokens.append(backup_root)
+            elif operation == "replication_pair_peer":
+                descriptor_token = existing("descriptor_path", "replication")
+                if descriptor_token is None:
+                    raise CoreProtocolError("invalid_request")
+                try:
+                    from replication_protocol import (
+                        ReplicationProtocolError,
+                        validate_node_descriptor,
+                    )
+
+                    descriptor = validate_node_descriptor(
+                        _read_authorized_replication_json(descriptor_token)
+                    )
+                except (
+                    CoreProtocolError,
+                    ReplicationProtocolError,
+                ) as exc:
+                    raise CoreProtocolError("invalid_request") from exc
+                if not secrets.compare_digest(
+                    str(descriptor["receipt_digest"]),
+                    str(authorized["expected_descriptor_digest"]),
+                ):
+                    raise CoreProtocolError("invalid_request")
+                # Dispatch the immutable validated document. The manager never
+                # reopens a client pathname after journal admission.
+                authorized["descriptor_path"] = descriptor
+            elif operation == "replication_stage_checkpoint":
+                existing("manifest_path", "replication")
+            elif operation == "replication_record_acknowledgement":
+                existing("acknowledgement_path", "replication")
             return authorized, tuple(tokens)
         except BaseException:
             for token in tokens:
@@ -3729,6 +4025,7 @@ class AuthoritativeCoreService:
             return self._response(request, error=safe_error(exc.code))
         if cached is not None:
             return cached
+        path_tokens: tuple[AuthorizedPath, ...] = ()
         try:
             authorized_arguments, path_tokens = self._authorize_operation_arguments(
                 contract.name,
@@ -3793,12 +4090,17 @@ class AuthoritativeCoreService:
             return response
 
         remaining = (request["deadline_unix_ms"] / 1000.0) - time.time()
+        lane_floor_seconds = self._backend_lane_timeout_floor(contract.name)
         if remaining <= 0 or not self._acquire_backend_lane(
-            owner="rpc",
+            owner=(
+                "replication-maintenance"
+                if contract.name in LONG_REPLICATION_OPERATIONS
+                else "rpc"
+            ),
             timeout=remaining,
             deadline_monotonic=(
                 time.monotonic()
-                + max(remaining, BACKEND_LANE_RPC_TIMEOUT_SECONDS)
+                + max(remaining, lane_floor_seconds)
             ),
         ):
             for token in path_tokens:
@@ -4090,13 +4392,21 @@ class AuthoritativeCoreService:
                 )
             except (CoreRequestJournalError, OSError, sqlite3.Error):
                 LOGGER.error("mutation request journal health failed")
+        ready = (
+            self._started_event.is_set()
+            and not self._stop_event.is_set()
+            and authority_ready
+            and lane_health["ready"]
+            and journal_health["ready"]
+        )
         return {
-            "ready": (
-                self._started_event.is_set()
-                and not self._stop_event.is_set()
-                and authority_ready
-                and lane_health["ready"]
-                and journal_health["ready"]
+            "ready": ready,
+            "operational_state": (
+                "unavailable"
+                if not ready
+                else "maintenance"
+                if lane_health["maintenance"]
+                else "ready"
             ),
             "protocol_version": PROTOCOL_VERSION,
             "authority": {

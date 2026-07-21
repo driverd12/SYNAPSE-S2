@@ -15,7 +15,7 @@ class CorePathPolicyTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()
         self.roots: dict[str, Path] = {}
-        for name in ("export", "backup", "recovery", "capture"):
+        for name in ("export", "backup", "recovery", "replication", "capture"):
             root = self.base / name
             root.mkdir(mode=0o700)
             root.chmod(0o700)
@@ -24,6 +24,7 @@ class CorePathPolicyTests(unittest.TestCase):
             export_root=self.roots["export"],
             backup_root=self.roots["backup"],
             recovery_root=self.roots["recovery"],
+            replication_root=self.roots["replication"],
             capture_root=self.roots["capture"],
         )
 
@@ -45,6 +46,17 @@ class CorePathPolicyTests(unittest.TestCase):
         self.assertEqual(os.fspath(authorization), str(receipt))
         self.assertTrue(authorization.target_exists)
         authorization.assert_stable()
+
+    def test_replication_input_is_confined_to_its_private_root(self) -> None:
+        manifest = self.private_file(
+            self.roots["replication"] / "checkpoint.manifest.json"
+        )
+        authorization = self.policy.authorize_replication_input(manifest)
+        self.assertEqual(authorization.path, manifest)
+        authorization.assert_stable()
+        outside = self.private_file(self.roots["recovery"] / "ack.json")
+        with self.assertRaises(CorePathPolicyError):
+            self.policy.authorize_replication_input(outside)
 
     def test_existing_input_rejects_escape_symlinks_hardlinks_and_public_mode(self) -> None:
         outside = self.private_file(self.base / "outside.json")
@@ -267,6 +279,7 @@ class CorePathPolicyTests(unittest.TestCase):
                 export_root=linked,
                 backup_root=self.roots["backup"],
                 recovery_root=self.roots["recovery"],
+                replication_root=self.roots["replication"],
                 capture_root=self.roots["capture"],
             )
 
@@ -276,6 +289,7 @@ class CorePathPolicyTests(unittest.TestCase):
                 export_root=self.roots["export"],
                 backup_root=self.roots["backup"],
                 recovery_root=self.roots["recovery"],
+                replication_root=self.roots["replication"],
                 capture_root=self.roots["capture"],
             )
 

@@ -1373,6 +1373,43 @@ class McpServerTests(unittest.TestCase):
             tools["list_spiking_namespace_link_history"].annotations.readOnlyHint
         )
 
+    def test_mcp_replication_surface_is_read_only_status_only(self):
+        async def inspect_tools():
+            return {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
+
+        tools = asyncio.run(inspect_tools())
+        self.assertIn("get_spiking_replication_identity", tools)
+        self.assertIn("get_spiking_replication_status", tools)
+        self.assertTrue(
+            tools["get_spiking_replication_identity"].annotations.readOnlyHint
+        )
+        self.assertTrue(
+            tools["get_spiking_replication_status"].annotations.readOnlyHint
+        )
+        for forbidden in (
+            "pair_spiking_replication_peer",
+            "revoke_spiking_replication_peer",
+            "create_spiking_replication_checkpoint",
+            "stage_spiking_replication_checkpoint",
+            "ack_spiking_replication_checkpoint",
+        ):
+            self.assertNotIn(forbidden, tools)
+
+        core = mock.Mock()
+        core.replication_identity.return_value = {"schema": "node"}
+        core.replication_status.return_value = {"schema": "status"}
+        with mock.patch.object(mcp_server, "_load_backend", return_value=(None, object())), mock.patch.object(
+            mcp_server,
+            "_loaded_core_client",
+            return_value=core,
+        ):
+            identity = json.loads(mcp_server.get_spiking_replication_identity())
+            status = json.loads(mcp_server.get_spiking_replication_status())
+        self.assertEqual(identity["schema"], "node")
+        self.assertEqual(status["schema"], "status")
+        core.replication_identity.assert_called_once_with()
+        core.replication_status.assert_called_once_with()
+
     def test_sleep_consolidation_returns_status_string(self):
         result = mcp_server.trigger_sleep_consolidation()
 

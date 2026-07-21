@@ -3445,6 +3445,60 @@ def restore_spiking_recovery_proof(
         )
 
 
+@mcp.tool(
+    description=(
+        "Read this authoritative core's signed offline-replication identity. "
+        "This surface cannot pair peers, stage checkpoints, or mutate replication state."
+    ),
+    annotations={
+        "title": "Read SYNAPSE-S2 Replication Identity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    },
+)
+def get_spiking_replication_identity() -> str:
+    try:
+        _, mlx_backend = _load_backend()
+        core = _loaded_core_client(mlx_backend)
+        if core is None:
+            raise RuntimeError("authoritative replication core is unavailable")
+        return json.dumps(core.replication_identity(), sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("replication identity read failed")
+        return json.dumps(
+            {"error": _public_error("replication identity read failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool(
+    description=(
+        "Read bounded offline replication status from the authoritative core. "
+        "Peer pairing, revocation, checkpoint creation, staging, and ACK recording remain operator-CLI only."
+    ),
+    annotations={
+        "title": "Read SYNAPSE-S2 Replication Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    },
+)
+def get_spiking_replication_status() -> str:
+    try:
+        _, mlx_backend = _load_backend()
+        core = _loaded_core_client(mlx_backend)
+        if core is None:
+            raise RuntimeError("authoritative replication core is unavailable")
+        return json.dumps(core.replication_status(), sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("replication status read failed")
+        return json.dumps(
+            {"error": _public_error("replication status read failed", exc)},
+            sort_keys=True,
+        )
+
+
 @mcp.tool()
 def plan_spiking_recovery_retention(
     keep_latest: int = 7,

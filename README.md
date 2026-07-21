@@ -168,6 +168,9 @@ a fixed synthetic regression gate, not a live-corpus relevance or latency SLO.
 The proposal/review/CAS lifecycle, actor binding, expiry and revocation rules,
 audit non-repair semantics, namespace catalog, and safe operator procedure for
 connected recall are in `docs/BRIDGE_GOVERNANCE.md`.
+The authoritative-core-only, offline multi-Mac checkpoint protocol, anti-TOFU
+pairing flow, private replication inbox, isolated restore proof, and signed ACK
+procedure are in `docs/MULTI_MAC_REPLICATION.md`.
 The sanitized Phase 6 acceptance artifact is
 `docs/evidence/phase6-token-contract-acceptance.json`: it passed all 11
 correctness gates against a verified isolated recovery restore, with an
@@ -280,7 +283,7 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 Expected Retrieval v2 output is a `synapse-s2.token-contract.v1` `memory-retrieval` envelope containing ranked registered traces such as `production-memory-contract` and linked event traces from `production-preflight-brief`. The read does not run the recurrent network, apply STDP or pruning, update runtime state, mark activity, or populate the legacy query cache. It fingerprints the redacted prompt without storing or returning the raw prompt.
 Event ingestion additionally creates segmented memories such as `production-preflight-brief-event-001` and relationship edges such as `temporal_next` and `semantic_overlap`. Event boundaries are driven by the configured local embedding provider's cosine-distance surprise when available, while retaining lexical surprise as an auditable fallback.
 
-Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `/Users/dan.driver/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, or neural configuration. Authoritative exports and recovery paths are injected and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
+Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `/Users/dan.driver/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, replication, or neural configuration. Authoritative exports, recovery paths, and the private replication inbox are published explicitly by the binding and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode`, `metadata.semantic_surprise_score`, and `metadata.lexical_surprise_score`, so operators can tell whether a boundary was cut by semantic embedding distance or by lexical fallback.
 SQLite maintains a durable sparse spike index and a durable surface-term index for prompt recall. The surface index is built from tags, display labels, display summaries, semantic facets, detail badges, keywords, and bounded source text, and existing memory databases are backfilled automatically on startup.
@@ -633,6 +636,8 @@ The MCP server exposes these tools:
 | `reject_spiking_namespace_link` | CAS-reject the exact pending proposal revision; the MCP surface cannot approve a bridge or expand recall. |
 | `list_spiking_namespace_link_history` | Inspect bounded append-only bridge-governance history by proposal or durable link id. |
 | `audit_spiking_namespace_link_governance` | Read-only integrity audit across governance projections, receipts, and durable link rows. |
+| `get_spiking_replication_identity` | Read this authoritative core's signed offline-replication identity; it cannot pair a peer or mutate state. |
+| `get_spiking_replication_status` | Read bounded peer/checkpoint/ACK status; all replication mutations remain operator-CLI only. |
 | `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Atomically acknowledge exact receipt ids after their deployments were consumed. |

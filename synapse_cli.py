@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Any
@@ -1522,6 +1523,111 @@ def command_restore_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _replication_core(args: argparse.Namespace) -> CoreClient:
+    backend = build_backend(args)
+    if not isinstance(backend, CoreClient):
+        raise RuntimeError(
+            "multi-Mac replication is available only through the authoritative core"
+        )
+    return backend
+
+
+def _replication_inbox_path(
+    core: CoreClient,
+    value: Any,
+    *,
+    field: str,
+) -> str:
+    raw = _optional_public_output_path(value, field=field)
+    if raw is None:
+        raise ValueError(f"{field} is required")
+    inbox_root = core.replication_inbox_root
+    if inbox_root is None:
+        raise RuntimeError(
+            "authoritative core binding does not publish a replication inbox"
+        )
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = inbox_root / candidate
+    return str(candidate)
+
+
+def command_replication_identity(args: argparse.Namespace) -> dict[str, Any]:
+    return _replication_core(args).replication_identity()
+
+
+def command_replication_lineage_new(args: argparse.Namespace) -> dict[str, Any]:
+    _replication_core(args)
+    return {
+        "schema": "synapse-s2.replication-lineage.v1",
+        "lineage_id": f"s2lineage_{secrets.token_hex(16)}",
+        "durable_state_changed": False,
+    }
+
+
+def command_replication_peer_add(args: argparse.Namespace) -> dict[str, Any]:
+    core = _replication_core(args)
+    return core.replication_pair_peer(
+        _replication_inbox_path(
+            core,
+            args.descriptor,
+            field="replication descriptor path",
+        ),
+        args.expected_descriptor_digest,
+        lineage_id=args.lineage_id,
+        direction=args.direction,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_replication_peer_revoke(args: argparse.Namespace) -> dict[str, Any]:
+    return _replication_core(args).replication_revoke_peer(
+        peer_id=args.peer_id,
+        reason=args.reason,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_replication_peer_list(args: argparse.Namespace) -> dict[str, Any]:
+    status = _replication_core(args).replication_status()
+    return {
+        "schema": "synapse-s2.replication-peer-list.v1",
+        "node_id": status["node_id"],
+        "peer_count": status["peer_count"],
+        "peers": status["peers"],
+    }
+
+
+def command_replication_checkpoint_create(args: argparse.Namespace) -> dict[str, Any]:
+    return _replication_core(args).replication_create_checkpoint(args.peer_id)
+
+
+def command_replication_stage(args: argparse.Namespace) -> dict[str, Any]:
+    core = _replication_core(args)
+    return core.replication_stage_checkpoint(
+        _replication_inbox_path(
+            core,
+            args.manifest,
+            field="replication checkpoint manifest path",
+        )
+    )
+
+
+def command_replication_ack(args: argparse.Namespace) -> dict[str, Any]:
+    core = _replication_core(args)
+    return core.replication_record_acknowledgement(
+        _replication_inbox_path(
+            core,
+            args.acknowledgement,
+            field="replication acknowledgement path",
+        )
+    )
+
+
+def command_replication_status(args: argparse.Namespace) -> dict[str, Any]:
+    return _replication_core(args).replication_status()
+
+
 def command_plan_recovery_retention(args: argparse.Namespace) -> dict[str, Any]:
     directory = _optional_public_output_path(
         args.directory,
@@ -2472,6 +2578,72 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     backup_recovery.set_defaults(func=command_backup_recovery_bundle)
+
+    replication_identity = subparsers.add_parser(
+        "replication-identity",
+        help="Read this authoritative core's signed offline-replication identity.",
+    )
+    replication_identity.set_defaults(func=command_replication_identity)
+
+    replication_lineage = subparsers.add_parser(
+        "replication-lineage-new",
+        help="Generate a new lineage identifier before explicitly pairing two Macs.",
+    )
+    replication_lineage.set_defaults(func=command_replication_lineage_new)
+
+    replication_peer_add = subparsers.add_parser(
+        "replication-peer-add",
+        help="Pin a copied peer descriptor from the core-owned replication inbox.",
+    )
+    replication_peer_add.add_argument("--descriptor", required=True)
+    replication_peer_add.add_argument(
+        "--expected-descriptor-digest",
+        required=True,
+        help="Independently verified receipt_digest printed by replication-identity.",
+    )
+    replication_peer_add.add_argument("--lineage-id", required=True)
+    replication_peer_add.add_argument(
+        "--direction",
+        choices=("send", "receive"),
+        required=True,
+    )
+    replication_peer_add.add_argument("--confirm", action="store_true")
+    replication_peer_add.set_defaults(func=command_replication_peer_add)
+
+    replication_peer_revoke = subparsers.add_parser("replication-peer-revoke")
+    replication_peer_revoke.add_argument("--peer-id", required=True)
+    replication_peer_revoke.add_argument("--reason", required=True)
+    replication_peer_revoke.add_argument("--confirm", action="store_true")
+    replication_peer_revoke.set_defaults(func=command_replication_peer_revoke)
+
+    replication_peer_list = subparsers.add_parser("replication-peer-list")
+    replication_peer_list.set_defaults(func=command_replication_peer_list)
+
+    replication_checkpoint_create = subparsers.add_parser(
+        "replication-checkpoint-create",
+        help="Create a target-bound verified recovery checkpoint for one send peer.",
+    )
+    replication_checkpoint_create.add_argument("--peer-id", required=True)
+    replication_checkpoint_create.set_defaults(
+        func=command_replication_checkpoint_create
+    )
+
+    replication_stage = subparsers.add_parser(
+        "replication-stage",
+        help="Verify a copied checkpoint and materialize only an isolated restore proof.",
+    )
+    replication_stage.add_argument("--manifest", required=True)
+    replication_stage.set_defaults(func=command_replication_stage)
+
+    replication_ack = subparsers.add_parser(
+        "replication-ack",
+        help="Record a copied receiver-signed acknowledgement for an outgoing checkpoint.",
+    )
+    replication_ack.add_argument("--acknowledgement", required=True)
+    replication_ack.set_defaults(func=command_replication_ack)
+
+    replication_status = subparsers.add_parser("replication-status")
+    replication_status.set_defaults(func=command_replication_status)
 
     verify_recovery = subparsers.add_parser("verify-recovery")
     verify_recovery.add_argument("--receipt", required=True)

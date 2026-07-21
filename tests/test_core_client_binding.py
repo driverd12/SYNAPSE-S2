@@ -67,6 +67,10 @@ class CoreClientBindingTests(unittest.TestCase):
         loaded = load_core_client_binding(self.binding_path)
 
         self.assertEqual(loaded, binding)
+        self.assertEqual(
+            loaded.replication_inbox_root,
+            self.data / "replication" / "inbox",
+        )
         self.assertEqual(stat.S_IMODE(self.binding_path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.binding_path.parent.stat().st_mode), 0o700)
         self.assertEqual(
@@ -84,6 +88,16 @@ class CoreClientBindingTests(unittest.TestCase):
         write_core_client_binding(self.binding_path, binding)
         payload = binding.to_wire()
         payload["socket_path"] = str(self.root / "other.sock")
+        self.binding_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(CoreClientBindingError):
+            load_core_client_binding(self.binding_path)
+
+        write_core_client_binding(self.binding_path, binding)
+        payload = binding.to_wire()
+        payload["replication_inbox_root"] = str(self.data / "other-inbox")
         self.binding_path.write_text(
             json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
@@ -115,6 +129,10 @@ class CoreClientBindingTests(unittest.TestCase):
                 loaded = apply_binding_environment(env)
                 self.assertEqual(loaded.authority_mode, mode)
                 self.assertEqual(env["SYNAPSE_S2_CAPTURE_ROOT"], str(self.data))
+                self.assertEqual(
+                    env["SYNAPSE_S2_REPLICATION_INBOX_ROOT"],
+                    str(self.data / "replication" / "inbox"),
+                )
                 if mode == "candidate-local-v5":
                     self.assertEqual(env["SYNAPSE_S2_MEMORY_DB"], str(self.config.memory_path))
                     self.assertEqual(env["SYNAPSE_S2_DIMENSION"], "8")
