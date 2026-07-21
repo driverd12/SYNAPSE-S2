@@ -4,9 +4,7 @@
       "args": [],
       "command": "/Users/dan.driver/.local/bin/synapse-s2-mcp",
       "env": {
-        "MLX_DEVICE": "gpu",
         "PYTHONPATH": "/Users/dan.driver/Documents/Playground/SYNAPSE-S2",
-        "SYNAPSE_S2_CAPTURE_ROOT": "/Users/dan.driver/Documents/Playground/SYNAPSE-S2/.synapse_s2",
         "SYNAPSE_S2_CLIENT_AGENT_ID": "project-mcp",
         "SYNAPSE_S2_CLIENT_CORTEX": "1",
         "SYNAPSE_S2_CLIENT_CORTEX_MODE": "strict",
@@ -15,19 +13,9 @@
         "SYNAPSE_S2_CLIENT_STARTUP_PROMPT": "Hydrate SYNAPSE-S2 context for project-mcp local MCP client startup.",
         "SYNAPSE_S2_CLIENT_STARTUP_RECALL_MODE": "surface",
         "SYNAPSE_S2_CONTEXT_ID": "default",
+        "SYNAPSE_S2_CORE_BINDING": "/Users/dan.driver/.config/synapse-s2/core-binding.json",
         "SYNAPSE_S2_DEFAULT_RESPONSE_MODE": "compact",
-        "SYNAPSE_S2_DIMENSION": "1024",
-        "SYNAPSE_S2_EMBEDDING_PROVIDER": "mlx-neural",
-        "SYNAPSE_S2_EXPORT_DIR": "/Users/dan.driver/Documents/Playground/SYNAPSE-S2/.synapse_s2",
-        "SYNAPSE_S2_MAX_RESPONSE_BYTES": "12288",
-        "SYNAPSE_S2_MEMORY_DB": "/Users/dan.driver/Documents/Playground/SYNAPSE-S2/.synapse_s2/memory.sqlite3",
-        "SYNAPSE_S2_NEURAL_CACHE_DIR": "/Users/dan.driver/Documents/Playground/SYNAPSE-S2/.synapse_s2/models",
-        "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY": "1",
-        "SYNAPSE_S2_NEURAL_MODEL": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
-        "SYNAPSE_S2_NEURONS": "8192",
-        "SYNAPSE_S2_RECALL_COUNT": "10",
-        "SYNAPSE_S2_STATE_PATH": "/Users/dan.driver/Documents/Playground/SYNAPSE-S2/.synapse_s2/runtime_state.json",
-        "SYNAPSE_S2_TOP_K": "256"
+        "SYNAPSE_S2_MAX_RESPONSE_BYTES": "12288"
       },
       "timeout": 30000,
       "type": "stdio"
