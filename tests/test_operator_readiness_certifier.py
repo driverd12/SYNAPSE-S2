@@ -2308,6 +2308,109 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertEqual(status, "blocked")
         self.assertIn("wrote memory", detail)
 
+    def test_successful_app_support_checks_preserve_exact_required_contract(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(
+                Path(tmp),
+                run_id="app-support-proof-contract",
+            )
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            certifier.metadata = {
+                "run_id": certifier.run_id,
+                "context_id": certifier.context,
+                "agent_id": certifier.agent_id,
+                "git": {"head": "unit-test", "status_short": ""},
+                "embedding_provider": "semantic-hash",
+            }
+            certifier.results = [
+                result
+                for result in self._required_ready_results()
+                if result.check_id != "app_preview"
+            ]
+            parsed_by_check = {
+                "app_list": {
+                    "apps": [
+                        {
+                            "app_name": "Codex",
+                            "bundle_id": "com.openai.codex",
+                            "pid": 123,
+                        }
+                    ]
+                },
+                "app_connect": {
+                    "app_name": "Codex",
+                    "connection_id": "app-support-unit-test",
+                },
+                "app_preview": {
+                    "action": "preview-app-snapshot",
+                    "app_name": "Codex",
+                    "writes_memory": False,
+                    "snapshot_quality": {"signal_chars": 128},
+                    "quality_badge": {"status": "ready"},
+                    "capability_badge": {"level": "rich_text_available"},
+                    "capture_guidance": [],
+                },
+            }
+
+            def run_command(
+                check_id,
+                *,
+                label,
+                command,
+                required,
+                timeout,
+                evaluator,
+                env=None,
+            ):
+                del timeout, env
+                status, detail, repair, metrics = evaluator(
+                    0,
+                    parsed_by_check[check_id],
+                    "",
+                    "",
+                )
+                result = CheckResult(
+                    check_id=check_id,
+                    label=label,
+                    status=status,
+                    required=required,
+                    detail=detail,
+                    repair=repair,
+                    command=command,
+                    returncode=0,
+                    metrics=metrics,
+                )
+                certifier.results.append(result)
+                return result
+
+            with mock.patch.object(certifier, "_run_command", side_effect=run_command):
+                certifier._check_app_preview()
+
+            by_id = {result.check_id: result for result in certifier.results}
+            self.assertFalse(by_id["app_list"].required)
+            self.assertFalse(by_id["app_connect"].required)
+            self.assertTrue(by_id["app_preview"].required)
+
+            result = certifier._finalize()
+            manifest = json.loads(
+                Path(result["manifest_path"]).read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["overall_status"], "ready")
+            self.assertTrue(result["operator_trustworthy"])
+            self.assertEqual(result["required_ready"], len(REQUIRED_PROOFS))
+            self.assertEqual(result["required_total"], len(REQUIRED_PROOFS))
+            self.assertEqual(result["failed_required"], [])
+            self.assertTrue(manifest["required_proof_contract"]["valid"])
+            self.assertEqual(
+                manifest["required_proof_contract"].get(
+                    "unexpected_required",
+                    [],
+                ),
+                [],
+            )
+
     def test_summary_and_runbook_make_required_failures_visible(self):
         results = [
             CheckResult(

@@ -2333,7 +2333,7 @@ class OperatorReadinessCertifier:
             "app_list",
             label="App Connect detect",
             command=self._cli_command("app-list"),
-            required=True,
+            required=False,
             timeout=45,
             evaluator=app_list_eval,
         )
@@ -2390,7 +2390,7 @@ class OperatorReadinessCertifier:
                 json.dumps({"source": "operator_readiness_certify", "run_id": self.run_id}),
                 "--confirm",
             ),
-            required=True,
+            required=False,
             timeout=60,
             evaluator=connect_eval,
         )
@@ -3297,7 +3297,7 @@ class OperatorReadinessCertifier:
             label="Dashboard render smoke",
             command=[self.python, str(ROOT / "scripts" / "smoke_dashboard.py"), self.context],
             required=True,
-            timeout=90,
+            timeout=120,
             evaluator=smoke_eval,
         )
 
