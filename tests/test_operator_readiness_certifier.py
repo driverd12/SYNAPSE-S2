@@ -68,6 +68,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
 
     @classmethod
     def _compact_mcp_result(cls, *, camel_case=False):
+        cursor = "s2rc2.payload." + ("a" * 43)
         structured = {
             "schema": MCP_CONTRACT_SCHEMA,
             "version": 1,
@@ -101,32 +102,32 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 "source": "sqlite-memory-store",
                 "context_id": "default",
                 "recall_scope": "local",
+                "origin_node": "s2origin_" + ("b" * 32),
             },
-            "warnings": [
-                {
-                    "code": "pagination-unsupported",
-                    "severity": "info",
-                    "message": "Authoritative cursor unavailable.",
-                    "action_required": False,
-                }
-            ],
+            "warnings": [],
             "pagination": {
-                "supported": False,
-                "strategy": "retrieval-v2-required",
+                "supported": True,
+                "strategy": "authenticated-keyset-v2",
                 "requested_limit": 1,
                 "effective_limit": 1,
                 "returned": 1,
-                "has_more": None,
-                "next_cursor": None,
+                "total": {"entries": 2},
+                "has_more": True,
+                "next_cursor": cursor,
+                "snapshot_revision": "c" * 64,
+                "expires_at": 1_900_000_000,
             },
             "completeness": {
-                "complete": None,
+                "complete": False,
+                "snapshot_bound": True,
+                "authoritative_total": True,
                 "source_limit_reduced": False,
-                "reason": "authoritative-total-and-cursor-unavailable",
+                "reason": "more-pages-available",
             },
             "continuation": {
-                "strategy": "request-full-or-wait-for-retrieval-v2",
-                "cursor": None,
+                "strategy": "use-authenticated-keyset-cursor",
+                "cursor": cursor,
+                "expires_at": 1_900_000_000,
             },
             "response_contract": {
                 "profile": "compact",
@@ -144,15 +145,9 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             "ok": True,
             "structuredContent_required": True,
             "max_bytes": MCP_SAFETY_BUDGET,
-            "warnings": [
-                {
-                    "code": "pagination-unsupported",
-                    "severity": "info",
-                    "action_required": False,
-                }
-            ],
+            "warnings": [],
             "continuation": {
-                "strategy": "request-full-or-wait-for-retrieval-v2"
+                "strategy": "use-authenticated-keyset-cursor"
             },
         }
         return {
@@ -794,6 +789,66 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--timeout") + 1], "30")
         self.assertEqual(probe.kwargs["timeout"], 60)
+
+    def test_recall_check_requires_structured_read_only_retrieval_v2(self):
+        with TemporaryDirectory() as tmp:
+            certifier = OperatorReadinessCertifier(self._args(Path(tmp)))
+            memory = {
+                "memory_id": "s2mem_readiness_fixture",
+                "tag": "operator-readiness-unit-test-memory-write",
+            }
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_recall(memory)
+
+        call = run_command.call_args
+        command = call.kwargs["command"]
+        evaluator = call.kwargs["evaluator"]
+        self.assertIn("retrieve-v2", command)
+        self.assertNotIn("query-text", command)
+        self.assertEqual(command[command.index("--scope") + 1], "local")
+        self.assertEqual(command[command.index("--response-mode") + 1], "compact")
+
+        valid = {
+            "schema": "synapse-s2.token-contract.v1",
+            "operation": "memory-retrieval",
+            "ok": True,
+            "data": {
+                "raw_input_stored": False,
+                "query": {
+                    "context_id": "default",
+                    "recall_scope": "local",
+                    "raw_input_stored": False,
+                },
+                "ranker": {
+                    "id": "hybrid-ranker",
+                    "version": 2,
+                    "score_semantics": "uncalibrated-ranking-signal",
+                },
+                "items": [
+                    {
+                        "memory_id": memory["memory_id"],
+                        "tag": memory["tag"],
+                        "label": "readiness proof",
+                        "summary": "operator-readiness-unit-test",
+                        "excerpt": "bounded evidence",
+                    }
+                ],
+            },
+            "provenance": {
+                "source": "authoritative-retrieval-v2",
+                "context_id": "default",
+                "raw_input_stored": False,
+                "snapshot_id": "s2snap_fixture",
+            },
+        }
+        ready = evaluator(0, valid, "", "")
+        invalid = copy.deepcopy(valid)
+        invalid["data"]["raw_input_stored"] = True
+        blocked = evaluator(0, invalid, "", "")
+
+        self.assertEqual(ready[0], "ready")
+        self.assertIn(memory["memory_id"], ready[3]["matched_evidence"])
+        self.assertEqual(blocked[0], "blocked")
 
     def test_installed_launcher_status_attests_bound_config_and_embedding_identity(self):
         with TemporaryDirectory() as tmp:

@@ -16,6 +16,8 @@ from token_contracts import (
     DEFAULT_RESPONSE_BYTES,
     ResponseContractError,
     compact_agent_event_limit,
+    compact_retrieval_page_limit,
+    compact_retrieval_result_limit,
     normalize_response_budget,
     normalize_response_mode,
     project_response,
@@ -27,6 +29,7 @@ from token_contracts import (
 _STARTUP_IMPORT_ERROR: Exception | None = None
 _CONTRACT_COMMAND_SURFACES = {
     "agent-brief": "agent-hydration",
+    "retrieve-v2": "memory-retrieval",
     "list-memory": "memory-list",
     "graph": "memory-graph",
     "cortex-state": "cortex-state",
@@ -44,6 +47,9 @@ try:
         DEFAULT_NUM_NEURONS,
         DEFAULT_RESOURCE_TARGET_MAX_MB,
         DEFAULT_RESOURCE_TARGET_MIN_MB,
+        RETRIEVAL_V2_MAX_CANDIDATE_LIMIT,
+        RETRIEVAL_V2_MAX_PROMPT_BYTES,
+        RETRIEVAL_V2_MAX_RESULT_LIMIT,
     )
     from transcript_capture import TranscriptCaptureManager
 except Exception as startup_exc:  # pragma: no cover - dependency/environment specific
@@ -221,6 +227,22 @@ def _normalize_cli_limit(value: Any, *, maximum: int) -> int:
     except (TypeError, ValueError) as exc:
         raise ResponseContractError("limit must be an integer") from exc
     return min(max(parsed, 1), max(1, int(maximum)))
+
+
+def _strict_cli_bounded_integer(
+    value: Any,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ResponseContractError(f"{field_name} must be an integer")
+    if value < minimum or value > maximum:
+        raise ResponseContractError(
+            f"{field_name} must be between {minimum} and {maximum}"
+        )
+    return value
 
 
 def _optional_public_output_path(value: Any, *, field: str) -> str | None:
@@ -419,6 +441,55 @@ def command_query_text(args: argparse.Namespace) -> dict[str, Any]:
             recall_scope=args.recall_scope,
         ),
     }
+
+
+def command_retrieve_v2(args: argparse.Namespace) -> dict[str, Any]:
+    mode, budget = _cli_response_options(args, surface="memory-retrieval")
+    result_limit = _strict_cli_bounded_integer(
+        args.result_limit,
+        field_name="result_limit",
+        minimum=1,
+        maximum=RETRIEVAL_V2_MAX_RESULT_LIMIT,
+    )
+    candidate_limit = _strict_cli_bounded_integer(
+        args.candidate_limit,
+        field_name="candidate_limit",
+        minimum=1,
+        maximum=RETRIEVAL_V2_MAX_CANDIDATE_LIMIT,
+    )
+    if candidate_limit < result_limit:
+        raise ResponseContractError(
+            "candidate_limit must be greater than or equal to result_limit"
+        )
+    effective_result_limit = (
+        compact_retrieval_result_limit(
+            requested_limit=result_limit,
+            max_output_bytes=budget,
+        )
+        if mode == "compact"
+        else result_limit
+    )
+    backend = build_backend(args)
+    payload = backend.retrieve_text_v2(
+        args.prompt,
+        context_id=args.context,
+        recall_scope=args.recall_scope,
+        result_limit=effective_result_limit,
+        candidate_limit=candidate_limit,
+        include_graph_neighbors=bool(args.include_graph_neighbors),
+    )
+    if mode == "legacy":
+        return payload
+    payload["_response_source"] = {
+        "requested_limit": result_limit,
+        "effective_limit": effective_result_limit,
+    }
+    return project_response(
+        "memory-retrieval",
+        payload,
+        mode=mode,
+        max_response_bytes=budget,
+    )
 
 
 def command_query_vector(args: argparse.Namespace) -> dict[str, Any]:
@@ -671,9 +742,16 @@ def command_app_snapshot_preview(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_graph(args: argparse.Namespace) -> dict[str, Any]:
     mode, budget = _cli_response_options(args, surface="memory-graph")
+    cursor = str(getattr(args, "cursor", "") or "").strip()
+    if mode == "legacy" and cursor:
+        raise ResponseContractError("legacy graph responses do not support cursors")
     requested_limit = _normalize_cli_limit(args.limit, maximum=500)
     effective_limit = (
-        min(requested_limit, COMPACT_SOURCE_LIMITS["memory-graph"])
+        compact_retrieval_page_limit(
+            "memory-graph",
+            requested_limit=requested_limit,
+            max_output_bytes=budget,
+        )
         if mode == "compact"
         else requested_limit
     )
@@ -681,6 +759,8 @@ def command_graph(args: argparse.Namespace) -> dict[str, Any]:
     payload = backend.list_memory_graph(
         context_id=args.context,
         limit=effective_limit,
+        cursor=cursor,
+        response_mode=mode,
     )
     if mode == "legacy":
         return payload
@@ -967,9 +1047,16 @@ def command_commit_cortex(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_cortex_state(args: argparse.Namespace) -> dict[str, Any]:
     mode, budget = _cli_response_options(args, surface="cortex-state")
+    cursor = str(getattr(args, "cursor", "") or "").strip()
+    if mode == "legacy" and cursor:
+        raise ResponseContractError("legacy Cortex responses do not support cursors")
     requested_limit = _normalize_cli_limit(args.limit, maximum=500)
     effective_limit = (
-        min(requested_limit, COMPACT_SOURCE_LIMITS["cortex-state"])
+        compact_retrieval_page_limit(
+            "cortex-state",
+            requested_limit=requested_limit,
+            max_output_bytes=budget,
+        )
         if mode == "compact"
         else requested_limit
     )
@@ -978,6 +1065,8 @@ def command_cortex_state(args: argparse.Namespace) -> dict[str, Any]:
         context_id=args.context,
         agent_id=args.agent_id,
         limit=effective_limit,
+        cursor=cursor,
+        response_mode=mode,
     )
     if mode == "legacy":
         return payload
@@ -1157,13 +1246,20 @@ def command_sleep(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_list_memory(args: argparse.Namespace) -> dict[str, Any]:
     mode, budget = _cli_response_options(args, surface="memory-list")
+    cursor = str(getattr(args, "cursor", "") or "").strip()
+    if mode == "legacy" and cursor:
+        raise ResponseContractError("legacy memory responses do not support cursors")
     if mode == "compact" and bool(args.include_vectors):
         raise ResponseContractError(
             "compact memory responses do not support vectors; use full or legacy mode"
         )
     requested_limit = _normalize_cli_limit(args.limit, maximum=10_000)
     effective_limit = (
-        min(requested_limit, COMPACT_SOURCE_LIMITS["memory-list"])
+        compact_retrieval_page_limit(
+            "memory-list",
+            requested_limit=requested_limit,
+            max_output_bytes=budget,
+        )
         if mode == "compact"
         else requested_limit
     )
@@ -1172,6 +1268,10 @@ def command_list_memory(args: argparse.Namespace) -> dict[str, Any]:
         context_id=args.context,
         limit=effective_limit,
         include_vectors=args.include_vectors,
+        include_global=not bool(args.no_global),
+        recall_scope=args.recall_scope,
+        cursor=cursor,
+        response_mode=mode,
     )
     if mode == "legacy":
         return payload
@@ -1448,9 +1548,16 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     launcher_path = Path(args.launcher).expanduser()
     state_path = Path(status["state_path"]).expanduser()
     memory_db_path = Path(status["memory_db_path"]).expanduser()
-    query_result = ""
-    if args.query_text:
-        query_result = backend.query_text(args.query_text, context_id=args.context)
+    query_result: dict[str, Any] | None = None
+    if args.retrieval_prompt:
+        query_result = backend.retrieve_text_v2(
+            args.retrieval_prompt,
+            context_id=args.context,
+            recall_scope="local",
+            result_limit=8,
+            candidate_limit=64,
+            include_graph_neighbors=True,
+        )
 
     checks = {
         "dependencies_importable": all(
@@ -1488,13 +1595,30 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     }
     if native_certification is not None:
         checks["native_certification_ready"] = bool(native_certification["ready"])
-    if args.query_text:
-        checks["query_returned_context"] = (
-            bool(query_result)
-            and "No high-salience" not in query_result
-            and "No registered historical context matched" not in query_result
+    if args.retrieval_prompt:
+        retrieval_items = (
+            query_result.get("items") if isinstance(query_result, dict) else None
         )
-        checks["query_not_disabled"] = "disabled" not in query_result.lower()
+        checks["retrieval_v2_read_only_contract"] = bool(
+            isinstance(query_result, dict)
+            and query_result.get("schema") == "synapse-retrieval.v2"
+            and query_result.get("raw_input_stored") is False
+            and isinstance(query_result.get("query"), dict)
+            and query_result["query"].get("context_id")
+            == mlx_backend.sanitize_context_id(args.context)
+            and query_result["query"].get("recall_scope") == "local"
+            and query_result["query"].get("raw_input_stored") is False
+        )
+        checks["query_returned_context"] = bool(
+            isinstance(retrieval_items, list)
+            and any(
+                isinstance(item, dict)
+                and item.get("context_id")
+                == mlx_backend.sanitize_context_id(args.context)
+                for item in retrieval_items
+            )
+        )
+        checks["query_not_disabled"] = bool(status["effective_enabled"])
 
     failed_checks = [name for name, passed in checks.items() if not passed]
     return {
@@ -1609,7 +1733,14 @@ def build_parser() -> argparse.ArgumentParser:
     remember_vector.add_argument("--metadata", default=None)
     remember_vector.set_defaults(func=command_remember_vector)
 
-    query_text = subparsers.add_parser("query-text")
+    query_text = subparsers.add_parser(
+        "query-text",
+        help="Deprecated stateful text query; use retrieve-v2 for read-only recall.",
+        description=(
+            "Deprecated stateful text query. It may update spiking runtime state; "
+            "use retrieve-v2 for deterministic read-only recall."
+        ),
+    )
     add_context(query_text)
     query_text.add_argument("--text", required=True)
     query_text.add_argument(
@@ -1621,7 +1752,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     query_text.set_defaults(func=command_query_text)
 
-    query_vector = subparsers.add_parser("query-vector")
+    retrieve_v2 = subparsers.add_parser(
+        "retrieve-v2",
+        help="Deterministic, read-only, structured Retrieval v2.",
+        description=(
+            "Retrieve bounded memory results without running recurrent spiking, "
+            "STDP, pruning, or runtime-state mutation."
+        ),
+    )
+    add_context(retrieve_v2)
+    retrieve_v2.add_argument(
+        "--prompt",
+        "--text",
+        dest="prompt",
+        required=True,
+        help=(
+            "Retrieval prompt (maximum "
+            f"{RETRIEVAL_V2_MAX_PROMPT_BYTES} UTF-8 bytes after CLI decoding)."
+        ),
+    )
+    retrieve_v2.add_argument(
+        "--scope",
+        "--recall-scope",
+        dest="recall_scope",
+        choices=("local", "connected", "all"),
+        default="local",
+        help="Recall only this namespace, approved one-hop links, or every namespace.",
+    )
+    retrieve_v2.add_argument("--result-limit", type=int, default=10)
+    retrieve_v2.add_argument("--candidate-limit", type=int, default=128)
+    retrieve_v2.add_argument(
+        "--include-graph-neighbors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include bounded same-context graph-neighbor candidates.",
+    )
+    _add_response_contract_args(retrieve_v2)
+    retrieve_v2.set_defaults(func=command_retrieve_v2)
+
+    query_vector = subparsers.add_parser(
+        "query-vector",
+        help="Deprecated stateful vector query; use retrieve-v2 for read-only recall.",
+        description=(
+            "Deprecated stateful vector query. It may update spiking runtime state; "
+            "use retrieve-v2 for deterministic read-only recall."
+        ),
+    )
     add_context(query_vector)
     query_vector.add_argument("--vector", required=True)
     query_vector.add_argument(
@@ -1792,6 +1968,11 @@ def build_parser() -> argparse.ArgumentParser:
     graph = subparsers.add_parser("graph")
     add_context(graph)
     graph.add_argument("--limit", type=int, default=100)
+    graph.add_argument(
+        "--cursor",
+        default="",
+        help="opaque Retrieval v2 continuation returned by the prior page",
+    )
     _add_response_contract_args(graph)
     graph.set_defaults(func=command_graph)
 
@@ -1948,6 +2129,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(cortex_state)
     cortex_state.add_argument("--agent-id", default="")
     cortex_state.add_argument("--limit", type=int, default=50)
+    cortex_state.add_argument(
+        "--cursor",
+        default="",
+        help="opaque Retrieval v2 continuation returned by the prior page",
+    )
     _add_response_contract_args(cortex_state)
     cortex_state.set_defaults(func=command_cortex_state)
 
@@ -2076,6 +2262,21 @@ def build_parser() -> argparse.ArgumentParser:
     add_context(list_memory)
     list_memory.add_argument("--limit", type=int, default=50)
     list_memory.add_argument("--include-vectors", action="store_true")
+    list_memory.add_argument(
+        "--recall-scope",
+        choices=("local", "connected", "all"),
+        default="local",
+    )
+    list_memory.add_argument(
+        "--no-global",
+        action="store_true",
+        help="exclude the global namespace from this retrieval page",
+    )
+    list_memory.add_argument(
+        "--cursor",
+        default="",
+        help="opaque Retrieval v2 continuation returned by the prior page",
+    )
     _add_response_contract_args(list_memory)
     list_memory.set_defaults(func=command_list_memory)
 
@@ -2223,8 +2424,14 @@ def build_parser() -> argparse.ArgumentParser:
     preflight = subparsers.add_parser("preflight")
     add_context(preflight)
     preflight.add_argument(
+        "--retrieval-prompt",
         "--query-text",
+        dest="retrieval_prompt",
         default="SYNAPSE-S2 durable local memory Apple Silicon MCP recall",
+        help=(
+            "Read-only Retrieval v2 probe text. --query-text remains a deprecated "
+            "compatibility spelling and does not invoke the legacy stateful query."
+        ),
     )
     preflight.add_argument("--minimum-memory", type=int, default=1)
     preflight.add_argument("--minimum-relationships", type=int, default=0)

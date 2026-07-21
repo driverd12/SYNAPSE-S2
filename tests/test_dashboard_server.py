@@ -712,6 +712,41 @@ class DashboardRuntimeTests(unittest.TestCase):
             "recall_scope must be local, connected, or all",
         )
 
+    def test_query_result_limit_rejects_out_of_range_values_instead_of_clamping(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            responses = []
+            for value in (0, 51, True):
+                responses.append(
+                    self.decode(
+                        runtime.handle(
+                            "POST",
+                            "/api/query",
+                            json.dumps(
+                                {
+                                    "context_id": "demo",
+                                    "prompt": "bounded retrieval",
+                                    "result_limit": value,
+                                }
+                            ).encode(),
+                        )
+                    )
+                )
+
+        self.assertEqual([status for status, _ in responses], [400, 400, 400])
+        self.assertEqual(
+            responses[0][1]["error"],
+            "result_limit must be between 1 and 50",
+        )
+        self.assertEqual(
+            responses[1][1]["error"],
+            "result_limit must be between 1 and 50",
+        )
+        self.assertEqual(
+            responses[2][1]["error"],
+            "result_limit must be an integer",
+        )
+
     def test_namespace_map_and_confirmed_link_api(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -850,7 +885,7 @@ class DashboardRuntimeTests(unittest.TestCase):
             def fail_query(*args, **kwargs):
                 raise RuntimeError("internal path /tmp/secret should stay in logs only")
 
-            runtime.backend.query_text = fail_query  # type: ignore[method-assign]
+            runtime.backend.retrieve_text_v2 = fail_query  # type: ignore[method-assign]
             status, payload = self.decode(
                 runtime.handle(
                     "POST",
@@ -879,7 +914,7 @@ class DashboardRuntimeTests(unittest.TestCase):
                     f"api_key={marker} at /Users/operator/private/config.json"
                 )
 
-            runtime.backend.query_text = fail_query  # type: ignore[method-assign]
+            runtime.backend.retrieve_text_v2 = fail_query  # type: ignore[method-assign]
             with mock.patch.dict(
                 os.environ,
                 {"SYNAPSE_S2_DASHBOARD_DEBUG_ERRORS": "1"},
@@ -1021,7 +1056,19 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertTrue(audit_payload["checks"]["mlx_ready"])
         self.assertTrue(audit_payload["checks"]["memory_ready"])
         self.assertTrue(audit_payload["checks"]["graph_ready"])
-        self.assertIn("dashboard-memory", audit_payload["query_result"])
+        self.assertTrue(
+            any(
+                item.get("tag") == "dashboard-memory"
+                for item in audit_payload["query_result"]["items"]
+            )
+        )
+        self.assertNotIn("query_prompt", audit_payload)
+        self.assertEqual(
+            audit_payload["query_probe"]["source"],
+            "fixed-non-memory-bearing-probe",
+        )
+        self.assertFalse(audit_payload["query_probe"]["raw_input_stored"])
+        self.assertEqual(len(audit_payload["query_probe"]["fingerprint_sha256"]), 64)
 
     def test_namespace_detail_endpoint_validates_and_preserves_bounded_projection(self):
         with TemporaryDirectory() as tmp:
@@ -1383,7 +1430,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("recallGuide", index)
         self.assertIn("Local uses this namespace plus global memory", index)
         self.assertIn("Connected adds approved one-hop bridges", index)
-        self.assertIn("query_spiking_attention_text", index)
+        self.assertIn("retrieve_spiking_memory_v2", index)
         self.assertIn("readinessAuditButton", index)
         self.assertIn("mondayReadinessButton", index)
         self.assertIn("connectionStatusCard", index)
@@ -1716,6 +1763,27 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)
         self.assertNotIn('dispatchEvent(new Event("submit"', app)
+
+    def test_recall_console_is_context_safe_and_describes_retrieval_v2(self):
+        root = Path(__file__).resolve().parents[1]
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("Deterministic hybrid retrieval", index)
+        self.assertIn("retrieve_spiking_memory_v2", index)
+        self.assertIn("deterministic hybrid ranking", app)
+        self.assertNotIn("query_spiking_attention_text", index)
+        self.assertNotIn("gates the spiking memory graph", index)
+        self.assertNotIn("gates the spiking memory graph", app)
+
+        self.assertIn("recallRequestGeneration: 0", app)
+        self.assertIn("function resetRecallResults", app)
+        self.assertIn("const queryContext = state.context", app)
+        self.assertIn("requestGeneration !== state.recallRequestGeneration", app)
+        self.assertIn("state.context !== queryContext", app)
+        self.assertIn("resetRecallResults({ contextId: nextContext })", app)
+        self.assertIn("Context: ${queryContext} · Latency:", app)
+        self.assertIn('status: "stale-context"', app)
 
     def test_namespace_galaxy_assets_explain_weighted_visual_mass(self):
         root = Path(__file__).resolve().parents[1]

@@ -62,12 +62,12 @@ Exit code `0` means every required proof returned `ready`. Any `degraded` or `bl
 | Local launcher | `/Users/dan.driver/.local/bin/synapse-s2-mcp` exists and is executable. |
 | Client config | `scripts/install_client_configs.py --dry-run` has no pending changes and the installed definitions carry only the reviewed core-binding pointer. |
 | MCP connect | FastMCP lists SYNAPSE-S2 tools through the installed launcher; its status payload exactly matches the bound topology, maintenance intervals, MLX device, provider identity, configuration fingerprint, and embedding-space identity. |
-| MCP compact contract probe | An installed-launcher `list_spiking_memory` call returns exactly one authoritative `synapse-s2.token-contract.v1` compact `structuredContent` envelope at or below 12,288 bytes, with independently verified canonical byte accounting, plus exactly one `synapse-s2.mcp-safety-summary.v1` `TextContent` item at or below its separate 4,096-byte ceiling. The safety item must declare `structuredContent_required: true`. Outer JSON-RPC framing is excluded. |
+| MCP compact contract probe | An installed-launcher `list_spiking_memory` call returns exactly one authoritative `synapse-s2.token-contract.v1` compact `structuredContent` envelope at or below 12,288 bytes, with independently verified canonical byte accounting, exact authoritative totals, and authenticated-keyset snapshot/continuation metadata, plus exactly one `synapse-s2.mcp-safety-summary.v1` `TextContent` item at or below its separate 4,096-byte ceiling. The safety item must declare `structuredContent_required: true`. Outer JSON-RPC framing is excluded. |
 | Neural embedding | The requested provider returns a non-empty vector; `mlx-neural` must report native MLX. The bound dimension and exact steady float32 topology must pass pre-materialization admission at or below 384 MiB. |
 | Doctor | Doctor is clean, or the evidence pack clearly reports a repair plan. |
 | Start Work | Start Work returns real operator sections from the selected context. |
 | Memory write | A unique readiness trace is written into the local SQLite memory DB. |
-| Recall | `query-text` returns the same unique readiness trace by run id, tag, or memory id. |
+| Recall | Read-only `retrieve-v2` returns the same unique readiness trace by run id, tag, or memory id inside a bounded `memory-retrieval` contract. It must report `raw_input_stored: false`, local scope, authoritative Retrieval v2 provenance, and uncalibrated score semantics. |
 | App Connect preview | A real running app is attached and previewed without writing memory. Quality and capability badges must be present even if Accessibility is blocked. |
 | Wrap Session | A factual handoff is persisted as durable session memory. |
 | Capture ledger audit | Every processed `capture.v2` record has an exact authoritative SQLite ledger binding; missing, ambiguous, or mismatched evidence blocks backup. |
@@ -140,7 +140,7 @@ post-header I/O, and uses bounded shutdown.
 | `neural_embedding` | Verify `.synapse_s2/models` contains the configured model snapshot, `SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY=1`, and the provider benchmark passes with `--embedding-provider mlx-neural`. |
 | `doctor` | Follow the repair plan inside `summary.md`; rerun Doctor before rerunning certification. |
 | `memory_write` | Check authoritative-core health and the binding-owned memory store; do not inject a competing database path into a bound client. |
-| `recall` | Verify the readiness memory id exists in `list-memory`; then rerun with the same embedding provider. |
+| `recall` | Verify the readiness memory id exists in `list-memory`; then rerun `retrieve-v2` with the same embedding provider. Do not substitute deprecated `query-text`, which is a stateful compatibility path. |
 | `app_preview` | Open a visible app, grant macOS Accessibility/Automation where appropriate, or use selected-text capture when preview reports low signal. |
 | `wrap_session` | Run `wrap-session --preview`, confirm text is non-empty, then rerun certification. |
 | `capture_ledger_audit` | Review `finding_samples` and `audit_revision`. Only when `repairable: true`, run `capture-ledger-integrity --repair --confirm --expected-revision '<audit_revision>'`, then rerun the read-only audit and certification. Never replay captures or synthesize receipts. |

@@ -234,7 +234,7 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 - CLI `agent-brief`, `list-memory`, `graph`, and `cortex-state` use the same compact contract by default. They accept `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics and `--response-mode legacy` only for known local compatibility consumers.
 - Compact projection never drops a leased receipt or its matching visible event. If a hydration projection cannot be delivered safely, its leases are released and acknowledgement remains a separate exact-receipt operation.
 - Critical/high, action-required, and protected contract warnings survive compact projection. Noncritical warnings may be omitted only as complete items with a truthful omission count. MCP consumers must treat `structuredContent` as authoritative; the bounded text item is only a safety decision aid.
-- The reproducible Phase 6 acceptance artifact passed all 11 gates on all four contracted surfaces. It records 1,200,724 legacy installed-policy bytes versus 38,205 compact structured bytes (96.818% reduction), and 106,735 identical-source legacy bytes versus 23,450 compact structured bytes (78.03% reduction). These are informational byte measurements from a verified isolated restore; token counts and transport framing are excluded.
+- The reproducible Phase 6 acceptance artifact passed all 11 gates on the four surfaces contracted at that phase. It records 1,200,724 legacy installed-policy bytes versus 38,205 compact structured bytes (96.818% reduction), and 106,735 identical-source legacy bytes versus 23,450 compact structured bytes (78.03% reduction). These are informational byte measurements from a verified isolated restore; token counts and transport framing are excluded. The later `memory-retrieval` surface has its own synthetic-only validation method and is not retroactively included in those percentages.
 - The loopback dashboard keeps its rich browser API and Namespace Galaxy payloads; the installed MCP token ceiling does not reduce the operator visualization.
 - Dashboard API reads and writes require two independent browser capabilities: a port-specific HttpOnly, SameSite=Strict cookie and `X-Synapse-Dashboard-Session`. The owner-only rotating bootstrap issues both without storing the cookie secret in its `0600` auth file; the browser keeps the header capability only in port-scoped `sessionStorage` and removes it from the redirect fragment before normal navigation. POST additionally requires the exact configured `Host` and same-origin `Origin`.
 - LaunchAgent installers fence concurrent installs, publish private/fsynced plists, wait for launchd unload/start transitions, probe the authoritative service, and restore the prior definition and policy when a health gate fails. The core plist carries the non-secret build identity plus the exact closed `CoreConfig.mlx_device` as `MLX_DEVICE`, so a reviewed CPU/GPU/default selection survives launchd startup.
@@ -258,14 +258,16 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
   --text "The SYNAPSE-S2 backend imports mlx.core and mlxsnn on Apple Silicon. The recurrent LIF backend uses z-score top-k spike coding, immutable MLX state updates, STDP relationship updates, quick-pruning maintenance, and deep-sleep consolidation. The context bus stores durable deployment events that connected local clients pull with fenced receipts, acknowledge exactly after consumption, and track through derived delivery cursors." \
   --surprise-threshold 0.58 \
   --min-segment-sentences 1
-.venv/bin/python synapse_cli.py --json query-text \
+.venv/bin/python synapse_cli.py --json retrieve-v2 \
   --context default \
-  --text "Which clients share the SYNAPSE-S2 memory database and launcher?"
+  --prompt "Which clients share the SYNAPSE-S2 memory database and launcher?" \
+  --scope local --result-limit 10 --candidate-limit 64 \
+  --response-mode compact --max-response-bytes 12288
 .venv/bin/python synapse_cli.py --json graph --context default --limit 10 \
   --response-mode compact --max-response-bytes 12288
 ```
 
-Expected query output returns ranked registered traces such as `production-memory-contract` and linked event traces from `production-preflight-brief`.
+Expected Retrieval v2 output is a `synapse-s2.token-contract.v1` `memory-retrieval` envelope containing ranked registered traces such as `production-memory-contract` and linked event traces from `production-preflight-brief`. The read does not run the recurrent network, apply STDP or pruning, update runtime state, mark activity, or populate the legacy query cache. It fingerprints the redacted prompt without storing or returning the raw prompt.
 Event ingestion additionally creates segmented memories such as `production-preflight-brief-event-001` and relationship edges such as `temporal_next` and `semantic_overlap`. Event boundaries are driven by the configured local embedding provider's cosine-distance surprise when available, while retaining lexical surprise as an auditable fallback.
 
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `/Users/dan.driver/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, or neural configuration. Authoritative exports and recovery paths are injected and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
@@ -581,11 +583,13 @@ Supported prune targets are `event`, `memory`, `relationship`, `context_event`, 
 
 ```bash
 .venv/bin/python synapse_cli.py --json disable --context default
-.venv/bin/python synapse_cli.py --json query-text --context default --text "anything"
+.venv/bin/python synapse_cli.py --json status --context default
 .venv/bin/python synapse_cli.py --json enable --context default
+.venv/bin/python synapse_cli.py --json retrieve-v2 --context default \
+  --prompt "anything" --scope local --response-mode compact
 ```
 
-When disabled, queries return a disabled status instead of mutating or recalling memory.
+The enable switch governs the stateful recurrent/spiking execution path. Use status to verify the toggle and Retrieval v2 for ordinary recall. Retrieval v2 is deliberately read-only; it does not use a recall request as an opportunity to mutate the recurrent substrate.
 
 ### 5. MCP Tool Surface
 
@@ -593,8 +597,9 @@ The MCP server exposes these tools:
 
 | Tool | Purpose |
 | :--- | :--- |
-| `query_spiking_attention` | Query with a dense embedding vector. |
-| `query_spiking_attention_text` | Query text through the configured local embedding provider, defaulting to MLX neural embeddings in installed clients. |
+| `retrieve_spiking_memory_v2` | Deterministic, structured, read-only text retrieval through the configured local provider, with explicit namespace scope, provenance, completeness, and uncalibrated score semantics. This is the recall tool for new integrations. |
+| `query_spiking_attention` | Deprecated stateful dense-vector query. It may update recurrent runtime state; do not use it for read-only recall. |
+| `query_spiking_attention_text` | Deprecated stateful text query. It may update recurrent runtime state; use `retrieve_spiking_memory_v2` instead. |
 | `remember_spiking_context` | Persist a named context trace from text and/or an embedding. |
 | `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
@@ -709,9 +714,13 @@ Recall always declares one of three scopes:
 - `connected` adds directly connected, enabled namespaces to the local/global set and retains source/link provenance on every recalled trace.
 - `all` deliberately searches all namespaces plus global memory. It is never selected implicitly.
 
+Retrieval v2 fuses the durable spike-overlap index, durable surface/facet index, and an optional bounded set of same-context graph neighbors with versioned weights, then applies bounded MMR/Jaccard diversity selection. Every result carries stable memory identity, source provenance, scope provenance, and—when it crossed a namespace boundary—the exact approved one-hop link that authorized it. Scores are deterministic ranking signals, not confidence estimates, truth probabilities, or biological firing rates. The response reports candidate, scope, term, and result truncation independently; ranked retrieval itself is one bounded snapshot read and does not advertise a continuation cursor.
+
+The full validation contract, cursor behavior, benchmark method, and non-claims are documented in [`docs/RETRIEVAL_V2_VALIDATION.md`](docs/RETRIEVAL_V2_VALIDATION.md).
+
 Connected recall is a bounded read operation. Similarity and density-normalized suggestion scores never copy or write durable memories into another namespace, and links require explicit confirmation. Phase-delay values are presentation metadata used only for bridge styling and inspection in the galaxy, not a claim that the SQLite memory store runs a validated biological synchronization model.
 
-The visual and suggestion model is informed by [S2-Net's time-delayed coordination preprint](https://arxiv.org/abs/2605.01656), [Spike Dice Attention's density-bias work](https://openreview.net/forum?id=8clCPAImE3), and the [Spiking Graph Transformer Network paper](https://www.frontiersin.org/journals/behavioral-neuroscience/articles/10.3389/fnbeh.2026.1797210/full). Those papers study spiking neural systems, not durable memory namespace synchronization; SYNAPSE-S2 therefore treats the cross-namespace adaptation as an operator-governed product design rather than an experimentally established result.
+The supplied proposal cited S2-Net, Spike Dice Attention (SDA), and Spiking Graph Transformer Networks (SGTN) as May-July 2026 publications. Those citations were future-dated relative to the design evidence supplied to this repository and have not been independently verified as implementation evidence for SYNAPSE-S2. No S2-Net phase-delay engine, SDA spike-train attention operator, or SGTN training/inference model is implemented or validated here. The galaxy and bridge suggestions are operator-governed product features built from durable indexes, typed links, deterministic scoring, and explicit provenance—not a claim of experimentally established biological synchronization.
 
 Install or refresh the local adapter, then open it only through the authenticated
 helper:

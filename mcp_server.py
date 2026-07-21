@@ -25,6 +25,8 @@ from token_contracts import (
     TOKEN_CONTRACT_OUTPUT_SCHEMA,
     ResponseContractError,
     compact_agent_event_limit,
+    compact_retrieval_page_limit,
+    compact_retrieval_result_limit,
     normalize_response_budget,
     normalize_response_mode,
     project_response,
@@ -65,6 +67,9 @@ logging.basicConfig(
 install_secret_safe_formatters(logging.getLogger().handlers)
 
 MAX_TOOL_EMBEDDING_DIMS = 32_768
+MCP_RETRIEVAL_V2_MAX_PROMPT_BYTES = 16_384
+MCP_RETRIEVAL_V2_MAX_RESULT_LIMIT = 50
+MCP_RETRIEVAL_V2_MAX_CANDIDATE_LIMIT = 512
 MCP_DELIVERY_INSTANCE_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex}"
 MCP_COMPACT_SAFETY_SUMMARY_BYTES = 4_096
 MCP_FULL_SAFETY_SUMMARY_BYTES = 131_072
@@ -154,14 +159,62 @@ ToolBooleanInput = Annotated[
     BeforeValidator(_schema_safe_boolean),
     WithJsonSchema({"type": "boolean"}),
 ]
+RetrievalResultLimitInput = Annotated[
+    int | str,
+    BeforeValidator(_schema_safe_integer),
+    WithJsonSchema(
+        {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MCP_RETRIEVAL_V2_MAX_RESULT_LIMIT,
+        }
+    ),
+]
+RetrievalCandidateLimitInput = Annotated[
+    int | str,
+    BeforeValidator(_schema_safe_integer),
+    WithJsonSchema(
+        {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MCP_RETRIEVAL_V2_MAX_CANDIDATE_LIMIT,
+        }
+    ),
+]
+RetrievalScopeInput = Annotated[
+    str,
+    BeforeValidator(_schema_safe_string),
+    WithJsonSchema(
+        {
+            "type": "string",
+            "enum": ["local", "connected", "all"],
+            "description": "Exact namespace boundary for Retrieval v2.",
+        }
+    ),
+]
 
 
 _CONTRACT_TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
+    "retrieve_spiking_memory_v2": frozenset(
+        {
+            "prompt",
+            "context_id",
+            "recall_scope",
+            "result_limit",
+            "candidate_limit",
+            "include_graph_neighbors",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
     "list_spiking_memory": frozenset(
         {
             "context_id",
             "limit",
             "include_vectors",
+            "recall_scope",
+            "include_global",
+            "cursor",
             "response_mode",
             "max_response_bytes",
         }
@@ -170,6 +223,7 @@ _CONTRACT_TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
         {
             "context_id",
             "limit",
+            "cursor",
             "response_mode",
             "max_response_bytes",
         }
@@ -190,12 +244,14 @@ _CONTRACT_TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
             "agent_id",
             "context_id",
             "limit",
+            "cursor",
             "response_mode",
             "max_response_bytes",
         }
     ),
 }
 _CONTRACT_TOOL_SURFACES = {
+    "retrieve_spiking_memory_v2": "memory-retrieval",
     "list_spiking_memory": "memory-list",
     "list_spiking_memory_graph": "memory-graph",
     "hydrate_spiking_agent_context": "agent-hydration",
@@ -814,10 +870,50 @@ def _validate_limit(limit: Any) -> int:
     return min(max(value, 1), 500)
 
 
+def _validate_bounded_integer(
+    value: Any,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Validate a bounded integer without silently changing caller intent."""
+
+    if isinstance(value, bool) or value == _SCHEMA_INVALID_INTEGER:
+        raise ValueError(f"{field_name} must be an integer")
+    if isinstance(value, str):
+        try:
+            reject_sensitive_identifier(value, field=field_name)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer") from exc
+        if not re.fullmatch(r"[+-]?[0-9]+", value.strip()):
+            raise ValueError(f"{field_name} must be an integer")
+        parsed = int(value.strip())
+    elif isinstance(value, int):
+        parsed = value
+    else:
+        raise ValueError(f"{field_name} must be an integer")
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(
+            f"{field_name} must be between {minimum} and {maximum}"
+        )
+    return parsed
+
+
 def _validate_recall_scope(recall_scope: str) -> str:
     normalized = str(recall_scope or "local").strip().lower()
     if normalized == "broad":
         normalized = "all"
+    if normalized not in {"local", "connected", "all"}:
+        raise ValueError("recall_scope must be local, connected, or all")
+    return normalized
+
+
+def _validate_retrieval_scope(recall_scope: Any) -> str:
+    normalized = _validate_tool_string(
+        recall_scope,
+        field_name="recall_scope",
+    ).strip().casefold()
     if normalized not in {"local", "connected", "all"}:
         raise ValueError("recall_scope must be local, connected, or all")
     return normalized
@@ -997,9 +1093,115 @@ def _publish_tool_deployment(
 
 
 @mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
     annotations={
-        "title": "Query Spiking Associative Memory",
+        "title": "Retrieve SYNAPSE-S2 Memory v2",
         "readOnlyHint": True,
+    },
+)
+def retrieve_spiking_memory_v2(
+    prompt: ToolStringInput,
+    context_id: ToolStringInput = "default",
+    recall_scope: RetrievalScopeInput = "local",
+    result_limit: RetrievalResultLimitInput = 10,
+    candidate_limit: RetrievalCandidateLimitInput = 128,
+    include_graph_neighbors: ToolBooleanInput = True,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Return deterministic, read-only Retrieval v2 results in a bounded contract."""
+
+    context = "unknown"
+    budget: int | None = _token_error_budget(surface="memory-retrieval")
+    try:
+        budget = _token_response_budget(
+            surface="memory-retrieval",
+            max_response_bytes=max_response_bytes,
+        )
+        configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+        mode = normalize_response_mode(response_mode, default=configured_mode)
+        prompt_text = _validate_text(
+            _validate_tool_string(prompt, field_name="prompt"),
+            field_name="prompt",
+        )
+        if len(prompt_text.encode("utf-8")) > MCP_RETRIEVAL_V2_MAX_PROMPT_BYTES:
+            raise ValueError(
+                "prompt exceeds "
+                f"{MCP_RETRIEVAL_V2_MAX_PROMPT_BYTES} UTF-8 bytes"
+            )
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
+        scope = _validate_retrieval_scope(recall_scope)
+        bounded_result_limit = _validate_bounded_integer(
+            result_limit,
+            field_name="result_limit",
+            minimum=1,
+            maximum=MCP_RETRIEVAL_V2_MAX_RESULT_LIMIT,
+        )
+        bounded_candidate_limit = _validate_bounded_integer(
+            candidate_limit,
+            field_name="candidate_limit",
+            minimum=1,
+            maximum=MCP_RETRIEVAL_V2_MAX_CANDIDATE_LIMIT,
+        )
+        if bounded_candidate_limit < bounded_result_limit:
+            raise ValueError(
+                "candidate_limit must be greater than or equal to result_limit"
+            )
+        include_neighbors = _validate_tool_boolean(
+            include_graph_neighbors,
+            field_name="include_graph_neighbors",
+        )
+        effective_result_limit = (
+            compact_retrieval_result_limit(
+                requested_limit=bounded_result_limit,
+                max_output_bytes=budget,
+            )
+            if mode == "compact"
+            else bounded_result_limit
+        )
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_backend().retrieve_text_v2(
+            prompt_text,
+            context_id=context,
+            recall_scope=scope,
+            result_limit=effective_result_limit,
+            candidate_limit=bounded_candidate_limit,
+            include_graph_neighbors=include_neighbors,
+        )
+        payload["_response_source"] = {
+            "requested_limit": bounded_result_limit,
+            "effective_limit": effective_result_limit,
+        }
+        return _contract_tool_result(
+            project_response(
+                "memory-retrieval",
+                payload,
+                mode=mode,
+                max_response_bytes=budget,
+            )
+        )
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid Retrieval v2 request for context_id=%s: %s",
+            context,
+            exc,
+        )
+        return _contract_tool_result(
+            _contract_error("memory-retrieval", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("Retrieval v2 failed for context_id=%s", context)
+        return _contract_tool_result(
+            _contract_error("memory-retrieval", exc, max_response_bytes=budget)
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Deprecated Legacy Spiking Associative Query",
+        "readOnlyHint": False,
     }
 )
 def query_spiking_attention(
@@ -1007,7 +1209,7 @@ def query_spiking_attention(
     context_id: str = "default",
     recall_scope: str = "local",
 ) -> str:
-    """Return context-local, approved connected, or all-context memory matches."""
+    """Deprecated stateful query; use retrieve_spiking_memory_v2 for read-only recall."""
     context = "unknown"
     try:
         context = _sanitize_context_id(context_id)
@@ -1030,8 +1232,8 @@ def query_spiking_attention(
 
 @mcp.tool(
     annotations={
-        "title": "Query Spiking Associative Memory From Text",
-        "readOnlyHint": True,
+        "title": "Deprecated Legacy Spiking Associative Text Query",
+        "readOnlyHint": False,
     }
 )
 def query_spiking_attention_text(
@@ -1039,7 +1241,7 @@ def query_spiking_attention_text(
     context_id: str = "default",
     recall_scope: str = "local",
 ) -> str:
-    """Return scoped context matches using the configured local text embedding provider."""
+    """Deprecated stateful query; use retrieve_spiking_memory_v2 for read-only recall."""
     context = "unknown"
     try:
         context = _sanitize_context_id(context_id)
@@ -1272,6 +1474,9 @@ def list_spiking_memory(
     context_id: ToolStringInput = "default",
     limit: ToolIntegerInput = 50,
     include_vectors: ToolBooleanInput = False,
+    recall_scope: ToolStringInput = "local",
+    include_global: ToolBooleanInput = True,
+    cursor: ToolStringInput = "",
     response_mode: ResponseModeInput = "",
     max_response_bytes: ResponseBudgetInput = "",
 ) -> Any:
@@ -1293,12 +1498,26 @@ def list_spiking_memory(
             include_vectors,
             field_name="include_vectors",
         )
+        scope = _validate_recall_scope(
+            _validate_tool_string(recall_scope, field_name="recall_scope")
+        )
+        include_global_data = _validate_tool_boolean(
+            include_global,
+            field_name="include_global",
+        )
+        continuation = _validate_tool_string(cursor, field_name="cursor").strip()
+        if len(continuation.encode("utf-8")) > 4_096:
+            raise ValueError("cursor exceeds 4096 bytes")
         if mode == "compact" and include_vector_data:
             raise ResponseContractError(
                 "compact memory responses do not support vectors; use full mode"
             )
         effective_limit = (
-            min(bounded_limit, COMPACT_SOURCE_LIMITS["memory-list"])
+            compact_retrieval_page_limit(
+                "memory-list",
+                requested_limit=bounded_limit,
+                max_output_bytes=budget,
+            )
             if mode == "compact"
             else bounded_limit
         )
@@ -1307,6 +1526,10 @@ def list_spiking_memory(
             context_id=context,
             limit=effective_limit,
             include_vectors=include_vector_data,
+            recall_scope=scope,
+            include_global=include_global_data,
+            cursor=continuation,
+            response_mode=mode,
         )
         payload["_response_source"] = {
             "requested_limit": bounded_limit,
@@ -1857,6 +2080,7 @@ def prune_spiking_memory(
 def list_spiking_memory_graph(
     context_id: ToolStringInput = "default",
     limit: ToolIntegerInput = 100,
+    cursor: ToolStringInput = "",
     response_mode: ResponseModeInput = "",
     max_response_bytes: ResponseBudgetInput = "",
 ) -> Any:
@@ -1874,8 +2098,15 @@ def list_spiking_memory_graph(
             _validate_tool_string(context_id, field_name="context_id")
         )
         bounded_limit = _validate_limit(limit)
+        continuation = _validate_tool_string(cursor, field_name="cursor").strip()
+        if len(continuation.encode("utf-8")) > 4_096:
+            raise ValueError("cursor exceeds 4096 bytes")
         effective_limit = (
-            min(bounded_limit, COMPACT_SOURCE_LIMITS["memory-graph"])
+            compact_retrieval_page_limit(
+                "memory-graph",
+                requested_limit=bounded_limit,
+                max_output_bytes=budget,
+            )
             if mode == "compact"
             else bounded_limit
         )
@@ -1883,6 +2114,8 @@ def list_spiking_memory_graph(
         payload = mlx_backend.list_memory_graph(
             context_id=context,
             limit=effective_limit,
+            cursor=continuation,
+            response_mode=mode,
         )
         payload["_response_source"] = {
             "requested_limit": bounded_limit,
@@ -2494,6 +2727,7 @@ def get_spiking_cortex_state(
     agent_id: ToolStringInput = "",
     context_id: ToolStringInput = "default",
     limit: ToolIntegerInput = 50,
+    cursor: ToolStringInput = "",
     response_mode: ResponseModeInput = "",
     max_response_bytes: ResponseBudgetInput = "",
 ) -> Any:
@@ -2514,8 +2748,15 @@ def get_spiking_cortex_state(
         agent_input = _validate_tool_string(agent_id, field_name="agent_id")
         agent = _sanitize_agent_id(agent_input) if agent_input.strip() else ""
         bounded_limit = _validate_limit(limit)
+        continuation = _validate_tool_string(cursor, field_name="cursor").strip()
+        if len(continuation.encode("utf-8")) > 4_096:
+            raise ValueError("cursor exceeds 4096 bytes")
         effective_limit = (
-            min(bounded_limit, COMPACT_SOURCE_LIMITS["cortex-state"])
+            compact_retrieval_page_limit(
+                "cortex-state",
+                requested_limit=bounded_limit,
+                max_output_bytes=budget,
+            )
             if mode == "compact"
             else bounded_limit
         )
@@ -2524,6 +2765,8 @@ def get_spiking_cortex_state(
             context_id=context,
             agent_id=agent,
             limit=effective_limit,
+            cursor=continuation,
+            response_mode=mode,
         )
         payload["_response_source"] = {
             "requested_limit": bounded_limit,

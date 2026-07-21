@@ -26,7 +26,7 @@ assertions against that candidate, not client-side configuration overrides. Its
 manifest embeds the canonical `synapse-s2.core-config-evidence.v1` contract and
 candidate configuration fingerprint. The certifier exits non-zero unless client
 config, MCP connection, the required compact MCP contract probe, native neural
-embedding, Doctor, Start Work, real memory write and recall, App Connect
+embedding, Doctor, Start Work, real memory write and read-only Retrieval v2 recall, App Connect
 no-write preview, Wrap Session persistence, dashboard smoke, signed recovery,
 and isolated restore are all ready.
 
@@ -152,10 +152,11 @@ Restart Codex, Claude Desktop, and Claude Code after the client-config installer
 - Dashboard App Connect attach and snapshot actions require short-lived preflight tokens bound to the selected app or connection before they can write to memory.
 - Destructive memory and Cortex pruning are confirmation-gated: CLI requires `--confirm`, MCP requires `confirm=true`, and the dashboard requires an explicit confirmation action before deleting graph data or governed traces.
 - `test-validated` Cortex memory requires concrete validation evidence such as a test command, test list, output summary, artifact path, commit, or verification report. Use `observed` or `operator-confirmed` for ordinary notes.
-- Recall is backed by durable SQLite indexes for sparse spikes and surface terms. Existing databases are backfilled automatically, and `memory_store.stats()` exposes the populated index counts.
+- Retrieval v2 is backed by durable SQLite indexes for sparse spikes and surface terms, with optional bounded same-context graph expansion and deterministic MMR diversity selection. Existing databases are backfilled automatically, and `memory_store.stats()` exposes the populated index counts. Ranking scores are uncalibrated relevance signals, not probabilities or truth confidence.
 - Client config installation refuses malformed existing JSON instead of silently replacing it.
-- Installed MCP clients default to `synapse-s2.token-contract.v1` compact responses with a 12,288-byte post-redaction UTF-8 ceiling for authoritative `structuredContent` on memory list, graph, agent hydration, and Cortex state calls. MCP also emits one separate compact safety `TextContent` item bounded to 4,096 bytes; full-mode safety text is bounded separately to 131,072 bytes. Outer JSON-RPC framing is excluded from all three ceilings. `response_mode="full"` is an explicit bounded diagnostic choice, never an automatic fallback.
-- CLI `agent-brief`, `list-memory`, `graph`, and `cortex-state` use the same compact envelope by default. Use `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics or `--response-mode legacy` only for a known compatibility consumer.
+- Installed MCP clients default to `synapse-s2.token-contract.v1` compact responses with a 12,288-byte post-redaction UTF-8 ceiling for authoritative `structuredContent` on Retrieval v2, memory list, graph, agent hydration, and Cortex state calls. MCP also emits one separate compact safety `TextContent` item bounded to 4,096 bytes; full-mode safety text is bounded separately to 131,072 bytes. Outer JSON-RPC framing is excluded from all three ceilings. `response_mode="full"` is an explicit bounded diagnostic choice, never an automatic fallback.
+- CLI `retrieve-v2`, `agent-brief`, `list-memory`, `graph`, and `cortex-state` use the same compact envelope by default. Use `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics or `--response-mode legacy` only for a known compatibility consumer.
+- Compact/full memory-list, memory-graph, and Cortex-state reads expose exact authoritative totals and authenticated keyset continuation. A cursor is bound to contract version, response mode, context, scope, filters, ordering, snapshot revision, expiry, and origin node. Cortex cursors additionally bind the frozen live active-session view. A stale, expired, altered, wrong-context, wrong-mode, wrong-filter, or cross-origin cursor fails closed instead of restarting at page one.
 - Compact hydration preserves a one-to-one mapping from every leased `receipt_id` to a visible deployment event. Projection failure releases acquired leases; only a later exact-receipt acknowledgement advances durable delivery state.
 - A deterministic no-effect ACK, release, or dead-letter request becomes a terminal `failed` / `invalid_request` journal row; a genuinely uncertain commit remains `outcome_unknown` and is never replayed. Credential-shaped delivery identifiers fail before journal admission. Terminal rows retain dedup evidence until age-based pruning, so total retained-row throughput remains finite even though deterministic rejects do not consume accepted-row capacity.
 - Raw `register_trace` and `query` vectors must match the configured dimension before journal admission. The exact steady float32 dense topology must fit 384 MiB before MLX loading, materialization, or resize; this is not peak-residency, target-hardware, or execution-time proof.
@@ -309,10 +310,19 @@ Full vector details, only when needed:
 Recall smoke:
 
 ```bash
-.venv/bin/python synapse_cli.py --json query-text \
+.venv/bin/python synapse_cli.py --json retrieve-v2 \
   --context default \
-  --text "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients"
+  --prompt "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients" \
+  --scope local --result-limit 8 --candidate-limit 64 \
+  --response-mode compact --max-response-bytes 12288
 ```
+
+Require `operation: "memory-retrieval"`, `data.raw_input_stored: false`, explicit
+`data.scope.contexts`, and item-level `scope_provenance`, `source_provenance`,
+and `confidence.signal: "uncalibrated-ranking-score"`. `has_more: true` on this
+ranked response reports a bounded candidate/result limit; it is not a page
+cursor. Use a larger bounded request or a new snapshot when more ranked results
+are needed. Do not fall back to the deprecated stateful `query-text` command.
 
 Event graph ingestion:
 
@@ -682,7 +692,8 @@ Useful tool calls:
 | :--- | :--- |
 | `get_spiking_attention_status` | Proves the runtime is enabled and shows memory counts. |
 | `remember_spiking_context` | Stores a new local memory trace. |
-| `query_spiking_attention_text` | Recalls local memory from text using the configured local provider; installed clients default to MLX neural embeddings without external inference calls. |
+| `retrieve_spiking_memory_v2` | Deterministically recalls bounded memory through the configured local provider without recurrent/STDP/pruning/runtime-state mutation; returns explicit scope/link provenance, completeness, and uncalibrated ranking semantics. |
+| `query_spiking_attention_text` | Deprecated stateful compatibility query; it may mutate recurrent runtime state and must not be used as read-only recall. |
 | `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
 | `capture_spiking_conversation` | Captures real operator/agent session notes into event memory. |
 | `drop_spiking_capture_inbox` | Drops opt-in session notes for the always-on local sidecar. |

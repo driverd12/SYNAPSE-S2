@@ -1,0 +1,472 @@
+{
+  "schema": "synapse-s2.retrieval-v2-fixture.v1",
+  "version": 1,
+  "random_seed": 271828,
+  "fixed_epoch": 1784600000.0,
+  "backend": {
+    "dimension": 32,
+    "num_neurons": 24,
+    "default_top_k": 6,
+    "recall_count": 12,
+    "embedding_provider": "semantic-hash"
+  },
+  "thresholds": {
+    "macro_recall_at_k_min": 0.8,
+    "macro_ndcg_at_k_min": 0.75,
+    "macro_mrr_min": 0.75,
+    "per_query_recall_at_k_min": 0.5,
+    "per_query_ndcg_at_k_min": 0.5,
+    "per_query_mrr_min": 0.5,
+    "namespace_leakage_rate_max": 0.0,
+    "duplicate_rate_max": 0.0,
+    "near_duplicate_collision_rate_max": 0.25,
+    "required_positive_signals": [
+      "spike_index",
+      "surface_index",
+      "same_context_graph"
+    ]
+  },
+  "context_links": [
+    {
+      "source_context_id": "control-room",
+      "target_context_id": "ptz-camera",
+      "relation_type": "approved-operational-overlap",
+      "direction": "bidirectional",
+      "confidence": 0.94,
+      "approved_by": "retrieval-v2-fixture",
+      "enabled": true
+    }
+  ],
+  "relationships": [
+    {
+      "context_id": "ptz-camera",
+      "source_document_id": "ptz-encoder-calibration",
+      "target_document_id": "ptz-graph-follow-up",
+      "relation_type": "supports",
+      "weight": 1.0
+    }
+  ],
+  "documents": [
+    {
+      "document_id": "cr-camera-anchor",
+      "context_id": "control-room",
+      "tag": "camera-anchor",
+      "label": "Camera encoder calibration evidence",
+      "text": "PTZ camera encoder calibration in the control room verified pan, tilt, iris, and preset response.",
+      "embedding_prompt": "camera control room PTZ encoder calibration",
+      "categories": ["local", "dense", "duplicate"],
+      "duplicate_group": "camera-anchor-exact",
+      "near_duplicate_group": "camera-calibration-family"
+    },
+    {
+      "document_id": "cr-camera-anchor-copy",
+      "context_id": "control-room",
+      "tag": "camera-anchor-copy",
+      "label": "Camera encoder calibration evidence",
+      "text": "PTZ camera encoder calibration in the control room verified pan, tilt, iris, and preset response.",
+      "embedding_prompt": "camera control room PTZ encoder calibration",
+      "categories": ["local", "duplicate"],
+      "duplicate_group": "camera-anchor-exact",
+      "near_duplicate_group": "camera-calibration-family"
+    },
+    {
+      "document_id": "cr-camera-near-copy",
+      "context_id": "control-room",
+      "tag": "camera-near-copy",
+      "label": "Adjacent camera calibration note",
+      "text": "Control-room PTZ camera encoder calibration verified pan and tilt response with a nearby preset check.",
+      "embedding_prompt": "camera control room PTZ encoder calibration",
+      "categories": ["local", "near-duplicate"],
+      "near_duplicate_group": "camera-calibration-family"
+    },
+    {
+      "document_id": "cr-surface-only",
+      "context_id": "control-room",
+      "tag": "camera-surface-only",
+      "label": "Surface-index camera evidence",
+      "text": "Camera control room PTZ encoder calibration terms are present in this lexical evidence record.",
+      "embedding_prompt": "orchard cedar rainfall inventory",
+      "categories": ["local", "dense"]
+    },
+    {
+      "document_id": "cr-spike-only",
+      "context_id": "control-room",
+      "tag": "camera-spike-only",
+      "label": "Latent control evidence",
+      "text": "Verified operational note zeta with deliberately sparse visible wording.",
+      "embedding_prompt": "camera control room PTZ encoder calibration",
+      "categories": ["local", "sparse"]
+    },
+    {
+      "document_id": "cr-sparse-fault",
+      "context_id": "control-room",
+      "tag": "iris-azimuth-271",
+      "label": "IRIS-AZIMUTH-271",
+      "text": "IRIS-AZIMUTH-271",
+      "embedding_prompt": "IRIS-AZIMUTH-271",
+      "categories": ["local", "sparse"]
+    },
+    {
+      "document_id": "cr-dense-distractor",
+      "context_id": "control-room",
+      "tag": "dense-operator-handbook",
+      "label": "Dense operator handbook",
+      "text": "The operator handbook covers camera labels, control surfaces, room assignments, presets, routing, maintenance, handoff, staffing, schedules, and general troubleshooting without documenting the requested encoder calibration result.",
+      "embedding_prompt": "operator staffing handbook maintenance schedule",
+      "categories": ["local", "dense", "distractor"]
+    },
+    {
+      "document_id": "cr-tie-alpha",
+      "context_id": "control-room",
+      "tag": "tie-alpha",
+      "label": "Deterministic tie candidate alpha",
+      "text": "Deterministic tie breaker evidence candidate alpha.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "deterministic-tie"
+    },
+    {
+      "document_id": "cr-tie-bravo",
+      "context_id": "control-room",
+      "tag": "tie-bravo",
+      "label": "Deterministic tie candidate bravo",
+      "text": "Deterministic tie breaker evidence candidate bravo.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "deterministic-tie"
+    },
+    {
+      "document_id": "tie-cap-00",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-00",
+      "label": "Over-cap tie candidate unit00",
+      "text": "Deterministic tie breaker evidence unit00.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-01",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-01",
+      "label": "Over-cap tie candidate unit01",
+      "text": "Deterministic tie breaker evidence unit01.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-02",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-02",
+      "label": "Over-cap tie candidate unit02",
+      "text": "Deterministic tie breaker evidence unit02.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-03",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-03",
+      "label": "Over-cap tie candidate unit03",
+      "text": "Deterministic tie breaker evidence unit03.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-04",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-04",
+      "label": "Over-cap tie candidate unit04",
+      "text": "Deterministic tie breaker evidence unit04.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-05",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-05",
+      "label": "Over-cap tie candidate unit05",
+      "text": "Deterministic tie breaker evidence unit05.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-06",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-06",
+      "label": "Over-cap tie candidate unit06",
+      "text": "Deterministic tie breaker evidence unit06.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-07",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-07",
+      "label": "Over-cap tie candidate unit07",
+      "text": "Deterministic tie breaker evidence unit07.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-08",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-08",
+      "label": "Over-cap tie candidate unit08",
+      "text": "Deterministic tie breaker evidence unit08.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-09",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-09",
+      "label": "Over-cap tie candidate unit09",
+      "text": "Deterministic tie breaker evidence unit09.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-10",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-10",
+      "label": "Over-cap tie candidate unit10",
+      "text": "Deterministic tie breaker evidence unit10.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-11",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-11",
+      "label": "Over-cap tie candidate unit11",
+      "text": "Deterministic tie breaker evidence unit11.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-12",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-12",
+      "label": "Over-cap tie candidate unit12",
+      "text": "Deterministic tie breaker evidence unit12.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-13",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-13",
+      "label": "Over-cap tie candidate unit13",
+      "text": "Deterministic tie breaker evidence unit13.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-14",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-14",
+      "label": "Over-cap tie candidate unit14",
+      "text": "Deterministic tie breaker evidence unit14.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-15",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-15",
+      "label": "Over-cap tie candidate unit15",
+      "text": "Deterministic tie breaker evidence unit15.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-16",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-16",
+      "label": "Over-cap tie candidate unit16",
+      "text": "Deterministic tie breaker evidence unit16.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "tie-cap-17",
+      "context_id": "tie-lab",
+      "tag": "over-cap-tie-17",
+      "label": "Over-cap tie candidate unit17",
+      "text": "Deterministic tie breaker evidence unit17.",
+      "embedding_prompt": "deterministic tie breaker evidence",
+      "categories": ["local", "tie"],
+      "tie_group": "over-source-limit-tie",
+      "fixed_time_group": "over-source-limit-tie"
+    },
+    {
+      "document_id": "ptz-encoder-calibration",
+      "context_id": "ptz-camera",
+      "tag": "ptz-encoder-calibration",
+      "label": "PTZ encoder calibration result",
+      "text": "PTZ camera encoder calibration confirmed accurate pan and tilt telemetry for the connected control-room workflow.",
+      "embedding_prompt": "camera control room PTZ encoder calibration",
+      "categories": ["approved-connected", "dense"]
+    },
+    {
+      "document_id": "ptz-surface-only",
+      "context_id": "ptz-camera",
+      "tag": "ptz-surface-only",
+      "label": "Connected lexical calibration note",
+      "text": "The connected PTZ camera encoder calibration record references the control room and iris setup.",
+      "embedding_prompt": "harbor freight logistics manifest",
+      "categories": ["approved-connected"]
+    },
+    {
+      "document_id": "ptz-graph-follow-up",
+      "context_id": "ptz-camera",
+      "tag": "ptz-graph-follow-up",
+      "label": "Graph-only follow-up packet",
+      "text": "Follow-up packet omega contains the corroborating measurement attachment.",
+      "embedding_prompt": "botanical specimen archive omega",
+      "categories": ["approved-connected", "sparse"]
+    },
+    {
+      "document_id": "ptz-distractor",
+      "context_id": "ptz-camera",
+      "tag": "ptz-cleaning-schedule",
+      "label": "PTZ cleaning schedule",
+      "text": "Quarterly lens cleaning supplies and facilities access schedule.",
+      "embedding_prompt": "lens cleaning facilities schedule",
+      "categories": ["approved-connected", "distractor"]
+    },
+    {
+      "document_id": "finance-runway",
+      "context_id": "finance",
+      "tag": "finance-runway",
+      "label": "Quarterly finance runway forecast",
+      "text": "Quarterly finance runway forecast reconciles operating cash, committed spend, and the approved planning horizon.",
+      "embedding_prompt": "quarterly finance runway forecast",
+      "categories": ["unrelated", "dense"]
+    },
+    {
+      "document_id": "finance-leak-trap",
+      "context_id": "finance",
+      "tag": "camera-leak-trap",
+      "label": "Unapproved camera lexical trap",
+      "text": "Camera control room PTZ encoder calibration appears here only as an unapproved cross-namespace leakage trap.",
+      "embedding_prompt": "camera control room PTZ encoder calibration",
+      "categories": ["unrelated", "distractor"]
+    },
+    {
+      "document_id": "finance-distractor",
+      "context_id": "finance",
+      "tag": "expense-coding",
+      "label": "Expense coding reminder",
+      "text": "Finance expense category coding and receipt submission reminder.",
+      "embedding_prompt": "expense category receipt submission",
+      "categories": ["unrelated", "distractor", "sparse"]
+    },
+    {
+      "document_id": "audio-unrelated",
+      "context_id": "audio-recording",
+      "tag": "audio-proof-take",
+      "label": "Audio proof take",
+      "text": "Recorded proof take confirms channel isolation and playback routing.",
+      "embedding_prompt": "audio proof take channel playback",
+      "categories": ["unrelated", "distractor"]
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "connected-camera-calibration",
+      "prompt": "camera control room PTZ encoder calibration",
+      "context_id": "control-room",
+      "recall_scope": "connected",
+      "result_limit": 12,
+      "candidate_limit": 64,
+      "include_graph_neighbors": true,
+      "allowed_contexts": ["control-room", "ptz-camera"],
+      "judgments": {
+        "cr-camera-anchor": 3,
+        "cr-camera-near-copy": 2,
+        "cr-surface-only": 2,
+        "cr-spike-only": 2,
+        "ptz-encoder-calibration": 3,
+        "ptz-surface-only": 2,
+        "ptz-graph-follow-up": 1
+      }
+    },
+    {
+      "query_id": "sparse-fault-code",
+      "prompt": "IRIS-AZIMUTH-271",
+      "context_id": "control-room",
+      "recall_scope": "local",
+      "result_limit": 4,
+      "candidate_limit": 32,
+      "include_graph_neighbors": true,
+      "allowed_contexts": ["control-room"],
+      "judgments": {
+        "cr-sparse-fault": 3
+      }
+    },
+    {
+      "query_id": "deterministic-tie-order",
+      "prompt": "deterministic tie breaker evidence",
+      "context_id": "tie-lab",
+      "recall_scope": "local",
+      "result_limit": 4,
+      "candidate_limit": 32,
+      "include_graph_neighbors": false,
+      "allowed_contexts": ["tie-lab"],
+      "judgments": {
+        "tie-cap-00": 3,
+        "tie-cap-04": 3,
+        "tie-cap-09": 3,
+        "tie-cap-10": 3
+      }
+    },
+    {
+      "query_id": "unrelated-finance-local",
+      "prompt": "quarterly finance runway forecast",
+      "context_id": "finance",
+      "recall_scope": "local",
+      "result_limit": 4,
+      "candidate_limit": 32,
+      "include_graph_neighbors": true,
+      "allowed_contexts": ["finance"],
+      "judgments": {
+        "finance-runway": 3
+      }
+    }
+  ]
+}

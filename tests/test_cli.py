@@ -2401,7 +2401,7 @@ class SynapseCliTests(unittest.TestCase):
                 "preflight",
                 "--context",
                 "demo",
-                "--query-text",
+                "--retrieval-prompt",
                 "SYNAPSE-S2 preflight verifies memory recall.",
                 "--minimum-memory",
                 "1",
@@ -2418,7 +2418,15 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(payload["failed_checks"], [])
         self.assertTrue(payload["checks"]["launcher_executable"])
         self.assertTrue(payload["checks"]["memory_minimum_met"])
-        self.assertIn("cli-preflight-memory", payload["query_result"])
+        self.assertTrue(payload["checks"]["retrieval_v2_read_only_contract"])
+        self.assertEqual(payload["query_result"]["schema"], "synapse-retrieval.v2")
+        self.assertFalse(payload["query_result"]["raw_input_stored"])
+        self.assertTrue(
+            any(
+                item.get("tag") == "cli-preflight-memory"
+                for item in payload["query_result"]["items"]
+            )
+        )
 
     def test_cli_preflight_can_require_memory_graph_relationships(self):
         with TemporaryDirectory() as tmp:

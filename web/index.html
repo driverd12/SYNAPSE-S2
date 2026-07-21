@@ -962,18 +962,18 @@
             <div class="panel-header">
               <div>
                 <p class="section-label">Recall Console</p>
-                <h2 id="recallTitle">Associative query</h2>
+                <h2 id="recallTitle">Deterministic hybrid retrieval</h2>
               </div>
               <button id="clearRecallButton" class="utility-button small" type="button">Clear</button>
             </div>
             <div id="recallGuide" class="recall-guide" aria-label="Recall console guidance">
               <div>
                 <strong>What this does</strong>
-                <span>Embeds your text locally, gates the spiking memory graph, and returns matching traces from the selected recall scope.</span>
+                <span>Embeds your text locally, reads durable spike and semantic indexes, fuses versioned rank signals, and returns bounded matching traces without mutating memory state.</span>
               </div>
               <div>
                 <strong>Where it goes</strong>
-                <span title="MCP tool: query_spiking_attention_text">Local uses this namespace plus global memory; Connected adds approved one-hop bridges; All searches every namespace.</span>
+                <span title="MCP tool: retrieve_spiking_memory_v2">Local uses this namespace plus global memory; Connected adds approved one-hop bridges; All searches every namespace.</span>
               </div>
               <div>
                 <strong>Good prompts</strong>
@@ -1013,7 +1013,7 @@
             </form>
             <div class="result-head">
               <span>Results <strong id="resultCount">(0)</strong></span>
-              <span id="latencyLabel">Latency: -- ms</span>
+              <span id="latencyLabel">Context: active · Latency: -- ms</span>
             </div>
             <div id="queryResults" class="result-list" aria-live="polite"></div>
           </article>

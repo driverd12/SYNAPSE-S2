@@ -27,6 +27,7 @@ MIN_RESPONSE_BYTES = 4 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
 DEFAULT_RESPONSE_BYTES = {
     "agent-hydration": 16 * 1024,
+    "memory-retrieval": 24 * 1024,
     "memory-list": 32 * 1024,
     "memory-graph": 48 * 1024,
     "cortex-state": 16 * 1024,
@@ -34,14 +35,29 @@ DEFAULT_RESPONSE_BYTES = {
 COMPACT_SOURCE_LIMITS = {
     "agent-events": 8,
     "agent-graph": 20,
+    "memory-retrieval": 8,
     "memory-list": 50,
     "memory-graph": 30,
     "cortex-state": 20,
 }
+COMPACT_RETRIEVAL_ITEM_BYTES = {
+    "memory-list": 1_024,
+    "memory-graph": 2_048,
+    "cortex-state": 1_024,
+}
+COMPACT_RETRIEVAL_FIXED_BYTES = 3_072
+RETRIEVAL_PAGE_SCHEMA = "synapse-s2.retrieval-page.v2"
+RETRIEVAL_CURSOR_STRATEGY = "authenticated-keyset-v2"
+_RETRIEVAL_CURSOR_RE = re.compile(r"\As2rc2\.[A-Za-z0-9_-]{1,4000}\.[A-Za-z0-9_-]{43}\Z")
+_RETRIEVAL_REVISION_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_RETRIEVAL_ORIGIN_RE = re.compile(r"\As2origin_[0-9a-f]{32}\Z")
 SURFACE_ALIASES = {
     "agent-context-hydrate": "agent-hydration",
     "agent-hydration": "agent-hydration",
     "hydrate": "agent-hydration",
+    "retrieve": "memory-retrieval",
+    "retrieve-v2": "memory-retrieval",
+    "memory-retrieval": "memory-retrieval",
     "list-memory": "memory-list",
     "memory-list": "memory-list",
     "graph": "memory-graph",
@@ -184,6 +200,59 @@ def compact_agent_event_limit(*, requested_limit: int, max_output_bytes: int) ->
     )
     budget_bound = max(1, (budget - 2_048) // 768)
     return min(requested, COMPACT_SOURCE_LIMITS["agent-events"], budget_bound)
+
+
+def compact_retrieval_page_limit(
+    surface: Any,
+    *,
+    requested_limit: int,
+    max_output_bytes: Any,
+) -> int:
+    """Choose a source page that can preserve every cursor-addressed item.
+
+    Retrieval v2 must never fetch an item, drop it during compact projection,
+    and then issue a cursor beyond it.  The conservative per-surface envelope
+    keeps whole page identities while excerpt text remains shrinkable.
+    """
+
+    normalized_surface = normalize_surface(surface)
+    if normalized_surface not in COMPACT_RETRIEVAL_ITEM_BYTES:
+        raise ResponseContractError("response surface does not support retrieval pages")
+    requested = max(1, int(requested_limit))
+    budget = normalize_response_budget(
+        max_output_bytes,
+        default_bytes=DEFAULT_RESPONSE_BYTES[normalized_surface],
+    )
+    available = max(1, budget - COMPACT_RETRIEVAL_FIXED_BYTES)
+    budget_bound = max(
+        1,
+        available // COMPACT_RETRIEVAL_ITEM_BYTES[normalized_surface],
+    )
+    return min(
+        requested,
+        COMPACT_SOURCE_LIMITS[normalized_surface],
+        budget_bound,
+    )
+
+
+def compact_retrieval_result_limit(
+    *,
+    requested_limit: int,
+    max_output_bytes: Any,
+) -> int:
+    """Bound structured recall before ranking so compact output drops no hits."""
+
+    requested = max(1, int(requested_limit))
+    budget = normalize_response_budget(
+        max_output_bytes,
+        default_bytes=DEFAULT_RESPONSE_BYTES["memory-retrieval"],
+    )
+    budget_bound = max(1, (budget - 4_096) // 2_304)
+    return min(
+        requested,
+        COMPACT_SOURCE_LIMITS["memory-retrieval"],
+        budget_bound,
+    )
 
 
 def _validate_json_mapping_keys(
@@ -336,6 +405,7 @@ def project_response(
         )
     projector = {
         "agent-hydration": project_agent_hydration,
+        "memory-retrieval": project_memory_retrieval,
         "memory-list": project_memory_list,
         "memory-graph": project_memory_graph,
         "cortex-state": project_cortex_state,
@@ -357,7 +427,11 @@ def full_response(
     _validate_surface_identities(normalized_surface, payload)
     try:
         copied = copy.deepcopy(
-            {key: value for key, value in payload.items() if key != "_response_source"}
+            {
+                key: value
+                for key, value in payload.items()
+                if key not in {"_response_source", "_retrieval_page"}
+            }
         )
         canonical_response_bytes(copied)
     except Exception as exc:
@@ -430,6 +504,11 @@ def full_response(
         "reason": "authoritative-producer-did-not-provide-total",
     }
     continuation = {"strategy": "none", "cursor": None}
+    retrieval_page = _retrieval_page_metadata(
+        payload,
+        surface=normalized_surface,
+        mode="full",
+    )
     if normalized_surface == "agent-hydration":
         source = _source_metadata(payload)
         deployments = _strict_object_list(payload.get("deliveries"), field="deliveries")
@@ -460,6 +539,90 @@ def full_response(
             "reason": "graph-and-cortex-producers-do-not-expose-authoritative-totals",
         }
         continuation = _agent_delivery_continuation(payload)
+    elif normalized_surface == "memory-retrieval":
+        raw_completeness = payload.get("completeness")
+        if not isinstance(raw_completeness, dict):
+            raise ResponseContractError("retrieval completeness must be an object")
+        source = _source_metadata(payload)
+        returned = len(copied.get("items", []))
+        has_more = _strict_boolean(
+            raw_completeness.get("has_more"),
+            field="completeness.has_more",
+        )
+        pagination = {
+            "supported": False,
+            "strategy": "deterministic-bounded-top-k",
+            "requested_limit": source.get("requested_limit"),
+            "effective_limit": source.get("effective_limit"),
+            "returned": returned,
+            "has_more": has_more,
+            "next_cursor": None,
+        }
+        completeness = {
+            "complete": _strict_boolean(
+                raw_completeness.get("complete"),
+                field="completeness.complete",
+            ),
+            "scope_complete": _strict_boolean(
+                raw_completeness.get("scope_complete"),
+                field="completeness.scope_complete",
+            ),
+            "query_terms_truncated": _strict_boolean(
+                raw_completeness.get("query_terms_truncated"),
+                field="completeness.query_terms_truncated",
+            ),
+            "candidate_scan_truncated": _strict_boolean(
+                raw_completeness.get("candidate_scan_truncated"),
+                field="completeness.candidate_scan_truncated",
+            ),
+            "result_set_truncated": _strict_boolean(
+                raw_completeness.get("result_set_truncated"),
+                field="completeness.result_set_truncated",
+            ),
+            "reason": (
+                "bounded-result-set-has-more"
+                if has_more
+                else "bounded-result-set-complete"
+            ),
+        }
+        continuation = {
+            "strategy": (
+                "refine-query-or-increase-result-limit" if has_more else "none"
+            ),
+            "cursor": None,
+        }
+        warnings.extend(_trusted_warnings(raw_completeness.get("warnings")))
+    elif retrieval_page is not None:
+        returned: Any
+        if normalized_surface == "memory-list":
+            returned = len(copied.get("entries", []))
+        elif normalized_surface == "memory-graph":
+            returned = {
+                "nodes": len(copied.get("entries", [])),
+                "relationships": len(copied.get("relationships", [])),
+            }
+        else:
+            returned = {
+                "working_memory": len(copied.get("working_memory", [])),
+                "sessions": len(copied.get("active_sessions", [])),
+                "goals": len(copied.get("goals", [])),
+            }
+        pagination, completeness, continuation = _retrieval_contract_fields(
+            retrieval_page,
+            returned=(
+                retrieval_page["returned"]["entries"]
+                if normalized_surface == "memory-list"
+                else {
+                    "nodes": retrieval_page["returned"]["nodes"],
+                    "relationships": retrieval_page["returned"]["relationships"],
+                }
+                if normalized_surface == "memory-graph"
+                else {
+                    **returned,
+                    "working_memory": retrieval_page["returned"]["working_memory"],
+                }
+            ),
+        )
     envelope = _base_envelope(
         surface=normalized_surface,
         mode="full",
@@ -469,11 +632,23 @@ def full_response(
             "source": "authoritative-backend",
             "payload_trust": "mixed-control-and-untrusted-evidence",
             "context_id": _atomic_identifier(
-                payload.get("context_id"), field="context_id", max_chars=128
+                (
+                    payload.get("query", {}).get("context_id")
+                    if normalized_surface == "memory-retrieval"
+                    and isinstance(payload.get("query"), dict)
+                    else payload.get("context_id")
+                ),
+                field="context_id",
+                max_chars=128,
             ),
             "redaction_applied": total_redactions > 0,
             "redaction_count": total_redactions,
             "raw_digest_removal_count": int(raw_digest_removals),
+            "origin_node": (
+                retrieval_page["origin_node"]
+                if retrieval_page is not None
+                else None
+            ),
         },
         pagination=pagination,
         completeness=completeness,
@@ -739,6 +914,209 @@ def project_agent_hydration(
 
 
 @_audited_projection
+def project_memory_retrieval(
+    payload: dict[str, Any],
+    *,
+    max_response_bytes: Any = None,
+) -> dict[str, Any]:
+    budget = normalize_response_budget(
+        max_response_bytes,
+        default_bytes=DEFAULT_RESPONSE_BYTES["memory-retrieval"],
+    )
+    _validate_surface_identities("memory-retrieval", payload)
+    items = [
+        _project_retrieval_item(item)
+        for item in _strict_object_list(payload.get("items"), field="items")
+    ]
+    source = _source_metadata(payload)
+    query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
+    ranker = payload.get("ranker") if isinstance(payload.get("ranker"), dict) else {}
+    snapshot = (
+        payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    )
+    scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+    resolved_scope = []
+    for record in _strict_object_list(
+        scope.get("contexts"), field="scope contexts"
+    ):
+        link = _project_retrieval_context_link(record.get("context_link"))
+        resolved_scope.append(
+            {
+                "context_id": _atomic_identifier(
+                    record.get("resolved_context_id"),
+                    field="resolved_context_id",
+                    max_chars=128,
+                ),
+                "provenance": _clean_text(record.get("provenance"), 32),
+                "via_context_link_id": (
+                    link["context_link_id"] if link is not None else None
+                ),
+                "via_relation_type": (
+                    link["relation_type"] if link is not None else ""
+                ),
+                "via_direction": link["direction"] if link is not None else "",
+            }
+        )
+    raw_completeness = (
+        payload.get("completeness")
+        if isinstance(payload.get("completeness"), dict)
+        else {}
+    )
+    warnings = _trusted_warnings(raw_completeness.get("warnings"))
+    has_more = _strict_boolean(
+        raw_completeness.get("has_more"),
+        field="completeness.has_more",
+    )
+    complete = _strict_boolean(
+        raw_completeness.get("complete"),
+        field="completeness.complete",
+    )
+    data = {
+        "retrieval_id": _atomic_identifier(
+            payload.get("retrieval_id"), field="retrieval_id", max_chars=80
+        ),
+        "query": {
+            "fingerprint_sha256": _digest_identifier(
+                query.get("fingerprint_sha256"), field="query fingerprint"
+            ),
+            "context_id": _atomic_identifier(
+                query.get("context_id"), field="context_id", max_chars=128
+            ),
+            "recall_scope": _clean_text(query.get("recall_scope"), 16),
+            "raw_input_stored": _strict_boolean(
+                query.get("raw_input_stored"), field="query.raw_input_stored"
+            ),
+            "input_redaction_count": _safe_int(
+                query.get("input_redaction_count")
+            ),
+        },
+        "ranker": {
+            "id": _atomic_identifier(
+                ranker.get("id"), field="ranker_id", max_chars=96
+            ),
+            "version": _atomic_identifier(
+                ranker.get("version"), field="ranker_version", max_chars=48
+            ),
+            "fusion": _clean_text(ranker.get("fusion"), 48),
+            "confidence_calibrated": False,
+            "score_semantics": "uncalibrated-ranking-signal",
+        },
+        "snapshot": {
+            "snapshot_id": _atomic_identifier(
+                snapshot.get("snapshot_id"), field="snapshot_id", max_chars=80
+            ),
+            "consistency": _clean_text(snapshot.get("consistency"), 80),
+            "entries_revision": _retrieval_revision_summary(
+                snapshot.get("entries_revision")
+            ),
+            "scope_revision": _digest_identifier(
+                snapshot.get("scope_revision"), field="scope_revision"
+            ),
+            "graph_revision": _digest_identifier(
+                snapshot.get("graph_revision"), field="graph_revision"
+            ),
+        },
+        "scope": {
+            "origin_context_id": _atomic_identifier(
+                scope.get("origin_context_id"),
+                field="origin_context_id",
+                max_chars=128,
+            ),
+            "requested_scope": _clean_text(scope.get("requested_scope"), 16),
+            "one_hop_only": _strict_boolean(
+                scope.get("one_hop_only"), field="scope.one_hop_only"
+            ),
+            "inherits_global": _strict_boolean(
+                scope.get("inherits_global"), field="scope.inherits_global"
+            ),
+            "resolved_context_count": _safe_int(
+                scope.get("resolved_context_count")
+            ),
+            "active_adjacent_link_count": _safe_int(
+                scope.get("active_adjacent_link_count")
+            ),
+            "link_provenance_complete": _strict_boolean(
+                scope.get("link_provenance_complete"),
+                field="scope.link_provenance_complete",
+            ),
+            "truncated": _strict_boolean(
+                scope.get("truncated"), field="scope.truncated"
+            ),
+            "contexts": resolved_scope,
+        },
+        "result_count": len(items),
+        "items": items,
+        "raw_input_stored": False,
+    }
+    envelope = _base_envelope(
+        surface="memory-retrieval",
+        mode="compact",
+        budget=budget,
+        data=data,
+        provenance={
+            "source": "authoritative-retrieval-v2",
+            "context_id": data["query"]["context_id"],
+            "recall_scope": data["query"]["recall_scope"],
+            "snapshot_id": data["snapshot"]["snapshot_id"],
+            "ranker_id": data["ranker"]["id"],
+            "ranker_version": data["ranker"]["version"],
+            "raw_input_stored": False,
+        },
+        pagination={
+            "supported": False,
+            "strategy": "deterministic-bounded-top-k",
+            "requested_limit": source.get("requested_limit"),
+            "effective_limit": source.get("effective_limit"),
+            "returned": len(items),
+            "has_more": has_more,
+            "next_cursor": None,
+        },
+        completeness={
+            "complete": complete,
+            "scope_complete": _strict_boolean(
+                raw_completeness.get("scope_complete"),
+                field="completeness.scope_complete",
+            ),
+            "query_terms_truncated": _strict_boolean(
+                raw_completeness.get("query_terms_truncated"),
+                field="completeness.query_terms_truncated",
+            ),
+            "candidate_scan_truncated": _strict_boolean(
+                raw_completeness.get("candidate_scan_truncated"),
+                field="completeness.candidate_scan_truncated",
+            ),
+            "result_set_truncated": _strict_boolean(
+                raw_completeness.get("result_set_truncated"),
+                field="completeness.result_set_truncated",
+            ),
+            "reason": (
+                "bounded-result-set-has-more" if has_more else "bounded-result-set-complete"
+            ),
+        },
+        continuation={
+            "strategy": (
+                "refine-query-or-increase-result-limit" if has_more else "none"
+            ),
+            "cursor": None,
+        },
+        warnings=warnings,
+    )
+    return _finalize(
+        envelope,
+        budget=budget,
+        shrinkers=[
+            lambda: _shrink_item_excerpts(
+                items,
+                envelope,
+                "retrieval_excerpts",
+            ),
+            lambda: _drop_retrieval_optional_reason(items, envelope),
+            lambda: _drop_noncritical_warning(envelope),
+        ],
+    )
+
+
+@_audited_projection
 def project_memory_list(
     payload: dict[str, Any],
     *,
@@ -759,10 +1137,20 @@ def project_memory_list(
     entries = [_project_memory_entry(item) for item in source_entries]
     source = _source_metadata(payload)
     source_reduced = _source_limit_reduced(source)
-    warnings = [
-        *_trusted_warnings(payload.get("warnings")),
-        _warning("pagination-unsupported", "info", "This producer has no authoritative cursor yet."),
-    ]
+    retrieval_page = _retrieval_page_metadata(
+        payload,
+        surface="memory-list",
+        mode="compact",
+    )
+    warnings = [*_trusted_warnings(payload.get("warnings"))]
+    if retrieval_page is None:
+        warnings.append(
+            _warning(
+                "pagination-unsupported",
+                "info",
+                "This producer has no authoritative cursor yet.",
+            )
+        )
     if source_reduced:
         warnings.append(
             _warning(
@@ -771,6 +1159,33 @@ def project_memory_list(
                 "The compact profile reduced the memory source limit before projection.",
             )
         )
+    if retrieval_page is None:
+        pagination = {
+            "supported": False,
+            "strategy": "retrieval-v2-required",
+            "requested_limit": source.get("requested_limit"),
+            "effective_limit": source.get("effective_limit"),
+            "returned": len(entries),
+            "has_more": None,
+            "next_cursor": None,
+        }
+        completeness = {
+            "complete": None,
+            "source_limit_reduced": source_reduced,
+            "reason": "authoritative-total-and-cursor-unavailable",
+        }
+        continuation = {
+            "strategy": "request-full-or-wait-for-retrieval-v2",
+            "cursor": None,
+        }
+    else:
+        pagination, completeness, continuation = _retrieval_contract_fields(
+            retrieval_page,
+            returned=retrieval_page["returned"]["entries"],
+        )
+        pagination["requested_limit"] = source.get("requested_limit")
+        pagination["effective_limit"] = source.get("effective_limit")
+        completeness["source_limit_reduced"] = source_reduced
     envelope = _base_envelope(
         surface="memory-list",
         mode="compact",
@@ -790,32 +1205,21 @@ def project_memory_list(
                 payload.get("context_id"), field="context_id", max_chars=128
             ),
             "recall_scope": _clean_text(payload.get("recall_scope"), 32),
+            "origin_node": (
+                retrieval_page["origin_node"]
+                if retrieval_page is not None
+                else None
+            ),
         },
-        pagination={
-            "supported": False,
-            "strategy": "retrieval-v2-required",
-            "requested_limit": source.get("requested_limit"),
-            "effective_limit": source.get("effective_limit"),
-            "returned": len(entries),
-            "has_more": None,
-            "next_cursor": None,
-        },
-        completeness={
-            "complete": None,
-            "source_limit_reduced": source_reduced,
-            "reason": "authoritative-total-and-cursor-unavailable",
-        },
-        continuation={
-            "strategy": "request-full-or-wait-for-retrieval-v2",
-            "cursor": None,
-        },
+        pagination=pagination,
+        completeness=completeness,
+        continuation=continuation,
         warnings=warnings,
     )
-    shrinkers = [
-        lambda: _drop_last(entries, envelope, "memory_entries"),
-        lambda: _shrink_item_excerpts(entries, envelope, "memory_excerpts"),
-        lambda: _drop_noncritical_warning(envelope),
-    ]
+    shrinkers = [lambda: _shrink_item_excerpts(entries, envelope, "memory_excerpts")]
+    if retrieval_page is None:
+        shrinkers.insert(0, lambda: _drop_last(entries, envelope, "memory_entries"))
+    shrinkers.append(lambda: _drop_noncritical_warning(envelope))
     return _finalize(envelope, budget=budget, shrinkers=shrinkers)
 
 
@@ -863,10 +1267,20 @@ def project_memory_graph(
         edges.append(edge)
     source = _source_metadata(payload)
     source_reduced = _source_limit_reduced(source)
-    warnings = [
-        *_trusted_warnings(payload.get("warnings")),
-        _warning("pagination-unsupported", "info", "This producer has no authoritative cursor yet."),
-    ]
+    retrieval_page = _retrieval_page_metadata(
+        payload,
+        surface="memory-graph",
+        mode="compact",
+    )
+    warnings = [*_trusted_warnings(payload.get("warnings"))]
+    if retrieval_page is None:
+        warnings.append(
+            _warning(
+                "pagination-unsupported",
+                "info",
+                "This producer has no authoritative cursor yet.",
+            )
+        )
     if source_reduced:
         warnings.append(
             _warning(
@@ -875,6 +1289,39 @@ def project_memory_graph(
                 "The compact profile reduced the graph source limit before projection.",
             )
         )
+    returned = {"nodes": len(nodes), "relationships": len(edges)}
+    if retrieval_page is None:
+        pagination = {
+            "supported": False,
+            "strategy": "retrieval-v2-required",
+            "requested_limit": source.get("requested_limit"),
+            "effective_limit": source.get("effective_limit"),
+            "returned": {"nodes": len(nodes), "edges": len(edges)},
+            "has_more": None,
+            "next_cursor": None,
+        }
+        completeness = {
+            "complete": None,
+            "all_returned_edge_endpoints_resolved": unresolved == 0,
+            "source_limit_reduced": source_reduced,
+            "reason": "authoritative-total-and-cursor-unavailable",
+        }
+        continuation = {
+            "strategy": "request-full-or-wait-for-retrieval-v2",
+            "cursor": None,
+        }
+    else:
+        pagination, completeness, continuation = _retrieval_contract_fields(
+            retrieval_page,
+            returned={
+                "nodes": retrieval_page["returned"]["nodes"],
+                "relationships": retrieval_page["returned"]["relationships"],
+            },
+        )
+        pagination["requested_limit"] = source.get("requested_limit")
+        pagination["effective_limit"] = source.get("effective_limit")
+        completeness["all_returned_edge_endpoints_resolved"] = unresolved == 0
+        completeness["source_limit_reduced"] = source_reduced
     envelope = _base_envelope(
         surface="memory-graph",
         mode="compact",
@@ -904,34 +1351,26 @@ def project_memory_graph(
                 payload.get("context_id"), field="context_id", max_chars=128
             ),
             "entry_strategy": _clean_text(payload.get("graph_entry_strategy"), 80),
+            "origin_node": (
+                retrieval_page["origin_node"]
+                if retrieval_page is not None
+                else None
+            ),
         },
-        pagination={
-            "supported": False,
-            "strategy": "retrieval-v2-required",
-            "requested_limit": source.get("requested_limit"),
-            "effective_limit": source.get("effective_limit"),
-            "returned": {"nodes": len(nodes), "edges": len(edges)},
-            "has_more": None,
-            "next_cursor": None,
-        },
-        completeness={
-            "complete": None,
-            "all_returned_edge_endpoints_resolved": unresolved == 0,
-            "source_limit_reduced": source_reduced,
-            "reason": "authoritative-total-and-cursor-unavailable",
-        },
-        continuation={
-            "strategy": "request-full-or-wait-for-retrieval-v2",
-            "cursor": None,
-        },
+        pagination=pagination,
+        completeness=completeness,
+        continuation=continuation,
         warnings=warnings,
     )
-    shrinkers = [
-        lambda: _shrink_item_excerpts(nodes, envelope, "graph_excerpts"),
-        lambda: _drop_unreferenced_node(nodes, edges, envelope),
-        lambda: _drop_edge_with_orphan_cleanup(edges, nodes, envelope),
-        lambda: _drop_noncritical_warning(envelope),
-    ]
+    shrinkers = [lambda: _shrink_item_excerpts(nodes, envelope, "graph_excerpts")]
+    if retrieval_page is None:
+        shrinkers.extend(
+            [
+                lambda: _drop_unreferenced_node(nodes, edges, envelope),
+                lambda: _drop_edge_with_orphan_cleanup(edges, nodes, envelope),
+            ]
+        )
+    shrinkers.append(lambda: _drop_noncritical_warning(envelope))
     return _finalize(envelope, budget=budget, shrinkers=shrinkers)
 
 
@@ -978,14 +1417,35 @@ def project_cortex_state(
             allow_missing=True,
         )
     ]
+    retrieval_page = _retrieval_page_metadata(
+        payload,
+        surface="cortex-state",
+        mode="compact",
+    )
+    working_memory = (
+        [
+            _project_cortex_item(item)
+            for item in _strict_object_list(
+                payload.get("working_memory"),
+                field="working_memory",
+                allow_missing=True,
+            )
+        ]
+        if retrieval_page is not None
+        else []
+    )
     source = _source_metadata(payload)
     source_reduced = _source_limit_reduced(source)
     cortex_warnings = _cortex_session_warnings(payload)
-    warnings = [
-        *_trusted_warnings(payload.get("warnings")),
-        *cortex_warnings,
-        _warning("pagination-unsupported", "info", "Working-memory totals are not cursor-addressable yet."),
-    ]
+    warnings = [*_trusted_warnings(payload.get("warnings")), *cortex_warnings]
+    if retrieval_page is None:
+        warnings.append(
+            _warning(
+                "pagination-unsupported",
+                "info",
+                "Working-memory totals are not cursor-addressable yet.",
+            )
+        )
     if source_reduced:
         warnings.append(
             _warning(
@@ -1023,17 +1483,11 @@ def project_cortex_state(
             cortex_warnings=cortex_warnings,
         ),
     }
-    envelope = _base_envelope(
-        surface="cortex-state",
-        mode="compact",
-        budget=budget,
-        data=data,
-        provenance={
-            "source": "cortex-governor",
-            "context_id": data["context_id"],
-            "agent_id": data["agent_id"],
-        },
-        pagination={
+    if retrieval_page is not None:
+        data["working_memory"] = working_memory
+        data["working_memory_trust"] = "untrusted-memory-evidence"
+    if retrieval_page is None:
+        pagination = {
             "supported": False,
             "strategy": "retrieval-v2-required",
             "requested_limit": source.get("requested_limit"),
@@ -1047,16 +1501,53 @@ def project_cortex_state(
             },
             "has_more": None,
             "next_cursor": None,
-        },
-        completeness={
+        }
+        completeness = {
             "complete": None,
             "source_limit_reduced": source_reduced,
             "reason": "authoritative-total-and-cursor-unavailable",
-        },
-        continuation={
+        }
+        continuation = {
             "strategy": "request-full-or-wait-for-retrieval-v2",
             "cursor": None,
+        }
+    else:
+        returned = {
+            "working_memory": len(working_memory),
+            "sessions": len(sessions),
+            "goals": len(goals),
+            "constraints": len(constraints),
+            "risks": len(risks),
+            "contradictions": len(contradictions),
+        }
+        pagination, completeness, continuation = _retrieval_contract_fields(
+            retrieval_page,
+            returned={
+                **returned,
+                "working_memory": retrieval_page["returned"]["working_memory"],
+            },
+        )
+        pagination["requested_limit"] = source.get("requested_limit")
+        pagination["effective_limit"] = source.get("effective_limit")
+        completeness["source_limit_reduced"] = source_reduced
+    envelope = _base_envelope(
+        surface="cortex-state",
+        mode="compact",
+        budget=budget,
+        data=data,
+        provenance={
+            "source": "cortex-governor",
+            "context_id": data["context_id"],
+            "agent_id": data["agent_id"],
+            "origin_node": (
+                retrieval_page["origin_node"]
+                if retrieval_page is not None
+                else None
+            ),
         },
+        pagination=pagination,
+        completeness=completeness,
+        continuation=continuation,
         warnings=warnings,
     )
     shrinkers = [
@@ -1067,6 +1558,15 @@ def project_cortex_state(
         lambda: _drop_last(sessions, envelope, "cortex_sessions"),
         lambda: _drop_noncritical_warning(envelope),
     ]
+    if retrieval_page is not None:
+        shrinkers.insert(
+            0,
+            lambda: _shrink_item_excerpts(
+                working_memory,
+                envelope,
+                "cortex_working_memory_excerpts",
+            ),
+        )
     return _finalize(envelope, budget=budget, shrinkers=shrinkers)
 
 
@@ -1189,10 +1689,15 @@ def _refresh_dynamic_counts(envelope: dict[str, Any]) -> None:
             completeness["all_returned_graph_edge_endpoints_resolved"] = (
                 unresolved == 0
             )
+    elif operation == "memory-retrieval":
+        items = data.get("items", []) if isinstance(data.get("items"), list) else []
+        data["result_count"] = len(items)
+        pagination["returned"] = len(items)
     elif operation == "memory-list":
         count = len(data.get("entries", [])) if isinstance(data.get("entries"), list) else 0
         data["returned"] = count
-        pagination["returned"] = count
+        if pagination.get("strategy") != RETRIEVAL_CURSOR_STRATEGY:
+            pagination["returned"] = count
     elif operation == "memory-graph":
         nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
         edges = data.get("edges", []) if isinstance(data.get("edges"), list) else []
@@ -1209,7 +1714,8 @@ def _refresh_dynamic_counts(envelope: dict[str, Any]) -> None:
         data["returned_nodes"] = len(nodes)
         data["returned_edges"] = len(edges)
         data["unresolved_edge_count"] = unresolved
-        pagination["returned"] = {"nodes": len(nodes), "edges": len(edges)}
+        if pagination.get("strategy") != RETRIEVAL_CURSOR_STRATEGY:
+            pagination["returned"] = {"nodes": len(nodes), "edges": len(edges)}
         completeness = envelope.get("completeness")
         if isinstance(completeness, dict):
             completeness["all_returned_edge_endpoints_resolved"] = unresolved == 0
@@ -1221,10 +1727,19 @@ def _refresh_dynamic_counts(envelope: dict[str, Any]) -> None:
             "risks": "risks",
             "contradictions": "contradictions",
         }
-        pagination["returned"] = {
+        if "working_memory" in data:
+            keys = {"working_memory": "working_memory", **keys}
+        dynamic_returned = {
             label: len(data.get(key, [])) if isinstance(data.get(key), list) else 0
             for label, key in keys.items()
         }
+        if pagination.get("strategy") == RETRIEVAL_CURSOR_STRATEGY:
+            authoritative = pagination.get("returned")
+            if isinstance(authoritative, dict) and "working_memory" in authoritative:
+                dynamic_returned["working_memory"] = _safe_int(
+                    authoritative["working_memory"]
+                )
+        pagination["returned"] = dynamic_returned
 
 
 def _stabilize_metrics(envelope: dict[str, Any]) -> None:
@@ -1311,6 +1826,24 @@ def _shrink_item_excerpts(items: list[dict[str, Any]], envelope: dict[str, Any],
                 item[key] = text[:79].rstrip() + "…"
                 _record_omission(envelope, section, len(text) - 79)
                 return True
+    return False
+
+
+def _drop_retrieval_optional_reason(
+    items: list[dict[str, Any]],
+    envelope: dict[str, Any],
+) -> bool:
+    for item in reversed(items):
+        reasons = item.get("match_reasons")
+        if isinstance(reasons, list) and reasons:
+            reasons.pop()
+            _record_omission(envelope, "retrieval_match_reasons")
+            return True
+        facets = item.get("facets")
+        if isinstance(facets, list) and facets:
+            facets.pop()
+            _record_omission(envelope, "retrieval_facets")
+            return True
     return False
 
 
@@ -1474,6 +2007,329 @@ def _project_memory_entry(entry: dict[str, Any]) -> dict[str, Any]:
         },
     }
     result["provenance"] = {key: val for key, val in result["provenance"].items() if val not in {"", None}}
+    return result
+
+
+def _digest_identifier(value: Any, *, field: str) -> str:
+    digest = _atomic_identifier(value, field=field, max_chars=64)
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ResponseContractError(f"{field} must be a lowercase sha256 digest")
+    return digest
+
+
+def _retrieval_revision_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ResponseContractError("entries_revision must be an object")
+    revision = _atomic_identifier(
+        value.get("revision"), field="entries_revision", max_chars=64
+    )
+    if re.fullmatch(r"[0-9a-f]{16,64}", revision) is None:
+        raise ResponseContractError("entries_revision is invalid")
+    return {
+        "revision": revision,
+        "entry_count": _safe_int(value.get("entry_count")),
+        "semantic_index_generation": _safe_int(
+            value.get("semantic_index_generation")
+        ),
+    }
+
+
+def _unit_number(value: Any, *, field: str) -> int | float:
+    number = _safe_number(value)
+    if float(number) < 0.0 or float(number) > 1.0:
+        raise ResponseContractError(f"{field} must be between zero and one")
+    return number
+
+
+def _project_retrieval_context_link(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ResponseContractError("retrieval context_link must be an object")
+    return {
+        "context_link_id": _atomic_identifier(
+            value.get("context_link_id"), field="context_link_id", max_chars=160
+        ),
+        "source_context_id": _atomic_identifier(
+            value.get("source_context_id"),
+            field="source_context_id",
+            max_chars=128,
+        ),
+        "target_context_id": _atomic_identifier(
+            value.get("target_context_id"),
+            field="target_context_id",
+            max_chars=128,
+        ),
+        "relation_type": _clean_text(value.get("relation_type"), 80),
+        "direction": _clean_text(value.get("direction"), 32),
+        "confidence": _unit_number(
+            value.get("confidence"), field="context_link.confidence"
+        ),
+        "enabled": _strict_boolean(
+            value.get("enabled"), field="context_link.enabled"
+        ),
+        "approved": _strict_boolean(
+            value.get("approved"), field="context_link.approved"
+        ),
+        "approved_by": _clean_text(value.get("approved_by"), 96),
+        "approved_at": _safe_number(value.get("approved_at")),
+        "updated_at": _safe_number(value.get("updated_at")),
+    }
+
+
+def _validate_retrieval_link_reachability(
+    link: dict[str, Any],
+    *,
+    origin_context_id: str,
+    resolved_context_id: str,
+) -> None:
+    source = str(link.get("source_context_id") or "")
+    target = str(link.get("target_context_id") or "")
+    direction = str(link.get("direction") or "")
+    reachable = ""
+    if source == origin_context_id:
+        reachable = target
+    elif target == origin_context_id and direction == "bidirectional":
+        reachable = source
+    if reachable != resolved_context_id:
+        raise ResponseContractError(
+            "retrieval context link does not authorize the resolved namespace"
+        )
+
+
+def _project_retrieval_relationship(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ResponseContractError("retrieval relationship must be an object")
+    return {
+        "relationship_id": _atomic_identifier(
+            value.get("relationship_id"), field="relationship_id", max_chars=200
+        ),
+        "anchor_memory_id": _atomic_identifier(
+            value.get("anchor_memory_id"), field="anchor_memory_id"
+        ),
+        "neighbor_memory_id": _atomic_identifier(
+            value.get("neighbor_memory_id"), field="neighbor_memory_id"
+        ),
+        "relation_type": _clean_text(value.get("relation_type"), 80),
+        "signal": _unit_number(value.get("signal"), field="graph signal"),
+    }
+
+
+def _project_retrieval_reason(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ResponseContractError("retrieval match reason must be an object")
+    reason_type = _atomic_identifier(
+        value.get("type"), field="match reason type", max_chars=64
+    )
+    if reason_type == "spike-index-overlap":
+        return {
+            "type": reason_type,
+            "overlap_count": _safe_int(value.get("overlap_count")),
+            "query_spike_count": _safe_int(value.get("query_spike_count")),
+            "candidate_spike_count": _safe_int(
+                value.get("candidate_spike_count")
+            ),
+            "jaccard": _unit_number(value.get("jaccard"), field="spike jaccard"),
+            "source_rank": _safe_int(value.get("source_rank")),
+        }
+    if reason_type == "surface-index-overlap":
+        return {
+            "type": reason_type,
+            "indexed_overlap_count": _safe_int(
+                value.get("indexed_overlap_count")
+            ),
+            "query_term_count": _safe_int(value.get("query_term_count")),
+            "matched_terms": [
+                _clean_text(term, 64)
+                for term in _strict_string_list(
+                    value.get("matched_terms"),
+                    field="matched_terms",
+                    allow_missing=True,
+                )[:8]
+            ],
+            "indexed_coverage": _unit_number(
+                value.get("indexed_coverage"), field="indexed coverage"
+            ),
+            "rendered_coverage": _unit_number(
+                value.get("rendered_coverage"), field="rendered coverage"
+            ),
+            "source_rank": _safe_int(value.get("source_rank")),
+        }
+    if reason_type == "same-context-graph-neighbor":
+        relationships = [
+            _project_retrieval_relationship(item)
+            for item in _strict_object_list(
+                value.get("relationships"),
+                field="reason relationships",
+                allow_missing=True,
+            )[:4]
+        ]
+        return {
+            "type": reason_type,
+            "relationship_count": _safe_int(value.get("relationship_count")),
+            "relationships": relationships,
+        }
+    raise ResponseContractError("retrieval match reason type is unsupported")
+
+
+def _project_retrieval_item(item: dict[str, Any]) -> dict[str, Any]:
+    score = _unit_number(item.get("score"), field="retrieval score")
+    score_breakdown = (
+        item.get("score_breakdown")
+        if isinstance(item.get("score_breakdown"), dict)
+        else {}
+    )
+    signals = (
+        score_breakdown.get("signals")
+        if isinstance(score_breakdown.get("signals"), dict)
+        else {}
+    )
+    contributions = (
+        score_breakdown.get("contributions")
+        if isinstance(score_breakdown.get("contributions"), dict)
+        else {}
+    )
+    diversity = (
+        score_breakdown.get("diversity")
+        if isinstance(score_breakdown.get("diversity"), dict)
+        else {}
+    )
+    confidence = (
+        item.get("confidence") if isinstance(item.get("confidence"), dict) else {}
+    )
+    if (
+        confidence.get("calibrated") is not False
+        or confidence.get("probability") is not None
+        or confidence.get("signal") != "uncalibrated-ranking-score"
+    ):
+        raise ResponseContractError("retrieval confidence semantics are invalid")
+    scope = (
+        item.get("scope_provenance")
+        if isinstance(item.get("scope_provenance"), dict)
+        else {}
+    )
+    source = (
+        item.get("source_provenance")
+        if isinstance(item.get("source_provenance"), dict)
+        else {}
+    )
+    result = {
+        "rank": _integer_identifier(item.get("rank"), field="retrieval rank"),
+        "memory_id": _atomic_identifier(item.get("memory_id"), field="memory_id"),
+        "context_id": _atomic_identifier(
+            item.get("context_id"), field="context_id", max_chars=128
+        ),
+        "tag": _clean_text(item.get("tag"), 96),
+        "label": _clean_text(item.get("label"), 96),
+        "summary": _clean_text(item.get("summary"), 180),
+        "excerpt": _clean_text(item.get("excerpt"), 320),
+        "facets": [
+            _clean_text(facet, 48)
+            for facet in _strict_string_list(
+                item.get("facets"), field="facets", allow_missing=True
+            )[:6]
+        ],
+        "score": score,
+        "score_breakdown": {
+            "signals": {
+                key: _unit_number(signals.get(key), field=f"signal {key}")
+                for key in ("spike_index", "surface_index", "same_context_graph")
+            },
+            "contributions": {
+                key: _unit_number(
+                    contributions.get(key), field=f"contribution {key}"
+                )
+                for key in ("spike_index", "surface_index", "same_context_graph")
+            },
+            "relevance_score": _unit_number(
+                score_breakdown.get("relevance_score"),
+                field="relevance_score",
+            ),
+            "diversity": {
+                "lambda": _unit_number(diversity.get("lambda"), field="MMR lambda"),
+                "maximum_selected_similarity": _unit_number(
+                    diversity.get("maximum_selected_similarity"),
+                    field="MMR similarity",
+                ),
+                "diversity_penalty": _unit_number(
+                    diversity.get("diversity_penalty"),
+                    field="MMR penalty",
+                ),
+                "selection_score": _safe_number(
+                    diversity.get("selection_score")
+                ),
+            },
+        },
+        "confidence": {
+            "calibrated": False,
+            "probability": None,
+            "signal": "uncalibrated-ranking-score",
+            "score": _unit_number(
+                confidence.get("score"), field="confidence score"
+            ),
+            "warning": "Do not interpret this ranking signal as a truth probability.",
+        },
+        "match_reasons": [
+            _project_retrieval_reason(reason)
+            for reason in _strict_object_list(
+                item.get("match_reasons"),
+                field="match_reasons",
+                allow_missing=True,
+            )[:3]
+        ],
+        "scope_provenance": {
+            "origin_context_id": _atomic_identifier(
+                scope.get("origin_context_id"),
+                field="origin_context_id",
+                max_chars=128,
+            ),
+            "resolved_context_id": _atomic_identifier(
+                scope.get("resolved_context_id"),
+                field="resolved_context_id",
+                max_chars=128,
+            ),
+            "requested_scope": _clean_text(scope.get("requested_scope"), 16),
+            "provenance": _clean_text(scope.get("provenance"), 32),
+            "context_link": _project_retrieval_context_link(
+                scope.get("context_link")
+            ),
+        },
+        "source_provenance": {
+            "created_at": _safe_number(source.get("created_at")),
+            "updated_at": _safe_number(source.get("updated_at")),
+            "source": _clean_text(source.get("source"), 128),
+            "source_tag": _clean_text(source.get("source_tag"), 128),
+            "speaker": _clean_text(source.get("speaker"), 96),
+            "trace_type": _clean_text(source.get("trace_type"), 64),
+            "truth_posture": _clean_text(source.get("truth_posture"), 64),
+            "stored_confidence": (
+                None
+                if source.get("stored_confidence") is None
+                else _unit_number(
+                    source.get("stored_confidence"),
+                    field="stored confidence",
+                )
+            ),
+        },
+        "ranker_id": _atomic_identifier(
+            item.get("ranker_id"), field="ranker_id", max_chars=96
+        ),
+        "ranker_version": _atomic_identifier(
+            item.get("ranker_version"), field="ranker_version", max_chars=48
+        ),
+        "content_duplicate_count": _safe_int(
+            item.get("content_duplicate_count")
+        ),
+        "raw_source_included": _strict_boolean(
+            item.get("raw_source_included"), field="raw_source_included"
+        ),
+        "trust": "untrusted-memory-evidence",
+    }
+    result["source_provenance"] = {
+        key: value
+        for key, value in result["source_provenance"].items()
+        if value not in {"", None}
+    }
     return result
 
 
@@ -1857,6 +2713,146 @@ def _source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         "effective_graph_limit",
     )
     return {key: _safe_int(value.get(key)) for key in allowed if key in value}
+
+
+def _retrieval_page_metadata(
+    payload: dict[str, Any],
+    *,
+    surface: str,
+    mode: str,
+) -> dict[str, Any] | None:
+    raw = payload.get("_retrieval_page")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ResponseContractError("retrieval page metadata must be an object")
+    required = {
+        "schema",
+        "surface",
+        "response_mode",
+        "snapshot_revision",
+        "filters_sha256",
+        "ordering",
+        "total",
+        "returned",
+        "has_more",
+        "next_cursor",
+        "expires_at",
+        "origin_node",
+    }
+    if set(raw) != required:
+        raise ResponseContractError("retrieval page metadata fields are invalid")
+    if raw.get("schema") != RETRIEVAL_PAGE_SCHEMA:
+        raise ResponseContractError("retrieval page schema is invalid")
+    if raw.get("surface") != surface or raw.get("response_mode") != mode:
+        raise ResponseContractError("retrieval page binding is invalid")
+    snapshot_revision = raw.get("snapshot_revision")
+    filters_sha256 = raw.get("filters_sha256")
+    origin_node = raw.get("origin_node")
+    if (
+        not isinstance(snapshot_revision, str)
+        or _RETRIEVAL_REVISION_RE.fullmatch(snapshot_revision) is None
+        or not isinstance(filters_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", filters_sha256) is None
+        or not isinstance(origin_node, str)
+        or _RETRIEVAL_ORIGIN_RE.fullmatch(origin_node) is None
+    ):
+        raise ResponseContractError("retrieval page identity is invalid")
+    expected_ordering = {
+        "memory-list": "updated_at-desc,memory_id-desc",
+        "memory-graph": (
+            "entries:updated_at-desc,memory_id-desc;"
+            "relationships:updated_at-desc,relationship_id-desc"
+        ),
+        "cortex-state": "updated_at-desc,memory_id-desc",
+    }[surface]
+    if raw.get("ordering") != expected_ordering:
+        raise ResponseContractError("retrieval page ordering is invalid")
+    expected_total_keys = {
+        "memory-list": {"entries"},
+        "memory-graph": {"nodes", "relationships"},
+        "cortex-state": {"working_memory"},
+    }[surface]
+    total = raw.get("total")
+    if not isinstance(total, dict) or set(total) != expected_total_keys:
+        raise ResponseContractError("retrieval page total is invalid")
+    clean_total = {key: _safe_int(value) for key, value in total.items()}
+    returned = raw.get("returned")
+    if not isinstance(returned, dict) or set(returned) != expected_total_keys:
+        raise ResponseContractError("retrieval page returned counts are invalid")
+    clean_returned = {key: _safe_int(value) for key, value in returned.items()}
+    if any(clean_returned[key] > clean_total[key] for key in expected_total_keys):
+        raise ResponseContractError("retrieval page returned counts exceed totals")
+    has_more = raw.get("has_more")
+    if not isinstance(has_more, bool):
+        raise ResponseContractError("retrieval page has_more is invalid")
+    next_cursor = raw.get("next_cursor")
+    if has_more:
+        try:
+            cursor_bytes = (
+                next_cursor.encode("ascii", "strict")
+                if isinstance(next_cursor, str)
+                else b""
+            )
+        except UnicodeError:
+            cursor_bytes = b""
+        if (
+            not isinstance(next_cursor, str)
+            or not cursor_bytes
+            or len(cursor_bytes) > 4_096
+            or _RETRIEVAL_CURSOR_RE.fullmatch(next_cursor) is None
+        ):
+            raise ResponseContractError("retrieval continuation is invalid")
+    elif next_cursor is not None:
+        raise ResponseContractError("complete retrieval page must not have a cursor")
+    expires_at = _safe_int(raw.get("expires_at"))
+    if has_more and expires_at <= 0:
+        raise ResponseContractError("retrieval continuation expiry is invalid")
+    return {
+        "schema": RETRIEVAL_PAGE_SCHEMA,
+        "snapshot_revision": snapshot_revision,
+        "filters_sha256": filters_sha256,
+        "ordering": expected_ordering,
+        "total": clean_total,
+        "returned": clean_returned,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "expires_at": expires_at,
+        "origin_node": origin_node,
+    }
+
+
+def _retrieval_contract_fields(
+    page: dict[str, Any],
+    *,
+    returned: Any | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    has_more = bool(page["has_more"])
+    authoritative_returned: Any = (
+        dict(page["returned"]) if returned is None else returned
+    )
+    pagination = {
+        "supported": True,
+        "strategy": RETRIEVAL_CURSOR_STRATEGY,
+        "returned": authoritative_returned,
+        "total": dict(page["total"]),
+        "has_more": has_more,
+        "next_cursor": page["next_cursor"],
+        "snapshot_revision": page["snapshot_revision"],
+        "expires_at": page["expires_at"] if has_more else None,
+    }
+    completeness = {
+        "complete": not has_more,
+        "snapshot_bound": True,
+        "authoritative_total": True,
+        "reason": "more-pages-available" if has_more else "snapshot-page-complete",
+    }
+    continuation = {
+        "strategy": "use-authenticated-keyset-cursor" if has_more else "none",
+        "cursor": page["next_cursor"],
+        "expires_at": page["expires_at"] if has_more else None,
+    }
+    return pagination, completeness, continuation
 
 
 def _source_limit_reduced(
@@ -2341,6 +3337,190 @@ def _validate_cortex_counts(payload: dict[str, Any]) -> None:
 
 
 def _validate_surface_identities(surface: str, payload: dict[str, Any]) -> None:
+    if surface == "memory-retrieval":
+        if payload.get("schema") != "synapse-retrieval.v2":
+            raise ResponseContractError("retrieval schema is unsupported")
+        if payload.get("schema_version") != 2:
+            raise ResponseContractError("retrieval schema_version is unsupported")
+        if payload.get("raw_input_stored") is not False:
+            raise ResponseContractError("retrieval must not store raw query input")
+        query = payload.get("query")
+        ranker = payload.get("ranker")
+        scope = payload.get("scope")
+        completeness = payload.get("completeness")
+        if not all(
+            isinstance(value, dict)
+            for value in (query, ranker, scope, completeness)
+        ):
+            raise ResponseContractError("retrieval control metadata is invalid")
+        assert isinstance(query, dict)
+        assert isinstance(ranker, dict)
+        assert isinstance(scope, dict)
+        assert isinstance(completeness, dict)
+        context_id = _atomic_identifier(
+            query.get("context_id"), field="context_id", max_chars=128
+        )
+        if query.get("raw_input_stored") is not False:
+            raise ResponseContractError("retrieval query must not store raw input")
+        if str(query.get("recall_scope") or "") not in {
+            "local",
+            "connected",
+            "all",
+        }:
+            raise ResponseContractError("retrieval recall_scope is invalid")
+        recall_scope = str(query.get("recall_scope"))
+        confidence_semantics = ranker.get("confidence_semantics")
+        if (
+            not isinstance(confidence_semantics, dict)
+            or confidence_semantics.get("calibrated") is not False
+            or confidence_semantics.get("probability") is not False
+        ):
+            raise ResponseContractError("retrieval ranker confidence is not uncalibrated")
+        if scope.get("origin_context_id") != context_id:
+            raise ResponseContractError("retrieval scope origin does not match query")
+        if scope.get("requested_scope") != recall_scope:
+            raise ResponseContractError("retrieval scope does not match query")
+        scope_contexts = _strict_object_list(
+            scope.get("contexts"), field="scope contexts"
+        )
+        resolved_context_ids: set[str] = set()
+        for record in scope_contexts:
+            record_origin = _atomic_identifier(
+                record.get("origin_context_id"),
+                field="origin_context_id",
+                max_chars=128,
+            )
+            resolved_context_id = _atomic_identifier(
+                record.get("resolved_context_id"),
+                field="resolved_context_id",
+                max_chars=128,
+            )
+            record_scope = str(record.get("requested_scope") or "")
+            provenance = str(record.get("provenance") or "")
+            if record_origin != context_id or record_scope != recall_scope:
+                raise ResponseContractError(
+                    "retrieval scope provenance does not match query"
+                )
+            context_link = _project_retrieval_context_link(
+                record.get("context_link")
+            )
+            if provenance == "connected":
+                if (
+                    recall_scope != "connected"
+                    or context_link is None
+                    or context_link.get("enabled") is not True
+                    or context_link.get("approved") is not True
+                ):
+                    raise ResponseContractError(
+                        "connected retrieval scope requires approved link provenance"
+                    )
+                _validate_retrieval_link_reachability(
+                    context_link,
+                    origin_context_id=context_id,
+                    resolved_context_id=resolved_context_id,
+                )
+            elif provenance not in {"local", "global", "all"}:
+                raise ResponseContractError("retrieval scope provenance is invalid")
+            elif context_link is not None:
+                raise ResponseContractError(
+                    "non-connected retrieval scope must not claim link provenance"
+                )
+            resolved_context_ids.add(resolved_context_id)
+        if len(resolved_context_ids) != len(scope_contexts):
+            raise ResponseContractError("retrieval scope contexts must be unique")
+        if context_id not in resolved_context_ids:
+            raise ResponseContractError("retrieval scope omitted its origin context")
+        if _safe_int(scope.get("resolved_context_count")) != len(scope_contexts):
+            raise ResponseContractError(
+                "retrieval resolved_context_count must match scope contexts"
+            )
+        items = _strict_object_list(payload.get("items"), field="items")
+        if _safe_int(payload.get("result_count")) != len(items):
+            raise ResponseContractError("retrieval result_count must match items")
+        memory_ids: set[str] = set()
+        for expected_rank, item in enumerate(items, start=1):
+            projected = _project_retrieval_item(item)
+            if projected["rank"] != expected_rank:
+                raise ResponseContractError("retrieval ranks must be contiguous")
+            memory_id = projected["memory_id"]
+            if memory_id in memory_ids:
+                raise ResponseContractError("retrieval memory ids must be unique")
+            memory_ids.add(memory_id)
+            item_context = projected["context_id"]
+            item_scope = projected["scope_provenance"]
+            if (
+                item_context not in resolved_context_ids
+                or item_scope["origin_context_id"] != context_id
+                or item_scope["resolved_context_id"] != item_context
+                or item_scope["requested_scope"] != query.get("recall_scope")
+            ):
+                raise ResponseContractError("retrieval item escaped its resolved scope")
+            provenance = item_scope["provenance"]
+            context_link = item_scope["context_link"]
+            if provenance == "connected":
+                if (
+                    not isinstance(context_link, dict)
+                    or context_link.get("enabled") is not True
+                    or context_link.get("approved") is not True
+                ):
+                    raise ResponseContractError(
+                        "connected retrieval requires approved link provenance"
+                    )
+                _validate_retrieval_link_reachability(
+                    context_link,
+                    origin_context_id=context_id,
+                    resolved_context_id=item_context,
+                )
+            elif context_link is not None:
+                raise ResponseContractError(
+                    "non-connected retrieval must not claim link provenance"
+                )
+            if projected["raw_source_included"] is not False:
+                raise ResponseContractError("retrieval item exposed raw source")
+            if (
+                projected["ranker_id"] != ranker.get("id")
+                or projected["ranker_version"] != ranker.get("version")
+            ):
+                raise ResponseContractError(
+                    "retrieval item ranker identity does not match response"
+                )
+        if completeness.get("pagination_supported") is not False:
+            raise ResponseContractError("ranked retrieval pagination is unsupported")
+        if completeness.get("next_cursor") is not None:
+            raise ResponseContractError("ranked retrieval must not invent a cursor")
+        scope_complete = _strict_boolean(
+            completeness.get("scope_complete"),
+            field="completeness.scope_complete",
+        )
+        query_terms_truncated = _strict_boolean(
+            completeness.get("query_terms_truncated"),
+            field="completeness.query_terms_truncated",
+        )
+        candidate_scan_truncated = _strict_boolean(
+            completeness.get("candidate_scan_truncated"),
+            field="completeness.candidate_scan_truncated",
+        )
+        result_set_truncated = _strict_boolean(
+            completeness.get("result_set_truncated"),
+            field="completeness.result_set_truncated",
+        )
+        expected_has_more = candidate_scan_truncated or result_set_truncated
+        if _strict_boolean(
+            completeness.get("has_more"), field="completeness.has_more"
+        ) != expected_has_more:
+            raise ResponseContractError("retrieval has_more is inconsistent")
+        expected_complete = bool(
+            scope_complete
+            and not query_terms_truncated
+            and not candidate_scan_truncated
+            and not result_set_truncated
+        )
+        if _strict_boolean(
+            completeness.get("complete"), field="completeness.complete"
+        ) != expected_complete:
+            raise ResponseContractError("retrieval completeness is inconsistent")
+        return
+
     context_id = _atomic_identifier(
         payload.get("context_id"), field="context_id", max_chars=128
     )
@@ -2547,6 +3727,16 @@ def _validate_surface_identities(surface: str, payload: dict[str, Any]) -> None:
             ):
                 _optional_atomic_identifier(
                     item.get("memory_id", item.get("goal_id")), field="memory_id"
+                )
+        if payload.get("_retrieval_page") is not None:
+            for item in _strict_object_list(
+                payload.get("working_memory"),
+                field="working_memory",
+                allow_missing=True,
+            ):
+                _optional_atomic_identifier(
+                    item.get("memory_id", item.get("goal_id")),
+                    field="memory_id",
                 )
         policy = payload.get("policy")
         if isinstance(policy, dict) and policy.get("policy_id") not in (None, ""):

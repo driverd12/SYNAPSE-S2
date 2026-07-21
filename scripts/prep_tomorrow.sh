@@ -312,15 +312,15 @@ echo "=== cli preflight ==="
   --require-resource-envelope \
   --require-native \
   --launcher "$LAUNCHER" \
-  --query-text "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients"
+  --retrieval-prompt "durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients"
 
 echo "=== mcp tool list ==="
 .venv/bin/fastmcp list --command "$LAUNCHER" --json --timeout 15
 
 echo "=== mcp recall smoke ==="
 .venv/bin/fastmcp call --command "$LAUNCHER" \
-  --target query_spiking_attention_text \
-  --input-json "{\"context_id\":\"$CONTEXT\",\"prompt\":\"durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients\"}" \
+  --target retrieve_spiking_memory_v2 \
+  --input-json "{\"context_id\":\"$CONTEXT\",\"prompt\":\"durable real memory local SQLite substrate MCP list export backup toggle remember recall context across clients\",\"recall_scope\":\"local\",\"result_limit\":8,\"candidate_limit\":64,\"include_graph_neighbors\":true,\"response_mode\":\"compact\",\"max_response_bytes\":24576}" \
   --json --timeout 15
 
 echo "=== mcp graph smoke ==="

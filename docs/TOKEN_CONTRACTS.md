@@ -2,12 +2,13 @@
 
 SYNAPSE-S2 has two different response audiences:
 
-- local agents consuming installed MCP output or the four contracted CLI read
+- local agents consuming installed MCP output or the five contracted CLI read
   commands, where every repeated field consumes context-window tokens; and
 - the loopback dashboard, where the browser needs the richer graph and
   inspection payloads used to render the operator UI.
 
-Phase 6 keeps those boundaries separate. Installed agent clients default to a
+Phase 6 established those boundaries, and Retrieval v2 extends them without
+changing the dashboard contract. Installed agent clients default to a
 bounded `compact` response. An operator can explicitly request `full` output
 for diagnostics. The dashboard continues to use the rich local backend and HTTP
 API; the agent contract does not silently reduce the dashboard's graph or
@@ -43,15 +44,17 @@ standalone defaults are:
 | Contract surface | Default ceiling |
 | :--- | ---: |
 | `agent-hydration` | 16,384 bytes |
+| `memory-retrieval` | 24,576 bytes |
 | `memory-list` | 32,768 bytes |
 | `memory-graph` | 49,152 bytes |
 | `cortex-state` | 16,384 bytes |
 
-Only these four agent-facing surfaces use
+Only these five agent-facing surfaces use
 `synapse-s2.token-contract.v1`: MCP `hydrate_spiking_agent_context`,
-`list_spiking_memory`, `list_spiking_memory_graph`, and
-`get_spiking_cortex_state`, plus their CLI `agent-brief`, `list-memory`, `graph`,
-and `cortex-state` counterparts. Receipt acknowledgement, release, dead-letter,
+`retrieve_spiking_memory_v2`, `list_spiking_memory`,
+`list_spiking_memory_graph`, and `get_spiking_cortex_state`, plus their CLI
+`agent-brief`, `retrieve-v2`, `list-memory`, `graph`, and `cortex-state`
+counterparts. Receipt acknowledgement, release, dead-letter,
 repair, backup, morning Start Work, and other fixed-purpose operations keep
 their established schemas; they are not passed through a generic lossy
 projector.
@@ -61,7 +64,8 @@ projector.
 ### `compact`
 
 `compact` is the installed-client default. It returns the smallest useful,
-provenance-bearing representation of memory, graph, Cortex, and delivery state.
+provenance-bearing representation of ranked retrieval, memory, graph, Cortex,
+and delivery state.
 It removes repeated renderings and diagnostic bulk, including full vector/index
 arrays, repeated endpoint summaries, redundant Markdown plus JSON copies,
 absolute local paths, and repeated provider-detail objects.
@@ -96,7 +100,7 @@ fencing, confirmation requirements, or any other security boundary.
 
 ### `legacy` (CLI only)
 
-The four contracted CLI commands accept `--response-mode legacy` for internal
+The five contracted CLI commands accept `--response-mode legacy` for internal
 operator scripts and reports that still consume the established unwrapped
 domain payload. It is a deliberate compatibility path, not an installed MCP
 profile, and it is never selected as a fallback after a contract error. MCP
@@ -146,10 +150,12 @@ is exposed through MCP or emitted by a contracted CLI command.
    digest fields are removed rather than promoted into trusted contract data;
    this is not a promise to preserve every producer-supplied field named
    `digest`, `hash`, or `revision`.
-5. Every bounded collection reports its returned count. If the authoritative
-   producer does not expose an exact total or cursor, `completeness.complete`
-   is `null`, its reason says so, and pagination is explicitly marked
-   `retrieval-v2-required`; compact output never invents an available count.
+5. Every bounded collection reports its returned count. Memory list, graph, and
+   Cortex pages report exact authoritative totals and authenticated keyset
+   continuation metadata. Ranked `memory-retrieval` instead reports its bounded
+   candidate/result completeness and explicitly sets pagination unsupported;
+   `has_more` there never impersonates a cursor. A producer that genuinely lacks
+   an exact total says so; compact output never invents one.
 6. A projection-truncated response says so explicitly through
    `response_contract.truncated`, the omission count map, and an
    `output-truncated` warning. Source completeness remains a separate
@@ -233,6 +239,14 @@ Repeated provider-detail objects, raw vectors, and duplicate node metadata are
 not emitted in compact mode. Graph edges refer to stable endpoint ids instead of
 repeating each node's labels, summaries, facets, and metadata on every edge.
 
+Ranked Retrieval v2 adds item-level `scope_provenance`, `source_provenance`, and
+optional `graph_provenance`. A connected result must name the exact enabled
+one-hop namespace link that authorizes it. `score`, `score_breakdown`, and
+`confidence.score` are deterministic ranking signals. The contract fixes
+`confidence.calibrated: false`, `confidence.probability: null`, and
+`confidence.signal: uncalibrated-ranking-score`; callers must not present a
+rank score as truth confidence or probability.
+
 ## Current continuation behavior
 
 Agent hydration uses the durable context-delivery protocol rather than an
@@ -254,24 +268,55 @@ Claiming hydrations use `receipt-fenced-fifo`; observation-only hydration uses
 must follow both halves of the combined continuation instruction instead of
 assuming the visible receipt page is the whole queue.
 
-Compact memory-list, memory-graph, and Cortex-state responses do not yet claim
-cursor pagination. They return `pagination.supported: false`, strategy
-`retrieval-v2-required`, `next_cursor: null`, and unknown authoritative
-completeness. An operator can request bounded full mode for diagnosis; full mode
-does not turn that absence into a cursor.
+Compact and full memory-list, memory-graph, and Cortex-state responses use
+`authenticated-keyset-v2`. Each page reports an exact authoritative total,
+returned count, snapshot revision, stable ordering, origin node, `has_more`, and
+an opaque `next_cursor` plus expiry only when another page exists. Graph
+continuation advances the independently ordered primary-entry and relationship
+streams together; endpoint-only nodes hydrate returned relationships and are
+not counted as additional primary rows.
 
-## Retrieval v2 continuation requirements
+The Cortex page binds two sources: durable Cortex memory and the frozen active
+governor-session view rendered in the same response. Its composite snapshot
+revision and authenticated cursor include both the durable revision and live
+runtime revision. A session entering, leaving, closing, or otherwise changing
+between pages makes the old cursor stale instead of allowing a mixed snapshot.
 
-Retrieval v2 must use keyset continuation rather than an offset that can silently
-skip or duplicate changing data. A continuation must bind the response contract
-version, mode, namespace, recall scope and filters, ordering, unique tie-breaker,
-snapshot revision, expiry, and origin node. It must be authenticated with a
-domain-separated local key.
+Ranked `memory-retrieval` is deliberately different. It is one deterministic,
+bounded relevance read with `pagination.supported: false` and
+`next_cursor: null`. Its `completeness.has_more` reports scope, term, candidate,
+or result truncation. A caller can make a larger bounded request or begin a new
+snapshot, but cannot continue the old ranking with a list/graph/Cortex cursor.
 
-Tampered, expired, stale-revision, wrong-context, wrong-mode, wrong-filter, or
-cross-host Retrieval v2 continuations must fail closed. They must never restart
-from page one without telling the caller. Stable ordering must always end in a
-unique id tie-breaker.
+## Authenticated read continuation
+
+Read pages use keyset continuation rather than an offset that can silently skip
+or duplicate changing data. A continuation binds the response contract schema
+and version, surface, mode, namespace, recall scope and filters, ordering,
+unique tie-breaker, keyset position, snapshot revision, issue/expiry time, and
+origin node. It is authenticated with a domain-separated owner-local HMAC key.
+The default lifetime is 900 seconds; tokens never authorize writes.
+
+Tampered, malformed, expired, stale-revision, wrong-contract, wrong-surface,
+wrong-context, wrong-mode, wrong-scope, wrong-filter, wrong-ordering, or
+cross-origin continuations fail closed. They never restart from page one without
+telling the caller. Stable ordering always ends in a unique id tie-breaker.
+
+Snapshot revisions hash transaction-coupled, per-namespace content generations,
+the relevant exact row counts, and the semantic-index generation. Authoritative
+writer connections—including the governed maintenance/repair lane—advance the
+memory, relationship, and Cortex generations in the same SQLite transaction as
+each covered mutation. Spike and surface-index row changes advance the affected
+namespace's memory generation as well, so a bounded page does not reread every
+memory body merely to establish its stale-page fence. Missing, malformed, or
+overflowing generation state fails closed. This guarantee assumes
+the documented authoritative-core boundary: an out-of-contract process that
+writes the SQLite file directly instead of using a governed writer connection
+can bypass the temporary revision triggers and is unsupported.
+
+See [`RETRIEVAL_V2_VALIDATION.md`](RETRIEVAL_V2_VALIDATION.md) for the ranker,
+scope/provenance contract, cursor threat boundary, synthetic acceptance method,
+and exact non-claims.
 
 ## Dashboard boundary
 
@@ -389,6 +434,10 @@ that full mode remains redacted, trust-labelled, and context-scoped.
 CLI examples:
 
 ```bash
+.venv/bin/python synapse_cli.py --json retrieve-v2 \
+  --context default --prompt "current task constraints" --scope local \
+  --result-limit 8 --candidate-limit 64 \
+  --response-mode compact --max-response-bytes 12288
 .venv/bin/python synapse_cli.py --json list-memory \
   --context default --limit 50 \
   --response-mode compact --max-response-bytes 12288
@@ -402,3 +451,9 @@ CLI examples:
 Use the legacy form only for a known local consumer that has not yet migrated
 to the versioned envelope. A full response may still fail if its complete
 serialization does not fit the explicit ceiling.
+
+For memory list, graph, or Cortex state, pass the prior envelope's exact
+`pagination.next_cursor` back through that command's `--cursor` option without
+decoding or modifying it. Preserve every other request binding. If the command
+reports a cursor error, begin a deliberate new page-one read; never suppress the
+error and silently relabel the new response as the old snapshot's continuation.

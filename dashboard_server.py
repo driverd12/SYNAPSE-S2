@@ -830,42 +830,108 @@ class DashboardRuntime:
                     HTTPStatus.BAD_REQUEST,
                     "recall_scope must be local, connected, or all",
                 )
+            raw_result_limit = payload.get("result_limit", 12)
+            if type(raw_result_limit) is not int:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "result_limit must be an integer",
+                )
+            if raw_result_limit < 1 or raw_result_limit > 50:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "result_limit must be between 1 and 50",
+                )
+            result_limit = raw_result_limit
+            raw_include_graph = payload.get("include_graph_neighbors", True)
+            if type(raw_include_graph) is not bool:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "include_graph_neighbors must be a boolean",
+                )
             started = time.perf_counter()
-            result = self.backend.query_text(
+            if not self.backend.is_enabled(context):
+                result = (
+                    f"SYNAPSE-S2 disabled for context {context}. "
+                    "Toggle it with set_spiking_attention_enabled(true)."
+                )
+                elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+                return self._json_response(
+                    {
+                        "schema": "synapse-s2.dashboard-retrieval.v2",
+                        "context_id": context,
+                        "recall_scope": recall_scope,
+                        "result": result,
+                        "results": [
+                            {
+                                "kind": "status",
+                                "tag": result,
+                                "label": result,
+                                "rank": 1,
+                            }
+                        ],
+                        "latency_ms": elapsed_ms,
+                        "diagnostics": {
+                            "result_count": 1,
+                            "recall_scope": recall_scope,
+                            "effective_context_ids": [context],
+                            "runtime": "disabled",
+                            "retrieval_version": 2,
+                            "raw_input_stored": False,
+                            "memory_entry_revision": self.backend.memory_entries_revision(
+                                context_id=context,
+                                include_global=True,
+                            ),
+                        },
+                        "query_id": self._query_id(context=context),
+                    }
+                )
+            candidate_limit = min(max(result_limit * 4, 16), 500)
+            retrieval = self.backend.retrieve_text_v2(
                 prompt,
                 context_id=context,
                 recall_scope=recall_scope,
+                result_limit=result_limit,
+                candidate_limit=candidate_limit,
+                include_graph_neighbors=raw_include_graph,
             )
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
-            results = self._parse_recall_result(result)
-            recall_contexts = self.backend.resolve_recall_contexts(
-                context_id=context,
-                recall_scope=recall_scope,
-            )
+            results = self._dashboard_retrieval_v2_items(retrieval)
+            scope = retrieval.get("scope") if isinstance(retrieval.get("scope"), dict) else {}
+            recall_contexts = scope.get("contexts") if isinstance(scope.get("contexts"), list) else []
             effective_context_ids = [
-                str(record.get("context_id") or "")
+                str(record.get("resolved_context_id") or "")
                 for record in recall_contexts
-                if str(record.get("context_id") or "")
+                if isinstance(record, dict)
+                and str(record.get("resolved_context_id") or "")
             ]
             return self._json_response(
                 {
+                    "schema": "synapse-s2.dashboard-retrieval.v2",
                     "context_id": context,
                     "recall_scope": recall_scope,
-                    "prompt": prompt,
-                    "result": result,
+                    "retrieval": retrieval,
                     "results": results,
                     "latency_ms": elapsed_ms,
                     "diagnostics": {
                         "result_count": len(results),
                         "recall_scope": recall_scope,
                         "effective_context_ids": effective_context_ids,
-                        "runtime": "ready" if self.backend.is_enabled(context) else "disabled",
-                        "embedding_provider": self.backend.embedding_provider_info(),
-                        "memory_entry_revision": self.backend.memory_entries_revision(
-                            context_ids=effective_context_ids,
+                        "runtime": "ready",
+                        "retrieval_version": 2,
+                        "ranker": retrieval.get("ranker", {}),
+                        "snapshot": retrieval.get("snapshot", {}),
+                        "memory_entry_revision": (
+                            retrieval.get("snapshot", {}).get(
+                                "entries_revision", {}
+                            )
+                            if isinstance(retrieval.get("snapshot"), dict)
+                            else {}
                         ),
+                        "completeness": retrieval.get("completeness", {}),
+                        "raw_input_stored": False,
                     },
-                    "query_id": self._query_id(context=context),
+                    "query_id": retrieval.get("retrieval_id")
+                    or self._query_id(context=context),
                 }
             )
         if method == "POST" and path == "/api/namespace-links":
@@ -2720,9 +2786,15 @@ class DashboardRuntime:
         profile = self.backend.resource_profile(benchmark_quick_prune=False)
         graph = self.backend.list_memory_graph(context_id=context, limit=20)
         prompt = self._audit_prompt(graph)
-        query_result = ""
+        query_result: dict[str, Any] | None = None
         if prompt:
-            query_result = self.backend.query_text(prompt, context_id=context)
+            query_result = self.backend.retrieve_text_v2(
+                prompt,
+                context_id=context,
+                recall_scope="local",
+                result_limit=4,
+                candidate_limit=16,
+            )
         target_max = float(
             profile.get("target_envelope_mb", {}).get(
                 "max",
@@ -2738,7 +2810,11 @@ class DashboardRuntime:
             "memory_ready": int(status.get("memory_context_entry_count") or 0) > 0,
             "graph_ready": int(graph.get("relationship_count") or 0) > 0,
             "resource_ceiling_ok": estimated_mb <= target_max,
-            "query_ready": bool(query_result) and "disabled" not in query_result.lower(),
+            "query_ready": bool(
+                isinstance(query_result, dict)
+                and query_result.get("schema") == "synapse-retrieval.v2"
+                and query_result.get("raw_input_stored") is False
+            ),
         }
         failed_checks = [name for name, passed in checks.items() if not passed]
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
@@ -2750,7 +2826,16 @@ class DashboardRuntime:
             "checks": checks,
             "failed_checks": failed_checks,
             "elapsed_ms": elapsed_ms,
-            "query_prompt": prompt,
+            "query_probe": {
+                "schema": "synapse-s2.readiness-query-probe.v1",
+                "source": "fixed-non-memory-bearing-probe",
+                "fingerprint_sha256": (
+                    str(query_result.get("query", {}).get("fingerprint_sha256") or "")
+                    if isinstance(query_result, dict)
+                    else ""
+                ),
+                "raw_input_stored": False,
+            },
             "query_result": query_result,
             "graph_summary": graph.get("relationship_summary", {}),
             "status_summary": {
@@ -2961,7 +3046,7 @@ class DashboardRuntime:
                 metrics={
                     "failed_checks": failed_checks,
                     "elapsed_ms": audit.get("elapsed_ms"),
-                    "query_prompt": audit.get("query_prompt"),
+                    "query_probe": audit.get("query_probe"),
                 },
             )
             if failed_checks:
@@ -3091,16 +3176,11 @@ class DashboardRuntime:
         return payload
 
     def _audit_prompt(self, graph: dict[str, Any]) -> str:
-        entries = graph.get("entries", [])
-        for entry in entries:
-            if not entry.get("metadata", {}).get("event_segment"):
-                text = str(entry.get("source_text") or entry.get("tag") or "").strip()
-                if text:
-                    return text
-        for entry in entries:
-            text = str(entry.get("source_text") or entry.get("tag") or "").strip()
-            if text:
-                return text
+        # Readiness needs to prove the retrieval contract, not replay an
+        # arbitrary stored memory as a query or echo it into evidence packs.
+        # Keep this fixed and non-sensitive; ``graph`` remains accepted for API
+        # compatibility with extensions that call this helper directly.
+        del graph
         return "SYNAPSE-S2 local memory readiness"
 
     def _system_info(self, *, context_id: str) -> dict[str, Any]:
@@ -3158,7 +3238,85 @@ class DashboardRuntime:
         machine = platform.machine()
         return machine or "unknown"
 
+    def _dashboard_retrieval_v2_items(
+        self,
+        retrieval: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Flatten typed Retrieval v2 hits for the existing result-card view."""
+
+        rendered: list[dict[str, Any]] = []
+        source_items = retrieval.get("items")
+        if not isinstance(source_items, list):
+            return rendered
+        for item in source_items:
+            if not isinstance(item, dict):
+                continue
+            scope = (
+                item.get("scope_provenance")
+                if isinstance(item.get("scope_provenance"), dict)
+                else {}
+            )
+            context_link = (
+                scope.get("context_link")
+                if isinstance(scope.get("context_link"), dict)
+                else {}
+            )
+            match_reasons = (
+                item.get("match_reasons")
+                if isinstance(item.get("match_reasons"), list)
+                else []
+            )
+            graph_relationship = next(
+                (
+                    relationship
+                    for reason in match_reasons
+                    if isinstance(reason, dict)
+                    and reason.get("type") == "same-context-graph-neighbor"
+                    for relationship in (
+                        reason.get("relationships")
+                        if isinstance(reason.get("relationships"), list)
+                        else []
+                    )
+                    if isinstance(relationship, dict)
+                ),
+                None,
+            )
+            rendered.append(
+                {
+                    "kind": "linked" if graph_relationship else "memory",
+                    "rank": item.get("rank"),
+                    "memory_id": item.get("memory_id", ""),
+                    "context_id": item.get("context_id", ""),
+                    "tag": item.get("tag", ""),
+                    "label": item.get("label", ""),
+                    "summary": item.get("summary", ""),
+                    "excerpt": item.get("excerpt", ""),
+                    "facets": item.get("facets", []),
+                    "score": item.get("score"),
+                    "relation_type": (
+                        graph_relationship.get("relation_type", "")
+                        if graph_relationship
+                        else ""
+                    ),
+                    "recall_scope": scope.get("requested_scope", "local"),
+                    "recall_provenance": scope.get("provenance", "local"),
+                    "via_context_link_id": context_link.get(
+                        "context_link_id", ""
+                    ),
+                    "via_relation_type": context_link.get(
+                        "relation_type", ""
+                    ),
+                    "via_direction": context_link.get("direction", ""),
+                    "match_reasons": match_reasons,
+                    "confidence": item.get("confidence", {}),
+                    "scope_provenance": scope,
+                    "source_provenance": item.get("source_provenance", {}),
+                }
+            )
+        return rendered
+
     def _parse_recall_result(self, result: str) -> list[dict[str, Any]]:
+        """Legacy delimiter parser retained only for old persisted UI payloads."""
         items: list[dict[str, Any]] = []
         for rank, chunk in enumerate(str(result or "").split(" / "), start=1):
             text = chunk.strip()

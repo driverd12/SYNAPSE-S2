@@ -39,6 +39,7 @@ from core_service import (
     CORE_OPERATION_CONTRACTS,
     LOGGER,
     MAX_ACTIVE_CONNECTIONS,
+    SAFE_READ_OPERATIONS,
     SERVICE_CONTROL_OPERATIONS,
     AuthoritativeCoreService,
     CoreConfig,
@@ -54,6 +55,7 @@ from core_service import (
     write_core_config,
 )
 from memory_store import ContextDeliveryRejected, DurableMemoryStore
+from mlx_backend import SpikingAttentionBackend
 from redaction import SECRET_SAFE_LOG_FORMAT, SecretRedactingFormatter
 
 
@@ -1899,6 +1901,98 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=5.0)
 
+    def test_retrieval_v2_is_structured_and_never_admitted_to_mutation_journal(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            service = AuthoritativeCoreService(config)
+            failures: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    service.serve_forever()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not config.socket_path.exists():
+                if failures:
+                    break
+                time.sleep(0.02)
+            try:
+                self.assertEqual(failures, [])
+                client = CoreClient(
+                    socket_path=config.socket_path,
+                    caller="retrieval-v2-core-test",
+                    default_timeout_seconds=3.0,
+                )
+                client.register_text_trace(
+                    tag="ptz-control-room",
+                    text="PTZ camera control room routing evidence.",
+                    context_id="ops",
+                )
+
+                journal = service._request_journal
+                self.assertIsNotNone(journal)
+                assert journal is not None
+
+                def journal_rows() -> int:
+                    with closing(sqlite3.connect(journal.path)) as connection:
+                        return int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM request_journal"
+                            ).fetchone()[0]
+                        )
+
+                before_rows = journal_rows()
+                original_handler = service._handlers["retrieve_text_v2"]
+                handler = mock.Mock(wraps=original_handler)
+                service._handlers["retrieve_text_v2"] = handler
+                arguments = {
+                    "prompt": "PTZ camera control room",
+                    "context_id": "ops",
+                    "recall_scope": "local",
+                    "result_limit": 1,
+                    "candidate_limit": 8,
+                    "include_graph_neighbors": False,
+                }
+                with mock.patch.object(
+                    service,
+                    "_journal_accept",
+                    wraps=service._journal_accept,
+                ) as journal_accept:
+                    result = client.call(
+                        "retrieve_text_v2",
+                        arguments,
+                        request_id="req-retrieval-v2-read-only",
+                    )
+                    request_status = client.request_status(
+                        caller="retrieval-v2-core-test",
+                        request_id="req-retrieval-v2-read-only",
+                    )
+
+                journal_accept.assert_not_called()
+                self.assertEqual(journal_rows(), before_rows)
+                self.assertFalse(request_status["known"])
+                self.assertEqual(request_status["state"], "not_found")
+                handler.assert_called_once_with(**arguments)
+                self.assertEqual(result["schema"], "synapse-retrieval.v2")
+                self.assertEqual(result["schema_version"], 2)
+                self.assertEqual(result["query"]["context_id"], "ops")
+                self.assertEqual(result["query"]["recall_scope"], "local")
+                self.assertFalse(result["query"]["raw_input_stored"])
+                self.assertFalse(result["raw_input_stored"])
+                self.assertEqual(result["ranker"]["version"], "2.0.0")
+                self.assertEqual(result["result_count"], 1)
+                self.assertEqual(len(result["items"]), 1)
+                self.assertEqual(result["items"][0]["context_id"], "ops")
+            finally:
+                service.close()
+                thread.join(timeout=5.0)
+
     def test_restart_refuses_valid_shaped_stale_runtime_epoch_binding(self) -> None:
         with TemporaryDirectory() as temporary:
             config = self.config(Path(temporary))
@@ -3217,6 +3311,96 @@ class CoreClientRetryTests(unittest.TestCase):
             with self.assertRaises(CoreUnavailable):
                 client.set_enabled(True)
             self.assertEqual(mutation_attempts, 1)
+
+    def test_retrieval_v2_contract_matches_backend_and_client_forwarding(self) -> None:
+        contract = CORE_OPERATION_CONTRACTS["retrieve_text_v2"]
+        signature = inspect.signature(SpikingAttentionBackend.retrieve_text_v2)
+        backend_arguments = {
+            name for name in signature.parameters if name != "self"
+        }
+        required_backend_arguments = {
+            name
+            for name, parameter in signature.parameters.items()
+            if name != "self" and parameter.default is inspect.Parameter.empty
+        }
+        self.assertEqual(contract.allowed_arguments, backend_arguments)
+        self.assertEqual(contract.required_arguments, required_backend_arguments)
+        self.assertFalse(contract.mutation)
+        self.assertTrue(contract.retry_safe)
+        self.assertIn("retrieve_text_v2", SAFE_READ_OPERATIONS)
+
+        with TemporaryDirectory() as temporary:
+            client = CoreClient(
+                socket_path=Path(temporary) / "core" / "service.sock",
+                caller="retrieval-contract-client",
+            )
+            expected = {"schema": "synapse-retrieval.v2"}
+            arguments = {
+                "context_id": "ops",
+                "recall_scope": "connected",
+                "result_limit": 7,
+                "candidate_limit": 31,
+                "include_graph_neighbors": False,
+            }
+            with mock.patch.object(
+                client,
+                "call",
+                return_value=expected,
+            ) as call:
+                result = client.retrieve_text_v2("camera routing", **arguments)
+        self.assertEqual(result, expected)
+        call.assert_called_once_with(
+            "retrieve_text_v2",
+            {"prompt": "camera routing", **arguments},
+        )
+
+    def test_retrieval_v2_reconnects_once_with_the_same_request(self) -> None:
+        with TemporaryDirectory() as temporary:
+            client = self.client(Path(temporary))
+            requests: list[dict[str, Any]] = []
+            expected = {
+                "schema": "synapse-retrieval.v2",
+                "schema_version": 2,
+                "items": [],
+                "result_count": 0,
+            }
+
+            def exchange(
+                request: dict[str, Any],
+                *,
+                timeout_seconds: float,
+            ) -> Any:
+                _ = timeout_seconds
+                requests.append(request)
+                if len(requests) == 1:
+                    raise CoreUnavailable()
+                return self.response(request, expected)
+
+            client._exchange = exchange  # type: ignore[method-assign]
+            result = client.retrieve_text_v2(
+                "camera routing",
+                context_id="ops",
+                recall_scope="connected",
+                result_limit=7,
+                candidate_limit=31,
+                include_graph_neighbors=False,
+            )
+
+            self.assertEqual(result, expected)
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0], requests[1])
+            self.assertEqual(requests[0]["operation"], "retrieve_text_v2")
+            self.assertEqual(
+                requests[0]["arguments"],
+                {
+                    "prompt": "camera routing",
+                    "context_id": "ops",
+                    "recall_scope": "connected",
+                    "result_limit": 7,
+                    "candidate_limit": 31,
+                    "include_graph_neighbors": False,
+                },
+            )
 
     def test_resource_profile_benchmark_routes_to_journaled_mutation(self) -> None:
         self.assertTrue(CORE_OPERATION_CONTRACTS["resource_profile"].retry_safe)

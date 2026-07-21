@@ -380,6 +380,9 @@ class CoreClient:
     def query_text(self, prompt: str, **arguments: Any) -> str:
         return self.call("query_text", {"prompt": prompt, **arguments})
 
+    def retrieve_text_v2(self, prompt: str, **arguments: Any) -> dict[str, Any]:
+        return self.call("retrieve_text_v2", {"prompt": prompt, **arguments})
+
     def query(self, embedding: Any, **arguments: Any) -> str:
         return self.call("query", {"embedding": embedding, **arguments})
 

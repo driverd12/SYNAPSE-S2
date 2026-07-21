@@ -154,12 +154,12 @@ const WIZARD_FLOWS = {
   {
     selector: "#queryForm",
     title: "Recall what has been captured",
-    body: "Recall embeds your prompt locally, gates the spiking memory graph, and returns matching traces from the active context.",
-    capability: "Recall: local neural embedding, sparse spiking attention, graph-backed results.",
+    body: "Retrieval v2 embeds your prompt locally, reads durable spike and semantic indexes, and returns deterministic bounded results without recurrent spiking or memory mutation.",
+    capability: "Recall: deterministic hybrid ranking, explicit namespace scope, and typed provenance.",
     items: [
       "Ask for decisions, incidents, project state, or prior validation.",
       "If results are thin, capture better traces rather than broad filler.",
-      "MCP clients use the same memory through the query tool.",
+      "MCP clients use the same read-only contract through retrieve_spiking_memory_v2.",
     ],
   },
   {
@@ -413,6 +413,7 @@ const state = {
   )?.trim() || DEFAULT_CONTEXT,
   snapshot: null,
   lastQueryPayload: null,
+  recallRequestGeneration: 0,
   neuralInspector: false,
   graph: {
     nodePositions: new Map(),
@@ -1036,6 +1037,7 @@ function formatContextOption(row) {
 
 async function applySelectedContext(context, busyElement = elements.contextApply) {
   const nextContext = String(context || "").trim() || DEFAULT_CONTEXT;
+  const contextChanged = nextContext !== state.context;
   const galaxy = state.namespaceGalaxy;
   const switchingOpenNamespace = galaxy.view === "namespace"
     && Boolean(galaxy.detailContextId)
@@ -1053,6 +1055,9 @@ async function applySelectedContext(context, busyElement = elements.contextApply
     updateNamespaceGalaxyChrome();
   }
   state.context = nextContext;
+  if (contextChanged) {
+    resetRecallResults({ contextId: nextContext });
+  }
   const galaxyNode = state.namespaceGalaxy.data.nodes.find((item) => item.contextId === nextContext);
   if (galaxyNode && state.namespaceGalaxy.view === "galaxy") {
     selectNamespaceGalaxyItem(galaxyNode, { focusCanvas: false });
@@ -5640,7 +5645,7 @@ function renderFooter(snapshot, status, profile, contextCount) {
 }
 
 function renderQueryResult(payload) {
-  const items = Array.isArray(payload.results) && payload.results.length
+  const items = Array.isArray(payload.results)
     ? payload.results
     : parseResultString(payload.result);
   const limit = Math.max(1, Math.trunc(Number(elements.recallLimit.value || 8)));
@@ -5648,12 +5653,29 @@ function renderQueryResult(payload) {
   const recallScope = ["local", "connected", "all"].includes(payload.recall_scope)
     ? payload.recall_scope
     : currentRecallScope();
+  const queryContext = String(
+    payload.context_id
+    || payload.retrieval?.query?.context_id
+    || state.context
+    || DEFAULT_CONTEXT,
+  );
 
   elements.resultCount.textContent = `(${formatNumber(items.length)})`;
-  elements.latencyLabel.textContent = `Latency: ${formatNumber(payload.latency_ms, 1)} ms · ${recallScope} scope`;
+  elements.latencyLabel.textContent = `Context: ${queryContext} · Latency: ${formatNumber(payload.latency_ms, 1)} ms · ${recallScope} scope`;
   elements.queryResults.innerHTML = visible.length
     ? visible.map((item) => resultCard(item)).join("")
     : '<div class="empty-result">No high-salience results returned.</div>';
+}
+
+function resetRecallResults({ contextId = state.context, clearPrompt = false } = {}) {
+  state.recallRequestGeneration += 1;
+  state.lastQueryPayload = null;
+  if (clearPrompt) {
+    elements.queryInput.value = "";
+  }
+  elements.queryResults.replaceChildren();
+  elements.resultCount.textContent = "(0)";
+  elements.latencyLabel.textContent = `Context: ${contextId || DEFAULT_CONTEXT} · Latency: -- ms`;
 }
 
 function resultCard(item) {
@@ -5688,9 +5710,15 @@ function resultCard(item) {
     memoryId ? `id ${compactMemoryId(memoryId)}` : "",
   ].filter(Boolean).join(" / ");
   const whyMatched = [
-    Number.isFinite(Number(item.score)) ? "embedding score" : "",
+    Number.isFinite(Number(item.score)) ? "hybrid rank signal (not probability)" : "",
     Number.isFinite(Number(item.weight)) ? "graph relationship weight" : "",
     item.relation_type ? `related by ${item.relation_type}` : "",
+    Array.isArray(item.match_reasons) && item.match_reasons.some((reason) => reason?.type === "spike-index-overlap")
+      ? "spike-index overlap"
+      : "",
+    Array.isArray(item.match_reasons) && item.match_reasons.some((reason) => reason?.type === "surface-index-overlap")
+      ? "surface-term overlap"
+      : "",
     Array.isArray(item.facets) && item.facets.length ? "facet overlap" : "",
     item.context_id ? "namespace provenance" : "",
     recallProvenance === "connected" ? "approved one-hop bridge" : "",
@@ -6936,22 +6964,34 @@ elements.queryForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const prompt = elements.queryInput.value.trim();
   if (!prompt) {
-    elements.queryResults.replaceChildren();
-    elements.resultCount.textContent = "(0)";
-    elements.latencyLabel.textContent = "Latency: -- ms";
+    resetRecallResults();
     logOperation("Recall rejected", "prompt is required");
     elements.queryInput.focus();
     return;
   }
+  const queryContext = state.context;
+  const requestGeneration = state.recallRequestGeneration + 1;
+  state.recallRequestGeneration = requestGeneration;
   await withBusy(elements.queryForm.querySelector("button"), "Recall", async () => {
     const payload = await requestJson("/api/query", {
       method: "POST",
       body: {
-        context_id: state.context,
+        context_id: queryContext,
         prompt,
         recall_scope: currentRecallScope(),
       },
     });
+    if (
+      requestGeneration !== state.recallRequestGeneration
+      || state.context !== queryContext
+    ) {
+      return {
+        action: "recall-discarded",
+        status: "stale-context",
+        context_id: queryContext,
+        current_context_id: state.context,
+      };
+    }
     state.lastQueryPayload = payload;
     renderQueryResult(payload);
     return payload;
@@ -6976,15 +7016,14 @@ elements.recallLimit.addEventListener("change", () => {
 });
 
 [elements.recallScopeLocal, elements.recallScopeConnected, elements.recallScopeAll].forEach((control) => {
-  control.addEventListener("change", updateRecallScopeHelp);
+  control.addEventListener("change", () => {
+    updateRecallScopeHelp();
+    resetRecallResults();
+  });
 });
 
 elements.clearRecallButton.addEventListener("click", () => {
-  state.lastQueryPayload = null;
-  elements.queryInput.value = "";
-  elements.queryResults.replaceChildren();
-  elements.resultCount.textContent = "(0)";
-  elements.latencyLabel.textContent = "Latency: -- ms";
+  resetRecallResults({ clearPrompt: true });
 });
 
 elements.quickPruneButton.addEventListener("click", () => {

@@ -63,6 +63,22 @@ class ContextDeliveryRejected(ValueError):
     """A deterministic delivery request rejection with no committed effects."""
 
 
+class RetrievalSnapshotStaleError(ValueError):
+    """Raised when a Retrieval v2 page no longer matches its reviewed snapshot."""
+
+    def __init__(self, *, expected_revision: str, actual_revision: str) -> None:
+        self.expected_revision = str(expected_revision)
+        self.actual_revision = str(actual_revision)
+        super().__init__("retrieval snapshot revision is stale")
+
+
+_RETRIEVAL_PAGE_MAX_LIMIT = 500
+_RETRIEVAL_MAX_CONTEXTS = 64
+_RETRIEVAL_SNAPSHOT_REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+_RETRIEVAL_GENERATION_KEY_PREFIX = "retrieval_snapshot_generation.v1"
+_RETRIEVAL_GENERATION_MAX = 9_223_372_036_854_775_807
+
+
 BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v3"
 LEGACY_BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v2"
 BACKUP_RESTORE_RECEIPT_SCHEMA = "synapse-s2.memory-restore.v2"
@@ -2607,6 +2623,209 @@ class DurableMemoryStore:
         ):
             self._assert_durable_authority(conn)
 
+    @staticmethod
+    def _install_retrieval_revision_triggers(conn: sqlite3.Connection) -> None:
+        """Track content generations without adding durable schema objects.
+
+        Every authoritative writer connection gets TEMP triggers over each
+        available retrieval table. The counters themselves live in
+        ``store_metadata`` and therefore advance in the exact same transaction
+        as the content mutation. TEMP triggers keep the versioned backup schema
+        stable while still covering direct SQL issued through governed store
+        connections, including maintenance and repair operations.
+
+        Existing-write repair connections may deliberately open a store whose
+        derived index tables are missing or quarantined. Install coverage for
+        every valid table that exists, then let the repair path call this helper
+        again immediately after it restores the derived schema.
+        """
+
+        now_sql = "CAST(strftime('%s', 'now') AS REAL)"
+
+        def bump(channel: str, context_expression: str) -> str:
+            key_expression = (
+                f"'{_RETRIEVAL_GENERATION_KEY_PREFIX}.{channel}.' || "
+                f"{context_expression}"
+            )
+            return f"""
+                INSERT INTO store_metadata (key, value_json, updated_at)
+                VALUES ({key_expression}, '1', {now_sql})
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json =
+                        CASE
+                            WHEN json_valid(store_metadata.value_json)
+                                AND json_type(store_metadata.value_json) = 'integer'
+                                AND CAST(store_metadata.value_json AS INTEGER)
+                                BETWEEN 0 AND {_RETRIEVAL_GENERATION_MAX - 1}
+                            THEN CAST(
+                                CAST(store_metadata.value_json AS INTEGER) + 1
+                                AS TEXT
+                            )
+                            ELSE 'null'
+                        END,
+                    updated_at = excluded.updated_at;
+            """
+
+        memory_new = bump("memory", "NEW.context_id")
+        memory_old = bump("memory", "OLD.context_id")
+        cortex_new = bump("cortex", "NEW.context_id")
+        cortex_old = bump("cortex", "OLD.context_id")
+        relationship_new = bump("relationship", "NEW.context_id")
+        relationship_old = bump("relationship", "OLD.context_id")
+        spike_new = bump("memory", "NEW.context_id")
+        spike_old = bump("memory", "OLD.context_id")
+        surface_new = bump("memory", "NEW.context_id")
+        surface_old = bump("memory", "OLD.context_id")
+        new_is_cortex = (
+            "json_valid(NEW.metadata_json) "
+            "AND json_type(NEW.metadata_json, '$.cortex_governor') = 'true'"
+        )
+        old_is_cortex = (
+            "json_valid(OLD.metadata_json) "
+            "AND json_type(OLD.metadata_json, '$.cortex_governor') = 'true'"
+        )
+        rows = conn.execute(
+            """
+            SELECT name
+            FROM main.sqlite_master
+            WHERE type = 'table'
+              AND name IN (
+                  'memory_entries',
+                  'memory_relationships',
+                  'memory_spikes',
+                  'memory_surface_terms'
+              )
+            """
+        ).fetchall()
+        available_tables = {str(row[0]) for row in rows}
+        statements: list[str] = []
+        if "memory_entries" in available_tables:
+            statements.extend(
+                (
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_memory_ai
+                    AFTER INSERT ON main.memory_entries
+                    BEGIN {memory_new} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_memory_ad
+                    AFTER DELETE ON main.memory_entries
+                    BEGIN {memory_old} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_memory_au
+                    AFTER UPDATE ON main.memory_entries
+                    BEGIN {memory_new} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_memory_au_old_context
+                    AFTER UPDATE OF context_id ON main.memory_entries
+                    WHEN OLD.context_id <> NEW.context_id
+                    BEGIN {memory_old} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_cortex_ai
+                    AFTER INSERT ON main.memory_entries
+                    WHEN {new_is_cortex}
+                    BEGIN {cortex_new} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_cortex_ad
+                    AFTER DELETE ON main.memory_entries
+                    WHEN {old_is_cortex}
+                    BEGIN {cortex_old} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_cortex_au
+                    AFTER UPDATE ON main.memory_entries
+                    WHEN ({old_is_cortex}) OR ({new_is_cortex})
+                    BEGIN {cortex_new} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_cortex_au_old_context
+                    AFTER UPDATE OF context_id ON main.memory_entries
+                    WHEN OLD.context_id <> NEW.context_id AND ({old_is_cortex})
+                    BEGIN {cortex_old} END
+                    """,
+                )
+            )
+        if "memory_relationships" in available_tables:
+            statements.extend(
+                (
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_relationship_ai
+                    AFTER INSERT ON main.memory_relationships
+                    BEGIN {relationship_new} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_relationship_ad
+                    AFTER DELETE ON main.memory_relationships
+                    BEGIN {relationship_old} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_relationship_au
+                    AFTER UPDATE ON main.memory_relationships
+                    BEGIN {relationship_new} END
+                    """,
+                    f"""
+                    CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_relationship_au_old_context
+                    AFTER UPDATE OF context_id ON main.memory_relationships
+                    WHEN OLD.context_id <> NEW.context_id
+                    BEGIN {relationship_old} END
+                    """,
+                )
+            )
+        if "memory_spikes" in available_tables:
+            statements.extend((
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_spike_ai
+                AFTER INSERT ON main.memory_spikes
+                BEGIN {spike_new} END
+                """,
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_spike_ad
+                AFTER DELETE ON main.memory_spikes
+                BEGIN {spike_old} END
+                """,
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_spike_au
+                AFTER UPDATE ON main.memory_spikes
+                BEGIN {spike_new} END
+                """,
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_spike_au_old_context
+                AFTER UPDATE OF context_id ON main.memory_spikes
+                WHEN OLD.context_id <> NEW.context_id
+                BEGIN {spike_old} END
+                """,
+            ))
+        if "memory_surface_terms" in available_tables:
+            statements.extend((
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_surface_ai
+                AFTER INSERT ON main.memory_surface_terms
+                BEGIN {surface_new} END
+                """,
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_surface_ad
+                AFTER DELETE ON main.memory_surface_terms
+                BEGIN {surface_old} END
+                """,
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_surface_au
+                AFTER UPDATE ON main.memory_surface_terms
+                BEGIN {surface_new} END
+                """,
+                f"""
+                CREATE TEMP TRIGGER IF NOT EXISTS s2_retrieval_surface_au_old_context
+                AFTER UPDATE OF context_id ON main.memory_surface_terms
+                WHEN OLD.context_id <> NEW.context_id
+                BEGIN {surface_old} END
+                """,
+            ))
+        for statement in statements:
+            conn.execute(statement)
+
     def _connect(self) -> sqlite3.Connection:
         lease = self._assert_filesystem_authority()
         if (
@@ -2662,6 +2881,7 @@ class DurableMemoryStore:
                 )
                 self._run_migrations(conn, allow_mutation=False)
                 self._assert_durable_authority(conn)
+                self._install_retrieval_revision_triggers(conn)
                 return conn
 
             journal_mode = str(
@@ -2691,6 +2911,7 @@ class DurableMemoryStore:
             self._assert_filesystem_authority()
             self._run_migrations(conn, allow_mutation=True)
             self._publish_schema_compatibility_markers(conn, user_version=5)
+            self._install_retrieval_revision_triggers(conn)
             return conn
         except BaseException:
             conn.close()
@@ -2814,6 +3035,7 @@ class DurableMemoryStore:
                 if durability == "full"
                 else "PRAGMA synchronous = NORMAL"
             )
+            self._install_retrieval_revision_triggers(conn)
             return conn
         except BaseException:
             conn.close()
@@ -8085,6 +8307,728 @@ class DurableMemoryStore:
             )
             raise
 
+    @staticmethod
+    def _retrieval_page_limit(value: Any, *, field: str) -> int:
+        if (
+            type(value) is not int
+            or value < 1
+            or value > _RETRIEVAL_PAGE_MAX_LIMIT
+        ):
+            raise ValueError(
+                f"{field} must be an exact integer between 1 and "
+                f"{_RETRIEVAL_PAGE_MAX_LIMIT}"
+            )
+        return value
+
+    @staticmethod
+    def _retrieval_expected_revision(value: Any) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or _RETRIEVAL_SNAPSHOT_REVISION_RE.fullmatch(value) is None
+        ):
+            raise ValueError(
+                "expected_revision must be a lowercase 64-character sha256 digest"
+            )
+        return value
+
+    @staticmethod
+    def _canonical_retrieval_context_ids(
+        context_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        if isinstance(context_ids, (str, bytes, bytearray, dict)):
+            raise ValueError("context_ids must be a bounded iterable of identifiers")
+        try:
+            iterator = iter(context_ids)
+        except TypeError as exc:
+            raise ValueError(
+                "context_ids must be a bounded iterable of identifiers"
+            ) from exc
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        for raw_context_id in iterator:
+            if len(selected) >= _RETRIEVAL_MAX_CONTEXTS:
+                raise ValueError(
+                    f"context_ids may contain at most {_RETRIEVAL_MAX_CONTEXTS} identifiers"
+                )
+            context_id = validate_public_identifier(
+                raw_context_id,
+                field="context_id",
+                max_chars=128,
+            )
+            if unicodedata.normalize("NFC", context_id) != context_id:
+                raise ValueError("context_id must use canonical NFC text")
+            if context_id in seen:
+                raise ValueError("context_ids must not contain duplicates")
+            seen.add(context_id)
+            selected.append(context_id)
+        if not selected:
+            raise ValueError("context_ids must contain at least one identifier")
+        return tuple(sorted(selected))
+
+    @classmethod
+    def _retrieval_context_scope(
+        cls,
+        *,
+        context_id: Any,
+        include_global: Any,
+    ) -> tuple[str, ...]:
+        if type(include_global) is not bool:
+            raise ValueError("include_global must be an exact boolean")
+        context = validate_public_identifier(
+            context_id,
+            field="context_id",
+            max_chars=128,
+        )
+        if unicodedata.normalize("NFC", context) != context:
+            raise ValueError("context_id must use canonical NFC text")
+        selected = [context]
+        if include_global and context != "global":
+            selected.append("global")
+        return cls._canonical_retrieval_context_ids(selected)
+
+    @staticmethod
+    def _retrieval_position(
+        value: Any,
+        *,
+        id_field: str,
+        allow_done: bool = False,
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError(f"position must be an object containing updated_at and {id_field}")
+        if allow_done and set(value) == {"done"}:
+            if value["done"] is not True:
+                raise ValueError("done position must contain the exact boolean true")
+            return {"done": True}
+        if set(value) != {"updated_at", id_field}:
+            raise ValueError(
+                f"position must contain exactly updated_at and {id_field}"
+            )
+        updated_at = value["updated_at"]
+        if (
+            isinstance(updated_at, bool)
+            or not isinstance(updated_at, (int, float))
+            or not math.isfinite(float(updated_at))
+            or float(updated_at) < 0.0
+        ):
+            raise ValueError("position updated_at must be a finite non-negative number")
+        row_id = validate_public_identifier(
+            value[id_field],
+            field=id_field,
+            max_chars=200,
+        )
+        return {"updated_at": float(updated_at), id_field: row_id}
+
+    @classmethod
+    def _retrieval_generation_snapshot_revision(
+        cls,
+        *,
+        conn: sqlite3.Connection,
+        kind: str,
+        context_ids: tuple[str, ...],
+        channels: tuple[str, ...],
+        counts: dict[str, int],
+    ) -> str:
+        """Build a stable revision from transaction-coupled content counters.
+
+        This avoids reading and hashing every memory body for every bounded
+        page. Counters are advanced by TEMP writer triggers in the same commit
+        as the corresponding content change. They are namespace-specific, so
+        unrelated namespace activity does not invalidate a reviewed cursor.
+        """
+
+        supported_channels = {"memory", "relationship", "cortex"}
+        if (
+            not channels
+            or len(channels) != len(set(channels))
+            or any(channel not in supported_channels for channel in channels)
+        ):
+            raise ValueError("retrieval generation channels are invalid")
+        normalized_counts: dict[str, int] = {}
+        for name, value in sorted(counts.items()):
+            if (
+                not isinstance(name, str)
+                or not name
+                or type(value) is not int
+                or value < 0
+            ):
+                raise RuntimeError("retrieval snapshot count is invalid")
+            normalized_counts[name] = value
+
+        keys = [
+            f"{_RETRIEVAL_GENERATION_KEY_PREFIX}.{channel}.{context_id}"
+            for channel in channels
+            for context_id in context_ids
+        ]
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"""
+            SELECT key, value_json
+            FROM store_metadata
+            WHERE key IN ({placeholders})
+            """,
+            tuple(keys),
+        ).fetchall()
+        values_by_key = {str(row["key"]): str(row["value_json"]) for row in rows}
+
+        semantic_row = conn.execute(
+            "SELECT value_json FROM store_metadata WHERE key = ?",
+            ("semantic_index_generation",),
+        ).fetchone()
+        if semantic_row is None:
+            semantic_index_generation = 0
+        else:
+            try:
+                semantic_index_generation = json.loads(
+                    str(semantic_row["value_json"])
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "semantic index generation is not valid JSON"
+                ) from exc
+            if (
+                type(semantic_index_generation) is not int
+                or semantic_index_generation < 0
+                or semantic_index_generation > _RETRIEVAL_GENERATION_MAX
+            ):
+                raise RuntimeError("semantic index generation is invalid")
+        generations: dict[str, list[dict[str, Any]]] = {}
+        for channel in channels:
+            channel_values: list[dict[str, Any]] = []
+            for context_id in context_ids:
+                key = (
+                    f"{_RETRIEVAL_GENERATION_KEY_PREFIX}.{channel}.{context_id}"
+                )
+                raw_value = values_by_key.get(key)
+                if raw_value is None:
+                    generation = 0
+                else:
+                    try:
+                        generation = json.loads(raw_value)
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            "retrieval snapshot generation is not valid JSON"
+                        ) from exc
+                    if (
+                        type(generation) is not int
+                        or generation < 0
+                        or generation > _RETRIEVAL_GENERATION_MAX
+                    ):
+                        raise RuntimeError(
+                            "retrieval snapshot generation is invalid"
+                        )
+                channel_values.append(
+                    {"context_id": context_id, "generation": generation}
+                )
+            generations[channel] = channel_values
+        payload = {
+            "schema": "synapse-s2.retrieval-snapshot.v2",
+            "kind": kind,
+            "context_ids": list(context_ids),
+            "generations": generations,
+            "semantic_index_generation": semantic_index_generation,
+            "counts": normalized_counts,
+        }
+        return hashlib.sha256(_json_dumps(payload).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _assert_retrieval_revision(
+        *,
+        expected_revision: str | None,
+        actual_revision: str,
+    ) -> None:
+        if expected_revision is not None and not secrets.compare_digest(
+            expected_revision,
+            actual_revision,
+        ):
+            raise RetrievalSnapshotStaleError(
+                expected_revision=expected_revision,
+                actual_revision=actual_revision,
+            )
+
+    @staticmethod
+    def _require_retrieval_continuation_revision(
+        *,
+        position: dict[str, Any] | None,
+        expected_revision: str | None,
+        field: str,
+    ) -> None:
+        if position is not None and expected_revision is None:
+            raise ValueError(
+                f"expected_revision is required when {field} is supplied"
+            )
+
+    @staticmethod
+    def _retrieval_keyset_position(
+        row: sqlite3.Row | dict[str, Any],
+        *,
+        id_field: str,
+    ) -> dict[str, Any]:
+        return {
+            "updated_at": float(row["updated_at"]),
+            id_field: str(row[id_field]),
+        }
+
+    def retrieval_memory_page(
+        self,
+        *,
+        context_ids: Iterable[str],
+        limit: int = 100,
+        position: dict[str, Any] | None = None,
+        expected_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one stable keyset page from explicitly selected namespaces."""
+
+        selected = self._canonical_retrieval_context_ids(context_ids)
+        bounded_limit = self._retrieval_page_limit(limit, field="limit")
+        page_position = self._retrieval_position(
+            position,
+            id_field="memory_id",
+        )
+        expected = self._retrieval_expected_revision(expected_revision)
+        self._require_retrieval_continuation_revision(
+            position=page_position,
+            expected_revision=expected,
+            field="position",
+        )
+        placeholders = ",".join("?" for _ in selected)
+
+        with closing(self._connect_read_only()) as conn:
+            with self._transaction(conn):
+                total = int(
+                    conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_entries
+                    WHERE context_id IN ({placeholders})
+                    """,
+                    selected,
+                    ).fetchone()[0]
+                )
+                counts = {"entries": total}
+                revision = self._retrieval_generation_snapshot_revision(
+                    conn=conn,
+                    kind="memory-page",
+                    context_ids=selected,
+                    channels=("memory",),
+                    counts=counts,
+                )
+                self._assert_retrieval_revision(
+                    expected_revision=expected,
+                    actual_revision=revision,
+                )
+
+                params: list[Any] = list(selected)
+                keyset_sql = ""
+                if page_position is not None:
+                    keyset_sql = (
+                        "AND (updated_at < ? OR "
+                        "(updated_at = ? AND memory_id < ?))"
+                    )
+                    params.extend(
+                        (
+                            page_position["updated_at"],
+                            page_position["updated_at"],
+                            page_position["memory_id"],
+                        )
+                    )
+                params.append(bounded_limit + 1)
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM memory_entries
+                    WHERE context_id IN ({placeholders})
+                    {keyset_sql}
+                    ORDER BY updated_at DESC, memory_id DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+
+        has_more = len(rows) > bounded_limit
+        page_rows = rows[:bounded_limit]
+        entries = [self._row_to_entry(row) for row in page_rows]
+        return {
+            "schema": "synapse-s2.retrieval-memory-page.v1",
+            "context_ids": list(selected),
+            "snapshot_revision": revision,
+            "total": counts["entries"],
+            "returned": len(entries),
+            "has_more": has_more,
+            "next_position": (
+                self._retrieval_keyset_position(page_rows[-1], id_field="memory_id")
+                if has_more and page_rows
+                else None
+            ),
+            "entries": entries,
+            "read_only": True,
+        }
+
+    def retrieval_graph_page(
+        self,
+        *,
+        context_id: str,
+        include_global: bool = False,
+        entry_limit: int = 100,
+        relationship_limit: int = 100,
+        entry_position: dict[str, Any] | None = None,
+        relationship_position: dict[str, Any] | None = None,
+        expected_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Page graph nodes and edges independently from one read transaction.
+
+        A completed stream returns ``{"done": True}`` as its next position.  That
+        sentinel lets a future cursor keep one stream exhausted while continuing
+        the other without accidentally restarting the completed stream.
+        """
+
+        selected = self._retrieval_context_scope(
+            context_id=context_id,
+            include_global=include_global,
+        )
+        bounded_entry_limit = self._retrieval_page_limit(
+            entry_limit,
+            field="entry_limit",
+        )
+        bounded_relationship_limit = self._retrieval_page_limit(
+            relationship_limit,
+            field="relationship_limit",
+        )
+        selected_entry_position = self._retrieval_position(
+            entry_position,
+            id_field="memory_id",
+            allow_done=True,
+        )
+        selected_relationship_position = self._retrieval_position(
+            relationship_position,
+            id_field="relationship_id",
+            allow_done=True,
+        )
+        expected = self._retrieval_expected_revision(expected_revision)
+        self._require_retrieval_continuation_revision(
+            position=selected_entry_position,
+            expected_revision=expected,
+            field="entry_position",
+        )
+        self._require_retrieval_continuation_revision(
+            position=selected_relationship_position,
+            expected_revision=expected,
+            field="relationship_position",
+        )
+        placeholders = ",".join("?" for _ in selected)
+
+        with closing(self._connect_read_only()) as conn:
+            with self._transaction(conn):
+                entry_total = int(
+                    conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_entries
+                    WHERE context_id IN ({placeholders})
+                    """,
+                    selected,
+                    ).fetchone()[0]
+                )
+                relationship_total = int(
+                    conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_relationships AS r
+                    JOIN memory_entries AS source
+                        ON source.memory_id = r.source_memory_id
+                        AND source.context_id = r.context_id
+                    JOIN memory_entries AS target
+                        ON target.memory_id = r.target_memory_id
+                        AND target.context_id = r.context_id
+                    WHERE r.context_id IN ({placeholders})
+                    """,
+                    selected,
+                    ).fetchone()[0]
+                )
+                counts = {
+                    "entries": entry_total,
+                    "relationships": relationship_total,
+                }
+                revision = self._retrieval_generation_snapshot_revision(
+                    conn=conn,
+                    kind="graph-page",
+                    context_ids=selected,
+                    channels=("memory", "relationship"),
+                    counts=counts,
+                )
+                self._assert_retrieval_revision(
+                    expected_revision=expected,
+                    actual_revision=revision,
+                )
+
+                entry_rows: list[sqlite3.Row] = []
+                entry_stream_done = bool(
+                    selected_entry_position
+                    and selected_entry_position.get("done") is True
+                )
+                if not entry_stream_done:
+                    entry_params: list[Any] = list(selected)
+                    entry_keyset_sql = ""
+                    if selected_entry_position is not None:
+                        entry_keyset_sql = (
+                            "AND (updated_at < ? OR "
+                            "(updated_at = ? AND memory_id < ?))"
+                        )
+                        entry_params.extend(
+                            (
+                                selected_entry_position["updated_at"],
+                                selected_entry_position["updated_at"],
+                                selected_entry_position["memory_id"],
+                            )
+                        )
+                    entry_params.append(bounded_entry_limit + 1)
+                    entry_rows = conn.execute(
+                        f"""
+                        SELECT *
+                        FROM memory_entries
+                        WHERE context_id IN ({placeholders})
+                          {entry_keyset_sql}
+                        ORDER BY updated_at DESC, memory_id DESC
+                        LIMIT ?
+                        """,
+                        tuple(entry_params),
+                    ).fetchall()
+
+                relationship_rows: list[sqlite3.Row] = []
+                relationship_stream_done = bool(
+                    selected_relationship_position
+                    and selected_relationship_position.get("done") is True
+                )
+                if not relationship_stream_done:
+                    relationship_params: list[Any] = list(selected)
+                    relationship_keyset_sql = ""
+                    if selected_relationship_position is not None:
+                        relationship_keyset_sql = (
+                            "AND (r.updated_at < ? OR "
+                            "(r.updated_at = ? AND r.relationship_id < ?))"
+                        )
+                        relationship_params.extend(
+                            (
+                                selected_relationship_position["updated_at"],
+                                selected_relationship_position["updated_at"],
+                                selected_relationship_position["relationship_id"],
+                            )
+                        )
+                    relationship_params.append(bounded_relationship_limit + 1)
+                    relationship_rows = conn.execute(
+                        f"""
+                        SELECT
+                            r.*,
+                            source.tag AS source_tag,
+                            target.tag AS target_tag
+                        FROM memory_relationships AS r
+                        JOIN memory_entries AS source
+                            ON source.memory_id = r.source_memory_id
+                            AND source.context_id = r.context_id
+                        JOIN memory_entries AS target
+                            ON target.memory_id = r.target_memory_id
+                            AND target.context_id = r.context_id
+                        WHERE r.context_id IN ({placeholders})
+                          {relationship_keyset_sql}
+                        ORDER BY r.updated_at DESC, r.relationship_id DESC
+                        LIMIT ?
+                        """,
+                        tuple(relationship_params),
+                    ).fetchall()
+
+                page_relationship_rows = relationship_rows[
+                    :bounded_relationship_limit
+                ]
+                endpoint_ids = sorted(
+                    {
+                        str(row[field])
+                        for row in page_relationship_rows
+                        for field in ("source_memory_id", "target_memory_id")
+                    }
+                )
+                endpoint_rows: list[sqlite3.Row] = []
+                for offset in range(0, len(endpoint_ids), 300):
+                    endpoint_chunk = endpoint_ids[offset : offset + 300]
+                    endpoint_placeholders = ",".join("?" for _ in endpoint_chunk)
+                    endpoint_rows.extend(
+                        conn.execute(
+                            f"""
+                            SELECT *
+                            FROM memory_entries
+                            WHERE memory_id IN ({endpoint_placeholders})
+                              AND context_id IN ({placeholders})
+                            """,
+                            tuple(endpoint_chunk) + selected,
+                        ).fetchall()
+                    )
+                hydrated_endpoint_ids = {
+                    str(row["memory_id"]) for row in endpoint_rows
+                }
+                if hydrated_endpoint_ids != set(endpoint_ids):
+                    raise RuntimeError(
+                        "retrieval graph page could not hydrate every edge endpoint"
+                    )
+
+        entry_has_more = len(entry_rows) > bounded_entry_limit
+        relationship_has_more = (
+            len(relationship_rows) > bounded_relationship_limit
+        )
+        page_entry_rows = entry_rows[:bounded_entry_limit]
+        entries = [self._row_to_entry(row) for row in page_entry_rows]
+        relationships = [
+            self._row_to_relationship(row) for row in page_relationship_rows
+        ]
+        endpoint_entries = sorted(
+            (self._row_to_entry(row) for row in endpoint_rows),
+            key=lambda item: (item["updated_at"], item["memory_id"]),
+            reverse=True,
+        )
+        next_entry_position: dict[str, Any]
+        if entry_has_more and page_entry_rows:
+            next_entry_position = self._retrieval_keyset_position(
+                page_entry_rows[-1],
+                id_field="memory_id",
+            )
+        else:
+            next_entry_position = {"done": True}
+        next_relationship_position: dict[str, Any]
+        if relationship_has_more and page_relationship_rows:
+            next_relationship_position = self._retrieval_keyset_position(
+                page_relationship_rows[-1],
+                id_field="relationship_id",
+            )
+        else:
+            next_relationship_position = {"done": True}
+        return {
+            "schema": "synapse-s2.retrieval-graph-page.v1",
+            "context_ids": list(selected),
+            "include_global": bool(include_global),
+            "snapshot_revision": revision,
+            "entry_total": counts["entries"],
+            "relationship_total": counts["relationships"],
+            "entry_returned": len(entries),
+            "relationship_returned": len(relationships),
+            "entry_has_more": entry_has_more,
+            "relationship_has_more": relationship_has_more,
+            "entry_next_position": next_entry_position,
+            "relationship_next_position": next_relationship_position,
+            "entries": entries,
+            "relationships": relationships,
+            "endpoint_entries": endpoint_entries,
+            "read_only": True,
+        }
+
+    def retrieval_cortex_page(
+        self,
+        *,
+        context_id: str,
+        include_global: bool = False,
+        limit: int = 100,
+        position: dict[str, Any] | None = None,
+        expected_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Return only durable Cortex Governor entries from a stable snapshot."""
+
+        selected = self._retrieval_context_scope(
+            context_id=context_id,
+            include_global=include_global,
+        )
+        bounded_limit = self._retrieval_page_limit(limit, field="limit")
+        page_position = self._retrieval_position(
+            position,
+            id_field="memory_id",
+        )
+        expected = self._retrieval_expected_revision(expected_revision)
+        self._require_retrieval_continuation_revision(
+            position=page_position,
+            expected_revision=expected,
+            field="position",
+        )
+        placeholders = ",".join("?" for _ in selected)
+        cortex_filter = (
+            "CASE WHEN json_valid(metadata_json) "
+            "THEN json_type(metadata_json, '$.cortex_governor') "
+            "END = 'true'"
+        )
+
+        with closing(self._connect_read_only()) as conn:
+            with self._transaction(conn):
+                total = int(
+                    conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_entries
+                    WHERE context_id IN ({placeholders})
+                      AND {cortex_filter}
+                    """,
+                    selected,
+                    ).fetchone()[0]
+                )
+                counts = {"entries": total}
+                revision = self._retrieval_generation_snapshot_revision(
+                    conn=conn,
+                    kind="cortex-page",
+                    context_ids=selected,
+                    channels=("cortex",),
+                    counts=counts,
+                )
+                self._assert_retrieval_revision(
+                    expected_revision=expected,
+                    actual_revision=revision,
+                )
+
+                params: list[Any] = list(selected)
+                keyset_sql = ""
+                if page_position is not None:
+                    keyset_sql = (
+                        "AND (updated_at < ? OR "
+                        "(updated_at = ? AND memory_id < ?))"
+                    )
+                    params.extend(
+                        (
+                            page_position["updated_at"],
+                            page_position["updated_at"],
+                            page_position["memory_id"],
+                        )
+                    )
+                params.append(bounded_limit + 1)
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM memory_entries
+                    WHERE context_id IN ({placeholders})
+                      AND {cortex_filter}
+                      {keyset_sql}
+                    ORDER BY updated_at DESC, memory_id DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+
+        has_more = len(rows) > bounded_limit
+        page_rows = rows[:bounded_limit]
+        entries = [self._row_to_entry(row) for row in page_rows]
+        return {
+            "schema": "synapse-s2.retrieval-cortex-page.v1",
+            "context_ids": list(selected),
+            "include_global": bool(include_global),
+            "snapshot_revision": revision,
+            "total": counts["entries"],
+            "returned": len(entries),
+            "has_more": has_more,
+            "next_position": (
+                self._retrieval_keyset_position(page_rows[-1], id_field="memory_id")
+                if has_more and page_rows
+                else None
+            ),
+            "entries": entries,
+            "read_only": True,
+        }
+
     def entries_revision(
         self,
         *,
@@ -8216,7 +9160,10 @@ class DurableMemoryStore:
                         s.context_id IN ({context_placeholders})
                         AND s.spike_index IN ({placeholders})
                     GROUP BY e.memory_id
-                    ORDER BY overlap_count DESC, e.updated_at DESC
+                    ORDER BY
+                        overlap_count DESC,
+                        e.updated_at DESC,
+                        e.memory_id ASC
                     LIMIT ?
                     """,
                     tuple(params),
@@ -8249,8 +9196,11 @@ class DurableMemoryStore:
             candidate.update(scope_by_context.get(str(entry["context_id"]), {}))
             candidates.append(candidate)
         candidates.sort(
-            key=lambda item: (float(item["score"]), float(item["updated_at"])),
-            reverse=True,
+            key=lambda item: (
+                -float(item["score"]),
+                -float(item["updated_at"]),
+                str(item["memory_id"]),
+            )
         )
         return candidates[:bounded_limit]
 
@@ -8306,7 +9256,10 @@ class DurableMemoryStore:
                             context_id IN ({context_placeholders})
                             AND term IN ({placeholders})
                         GROUP BY memory_id
-                        ORDER BY overlap_count DESC, term_weight DESC
+                        ORDER BY
+                            overlap_count DESC,
+                            term_weight DESC,
+                            memory_id ASC
                         LIMIT ?
                     )
                     SELECT
@@ -8319,7 +9272,8 @@ class DurableMemoryStore:
                     ORDER BY
                         matched.overlap_count DESC,
                         matched.term_weight DESC,
-                        e.updated_at DESC
+                        e.updated_at DESC,
+                        e.memory_id ASC
                     """,
                     tuple(params),
                 ).fetchall()
@@ -13093,6 +14047,10 @@ class DurableMemoryStore:
                         conn,
                         before,
                     )
+                    # Normalization may have recreated a missing or quarantined
+                    # derived table. Install its connection-local generation
+                    # triggers before any repaired rows are written.
+                    self._install_retrieval_revision_triggers(conn)
                     normalized_schema_objects = schema_normalization[
                         "normalized_schema_objects"
                     ]

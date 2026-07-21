@@ -337,6 +337,13 @@ _CONTRACT_LIST = (
     ),
     _contract("query_text", "prompt context_id steps recall_scope", "prompt", mutation=True),
     _contract(
+        "retrieve_text_v2",
+        "prompt context_id recall_scope result_limit candidate_limit "
+        "include_graph_neighbors",
+        "prompt",
+        retry_safe=True,
+    ),
+    _contract(
         "query",
         "embedding context_id steps prompt_text recall_scope",
         "embedding",
@@ -344,7 +351,7 @@ _CONTRACT_LIST = (
     ),
     _contract(
         "list_memory",
-        "context_id limit include_global include_vectors recall_scope",
+        "context_id limit include_global include_vectors recall_scope cursor response_mode",
         retry_safe=True,
     ),
     _contract(
@@ -407,7 +414,11 @@ _CONTRACT_LIST = (
         "text",
         mutation=True,
     ),
-    _contract("get_cortex_state", "context_id agent_id limit", retry_safe=True),
+    _contract(
+        "get_cortex_state",
+        "context_id agent_id limit cursor response_mode",
+        retry_safe=True,
+    ),
     _contract(
         "reap_orphaned_cortex_sessions",
         "context_id agent_id",
@@ -500,7 +511,11 @@ _CONTRACT_LIST = (
         "context_id level cluster_id limit",
         retry_safe=True,
     ),
-    _contract("list_memory_graph", "context_id limit", retry_safe=True),
+    _contract(
+        "list_memory_graph",
+        "context_id limit cursor response_mode include_global",
+        retry_safe=True,
+    ),
     _contract(
         "audit_semantic_indexes",
         "context_id sample_limit",
@@ -656,7 +671,7 @@ _INT_NONNEGATIVE = _rule("int", minimum=0, maximum=10_000_000)
 _INT_POSITIVE = _rule("int", minimum=1, maximum=10_000_000)
 _LIMIT = _rule("int", minimum=1, maximum=100_000)
 _SAMPLE_LIMIT = _rule("int", minimum=1, maximum=1_000)
-_STEPS = _rule("int", minimum=1, maximum=4_096)
+_STEPS = _rule("int", minimum=1, maximum=64)
 _PID = _rule("int", minimum=1, maximum=2_147_483_647)
 _PPID = _rule("int", minimum=0, maximum=2_147_483_647)
 _UNIT_INTERVAL = _rule("number", minimum=0.0, maximum=1.0)

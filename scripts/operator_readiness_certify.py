@@ -630,10 +630,14 @@ def mcp_compact_contract_probe_status(
     provenance = structured.get("provenance")
     if (
         not isinstance(provenance, dict)
-        or set(provenance) != {"source", "context_id", "recall_scope"}
+        or set(provenance)
+        != {"source", "context_id", "recall_scope", "origin_node"}
         or provenance.get("source") != "sqlite-memory-store"
         or provenance.get("context_id") != data.get("context_id")
         or provenance.get("recall_scope") != data.get("recall_scope")
+        or not isinstance(provenance.get("origin_node"), str)
+        or re.fullmatch(r"s2origin_[0-9a-f]{32}", provenance["origin_node"])
+        is None
     ):
         return blocked("MCP compact memory-list provenance is invalid.")
     warning_rows = structured.get("warnings")
@@ -645,8 +649,8 @@ def mcp_compact_contract_probe_status(
     warning_codes = {
         item["code"] for item in warning_rows if isinstance(item, dict)
     }
-    if "pagination-unsupported" not in warning_codes:
-        return blocked("MCP compact memory-list omitted its pagination warning.")
+    if "pagination-unsupported" in warning_codes:
+        return blocked("MCP compact memory-list still reports legacy pagination.")
     if truncated != ("output-truncated" in warning_codes):
         return blocked("MCP compact truncation warning disagrees with its contract metadata.")
     pagination = structured.get("pagination")
@@ -656,45 +660,79 @@ def mcp_compact_contract_probe_status(
         "requested_limit",
         "effective_limit",
         "returned",
+        "total",
         "has_more",
         "next_cursor",
+        "snapshot_revision",
+        "expires_at",
     } or pagination.get("returned") != returned:
         return blocked("MCP compact pagination metadata is invalid.")
+    total = pagination.get("total")
+    has_more = pagination.get("has_more")
+    cursor = pagination.get("next_cursor")
+    expiry = pagination.get("expires_at")
+    snapshot_revision = pagination.get("snapshot_revision")
     if (
-        pagination.get("supported") is not False
-        or pagination.get("strategy") != "retrieval-v2-required"
+        pagination.get("supported") is not True
+        or pagination.get("strategy") != "authenticated-keyset-v2"
         or type(pagination.get("requested_limit")) is not int
         or pagination.get("requested_limit") != 1
         or type(pagination.get("effective_limit")) is not int
         or pagination.get("effective_limit") != 1
-        or pagination.get("has_more") is not None
-        or pagination.get("next_cursor") is not None
+        or not isinstance(total, dict)
+        or set(total) != {"entries"}
+        or not valid_nonnegative_integer(total.get("entries"))
+        or total["entries"] < returned
+        or type(has_more) is not bool
+        or not isinstance(snapshot_revision, str)
+        or re.fullmatch(r"[0-9a-f]{64}", snapshot_revision) is None
     ):
         return blocked("MCP compact pagination values are invalid.")
+    if has_more:
+        if (
+            not isinstance(cursor, str)
+            or len(cursor.encode("ascii", "ignore")) > 4_096
+            or re.fullmatch(
+                r"s2rc2\.[A-Za-z0-9_-]{1,4000}\.[A-Za-z0-9_-]{43}",
+                cursor,
+            )
+            is None
+            or not valid_nonnegative_integer(expiry)
+            or expiry <= 0
+        ):
+            return blocked("MCP compact continuation cursor is invalid.")
+    elif cursor is not None or expiry is not None:
+        return blocked("MCP complete compact page exposed a continuation.")
     completeness = structured.get("completeness")
     if not isinstance(completeness, dict) or set(completeness) != {
         "complete",
+        "snapshot_bound",
+        "authoritative_total",
         "source_limit_reduced",
         "reason",
     }:
         return blocked("MCP compact completeness metadata is invalid.")
     if (
-        completeness.get("complete") is not None
+        completeness.get("complete") is not (not has_more)
+        or completeness.get("snapshot_bound") is not True
+        or completeness.get("authoritative_total") is not True
         or completeness.get("source_limit_reduced") is not False
         or completeness.get("reason")
-        != "authoritative-total-and-cursor-unavailable"
+        != ("more-pages-available" if has_more else "snapshot-page-complete")
     ):
         return blocked("MCP compact completeness values are invalid.")
     continuation = structured.get("continuation")
     if not isinstance(continuation, dict) or set(continuation) != {
         "strategy",
         "cursor",
+        "expires_at",
     }:
         return blocked("MCP compact continuation metadata is invalid.")
     if (
         continuation.get("strategy")
-        != "request-full-or-wait-for-retrieval-v2"
-        or continuation.get("cursor") is not None
+        != ("use-authenticated-keyset-cursor" if has_more else "none")
+        or continuation.get("cursor") != cursor
+        or continuation.get("expires_at") != expiry
     ):
         return blocked("MCP compact continuation values are invalid.")
 
@@ -1542,7 +1580,7 @@ class OperatorReadinessCertifier:
                     "Run uv sync and scripts/install_local_launcher.sh, then retry.",
                     {},
                 )
-            expected = "query_spiking_attention_text"
+            expected = "retrieve_spiking_memory_v2"
             if expected not in stdout:
                 return (
                     "blocked",
@@ -2026,26 +2064,89 @@ class OperatorReadinessCertifier:
                     "Verify embedding provider and memory DB before trusting recall.",
                     {},
                 )
-            result_text = str(parsed.get("result") or "")
-            matched = [item for item in expected if item and item in result_text]
+            data = parsed.get("data")
+            query_metadata = data.get("query") if isinstance(data, dict) else None
+            ranker = data.get("ranker") if isinstance(data, dict) else None
+            provenance = parsed.get("provenance")
+            items = data.get("items") if isinstance(data, dict) else None
+            if (
+                parsed.get("schema") != "synapse-s2.token-contract.v1"
+                or parsed.get("operation") != "memory-retrieval"
+                or parsed.get("ok") is not True
+                or not isinstance(data, dict)
+                or data.get("raw_input_stored") is not False
+                or not isinstance(query_metadata, dict)
+                or query_metadata.get("context_id") != self.context
+                or query_metadata.get("recall_scope") != "local"
+                or query_metadata.get("raw_input_stored") is not False
+                or not isinstance(ranker, dict)
+                or ranker.get("score_semantics") != "uncalibrated-ranking-signal"
+                or not isinstance(provenance, dict)
+                or provenance.get("source") != "authoritative-retrieval-v2"
+                or provenance.get("context_id") != self.context
+                or provenance.get("raw_input_stored") is not False
+                or not isinstance(items, list)
+            ):
+                return (
+                    "blocked",
+                    "Retrieval v2 returned an invalid structured read-only contract.",
+                    "Inspect retrieve-v2, its authoritative core route, and token contract projection.",
+                    {},
+                )
+            evidence_fields: list[str] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                evidence_fields.extend(
+                    str(item.get(field) or "")
+                    for field in ("memory_id", "tag", "label", "summary", "excerpt")
+                )
+            matched = [
+                value
+                for value in expected
+                if value and any(value in field for field in evidence_fields)
+            ]
             if not matched:
                 return (
                     "blocked",
                     "Recall returned but did not include the readiness memory id, tag, or run id.",
-                    "Inspect query-text output and memory index consistency.",
+                    "Inspect retrieve-v2 output, scope provenance, and memory index consistency.",
                     {"expected": [item for item in expected if item]},
                 )
             return (
                 "ready",
-                f"Recall returned the readiness write using {', '.join(matched[:2])}.",
+                f"Retrieval v2 returned the readiness write using {', '.join(matched[:2])}.",
                 "",
-                {"matched_evidence": matched, "result_chars": len(result_text)},
+                {
+                    "matched_evidence": matched,
+                    "result_count": len(items),
+                    "ranker_id": ranker.get("id"),
+                    "ranker_version": ranker.get("version"),
+                    "snapshot_id": provenance.get("snapshot_id"),
+                    "raw_input_stored": False,
+                },
             )
 
         self._run_command(
             "recall",
-            label="Recall proof",
-            command=self._cli_command("query-text", "--context", self.context, "--text", query),
+            label="Retrieval v2 read-only proof",
+            command=self._cli_command(
+                "retrieve-v2",
+                "--context",
+                self.context,
+                "--prompt",
+                query,
+                "--scope",
+                "local",
+                "--result-limit",
+                "8",
+                "--candidate-limit",
+                "64",
+                "--response-mode",
+                "compact",
+                "--max-response-bytes",
+                "24576",
+            ),
             required=True,
             timeout=90,
             evaluator=evaluate,

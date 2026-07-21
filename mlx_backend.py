@@ -37,8 +37,16 @@ from memory_store import (
     CAPTURE_ID_RE,
     CAPTURE_PROTOCOL_VERSION,
     DurableMemoryStore,
+    RetrievalSnapshotStaleError,
     RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA,
     capture_request_fingerprint,
+)
+from retrieval_cursor import (
+    DEFAULT_RETRIEVAL_CURSOR_TTL_SECONDS,
+    RetrievalCursorCodec,
+    RetrievalCursorFilterMismatchError,
+    RetrievalCursorSnapshotMismatchError,
+    canonical_ordering,
 )
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
@@ -184,6 +192,32 @@ SURFACE_DETAIL_STOP_WORDS = {
 }
 MAX_SURFACE_RECALL_SOURCE_CHARS = 4096
 SURFACE_RECALL_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]{1,63}")
+
+# Retrieval v2 is deliberately a separate, read-only contract.  These limits are
+# server-owned so callers cannot turn a recall request into unbounded token,
+# SQLite-placeholder, graph, or quadratic-diversity work.
+RETRIEVAL_V2_SCHEMA = "synapse-retrieval.v2"
+RETRIEVAL_V2_RANKER_ID = "synapse-hybrid-mmr"
+RETRIEVAL_V2_RANKER_VERSION = "2.0.0"
+RETRIEVAL_V2_MAX_PROMPT_BYTES = 16_384
+RETRIEVAL_V2_MAX_QUERY_TERMS = 64
+RETRIEVAL_V2_MAX_QUERY_SPIKES = 256
+RETRIEVAL_V2_MAX_RESULT_LIMIT = 50
+RETRIEVAL_V2_MAX_CANDIDATE_LIMIT = 512
+RETRIEVAL_V2_MAX_SCOPE_CONTEXTS = 256
+RETRIEVAL_V2_MAX_SCOPE_LINKS = 512
+RETRIEVAL_V2_MAX_GRAPH_ANCHORS = 8
+RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR = 16
+RETRIEVAL_V2_MAX_GRAPH_EDGES = 64
+RETRIEVAL_V2_MAX_ITEM_TERMS = 128
+RETRIEVAL_V2_MAX_DIVERSITY_TERMS = 32
+RETRIEVAL_V2_MMR_LAMBDA = 0.82
+RETRIEVAL_V2_RANK_WEIGHTS = {
+    "spike_index": 0.55,
+    "surface_index": 0.40,
+    "same_context_graph": 0.05,
+}
+RETRIEVAL_PAGE_SCHEMA = "synapse-s2.retrieval-page.v2"
 NAMESPACE_DETAIL_LEVELS = {"cortex", "ganglion", "neurons"}
 NAMESPACE_DETAIL_ENTRY_SCAN_LIMIT = 10_000
 NAMESPACE_DETAIL_RELATIONSHIP_SCAN_LIMIT = 20_000
@@ -603,6 +637,8 @@ class SpikingAttentionBackend:
         self.cortex_sessions: dict[str, dict[str, Any]] = {}
         self.registered_traces: list[dict[str, Any]] = []
         self._surface_recall_cache: dict[str, dict[str, Any]] = {}
+        self._retrieval_cursor_codec: RetrievalCursorCodec | None = None
+        self._retrieval_cursor_lock = threading.Lock()
 
         if self.control_plane_only:
             # MCP discovery, health, graph hydration, and Cortex bookkeeping do
@@ -1889,6 +1925,1355 @@ class SpikingAttentionBackend:
         registration["embedding_provider"] = payload["provenance"]
         return registration
 
+    def retrieve_text_v2(
+        self,
+        prompt: str,
+        *,
+        context_id: str = "default",
+        recall_scope: str = "local",
+        result_limit: int = 10,
+        candidate_limit: int = 128,
+        include_graph_neighbors: bool = True,
+    ) -> dict[str, Any]:
+        """Return deterministic, structured, read-only hybrid retrieval results.
+
+        Unlike :meth:`query_text`, this path never runs the recurrent network,
+        applies STDP, prunes, writes runtime state, marks activity, or populates a
+        result cache.  It reads the already-durable spike and surface indexes,
+        fuses their independent scores with versioned weights, and optionally
+        admits a strictly bounded set of same-context graph neighbors.
+
+        The read is optimistic rather than a single SQLite transaction because
+        the existing store APIs own their connections.  Entry, scope/link, and
+        relevant graph revisions are therefore checked before and after the read;
+        one retry is allowed and a second moving snapshot fails closed.
+        """
+
+        self._require_neural_substrate()
+        context = sanitize_context_id(context_id)
+        scope = sanitize_recall_scope(recall_scope)
+        bounded_result_limit = self._retrieval_v2_bounded_int(
+            result_limit,
+            field="result_limit",
+            minimum=1,
+            maximum=RETRIEVAL_V2_MAX_RESULT_LIMIT,
+        )
+        bounded_candidate_limit = self._retrieval_v2_bounded_int(
+            candidate_limit,
+            field="candidate_limit",
+            minimum=bounded_result_limit,
+            maximum=RETRIEVAL_V2_MAX_CANDIDATE_LIMIT,
+        )
+        if type(include_graph_neighbors) is not bool:
+            raise ValueError("include_graph_neighbors must be a boolean")
+
+        prompt_text, prompt_metrics = self._retrieval_v2_sanitize_prompt(prompt)
+        extracted_terms = self._surface_recall_terms(prompt_text)
+        query_terms = self._retrieval_v2_select_terms(
+            extracted_terms,
+            limit=RETRIEVAL_V2_MAX_QUERY_TERMS,
+        )
+        embedding_payload = self.embed_text_payload(
+            prompt_text,
+            dimensions=self.dimension,
+        )
+        sensory_spikes = self.encode_to_spikes_top_k(
+            embedding_payload["embedding"],
+            k=min(self.default_top_k, RETRIEVAL_V2_MAX_QUERY_SPIKES),
+        )
+        query_spikes = set(self._active_indices_from_spikes(sensory_spikes))
+        embedding_identity = self._retrieval_v2_embedding_identity(
+            embedding_payload.get("provenance")
+        )
+        query_fingerprint = hashlib.sha256(
+            (
+                f"{RETRIEVAL_V2_SCHEMA}\x1f{context}\x1f{scope}\x1f"
+                f"{prompt_text}"
+            ).encode("utf-8")
+        ).hexdigest()
+
+        stable_read: dict[str, Any] | None = None
+        attempts = 0
+        for attempts in range(1, 3):
+            scope_before = self._retrieval_v2_scope_snapshot(
+                context=context,
+                recall_scope=scope,
+            )
+            scope_context_ids = [
+                str(record["context_id"])
+                for record in scope_before["records"]
+            ]
+            entries_before = self._retrieval_v2_entries_snapshot(
+                scope_context_ids
+            )
+            collected = self._retrieval_v2_collect_candidates(
+                query_spikes=query_spikes,
+                query_terms=query_terms,
+                scope_records=scope_before["records"],
+                result_limit=bounded_result_limit,
+                candidate_limit=bounded_candidate_limit,
+                include_graph_neighbors=include_graph_neighbors,
+            )
+            graph_after = self._retrieval_v2_graph_edges(
+                collected["graph_anchors"],
+                enabled=include_graph_neighbors,
+            )
+            entries_after = self._retrieval_v2_entries_snapshot(
+                scope_context_ids
+            )
+            scope_after = self._retrieval_v2_scope_snapshot(
+                context=context,
+                recall_scope=scope,
+            )
+            if (
+                entries_before.get("revision") == entries_after.get("revision")
+                and scope_before["revision"] == scope_after["revision"]
+                and collected["graph_snapshot"]["revision"]
+                == graph_after["revision"]
+            ):
+                stable_read = {
+                    "scope": scope_before,
+                    "entries_revision": entries_before,
+                    "collected": collected,
+                }
+                break
+        if stable_read is None:
+            raise RuntimeError("retrieval snapshot changed during bounded read")
+
+        scope_snapshot = stable_read["scope"]
+        collected = stable_read["collected"]
+        entries_revision = stable_read["entries_revision"]
+        snapshot_seed = {
+            "schema": RETRIEVAL_V2_SCHEMA,
+            "ranker_id": RETRIEVAL_V2_RANKER_ID,
+            "ranker_version": RETRIEVAL_V2_RANKER_VERSION,
+            "query_fingerprint": query_fingerprint,
+            "entries_revision": entries_revision,
+            "scope_revision": scope_snapshot["revision"],
+            "graph_revision": collected["graph_snapshot"]["revision"],
+            "embedding_identity": embedding_identity,
+        }
+        snapshot_id = "s2snap_" + self._retrieval_v2_digest(snapshot_seed)[:24]
+        retrieval_id = "s2ret_" + self._retrieval_v2_digest(
+            {
+                "snapshot_id": snapshot_id,
+                "query_fingerprint": query_fingerprint,
+                "result_limit": bounded_result_limit,
+                "candidate_limit": bounded_candidate_limit,
+                "include_graph_neighbors": include_graph_neighbors,
+            }
+        )[:24]
+
+        terms_truncated = len(extracted_terms) > len(query_terms)
+        candidate_scan_truncated = bool(
+            collected["work"]["spike_source_may_be_truncated"]
+            or collected["work"]["surface_source_may_be_truncated"]
+            or collected["work"]["candidate_pool_truncated"]
+        )
+        result_truncated = bool(collected["result_truncated"])
+        scope_complete = not bool(scope_snapshot["truncated"])
+        warnings: list[dict[str, str]] = []
+        if terms_truncated:
+            warnings.append(
+                {
+                    "code": "query-terms-truncated",
+                    "message": "The deterministic query-term ceiling was reached.",
+                }
+            )
+        if not scope_complete:
+            warnings.append(
+                {
+                    "code": "scope-truncated",
+                    "message": "The bounded namespace or bridge scope was not complete.",
+                }
+            )
+        if candidate_scan_truncated:
+            warnings.append(
+                {
+                    "code": "candidate-scan-truncated",
+                    "message": "At least one bounded candidate source may have more matches.",
+                }
+            )
+        if result_truncated:
+            warnings.append(
+                {
+                    "code": "result-set-truncated",
+                    "message": "More fused candidates existed than the requested result limit.",
+                }
+            )
+
+        work = {
+            **prompt_metrics,
+            "query_terms_extracted": len(extracted_terms),
+            "query_terms_used": len(query_terms),
+            "query_terms_limit": RETRIEVAL_V2_MAX_QUERY_TERMS,
+            "query_spikes_used": len(query_spikes),
+            "query_spikes_limit": RETRIEVAL_V2_MAX_QUERY_SPIKES,
+            "result_limit": bounded_result_limit,
+            "candidate_limit": bounded_candidate_limit,
+            "scope_context_limit": RETRIEVAL_V2_MAX_SCOPE_CONTEXTS,
+            **collected["work"],
+            "snapshot_attempts": attempts,
+        }
+        response = {
+            "schema": RETRIEVAL_V2_SCHEMA,
+            "schema_version": 2,
+            "retrieval_id": retrieval_id,
+            "query": {
+                "fingerprint_sha256": query_fingerprint,
+                "context_id": context,
+                "recall_scope": scope,
+                "raw_input_stored": False,
+                "input_redaction_count": int(
+                    prompt_metrics["input_redaction_count"]
+                    + int(embedding_payload.get("input_redaction_count", 0) or 0)
+                ),
+            },
+            "ranker": {
+                "id": RETRIEVAL_V2_RANKER_ID,
+                "version": RETRIEVAL_V2_RANKER_VERSION,
+                "fusion": "weighted-sum",
+                "weights": dict(RETRIEVAL_V2_RANK_WEIGHTS),
+                "diversity": {
+                    "method": "bounded-mmr-jaccard",
+                    "lambda": RETRIEVAL_V2_MMR_LAMBDA,
+                    "signature_term_limit": RETRIEVAL_V2_MAX_DIVERSITY_TERMS,
+                },
+                "confidence_semantics": {
+                    "calibrated": False,
+                    "probability": False,
+                    "description": (
+                        "Ranking scores are deterministic relevance signals, "
+                        "not truth probabilities."
+                    ),
+                },
+            },
+            "snapshot": {
+                "snapshot_id": snapshot_id,
+                "consistency": "optimistic-before-after-verified",
+                "entries_revision": entries_revision,
+                "scope_revision": scope_snapshot["revision"],
+                "graph_revision": collected["graph_snapshot"]["revision"],
+                "embedding": embedding_identity,
+            },
+            "scope": scope_snapshot["public"],
+            "items": collected["items"],
+            "result_count": len(collected["items"]),
+            "completeness": {
+                "complete": bool(
+                    scope_complete
+                    and not terms_truncated
+                    and not candidate_scan_truncated
+                    and not result_truncated
+                ),
+                "scope_complete": scope_complete,
+                "query_terms_truncated": terms_truncated,
+                "candidate_scan_truncated": candidate_scan_truncated,
+                "result_set_truncated": result_truncated,
+                "has_more": bool(candidate_scan_truncated or result_truncated),
+                "pagination_supported": False,
+                "next_cursor": None,
+                "warnings": warnings,
+            },
+            "work": work,
+            "raw_input_stored": False,
+        }
+        # Refuse to publish unsupported floats or non-JSON values.  This is a
+        # validation pass only; it does not reparse or coerce the result.
+        json.dumps(response, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return response
+
+    def _retrieval_v2_entries_snapshot(
+        self,
+        context_ids: Iterable[str],
+    ) -> dict[str, Any]:
+        """Bind ranking reads to transaction-coupled namespace generations.
+
+        The page revision is backed by namespace-specific counters advanced in
+        the same commit as memory mutations and also includes the semantic-index
+        generation. It detects in-place content changes without rescanning and
+        hashing every stored memory body for each retrieval attempt.
+        """
+
+        selected = sorted({str(value) for value in context_ids if str(value)})
+        if not selected:
+            raise RuntimeError("retrieval scope resolved no contexts")
+        exact = self.memory_store.retrieval_memory_page(
+            context_ids=selected,
+            limit=1,
+        )
+        content_revision = str(exact["snapshot_revision"])
+        revision = self._retrieval_v2_digest(
+            {
+                "schema": "synapse-s2.retrieval-entries-snapshot.v3",
+                "context_ids": selected,
+                "content_revision": content_revision,
+            }
+        )
+        return {
+            "revision": revision,
+            "content_revision": content_revision,
+            "context_ids": selected,
+            "entry_count": int(exact["total"]),
+        }
+
+    @staticmethod
+    def _retrieval_v2_bounded_int(
+        value: Any,
+        *,
+        field: str,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} must be an integer")
+        if value < minimum or value > maximum:
+            raise ValueError(f"{field} must be between {minimum} and {maximum}")
+        return int(value)
+
+    def _retrieval_v2_sanitize_prompt(self, prompt: Any) -> tuple[str, dict[str, int]]:
+        if not isinstance(prompt, str):
+            raise ValueError("prompt must be a string")
+        raw_bytes = len(prompt.encode("utf-8"))
+        if raw_bytes > RETRIEVAL_V2_MAX_PROMPT_BYTES:
+            raise ValueError(
+                f"prompt exceeds {RETRIEVAL_V2_MAX_PROMPT_BYTES} UTF-8 bytes"
+            )
+        without_controls = "".join(
+            " " if (ord(char) < 32 and char not in "\t\n\r") or 127 <= ord(char) < 160 else char
+            for char in prompt
+        )
+        normalized = " ".join(without_controls.split())
+        redacted, redaction_count = redact_capture_text(normalized)
+        sanitized = " ".join(str(redacted or "").split())
+        if not sanitized:
+            raise ValueError("prompt must not be empty")
+        sanitized_bytes = len(sanitized.encode("utf-8"))
+        if sanitized_bytes > RETRIEVAL_V2_MAX_PROMPT_BYTES:
+            raise ValueError(
+                f"sanitized prompt exceeds {RETRIEVAL_V2_MAX_PROMPT_BYTES} UTF-8 bytes"
+            )
+        return sanitized, {
+            "prompt_input_bytes": raw_bytes,
+            "prompt_sanitized_bytes": sanitized_bytes,
+            "prompt_byte_limit": RETRIEVAL_V2_MAX_PROMPT_BYTES,
+            "input_redaction_count": int(redaction_count),
+        }
+
+    def _retrieval_v2_select_terms(
+        self,
+        terms: Iterable[str],
+        *,
+        limit: int,
+    ) -> list[str]:
+        unique = {
+            str(term).strip().lower()
+            for term in terms
+            if str(term).strip()
+        }
+        return sorted(
+            unique,
+            key=lambda term: (
+                0 if self._is_concrete_surface_recall_term(term) else 1,
+                -len(term),
+                term,
+            ),
+        )[: max(0, int(limit))]
+
+    @staticmethod
+    def _retrieval_v2_digest(value: Any) -> str:
+        canonical = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _retrieval_v2_embedding_identity(self, provenance: Any) -> dict[str, Any]:
+        source = provenance if isinstance(provenance, dict) else {}
+        identity: dict[str, Any] = {}
+        for key in (
+            "provider",
+            "provider_type",
+            "dimensions",
+            "semantic",
+            "local_only",
+            "model_id",
+            "revision",
+            "pooling",
+            "normalize",
+            "vector_sha256",
+        ):
+            value = source.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                identity[key] = value
+            elif isinstance(value, int):
+                identity[key] = int(value)
+            elif isinstance(value, float):
+                if math.isfinite(value):
+                    identity[key] = float(value)
+            elif isinstance(value, str):
+                identity[key] = self._retrieval_v2_text(value, 160)[0]
+        return identity
+
+    def _retrieval_v2_scope_snapshot(
+        self,
+        *,
+        context: str,
+        recall_scope: str,
+    ) -> dict[str, Any]:
+        raw_records = self.memory_store.resolve_recall_contexts(
+            context_id=context,
+            scope=recall_scope,
+        )
+        raw_record_count = len(raw_records)
+        origin = [
+            dict(record)
+            for record in raw_records
+            if str(record.get("context_id") or "") == context
+        ]
+        inherited_global = [
+            dict(record)
+            for record in raw_records
+            if str(record.get("context_id") or "") == "global"
+        ]
+        remaining = sorted(
+            (
+                dict(record)
+                for record in raw_records
+                if str(record.get("context_id") or "") not in {context, "global"}
+            ),
+            key=lambda record: str(record.get("context_id") or ""),
+        )
+        selected: list[dict[str, Any]] = []
+        if origin:
+            selected.append(origin[0])
+        remaining_capacity = RETRIEVAL_V2_MAX_SCOPE_CONTEXTS - len(selected)
+        reserve_global = 1 if inherited_global and remaining_capacity > 0 else 0
+        selected.extend(remaining[: max(0, remaining_capacity - reserve_global)])
+        if reserve_global:
+            selected.append(inherited_global[0])
+        scope_truncated = raw_record_count > len(selected)
+
+        raw_links: list[dict[str, Any]] = []
+        links_truncated = False
+        if recall_scope == "connected":
+            raw_links = self.memory_store.list_context_links(
+                context_id=context,
+                enabled_only=True,
+                limit=RETRIEVAL_V2_MAX_SCOPE_LINKS + 1,
+            )
+            raw_links = sorted(
+                (dict(link) for link in raw_links),
+                key=lambda link: str(link.get("context_link_id") or ""),
+            )
+            links_truncated = len(raw_links) > RETRIEVAL_V2_MAX_SCOPE_LINKS
+            raw_links = raw_links[:RETRIEVAL_V2_MAX_SCOPE_LINKS]
+        link_by_id = {
+            str(link.get("context_link_id") or ""): link
+            for link in raw_links
+            if str(link.get("context_link_id") or "")
+        }
+
+        normalized_records: list[dict[str, Any]] = []
+        invalid_link_provenance_count = 0
+        for record in selected:
+            resolved_context = sanitize_context_id(
+                str(record.get("context_id") or "default")
+            )
+            provenance = str(record.get("recall_provenance") or "local")
+            normalized: dict[str, Any] = {
+                "origin_context_id": context,
+                "context_id": resolved_context,
+                "recall_scope": recall_scope,
+                "recall_provenance": provenance,
+                "via_context_link_id": "",
+                "via_relation_type": "",
+                "via_direction": "",
+                "context_link": None,
+            }
+            if provenance == "connected":
+                link_id = str(record.get("via_context_link_id") or "")
+                link = link_by_id.get(link_id)
+                if link is None or not bool(link.get("enabled")):
+                    invalid_link_provenance_count += 1
+                    continue
+                source = sanitize_context_id(str(link.get("source_context_id") or ""))
+                target = sanitize_context_id(str(link.get("target_context_id") or ""))
+                direction = str(link.get("direction") or "")
+                reachable_neighbor = ""
+                if source == context:
+                    reachable_neighbor = target
+                elif target == context and direction == "bidirectional":
+                    reachable_neighbor = source
+                if reachable_neighbor != resolved_context:
+                    invalid_link_provenance_count += 1
+                    continue
+                link_provenance = self._retrieval_v2_link_provenance(link)
+                normalized.update(
+                    {
+                        "via_context_link_id": link_id,
+                        "via_relation_type": str(link.get("relation_type") or ""),
+                        "via_direction": direction,
+                        "context_link": link_provenance,
+                    }
+                )
+            normalized_records.append(normalized)
+
+        normalized_records.sort(
+            key=lambda record: (
+                0 if record["context_id"] == context else 2 if record["context_id"] == "global" else 1,
+                str(record["context_id"]),
+            )
+        )
+        exact_links = [self._retrieval_v2_link_provenance(link) for link in raw_links]
+        revision_payload = {
+            "schema": "retrieval-scope.v2",
+            "origin_context_id": context,
+            "recall_scope": recall_scope,
+            "raw_record_count": raw_record_count,
+            "records": normalized_records,
+            "active_adjacent_links": exact_links,
+            "limits": {
+                "contexts": RETRIEVAL_V2_MAX_SCOPE_CONTEXTS,
+                "links": RETRIEVAL_V2_MAX_SCOPE_LINKS,
+            },
+            "truncated": bool(scope_truncated or links_truncated),
+            "invalid_link_provenance_count": invalid_link_provenance_count,
+        }
+        revision = self._retrieval_v2_digest(revision_payload)
+        public_records = [
+            self._retrieval_v2_public_scope_provenance(
+                record,
+                origin_context=context,
+            )
+            for record in normalized_records
+        ]
+        truncated = bool(
+            scope_truncated or links_truncated or invalid_link_provenance_count
+        )
+        return {
+            "records": normalized_records,
+            "revision": revision,
+            "truncated": truncated,
+            "public": {
+                "origin_context_id": context,
+                "requested_scope": recall_scope,
+                "one_hop_only": recall_scope == "connected",
+                "inherits_global": any(
+                    record["context_id"] == "global" for record in normalized_records
+                ),
+                "resolved_context_count": len(normalized_records),
+                "resolved_context_count_before_limit": raw_record_count,
+                "active_adjacent_link_count": len(exact_links),
+                "link_provenance_complete": not bool(
+                    links_truncated or invalid_link_provenance_count
+                ),
+                "truncated": truncated,
+                "contexts": public_records,
+            },
+        }
+
+    def _retrieval_v2_link_provenance(self, link: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "context_link_id": self._retrieval_v2_text(
+                str(link.get("context_link_id") or ""), 160
+            )[0],
+            "source_context_id": self._retrieval_v2_text(
+                str(link.get("source_context_id") or ""), 160
+            )[0],
+            "target_context_id": self._retrieval_v2_text(
+                str(link.get("target_context_id") or ""), 160
+            )[0],
+            "relation_type": self._retrieval_v2_text(
+                str(link.get("relation_type") or ""), 96
+            )[0],
+            "direction": self._retrieval_v2_text(
+                str(link.get("direction") or ""), 32
+            )[0],
+            "confidence": self._retrieval_v2_unit_float(link.get("confidence")),
+            "enabled": bool(link.get("enabled")),
+            "approved": bool(link.get("approved", True)),
+            "approved_by": self._retrieval_v2_text(
+                str(link.get("approved_by") or ""), 96
+            )[0],
+            "approved_at": self._retrieval_v2_finite_float(link.get("approved_at")),
+            "updated_at": self._retrieval_v2_finite_float(link.get("updated_at")),
+        }
+
+    def _retrieval_v2_public_scope_provenance(
+        self,
+        record: dict[str, Any],
+        *,
+        origin_context: str,
+    ) -> dict[str, Any]:
+        return {
+            "origin_context_id": origin_context,
+            "resolved_context_id": str(record.get("context_id") or ""),
+            "requested_scope": str(record.get("recall_scope") or "local"),
+            "provenance": str(record.get("recall_provenance") or "local"),
+            "context_link": record.get("context_link"),
+        }
+
+    def _retrieval_v2_collect_candidates(
+        self,
+        *,
+        query_spikes: set[int],
+        query_terms: list[str],
+        scope_records: list[dict[str, Any]],
+        result_limit: int,
+        candidate_limit: int,
+        include_graph_neighbors: bool,
+    ) -> dict[str, Any]:
+        if not scope_records:
+            empty_graph = self._retrieval_v2_graph_edges([], enabled=False)
+            return {
+                "items": [],
+                "result_truncated": False,
+                "graph_anchors": [],
+                "graph_snapshot": empty_graph,
+                "work": {
+                    "source_candidate_limit_each": 0,
+                    "spike_candidates_returned": 0,
+                    "surface_candidates_returned": 0,
+                    "spike_source_may_be_truncated": False,
+                    "surface_source_may_be_truncated": False,
+                    "candidate_pool_truncated": False,
+                    "candidate_memory_id_deduplications": 0,
+                    "candidate_content_deduplications": 0,
+                    "graph_relationship_rows_examined": 0,
+                    "graph_neighbor_loads": 0,
+                    "graph_cross_context_rejections": 0,
+                    "mmr_candidate_evaluations": 0,
+                },
+            }
+
+        scope_by_context = {
+            str(record["context_id"]): record for record in scope_records
+        }
+        origin_record = next(
+            (
+                record
+                for record in scope_records
+                if str(record.get("recall_provenance") or "") == "local"
+            ),
+            scope_records[0],
+        )
+        origin_context = str(origin_record["context_id"])
+        recall_scope = str(origin_record.get("recall_scope") or "local")
+        source_limit = min(
+            candidate_limit,
+            max(result_limit, (candidate_limit + 1) // 2),
+        )
+        spike_rows = self.memory_store.recall_candidates(
+            context_id=origin_context,
+            query_spikes=query_spikes,
+            firing_values=[],
+            limit=source_limit,
+            recall_scope=recall_scope,
+            recall_contexts=scope_records,
+        )
+        surface_rows = (
+            self.memory_store.surface_recall_candidates(
+                context_id=origin_context,
+                query_terms=query_terms,
+                limit=source_limit,
+                recall_scope=recall_scope,
+                recall_contexts=scope_records,
+            )
+            if query_terms
+            else []
+        )
+
+        pool: dict[str, dict[str, Any]] = {}
+        memory_id_deduplications = 0
+
+        def candidate_for(entry: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal memory_id_deduplications
+            memory_id = str(entry.get("memory_id") or "").strip()
+            candidate_context = str(entry.get("context_id") or "").strip()
+            if not memory_id or candidate_context not in scope_by_context:
+                return None
+            current = pool.get(memory_id)
+            if current is not None:
+                memory_id_deduplications += 1
+                return current
+            current = {
+                "entry": dict(entry),
+                "memory_id": memory_id,
+                "context_id": candidate_context,
+                "scope_record": dict(scope_by_context[candidate_context]),
+                "spike_signal": 0.0,
+                "surface_signal": 0.0,
+                "graph_signal": 0.0,
+                "spike_reason": None,
+                "surface_reason": None,
+                "graph_provenance": [],
+            }
+            pool[memory_id] = current
+            return current
+
+        spike_scored: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
+        for entry in spike_rows:
+            signal, reason = self._retrieval_v2_spike_signal(entry, query_spikes)
+            memory_id = str(entry.get("memory_id") or "")
+            if signal > 0.0 and memory_id:
+                spike_scored.append((signal, memory_id, entry, reason))
+        spike_scored.sort(key=lambda item: (-item[0], item[1]))
+        for source_rank, (signal, _memory_id, entry, reason) in enumerate(
+            spike_scored,
+            start=1,
+        ):
+            candidate = candidate_for(entry)
+            if candidate is None:
+                continue
+            candidate["spike_signal"] = max(float(candidate["spike_signal"]), signal)
+            candidate["spike_reason"] = {**reason, "source_rank": source_rank}
+
+        surface_scored: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
+        for entry in surface_rows:
+            signal, reason = self._retrieval_v2_surface_signal(entry, query_terms)
+            memory_id = str(entry.get("memory_id") or "")
+            if signal > 0.0 and memory_id:
+                surface_scored.append((signal, memory_id, entry, reason))
+        surface_scored.sort(key=lambda item: (-item[0], item[1]))
+        for source_rank, (signal, _memory_id, entry, reason) in enumerate(
+            surface_scored,
+            start=1,
+        ):
+            candidate = candidate_for(entry)
+            if candidate is None:
+                continue
+            candidate["surface_signal"] = max(float(candidate["surface_signal"]), signal)
+            candidate["surface_reason"] = {**reason, "source_rank": source_rank}
+
+        for candidate in pool.values():
+            self._retrieval_v2_score_candidate(candidate)
+        base_ranked = sorted(
+            pool.values(),
+            key=lambda candidate: (
+                -float(candidate["relevance_score"]),
+                str(candidate["memory_id"]),
+            ),
+        )
+        base_pool_truncated = len(base_ranked) > candidate_limit
+        base_ranked = base_ranked[:candidate_limit]
+        pool = {str(candidate["memory_id"]): candidate for candidate in base_ranked}
+
+        graph_anchors = [
+            {
+                "memory_id": str(candidate["memory_id"]),
+                "context_id": str(candidate["context_id"]),
+                "relevance_score": float(candidate["relevance_score"]),
+            }
+            for candidate in base_ranked[:RETRIEVAL_V2_MAX_GRAPH_ANCHORS]
+        ]
+        graph_snapshot = self._retrieval_v2_graph_edges(
+            graph_anchors,
+            enabled=include_graph_neighbors,
+        )
+        graph_neighbor_loads = 0
+        graph_cross_context_rejections = 0
+        anchor_by_id = {
+            str(anchor["memory_id"]): anchor for anchor in graph_anchors
+        }
+        for edge in graph_snapshot["edges"]:
+            anchor_id = str(edge["anchor_memory_id"])
+            anchor = anchor_by_id.get(anchor_id)
+            if anchor is None:
+                continue
+            neighbor_id = str(edge["neighbor_memory_id"])
+            neighbor = self.memory_store.get_entry(neighbor_id)
+            graph_neighbor_loads += 1
+            if neighbor is None:
+                continue
+            neighbor_context = str(neighbor.get("context_id") or "")
+            anchor_context = str(anchor["context_id"])
+            if (
+                neighbor_context != anchor_context
+                or neighbor_context not in scope_by_context
+                or str(edge.get("context_id") or "") != anchor_context
+            ):
+                graph_cross_context_rejections += 1
+                continue
+            candidate = candidate_for(neighbor)
+            if candidate is None:
+                continue
+            graph_signal = self._retrieval_v2_unit_float(
+                float(edge["weight"])
+                * (0.5 + 0.5 * float(anchor["relevance_score"]))
+            )
+            candidate["graph_signal"] = max(
+                float(candidate["graph_signal"]), graph_signal
+            )
+            provenance = {
+                "relationship_id": str(edge["relationship_id"]),
+                "anchor_memory_id": anchor_id,
+                "neighbor_memory_id": neighbor_id,
+                "context_id": anchor_context,
+                "relation_type": str(edge["relation_type"]),
+                "weight": float(edge["weight"]),
+                "signal": graph_signal,
+            }
+            candidate["graph_provenance"].append(provenance)
+
+        for candidate in pool.values():
+            self._retrieval_v2_score_candidate(candidate)
+            candidate["graph_provenance"] = sorted(
+                candidate["graph_provenance"],
+                key=lambda item: (
+                    -float(item["signal"]),
+                    str(item["relationship_id"]),
+                    str(item["anchor_memory_id"]),
+                ),
+            )[:4]
+            candidate["display"] = self._retrieval_v2_display(candidate["entry"])
+
+        ranked = sorted(
+            pool.values(),
+            key=lambda candidate: (
+                -float(candidate["relevance_score"]),
+                str(candidate["memory_id"]),
+            ),
+        )
+        graph_pool_truncated = len(ranked) > candidate_limit
+        ranked = ranked[:candidate_limit]
+
+        content_deduplications = 0
+        content_seen: dict[str, dict[str, Any]] = {}
+        deduplicated: list[dict[str, Any]] = []
+        for candidate in ranked:
+            content_key = self._retrieval_v2_content_key(candidate)
+            prior = content_seen.get(content_key)
+            if prior is not None:
+                prior["content_duplicate_count"] = int(
+                    prior.get("content_duplicate_count", 0)
+                ) + 1
+                content_deduplications += 1
+                continue
+            candidate["content_duplicate_count"] = 0
+            content_seen[content_key] = candidate
+            deduplicated.append(candidate)
+
+        selected, mmr_evaluations = self._retrieval_v2_mmr_select(
+            deduplicated,
+            limit=result_limit,
+        )
+        items = [
+            self._retrieval_v2_public_item(candidate, rank=rank)
+            for rank, candidate in enumerate(selected, start=1)
+        ]
+        result_truncated = len(deduplicated) > len(selected)
+        candidate_pool_truncated = bool(
+            base_pool_truncated
+            or graph_pool_truncated
+            or graph_snapshot["truncated"]
+        )
+        return {
+            "items": items,
+            "result_truncated": result_truncated,
+            "graph_anchors": graph_anchors,
+            "graph_snapshot": graph_snapshot,
+            "work": {
+                "source_candidate_limit_each": source_limit,
+                "spike_store_scan_ceiling": min(source_limit * 16, 10_000),
+                "spike_candidates_returned": len(spike_rows),
+                "surface_candidates_returned": len(surface_rows),
+                "spike_source_may_be_truncated": len(spike_rows) >= source_limit,
+                "surface_source_may_be_truncated": bool(
+                    query_terms and len(surface_rows) >= source_limit
+                ),
+                "candidate_pool_before_content_dedupe": len(ranked),
+                "candidate_pool_after_content_dedupe": len(deduplicated),
+                "candidate_pool_truncated": candidate_pool_truncated,
+                "candidate_memory_id_deduplications": memory_id_deduplications,
+                "candidate_content_deduplications": content_deduplications,
+                "graph_anchor_count": len(graph_anchors),
+                "graph_relationship_rows_examined": len(graph_snapshot["edges"]),
+                "graph_relationship_row_limit": RETRIEVAL_V2_MAX_GRAPH_EDGES,
+                "graph_neighbor_loads": graph_neighbor_loads,
+                "graph_cross_context_rejections": graph_cross_context_rejections,
+                "mmr_candidate_evaluations": mmr_evaluations,
+                "mmr_candidate_evaluation_ceiling": (
+                    candidate_limit * result_limit
+                ),
+            },
+        }
+
+    def _retrieval_v2_spike_signal(
+        self,
+        entry: dict[str, Any],
+        query_spikes: set[int],
+    ) -> tuple[float, dict[str, Any]]:
+        candidate_spikes = {
+            int(value) for value in entry.get("spike_indices", [])
+        }
+        overlap_count = len(query_spikes & candidate_spikes)
+        union_count = len(query_spikes | candidate_spikes)
+        signal = overlap_count / max(1, union_count)
+        return self._retrieval_v2_unit_float(signal), {
+            "type": "spike-index-overlap",
+            "overlap_count": overlap_count,
+            "query_spike_count": len(query_spikes),
+            "candidate_spike_count": len(candidate_spikes),
+            "jaccard": round(self._retrieval_v2_unit_float(signal), 8),
+        }
+
+    def _retrieval_v2_surface_signal(
+        self,
+        entry: dict[str, Any],
+        query_terms: list[str],
+    ) -> tuple[float, dict[str, Any]]:
+        if not query_terms:
+            return 0.0, {"type": "surface-index-overlap", "overlap_count": 0}
+        display = self._retrieval_v2_display(entry)
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        metadata_terms = " ".join(
+            str(metadata.get(key) or "")
+            for key in ("source", "source_tag", "speaker", "trace_type", "truth_posture")
+        )
+        corpus = " ".join(
+            [
+                display["tag"],
+                display["label"],
+                display["summary"],
+                display["excerpt"],
+                " ".join(display["facets"]),
+                metadata_terms,
+            ]
+        )
+        corpus_terms = set(
+            self._retrieval_v2_select_terms(
+                self._surface_recall_terms(corpus),
+                limit=RETRIEVAL_V2_MAX_ITEM_TERMS,
+            )
+        )
+        query_set = set(query_terms)
+        matched_terms = sorted(query_set & corpus_terms)
+        indexed_overlap = min(
+            max(int(entry.get("surface_overlap_count", 0) or 0), 0),
+            len(query_set),
+        )
+        term_weight = max(
+            0.0,
+            self._retrieval_v2_finite_float(entry.get("surface_term_weight")),
+        )
+        indexed_coverage = indexed_overlap / max(1, len(query_set))
+        rendered_coverage = len(matched_terms) / max(1, len(query_set))
+        weight_quality = min(1.0, term_weight / max(1.0, 4.0 * indexed_overlap))
+        signal = (
+            0.55 * indexed_coverage
+            + 0.30 * rendered_coverage
+            + 0.15 * weight_quality
+        )
+        return self._retrieval_v2_unit_float(signal), {
+            "type": "surface-index-overlap",
+            "indexed_overlap_count": indexed_overlap,
+            "query_term_count": len(query_set),
+            "matched_terms": matched_terms[:8],
+            "indexed_coverage": round(indexed_coverage, 8),
+            "rendered_coverage": round(rendered_coverage, 8),
+            "indexed_term_weight": round(term_weight, 8),
+        }
+
+    def _retrieval_v2_score_candidate(self, candidate: dict[str, Any]) -> None:
+        spike_signal = self._retrieval_v2_unit_float(candidate.get("spike_signal"))
+        surface_signal = self._retrieval_v2_unit_float(candidate.get("surface_signal"))
+        graph_signal = self._retrieval_v2_unit_float(candidate.get("graph_signal"))
+        contributions = {
+            "spike_index": RETRIEVAL_V2_RANK_WEIGHTS["spike_index"] * spike_signal,
+            "surface_index": RETRIEVAL_V2_RANK_WEIGHTS["surface_index"] * surface_signal,
+            "same_context_graph": (
+                RETRIEVAL_V2_RANK_WEIGHTS["same_context_graph"] * graph_signal
+            ),
+        }
+        candidate["score_contributions"] = contributions
+        candidate["relevance_score"] = self._retrieval_v2_unit_float(
+            sum(contributions.values())
+        )
+
+    def _retrieval_v2_graph_edges(
+        self,
+        anchors: list[dict[str, Any]],
+        *,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        normalized_anchors = sorted(
+            (
+                {
+                    "memory_id": str(anchor.get("memory_id") or ""),
+                    "context_id": str(anchor.get("context_id") or ""),
+                }
+                for anchor in anchors[:RETRIEVAL_V2_MAX_GRAPH_ANCHORS]
+                if str(anchor.get("memory_id") or "")
+                and str(anchor.get("context_id") or "")
+            ),
+            key=lambda anchor: (anchor["memory_id"], anchor["context_id"]),
+        )
+        if not enabled or not normalized_anchors:
+            payload = {
+                "schema": "retrieval-graph-snapshot.v2",
+                "enabled": bool(enabled),
+                "anchors": normalized_anchors,
+                "edges": [],
+                "truncated": False,
+            }
+            return {**payload, "revision": self._retrieval_v2_digest(payload)}
+
+        edges: list[dict[str, Any]] = []
+        truncated = False
+        fetch_limit = RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR + 1
+        for anchor in normalized_anchors:
+            outgoing = self.memory_store.list_relationships(
+                context_id=anchor["context_id"],
+                source_memory_id=anchor["memory_id"],
+                limit=fetch_limit,
+            )
+            incoming = self.memory_store.list_relationships(
+                context_id=anchor["context_id"],
+                target_memory_id=anchor["memory_id"],
+                limit=fetch_limit,
+            )
+            if len(outgoing) > RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR:
+                truncated = True
+            if len(incoming) > RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR:
+                truncated = True
+            by_relationship: dict[str, dict[str, Any]] = {}
+            for relationship in outgoing + incoming:
+                relationship_id = str(relationship.get("relationship_id") or "")
+                if relationship_id:
+                    by_relationship[relationship_id] = relationship
+            ordered = sorted(
+                by_relationship.values(),
+                key=lambda relationship: (
+                    -self._retrieval_v2_unit_float(relationship.get("weight")),
+                    str(relationship.get("relationship_id") or ""),
+                ),
+            )
+            if len(ordered) > RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR:
+                truncated = True
+            for relationship in ordered[:RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR]:
+                source_id = str(relationship.get("source_memory_id") or "")
+                target_id = str(relationship.get("target_memory_id") or "")
+                neighbor_id = target_id if source_id == anchor["memory_id"] else source_id
+                edges.append(
+                    {
+                        "anchor_memory_id": anchor["memory_id"],
+                        "neighbor_memory_id": neighbor_id,
+                        "relationship_id": str(relationship.get("relationship_id") or ""),
+                        "context_id": str(relationship.get("context_id") or ""),
+                        "source_memory_id": source_id,
+                        "target_memory_id": target_id,
+                        "relation_type": self._retrieval_v2_text(
+                            str(relationship.get("relation_type") or ""), 96
+                        )[0],
+                        "weight": self._retrieval_v2_unit_float(
+                            relationship.get("weight")
+                        ),
+                        "created_at": self._retrieval_v2_finite_float(
+                            relationship.get("created_at")
+                        ),
+                        "updated_at": self._retrieval_v2_finite_float(
+                            relationship.get("updated_at")
+                        ),
+                    }
+                )
+        edges.sort(
+            key=lambda edge: (
+                str(edge["anchor_memory_id"]),
+                -float(edge["weight"]),
+                str(edge["relationship_id"]),
+            )
+        )
+        if len(edges) > RETRIEVAL_V2_MAX_GRAPH_EDGES:
+            truncated = True
+        edges = edges[:RETRIEVAL_V2_MAX_GRAPH_EDGES]
+        payload = {
+            "schema": "retrieval-graph-snapshot.v2",
+            "enabled": True,
+            "anchors": normalized_anchors,
+            "edges": edges,
+            "truncated": truncated,
+        }
+        return {**payload, "revision": self._retrieval_v2_digest(payload)}
+
+    def _retrieval_v2_display(self, entry: dict[str, Any]) -> dict[str, Any]:
+        tag, tag_redactions = self._retrieval_v2_text(
+            str(entry.get("tag") or "untagged"), 96
+        )
+        label, label_redactions = self._retrieval_v2_text(
+            self._surface_label_for_entry(entry), 96
+        )
+        summary, summary_redactions = self._retrieval_v2_text(
+            self._surface_summary_for_entry(entry), 180
+        )
+        excerpt, excerpt_redactions = self._retrieval_v2_text(
+            str(entry.get("source_text") or ""), 320
+        )
+        facets: list[str] = []
+        facet_redactions = 0
+        for raw_facet in self._surface_facets_for_entry(entry)[:6]:
+            facet, count = self._retrieval_v2_text(str(raw_facet), 48)
+            facet_redactions += count
+            if facet and facet not in facets:
+                facets.append(facet)
+        return {
+            "tag": tag,
+            "label": label or tag,
+            "summary": summary,
+            "excerpt": excerpt,
+            "facets": facets,
+            "output_redaction_count": int(
+                tag_redactions
+                + label_redactions
+                + summary_redactions
+                + excerpt_redactions
+                + facet_redactions
+            ),
+        }
+
+    def _retrieval_v2_text(self, value: str, limit: int) -> tuple[str, int]:
+        without_controls = "".join(
+            " " if (ord(char) < 32 and char not in "\t\n\r") or 127 <= ord(char) < 160 else char
+            for char in str(value or "")
+        )
+        redacted, redaction_count = redact_capture_text(without_controls)
+        return self._compact_text(str(redacted or ""), max(0, int(limit))), int(
+            redaction_count
+        )
+
+    def _retrieval_v2_content_key(self, candidate: dict[str, Any]) -> str:
+        display = candidate["display"]
+        semantic_content = " ".join(
+            str(value or "").casefold()
+            for value in (
+                display.get("label"),
+                display.get("summary"),
+                display.get("excerpt"),
+            )
+            if str(value or "").strip()
+        )
+        if not semantic_content:
+            semantic_content = str(display.get("tag") or candidate["memory_id"]).casefold()
+        return self._retrieval_v2_digest(
+            {
+                "context_id": str(candidate["context_id"]),
+                "semantic_content": " ".join(semantic_content.split()),
+            }
+        )
+
+    def _retrieval_v2_mmr_select(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        remaining = list(candidates)
+        for candidate in remaining:
+            display = candidate["display"]
+            candidate["diversity_terms"] = set(
+                self._retrieval_v2_select_terms(
+                    self._surface_recall_terms(
+                        " ".join(
+                            [
+                                str(display.get("label") or ""),
+                                str(display.get("summary") or ""),
+                                str(display.get("excerpt") or ""),
+                                " ".join(display.get("facets") or []),
+                            ]
+                        )
+                    ),
+                    limit=RETRIEVAL_V2_MAX_DIVERSITY_TERMS,
+                )
+            )
+        selected: list[dict[str, Any]] = []
+        evaluations = 0
+        while remaining and len(selected) < limit:
+            evaluated: list[tuple[float, float, str, dict[str, Any], float]] = []
+            for candidate in remaining:
+                evaluations += 1
+                candidate_terms = candidate["diversity_terms"]
+                maximum_similarity = 0.0
+                for prior in selected:
+                    prior_terms = prior["diversity_terms"]
+                    if not candidate_terms or not prior_terms:
+                        similarity = 0.0
+                    else:
+                        similarity = len(candidate_terms & prior_terms) / max(
+                            1, len(candidate_terms | prior_terms)
+                        )
+                    maximum_similarity = max(maximum_similarity, similarity)
+                relevance = float(candidate["relevance_score"])
+                selection_score = (
+                    RETRIEVAL_V2_MMR_LAMBDA * relevance
+                    - (1.0 - RETRIEVAL_V2_MMR_LAMBDA) * maximum_similarity
+                )
+                evaluated.append(
+                    (
+                        selection_score,
+                        relevance,
+                        str(candidate["memory_id"]),
+                        candidate,
+                        maximum_similarity,
+                    )
+                )
+            evaluated.sort(key=lambda item: (-item[0], -item[1], item[2]))
+            selection_score, _relevance, _memory_id, chosen, similarity = evaluated[0]
+            chosen["mmr"] = {
+                "lambda": RETRIEVAL_V2_MMR_LAMBDA,
+                "maximum_selected_similarity": self._retrieval_v2_unit_float(similarity),
+                "diversity_penalty": (
+                    (1.0 - RETRIEVAL_V2_MMR_LAMBDA)
+                    * self._retrieval_v2_unit_float(similarity)
+                ),
+                "selection_score": selection_score,
+            }
+            selected.append(chosen)
+            remaining.remove(chosen)
+        return selected, evaluations
+
+    def _retrieval_v2_public_item(
+        self,
+        candidate: dict[str, Any],
+        *,
+        rank: int,
+    ) -> dict[str, Any]:
+        entry = candidate["entry"]
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        display = candidate["display"]
+        reasons: list[dict[str, Any]] = []
+        if isinstance(candidate.get("spike_reason"), dict):
+            reasons.append(dict(candidate["spike_reason"]))
+        if isinstance(candidate.get("surface_reason"), dict):
+            reasons.append(dict(candidate["surface_reason"]))
+        graph_provenance = [dict(item) for item in candidate["graph_provenance"]]
+        if graph_provenance:
+            reasons.append(
+                {
+                    "type": "same-context-graph-neighbor",
+                    "relationship_count": len(graph_provenance),
+                    "relationships": graph_provenance,
+                }
+            )
+        source_provenance: dict[str, Any] = {
+            "created_at": self._retrieval_v2_finite_float(entry.get("created_at")),
+            "updated_at": self._retrieval_v2_finite_float(entry.get("updated_at")),
+        }
+        for key in (
+            "source",
+            "source_tag",
+            "speaker",
+            "capture_id",
+            "trace_type",
+            "truth_posture",
+            "session_id",
+        ):
+            value = metadata.get(key)
+            if value is not None and str(value).strip():
+                source_provenance[key] = self._retrieval_v2_text(str(value), 128)[0]
+        stored_confidence: float | None = None
+        if metadata.get("confidence") is not None:
+            try:
+                parsed_confidence = float(metadata["confidence"])
+            except (TypeError, ValueError, OverflowError):
+                parsed_confidence = math.nan
+            if math.isfinite(parsed_confidence):
+                stored_confidence = self._retrieval_v2_unit_float(parsed_confidence)
+        source_provenance["stored_confidence"] = stored_confidence
+
+        relevance_score = self._retrieval_v2_unit_float(candidate["relevance_score"])
+        contributions = candidate["score_contributions"]
+        mmr = candidate.get("mmr") if isinstance(candidate.get("mmr"), dict) else {}
+        scope_record = candidate["scope_record"]
+        return {
+            "rank": int(rank),
+            "memory_id": str(candidate["memory_id"]),
+            "context_id": str(candidate["context_id"]),
+            "tag": display["tag"],
+            "label": display["label"],
+            "summary": display["summary"],
+            "excerpt": display["excerpt"],
+            "facets": list(display["facets"]),
+            "score": round(relevance_score, 8),
+            "score_breakdown": {
+                "signals": {
+                    "spike_index": round(
+                        self._retrieval_v2_unit_float(candidate["spike_signal"]), 8
+                    ),
+                    "surface_index": round(
+                        self._retrieval_v2_unit_float(candidate["surface_signal"]), 8
+                    ),
+                    "same_context_graph": round(
+                        self._retrieval_v2_unit_float(candidate["graph_signal"]), 8
+                    ),
+                },
+                "weights": dict(RETRIEVAL_V2_RANK_WEIGHTS),
+                "contributions": {
+                    key: round(self._retrieval_v2_unit_float(value), 8)
+                    for key, value in contributions.items()
+                },
+                "relevance_score": round(relevance_score, 8),
+                "diversity": {
+                    "lambda": RETRIEVAL_V2_MMR_LAMBDA,
+                    "maximum_selected_similarity": round(
+                        self._retrieval_v2_unit_float(
+                            mmr.get("maximum_selected_similarity")
+                        ),
+                        8,
+                    ),
+                    "diversity_penalty": round(
+                        max(
+                            0.0,
+                            self._retrieval_v2_finite_float(
+                                mmr.get("diversity_penalty")
+                            ),
+                        ),
+                        8,
+                    ),
+                    "selection_score": round(
+                        self._retrieval_v2_finite_float(mmr.get("selection_score")),
+                        8,
+                    ),
+                },
+            },
+            "confidence": {
+                "calibrated": False,
+                "probability": None,
+                "signal": "uncalibrated-ranking-score",
+                "score": round(relevance_score, 8),
+                "warning": "Do not interpret this value as truth probability.",
+            },
+            "match_reasons": reasons,
+            "scope_provenance": self._retrieval_v2_public_scope_provenance(
+                scope_record,
+                origin_context=str(scope_record.get("origin_context_id") or ""),
+            ),
+            "graph_provenance": graph_provenance,
+            "source_provenance": source_provenance,
+            "ranker_id": RETRIEVAL_V2_RANKER_ID,
+            "ranker_version": RETRIEVAL_V2_RANKER_VERSION,
+            "content_duplicate_count": int(candidate.get("content_duplicate_count", 0)),
+            "output_redaction_count": int(display["output_redaction_count"]),
+            "raw_source_included": False,
+        }
+
+    @staticmethod
+    def _retrieval_v2_finite_float(value: Any, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
+        return parsed if math.isfinite(parsed) else float(default)
+
+    @classmethod
+    def _retrieval_v2_unit_float(cls, value: Any) -> float:
+        parsed = cls._retrieval_v2_finite_float(value)
+        return min(max(parsed, 0.0), 1.0)
+
     def run_snn_cycle(self, sensory_spikes: Any, *, steps: int = 12):
         """Run recurrent LIF propagation with immutable state updates."""
         self._require_neural_substrate()
@@ -2750,6 +4135,246 @@ class SpikingAttentionBackend:
             include_vectors=bool(include_vectors),
         )
 
+    def _get_retrieval_cursor_codec(self) -> RetrievalCursorCodec:
+        codec = self._retrieval_cursor_codec
+        if codec is not None:
+            return codec
+        with self._retrieval_cursor_lock:
+            codec = self._retrieval_cursor_codec
+            if codec is None:
+                codec = RetrievalCursorCodec.from_key_path(
+                    self.state_path.parent / "retrieval_cursor.key"
+                )
+                self._retrieval_cursor_codec = codec
+        return codec
+
+    @staticmethod
+    def _retrieval_response_mode(value: Any) -> str:
+        normalized = str(value or "legacy").strip().casefold()
+        if normalized not in {"legacy", "compact", "full"}:
+            raise ValueError("response_mode must be legacy, compact, or full")
+        return normalized
+
+    @staticmethod
+    def _retrieval_filter_digest(filters: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                filters,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _cortex_retrieval_runtime_snapshot(
+        self,
+        *,
+        context: str,
+        agent: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Freeze and fingerprint the live Cortex fields returned by Retrieval v2.
+
+        Durable Cortex memories are snapshot-fenced by SQLite. Active governor
+        sessions live in the runtime-state plane, so they need an independent
+        revision that is authenticated alongside the durable page cursor. The
+        caller performs an optimistic before/after check and only renders the
+        frozen copy returned here.
+        """
+
+        active_sessions = [
+            self._json_safe_metadata(dict(session))
+            for session in self.cortex_sessions.values()
+            if session.get("context_id") == context
+            and session.get("status") == "active"
+            and (not agent or session.get("agent_id") == agent)
+        ]
+        active_sessions.sort(
+            key=lambda item: (
+                float(item.get("updated_at", 0.0)),
+                str(item.get("session_id", "")),
+            ),
+            reverse=True,
+        )
+        revision = self._retrieval_filter_digest(
+            {
+                "schema": "synapse-s2.cortex-runtime-snapshot.v1",
+                "context_id": context,
+                "agent_id": agent,
+                "active_sessions": active_sessions,
+            }
+        )
+        return active_sessions, revision
+
+    @classmethod
+    def _cortex_retrieval_snapshot_revision(
+        cls,
+        *,
+        durable_revision: str,
+        runtime_revision: str,
+    ) -> str:
+        return cls._retrieval_filter_digest(
+            {
+                "schema": "synapse-s2.cortex-composite-snapshot.v1",
+                "durable_revision": durable_revision,
+                "runtime_revision": runtime_revision,
+            }
+        )
+
+    def _retrieval_scope_binding(
+        self,
+        *,
+        context: str,
+        recall_scope: str,
+        include_global: bool,
+    ) -> dict[str, Any]:
+        records = self.memory_store.resolve_recall_contexts(
+            context_id=context,
+            scope=recall_scope,
+        )
+        if not include_global:
+            records = [
+                record
+                for record in records
+                if str(record.get("context_id") or "") != "global"
+            ]
+        normalized_records = sorted(
+            (
+                {
+                    "context_id": sanitize_context_id(
+                        str(record.get("context_id") or "")
+                    ),
+                    "recall_scope": recall_scope,
+                    "recall_provenance": str(
+                        record.get("recall_provenance") or "local"
+                    ),
+                    "via_context_link_id": str(
+                        record.get("via_context_link_id") or ""
+                    ),
+                    "via_relation_type": str(
+                        record.get("via_relation_type") or ""
+                    ),
+                    "via_direction": str(record.get("via_direction") or ""),
+                }
+                for record in records
+            ),
+            key=lambda record: (
+                0 if record["context_id"] == context else 1,
+                record["context_id"],
+                record["via_context_link_id"],
+            ),
+        )
+        if not normalized_records:
+            raise RuntimeError("retrieval scope resolved no namespaces")
+        if len(normalized_records) > 64:
+            raise RuntimeError(
+                "retrieval scope exceeds the 64-namespace snapshot ceiling"
+            )
+        context_ids = [record["context_id"] for record in normalized_records]
+        if len(context_ids) != len(set(context_ids)):
+            raise RuntimeError("retrieval scope contains duplicate namespaces")
+        revision = self._retrieval_filter_digest(
+            {
+                "schema": "synapse-s2.retrieval-scope-binding.v2",
+                "origin_context_id": context,
+                "recall_scope": recall_scope,
+                "include_global": bool(include_global),
+                "records": normalized_records,
+            }
+        )
+        return {
+            "records": normalized_records,
+            "context_ids": context_ids,
+            "revision": revision,
+        }
+
+    @staticmethod
+    def _retrieval_page_metadata(
+        *,
+        surface: str,
+        response_mode: str,
+        snapshot_revision: str,
+        filters: dict[str, Any],
+        ordering: str,
+        total: dict[str, int],
+        returned: dict[str, int],
+        has_more: bool,
+        next_cursor: str | None,
+        expires_at: int | None,
+        origin_node: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema": RETRIEVAL_PAGE_SCHEMA,
+            "surface": surface,
+            "response_mode": response_mode,
+            "snapshot_revision": snapshot_revision,
+            "filters_sha256": SpikingAttentionBackend._retrieval_filter_digest(
+                filters
+            ),
+            "ordering": ordering,
+            "total": {key: int(value) for key, value in total.items()},
+            "returned": {key: int(value) for key, value in returned.items()},
+            "has_more": bool(has_more),
+            "next_cursor": next_cursor,
+            "expires_at": int(expires_at or 0),
+            "origin_node": origin_node,
+        }
+
+    @staticmethod
+    def _graph_cursor_position_from_store(
+        *,
+        entry_position: dict[str, Any],
+        relationship_position: dict[str, Any],
+    ) -> dict[str, Any]:
+        entry_done = entry_position.get("done") is True
+        relationship_done = relationship_position.get("done") is True
+        return {
+            "entry_updated_at": (
+                None if entry_done else float(entry_position["updated_at"])
+            ),
+            "entry_memory_id": (
+                "" if entry_done else str(entry_position["memory_id"])
+            ),
+            "relationship_updated_at": (
+                None
+                if relationship_done
+                else float(relationship_position["updated_at"])
+            ),
+            "relationship_id": (
+                "" if relationship_done else str(relationship_position["relationship_id"])
+            ),
+        }
+
+    @staticmethod
+    def _graph_cursor_position_to_store(
+        position: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        entry_updated_at = position.get("entry_updated_at")
+        entry_memory_id = position.get("entry_memory_id")
+        relationship_updated_at = position.get("relationship_updated_at")
+        relationship_id = position.get("relationship_id")
+        if (entry_updated_at is None) != (entry_memory_id == ""):
+            raise ValueError("graph cursor entry position is invalid")
+        if (relationship_updated_at is None) != (relationship_id == ""):
+            raise ValueError("graph cursor relationship position is invalid")
+        entry_position = (
+            {"done": True}
+            if entry_updated_at is None
+            else {
+                "updated_at": float(entry_updated_at),
+                "memory_id": str(entry_memory_id),
+            }
+        )
+        relationship_position = (
+            {"done": True}
+            if relationship_updated_at is None
+            else {
+                "updated_at": float(relationship_updated_at),
+                "relationship_id": str(relationship_id),
+            }
+        )
+        return entry_position, relationship_position
+
     def list_memory(
         self,
         *,
@@ -2758,13 +4383,160 @@ class SpikingAttentionBackend:
         include_global: bool = True,
         include_vectors: bool = False,
         recall_scope: str = "local",
+        cursor: str = "",
+        response_mode: str = "legacy",
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         normalized_scope = sanitize_recall_scope(recall_scope)
+        mode = self._retrieval_response_mode(response_mode)
+        continuation = str(cursor or "").strip()
+        if mode == "legacy":
+            if continuation:
+                raise ValueError("legacy memory listing does not support cursors")
+            return self._list_memory_legacy(
+                context=context,
+                limit=limit,
+                include_global=include_global,
+                include_vectors=include_vectors,
+                recall_scope=normalized_scope,
+            )
+
+        if type(include_global) is not bool or type(include_vectors) is not bool:
+            raise ValueError("include_global and include_vectors must be booleans")
+        if type(limit) is not int or limit < 1 or limit > 500:
+            raise ValueError("limit must be an integer between 1 and 500")
+        bounded_limit = limit
+        scope_binding = self._retrieval_scope_binding(
+            context=context,
+            recall_scope=normalized_scope,
+            include_global=include_global,
+        )
+        filters = {
+            "include_global": include_global,
+            "include_vectors": include_vectors,
+            "scope_revision": scope_binding["revision"],
+        }
+        ordering = canonical_ordering(
+            (
+                {"field": "updated_at", "direction": "desc"},
+                {"field": "memory_id", "direction": "desc"},
+            ),
+            unique_tie_breaker="memory_id",
+        )
+        position = None
+        expected_revision = None
+        codec = self._get_retrieval_cursor_codec()
+        if continuation:
+            decoded = codec.decode(
+                continuation,
+                expected_surface="memory-list",
+                expected_response_mode=mode,
+                expected_context_id=context,
+                expected_recall_scope=normalized_scope,
+                expected_filters=filters,
+                expected_ordering=ordering,
+                expected_snapshot_revision=None,
+            )
+            position = decoded.position
+            expected_revision = str(decoded.snapshot_revision)
+
+        try:
+            page = self.memory_store.retrieval_memory_page(
+                context_ids=scope_binding["context_ids"],
+                limit=bounded_limit,
+                position=position,
+                expected_revision=expected_revision,
+            )
+        except RetrievalSnapshotStaleError as exc:
+            if continuation:
+                raise RetrievalCursorSnapshotMismatchError() from exc
+            raise
+        scope_after = self._retrieval_scope_binding(
+            context=context,
+            recall_scope=normalized_scope,
+            include_global=include_global,
+        )
+        if scope_after["revision"] != scope_binding["revision"]:
+            raise RetrievalSnapshotStaleError(
+                expected_revision=scope_binding["revision"],
+                actual_revision=scope_after["revision"],
+            )
+
+        record_by_context = {
+            str(record["context_id"]): record for record in scope_binding["records"]
+        }
+        rendered_entries: list[dict[str, Any]] = []
+        for entry in page["entries"]:
+            annotated = dict(entry)
+            annotated.update(record_by_context[str(entry["context_id"])])
+            rendered_entries.append(
+                self._render_memory_entry(
+                    annotated,
+                    include_vectors=include_vectors,
+                )
+            )
+
+        next_cursor = None
+        expires_at = None
+        if page["has_more"]:
+            next_cursor = codec.encode(
+                surface="memory-list",
+                response_mode=mode,
+                context_id=context,
+                recall_scope=normalized_scope,
+                filters=filters,
+                ordering=ordering,
+                position=page["next_position"],
+                snapshot_revision=page["snapshot_revision"],
+                ttl_seconds=DEFAULT_RETRIEVAL_CURSOR_TTL_SECONDS,
+            )
+            expires_at = codec.decode(
+                next_cursor,
+                expected_surface="memory-list",
+                expected_response_mode=mode,
+                expected_context_id=context,
+                expected_recall_scope=normalized_scope,
+                expected_filters=filters,
+                expected_ordering=ordering,
+                expected_snapshot_revision=page["snapshot_revision"],
+            ).expires_at
+        return {
+            "context_id": context,
+            "memory_db_path": str(self.memory_store.db_path),
+            "entry_count": len(rendered_entries),
+            "entries": rendered_entries,
+            "include_vectors": include_vectors,
+            "recall_scope": normalized_scope,
+            "recall_contexts": scope_binding["records"],
+            "one_hop_only": normalized_scope == "connected",
+            "_retrieval_page": self._retrieval_page_metadata(
+                surface="memory-list",
+                response_mode=mode,
+                snapshot_revision=page["snapshot_revision"],
+                filters=filters,
+                ordering="updated_at-desc,memory_id-desc",
+                total={"entries": page["total"]},
+                returned={"entries": page["returned"]},
+                has_more=page["has_more"],
+                next_cursor=next_cursor,
+                expires_at=expires_at,
+                origin_node=codec.origin_node,
+            ),
+        }
+
+    def _list_memory_legacy(
+        self,
+        *,
+        context: str,
+        limit: int,
+        include_global: bool,
+        include_vectors: bool,
+        recall_scope: str,
+    ) -> dict[str, Any]:
         bounded_limit = min(max(int(limit), 1), 10_000)
         scope_records = self.memory_store.resolve_recall_contexts(
             context_id=context,
-            scope=normalized_scope,
+            scope=recall_scope,
         )
         if not include_global:
             scope_records = [
@@ -2801,9 +4573,9 @@ class SpikingAttentionBackend:
             "entry_count": len(rendered_entries),
             "entries": rendered_entries,
             "include_vectors": bool(include_vectors),
-            "recall_scope": normalized_scope,
+            "recall_scope": recall_scope,
             "recall_contexts": scope_records,
-            "one_hop_only": normalized_scope == "connected",
+            "one_hop_only": recall_scope == "connected",
         }
 
     def publish_context_event(
@@ -3126,8 +4898,11 @@ class SpikingAttentionBackend:
         self.cortex_sessions[session_id] = session
         self._persist_runtime_state()
         if normalized_recall_mode == "neural":
-            recall_result = self.query_text(task_text, context_id=context)
-            recall_items = self._split_recall_result(recall_result)
+            _retrieval, recall_items = self._retrieval_v2_briefing_recall(
+                prompt_text=task_text,
+                context=context,
+            )
+            recall_result = " / ".join(recall_items)
         elif normalized_recall_mode == "surface":
             recall_items = self._surface_bootstrap_recall(
                 context=context,
@@ -3169,7 +4944,7 @@ class SpikingAttentionBackend:
             "recall_items": recall_items,
             "recall_mode": normalized_recall_mode,
             "recall_provenance": (
-                "mlx-spiking-neural"
+                "retrieval-v2-hybrid-read-only"
                 if normalized_recall_mode == "neural"
                 else "sqlite-surface-bootstrap"
                 if normalized_recall_mode == "surface"
@@ -3330,12 +5105,15 @@ class SpikingAttentionBackend:
         bounded_confidence = min(max(float(confidence), 0.0), 1.0)
         state = self.get_cortex_state(context_id=context, agent_id=agent)
         recall_prompt = " ".join(part for part in (observation_text, proposed_text) if part)
-        recall_result = (
-            self.query_text(recall_prompt, context_id=context)
-            if recall_prompt
-            else ""
-        )
-        recall_items = self._split_recall_result(recall_result)
+        if recall_prompt:
+            _retrieval, recall_items = self._retrieval_v2_briefing_recall(
+                prompt_text=recall_prompt,
+                context=context,
+            )
+            recall_result = " / ".join(recall_items)
+        else:
+            recall_result = ""
+            recall_items = []
         warnings = self._cortex_warnings(
             mutation_intent=bool(mutation_intent),
             confidence=bounded_confidence,
@@ -3593,9 +5371,23 @@ class SpikingAttentionBackend:
         context_id: str = "default",
         agent_id: str = "",
         limit: int = 50,
+        cursor: str = "",
+        response_mode: str = "legacy",
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id) if agent_id else ""
+        mode = self._retrieval_response_mode(response_mode)
+        continuation = str(cursor or "").strip()
+        if mode != "legacy":
+            return self._get_cortex_state_retrieval(
+                context=context,
+                agent=agent,
+                limit=limit,
+                cursor=continuation,
+                response_mode=mode,
+            )
+        if continuation:
+            raise ValueError("legacy Cortex state does not support cursors")
         visible_limit = max(1, min(int(limit), 500))
         scan_limit = max(100, visible_limit * 5)
         scan_limit = min(scan_limit, 500)
@@ -3701,6 +5493,259 @@ class SpikingAttentionBackend:
                 str(active_sessions[0].get("mode", "strict")) if active_sessions else "strict"
             ),
             "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def _get_cortex_state_retrieval(
+        self,
+        *,
+        context: str,
+        agent: str,
+        limit: int,
+        cursor: str,
+        response_mode: str,
+    ) -> dict[str, Any]:
+        if type(limit) is not int or limit < 1 or limit > 500:
+            raise ValueError("limit must be an integer between 1 and 500")
+        bounded_limit = limit
+        include_global = True
+        base_filters = {
+            "agent_id": agent,
+            "include_global": include_global,
+            "memory_filter": "metadata.cortex_governor=true",
+        }
+        ordering = canonical_ordering(
+            (
+                {"field": "updated_at", "direction": "desc"},
+                {"field": "memory_id", "direction": "desc"},
+            ),
+            unique_tie_breaker="memory_id",
+        )
+        position = None
+        expected_revision = None
+        codec = self._get_retrieval_cursor_codec()
+        active_sessions, runtime_revision = self._cortex_retrieval_runtime_snapshot(
+            context=context,
+            agent=agent,
+        )
+        decoded = None
+        if cursor:
+            decoded = codec.decode(
+                cursor,
+                expected_surface="cortex-state",
+                expected_response_mode=response_mode,
+                expected_context_id=context,
+                expected_recall_scope="local",
+                expected_filters=None,
+                expected_ordering=ordering,
+                expected_snapshot_revision=None,
+            )
+            decoded_filters = decoded.filters
+            if (
+                set(decoded_filters)
+                != {
+                    *base_filters,
+                    "durable_snapshot_revision",
+                    "runtime_snapshot_revision",
+                }
+                or any(
+                    decoded_filters.get(key) != value
+                    for key, value in base_filters.items()
+                )
+            ):
+                raise RetrievalCursorFilterMismatchError()
+            durable_revision = decoded_filters.get("durable_snapshot_revision")
+            cursor_runtime_revision = decoded_filters.get(
+                "runtime_snapshot_revision"
+            )
+            if (
+                not isinstance(durable_revision, str)
+                or re.fullmatch(r"[0-9a-f]{64}", durable_revision) is None
+                or not isinstance(cursor_runtime_revision, str)
+                or re.fullmatch(r"[0-9a-f]{64}", cursor_runtime_revision) is None
+            ):
+                raise RetrievalCursorFilterMismatchError()
+            if not secrets.compare_digest(
+                cursor_runtime_revision,
+                runtime_revision,
+            ):
+                raise RetrievalCursorSnapshotMismatchError()
+            position = decoded.position
+            expected_revision = durable_revision
+        try:
+            page = self.memory_store.retrieval_cortex_page(
+                context_id=context,
+                include_global=include_global,
+                limit=bounded_limit,
+                position=position,
+                expected_revision=expected_revision,
+            )
+        except RetrievalSnapshotStaleError as exc:
+            if cursor:
+                raise RetrievalCursorSnapshotMismatchError() from exc
+            raise
+        _active_sessions_after, runtime_revision_after = (
+            self._cortex_retrieval_runtime_snapshot(
+                context=context,
+                agent=agent,
+            )
+        )
+        if not secrets.compare_digest(runtime_revision, runtime_revision_after):
+            raise RetrievalSnapshotStaleError(
+                expected_revision=runtime_revision,
+                actual_revision=runtime_revision_after,
+            )
+        snapshot_revision = self._cortex_retrieval_snapshot_revision(
+            durable_revision=page["snapshot_revision"],
+            runtime_revision=runtime_revision,
+        )
+        if decoded is not None and not secrets.compare_digest(
+            str(decoded.snapshot_revision),
+            snapshot_revision,
+        ):
+            raise RetrievalCursorSnapshotMismatchError()
+        filters = {
+            **base_filters,
+            "durable_snapshot_revision": page["snapshot_revision"],
+            "runtime_snapshot_revision": runtime_revision,
+        }
+        cortical_entries = [
+            self._summarize_cortex_memory(entry) for entry in page["entries"]
+        ]
+        typed_counts: dict[str, int] = {}
+        for entry in cortical_entries:
+            trace_type = str(entry.get("trace_type") or "unknown")
+            typed_counts[trace_type] = typed_counts.get(trace_type, 0) + 1
+        high_confidence = [
+            entry
+            for entry in cortical_entries
+            if float(entry.get("confidence", 0.0)) >= 0.8
+        ][:10]
+        constraints = [
+            entry
+            for entry in cortical_entries
+            if entry.get("trace_type") == "constraint"
+        ][:10]
+        risks = [
+            entry
+            for entry in cortical_entries
+            if entry.get("trace_type") in {"risk", "blocker", "assumption"}
+        ][:10]
+        decisions = [
+            entry
+            for entry in cortical_entries
+            if entry.get("trace_type") == "decision"
+        ][:10]
+        assumptions = [
+            entry
+            for entry in cortical_entries
+            if entry.get("trace_type") == "assumption"
+            or entry.get("truth_posture") == "inferred"
+            or float(entry.get("confidence", 0.0) or 0.0) < 0.6
+        ][:10]
+        stale_or_uncertain = [
+            entry
+            for entry in cortical_entries
+            if entry.get("truth_posture") == "stale"
+            or entry.get("trace_type") in {"assumption", "blocker"}
+            or any(
+                token in str(entry.get("excerpt", "")).lower()
+                for token in ("assume", "maybe", "might", "uncertain")
+            )
+        ][:10]
+        goals = self._goal_ledger_from_cortical_summaries(
+            cortical_entries,
+            limit=10,
+        )
+        active_goal = (
+            str(active_sessions[0].get("task", ""))
+            if active_sessions
+            else next(
+                (
+                    str(goal.get("title", ""))
+                    for goal in goals
+                    if goal.get("state") not in {"done", "stale"}
+                ),
+                "",
+            )
+        )
+        contradictions = self._cortex_contradictions(cortical_entries)[:10]
+        capture_queue = self._cortex_capture_queue(active_sessions)[:10]
+        suggested_next_move = self._cortex_suggested_next_move(
+            active_sessions=active_sessions,
+            assumptions=assumptions,
+            stale_or_uncertain=stale_or_uncertain,
+            contradictions=contradictions,
+            risks=risks,
+            capture_queue=capture_queue,
+        )
+
+        next_cursor = None
+        expires_at = None
+        if page["has_more"]:
+            next_cursor = codec.encode(
+                surface="cortex-state",
+                response_mode=response_mode,
+                context_id=context,
+                recall_scope="local",
+                filters=filters,
+                ordering=ordering,
+                position=page["next_position"],
+                snapshot_revision=snapshot_revision,
+                ttl_seconds=DEFAULT_RETRIEVAL_CURSOR_TTL_SECONDS,
+            )
+            expires_at = codec.decode(
+                next_cursor,
+                expected_surface="cortex-state",
+                expected_response_mode=response_mode,
+                expected_context_id=context,
+                expected_recall_scope="local",
+                expected_filters=filters,
+                expected_ordering=ordering,
+                expected_snapshot_revision=snapshot_revision,
+            ).expires_at
+        return {
+            "action": "cortex-state",
+            "context_id": context,
+            "agent_id": agent,
+            "active_goal": active_goal,
+            "current_goal": active_goal,
+            "active_session_count": len(active_sessions),
+            "active_sessions": active_sessions[:10],
+            "goals": goals,
+            "goal_count": len(goals),
+            "typed_memory_counts": dict(sorted(typed_counts.items())),
+            "typed_memory_counts_scope": "returned-page",
+            "high_confidence_truths": high_confidence,
+            "constraints": constraints,
+            "governing_constraints": constraints,
+            "risks": risks,
+            "decisions": decisions,
+            "recent_decisions": decisions,
+            "unverified_assumptions": assumptions,
+            "stale_or_uncertain_memories": stale_or_uncertain,
+            "contradictions": contradictions,
+            "suggested_next_move": suggested_next_move,
+            "capture_queue": capture_queue,
+            "working_memory": cortical_entries,
+            "policy": self._cortex_policy(
+                str(active_sessions[0].get("mode", "strict"))
+                if active_sessions
+                else "strict"
+            ),
+            "memory_db_path": str(self.memory_store.db_path),
+            "_retrieval_page": self._retrieval_page_metadata(
+                surface="cortex-state",
+                response_mode=response_mode,
+                snapshot_revision=snapshot_revision,
+                filters=filters,
+                ordering="updated_at-desc,memory_id-desc",
+                total={"working_memory": page["total"]},
+                returned={"working_memory": page["returned"]},
+                has_more=page["has_more"],
+                next_cursor=next_cursor,
+                expires_at=expires_at,
+                origin_node=codec.origin_node,
+            ),
         }
 
     def reap_orphaned_cortex_sessions(
@@ -4738,11 +6783,11 @@ class SpikingAttentionBackend:
         recall_items: list[str] = []
         if prompt_text:
             if normalized_recall_mode == "neural":
-                recall_result = self.query(
-                    self.embed_text(prompt_text),
-                    context_id=context,
+                _retrieval, recall_items = self._retrieval_v2_briefing_recall(
+                    prompt_text=prompt_text,
+                    context=context,
                 )
-                recall_items = self._split_recall_result(recall_result)
+                recall_result = " / ".join(recall_items)
             elif normalized_recall_mode == "surface":
                 recall_items = self._surface_bootstrap_recall(
                     context=context,
@@ -4912,7 +6957,7 @@ class SpikingAttentionBackend:
             "recall_items": recall_items,
             "recall_mode": normalized_recall_mode,
             "recall_provenance": (
-                "mlx-spiking-neural"
+                "retrieval-v2-hybrid-read-only"
                 if normalized_recall_mode == "neural"
                 else "sqlite-surface-bootstrap"
                 if normalized_recall_mode == "surface"
@@ -4944,6 +6989,72 @@ class SpikingAttentionBackend:
         if normalized not in {"neural", "surface", "none"}:
             raise ValueError("recall_mode must be neural, surface, or none")
         return normalized
+
+    def _retrieval_v2_briefing_recall(
+        self,
+        *,
+        prompt_text: str,
+        context: str,
+        recall_scope: str = "local",
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Adapt structured Retrieval v2 hits to existing briefing text fields.
+
+        The compatibility strings are rendered from typed result fields; they
+        are never parsed back into authority-bearing identities or provenance.
+        """
+
+        result_limit = min(
+            max(int(self.recall_count), 1),
+            RETRIEVAL_V2_MAX_RESULT_LIMIT,
+        )
+        candidate_limit = min(
+            max(result_limit * 4, 16),
+            RETRIEVAL_V2_MAX_CANDIDATE_LIMIT,
+        )
+        retrieval = self.retrieve_text_v2(
+            prompt_text,
+            context_id=context,
+            recall_scope=recall_scope,
+            result_limit=result_limit,
+            candidate_limit=candidate_limit,
+            include_graph_neighbors=True,
+        )
+        rendered: list[str] = []
+        for item in retrieval.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            scope = (
+                item.get("scope_provenance")
+                if isinstance(item.get("scope_provenance"), dict)
+                else {}
+            )
+            context_link = (
+                scope.get("context_link")
+                if isinstance(scope.get("context_link"), dict)
+                else {}
+            )
+            entry = {
+                "memory_id": item.get("memory_id", ""),
+                "tag": item.get("tag", ""),
+                "context_id": item.get("context_id", ""),
+                "recall_scope": scope.get("requested_scope", recall_scope),
+                "recall_provenance": scope.get("provenance", "local"),
+                "via_context_link_id": context_link.get("context_link_id", ""),
+                "via_relation_type": context_link.get("relation_type", ""),
+                "via_direction": context_link.get("direction", ""),
+                "metadata": {
+                    "display_label": item.get("label", ""),
+                    "display_summary": item.get("summary", ""),
+                    "semantic_facets": item.get("facets", []),
+                },
+            }
+            rendered.append(
+                self._format_recall_entry(
+                    entry,
+                    score=float(item.get("score", 0.0) or 0.0),
+                )
+            )
+        return retrieval, rendered
 
     def _surface_bootstrap_recall(
         self,
@@ -7779,8 +9890,174 @@ class SpikingAttentionBackend:
         *,
         context_id: str = "default",
         limit: int = 100,
+        cursor: str = "",
+        response_mode: str = "legacy",
+        include_global: bool = True,
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
+        mode = self._retrieval_response_mode(response_mode)
+        continuation = str(cursor or "").strip()
+        if mode == "legacy":
+            if continuation:
+                raise ValueError("legacy memory graph does not support cursors")
+            return self._list_memory_graph_legacy(context=context, limit=limit)
+        if type(include_global) is not bool:
+            raise ValueError("include_global must be a boolean")
+        if type(limit) is not int or limit < 1 or limit > 500:
+            raise ValueError("limit must be an integer between 1 and 500")
+        bounded_limit = limit
+        filters = {"include_global": include_global}
+        ordering = canonical_ordering(
+            (
+                {"field": "entry_updated_at", "direction": "desc"},
+                {"field": "entry_memory_id", "direction": "desc"},
+                {"field": "relationship_updated_at", "direction": "desc"},
+                {"field": "relationship_id", "direction": "desc"},
+            ),
+            unique_tie_breaker="relationship_id",
+        )
+        entry_position = None
+        relationship_position = None
+        expected_revision = None
+        codec = self._get_retrieval_cursor_codec()
+        if continuation:
+            decoded = codec.decode(
+                continuation,
+                expected_surface="memory-graph",
+                expected_response_mode=mode,
+                expected_context_id=context,
+                expected_recall_scope="local",
+                expected_filters=filters,
+                expected_ordering=ordering,
+                expected_snapshot_revision=None,
+            )
+            entry_position, relationship_position = (
+                self._graph_cursor_position_to_store(decoded.position)
+            )
+            expected_revision = str(decoded.snapshot_revision)
+
+        try:
+            page = self.memory_store.retrieval_graph_page(
+                context_id=context,
+                include_global=include_global,
+                entry_limit=bounded_limit,
+                relationship_limit=bounded_limit,
+                entry_position=entry_position,
+                relationship_position=relationship_position,
+                expected_revision=expected_revision,
+            )
+        except RetrievalSnapshotStaleError as exc:
+            if continuation:
+                raise RetrievalCursorSnapshotMismatchError() from exc
+            raise
+        roles_by_memory_id: dict[str, set[str]] = {}
+        raw_by_memory_id: dict[str, dict[str, Any]] = {}
+        for entry in page["entries"]:
+            memory_id = str(entry["memory_id"])
+            raw_by_memory_id[memory_id] = entry
+            roles_by_memory_id.setdefault(memory_id, set()).add("primary")
+        for entry in page["endpoint_entries"]:
+            memory_id = str(entry["memory_id"])
+            raw_by_memory_id.setdefault(memory_id, entry)
+            roles_by_memory_id.setdefault(memory_id, set()).add("edge-endpoint")
+        primary_ids = [str(entry["memory_id"]) for entry in page["entries"]]
+        supplemental_ids = sorted(
+            (memory_id for memory_id in raw_by_memory_id if memory_id not in primary_ids),
+            key=lambda memory_id: (
+                float(raw_by_memory_id[memory_id].get("updated_at", 0.0)),
+                memory_id,
+            ),
+            reverse=True,
+        )
+        ordered_raw_entries = [
+            raw_by_memory_id[memory_id]
+            for memory_id in [*primary_ids, *supplemental_ids]
+        ]
+        entries: list[dict[str, Any]] = []
+        for entry in ordered_raw_entries:
+            rendered = self._render_memory_entry(entry, include_vectors=False)
+            rendered["graph_page_roles"] = sorted(
+                roles_by_memory_id[str(entry["memory_id"])]
+            )
+            entries.append(rendered)
+        relationship_entries = {str(entry["memory_id"]): entry for entry in entries}
+        enriched_relationships = [
+            self._decorate_memory_relationship(relationship, relationship_entries)
+            for relationship in page["relationships"]
+        ]
+
+        has_more = bool(page["entry_has_more"] or page["relationship_has_more"])
+        next_cursor = None
+        expires_at = None
+        if has_more:
+            next_position = self._graph_cursor_position_from_store(
+                entry_position=page["entry_next_position"],
+                relationship_position=page["relationship_next_position"],
+            )
+            next_cursor = codec.encode(
+                surface="memory-graph",
+                response_mode=mode,
+                context_id=context,
+                recall_scope="local",
+                filters=filters,
+                ordering=ordering,
+                position=next_position,
+                snapshot_revision=page["snapshot_revision"],
+                ttl_seconds=DEFAULT_RETRIEVAL_CURSOR_TTL_SECONDS,
+            )
+            expires_at = codec.decode(
+                next_cursor,
+                expected_surface="memory-graph",
+                expected_response_mode=mode,
+                expected_context_id=context,
+                expected_recall_scope="local",
+                expected_filters=filters,
+                expected_ordering=ordering,
+                expected_snapshot_revision=page["snapshot_revision"],
+            ).expires_at
+        return {
+            "context_id": context,
+            "memory_db_path": str(self.memory_store.db_path),
+            "entry_count": len(entries),
+            "primary_entry_count": page["entry_returned"],
+            "relationship_endpoint_count": len(page["endpoint_entries"]),
+            "graph_entry_strategy": "cursor-primary-plus-edge-endpoints",
+            "relationship_count": len(enriched_relationships),
+            "relationship_summary": self._summarize_relationship_modes(
+                enriched_relationships
+            ),
+            "entries": entries,
+            "relationships": enriched_relationships,
+            "_retrieval_page": self._retrieval_page_metadata(
+                surface="memory-graph",
+                response_mode=mode,
+                snapshot_revision=page["snapshot_revision"],
+                filters=filters,
+                ordering=(
+                    "entries:updated_at-desc,memory_id-desc;"
+                    "relationships:updated_at-desc,relationship_id-desc"
+                ),
+                total={
+                    "nodes": page["entry_total"],
+                    "relationships": page["relationship_total"],
+                },
+                returned={
+                    "nodes": page["entry_returned"],
+                    "relationships": page["relationship_returned"],
+                },
+                has_more=has_more,
+                next_cursor=next_cursor,
+                expires_at=expires_at,
+                origin_node=codec.origin_node,
+            ),
+        }
+
+    def _list_memory_graph_legacy(
+        self,
+        *,
+        context: str,
+        limit: int,
+    ) -> dict[str, Any]:
         bounded_limit = min(max(int(limit), 1), 500)
         relationships = self.memory_store.list_relationships(
             context_id=context,
@@ -8810,14 +11087,39 @@ def get_status(context_id: str = "default") -> dict[str, Any]:
 def list_memory(
     context_id: str = "default",
     limit: int = 50,
+    include_global: bool = True,
     include_vectors: bool = False,
     recall_scope: str = "local",
+    cursor: str = "",
+    response_mode: str = "legacy",
 ) -> dict[str, Any]:
     return get_backend().list_memory(
         context_id=context_id,
         limit=limit,
+        include_global=include_global,
         include_vectors=include_vectors,
         recall_scope=recall_scope,
+        cursor=cursor,
+        response_mode=response_mode,
+    )
+
+
+def retrieve_text_v2(
+    prompt: str,
+    *,
+    context_id: str = "default",
+    recall_scope: str = "local",
+    result_limit: int = 10,
+    candidate_limit: int = 128,
+    include_graph_neighbors: bool = True,
+) -> dict[str, Any]:
+    return get_backend().retrieve_text_v2(
+        prompt,
+        context_id=context_id,
+        recall_scope=recall_scope,
+        result_limit=result_limit,
+        candidate_limit=candidate_limit,
+        include_graph_neighbors=include_graph_neighbors,
     )
 
 
@@ -9043,11 +11345,15 @@ def get_cortex_state(
     context_id: str = "default",
     agent_id: str = "",
     limit: int = 50,
+    cursor: str = "",
+    response_mode: str = "legacy",
 ) -> dict[str, Any]:
     return get_backend().get_cortex_state(
         context_id=context_id,
         agent_id=agent_id,
         limit=limit,
+        cursor=cursor,
+        response_mode=response_mode,
     )
 
 
@@ -9194,8 +11500,17 @@ def prune_memory(
 def list_memory_graph(
     context_id: str = "default",
     limit: int = 100,
+    cursor: str = "",
+    response_mode: str = "legacy",
+    include_global: bool = True,
 ) -> dict[str, Any]:
-    return get_backend().list_memory_graph(context_id=context_id, limit=limit)
+    return get_backend().list_memory_graph(
+        context_id=context_id,
+        limit=limit,
+        cursor=cursor,
+        response_mode=response_mode,
+        include_global=include_global,
+    )
 
 
 def approve_namespace_link(
