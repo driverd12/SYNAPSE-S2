@@ -184,12 +184,19 @@ cases. Acceptance checks:
 - canonical equality across repeated reads, a fresh backend, and seeded
   randomized insertion order; and
 - unchanged neural arrays, runtime fields/file, SQLite database/logical rows,
-  and SQLite WAL/journal state before and after reads, with forbidden mutators
-  tripwired.
+  and SQLite WAL/SHM/journal state before and after reads, with forbidden
+  mutators tripwired.
 
 Latency samples are informational and excluded from acceptance. When a durable
 evidence artifact is needed, write the canonical report to a new reviewed path
 with `--output`; do not overwrite or reinterpret an older report.
+
+The reviewed Phase 8 artifact is
+`docs/evidence/phase8-retrieval-v2-acceptance.json`. It is bound to clean code
+commit `738cfceb21aa878aad70cdb219ec370c86a833bc`, has owner-only mode `0600`,
+and records a passing synthetic acceptance verdict. The evidence commit that
+adds this immutable report is intentionally separate from the implementation
+commit it measures.
 
 ## Exact current limitations
 

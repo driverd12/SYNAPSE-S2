@@ -158,6 +158,13 @@ The durable idempotency, crash-recovery, and rollout contract for capture
 producers is in `docs/EXACTLY_ONCE_CAPTURE.md`.
 The bounded installed-client response profiles, receipt-safety invariants, and
 the reproducible measurement acceptance gate are in `docs/TOKEN_CONTRACTS.md`.
+The Retrieval v2 ranker, authenticated continuation, scope/provenance, and
+synthetic validation contract is in `docs/RETRIEVAL_V2_VALIDATION.md`. Its
+sanitized acceptance artifact is
+`docs/evidence/phase8-retrieval-v2-acceptance.json`, bound to clean commit
+`738cfce`; it records Recall@k 1.0, MRR 1.0, nDCG@k 0.99951846, zero namespace
+leakage, deterministic output, and unchanged measured read state. This remains
+a fixed synthetic regression gate, not a live-corpus relevance or latency SLO.
 The sanitized Phase 6 acceptance artifact is
 `docs/evidence/phase6-token-contract-acceptance.json`: it passed all 11
 correctness gates against a verified isolated recovery restore, with an
