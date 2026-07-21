@@ -1,0 +1,101 @@
+{
+  "acceptance": {
+    "accepted": true,
+    "failure_codes": [],
+    "verdict": "pass"
+  },
+  "adversarial_validation": {
+    "ack_parent_fsync_failure_left_rows_or_files": 0,
+    "bounded_directory_and_descriptor_scans": true,
+    "checkpoint_and_ack_row_document_parity": true,
+    "crash_windows_exercised": 7,
+    "empty_ledger_global_recovery_ready": false,
+    "fd_leak_and_zero_write_guards": true,
+    "full_restore_and_capture_manifest_revalidation": true,
+    "ledger_tree_and_external_witness_rollback_detected_when_main_database_current": true,
+    "peer_direction_enforced": true,
+    "stale_epoch_and_lineage_rollback_rejected": true,
+    "v5_normal_replication_rejected": true
+  },
+  "generated_at": "2026-07-21T12:11:21Z",
+  "implementation": {
+    "commit": "9a438e2882e78071238e5519ee635ab78ae95938",
+    "files": {
+      "docs/MULTI_MAC_REPLICATION.md": "33b083fe202f7477d604a2b041c1d179a7e8f4e15db9ce6fce8af118e36af428",
+      "replication_manager.py": "342a3ea4865d7522c44a053d1aca8f0c70001e1a1277346a9c6f8c43c7a0a48e",
+      "replication_protocol.py": "8c99bf5e1e50773a2aca321482334018b259d26a85c1ccd7d63470d97db59d7e",
+      "replication_store.py": "8989f4fdcc975133b8da784e1d2c21d68a2201d77704aacd8bcd9d8c3d6f5b4e",
+      "tests/test_replication.py": "36a6986c483f8784d72f82f95d2f60e9086859913199918af7d06ef8f4b9cb75"
+    },
+    "source_worktree_clean_before_evidence": true
+  },
+  "performance_observations": {
+    "acceptance_slo": false,
+    "anchor_history_audit_202_revisions_seconds": 0.174,
+    "ledger_mutation_batch_seconds": {
+      "100": 3.369,
+      "25_first": 0.812,
+      "25_second": 0.823,
+      "50": 1.619
+    },
+    "status_seconds": 0.006
+  },
+  "publication": {
+    "git_boom_push_verified": false,
+    "local_commit_created": true,
+    "public_github_push_verified": false
+  },
+  "readiness_contract": {
+    "artifact_specific_memory_recovery_cutover_ready": true,
+    "global_status_memory_recovery_cutover_ready": false,
+    "live_overwrite_performed": false,
+    "promotion_supported": false,
+    "replication_promotion_ready": false
+  },
+  "residual_boundaries": [
+    "No live synchronization, automatic transport, multi-writer merge, failover, promotion, or live-store overwrite is implemented.",
+    "A coherent rollback of the main database, replication tree, signing key, external witness, and neutral watermark requires an independent off-host or OS-protected monotonic witness to detect.",
+    "Promotion requires a future atomic neutral-watermark and destination-ledger rebase protocol.",
+    "Ledger mutations are O(n); signed archival and rotation must be implemented before the 100000-revision or row caps.",
+    "Full anchor-history audit is explicit and must be scheduled by the deployment runbook until a governed core wrapper exists.",
+    "Crash tests use deterministic injection rather than a real APFS power-cut harness."
+  ],
+  "schema": "synapse-s2.replication-acceptance.v1",
+  "scope": {
+    "authority": "authoritative-core-v6-only",
+    "receiver_action": "verified-isolated-restore-only",
+    "topology": "offline-operator-mediated-single-writer-checkpoint",
+    "transport": "private-directory-copy"
+  },
+  "tests": {
+    "resource_warnings_are_errors": true,
+    "suites": [
+      {
+        "count": 34,
+        "name": "replication",
+        "seconds": 24.947,
+        "status": "pass"
+      },
+      {
+        "count": 82,
+        "name": "authoritative-core",
+        "seconds": 21.957,
+        "status": "pass"
+      },
+      {
+        "count": 176,
+        "name": "path-binding-dashboard-mcp",
+        "seconds": 32.573,
+        "status": "pass"
+      },
+      {
+        "count": 53,
+        "name": "cli",
+        "seconds": 27.891,
+        "status": "pass"
+      }
+    ],
+    "total": 345
+  },
+  "version": 1
+}
