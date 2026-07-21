@@ -5448,12 +5448,13 @@ class DurableMemoryStore:
         repaired_at: float,
     ) -> int:
         mismatches = self._context_delivery_cursor_mismatches(conn)
+        repaired_count = 0
         for mismatch in mismatches:
             if mismatch["derived_event_id"] is None:
                 raise RuntimeError(
                     "context delivery cursor identity failed integrity validation"
                 )
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE agent_context_delivery_cursors
                 SET last_contiguous_event_id = ?, updated_at = ?
@@ -5466,7 +5467,1088 @@ class DurableMemoryStore:
                     str(mismatch["agent_id"]),
                 ),
             )
-        return len(mismatches)
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "context delivery cursor changed during repair"
+                )
+            repaired_count += 1
+        return repaired_count
+
+    def _context_delivery_publication_receipt_inventory(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        """Classify repair receipts without exposing backup paths publicly."""
+
+        rows = conn.execute(
+            """
+            SELECT operation_id, before_revision, after_revision,
+                   payload_json, created_at
+            FROM store_maintenance_receipts
+            WHERE operation_type = 'context-delivery-publication-repair'
+            ORDER BY created_at ASC, operation_id ASC
+            """
+        ).fetchall()
+        pending: list[dict[str, Any]] = []
+        verified: list[dict[str, Any]] = []
+        invalid_count = 0
+        base_fields = {
+            "protocol_version",
+            "verification_status",
+            "cursor_mismatch_count",
+            "reconciled_target_highwater",
+            "target_highwater_before",
+            "target_highwater_after",
+            "derivation_source_sha256_after",
+            "safety_backup_path",
+            "safety_backup_sha256",
+            "safety_backup_size_bytes",
+        }
+        for row in rows:
+            payload = _decode_json(str(row["payload_json"]), None)
+            status = (
+                str(payload.get("verification_status") or "")
+                if isinstance(payload, dict)
+                else ""
+            )
+            expected_fields = (
+                base_fields
+                if status == "pending"
+                else base_fields | {"verified_at"}
+                if status == "verified"
+                else set()
+            )
+            backup_path = (
+                Path(str(payload.get("safety_backup_path") or ""))
+                if isinstance(payload, dict)
+                else Path()
+            )
+            backup_parent = (self.db_path.parent / "backups").resolve()
+            payload_valid = bool(
+                isinstance(payload, dict)
+                and set(payload) == expected_fields
+                and payload.get("protocol_version")
+                == "context-delivery-publication-repair.v1"
+                and type(payload.get("cursor_mismatch_count")) is int
+                and int(payload["cursor_mismatch_count"]) >= 0
+                and type(payload.get("reconciled_target_highwater")) is bool
+                and type(payload.get("target_highwater_before")) is int
+                and int(payload["target_highwater_before"]) >= 0
+                and type(payload.get("target_highwater_after")) is int
+                and int(payload["target_highwater_after"])
+                >= int(payload["target_highwater_before"])
+                and isinstance(
+                    payload.get("derivation_source_sha256_after"), str
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(payload["derivation_source_sha256_after"]),
+                )
+                is not None
+                and isinstance(payload.get("safety_backup_sha256"), str)
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(payload["safety_backup_sha256"]),
+                )
+                is not None
+                and type(payload.get("safety_backup_size_bytes")) is int
+                and int(payload["safety_backup_size_bytes"]) > 0
+                and backup_path.is_absolute()
+                and backup_path.parent.resolve() == backup_parent
+                and backup_path.name == backup_path.resolve().name
+                and (
+                    status != "verified"
+                    or self._context_delivery_timestamp_is_valid(
+                        payload.get("verified_at")
+                    )
+                )
+            )
+            operation_id = str(row["operation_id"])
+            before_revision = str(row["before_revision"])
+            after_revision = str(row["after_revision"])
+            created_at = row["created_at"]
+            row_valid = bool(
+                re.fullmatch(r"s2maint_[0-9a-f]{32}", operation_id)
+                and re.fullmatch(r"[0-9a-f]{64}", before_revision)
+                and re.fullmatch(r"[0-9a-f]{64}", after_revision)
+                and self._context_delivery_timestamp_is_valid(created_at)
+            )
+            if not payload_valid or not row_valid:
+                invalid_count += 1
+                continue
+            record = {
+                "operation_id": operation_id,
+                "before_revision": before_revision,
+                "after_revision": after_revision,
+                "payload": dict(payload),
+                "payload_sha256": hashlib.sha256(
+                    _json_dumps(payload).encode("utf-8")
+                ).hexdigest(),
+                "created_at": float(created_at),
+            }
+            (pending if status == "pending" else verified).append(record)
+        return {
+            "invalid_count": invalid_count,
+            "pending": pending,
+            "verified": verified,
+        }
+
+    def _verify_context_delivery_publication_backup(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        backup_path = Path(str(payload["safety_backup_path"]))
+        backup_sidecars = tuple(
+            Path(str(backup_path) + suffix)
+            for suffix in ("-wal", "-shm", "-journal")
+        )
+
+        def assert_no_backup_sidecars() -> None:
+            if any(os.path.lexists(str(sidecar)) for sidecar in backup_sidecars):
+                raise RuntimeError(
+                    "context delivery repair backup has SQLite sidecars"
+                )
+
+        expected_parent = (self.db_path.parent / "backups").resolve()
+        if backup_path.parent.resolve() != expected_parent:
+            raise RuntimeError(
+                "context delivery repair backup escaped its canonical directory"
+            )
+        assert_no_backup_sidecars()
+        digest, size_bytes, metadata = self._hash_stable_regular_file(backup_path)
+        if (
+            digest != str(payload["safety_backup_sha256"])
+            or size_bytes != int(payload["safety_backup_size_bytes"])
+            or metadata.st_uid != os.getuid()
+            or int(metadata.st_nlink) != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise RuntimeError(
+                "context delivery repair backup failed durable verification"
+            )
+        assert_no_backup_sidecars()
+        with closing(
+            sqlite3.connect(
+                backup_path.as_uri() + "?mode=ro&immutable=1",
+                uri=True,
+            )
+        ) as backup:
+            quick_check = [str(row[0]) for row in backup.execute("PRAGMA quick_check")]
+            integrity_check = [
+                str(row[0]) for row in backup.execute("PRAGMA integrity_check")
+            ]
+            foreign_key_error_count = sum(
+                1 for _ in backup.execute("PRAGMA foreign_key_check")
+            )
+        assert_no_backup_sidecars()
+        if (
+            quick_check != ["ok"]
+            or integrity_check != ["ok"]
+            or foreign_key_error_count != 0
+        ):
+            raise RuntimeError(
+                "context delivery repair backup failed SQLite reverification"
+            )
+        return {
+            "sha256": digest,
+            "size_bytes": size_bytes,
+            "quick_check": quick_check,
+            "integrity_check": integrity_check,
+            "foreign_key_error_count": foreign_key_error_count,
+            "verified": True,
+        }
+
+    def _context_delivery_publication_repair_audit(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        """Classify only the derived publication state safe to rebuild offline."""
+
+        self._validate_existing_schema_compatibility_markers(conn)
+        user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if user_version != SQLITE_USER_VERSION:
+            raise CoreAuthorityError(
+                "context delivery publication repair requires authoritative v6"
+            )
+        self._assert_exact_schema_contract(conn, user_version=user_version)
+        marker = self._core_authority_marker(conn)
+        self._validate_core_authority_version_pair(conn, marker)
+        if marker is None or marker.get("service_required") is not True:
+            raise CoreAuthorityError(
+                "context delivery publication repair requires a claimed core store"
+            )
+
+        delivery_schema_errors = self._context_delivery_v2_table_errors(conn) + (
+            self._context_delivery_v2_index_errors(conn)
+        )
+        delivery_data_errors = self._context_delivery_data_errors(conn)
+        cursor_mismatches = self._context_delivery_cursor_mismatches(conn)
+        cursor_repairs_are_derived = all(
+            mismatch.get("derived_event_id") is not None
+            and not mismatch.get("integrity_errors")
+            for mismatch in cursor_mismatches
+        )
+        expected_cursor_error = (
+            []
+            if not cursor_mismatches
+            else [f"receipt-derived-cursor-mismatch:{len(cursor_mismatches)}"]
+        )
+        unrelated_delivery_errors = sorted(
+            set(delivery_data_errors) - set(expected_cursor_error)
+        )
+        highwater_contract_error_count = 0
+        try:
+            target_highwater = self._read_context_event_target_highwater(
+                conn,
+                allow_missing=False,
+            )
+        except RuntimeError:
+            target_highwater = 0
+            highwater_contract_error_count = 1
+        latest_event_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
+            ).fetchone()[0]
+            or 0
+        )
+        target_reconciliation_needed = bool(
+            highwater_contract_error_count == 0
+            and latest_event_id > target_highwater
+        )
+        target_canonicalization_needed = (
+            self._context_event_target_canonicalization_needed(conn)
+        )
+        (
+            target_integrity_error_count,
+            _,
+            _,
+            _,
+        ) = self._context_event_target_integrity_audit(conn, sample_limit=1)
+        event_ledger_integrity_error_count, _ = (
+            self._context_event_ledger_integrity_audit(conn, sample_limit=1)
+        )
+        target_highwater_error_count, _ = (
+            self._context_event_target_highwater_audit(conn)
+        )
+        repair_required = bool(
+            target_reconciliation_needed or cursor_mismatches
+        )
+        repair_receipts = (
+            self._context_delivery_publication_receipt_inventory(conn)
+        )
+        pending_repair_receipts = list(repair_receipts["pending"])
+        repair_receipt_integrity_error_count = int(
+            repair_receipts["invalid_count"]
+        )
+        derivation_source_sha256, derivation_source_row_count = (
+            self._context_delivery_publication_derivation_digest(conn)
+        )
+        settled_revision_payload = {
+            "schema_identity": f"sqlite-{SQLITE_APPLICATION_ID:x}-v{user_version}",
+            "marker_sha256": self._core_authority_marker_sha256(marker),
+            "target_highwater": target_highwater,
+            "latest_event_id": latest_event_id,
+            "target_reconciliation_needed": target_reconciliation_needed,
+            "target_canonicalization_needed": target_canonicalization_needed,
+            "delivery_schema_errors": delivery_schema_errors,
+            "delivery_data_errors": delivery_data_errors,
+            "cursor_mismatches": [
+                {
+                    "context_id": mismatch.get("context_id"),
+                    "agent_id": mismatch.get("agent_id"),
+                    "stored_event_id": mismatch.get("stored_event_id"),
+                    "derived_event_id": mismatch.get("derived_event_id"),
+                    "integrity_errors": mismatch.get("integrity_errors"),
+                }
+                for mismatch in cursor_mismatches
+            ],
+            "target_integrity_error_count": target_integrity_error_count,
+            "event_ledger_integrity_error_count": (
+                event_ledger_integrity_error_count
+            ),
+            "target_highwater_error_count": target_highwater_error_count,
+            "highwater_contract_error_count": highwater_contract_error_count,
+            "derivation_source_sha256": derivation_source_sha256,
+            "derivation_source_row_count": derivation_source_row_count,
+        }
+        settled_audit_revision = hashlib.sha256(
+            _json_dumps(settled_revision_payload).encode("utf-8")
+        ).hexdigest()
+
+        pending_repair_receipt_semantic_error_count = sum(
+            1
+            for receipt in pending_repair_receipts
+            if (
+                receipt["after_revision"] != settled_audit_revision
+                or int(receipt["payload"]["target_highwater_after"])
+                != target_highwater
+                or str(
+                    receipt["payload"]["derivation_source_sha256_after"]
+                )
+                != derivation_source_sha256
+            )
+        )
+        verified_repair_receipt_semantic_error_count = sum(
+            1
+            for receipt in repair_receipts["verified"]
+            if (
+                str(
+                    receipt["payload"]["derivation_source_sha256_after"]
+                )
+                == derivation_source_sha256
+                and (
+                    receipt["after_revision"] != settled_audit_revision
+                    or int(receipt["payload"]["target_highwater_after"])
+                    != target_highwater
+                )
+            )
+        )
+        repair_receipt_semantic_error_count = (
+            pending_repair_receipt_semantic_error_count
+            + verified_repair_receipt_semantic_error_count
+        )
+        repairable = bool(
+            not delivery_schema_errors
+            and not unrelated_delivery_errors
+            and delivery_data_errors == expected_cursor_error
+            and cursor_repairs_are_derived
+            and not target_canonicalization_needed
+            and target_integrity_error_count == 0
+            and event_ledger_integrity_error_count == 0
+            and target_highwater_error_count == 0
+            and highwater_contract_error_count == 0
+            and repair_receipt_integrity_error_count == 0
+            and repair_receipt_semantic_error_count == 0
+            and not pending_repair_receipts
+        )
+        revision_payload = {
+            "settled_audit_revision": settled_audit_revision,
+            "repair_receipt_integrity_error_count": (
+                repair_receipt_integrity_error_count
+            ),
+            "repair_receipt_semantic_error_count": (
+                repair_receipt_semantic_error_count
+            ),
+            "pending_repair_receipts": [
+                {
+                    "operation_id": receipt["operation_id"],
+                    "before_revision": receipt["before_revision"],
+                    "after_revision": receipt["after_revision"],
+                    "payload_sha256": receipt["payload_sha256"],
+                }
+                for receipt in pending_repair_receipts
+            ],
+        }
+        audit_revision = hashlib.sha256(
+            _json_dumps(revision_payload).encode("utf-8")
+        ).hexdigest()
+        return {
+            "protocol_version": "context-delivery-publication-repair.v1",
+            "status": (
+                "committed_unverified"
+                if (
+                    not repair_required
+                    and repair_receipt_integrity_error_count == 0
+                    and repair_receipt_semantic_error_count == 0
+                    and len(pending_repair_receipts) == 1
+                    and not delivery_schema_errors
+                    and not unrelated_delivery_errors
+                    and delivery_data_errors == expected_cursor_error
+                    and cursor_repairs_are_derived
+                    and not target_canonicalization_needed
+                    and target_integrity_error_count == 0
+                    and event_ledger_integrity_error_count == 0
+                    and target_highwater_error_count == 0
+                    and highwater_contract_error_count == 0
+                )
+                else "blocked"
+                if not repairable
+                else "repairable"
+                if repair_required
+                else "ready"
+            ),
+            "audit_revision": audit_revision,
+            "settled_audit_revision": settled_audit_revision,
+            "repair_required": repair_required,
+            "repairable": repairable,
+            "cursor_mismatch_count": len(cursor_mismatches),
+            "target_reconciliation_needed": target_reconciliation_needed,
+            "target_highwater": target_highwater,
+            "latest_event_id": latest_event_id,
+            "delivery_schema_error_count": len(delivery_schema_errors),
+            "unrelated_delivery_error_count": len(unrelated_delivery_errors),
+            "target_canonicalization_needed": target_canonicalization_needed,
+            "target_integrity_error_count": target_integrity_error_count,
+            "event_ledger_integrity_error_count": (
+                event_ledger_integrity_error_count
+            ),
+            "target_highwater_error_count": target_highwater_error_count,
+            "highwater_contract_error_count": highwater_contract_error_count,
+            "derivation_source_sha256": derivation_source_sha256,
+            "derivation_source_row_count": derivation_source_row_count,
+            "repair_receipt_integrity_error_count": (
+                repair_receipt_integrity_error_count
+            ),
+            "repair_receipt_semantic_error_count": (
+                repair_receipt_semantic_error_count
+            ),
+            "pending_repair_receipt_semantic_error_count": (
+                pending_repair_receipt_semantic_error_count
+            ),
+            "verified_repair_receipt_semantic_error_count": (
+                verified_repair_receipt_semantic_error_count
+            ),
+            "pending_repair_receipt_count": len(pending_repair_receipts),
+        }
+
+    @staticmethod
+    def _context_delivery_publication_derivation_digest(
+        conn: sqlite3.Connection,
+    ) -> tuple[str, int]:
+        """Hash every raw row that can influence target or cursor derivation."""
+
+        sources = (
+            (
+                "agent_context_events",
+                """
+                SELECT event_id, context_id, agent_targets_json
+                FROM agent_context_events
+                ORDER BY event_id
+                """,
+            ),
+            (
+                "agent_context_event_targets",
+                """
+                SELECT event_id, target_kind, target_id
+                FROM agent_context_event_targets
+                ORDER BY event_id, target_kind, target_id
+                """,
+            ),
+            (
+                "agent_context_consumers",
+                """
+                SELECT agent_id, consumer_kind, enabled, created_at, updated_at
+                FROM agent_context_consumers
+                ORDER BY agent_id
+                """,
+            ),
+            (
+                "agent_context_consumer_groups",
+                """
+                SELECT agent_id, group_id, created_at
+                FROM agent_context_consumer_groups
+                ORDER BY agent_id, group_id
+                """,
+            ),
+            (
+                "agent_context_deliveries",
+                """
+                SELECT delivery_id, context_id, agent_id, event_id, state,
+                       attempt_count, current_receipt_id, lease_owner,
+                       first_delivered_at, last_delivered_at, lease_expires_at,
+                       acknowledged_at, cancelled_at, created_at, updated_at
+                FROM agent_context_deliveries
+                ORDER BY context_id, agent_id, event_id, delivery_id
+                """,
+            ),
+            (
+                "agent_context_delivery_receipts",
+                """
+                SELECT receipt_id, delivery_id, attempt_number,
+                       consumer_instance_id, state, leased_at,
+                       lease_expires_at, acknowledged_at, released_at,
+                       created_at, updated_at
+                FROM agent_context_delivery_receipts
+                ORDER BY delivery_id, attempt_number, receipt_id
+                """,
+            ),
+            (
+                "agent_context_delivery_ack_tombstones",
+                """
+                SELECT receipt_digest, delivery_id, context_id, agent_id,
+                       event_id, attempt_number, acknowledged_at, deleted_at
+                FROM agent_context_delivery_ack_tombstones
+                ORDER BY context_id, agent_id, event_id, attempt_number,
+                         receipt_digest
+                """,
+            ),
+            (
+                "agent_context_delivery_cursors",
+                """
+                SELECT context_id, agent_id, last_contiguous_event_id, updated_at
+                FROM agent_context_delivery_cursors
+                ORDER BY context_id, agent_id
+                """,
+            ),
+            (
+                "context_event_targets_reconciled_through",
+                """
+                SELECT key, value_json, updated_at
+                FROM store_metadata
+                WHERE key = 'context_event_targets_reconciled_through'
+                ORDER BY key
+                """,
+            ),
+        )
+        digest = hashlib.sha256()
+        row_count = 0
+        for source_name, query in sources:
+            encoded_name = source_name.encode("utf-8")
+            digest.update(len(encoded_name).to_bytes(4, "big"))
+            digest.update(encoded_name)
+            for row in conn.execute(query):
+                payload = json.dumps(
+                    list(row),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                digest.update(len(payload).to_bytes(8, "big"))
+                digest.update(payload)
+                row_count += 1
+        return digest.hexdigest(), row_count
+
+    def audit_context_delivery_publication_repair(self) -> dict[str, Any]:
+        """Return a content-free review token for the narrow offline repair."""
+
+        with closing(self._connect_read_only()) as conn:
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("BEGIN")
+            try:
+                result = self._context_delivery_publication_repair_audit(conn)
+            finally:
+                conn.rollback()
+        return result
+
+    def _prove_context_delivery_publication_repair_durable(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        lease: CoreAuthorityLease,
+        receipt: dict[str, Any],
+        receipt_status: str,
+        require_current_derivation_binding: bool = True,
+    ) -> dict[str, Any]:
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+        if (
+            checkpoint is None
+            or int(checkpoint[0]) != 0
+            or int(checkpoint[1]) != int(checkpoint[2])
+        ):
+            raise RuntimeError(
+                "context delivery publication repair checkpoint was incomplete"
+            )
+        lease.assert_core_for(self.db_path)
+        audit = self._context_delivery_publication_repair_audit(conn)
+        expected_audit_status = (
+            "committed_unverified" if receipt_status == "pending" else "ready"
+        )
+        if audit["status"] != expected_audit_status:
+            raise RuntimeError(
+                "context delivery publication post-commit audit failed"
+            )
+        inventory = self._context_delivery_publication_receipt_inventory(conn)
+        matching = [
+            candidate
+            for candidate in inventory[receipt_status]
+            if candidate["operation_id"] == receipt["operation_id"]
+            and candidate["payload_sha256"] == receipt["payload_sha256"]
+            and candidate["before_revision"] == receipt["before_revision"]
+            and candidate["after_revision"] == receipt["after_revision"]
+        ]
+        if inventory["invalid_count"] or len(matching) != 1:
+            raise RuntimeError(
+                "context delivery publication maintenance receipt is invalid"
+            )
+        payload = matching[0]["payload"]
+        receipt_highwater = int(payload["target_highwater_after"])
+        current_highwater = int(audit["target_highwater"])
+        highwater_inconsistent = bool(
+            require_current_derivation_binding
+            and receipt_highwater != current_highwater
+        )
+        if highwater_inconsistent:
+            raise RuntimeError(
+                "context delivery publication receipt high-water is inconsistent"
+            )
+        if require_current_derivation_binding:
+            if receipt["after_revision"] != audit["settled_audit_revision"]:
+                raise RuntimeError(
+                    "context delivery publication receipt revision is inconsistent"
+                )
+            if (
+                str(payload["derivation_source_sha256_after"])
+                != str(audit["derivation_source_sha256"])
+            ):
+                raise RuntimeError(
+                    "context delivery publication receipt source digest is inconsistent"
+                )
+        quick_check = [
+            str(row[0]) for row in conn.execute("PRAGMA quick_check")
+        ]
+        foreign_key_error_count = sum(
+            1 for _ in conn.execute("PRAGMA foreign_key_check")
+        )
+        self._run_migrations(conn, allow_mutation=False)
+        backup_verification = (
+            self._verify_context_delivery_publication_backup(payload)
+        )
+        if quick_check != ["ok"] or foreign_key_error_count != 0:
+            raise RuntimeError(
+                "context delivery publication durable verification failed"
+            )
+        return {
+            "audit": audit,
+            "receipt": matching[0],
+            "checkpoint": [int(value) for value in checkpoint],
+            "quick_check": quick_check,
+            "foreign_key_error_count": foreign_key_error_count,
+            "backup_verification": backup_verification,
+        }
+
+    def _verify_pending_context_delivery_publication_repair(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        lease: CoreAuthorityLease,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        pending_proof = self._prove_context_delivery_publication_repair_durable(
+            conn,
+            lease=lease,
+            receipt=receipt,
+            receipt_status="pending",
+        )
+        pending_payload = dict(pending_proof["receipt"]["payload"])
+        pending_payload_sha256 = str(
+            pending_proof["receipt"]["payload_sha256"]
+        )
+        conn.execute("BEGIN EXCLUSIVE")
+        try:
+            lease.assert_core_for(self.db_path)
+            current_audit = self._context_delivery_publication_repair_audit(conn)
+            if current_audit["status"] != "committed_unverified":
+                raise RuntimeError(
+                    "context delivery publication pending state changed"
+                )
+            inventory = self._context_delivery_publication_receipt_inventory(conn)
+            matching = [
+                candidate
+                for candidate in inventory["pending"]
+                if candidate["operation_id"] == receipt["operation_id"]
+                and candidate["payload_sha256"] == pending_payload_sha256
+                and candidate["before_revision"] == receipt["before_revision"]
+                and candidate["after_revision"] == receipt["after_revision"]
+                and candidate["created_at"] == receipt["created_at"]
+            ]
+            if inventory["invalid_count"] or len(matching) != 1:
+                raise RuntimeError(
+                    "context delivery publication pending receipt changed"
+                )
+            current_receipt = matching[0]
+            current_payload = current_receipt["payload"]
+            if (
+                current_receipt["after_revision"]
+                != current_audit["settled_audit_revision"]
+                or int(current_payload["target_highwater_after"])
+                != int(current_audit["target_highwater"])
+                or str(current_payload["derivation_source_sha256_after"])
+                != str(current_audit["derivation_source_sha256"])
+            ):
+                raise RuntimeError(
+                    "context delivery publication pending receipt is not bound to the repaired state"
+                )
+            verified_payload = {
+                **current_payload,
+                "verification_status": "verified",
+                "verified_at": max(
+                    time.time(),
+                    float(current_receipt["created_at"]),
+                ),
+            }
+            cursor = conn.execute(
+                """
+                UPDATE store_maintenance_receipts
+                SET payload_json = ?
+                WHERE operation_id = ?
+                  AND before_revision = ?
+                  AND after_revision = ?
+                  AND created_at = ?
+                  AND payload_json = ?
+                """,
+                (
+                    _json_dumps(verified_payload),
+                    current_receipt["operation_id"],
+                    current_receipt["before_revision"],
+                    current_receipt["after_revision"],
+                    current_receipt["created_at"],
+                    _json_dumps(current_payload),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "context delivery publication pending receipt changed"
+                )
+            lease.assert_core_for(self.db_path)
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+        inventory = self._context_delivery_publication_receipt_inventory(conn)
+        verified_matches = [
+            candidate
+            for candidate in inventory["verified"]
+            if candidate["operation_id"] == receipt["operation_id"]
+        ]
+        if inventory["invalid_count"] or len(verified_matches) != 1:
+            raise RuntimeError(
+                "context delivery publication verified receipt did not persist"
+            )
+        final_proof = self._prove_context_delivery_publication_repair_durable(
+            conn,
+            lease=lease,
+            receipt=verified_matches[0],
+            receipt_status="verified",
+        )
+        return {
+            **final_proof,
+            "pending_checkpoint": pending_proof["checkpoint"],
+        }
+
+    def repair_context_delivery_publication(
+        self,
+        *,
+        expected_revision: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Repair only deterministic target high-water and cursor derivations.
+
+        The caller must hold one unbound authoritative-core lease while the
+        service is offline. A reviewed audit revision, SQLite-verified safety
+        backup, exclusive transaction, durable maintenance receipt, and
+        post-commit audit fence every mutation.
+        """
+
+        if confirm is not True:
+            raise ValueError(
+                "context delivery publication repair requires confirm=True"
+            )
+        expected = str(expected_revision or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+            raise ValueError(
+                "context delivery publication repair requires a reviewed audit revision"
+            )
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "context delivery publication repair requires an unclaimed core maintenance lease"
+            )
+
+        safety_backup: dict[str, Any] | None = None
+        repair_committed = False
+        try:
+            with closing(self._connect_existing_write()) as conn:
+                before_data_version = int(
+                    conn.execute("PRAGMA data_version").fetchone()[0]
+                )
+                before = self._context_delivery_publication_repair_audit(conn)
+                if before["audit_revision"] != expected:
+                    raise RuntimeError(
+                        "context delivery publication repair plan is stale; rerun the audit"
+                    )
+                if before["status"] == "ready":
+                    inventory = (
+                        self._context_delivery_publication_receipt_inventory(conn)
+                    )
+                    latest_verified = (
+                        inventory["verified"][-1]
+                        if inventory["verified"]
+                        else None
+                    )
+                    ready_proof = (
+                        None
+                        if latest_verified is None
+                        else self._prove_context_delivery_publication_repair_durable(
+                            conn,
+                            lease=lease,
+                            receipt=latest_verified,
+                            receipt_status="verified",
+                            require_current_derivation_binding=False,
+                        )
+                    )
+                    if ready_proof is None:
+                        checkpoint_row = conn.execute(
+                            "PRAGMA wal_checkpoint(FULL)"
+                        ).fetchone()
+                        if (
+                            checkpoint_row is None
+                            or int(checkpoint_row[0]) != 0
+                            or int(checkpoint_row[1]) != int(checkpoint_row[2])
+                        ):
+                            raise RuntimeError(
+                                "context delivery publication ready checkpoint was incomplete"
+                            )
+                        lease.assert_core_for(self.db_path)
+                        ready_quick_check = [
+                            str(row[0])
+                            for row in conn.execute("PRAGMA quick_check")
+                        ]
+                        ready_foreign_key_error_count = sum(
+                            1 for _ in conn.execute("PRAGMA foreign_key_check")
+                        )
+                        self._run_migrations(conn, allow_mutation=False)
+                        if (
+                            ready_quick_check != ["ok"]
+                            or ready_foreign_key_error_count != 0
+                        ):
+                            raise RuntimeError(
+                                "context delivery publication ready verification failed"
+                            )
+                    return {
+                        "action": "context-delivery-publication-repair",
+                        "status": "ready",
+                        "operation_id": (
+                            None
+                            if latest_verified is None
+                            else latest_verified["operation_id"]
+                        ),
+                        "repair_confirmed": True,
+                        "expected_revision": expected,
+                        "reconciled_target_highwater": False,
+                        "repaired_cursor_count": 0,
+                        "safety_backup": None,
+                        "before": before,
+                        "after": (
+                            before
+                            if ready_proof is None
+                            else ready_proof["audit"]
+                        ),
+                        "checkpoint": (
+                            [int(value) for value in checkpoint_row]
+                            if ready_proof is None
+                            else ready_proof["checkpoint"]
+                        ),
+                        "quick_check": (
+                            ready_quick_check
+                            if ready_proof is None
+                            else ready_proof["quick_check"]
+                        ),
+                        "foreign_key_error_count": (
+                            ready_foreign_key_error_count
+                            if ready_proof is None
+                            else ready_proof["foreign_key_error_count"]
+                        ),
+                        "maintenance_receipt_verified": bool(ready_proof),
+                        "verification_passed": True,
+                    }
+                if before["status"] == "committed_unverified":
+                    inventory = (
+                        self._context_delivery_publication_receipt_inventory(conn)
+                    )
+                    if (
+                        inventory["invalid_count"]
+                        or len(inventory["pending"]) != 1
+                    ):
+                        raise RuntimeError(
+                            "context delivery publication pending receipt is ambiguous"
+                        )
+                    pending_receipt = inventory["pending"][0]
+                    proof = (
+                        self._verify_pending_context_delivery_publication_repair(
+                            conn,
+                            lease=lease,
+                            receipt=pending_receipt,
+                        )
+                    )
+                    return {
+                        "action": "context-delivery-publication-repair",
+                        "status": "verified",
+                        "operation_id": pending_receipt["operation_id"],
+                        "repair_confirmed": True,
+                        "expected_revision": expected,
+                        "reconciled_target_highwater": bool(
+                            pending_receipt["payload"][
+                                "reconciled_target_highwater"
+                            ]
+                        ),
+                        "repaired_cursor_count": int(
+                            pending_receipt["payload"]["cursor_mismatch_count"]
+                        ),
+                        "safety_backup": {
+                            "backup_path": pending_receipt["payload"][
+                                "safety_backup_path"
+                            ],
+                            **proof["backup_verification"],
+                        },
+                        "checkpoint": proof["checkpoint"],
+                        "quick_check": proof["quick_check"],
+                        "foreign_key_error_count": proof[
+                            "foreign_key_error_count"
+                        ],
+                        "maintenance_receipt_verified": True,
+                        "before": before,
+                        "after": proof["audit"],
+                        "verification_passed": True,
+                    }
+                if before["status"] != "repairable":
+                    raise RuntimeError(
+                        "context delivery publication state is not narrowly repairable"
+                    )
+                safety_backup = self._verified_safety_backup(
+                    conn,
+                    label="pre-context-delivery-publication-repair",
+                )
+                if int(conn.execute("PRAGMA data_version").fetchone()[0]) != (
+                    before_data_version
+                ):
+                    raise RuntimeError(
+                        "memory store changed during the safety backup; rerun the audit"
+                    )
+
+                conn.execute("BEGIN EXCLUSIVE")
+                try:
+                    lease.assert_core_for(self.db_path)
+                    current = self._context_delivery_publication_repair_audit(conn)
+                    if current["audit_revision"] != expected:
+                        raise RuntimeError(
+                            "context delivery publication repair plan changed before mutation"
+                        )
+                    repaired_at = time.time()
+                    reconciled_target_highwater = bool(
+                        current["target_reconciliation_needed"]
+                    )
+                    if reconciled_target_highwater:
+                        highwater_update = conn.execute(
+                            """
+                            UPDATE store_metadata
+                            SET value_json = ?, updated_at = ?
+                            WHERE key = 'context_event_targets_reconciled_through'
+                            """,
+                            (
+                                json.dumps(int(current["latest_event_id"])),
+                                repaired_at,
+                            ),
+                        )
+                        if highwater_update.rowcount != 1:
+                            raise RuntimeError(
+                                "context delivery target high-water changed during repair"
+                            )
+                    repaired_cursor_count = self._repair_context_delivery_cursors(
+                        conn,
+                        repaired_at=repaired_at,
+                    )
+                    if repaired_cursor_count != int(
+                        current["cursor_mismatch_count"]
+                    ):
+                        raise RuntimeError(
+                            "context delivery cursor repair count changed"
+                        )
+                    after = self._context_delivery_publication_repair_audit(conn)
+                    if after["status"] != "ready":
+                        raise RuntimeError(
+                            "context delivery publication verification failed; transaction rolled back"
+                        )
+                    operation_id = "s2maint_" + uuid.uuid4().hex
+                    receipt_payload = {
+                        "protocol_version": (
+                            "context-delivery-publication-repair.v1"
+                        ),
+                        "verification_status": "pending",
+                        "cursor_mismatch_count": repaired_cursor_count,
+                        "reconciled_target_highwater": (
+                            reconciled_target_highwater
+                        ),
+                        "target_highwater_before": int(
+                            current["target_highwater"]
+                        ),
+                        "target_highwater_after": int(
+                            after["target_highwater"]
+                        ),
+                        "derivation_source_sha256_after": str(
+                            after["derivation_source_sha256"]
+                        ),
+                        "safety_backup_path": safety_backup["backup_path"],
+                        "safety_backup_sha256": safety_backup["sha256"],
+                        "safety_backup_size_bytes": int(
+                            safety_backup["size_bytes"]
+                        ),
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO store_maintenance_receipts (
+                            operation_id, operation_type, context_id,
+                            before_revision, after_revision, payload_json,
+                            created_at
+                        ) VALUES (?, ?, NULL, ?, ?, ?, ?)
+                        """,
+                        (
+                            operation_id,
+                            "context-delivery-publication-repair",
+                            expected,
+                            str(after["settled_audit_revision"]),
+                            _json_dumps(receipt_payload),
+                            repaired_at,
+                        ),
+                    )
+                    lease.assert_core_for(self.db_path)
+                    conn.commit()
+                    repair_committed = True
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+
+                inventory = self._context_delivery_publication_receipt_inventory(
+                    conn
+                )
+                pending_matches = [
+                    receipt
+                    for receipt in inventory["pending"]
+                    if receipt["operation_id"] == operation_id
+                ]
+                if inventory["invalid_count"] or len(pending_matches) != 1:
+                    raise RuntimeError(
+                        "context delivery publication pending receipt did not persist"
+                    )
+                proof = self._verify_pending_context_delivery_publication_repair(
+                    conn,
+                    lease=lease,
+                    receipt=pending_matches[0],
+                )
+                verified = proof["audit"]
+                checkpoint = proof["checkpoint"]
+                quick_check = proof["quick_check"]
+                foreign_key_error_count = proof["foreign_key_error_count"]
+                receipt_verified = True
+            return {
+                "action": "context-delivery-publication-repair",
+                "status": "repaired",
+                "operation_id": operation_id,
+                "repair_confirmed": True,
+                "expected_revision": expected,
+                "reconciled_target_highwater": reconciled_target_highwater,
+                "repaired_cursor_count": repaired_cursor_count,
+                "safety_backup": safety_backup,
+                "checkpoint": checkpoint,
+                "quick_check": quick_check,
+                "foreign_key_error_count": foreign_key_error_count,
+                "maintenance_receipt_verified": receipt_verified,
+                "before": before,
+                "after": verified,
+                "verification_passed": True,
+            }
+        except Exception:
+            if safety_backup is not None and not repair_committed:
+                try:
+                    self._discard_safety_backup(safety_backup)
+                except Exception:
+                    LOGGER.exception(
+                        "failed to discard unused context delivery repair backup"
+                    )
+            LOGGER.exception("failed to repair context delivery publication state")
+            raise
 
     def _context_delivery_schema_is_v2(self, conn: sqlite3.Connection) -> bool:
         return not self._context_delivery_v2_table_errors(conn) and not (
@@ -6159,18 +7241,16 @@ class DurableMemoryStore:
         self,
         conn: sqlite3.Connection,
     ) -> bool:
-        highwater_row = conn.execute(
-            "SELECT value_json FROM store_metadata WHERE key = ?",
-            ("context_event_targets_reconciled_through",),
-        ).fetchone()
-        try:
-            highwater = int(
-                _decode_json(str(highwater_row["value_json"]), 0)
-                if highwater_row is not None
-                else 0
-            )
-        except (TypeError, ValueError, OverflowError):
-            highwater = 0
+        migration_applied = bool(
+            conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("context_event_targets_v2",),
+            ).fetchone()
+        )
+        highwater = self._read_context_event_target_highwater(
+            conn,
+            allow_missing=not migration_applied,
+        )
         latest_event_id = int(
             conn.execute(
                 "SELECT COALESCE(MAX(event_id), 0) FROM agent_context_events"
@@ -6178,6 +7258,39 @@ class DurableMemoryStore:
             or 0
         )
         return latest_event_id > max(0, highwater)
+
+    @staticmethod
+    def _read_context_event_target_highwater(
+        conn: sqlite3.Connection,
+        *,
+        allow_missing: bool,
+    ) -> int:
+        """Read one exact canonical nonnegative target high-water value."""
+
+        row = conn.execute(
+            "SELECT value_json FROM store_metadata WHERE key = ?",
+            ("context_event_targets_reconciled_through",),
+        ).fetchone()
+        if row is None:
+            if allow_missing:
+                return 0
+            raise RuntimeError("context event target high-water is missing")
+        raw_value = str(row["value_json"])
+        try:
+            decoded = json.loads(raw_value)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "context event target high-water is malformed"
+            ) from exc
+        if (
+            type(decoded) is not int
+            or decoded < 0
+            or raw_value != json.dumps(decoded)
+        ):
+            raise RuntimeError(
+                "context event target high-water is noncanonical"
+            )
+        return int(decoded)
 
     def _context_event_target_canonicalization_needed(
         self,
@@ -6443,8 +7556,8 @@ class DurableMemoryStore:
             for row in rows[:bounded_sample_limit]
         ]
 
-    @staticmethod
     def _context_event_target_highwater_audit(
+        self,
         conn: sqlite3.Connection,
     ) -> tuple[int, list[dict[str, Any]]]:
         latest_event_id = int(
@@ -6453,16 +7566,18 @@ class DurableMemoryStore:
             ).fetchone()[0]
             or 0
         )
-        highwater_row = conn.execute(
-            "SELECT value_json FROM store_metadata WHERE key = ?",
-            ("context_event_targets_reconciled_through",),
-        ).fetchone()
-        if highwater_row is None:
-            return 0, []
         try:
-            highwater = int(json.loads(str(highwater_row["value_json"])))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return 0, []
+            highwater = self._read_context_event_target_highwater(
+                conn,
+                allow_missing=False,
+            )
+        except RuntimeError:
+            return 1, [
+                {
+                    "latest_event_id": latest_event_id,
+                    "reason": "target-reconciliation-highwater-invalid",
+                }
+            ]
         if highwater <= latest_event_id:
             return 0, []
         return 1, [
@@ -6544,39 +7659,75 @@ class DurableMemoryStore:
         conn: sqlite3.Connection,
         *,
         reconciled_at: float,
+        strict_existing_targets: bool = False,
     ) -> int:
-        highwater_row = conn.execute(
-            "SELECT value_json FROM store_metadata WHERE key = ?",
-            ("context_event_targets_reconciled_through",),
-        ).fetchone()
-        try:
-            highwater = int(
-                _decode_json(str(highwater_row["value_json"]), 0)
-                if highwater_row is not None
-                else 0
-            )
-        except (TypeError, ValueError, OverflowError):
-            highwater = 0
+        migration_applied = bool(
+            conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("context_event_targets_v2",),
+            ).fetchone()
+        )
+        highwater = self._read_context_event_target_highwater(
+            conn,
+            allow_missing=not migration_applied,
+        )
         rows = conn.execute(
             """
-            SELECT event_id, agent_targets_json, created_at
+            SELECT event_id, context_id, agent_targets_json, created_at
             FROM agent_context_events
             WHERE event_id > ?
             ORDER BY event_id ASC
             """,
             (max(0, highwater),),
         ).fetchall()
+        affected_contexts = {
+            str(row["context_id"])
+            for row in rows
+        }
         inserted_count = 0
         for row in rows:
+            event_id = int(row["event_id"])
             raw_targets = _decode_json(str(row["agent_targets_json"]), None)
             if not isinstance(raw_targets, list):
+                if strict_existing_targets:
+                    raise RuntimeError(
+                        "context event target envelope changed before atomic publication"
+                    )
                 # Invalid envelopes remain deliberately unrouted and visible in
                 # delivery health. Advancing the scan highwater avoids turning
                 # every connection into a writer while still failing closed.
                 continue
             targets = self._normalize_event_targets(raw_targets)
-            target_records = self._normalized_event_target_records(targets)
+            target_records = sorted(
+                self._normalized_event_target_records(targets)
+            )
+            existing_target_records = [
+                (str(target["target_kind"]), str(target["target_id"]))
+                for target in conn.execute(
+                    """
+                    SELECT target_kind, target_id
+                    FROM agent_context_event_targets
+                    WHERE event_id = ?
+                    ORDER BY target_kind, target_id
+                    """,
+                    (event_id,),
+                ).fetchall()
+            ]
+            if strict_existing_targets and (
+                raw_targets != targets
+                or (
+                    existing_target_records
+                    and existing_target_records != target_records
+                )
+            ):
+                raise RuntimeError(
+                    "context event target rows changed before atomic publication"
+                )
             if not target_records:
+                if strict_existing_targets and existing_target_records:
+                    raise RuntimeError(
+                        "context event target rows changed before atomic publication"
+                    )
                 continue
             if raw_targets != targets:
                 conn.execute(
@@ -6585,29 +7736,53 @@ class DurableMemoryStore:
                     SET agent_targets_json = ?
                     WHERE event_id = ?
                     """,
-                    (_json_dumps(targets), int(row["event_id"])),
+                    (_json_dumps(targets), event_id),
                 )
-            cursor = conn.executemany(
-                """
-                INSERT OR IGNORE INTO agent_context_event_targets (
-                    event_id,
-                    target_kind,
-                    target_id,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?)
-                """,
-                [
-                    (
-                        int(row["event_id"]),
+            if not strict_existing_targets or not existing_target_records:
+                cursor = conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO agent_context_event_targets (
+                        event_id,
                         target_kind,
                         target_id,
-                        float(row["created_at"]),
+                        created_at
                     )
-                    for target_kind, target_id in target_records
-                ],
-            )
-            inserted_count += max(0, int(cursor.rowcount))
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            event_id,
+                            target_kind,
+                            target_id,
+                            float(row["created_at"]),
+                        )
+                        for target_kind, target_id in target_records
+                    ],
+                )
+                inserted_count += max(0, int(cursor.rowcount))
+        # Cursor values are derived from the complete routed ledger, including
+        # events that are deliberately ineligible for a consumer. Reconcile
+        # every existing cursor in each affected namespace before publishing
+        # the matching target high-water. This also closes the rolling-writer
+        # race where an older process commits an event after connection
+        # preflight but before this writer obtains BEGIN IMMEDIATE.
+        for affected_context in sorted(affected_contexts):
+            cursor_rows = conn.execute(
+                """
+                SELECT agent_id
+                FROM agent_context_delivery_cursors
+                WHERE context_id = ?
+                ORDER BY agent_id
+                """,
+                (affected_context,),
+            ).fetchall()
+            for cursor_row in cursor_rows:
+                self._advance_context_cursor(
+                    conn,
+                    context_id=affected_context,
+                    agent_id=str(cursor_row["agent_id"]),
+                    now=reconciled_at,
+                )
         if rows:
             highwater = int(rows[-1]["event_id"])
         latest_event_id = int(
@@ -7120,24 +8295,12 @@ class DurableMemoryStore:
                     ("secret_content_scrub_v3", time.time()),
                 )
             if not startup_target_integrity_required:
-                prior_highwater_row = conn.execute(
-                    "SELECT value_json FROM store_metadata WHERE key = ?",
-                    ("context_event_targets_reconciled_through",),
-                ).fetchone()
-                try:
-                    target_integrity_after_event_id = max(
-                        0,
-                        int(
-                            _decode_json(
-                                str(prior_highwater_row["value_json"]),
-                                0,
-                            )
-                            if prior_highwater_row is not None
-                            else 0
-                        ),
+                target_integrity_after_event_id = (
+                    self._read_context_event_target_highwater(
+                        conn,
+                        allow_missing=False,
                     )
-                except (TypeError, ValueError, OverflowError):
-                    target_integrity_after_event_id = 0
+                )
             target_migration_was_applied = bool(
                 conn.execute(
                     "SELECT 1 FROM store_migrations WHERE key = ?",
@@ -10792,6 +11955,16 @@ class DurableMemoryStore:
                 for target_kind, target_id in target_records
             ],
         )
+        # Publishing owns the canonical target rows, but the durable routing
+        # high-water and receipt-derived cursors must cross the same atomic
+        # boundary. Reusing reconciliation also catches a committed event from
+        # a rolling old writer without skipping it by blindly assigning this
+        # event ID as the new high-water.
+        self._reconcile_context_event_targets(
+            conn,
+            reconciled_at=time.time(),
+            strict_existing_targets=True,
+        )
         event_row = conn.execute(
             "SELECT * FROM agent_context_events WHERE event_id = ?",
             (event_id,),
@@ -11336,21 +12509,12 @@ class DurableMemoryStore:
                             """,
                             (str(context_id), bounded_event_id),
                         )
-                        highwater_row = conn.execute(
-                            """
-                            SELECT value_json
-                            FROM store_metadata
-                            WHERE key = 'context_event_targets_reconciled_through'
-                            """
-                        ).fetchone()
-                        try:
-                            target_highwater = int(
-                                json.loads(str(highwater_row["value_json"]))
-                                if highwater_row is not None
-                                else 0
+                        target_highwater = (
+                            self._read_context_event_target_highwater(
+                                conn,
+                                allow_missing=False,
                             )
-                        except (TypeError, ValueError, json.JSONDecodeError):
-                            target_highwater = 0
+                        )
                         latest_event_id = int(
                             conn.execute(
                                 """

@@ -1113,8 +1113,8 @@ class DurableContextEventDeliveryTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = self._store(tmp)
             self._publish(store, 1, targets=["mcp-clients"])
-            # Advance the reconciliation high-water through the first event.
-            store = self._store(tmp)
+            # Current publishers advance their own target high-water. Simulate
+            # one rolling old writer that commits only the legacy envelope.
             with closing(sqlite3.connect(store.db_path)) as conn:
                 cursor = conn.execute(
                     """
@@ -1160,6 +1160,228 @@ class DurableContextEventDeliveryTests(unittest.TestCase):
             late_event_id,
             [delivery["event_id"] for delivery in leased["deliveries"]],
         )
+
+    def test_atomic_publish_refuses_mismatched_rolling_writer_targets(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            first = self._publish(store, 1, targets=["agent-a"])
+            with closing(store._connect()) as publish_connection:
+                # The connection has completed its ordinary integrity preflight.
+                # Reproduce a rolling writer committing a mismatched envelope
+                # and route before this connection obtains BEGIN IMMEDIATE.
+                with closing(sqlite3.connect(store.db_path)) as old_writer:
+                    cursor = old_writer.execute(
+                        """
+                        INSERT INTO agent_context_events (
+                            context_id, source_surface, event_type, summary,
+                            payload_json, agent_targets_json, created_at
+                        ) VALUES (?, 'old-process', 'rolling-mismatch',
+                                  'mismatched old route', '{}', ?, 500.0)
+                        """,
+                        (self.context_id, json.dumps(["agent-a"])),
+                    )
+                    raced_event_id = int(cursor.lastrowid)
+                    old_writer.execute(
+                        """
+                        INSERT INTO agent_context_event_targets (
+                            event_id, target_kind, target_id, created_at
+                        ) VALUES (?, 'agent', 'agent-b', 500.0)
+                        """,
+                        (raced_event_id,),
+                    )
+                    old_writer.commit()
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "target rows changed before atomic publication",
+                ):
+                    with store._transaction(publish_connection, immediate=True):
+                        store._publish_context_event_conn(
+                            publish_connection,
+                            context_id=self.context_id,
+                            source_surface="current-process",
+                            event_type="must-rollback",
+                            summary="current event must roll back",
+                            payload_json="{}",
+                            targets=["mcp-clients"],
+                            created_at=501.0,
+                        )
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                events = conn.execute(
+                    """
+                    SELECT event_id, event_type
+                    FROM agent_context_events
+                    ORDER BY event_id
+                    """
+                ).fetchall()
+                target_rows = conn.execute(
+                    """
+                    SELECT event_id, target_kind, target_id
+                    FROM agent_context_event_targets
+                    ORDER BY event_id, target_kind, target_id
+                    """
+                ).fetchall()
+                highwater = json.loads(
+                    conn.execute(
+                        """
+                        SELECT value_json FROM store_metadata
+                        WHERE key = 'context_event_targets_reconciled_through'
+                        """
+                    ).fetchone()[0]
+                )
+
+        self.assertEqual(
+            events,
+            [
+                (first["event_id"], "delivery-contract"),
+                (raced_event_id, "rolling-mismatch"),
+            ],
+        )
+        self.assertEqual(
+            target_rows,
+            [
+                (first["event_id"], "agent", "agent-a"),
+                (raced_event_id, "agent", "agent-b"),
+            ],
+        )
+        self.assertEqual(highwater, first["event_id"])
+
+    def test_publish_advances_target_reconciliation_highwater_atomically(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            event = self._publish(store, 1, targets=["mcp-clients"])
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                highwater = json.loads(
+                    conn.execute(
+                        """
+                        SELECT value_json
+                        FROM store_metadata
+                        WHERE key = 'context_event_targets_reconciled_through'
+                        """
+                    ).fetchone()[0]
+                )
+                target_rows = conn.execute(
+                    """
+                    SELECT target_kind, target_id
+                    FROM agent_context_event_targets
+                    WHERE event_id = ?
+                    ORDER BY target_kind, target_id
+                    """,
+                    (event["event_id"],),
+                ).fetchall()
+                reconciliation_needed = (
+                    store._context_event_target_reconciliation_needed(conn)
+                )
+            reopened = self._store(tmp)
+            stats = reopened.stats(context_id=self.context_id)
+            health = reopened.context_delivery_health(context_id=self.context_id)
+
+        self.assertEqual(highwater, event["event_id"])
+        self.assertEqual(
+            [tuple(row) for row in target_rows],
+            [("group", "mcp-clients")],
+        )
+        self.assertFalse(reconciliation_needed)
+        self.assertEqual(stats["context_bus_latest_event_id"], event["event_id"])
+        self.assertEqual(health["status"], "ready")
+
+    def test_publish_never_normalizes_noncanonical_target_highwater(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            first = self._publish(store, 1, targets=["mcp-clients"])
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                conn.execute(
+                    """
+                    UPDATE store_metadata
+                    SET value_json = '1.0'
+                    WHERE key = 'context_event_targets_reconciled_through'
+                    """
+                )
+                conn.commit()
+            with (
+                mock.patch("memory_store.LOGGER.exception"),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "target high-water is noncanonical",
+                ),
+            ):
+                self._publish(store, 2, targets=["mcp-clients"])
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                highwater_raw = conn.execute(
+                    """
+                    SELECT value_json FROM store_metadata
+                    WHERE key = 'context_event_targets_reconciled_through'
+                    """
+                ).fetchone()[0]
+                event_ids = [
+                    int(row[0])
+                    for row in conn.execute(
+                        "SELECT event_id FROM agent_context_events ORDER BY event_id"
+                    )
+                ]
+
+        self.assertEqual(highwater_raw, "1.0")
+        self.assertEqual(event_ids, [first["event_id"]])
+
+    def test_publish_advances_existing_cursors_over_newly_ineligible_event(self):
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            first = self._publish(store, 1, targets=[])
+            for agent_id in ("codex-desktop", "claude-desktop"):
+                leased = self._lease(
+                    store,
+                    agent_id=agent_id,
+                    limit=1,
+                    now=800.0,
+                )
+                self._ack(
+                    store,
+                    leased["deliveries"],
+                    agent_id=agent_id,
+                    now=801.0,
+                )
+            second = self._publish(store, 2, targets=["another-agent"])
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                cursors = conn.execute(
+                    """
+                    SELECT agent_id, last_contiguous_event_id
+                    FROM agent_context_delivery_cursors
+                    WHERE context_id = ?
+                    ORDER BY agent_id
+                    """,
+                    (self.context_id,),
+                ).fetchall()
+                highwater = json.loads(
+                    conn.execute(
+                        """
+                        SELECT value_json
+                        FROM store_metadata
+                        WHERE key = 'context_event_targets_reconciled_through'
+                        """
+                    ).fetchone()[0]
+                )
+                delivery_errors = store._context_delivery_data_errors(conn)
+            reopened = self._store(tmp)
+            stats = reopened.stats(context_id=self.context_id)
+            health = reopened.context_delivery_health(context_id=self.context_id)
+
+        self.assertLess(first["event_id"], second["event_id"])
+        self.assertEqual(
+            [
+                (str(row["agent_id"]), int(row["last_contiguous_event_id"]))
+                for row in cursors
+            ],
+            [
+                ("claude-desktop", second["event_id"]),
+                ("codex-desktop", second["event_id"]),
+            ],
+        )
+        self.assertEqual(highwater, second["event_id"])
+        self.assertEqual(delivery_errors, [])
+        self.assertEqual(stats["context_bus_latest_event_id"], second["event_id"])
+        self.assertEqual(health["receipt_derived_cursor_mismatch_count"], 0)
+        self.assertEqual(health["status"], "ready")
 
     def test_invalid_prototype_delivery_rows_roll_back_the_schema_rebuild(self):
         with TemporaryDirectory() as tmp:

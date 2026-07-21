@@ -865,6 +865,210 @@ else:
         ), self.assertRaises(installer.CoreInstallerError):
             launchctl.disabled()
 
+    def test_context_delivery_integrity_repairs_only_after_reviewed_offline_audit(
+        self,
+    ) -> None:
+        self._prepare_recoverable_v6()
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO agent_context_events (
+                    context_id, source_surface, event_type, summary,
+                    payload_json, agent_targets_json, created_at
+                ) VALUES (
+                    'default', 'installer-test', 'late-event',
+                    'installer repair fixture', '{}', '["mcp-clients"]', 200.0
+                )
+                """
+            )
+            event_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO agent_context_event_targets (
+                    event_id, target_kind, target_id, created_at
+                ) VALUES (?, 'group', 'mcp-clients', 200.0)
+                """,
+                (event_id,),
+            )
+            connection.commit()
+        launchctl = self._launchctl()
+        launchctl.disable()
+
+        audited = installer.context_delivery_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "requires --confirm",
+        ):
+            installer.context_delivery_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=True,
+                confirm=False,
+                expected_revision=audited["audit"]["audit_revision"],
+            )
+        repaired = installer.context_delivery_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=True,
+            confirm=True,
+            expected_revision=audited["audit"]["audit_revision"],
+        )
+        verified = installer.context_delivery_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO agent_context_events (
+                    context_id, source_surface, event_type, summary,
+                    payload_json, agent_targets_json, created_at
+                ) VALUES (
+                    'default', 'successor-test', 'successor-event',
+                    'post-repair successor fixture', '{}', '["mcp-clients"]',
+                    300.0
+                )
+                """
+            )
+            successor_event_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO agent_context_event_targets (
+                    event_id, target_kind, target_id, created_at
+                ) VALUES (?, 'group', 'mcp-clients', 300.0)
+                """,
+                (successor_event_id,),
+            )
+            connection.execute(
+                """
+                UPDATE store_metadata
+                SET value_json = ?, updated_at = 300.0
+                WHERE key = 'context_event_targets_reconciled_through'
+                """,
+                (json.dumps(successor_event_id),),
+            )
+            connection.commit()
+        advanced = installer.context_delivery_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        reproved = installer.context_delivery_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=True,
+            confirm=True,
+            expected_revision=advanced["audit"]["audit_revision"],
+        )
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("DELETE FROM agent_context_events")
+            connection.execute(
+                """
+                UPDATE store_metadata
+                SET value_json = '0', updated_at = 400.0
+                WHERE key = 'context_event_targets_reconciled_through'
+                """
+            )
+            connection.commit()
+        pruned = installer.context_delivery_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        pruned_reproved = installer.context_delivery_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=True,
+            confirm=True,
+            expected_revision=pruned["audit"]["audit_revision"],
+        )
+
+        self.assertEqual(audited["status"], "repairable")
+        self.assertEqual(repaired["status"], "repaired")
+        self.assertTrue(repaired["repair"]["verification_passed"])
+        self.assertEqual(verified["status"], "ready")
+        self.assertEqual(advanced["status"], "ready")
+        self.assertEqual(reproved["status"], "ready")
+        self.assertTrue(reproved["repair"]["maintenance_receipt_verified"])
+        self.assertEqual(pruned["status"], "ready")
+        self.assertEqual(pruned_reproved["status"], "ready")
+        self.assertTrue(
+            pruned_reproved["repair"]["maintenance_receipt_verified"]
+        )
+        self.assertEqual(verified["audit"]["target_highwater"], event_id)
+        self.assertEqual(
+            advanced["audit"]["target_highwater"],
+            successor_event_id,
+        )
+        self.assertEqual(
+            repaired["service_state"],
+            {"loaded": False, "running": False, "disabled": True},
+        )
+        log_verbs = {
+            line.split()[0]
+            for line in (self.base / "launchctl.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        }
+        self.assertTrue(
+            log_verbs.isdisjoint(
+                {"enable", "bootstrap", "bootout", "kickstart"}
+            )
+        )
+
+    def test_context_delivery_integrity_refuses_loaded_or_enabled_core(self) -> None:
+        self._prepare_recoverable_v6()
+        launchctl = self._launchctl()
+        launchctl.bootstrap(self.paths.plist)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "disabled and unloaded",
+        ):
+            installer.context_delivery_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=False,
+                confirm=False,
+                expected_revision=None,
+            )
+        launchctl.bootout(wait_seconds=2.0)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "disabled and unloaded",
+        ):
+            installer.context_delivery_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=False,
+                confirm=False,
+                expected_revision=None,
+            )
+
     def test_recovery_identity_failures_never_mutate_launchd(self) -> None:
         self._prepare_recoverable_v6()
 

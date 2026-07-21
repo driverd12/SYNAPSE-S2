@@ -254,9 +254,14 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         root: Path,
         *,
         run_id: str = "operator-readiness-guard-test",
+        authority_mode: str = "candidate-local-v5",
+        **arg_overrides,
     ):
         root = root.resolve()
-        binding_path, binding, core_paths = self._write_candidate_binding(root)
+        binding_path, binding, core_paths = self._write_candidate_binding(
+            root,
+            authority_mode=authority_mode,
+        )
         with (
             mock.patch(
                 "scripts.operator_readiness_certify.resolve_candidate_core_paths",
@@ -264,7 +269,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             ),
             mock.patch(
                 "scripts.operator_readiness_certify.database_requires_core",
-                return_value=False,
+                return_value=(authority_mode == "authoritative-core-v6"),
             ),
         ):
             certifier = OperatorReadinessCertifier(
@@ -272,6 +277,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     root / "evidence",
                     run_id=run_id,
                     core_binding=str(binding_path),
+                    **arg_overrides,
                 )
             )
         return certifier, binding, core_paths
@@ -677,6 +683,39 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             certifier.candidate_config.embedding_neural_local_files_only
         )
         self.assertEqual(certifier.candidate_config.mlx_device, "gpu")
+
+    def test_delivery_publication_repair_flag_requires_explicit_core_handoff(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, _, core_paths = self._write_candidate_binding(root)
+            args = build_parser().parse_args(
+                [
+                    "--output-dir",
+                    str(root / "evidence"),
+                    "--launcher",
+                    str(root / "synapse-s2-mcp"),
+                    "--core-binding",
+                    str(binding_path),
+                    "--repair-delivery-publication-after-handoff",
+                ]
+            )
+            self.assertTrue(args.repair_delivery_publication_after_handoff)
+            self.assertFalse(args.handoff_running_core)
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "delivery publication repair requires --handoff-running-core",
+                ),
+            ):
+                OperatorReadinessCertifier(args)
 
     def test_candidate_expectation_mismatch_is_rejected_before_evidence_write(self):
         with TemporaryDirectory() as tmp, self.assertRaisesRegex(
@@ -1946,6 +1985,262 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     "guard",
                 ],
             )
+
+    def test_core_handoff_does_not_mutate_launchd_when_phase_a_is_not_ready(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(
+                Path(tmp),
+                authority_mode="authoritative-core-v6",
+                handoff_running_core=True,
+            )
+            guarded_ids = {
+                "authority_guard",
+                "guarded_quiescence",
+                "capture_ledger_audit",
+                "recovery_backup",
+                "recovery_verify",
+                "recovery_restore",
+            }
+            certifier.results = [
+                CheckResult(
+                    check_id=check_id,
+                    label=check_id,
+                    status=("blocked" if check_id == "doctor" else "ready"),
+                    required=True,
+                    detail="Synthetic Phase-A result.",
+                )
+                for check_id in REQUIRED_PROOFS
+                if check_id not in guarded_ids
+            ]
+
+            with mock.patch(
+                "scripts.operator_readiness_certify.LaunchCtl"
+            ) as launchctl:
+                ready = certifier._handoff_running_core_for_guard()
+
+            self.assertFalse(ready)
+            launchctl.assert_not_called()
+            handoff = certifier.results[-1]
+            self.assertEqual(handoff.check_id, "core_phase_handoff")
+            self.assertEqual(handoff.status, "blocked")
+            self.assertFalse(handoff.required)
+            self.assertEqual(handoff.metrics, {"action_taken": False})
+
+    def test_core_handoff_disables_and_unloads_only_exact_bound_v6_label(self):
+        with TemporaryDirectory() as tmp:
+            certifier, binding, _ = self._bound_certifier(
+                Path(tmp),
+                authority_mode="authoritative-core-v6",
+                handoff_running_core=True,
+            )
+            guarded_ids = {
+                "authority_guard",
+                "guarded_quiescence",
+                "capture_ledger_audit",
+                "recovery_backup",
+                "recovery_verify",
+                "recovery_restore",
+            }
+            certifier.results = [
+                CheckResult(
+                    check_id=check_id,
+                    label=check_id,
+                    status="ready",
+                    required=True,
+                    detail="Synthetic Phase-A readiness evidence.",
+                )
+                for check_id in REQUIRED_PROOFS
+                if check_id not in guarded_ids
+            ]
+            controller = mock.Mock()
+            controller.snapshot.side_effect = [
+                {
+                    "loaded": True,
+                    "running": True,
+                    "pid": 4242,
+                },
+                {
+                    "loaded": False,
+                    "running": False,
+                    "pid": None,
+                },
+            ]
+            controller.disabled.return_value = True
+
+            with mock.patch(
+                "scripts.operator_readiness_certify.LaunchCtl",
+                return_value=controller,
+            ) as launchctl:
+                ready = certifier._handoff_running_core_for_guard()
+
+            self.assertTrue(ready, certifier.results[-1])
+            launchctl.assert_called_once_with(
+                "/bin/launchctl",
+                uid=os.getuid(),
+                label=binding.core_label,
+            )
+            controller.disable.assert_called_once_with()
+            controller.bootout.assert_called_once_with(
+                wait_seconds=mock.ANY,
+            )
+            self.assertEqual(controller.snapshot.call_count, 2)
+            controller.disabled.assert_called_once_with()
+            handoff = certifier.results[-1]
+            self.assertEqual(handoff.check_id, "core_phase_handoff")
+            self.assertEqual(handoff.status, "ready")
+            self.assertEqual(
+                handoff.metrics,
+                {
+                    "action_taken": True,
+                    "prior_loaded": True,
+                    "prior_running": True,
+                    "prior_pid_present": True,
+                    "final_loaded": False,
+                    "final_running": False,
+                    "disabled_policy_verified": True,
+                },
+            )
+
+    def test_delivery_publication_repair_uses_locked_installer_and_bounded_artifact(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifier, _, _ = self._bound_certifier(
+                root,
+                authority_mode="authoritative-core-v6",
+                handoff_running_core=True,
+                repair_delivery_publication_after_handoff=True,
+            )
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            secret_marker = "must-not-enter-readiness-evidence"
+            audit = {
+                "protocol_version": "context-delivery-publication-repair.v1",
+                "status": "repairable",
+                "audit_revision": "b" * 64,
+                "repair_required": True,
+                "cursor_mismatch_count": 2,
+                "target_reconciliation_needed": True,
+                "repair_receipt_integrity_error_count": 0,
+                "repair_receipt_semantic_error_count": 0,
+                "unreviewed_payload": secret_marker,
+            }
+            result = {
+                "status": "repaired",
+                "operation_id": "s2maint_" + ("1" * 32),
+                "expected_revision": "b" * 64,
+                "after": {
+                    "audit_revision": "a" * 64,
+                    "status": "ready",
+                    "repair_receipt_integrity_error_count": 0,
+                    "repair_receipt_semantic_error_count": 0,
+                },
+                "reconciled_target_highwater": True,
+                "repaired_cursor_count": 2,
+                "safety_backup": {
+                    "sha256": "a" * 64,
+                    "size_bytes": 4096,
+                    "verified": True,
+                    "path": f"/private/{secret_marker}",
+                },
+                "maintenance_receipt_verified": True,
+                "checkpoint": [0, 4, 4],
+                "quick_check": ["ok"],
+                "foreign_key_error_count": 0,
+                "verification_passed": True,
+                "unreviewed_payload": secret_marker,
+            }
+            audit_envelope = {
+                "ok": True,
+                "action": "context-delivery-integrity",
+                "status": "repairable",
+                "service_state": {
+                    "loaded": False,
+                    "running": False,
+                    "disabled": True,
+                },
+                "audit": audit,
+                "repair": None,
+            }
+            repair_envelope = {
+                **audit_envelope,
+                "status": "repaired",
+                "repair": result,
+            }
+            completed = [
+                mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(audit_envelope),
+                    stderr="",
+                ),
+                mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(repair_envelope),
+                    stderr="",
+                ),
+            ]
+
+            with mock.patch(
+                "scripts.operator_readiness_certify.subprocess.run",
+                side_effect=completed,
+            ) as run:
+                ready = certifier._repair_delivery_publication_after_handoff(
+                    handoff_ready=True,
+                )
+
+            self.assertTrue(ready, certifier.results[-1])
+            self.assertEqual(run.call_count, 2)
+            audit_command = run.call_args_list[0].args[0]
+            repair_command = run.call_args_list[1].args[0]
+            self.assertIn("context-delivery-integrity", audit_command)
+            self.assertNotIn("--repair", audit_command)
+            self.assertIn("--repair", repair_command)
+            self.assertIn("--confirm", repair_command)
+            self.assertEqual(
+                repair_command[
+                    repair_command.index("--expected-revision") + 1
+                ],
+                "b" * 64,
+            )
+
+            repair = certifier.results[-1]
+            self.assertEqual(repair.check_id, "context_delivery_publication_repair")
+            self.assertEqual(repair.status, "ready")
+            self.assertFalse(repair.required)
+            parsed_path = Path(repair.artifact_paths["parsed"])
+            parsed_bytes = parsed_path.read_bytes()
+            self.assertNotIn(secret_marker.encode("utf-8"), parsed_bytes)
+            parsed = json.loads(parsed_bytes)
+            self.assertEqual(
+                set(parsed),
+                {
+                    "protocol_version",
+                    "status",
+                    "operation_id",
+                    "audit_revision_before",
+                    "audit_revision_after",
+                    "repair_required",
+                    "reconciled_target_highwater",
+                    "repaired_cursor_count",
+                    "safety_backup",
+                    "maintenance_receipt_verified",
+                    "checkpoint",
+                    "quick_check",
+                    "foreign_key_error_count",
+                    "after_status",
+                    "verification_passed",
+                    "installer_lock_enforced",
+                },
+            )
+            self.assertEqual(
+                set(parsed["safety_backup"]),
+                {"sha256", "size_bytes", "verified"},
+            )
+            self.assertTrue(parsed["maintenance_receipt_verified"])
+            self.assertEqual(parsed["checkpoint"], [0, 4, 4])
+            self.assertEqual(parsed["quick_check"], ["ok"])
+            self.assertEqual(parsed["foreign_key_error_count"], 0)
+            self.assertEqual(parsed["after_status"], "ready")
+            self.assertTrue(parsed["installer_lock_enforced"])
 
     def test_concurrent_local_lease_blocks_guarded_recovery_without_artifacts(self):
         with TemporaryDirectory() as tmp:

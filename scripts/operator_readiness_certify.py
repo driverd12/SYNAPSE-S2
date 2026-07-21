@@ -44,6 +44,7 @@ from core_client_binding import (
 )
 from scripts.core_agent_installer import (
     DEFAULT_LABEL as DEFAULT_CORE_LABEL,
+    LaunchCtl,
     build_config as build_candidate_core_config,
     resolve_paths as resolve_candidate_core_paths,
 )
@@ -1318,6 +1319,26 @@ class OperatorReadinessCertifier:
             getattr(args, "core_label", DEFAULT_CORE_LABEL),
             field="readiness core label",
         ).strip()
+        self.args.handoff_running_core = bool(
+            getattr(args, "handoff_running_core", False)
+        )
+        self.args.repair_delivery_publication_after_handoff = bool(
+            getattr(args, "repair_delivery_publication_after_handoff", False)
+        )
+        if (
+            self.args.repair_delivery_publication_after_handoff
+            and not self.args.handoff_running_core
+        ):
+            raise ValueError(
+                "delivery publication repair requires --handoff-running-core"
+            )
+        if (
+            self.args.handoff_running_core
+            and self.args.core_label != DEFAULT_CORE_LABEL
+        ):
+            raise ValueError(
+                "core handoff requires the canonical authoritative-core label"
+            )
         raw_layout_manifest = str(
             getattr(args, "noncanonical_layout_manifest", "") or ""
         ).strip()
@@ -1615,6 +1636,13 @@ class OperatorReadinessCertifier:
         self._check_wrap_session()
         self._check_dashboard()
         self._check_capture_inbox()
+        handoff_ready = True
+        if self.args.handoff_running_core:
+            handoff_ready = self._handoff_running_core_for_guard()
+        if self.args.repair_delivery_publication_after_handoff:
+            self._repair_delivery_publication_after_handoff(
+                handoff_ready=handoff_ready,
+            )
         return self._guarded_recovery_and_finalize()
 
     def _run_metadata(self) -> dict[str, Any]:
@@ -1639,6 +1667,12 @@ class OperatorReadinessCertifier:
             "core_config_contract": self.core_config_contract,
             "quiescence_policy_contract": quiescence_policy_contract(),
             "quiescence_policy_digest": quiescence_policy_digest(),
+            "core_phase_handoff_requested": bool(
+                self.args.handoff_running_core
+            ),
+            "delivery_publication_repair_requested": bool(
+                self.args.repair_delivery_publication_after_handoff
+            ),
             "embedding_provider": config.embedding_provider_name,
             "topology": {
                 "dimension": config.dimension,
@@ -3015,12 +3049,416 @@ class OperatorReadinessCertifier:
             "launch_agents": launch_agents,
         }
 
+    def _phase_a_is_ready_for_core_handoff(self) -> bool:
+        guarded_ids = {
+            "authority_guard",
+            "guarded_quiescence",
+            "capture_ledger_audit",
+            "recovery_backup",
+            "recovery_verify",
+            "recovery_restore",
+        }
+        expected = set(OPERATOR_READINESS_REQUIRED_PROOF_IDS) - guarded_ids
+        observed = [result for result in self.results if result.required]
+        counts = Counter(result.check_id for result in observed)
+        return bool(
+            set(counts) == expected
+            and all(counts[check_id] == 1 for check_id in expected)
+            and all(result.status == "ready" for result in observed)
+        )
+
+    def _handoff_running_core_for_guard(self) -> bool:
+        """Stop one exact proven v6 core between live Phase A and the guard."""
+
+        if not self._phase_a_is_ready_for_core_handoff():
+            self._record_manual(
+                "core_phase_handoff",
+                label="Live core to authority-guard handoff",
+                status="blocked",
+                required=False,
+                detail="The live core remained untouched because Phase A was not fully ready.",
+                repair="Repair Phase A and rerun a completely new evidence pack.",
+                metrics={"action_taken": False},
+            )
+            return False
+        if (
+            self.core_binding is None
+            or self.core_binding.authority_mode != "authoritative-core-v6"
+            or self.core_binding.core_label != self.args.core_label
+        ):
+            self._record_manual(
+                "core_phase_handoff",
+                label="Live core to authority-guard handoff",
+                status="blocked",
+                required=False,
+                detail="The requested handoff lacks one exact reviewed v6 core binding.",
+                repair="Restore the owner-only binding for the exact core label and rerun.",
+                metrics={"action_taken": False},
+            )
+            return False
+
+        controller = LaunchCtl(
+            "/bin/launchctl",
+            uid=os.getuid(),
+            label=self.args.core_label,
+        )
+        try:
+            before = controller.snapshot()
+            action_taken = bool(before.get("loaded") or before.get("running"))
+            controller.disable()
+            controller.bootout(wait_seconds=AUTHORITY_GUARD_TIMEOUT_SECONDS)
+            after = controller.snapshot()
+            disabled = controller.disabled()
+            ready = bool(
+                not after.get("loaded")
+                and not after.get("running")
+                and disabled
+            )
+            if not ready:
+                raise RuntimeError(
+                    "exact authoritative-core LaunchAgent did not remain disabled and unloaded"
+                )
+            self._record_manual(
+                "core_phase_handoff",
+                label="Live core to authority-guard handoff",
+                status="ready",
+                required=False,
+                detail=(
+                    "The exact Phase-A core was disabled and unloaded before exclusive recovery certification."
+                ),
+                metrics={
+                    "action_taken": action_taken,
+                    "prior_loaded": bool(before.get("loaded")),
+                    "prior_running": bool(before.get("running")),
+                    "prior_pid_present": isinstance(before.get("pid"), int),
+                    "final_loaded": bool(after.get("loaded")),
+                    "final_running": bool(after.get("running")),
+                    "disabled_policy_verified": disabled,
+                },
+            )
+            return True
+        except Exception as exc:
+            self._record_manual(
+                "core_phase_handoff",
+                label="Live core to authority-guard handoff",
+                status="blocked",
+                required=False,
+                detail=safe_public_error(
+                    exc,
+                    fallback="exact authoritative-core handoff failed",
+                ),
+                repair=(
+                    "Verify the exact core label is disabled and unloaded; do not use a broad process kill."
+                ),
+                metrics={"action_taken": True},
+            )
+            return False
+
+    def _repair_delivery_publication_after_handoff(
+        self,
+        *,
+        handoff_ready: bool,
+    ) -> bool:
+        """Delegate the narrow repair to the installer-only locked lane."""
+
+        if not handoff_ready:
+            self._record_manual(
+                "context_delivery_publication_repair",
+                label="Context delivery publication repair",
+                status="blocked",
+                required=False,
+                detail="Repair was skipped because the exact live-core handoff did not pass.",
+                repair="Complete the exact-label handoff and rerun a new evidence pack.",
+                metrics={"repair_attempted": False},
+            )
+            return False
+
+        started = time.perf_counter()
+        try:
+            installer = ROOT / "scripts" / "install_core_agent.sh"
+            base_command = [
+                str(installer),
+                "context-delivery-integrity",
+                "--label",
+                self.args.core_label,
+                "--wait-seconds",
+                str(max(2.0, AUTHORITY_GUARD_TIMEOUT_SECONDS)),
+            ]
+            layout_manifest = str(
+                getattr(self.args, "noncanonical_layout_manifest", "") or ""
+            ).strip()
+            if layout_manifest:
+                base_command.extend(
+                    ["--noncanonical-layout-manifest", layout_manifest]
+                )
+
+            def run_installer(command: list[str]) -> dict[str, Any]:
+                completed = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    env=self._base_env(),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=180.0,
+                    check=False,
+                )
+                try:
+                    payload = parse_json_stdout(completed.stdout)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "installer delivery-integrity response was not valid JSON"
+                    ) from exc
+                if (
+                    completed.returncode != 0
+                    or not isinstance(payload, dict)
+                    or payload.get("ok") is not True
+                    or payload.get("action") != "context-delivery-integrity"
+                ):
+                    raise RuntimeError(
+                        "installer delivery-integrity operation was refused"
+                    )
+                service_state = payload.get("service_state")
+                if not isinstance(service_state, dict) or not (
+                    service_state.get("loaded") is False
+                    and service_state.get("running") is False
+                    and service_state.get("disabled") is True
+                ):
+                    raise RuntimeError(
+                        "installer delivery-integrity operation lost exact-label quiescence"
+                    )
+                return payload
+
+            audited = run_installer(base_command)
+            audit = audited.get("audit")
+            if not isinstance(audit, dict):
+                raise RuntimeError(
+                    "installer delivery-integrity audit was missing"
+                )
+            if (
+                audit.get("protocol_version")
+                != "context-delivery-publication-repair.v1"
+            ):
+                raise RuntimeError(
+                    "installer delivery-integrity audit protocol was invalid"
+                )
+            audit_revision = str(audit.get("audit_revision") or "")
+            if re.fullmatch(r"[0-9a-f]{64}", audit_revision) is None:
+                raise RuntimeError(
+                    "installer delivery-integrity audit revision was invalid"
+                )
+            if audit["status"] == "blocked":
+                raise RuntimeError(
+                    "context delivery publication state is not narrowly repairable"
+                )
+            if audit["status"] not in {
+                "ready",
+                "repairable",
+                "committed_unverified",
+            }:
+                raise RuntimeError(
+                    "installer delivery-integrity audit status was invalid"
+                )
+
+            repair_attempted = audit["status"] != "ready"
+            repair_result: dict[str, Any] | None = None
+            if repair_attempted:
+                repaired = run_installer(
+                    [
+                        *base_command,
+                        "--repair",
+                        "--confirm",
+                        "--expected-revision",
+                        audit_revision,
+                    ]
+                )
+                if (
+                    not isinstance(repaired.get("audit"), dict)
+                    or repaired["audit"].get("audit_revision")
+                    != audit_revision
+                    or not isinstance(repaired.get("repair"), dict)
+                ):
+                    raise RuntimeError(
+                        "installer delivery-integrity repair was not bound to the reviewed audit"
+                    )
+                repair_result = repaired["repair"]
+
+            if repair_result is None:
+                proof_ready = bool(
+                    audit.get("status") == "ready"
+                    and audit.get("repair_required") is False
+                    and int(audit.get("repair_receipt_integrity_error_count", 0))
+                    == 0
+                    and int(audit.get("repair_receipt_semantic_error_count", 0))
+                    == 0
+                )
+                operation_id = None
+                after_audit = audit
+                checkpoint = None
+                quick_check = None
+                foreign_key_error_count = None
+                maintenance_receipt_verified = False
+                reconciled_target_highwater = False
+                repaired_cursor_count = 0
+                safety_backup = None
+                result_status = "ready"
+            else:
+                after_audit = repair_result.get("after")
+                checkpoint = repair_result.get("checkpoint")
+                quick_check = repair_result.get("quick_check")
+                foreign_key_error_count = repair_result.get(
+                    "foreign_key_error_count"
+                )
+                maintenance_receipt_verified = bool(
+                    repair_result.get("maintenance_receipt_verified")
+                )
+                safety_backup = repair_result.get("safety_backup")
+                checkpoint_ready = bool(
+                    isinstance(checkpoint, list)
+                    and len(checkpoint) == 3
+                    and all(type(value) is int for value in checkpoint)
+                    and checkpoint[0] == 0
+                    and checkpoint[1] == checkpoint[2]
+                )
+                backup_ready = bool(
+                    isinstance(safety_backup, dict)
+                    and safety_backup.get("verified") is True
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(safety_backup.get("sha256") or ""),
+                    )
+                    is not None
+                    and type(safety_backup.get("size_bytes")) is int
+                    and int(safety_backup["size_bytes"]) > 0
+                )
+                proof_ready = bool(
+                    repair_result.get("verification_passed") is True
+                    and maintenance_receipt_verified
+                    and isinstance(after_audit, dict)
+                    and after_audit.get("status") == "ready"
+                    and checkpoint_ready
+                    and quick_check == ["ok"]
+                    and foreign_key_error_count == 0
+                    and backup_ready
+                )
+                operation_id = repair_result.get("operation_id")
+                reconciled_target_highwater = bool(
+                    repair_result.get("reconciled_target_highwater")
+                )
+                repaired_cursor_count = int(
+                    repair_result.get("repaired_cursor_count", 0)
+                )
+                result_status = str(repair_result.get("status") or "")
+                after_revision = (
+                    str(after_audit.get("audit_revision") or "")
+                    if isinstance(after_audit, dict)
+                    else ""
+                )
+                receipt_shape_ready = bool(
+                    result_status in {"repaired", "verified"}
+                    and re.fullmatch(
+                        r"s2maint_[0-9a-f]{32}",
+                        str(operation_id or ""),
+                    )
+                    is not None
+                    and repair_result.get("expected_revision")
+                    == audit_revision
+                    and re.fullmatch(r"[0-9a-f]{64}", after_revision)
+                    is not None
+                    and int(
+                        after_audit.get(
+                            "repair_receipt_integrity_error_count",
+                            0,
+                        )
+                    )
+                    == 0
+                    and int(
+                        after_audit.get(
+                            "repair_receipt_semantic_error_count",
+                            0,
+                        )
+                    )
+                    == 0
+                )
+                proof_ready = bool(proof_ready and receipt_shape_ready)
+
+            parsed = {
+                "protocol_version": audit["protocol_version"],
+                "status": result_status,
+                "operation_id": operation_id,
+                "audit_revision_before": audit_revision,
+                "audit_revision_after": after_audit["audit_revision"],
+                "repair_required": bool(audit["repair_required"]),
+                "reconciled_target_highwater": reconciled_target_highwater,
+                "repaired_cursor_count": repaired_cursor_count,
+                "safety_backup": (
+                    None
+                    if safety_backup is None
+                    else {
+                        "sha256": safety_backup["sha256"],
+                        "size_bytes": int(safety_backup["size_bytes"]),
+                        "verified": bool(safety_backup["verified"]),
+                    }
+                ),
+                "maintenance_receipt_verified": (
+                    maintenance_receipt_verified
+                ),
+                "checkpoint": checkpoint,
+                "quick_check": quick_check,
+                "foreign_key_error_count": foreign_key_error_count,
+                "after_status": after_audit["status"],
+                "verification_passed": proof_ready,
+                "installer_lock_enforced": True,
+            }
+            self._record_in_process_check(
+                "context_delivery_publication_repair",
+                label="Context delivery publication repair",
+                status=(
+                    "ready" if proof_ready else "blocked"
+                ),
+                required=False,
+                detail=(
+                    "The exact derived publication state was reviewed, repaired if required, and reverified under an exclusive core lease."
+                ),
+                repair=(
+                    ""
+                    if proof_ready
+                    else "Inspect the bounded repair artifact before any core restart."
+                ),
+                parsed=parsed,
+                metrics={
+                    "repair_attempted": repair_attempted,
+                    "cursor_mismatch_count": int(audit["cursor_mismatch_count"]),
+                    "target_reconciliation_needed": bool(
+                        audit["target_reconciliation_needed"]
+                    ),
+                    "verification_passed": proof_ready,
+                },
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            return proof_ready
+        except Exception as exc:
+            self._record_manual(
+                "context_delivery_publication_repair",
+                label="Context delivery publication repair",
+                status="blocked",
+                required=False,
+                detail=safe_public_error(
+                    exc,
+                    fallback="context delivery publication repair failed",
+                ),
+                repair="Keep the core disabled; review the audit and safety-backup evidence before retrying.",
+                metrics={"repair_attempted": True},
+            )
+            return False
+
     def _record_in_process_check(
         self,
         check_id: str,
         *,
         label: str,
         status: str,
+        required: bool = True,
         detail: str,
         repair: str,
         parsed: dict[str, Any],
@@ -3052,7 +3490,7 @@ class OperatorReadinessCertifier:
             check_id=check_id,
             label=label,
             status=status,
-            required=True,
+            required=required,
             detail=sanitize_evidence_text(detail),
             repair=sanitize_evidence_text(repair),
             command=[],
@@ -3891,6 +4329,10 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         "--expect-embedding-provider",
         str(manifest.get("embedding_provider") or "mlx-neural"),
     ]
+    if manifest.get("core_phase_handoff_requested") is True:
+        command.append("--handoff-running-core")
+    if manifest.get("delivery_publication_repair_requested") is True:
+        command.append("--repair-delivery-publication-after-handoff")
     lines = [
         "# Operator Readiness Runbook",
         "",
@@ -3946,6 +4388,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--core-label",
         default=os.getenv("SYNAPSE_S2_CORE_LABEL", DEFAULT_CORE_LABEL),
+    )
+    parser.add_argument(
+        "--handoff-running-core",
+        action="store_true",
+        help=(
+            "after every live Phase-A proof passes, disable and unload only the exact "
+            "bound v6 core before guarded recovery certification"
+        ),
+    )
+    parser.add_argument(
+        "--repair-delivery-publication-after-handoff",
+        action="store_true",
+        help=(
+            "after the explicit exact-core handoff, delegate only the exact "
+            "revision-bound target-highwater and receipt-derived cursor repair "
+            "to the locked installer maintenance lane"
+        ),
     )
     parser.add_argument(
         "--noncanonical-layout-manifest",

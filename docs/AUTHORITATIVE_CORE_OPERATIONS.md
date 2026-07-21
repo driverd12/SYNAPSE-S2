@@ -334,6 +334,22 @@ changing permissions on an existing caller-owned directory.
    Those transient Phase-A processes do not authorize reopening an external
    persistent wrapper. Treat the returned manifest as immediately perishable
    and proceed directly to the next two commands.
+
+   For an ordinary v6 replacement whose exact bound core is already healthy,
+   add `--handoff-running-core`. The certifier performs every live Phase-A
+   proof first and only then disables and unloads the exact bound core label
+   before taking the exclusive authority guard. If any required Phase-A proof
+   is not ready, it leaves launchd untouched and the evidence pack is blocked.
+   `--repair-delivery-publication-after-handoff` may be added only with that
+   handoff flag and the canonical core label. The certifier first records the
+   content-free audit, then delegates its exact revision to
+   `install_core_agent.sh context-delivery-integrity` for any required repair.
+   That subprocess takes the same installer lock and enforces the same
+   disabled/unloaded label gate as the manual procedure below; the certifier is
+   not a second SQLite write lane. Its evidence is ready only when the installer
+   returns a verified maintenance receipt, complete checkpoint, `quick_check`,
+   zero foreign-key errors, verified backup, and a final `ready` audit. Neither
+   flag is a way to make an unhealthy Phase-A probe pass.
 4. Run the read-only inventory and recovery binding gate immediately after the
    certifier. This is also the post-backup quiescence proof: it must still show
    no writer process or loaded legacy category, and the exact recovery binding
@@ -426,6 +442,62 @@ same already-healthy service is idempotent. Any config, build, protocol,
 embedding, root, lock, store, journal, runtime, binding, token, or restored-
 target drift requires the ordinary fresh attested replacement or restore-
 adoption procedure instead.
+
+### Offline delivery-publication integrity repair
+
+One installer-only maintenance lane exists for the specific crash boundary in
+which canonical context events and target rows committed but the derived
+target high-water or existing receipt-derived cursors did not. It is not an
+MCP, dashboard, startup, migration, or general SQLite repair surface:
+
+```bash
+scripts/install_core_agent.sh stop
+scripts/install_core_agent.sh context-delivery-integrity
+scripts/install_core_agent.sh context-delivery-integrity \
+  --repair --confirm \
+  --expected-revision '<exact 64-hex audit revision>'
+scripts/install_core_agent.sh context-delivery-integrity
+```
+
+The audit and repair run under the existing installer lock and require the
+exact core LaunchAgent to be positively disabled and unloaded. The command
+does not change launchd state. It then acquires one unclaimed exclusive core
+lease, requires the exact authoritative-v6 marker/schema pair, validates every
+event, target, delivery, receipt, tombstone, consumer-group, cursor, foreign-
+key, and ledger prerequisite, and accepts no delivery defect other than the
+reported deterministic receipt-derived cursor mismatch. Missing, malformed,
+negative, noncanonical, or ahead-of-ledger target high-water values block the
+operation.
+
+The review revision hashes the exact raw derivation inputs as well as the
+content-free audit result. Any event, target, consumer, group, delivery,
+receipt, tombstone, cursor, or high-water change invalidates the revision even
+when mismatch counts stay equal. Repair first creates and verifies an owner-
+only SQLite safety backup. One exclusive transaction may update only the
+existing target high-water metadata row, existing derived cursor rows, and one
+`context-delivery-publication-repair` maintenance receipt. It does not create
+events or targets, alter delivery/ACK evidence, replay work, or call broad
+schema reconciliation. Commit is followed by a complete checkpoint, exact
+receipt verification, SQLite quick/foreign-key checks, a no-mutation migration
+contract check, and a fresh ready audit. Pre-commit failure rolls everything
+back and discards the unused attempt backup; post-commit uncertainty preserves
+the backup and leaves the service stopped.
+
+The committed receipt remains `pending` until those post-commit proofs finish.
+If the process is interrupted in that window, the next audit reports
+`committed_unverified`, not `ready`. Review that new exact audit revision and
+rerun the same `--repair --confirm --expected-revision ...` command; it rehashes
+and reopens the existing backup, rechecks SQLite and the no-mutation migration
+contract, and only then marks the receipt verified. It does not create a second
+repair or backup. An already-ready repair invocation also reverifies the latest
+verified receipt and backup instead of treating derived cursor equality alone
+as proof.
+
+The result reports `replacement_required: true` when the currently checked-out
+source build differs from the durable marker. In that case, do not use
+`recover-existing`; complete a fresh evidence-bound replacement. A same-build
+incident may proceed to `recover-existing` only when all of that action's
+independent identity and sealed-SQLite gates also pass.
 
 The recovery admission proof requires both SQLite main databases to be sealed.
 A rollback journal, incomplete WAL/SHM pair, nonzero WAL, nonprivate sidecar, or

@@ -2135,6 +2135,119 @@ def stop(*, launchctl: LaunchCtl, wait_seconds: float) -> dict[str, Any]:
     return _safe_result("stop", status="stopped", loaded=False)
 
 
+def context_delivery_integrity(
+    *,
+    paths: InstallPaths,
+    launchctl: LaunchCtl,
+    wait_seconds: float,
+    repair: bool,
+    confirm: bool,
+    expected_revision: str | None,
+) -> dict[str, Any]:
+    """Audit or narrowly repair derived delivery-publication state offline.
+
+    This is intentionally an installer-only maintenance lane.  It requires the
+    exact LaunchAgent to have already been disabled and unloaded, then takes an
+    exclusive unclaimed core lease before opening the existing v6 store.  It
+    never starts, stops, enables, installs, or rewrites core configuration.
+    """
+
+    snapshot = launchctl.snapshot()
+    disabled = launchctl.disabled()
+    if snapshot.get("loaded") or snapshot.get("running") or not disabled:
+        raise CoreInstallerError(
+            "context delivery integrity requires the exact core LaunchAgent "
+            "to be disabled and unloaded"
+        )
+    if repair:
+        if confirm is not True:
+            raise CoreInstallerError(
+                "context delivery integrity repair requires --confirm"
+            )
+        if re.fullmatch(r"[0-9a-f]{64}", str(expected_revision or "")) is None:
+            raise CoreInstallerError(
+                "context delivery integrity repair requires one exact reviewed revision"
+            )
+    elif confirm or expected_revision:
+        raise CoreInstallerError(
+            "repair confirmation and revision are valid only with --repair"
+        )
+
+    _validate_install_sources(paths)
+    from memory_store import DurableMemoryStore
+
+    lease: CoreAuthorityLease | None = None
+    store: DurableMemoryStore | None = None
+    try:
+        lease = CoreAuthorityLease.acquire_core(
+            paths.memory_db,
+            timeout_seconds=min(float(wait_seconds), 30.0),
+            instance_id="core-installer-context-delivery-integrity",
+        )
+        store = DurableMemoryStore.open_existing_for_core_maintenance(
+            paths.memory_db,
+            authority_lease=lease,
+        )
+        inspection = store.inspect_core_authority_preclaim()
+        marker = inspection.get("marker")
+        if (
+            inspection.get("governance_mode") != "authoritative-v6"
+            or inspection.get("schema_identity") != EXPECTED_SCHEMA_IDENTITY
+            or not isinstance(marker, dict)
+            or marker.get("service_required") is not True
+        ):
+            raise CoreInstallerError(
+                "context delivery integrity requires an authoritative v6 store"
+            )
+        audit = store.audit_context_delivery_publication_repair()
+        result: dict[str, Any] | None = None
+        if repair:
+            result = store.repair_context_delivery_publication(
+                expected_revision=str(expected_revision),
+                confirm=True,
+            )
+            lease.assert_core_for(paths.memory_db)
+        final_snapshot = launchctl.snapshot()
+        final_disabled = launchctl.disabled()
+        if (
+            final_snapshot.get("loaded")
+            or final_snapshot.get("running")
+            or not final_disabled
+        ):
+            raise CoreInstallerError(
+                "exact core LaunchAgent changed during context delivery integrity"
+            )
+        lease.assert_core_for(paths.memory_db)
+        replacement_required = str(marker.get("build_id") or "") != (
+            _manifest_build_id(paths.root)
+        )
+        return _safe_result(
+            "context-delivery-integrity",
+            status=(result["status"] if result is not None else audit["status"]),
+            service_state={
+                "loaded": False,
+                "running": False,
+                "disabled": final_disabled,
+            },
+            replacement_required=replacement_required,
+            audit=audit,
+            repair=result,
+        )
+    except CoreInstallerError:
+        raise
+    except Exception as exc:
+        raise CoreInstallerError(
+            "context delivery publication integrity operation failed"
+        ) from exc
+    finally:
+        try:
+            if store is not None:
+                store.close()
+        finally:
+            if lease is not None:
+                lease.close()
+
+
 def _unlink_exact_private(path: Path) -> bool:
     observed = _lstat(path)
     if observed is None:
@@ -2223,6 +2336,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "install",
             "recover-existing",
+            "context-delivery-integrity",
             "publish-binding",
             "status",
             "stop",
@@ -2235,6 +2349,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--maximum-evidence-age-seconds", type=float, default=7200.0)
     parser.add_argument("--wait-seconds", type=float, default=180.0)
     parser.add_argument("--force-restart", action="store_true")
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="apply only the reviewed derived delivery-publication repair",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="explicitly confirm the reviewed delivery-publication repair",
+    )
+    parser.add_argument(
+        "--expected-revision",
+        default="",
+        help="exact 64-hex audit revision reviewed immediately before repair",
+    )
     parser.add_argument(
         "--restored-target",
         action="store_true",
@@ -2259,6 +2388,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CoreInstallerError("maximum evidence age must be between 60 and 86400 seconds")
         if args.restored_target and args.action != "install":
             raise CoreInstallerError("restored-target is valid only for install")
+        delivery_integrity_flags = bool(
+            args.repair or args.confirm or args.expected_revision
+        )
+        if (
+            delivery_integrity_flags
+            and args.action != "context-delivery-integrity"
+        ):
+            raise CoreInstallerError(
+                "delivery integrity repair flags are valid only for "
+                "context-delivery-integrity"
+            )
+        if args.action == "context-delivery-integrity" and (
+            args.evidence_manifest or args.force_restart
+        ):
+            raise CoreInstallerError(
+                "context-delivery-integrity does not accept cutover evidence "
+                "or restart flags"
+            )
         if args.action == "recover-existing" and args.evidence_manifest:
             raise CoreInstallerError(
                 "recover-existing does not accept or reuse cutover evidence"
@@ -2328,6 +2475,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                             label=args.label,
                             config=config,
                             authority_mode="candidate-local-v5",
+                        ),
+                    )
+                elif args.action == "context-delivery-integrity":
+                    result = context_delivery_integrity(
+                        paths=paths,
+                        launchctl=launchctl,
+                        wait_seconds=args.wait_seconds,
+                        repair=bool(args.repair),
+                        confirm=bool(args.confirm),
+                        expected_revision=(
+                            str(args.expected_revision).strip().lower()
+                            if args.expected_revision
+                            else None
                         ),
                     )
                 elif args.action == "stop":

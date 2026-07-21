@@ -394,6 +394,599 @@ class CoreAuthorityLeaseTests(unittest.TestCase):
             self.assertTrue(authority.active)
             authority.close()
 
+    def test_core_maintenance_repairs_only_reviewed_delivery_publication_derivations(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "memory.sqlite3"
+            bootstrap = DurableMemoryStore(database)
+            first = bootstrap.publish_context_event(
+                context_id="default",
+                source_surface="delivery-repair-test",
+                event_type="shared-event",
+                summary="shared repair fixture event",
+                payload={},
+                agent_targets=["mcp-clients"],
+                created_at=100.0,
+            )
+            for agent_id in ("codex-desktop", "claude-desktop"):
+                leased = bootstrap.lease_context_events(
+                    context_id="default",
+                    agent_id=agent_id,
+                    consumer_instance_id=f"{agent_id}-repair-test",
+                    consumer_groups=["mcp-clients"],
+                    limit=1,
+                    lease_seconds=30.0,
+                    now=101.0,
+                )
+                bootstrap.acknowledge_context_deliveries(
+                    context_id="default",
+                    agent_id=agent_id,
+                    acknowledgements=[
+                        {
+                            "delivery_id": leased["deliveries"][0]["delivery_id"],
+                            "lease_token": leased["deliveries"][0]["lease_token"],
+                        }
+                    ],
+                    now=102.0,
+                )
+            bootstrap.close()
+
+            first_authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-delivery-repair-fixture",
+            )
+            first_core = DurableMemoryStore(
+                database,
+                authority_lease=first_authority,
+            )
+            self._claim(first_core, first_authority)
+            first_core.close()
+            first_authority.close()
+
+            # Reproduce the exact pre-fix publication boundary: the immutable
+            # event and canonical target row commit, while the routing
+            # high-water and existing ineligible cursors remain one event back.
+            with closing(sqlite3.connect(database)) as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO agent_context_events (
+                        context_id, source_surface, event_type, summary,
+                        payload_json, agent_targets_json, created_at
+                    ) VALUES (
+                        'default', 'legacy-publisher', 'excluded-event',
+                        'excluded repair fixture event', '{}', ?, 103.0
+                    )
+                    """,
+                    (json.dumps(["another-agent"]),),
+                )
+                second_event_id = int(cursor.lastrowid)
+                conn.execute(
+                    """
+                    INSERT INTO agent_context_event_targets (
+                        event_id, target_kind, target_id, created_at
+                    ) VALUES (?, 'agent', 'another-agent', 103.0)
+                    """,
+                    (second_event_id,),
+                )
+                conn.commit()
+
+            maintenance_authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-delivery-publication-repair",
+            )
+            maintenance = DurableMemoryStore.open_existing_for_core_maintenance(
+                database,
+                authority_lease=maintenance_authority,
+            )
+            audit = maintenance.audit_context_delivery_publication_repair()
+            source_tables = (
+                "agent_context_events",
+                "agent_context_event_targets",
+                "agent_context_consumers",
+                "agent_context_consumer_groups",
+                "agent_context_deliveries",
+                "agent_context_delivery_receipts",
+                "agent_context_delivery_ack_tombstones",
+            )
+            with closing(sqlite3.connect(database)) as conn:
+                source_rows_before = {
+                    table: conn.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ).fetchall()
+                    for table in source_tables
+                }
+            with (
+                patch("memory_store.LOGGER.exception"),
+                self.assertRaisesRegex(RuntimeError, "plan is stale"),
+            ):
+                maintenance.repair_context_delivery_publication(
+                    expected_revision="0" * 64,
+                    confirm=True,
+                )
+            with (
+                patch.object(
+                    maintenance,
+                    "_verified_safety_backup",
+                    side_effect=RuntimeError("synthetic backup refusal"),
+                ),
+                patch("memory_store.LOGGER.exception"),
+                self.assertRaisesRegex(RuntimeError, "synthetic backup refusal"),
+            ):
+                maintenance.repair_context_delivery_publication(
+                    expected_revision=audit["audit_revision"],
+                    confirm=True,
+                )
+            after_backup_refusal = (
+                maintenance.audit_context_delivery_publication_repair()
+            )
+            with (
+                patch.object(
+                    maintenance,
+                    "_prove_context_delivery_publication_repair_durable",
+                    side_effect=RuntimeError(
+                        "synthetic post-commit verification refusal"
+                    ),
+                ),
+                patch("memory_store.LOGGER.exception"),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic post-commit verification refusal",
+                ),
+            ):
+                maintenance.repair_context_delivery_publication(
+                    expected_revision=audit["audit_revision"],
+                    confirm=True,
+                )
+            committed_unverified = (
+                maintenance.audit_context_delivery_publication_repair()
+            )
+            result = maintenance.repair_context_delivery_publication(
+                expected_revision=committed_unverified["audit_revision"],
+                confirm=True,
+            )
+            verified = maintenance.audit_context_delivery_publication_repair()
+            safety_backup = Path(result["safety_backup"]["backup_path"])
+            safety_backup_present = safety_backup.is_file()
+            safety_backup_mode = safety_backup.stat().st_mode & 0o777
+            safety_backup_receipt = {
+                "safety_backup_path": str(safety_backup),
+                "safety_backup_sha256": result["safety_backup"]["sha256"],
+                "safety_backup_size_bytes": result["safety_backup"][
+                    "size_bytes"
+                ],
+            }
+            safety_backup_wal = Path(str(safety_backup) + "-wal")
+            safety_backup_wal.write_bytes(b"synthetic ambiguous sidecar")
+            with self.assertRaisesRegex(RuntimeError, "SQLite sidecars"):
+                maintenance._verify_context_delivery_publication_backup(
+                    safety_backup_receipt
+                )
+            safety_backup_wal.unlink()
+            safety_backup_journal = Path(str(safety_backup) + "-journal")
+            safety_backup_journal.write_bytes(b"synthetic rollback journal")
+            with self.assertRaisesRegex(RuntimeError, "SQLite sidecars"):
+                maintenance._verify_context_delivery_publication_backup(
+                    safety_backup_receipt
+                )
+            safety_backup_journal.unlink()
+            reverified_backup = (
+                maintenance._verify_context_delivery_publication_backup(
+                    safety_backup_receipt
+                )
+            )
+            with closing(sqlite3.connect(database)) as conn:
+                highwater = json.loads(
+                    conn.execute(
+                        """
+                        SELECT value_json FROM store_metadata
+                        WHERE key = 'context_event_targets_reconciled_through'
+                        """
+                    ).fetchone()[0]
+                )
+                cursor_rows = conn.execute(
+                    """
+                    SELECT last_contiguous_event_id
+                    FROM agent_context_delivery_cursors
+                    WHERE context_id = 'default'
+                    ORDER BY agent_id
+                    """
+                ).fetchall()
+                receipt_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM store_maintenance_receipts
+                        WHERE operation_type = 'context-delivery-publication-repair'
+                        """
+                    ).fetchone()[0]
+                )
+                source_rows_after = {
+                    table: conn.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ).fetchall()
+                    for table in source_tables
+                }
+            maintenance.close()
+            maintenance_authority.close()
+
+            successor_authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-delivery-repair-successor",
+            )
+            successor = DurableMemoryStore(
+                database,
+                authority_lease=successor_authority,
+            )
+            successor_inspection = successor.inspect_core_authority_preclaim()
+            successor.close()
+            successor_authority.close()
+
+        self.assertEqual(audit["status"], "repairable")
+        self.assertEqual(
+            after_backup_refusal["audit_revision"],
+            audit["audit_revision"],
+        )
+        self.assertEqual(audit["cursor_mismatch_count"], 2)
+        self.assertTrue(audit["target_reconciliation_needed"])
+        self.assertEqual(committed_unverified["status"], "committed_unverified")
+        self.assertEqual(committed_unverified["pending_repair_receipt_count"], 1)
+        self.assertEqual(result["status"], "verified")
+        self.assertTrue(result["verification_passed"])
+        self.assertTrue(result["reconciled_target_highwater"])
+        self.assertEqual(result["repaired_cursor_count"], 2)
+        self.assertTrue(result["safety_backup"]["verified"])
+        self.assertTrue(safety_backup_present)
+        self.assertEqual(safety_backup_mode, 0o600)
+        self.assertTrue(reverified_backup["verified"])
+        self.assertEqual(verified["status"], "ready")
+        self.assertEqual(verified["cursor_mismatch_count"], 0)
+        self.assertEqual(highwater, second_event_id)
+        self.assertEqual(
+            [int(row[0]) for row in cursor_rows],
+            [second_event_id, second_event_id],
+        )
+        self.assertEqual(receipt_count, 1)
+        self.assertEqual(source_rows_after, source_rows_before)
+        self.assertEqual(
+            successor_inspection["governance_mode"],
+            "authoritative-v6",
+        )
+        self.assertGreater(second_event_id, first["event_id"])
+
+    def test_delivery_publication_repair_refuses_noncanonical_highwater(self) -> None:
+        cases = (
+            ("missing", None),
+            ("malformed", "not-json"),
+            ("negative", "-1"),
+            ("noncanonical", "00"),
+        )
+        for label, value_json in cases:
+            with self.subTest(label=label), TemporaryDirectory() as temporary:
+                database = Path(temporary) / "memory.sqlite3"
+                bootstrap = DurableMemoryStore(database)
+                bootstrap.close()
+                authority = CoreAuthorityLease.acquire_core(
+                    database,
+                    timeout_seconds=0.0,
+                    instance_id=f"core-highwater-{label}",
+                )
+                core = DurableMemoryStore(
+                    database,
+                    authority_lease=authority,
+                )
+                self._claim(core, authority)
+                core.close()
+                authority.close()
+                with closing(sqlite3.connect(database)) as conn:
+                    if value_json is None:
+                        conn.execute(
+                            """
+                            DELETE FROM store_metadata
+                            WHERE key = 'context_event_targets_reconciled_through'
+                            """
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE store_metadata
+                            SET value_json = ?
+                            WHERE key = 'context_event_targets_reconciled_through'
+                            """,
+                            (value_json,),
+                        )
+                    conn.commit()
+                maintenance_authority = CoreAuthorityLease.acquire_core(
+                    database,
+                    timeout_seconds=0.0,
+                    instance_id=f"core-highwater-audit-{label}",
+                )
+                maintenance = DurableMemoryStore.open_existing_for_core_maintenance(
+                    database,
+                    authority_lease=maintenance_authority,
+                )
+                audit = maintenance.audit_context_delivery_publication_repair()
+                maintenance.close()
+                maintenance_authority.close()
+
+                self.assertEqual(audit["status"], "blocked")
+                self.assertFalse(audit["repairable"])
+                self.assertEqual(audit["highwater_contract_error_count"], 1)
+
+    def test_delivery_publication_repair_never_verifies_tampered_pending_receipt(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            bootstrap = DurableMemoryStore(database)
+            published = bootstrap.publish_context_event(
+                context_id="default",
+                source_surface="pending-receipt-regression",
+                event_type="repair-fixture",
+                summary="pending receipt binding fixture",
+                payload={},
+                agent_targets=["codex-desktop"],
+                created_at=100.0,
+            )
+            bootstrap.close()
+            authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-pending-receipt-fixture",
+            )
+            core = DurableMemoryStore(database, authority_lease=authority)
+            self._claim(core, authority)
+            core.close()
+            authority.close()
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    """
+                    UPDATE store_metadata
+                    SET value_json = '0', updated_at = 101.0
+                    WHERE key = 'context_event_targets_reconciled_through'
+                    """
+                )
+                conn.commit()
+
+            maintenance_authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-pending-receipt-repair",
+            )
+            maintenance = DurableMemoryStore.open_existing_for_core_maintenance(
+                database,
+                authority_lease=maintenance_authority,
+            )
+            audit = maintenance.audit_context_delivery_publication_repair()
+            with (
+                patch.object(
+                    maintenance,
+                    "_prove_context_delivery_publication_repair_durable",
+                    side_effect=RuntimeError("synthetic post-commit interruption"),
+                ),
+                patch("memory_store.LOGGER.exception"),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic post-commit interruption",
+                ),
+            ):
+                maintenance.repair_context_delivery_publication(
+                    expected_revision=audit["audit_revision"],
+                    confirm=True,
+                )
+            pending = maintenance.audit_context_delivery_publication_repair()
+            self.assertEqual(pending["status"], "committed_unverified")
+
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    """
+                    UPDATE store_maintenance_receipts
+                    SET after_revision = ?
+                    WHERE operation_type = 'context-delivery-publication-repair'
+                    """,
+                    ("f" * 64,),
+                )
+                conn.commit()
+            tampered_pending = (
+                maintenance.audit_context_delivery_publication_repair()
+            )
+            with (
+                patch("memory_store.LOGGER.exception"),
+                self.assertRaisesRegex(RuntimeError, "not narrowly repairable"),
+            ):
+                maintenance.repair_context_delivery_publication(
+                    expected_revision=tampered_pending["audit_revision"],
+                    confirm=True,
+                )
+            with closing(sqlite3.connect(database)) as conn:
+                row = conn.execute(
+                    """
+                    SELECT payload_json
+                    FROM store_maintenance_receipts
+                    WHERE operation_type = 'context-delivery-publication-repair'
+                    """
+                ).fetchone()
+                payload = json.loads(str(row[0]))
+                self.assertEqual(payload["verification_status"], "pending")
+                payload["verification_status"] = "verified"
+                payload["verified_at"] = 102.0
+                conn.execute(
+                    """
+                    UPDATE store_maintenance_receipts
+                    SET payload_json = ?
+                    WHERE operation_type = 'context-delivery-publication-repair'
+                    """,
+                    (json.dumps(payload, sort_keys=True, separators=(",", ":")),),
+                )
+                conn.commit()
+            tampered_verified = (
+                maintenance.audit_context_delivery_publication_repair()
+            )
+            maintenance.close()
+            maintenance_authority.close()
+
+        self.assertEqual(audit["status"], "repairable")
+        self.assertEqual(published["event_id"], 1)
+        self.assertEqual(tampered_pending["status"], "blocked")
+        self.assertEqual(
+            tampered_pending[
+                "pending_repair_receipt_semantic_error_count"
+            ],
+            1,
+        )
+        self.assertEqual(tampered_verified["status"], "blocked")
+        self.assertEqual(
+            tampered_verified[
+                "verified_repair_receipt_semantic_error_count"
+            ],
+            1,
+        )
+
+    def test_delivery_publication_audit_revision_binds_raw_derivation_rows(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            bootstrap = DurableMemoryStore(database)
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO agent_context_consumers (
+                        agent_id, consumer_kind, enabled, created_at, updated_at
+                    ) VALUES ('codex-desktop', 'local-mcp', 1, 100.0, 100.0)
+                    """
+                )
+                conn.commit()
+            bootstrap.close()
+            authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-raw-derivation-fixture",
+            )
+            core = DurableMemoryStore(database, authority_lease=authority)
+            self._claim(core, authority)
+            core.close()
+            authority.close()
+
+            first_authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-raw-derivation-audit-one",
+            )
+            first_store = DurableMemoryStore.open_existing_for_core_maintenance(
+                database,
+                authority_lease=first_authority,
+            )
+            first = first_store.audit_context_delivery_publication_repair()
+            first_store.close()
+            first_authority.close()
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    """
+                    UPDATE agent_context_consumers
+                    SET updated_at = 101.0
+                    WHERE agent_id = 'codex-desktop'
+                    """
+                )
+                conn.commit()
+            second_authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-raw-derivation-audit-two",
+            )
+            second_store = DurableMemoryStore.open_existing_for_core_maintenance(
+                database,
+                authority_lease=second_authority,
+            )
+            second = second_store.audit_context_delivery_publication_repair()
+            second_store.close()
+            second_authority.close()
+
+        self.assertEqual(first["status"], "ready")
+        self.assertEqual(second["status"], "ready")
+        self.assertEqual(
+            first["derivation_source_row_count"],
+            second["derivation_source_row_count"],
+        )
+        self.assertNotEqual(
+            first["derivation_source_sha256"],
+            second["derivation_source_sha256"],
+        )
+        self.assertNotEqual(first["audit_revision"], second["audit_revision"])
+
+    def test_delivery_publication_repair_refuses_unrelated_delivery_defect(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            bootstrap = DurableMemoryStore(database)
+            bootstrap.publish_context_event(
+                context_id="default",
+                source_surface="delivery-defect-test",
+                event_type="delivery-defect",
+                summary="delivery defect fixture",
+                payload={},
+                agent_targets=["mcp-clients"],
+                created_at=100.0,
+            )
+            leased = bootstrap.lease_context_events(
+                context_id="default",
+                agent_id="codex-desktop",
+                consumer_instance_id="expected-owner",
+                consumer_groups=["mcp-clients"],
+                limit=1,
+                lease_seconds=30.0,
+                now=101.0,
+            )
+            receipt_id = leased["deliveries"][0]["receipt_id"]
+            bootstrap.close()
+            authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-unrelated-delivery-defect",
+            )
+            core = DurableMemoryStore(database, authority_lease=authority)
+            self._claim(core, authority)
+            core.close()
+            authority.close()
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    """
+                    UPDATE agent_context_delivery_receipts
+                    SET consumer_instance_id = 'wrong-owner'
+                    WHERE receipt_id = ?
+                    """,
+                    (receipt_id,),
+                )
+                conn.commit()
+            maintenance_authority = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-unrelated-delivery-audit",
+            )
+            maintenance = DurableMemoryStore.open_existing_for_core_maintenance(
+                database,
+                authority_lease=maintenance_authority,
+            )
+            audit = maintenance.audit_context_delivery_publication_repair()
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "not narrowly repairable",
+            ):
+                with patch("memory_store.LOGGER.exception"):
+                    maintenance.repair_context_delivery_publication(
+                        expected_revision=audit["audit_revision"],
+                        confirm=True,
+                    )
+            maintenance.close()
+            maintenance_authority.close()
+
+        self.assertEqual(audit["status"], "blocked")
+        self.assertGreater(audit["unrelated_delivery_error_count"], 0)
+
     def test_core_lease_cannot_be_reused_for_another_store(self) -> None:
         with TemporaryDirectory() as temporary:
             first = Path(temporary) / "first.sqlite3"
