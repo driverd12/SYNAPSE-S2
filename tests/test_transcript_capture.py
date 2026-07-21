@@ -13,10 +13,53 @@ from transcript_capture import (
     MAX_TRANSCRIPT_DELTA_BYTES,
     TranscriptCaptureManager,
     _capture_id_for_file_delta,
+    _exclusive_file_lock,
 )
 
 
 class TranscriptCaptureManagerTests(unittest.TestCase):
+    def test_transcript_lock_rejects_wrong_mode_symlink_and_hardlink(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            wrong_mode = root / "wrong-mode.lock"
+            wrong_mode.write_text("preserve", encoding="utf-8")
+            wrong_mode.chmod(0o644)
+            wrong_mode_inode = wrong_mode.stat().st_ino
+            with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+                with _exclusive_file_lock(wrong_mode, blocking=True):
+                    self.fail("unsafe lock must not be acquired")
+            self.assertEqual(wrong_mode.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(wrong_mode.stat().st_ino, wrong_mode_inode)
+
+            hardlink_target = root / "hardlink-target"
+            hardlink_target.write_text("preserve", encoding="utf-8")
+            hardlink_target.chmod(0o600)
+            hardlink = root / "hardlink.lock"
+            os.link(hardlink_target, hardlink)
+            with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+                with _exclusive_file_lock(hardlink, blocking=True):
+                    self.fail("hard-linked lock must not be acquired")
+            self.assertEqual(hardlink_target.stat().st_nlink, 2)
+
+            symlink_target = root / "symlink-target"
+            symlink_target.write_text("preserve", encoding="utf-8")
+            symlink_target.chmod(0o600)
+            symlink = root / "symlink.lock"
+            symlink.symlink_to(symlink_target)
+            with self.assertRaises(OSError):
+                with _exclusive_file_lock(symlink, blocking=True):
+                    self.fail("symlink lock must not be acquired")
+            self.assertEqual(symlink_target.read_text(encoding="utf-8"), "preserve")
+
+    def test_transcript_lock_never_creates_multiple_missing_parent_levels(self):
+        with TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "missing" / "nested" / "unsafe.lock"
+            with self.assertRaises(FileNotFoundError):
+                with _exclusive_file_lock(nested, blocking=True):
+                    self.fail("lock parent chain must not be created broadly")
+            self.assertFalse((Path(tmp) / "missing").exists())
+
     def test_capture_root_rejects_credential_shaped_path(self):
         with TemporaryDirectory() as tmp:
             marker = "SYNTHETIC_TRANSCRIPT_ROOT_SECRET_42"
@@ -187,10 +230,15 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
             lineage_path.write_text(json.dumps({"source_id": source_id}), encoding="utf-8")
 
             manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            manager.repair_legacy_state()
             listed = manager.list_sources()
             rewritten = state_path.read_text(encoding="utf-8")
             first_migration = state_path.read_bytes()
-            TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
+            second_manager = TranscriptCaptureManager(
+                root=root,
+                backend=self.make_backend(tmp),
+            )
+            second_manager.repair_legacy_state()
             second_migration = state_path.read_bytes()
             state_mode = state_path.stat().st_mode & 0o777
             retained_backups = list(root.glob("*.bak"))
@@ -243,10 +291,11 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
                 side_effect=write_then_fail,
             ):
                 with self.assertRaisesRegex(OSError, "post-replace"):
-                    TranscriptCaptureManager(
+                    manager = TranscriptCaptureManager(
                         root=root,
                         backend=self.make_backend(tmp),
                     )
+                    manager.repair_legacy_state()
 
             restored_state = state_path.read_bytes()
             restored_lineage = lineage_path.read_bytes()
@@ -316,16 +365,18 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
                 backend=self.make_backend(tmp),
                 running_app_provider=manager.running_app_provider,
             )
+            migrated_manager.repair_legacy_state()
             listed = migrated_manager.list_app_connections()
             scrubbed_text = state_path.read_text(encoding="utf-8")
             rendered = json.dumps({"attached": attached, "listed": listed})
             state_mode = state_path.stat().st_mode & 0o777
             first_migration = state_path.read_bytes()
-            TranscriptCaptureManager(
+            second_manager = TranscriptCaptureManager(
                 root=root,
                 backend=self.make_backend(tmp),
                 running_app_provider=manager.running_app_provider,
             )
+            second_manager.repair_legacy_state()
             second_migration = state_path.read_bytes()
 
         self.assertNotIn(marker, rendered)
@@ -341,6 +392,7 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
     def test_state_reads_are_side_effect_free_until_explicit_initialization_migration(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "capture-root"
+            root.mkdir(mode=0o700)
             manager = TranscriptCaptureManager(root=root, backend=self.make_backend(tmp))
             marker = "SYNTHETIC_LEGACY_READ_SECRET_42"
             source_id = "legacy-read-only"
@@ -412,14 +464,15 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
                     target.write_bytes(original)
                     (root / state_name).symlink_to(target)
 
+                    manager = TranscriptCaptureManager(
+                        root=root,
+                        backend=self.make_backend(tmp),
+                    )
                     with self.assertRaisesRegex(
                         RuntimeError,
                         "regular non-symlink file",
                     ):
-                        TranscriptCaptureManager(
-                            root=root,
-                            backend=self.make_backend(tmp),
-                        )
+                        manager.repair_legacy_state()
 
                     self.assertEqual(target.read_bytes(), original)
 
@@ -944,6 +997,7 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
             )
 
             repaired_manager = TranscriptCaptureManager(root=root, backend=backend)
+            repaired_manager.repair_legacy_state()
             repaired_lineage = json.loads(
                 repaired_manager._source_lineage_path("lineage-crash").read_text(
                     encoding="utf-8"
@@ -1008,6 +1062,7 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
             lineage_path.chmod(0o644)
 
             repaired_manager = TranscriptCaptureManager(root=root, backend=backend)
+            repaired_manager.repair_legacy_state()
             repaired_text = lineage_path.read_text(encoding="utf-8")
             repaired_source = repaired_manager.list_sources()["sources"][0]
             repaired_mode = lineage_path.stat().st_mode & 0o777
@@ -1756,7 +1811,7 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
                     capture_id=capture_id,
                 )
 
-    def test_accessibility_snapshot_resolves_ps_name_to_visible_app_name(self):
+    def test_accessibility_snapshot_revalidates_exact_live_app_identity(self):
         with TemporaryDirectory() as tmp:
             manager = TranscriptCaptureManager(
                 root=Path(tmp) / "capture-root",
@@ -1787,15 +1842,55 @@ class TranscriptCaptureManagerTests(unittest.TestCase):
                 snapshot = manager._snapshot_app_accessibility(
                     {
                         "app_name": "codex",
-                        "bundle_id": "",
+                        "bundle_id": "com.openai.codex",
                         "pid": 4242,
                     }
                 )
 
-        self.assertEqual(calls[0][-1], "Codex")
+        self.assertEqual(calls[0][-3:], ["Codex", "4242", "com.openai.codex"])
+        self.assertIn("application processes whose unix id is appPid", calls[0][2])
+        self.assertIn("bundle identifier of targetProcess", calls[0][2])
         self.assertIn("Application: Codex", snapshot)
         self.assertNotIn("missing value", snapshot)
         self.assertEqual(snapshot.count("Window 1: Codex"), 1)
+
+    def test_accessibility_snapshot_rejects_pid_reuse_or_identity_substitution(self):
+        mismatches = [
+            {
+                "app_name": "Passwords",
+                "bundle_id": "com.apple.Passwords",
+                "pid": 4242,
+            },
+            {
+                "app_name": "Codex",
+                "bundle_id": "com.example.substitute",
+                "pid": 4242,
+            },
+            {
+                "app_name": "Codex",
+                "bundle_id": "com.openai.codex",
+                "pid": 9001,
+            },
+        ]
+        for live_app in mismatches:
+            with self.subTest(live_app=live_app), TemporaryDirectory() as tmp:
+                manager = TranscriptCaptureManager(
+                    root=Path(tmp) / "capture-root",
+                    backend=self.make_backend(tmp),
+                )
+                manager._detect_visible_application_processes = lambda: [  # type: ignore[method-assign]
+                    live_app
+                ]
+                with patch("transcript_capture.subprocess.run") as run:
+                    with self.assertRaisesRegex(ValueError, "app identity changed"):
+                        manager._snapshot_app_accessibility(
+                            {
+                                "app_name": "Codex",
+                                "bundle_id": "com.openai.codex",
+                                "pid": 4242,
+                            }
+                        )
+                run.assert_not_called()
 
     def test_running_app_detection_falls_back_to_process_list_when_provider_fails(self):
         with TemporaryDirectory() as tmp:

@@ -12,6 +12,7 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import struct
 import sys
 import tempfile
 import time
@@ -28,6 +29,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from core_authority import (
+    CORE_AUTHORITY_INSTANCE_RE,
+    CORE_AUTHORITY_LOCK_GENERATION_RE,
+    CORE_AUTHORITY_METADATA_KEY,
+    CORE_AUTHORITY_SCHEMA_VERSION,
+    CoreAuthorityError,
+    CoreAuthorityLease,
+)
+from core_request_journal import JOURNAL_BINDING_SCHEMA, JOURNAL_SCHEMA_VERSION
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
     SecretRedactingFormatter,
@@ -49,24 +59,71 @@ LOGGER.setLevel(os.getenv("SYNAPSE_S2_LOG_LEVEL", "INFO").upper())
 LOGGER.propagate = False
 
 
-BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v2"
-BACKUP_RESTORE_RECEIPT_SCHEMA = "synapse-s2.memory-restore.v1"
+class ContextDeliveryRejected(ValueError):
+    """A deterministic delivery request rejection with no committed effects."""
+
+
+BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v3"
+LEGACY_BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v2"
+BACKUP_RESTORE_RECEIPT_SCHEMA = "synapse-s2.memory-restore.v2"
 BACKUP_RESTORE_PLAN_SCHEMA = "synapse-s2.memory-restore-plan.v1"
+RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA = (
+    "synapse-s2.recovery-request-journal-binding.v1"
+)
+LOGICAL_SNAPSHOT_DIGEST_SCHEMA = "synapse-s2.logical-snapshot.v1"
+CORE_ADOPTION_ATTESTATION_METADATA_KEY = "core_adoption_attestation"
+CORE_ADOPTION_ATTESTATION_SCHEMA = "synapse-s2.core-adoption-attestation.v1"
+CORE_RUNTIME_PUBLICATION_METADATA_KEY = "core_runtime_state_publication"
+CORE_RUNTIME_PUBLICATION_SCHEMA = "synapse-s2.core-runtime-publication.v1"
+CORE_STORE_IDENTITY_RE = re.compile(r"^store-[0-9a-f]{24}$")
+CORE_REQUEST_JOURNAL_ID_RE = re.compile(r"^journal-[0-9a-f]{24}$")
+CORE_ROOT_GENERATION_ID_RE = re.compile(r"^generation-[0-9a-f]{24}$")
 BACKUP_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA = (
+    "synapse-s2.runtime-authority-binding.v1"
+)
+CORE_AUTHORITY_MARKER_FIELDS = (
+    "schema_version",
+    "service_required",
+    "epoch",
+    "instance_id",
+    "config_fingerprint",
+    "build_id",
+    "protocol_version",
+    "lock_generation_id",
+    "store_identity",
+    "request_journal_id",
+    "request_journal_binding_schema",
+    "request_journal_schema_version",
+    "root_generation_id",
+    "embedding_space_identity",
+    "restored_target_binding_receipt_digest",
+    "claimed_at",
+    "updated_at",
+)
 SQLITE_APPLICATION_ID = 0x53324442  # ASCII "S2DB"
-SQLITE_USER_VERSION = 5
-BACKUP_SCHEMA_CONTRACT_VERSION = "s2-schema-v5"
-BACKUP_RECOVERY_RUNTIME_ID = "synapse-s2/0.1.0+schema-v5"
+SQLITE_USER_VERSION = 6
+BACKUP_SCHEMA_CONTRACT_VERSION = "s2-schema-v6"
+BACKUP_RECOVERY_RUNTIME_ID = "synapse-s2/0.1.0+schema-v6"
 BACKUP_SCHEMA_COMPATIBILITY_REGISTRY: dict[str, dict[str, Any]] = {
-    BACKUP_SCHEMA_CONTRACT_VERSION: {
+    "s2-schema-v5": {
         "schema_sha256": "861746736fae070d4ccd2765cedb0d049892385158846b1ea8272aa890c59685",
         "table_count": 19,
         "index_count": 28,
         "migration_set_sha256": "ff16d292fa470cd97a9a6cb2e88dd2f801824ce6c3ee640d7546e08b3191c228",
         "migration_count": 12,
         "application_id": SQLITE_APPLICATION_ID,
+        "user_version": 5,
+    },
+    BACKUP_SCHEMA_CONTRACT_VERSION: {
+        "schema_sha256": "861746736fae070d4ccd2765cedb0d049892385158846b1ea8272aa890c59685",
+        "table_count": 19,
+        "index_count": 28,
+        "migration_set_sha256": "ae7a7d3cd572233c5090f1bb6bb0ce209dd19925e5b03a3f86a00f6e2bc5f995",
+        "migration_count": 13,
+        "application_id": SQLITE_APPLICATION_ID,
         "user_version": SQLITE_USER_VERSION,
-    }
+    },
 }
 _CANONICAL_BACKUP_CONTRACT: dict[str, Any] | None = None
 BACKUP_CRITICAL_TABLES = frozenset(
@@ -1284,12 +1341,33 @@ def _decode_json(raw: str, fallback: Any) -> Any:
 class DurableMemoryStore:
     """SQLite-backed memory substrate shared by CLI and MCP launches."""
 
-    def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | os.PathLike[str] | None = None,
+        *,
+        authority_lease: CoreAuthorityLease | None = None,
+    ) -> None:
         self.db_path = self._resolve_db_path(db_path)
         self._target_integrity_verified = False
         self._capture_integrity_verified = False
+        self._initializing_authority_store = True
+        self._database_created_for_initialization = False
+        self._claimed_core_authority_marker_sha256: str | None = None
         self._ensure_directory(self.db_path.parent, owned=False)
-        self._initialize()
+        self._owns_authority_lease = authority_lease is None
+        self._authority_lease = authority_lease or CoreAuthorityLease.acquire_local(
+            self.db_path
+        )
+        if authority_lease is not None:
+            authority_lease.assert_core_for(self.db_path)
+        try:
+            self._initialize()
+        except BaseException:
+            if self._owns_authority_lease:
+                self._authority_lease.close()
+            raise
+        finally:
+            self._initializing_authority_store = False
 
     @classmethod
     def open_existing_for_audit(
@@ -1302,11 +1380,26 @@ class DurableMemoryStore:
         store.db_path = store._resolve_db_path(db_path)
         store._target_integrity_verified = False
         store._capture_integrity_verified = False
+        store._initializing_authority_store = False
+        store._database_created_for_initialization = False
+        store._claimed_core_authority_marker_sha256 = None
+        store._authority_lease = None
+        store._owns_authority_lease = False
         if not store.db_path.is_file():
             raise FileNotFoundError(
                 f"SYNAPSE-S2 memory store does not exist: {store.db_path}"
             )
         return store
+
+    def close(self) -> None:
+        if self._owns_authority_lease and self._authority_lease is not None:
+            self._authority_lease.close()
+
+    def __del__(self) -> None:  # pragma: no cover - process teardown fallback
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _resolve_db_path(self, db_path: str | os.PathLike[str] | None) -> Path:
         if db_path is not None:
@@ -1318,14 +1411,1231 @@ class DurableMemoryStore:
             return Path(configured).expanduser()
         return Path.cwd() / ".synapse_s2" / "memory.sqlite3"
 
+    def _assert_filesystem_authority(self) -> CoreAuthorityLease:
+        lease = self._authority_lease
+        if lease is None:
+            raise CoreAuthorityError(
+                "writable memory-store access requires an active authority lease"
+            )
+        lease.assert_active_for(self.db_path)
+        return lease
+
+    def assert_active_authority(self) -> None:
+        """Fence a non-SQLite publication against this store's live authority.
+
+        SQLite mutations revalidate inside their transaction immediately before
+        commit.  Runtime-state files share the same authority but commit through
+        atomic rename, so callers use this method as their pre-publication
+        callback.  A governed v6 store additionally proves the durable epoch.
+        """
+
+        lease = self._assert_filesystem_authority()
+        if lease.role == "core" and lease.durable_epoch is None:
+            return
+        with closing(self._connect_read_only()) as conn:
+            self._assert_durable_authority(conn)
+
+    @staticmethod
+    def _core_authority_marker(
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any] | None:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("store_metadata",),
+        ).fetchone()
+        if table_exists is None:
+            return None
+        row = conn.execute(
+            "SELECT value_json, updated_at FROM store_metadata WHERE key = ?",
+            (CORE_AUTHORITY_METADATA_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            marker = json.loads(str(row["value_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CoreAuthorityError(
+                "durable core authority marker is invalid"
+            ) from exc
+        if not isinstance(marker, dict):
+            raise CoreAuthorityError("durable core authority marker is invalid")
+        if set(marker) != set(CORE_AUTHORITY_MARKER_FIELDS):
+            raise CoreAuthorityError("durable core authority marker is invalid")
+        schema_version = marker.get("schema_version")
+        service_required = marker.get("service_required")
+        epoch = marker.get("epoch")
+        instance_id = marker.get("instance_id")
+        claimed_at = marker.get("claimed_at")
+        updated_at = marker.get("updated_at")
+        config_fingerprint = marker.get("config_fingerprint")
+        build_id = marker.get("build_id")
+        protocol_version = marker.get("protocol_version")
+        lock_generation_id = marker.get("lock_generation_id")
+        store_identity = marker.get("store_identity")
+        request_journal_id = marker.get("request_journal_id")
+        request_journal_binding_schema = marker.get(
+            "request_journal_binding_schema"
+        )
+        request_journal_schema_version = marker.get(
+            "request_journal_schema_version"
+        )
+        root_generation_id = marker.get("root_generation_id")
+        embedding_space_identity = marker.get("embedding_space_identity")
+        restored_target_binding_receipt_digest = marker.get(
+            "restored_target_binding_receipt_digest"
+        )
+        timestamps_valid = all(
+            type(value) in {int, float}
+            and math.isfinite(float(value))
+            and float(value) > 0.0
+            for value in (claimed_at, updated_at)
+        )
+        if (
+            type(schema_version) is not int
+            or schema_version != CORE_AUTHORITY_SCHEMA_VERSION
+            or service_required is not True
+            or type(epoch) is not int
+            or epoch <= 0
+            or epoch > (2**63 - 1)
+            or not isinstance(instance_id, str)
+            or CORE_AUTHORITY_INSTANCE_RE.fullmatch(instance_id) is None
+            or not isinstance(config_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", config_fingerprint) is None
+            or not isinstance(build_id, str)
+            or CORE_AUTHORITY_INSTANCE_RE.fullmatch(build_id) is None
+            or not isinstance(protocol_version, str)
+            or CORE_AUTHORITY_INSTANCE_RE.fullmatch(protocol_version) is None
+            or not isinstance(lock_generation_id, str)
+            or CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(lock_generation_id)
+            is None
+            or not isinstance(store_identity, str)
+            or CORE_STORE_IDENTITY_RE.fullmatch(store_identity) is None
+            or not isinstance(request_journal_id, str)
+            or CORE_REQUEST_JOURNAL_ID_RE.fullmatch(request_journal_id) is None
+            or request_journal_binding_schema != JOURNAL_BINDING_SCHEMA
+            or type(request_journal_schema_version) is not int
+            or request_journal_schema_version != JOURNAL_SCHEMA_VERSION
+            or not isinstance(root_generation_id, str)
+            or CORE_ROOT_GENERATION_ID_RE.fullmatch(root_generation_id) is None
+            or not isinstance(embedding_space_identity, str)
+            or BACKUP_DIGEST_RE.fullmatch(embedding_space_identity) is None
+            or (
+                restored_target_binding_receipt_digest is not None
+                and (
+                    not isinstance(
+                        restored_target_binding_receipt_digest,
+                        str,
+                    )
+                    or BACKUP_DIGEST_RE.fullmatch(
+                        restored_target_binding_receipt_digest
+                    )
+                    is None
+                )
+            )
+            or not timestamps_valid
+            or float(claimed_at) > float(updated_at)
+            or float(row["updated_at"]) != float(updated_at)
+        ):
+            raise CoreAuthorityError("durable core authority marker is invalid")
+        return {
+            "schema_version": schema_version,
+            "service_required": service_required,
+            "epoch": epoch,
+            "instance_id": instance_id,
+            "config_fingerprint": config_fingerprint,
+            "build_id": build_id,
+            "protocol_version": protocol_version,
+            "lock_generation_id": lock_generation_id,
+            "store_identity": store_identity,
+            "request_journal_id": request_journal_id,
+            "request_journal_binding_schema": request_journal_binding_schema,
+            "request_journal_schema_version": request_journal_schema_version,
+            "root_generation_id": root_generation_id,
+            "embedding_space_identity": embedding_space_identity,
+            "restored_target_binding_receipt_digest": (
+                restored_target_binding_receipt_digest
+            ),
+            "claimed_at": float(claimed_at),
+            "updated_at": float(updated_at),
+        }
+
+    @staticmethod
+    def _core_authority_marker_sha256(marker: dict[str, Any]) -> str:
+        """Digest the closed immutable marker contract without coercion."""
+
+        if set(marker) != set(CORE_AUTHORITY_MARKER_FIELDS):
+            raise CoreAuthorityError("durable core authority marker is invalid")
+        try:
+            encoded = json.dumps(
+                marker,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise CoreAuthorityError(
+                "durable core authority marker is invalid"
+            ) from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def runtime_state_authority_binding_for_marker(
+        cls,
+        marker: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the closed epoch binding embedded in governed runtime state."""
+
+        marker_sha256 = cls._core_authority_marker_sha256(marker)
+        epoch = marker.get("epoch")
+        lock_generation_id = marker.get("lock_generation_id")
+        if (
+            type(epoch) is not int
+            or epoch <= 0
+            or not isinstance(lock_generation_id, str)
+            or CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(lock_generation_id)
+            is None
+        ):
+            raise CoreAuthorityError("durable core authority marker is invalid")
+        return {
+            "schema": RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA,
+            "marker_sha256": marker_sha256,
+            "authority_epoch_number": epoch,
+            "lock_generation_id": lock_generation_id,
+        }
+
+    def runtime_state_authority_binding(self) -> dict[str, Any] | None:
+        """Return this live core epoch's exact runtime-state binding."""
+
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is None:
+            return None
+        with closing(self._connect_read_only()) as conn:
+            marker = self._core_authority_marker(conn)
+            self._assert_core_marker_matches(marker)
+        assert marker is not None
+        return self.runtime_state_authority_binding_for_marker(marker)
+
+    @staticmethod
+    def runtime_state_path_sha256(path: str | os.PathLike[str]) -> str:
+        """Return the closed identity of one canonical runtime-state pathname."""
+
+        candidate = Path(path).expanduser().resolve(strict=False)
+        return hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _core_runtime_publication(
+        cls,
+        conn: sqlite3.Connection,
+        marker: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Read and strictly validate the claim-to-runtime publication receipt."""
+
+        row = conn.execute(
+            "SELECT value_json, updated_at FROM store_metadata WHERE key = ?",
+            (CORE_RUNTIME_PUBLICATION_METADATA_KEY,),
+        ).fetchone()
+        if row is None:
+            # v6 stores created before this receipt contract remain readable,
+            # but they are never eligible for automatic publication repair.
+            return None
+        try:
+            payload = json.loads(str(row["value_json"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CoreAuthorityError(
+                "core runtime publication receipt is invalid"
+            ) from exc
+        expected_fields = {
+            "schema",
+            "status",
+            "marker_sha256",
+            "authority_epoch_number",
+            "lock_generation_id",
+            "instance_id",
+            "config_fingerprint",
+            "build_id",
+            "protocol_version",
+            "runtime_state_path_sha256",
+            "started_at",
+            "completed_at",
+            "updated_at",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected_fields:
+            raise CoreAuthorityError("core runtime publication receipt is invalid")
+        started_at = payload.get("started_at")
+        completed_at = payload.get("completed_at")
+        updated_at = payload.get("updated_at")
+        status_value = payload.get("status")
+        timestamps_valid = (
+            type(started_at) in {int, float}
+            and math.isfinite(float(started_at))
+            and float(started_at) > 0.0
+            and type(updated_at) in {int, float}
+            and math.isfinite(float(updated_at))
+            and float(updated_at) >= float(started_at)
+            and float(row["updated_at"]) == float(updated_at)
+        )
+        completion_valid = (
+            status_value == "pending" and completed_at is None
+        ) or (
+            status_value == "complete"
+            and type(completed_at) in {int, float}
+            and math.isfinite(float(completed_at))
+            and float(completed_at) >= float(started_at)
+            and float(completed_at) == float(updated_at)
+        )
+        if (
+            marker is None
+            or payload.get("schema") != CORE_RUNTIME_PUBLICATION_SCHEMA
+            or status_value not in {"pending", "complete"}
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(payload.get("marker_sha256") or "")
+            )
+            is None
+            or type(payload.get("authority_epoch_number")) is not int
+            or CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(
+                str(payload.get("lock_generation_id") or "")
+            )
+            is None
+            or CORE_AUTHORITY_INSTANCE_RE.fullmatch(
+                str(payload.get("instance_id") or "")
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(payload.get("config_fingerprint") or "")
+            )
+            is None
+            or CORE_AUTHORITY_INSTANCE_RE.fullmatch(
+                str(payload.get("build_id") or "")
+            )
+            is None
+            or CORE_AUTHORITY_INSTANCE_RE.fullmatch(
+                str(payload.get("protocol_version") or "")
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(payload.get("runtime_state_path_sha256") or ""),
+            )
+            is None
+            or not timestamps_valid
+            or not completion_valid
+            or payload["marker_sha256"] != cls._core_authority_marker_sha256(marker)
+            or payload["authority_epoch_number"] != marker["epoch"]
+            or payload["lock_generation_id"] != marker["lock_generation_id"]
+            or payload["instance_id"] != marker["instance_id"]
+            or payload["config_fingerprint"] != marker["config_fingerprint"]
+            or payload["build_id"] != marker["build_id"]
+            or payload["protocol_version"] != marker["protocol_version"]
+        ):
+            raise CoreAuthorityError("core runtime publication receipt is invalid")
+        return dict(payload)
+
+    def interrupted_runtime_publication_binding(
+        self,
+        *,
+        marker: dict[str, Any],
+        publication: dict[str, Any],
+        runtime_state_path: str | os.PathLike[str],
+        expected_config_fingerprint: str,
+        expected_build_id: str,
+        expected_protocol_version: str,
+        expected_root_generation_id: str,
+        expected_embedding_space_identity: str,
+    ) -> dict[str, Any]:
+        """Authorize a same-lock repair of one interrupted runtime publication.
+
+        This is deliberately not a general runtime-state repair surface.  It is
+        available only while an unbound core holds the exact lock inode named
+        by a durable ``pending`` receipt committed atomically with the marker.
+        """
+
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "interrupted runtime publication requires an unbound core lease"
+            )
+        path_digest = self.runtime_state_path_sha256(runtime_state_path)
+        with closing(self._connect_read_only()) as conn:
+            live_marker = self._core_authority_marker(conn)
+            self._validate_core_authority_version_pair(conn, live_marker)
+            live_publication = self._core_runtime_publication(conn, live_marker)
+        if (
+            live_marker != marker
+            or live_publication != publication
+            or live_publication is None
+            or live_publication["status"] != "pending"
+            or live_publication["runtime_state_path_sha256"] != path_digest
+            or marker["lock_generation_id"] != lease.lock_generation_id
+            or marker["config_fingerprint"] != expected_config_fingerprint
+            or marker["build_id"] != expected_build_id
+            or marker["protocol_version"] != expected_protocol_version
+            or marker["root_generation_id"] != expected_root_generation_id
+            or marker["embedding_space_identity"]
+            != expected_embedding_space_identity
+        ):
+            raise CoreAuthorityError(
+                "interrupted runtime publication is not recoverable by this core"
+            )
+        self._assert_filesystem_authority()
+        return self.runtime_state_authority_binding_for_marker(live_marker)
+
+    def complete_runtime_state_authority_publication(
+        self,
+        *,
+        runtime_state_path: str | os.PathLike[str],
+    ) -> dict[str, Any]:
+        """Commit the completion receipt after exact runtime-state publication."""
+
+        expected_path_digest = self.runtime_state_path_sha256(runtime_state_path)
+        self.assert_active_authority()
+        uri = self.db_path.resolve().as_uri() + "?mode=rw"
+        conn = sqlite3.connect(uri, timeout=10.0, isolation_level=None, uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 10000")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_durable_authority(conn)
+                marker = self._core_authority_marker(conn)
+                publication = self._core_runtime_publication(conn, marker)
+                if (
+                    marker is None
+                    or publication is None
+                    or publication["status"] != "pending"
+                    or publication["runtime_state_path_sha256"]
+                    != expected_path_digest
+                ):
+                    raise CoreAuthorityError(
+                        "core runtime publication is not pending"
+                    )
+                now = max(
+                    time.time(),
+                    float(publication["started_at"]),
+                    float(publication["updated_at"]),
+                )
+                completed = {
+                    **publication,
+                    "status": "complete",
+                    "completed_at": now,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    """
+                    UPDATE store_metadata
+                    SET value_json = ?, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (
+                        _json_dumps(completed),
+                        now,
+                        CORE_RUNTIME_PUBLICATION_METADATA_KEY,
+                    ),
+                )
+                persisted = self._core_runtime_publication(conn, marker)
+                if persisted != completed:
+                    raise CoreAuthorityError(
+                        "core runtime publication completion did not persist exactly"
+                    )
+                self._assert_durable_authority(conn)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+        self.assert_active_authority()
+        return completed
+
+    @staticmethod
+    def _core_authority_migration_present(conn: sqlite3.Connection) -> bool:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("store_migrations",),
+        ).fetchone()
+        if table_exists is None:
+            return False
+        return (
+            conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ? LIMIT 1",
+                ("authoritative_core_v1",),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _base_authority_migrations() -> frozenset[str]:
+        return frozenset(
+            {
+                "capture_operations_v1",
+                "capture_operations_private_receipts_v1",
+                "secret_content_scrub_v1",
+                "secret_content_scrub_v2",
+                "secret_content_scrub_v3",
+                "raw_digest_oracle_scrub_v1",
+                "secret_identifier_audit_v1",
+                "legacy_ack_receipts_retirement_v1",
+                "memory_spikes_v1",
+                "memory_surface_terms_v1",
+                "context_event_targets_v2",
+                "context_deliveries_v2",
+            }
+        )
+
+    def _assert_core_marker_matches(
+        self,
+        marker: dict[str, Any] | None,
+    ) -> None:
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is None:
+            raise CoreAuthorityError("authoritative core has not claimed the memory store")
+        if (
+            marker is None
+            or marker["service_required"] is not True
+            or marker["schema_version"] != lease.durable_schema_version
+            or marker["epoch"] != lease.durable_epoch
+            or marker["instance_id"] != lease.instance_id
+            or marker["config_fingerprint"] != lease.config_fingerprint
+            or marker["build_id"] != lease.build_id
+            or marker["protocol_version"] != lease.protocol_version
+        ):
+            raise CoreAuthorityError("durable core authority epoch does not match this process")
+        claimed_marker_sha256 = self._claimed_core_authority_marker_sha256
+        if (
+            claimed_marker_sha256 is None
+            or not secrets.compare_digest(
+                self._core_authority_marker_sha256(marker),
+                claimed_marker_sha256,
+            )
+        ):
+            raise CoreAuthorityError(
+                "durable core authority marker changed after this process claimed it"
+            )
+
+    def _assert_durable_authority(self, conn: sqlite3.Connection) -> None:
+        lease = self._assert_filesystem_authority()
+        marker = self._core_authority_marker(conn)
+        self._validate_core_authority_version_pair(conn, marker)
+        if lease.role == "core":
+            self._assert_core_marker_matches(marker)
+            return
+        if marker is not None and marker["service_required"] is True:
+            raise CoreAuthorityError(
+                "memory store requires the authoritative core service; "
+                "route through the core client"
+            )
+
+    def _preflight_durable_authority(self, conn: sqlite3.Connection) -> None:
+        lease = self._assert_filesystem_authority()
+        marker = self._core_authority_marker(conn)
+        self._validate_core_authority_version_pair(conn, marker)
+        if lease.role == "core":
+            if lease.durable_epoch is not None:
+                self._assert_core_marker_matches(marker)
+            return
+        if marker is not None and marker["service_required"] is True:
+            raise CoreAuthorityError(
+                "memory store requires the authoritative core service; "
+                "route through the core client"
+            )
+
+    @staticmethod
+    def _validate_core_authority_version_pair(
+        conn: sqlite3.Connection,
+        marker: dict[str, Any] | None,
+    ) -> None:
+        user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        marker_present = marker is not None
+        migration_present = DurableMemoryStore._core_authority_migration_present(conn)
+        adopted_version = user_version >= 6
+        if not (
+            (not adopted_version and not marker_present and not migration_present)
+            or (adopted_version and marker_present and migration_present)
+        ):
+            raise CoreAuthorityError(
+                "SQLite version, durable core authority marker, and adoption migration "
+                "are inconsistent"
+            )
+
+    def inspect_core_authority_preclaim(self) -> dict[str, Any]:
+        """Return one coherent, WAL-aware read-only authority snapshot.
+
+        The returned logical digest and epoch are inputs to
+        :meth:`claim_core_authority`; that method recomputes both inside its
+        ``BEGIN IMMEDIATE`` transaction before publishing any v6 state.
+        """
+
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "preclaim inspection requires one unbound authoritative core lease"
+            )
+        with closing(self._connect_read_only()) as conn:
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("BEGIN")
+            try:
+                self._validate_existing_schema_compatibility_markers(conn)
+                marker = self._core_authority_marker(conn)
+                self._validate_core_authority_version_pair(conn, marker)
+                runtime_publication = self._core_runtime_publication(conn, marker)
+                user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                if user_version not in {5, SQLITE_USER_VERSION}:
+                    raise CoreAuthorityError(
+                        "core preclaim inspection requires an authoritative v5 or v6 store"
+                    )
+                self._assert_exact_schema_contract(
+                    conn,
+                    user_version=user_version,
+                )
+                logical_snapshot = self._canonical_logical_snapshot_digest(
+                    conn,
+                    install_progress_handler=False,
+                )
+            finally:
+                conn.execute("ROLLBACK")
+        self._assert_filesystem_authority()
+        previous_epoch = int(marker["epoch"]) if marker is not None else 0
+        if previous_epoch >= (2**63 - 1):
+            raise CoreAuthorityError("authoritative core epoch is exhausted")
+        return {
+            "governance_mode": (
+                "authoritative-v6" if marker is not None else "pre-governed-v5"
+            ),
+            "schema_identity": f"sqlite-{SQLITE_APPLICATION_ID:x}-v{user_version}",
+            "previous_epoch": previous_epoch,
+            "next_epoch": previous_epoch + 1,
+            "logical_snapshot": logical_snapshot,
+            "marker": None if marker is None else dict(marker),
+            "runtime_publication": (
+                None if runtime_publication is None else dict(runtime_publication)
+            ),
+            "store_identity": (
+                str(marker["store_identity"])
+                if marker is not None
+                else self.store_identity_for_path(self.db_path)
+            ),
+            "new_empty_bootstrap": bool(
+                marker is None and self._database_created_for_initialization
+            ),
+        }
+
+    def claim_core_authority(
+        self,
+        *,
+        instance_id: str,
+        config_fingerprint: str,
+        build_id: str,
+        protocol_version: str,
+        expected_store_identity: str,
+        request_journal_id: str,
+        request_journal_binding_schema: str,
+        request_journal_schema_version: int,
+        expected_preclaim_logical_snapshot_sha256: str,
+        expected_previous_epoch: int,
+        expected_next_epoch: int,
+        root_generation_id: str,
+        embedding_space_identity: str,
+        attestation_receipt_digest: str | None = None,
+        restored_target_binding_receipt_digest: str | None = None,
+        attestation_expires_at_unix_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Permanently adopt the store after the core backend is fully ready.
+
+        The v6 marker, migration row, and monotonic epoch are committed in one
+        ``BEGIN IMMEDIATE`` transaction.  Before this explicit call an unbound
+        core lease is read-only, so a failed backend bootstrap leaves a v5 store
+        unclaimed and legacy-compatible.
+        """
+
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core":
+            raise CoreAuthorityError("only the authoritative core may claim the store")
+        clean_instance_id = str(instance_id).strip()
+        clean_config_fingerprint = str(config_fingerprint).strip()
+        clean_build_id = str(build_id).strip()
+        clean_protocol_version = str(protocol_version).strip()
+        clean_store_identity = str(expected_store_identity).strip()
+        clean_request_journal_id = str(request_journal_id).strip()
+        clean_journal_binding_schema = str(request_journal_binding_schema).strip()
+        clean_preclaim_digest = str(
+            expected_preclaim_logical_snapshot_sha256
+        ).strip()
+        clean_root_generation_id = str(root_generation_id).strip()
+        clean_embedding_space_identity = str(embedding_space_identity).strip()
+        clean_attestation_digest = (
+            None
+            if attestation_receipt_digest is None
+            else str(attestation_receipt_digest).strip()
+        )
+        clean_restored_binding_digest = (
+            None
+            if restored_target_binding_receipt_digest is None
+            else str(restored_target_binding_receipt_digest).strip()
+        )
+        if clean_instance_id != lease.instance_id:
+            raise CoreAuthorityError(
+                "core service identity does not match its authority lease"
+            )
+        if re.fullmatch(r"[0-9a-f]{64}", clean_config_fingerprint) is None:
+            raise CoreAuthorityError("core configuration fingerprint is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", clean_preclaim_digest) is None:
+            raise CoreAuthorityError("core preclaim logical snapshot digest is invalid")
+        if CORE_ROOT_GENERATION_ID_RE.fullmatch(clean_root_generation_id) is None:
+            raise CoreAuthorityError("core root generation is invalid")
+        if BACKUP_DIGEST_RE.fullmatch(clean_embedding_space_identity) is None:
+            raise CoreAuthorityError("core embedding-space identity is invalid")
+        if (
+            type(expected_previous_epoch) is not int
+            or expected_previous_epoch < 0
+            or expected_previous_epoch >= (2**63 - 1)
+            or type(expected_next_epoch) is not int
+            or expected_next_epoch != expected_previous_epoch + 1
+        ):
+            raise CoreAuthorityError("core authority epoch expectation is invalid")
+        if clean_attestation_digest is not None and re.fullmatch(
+            r"[0-9a-f]{64}", clean_attestation_digest
+        ) is None:
+            raise CoreAuthorityError("core cutover attestation digest is invalid")
+        if clean_attestation_digest is None:
+            if attestation_expires_at_unix_ms is not None:
+                raise CoreAuthorityError("core cutover attestation expiry is invalid")
+        elif (
+            type(attestation_expires_at_unix_ms) is not int
+            or int(attestation_expires_at_unix_ms) <= 0
+        ):
+            raise CoreAuthorityError("core cutover attestation expiry is invalid")
+        if clean_restored_binding_digest is not None and BACKUP_DIGEST_RE.fullmatch(
+            clean_restored_binding_digest
+        ) is None:
+            raise CoreAuthorityError("restored-target binding digest is invalid")
+        if CORE_STORE_IDENTITY_RE.fullmatch(clean_store_identity) is None:
+            raise CoreAuthorityError("core store identity is invalid")
+        if CORE_REQUEST_JOURNAL_ID_RE.fullmatch(clean_request_journal_id) is None:
+            raise CoreAuthorityError("core request-journal identity is invalid")
+        if (
+            clean_journal_binding_schema != JOURNAL_BINDING_SCHEMA
+            or type(request_journal_schema_version) is not int
+            or request_journal_schema_version != JOURNAL_SCHEMA_VERSION
+        ):
+            raise CoreAuthorityError("core request-journal binding is unsupported")
+        for field, value in (
+            ("build_id", clean_build_id),
+            ("protocol_version", clean_protocol_version),
+        ):
+            if CORE_AUTHORITY_INSTANCE_RE.fullmatch(value) is None:
+                raise CoreAuthorityError(f"core {field} is invalid")
+            try:
+                reject_sensitive_identifier(value, field=f"core_{field}")
+            except ValueError as exc:
+                raise CoreAuthorityError(f"core {field} is invalid") from exc
+        if lease.durable_epoch is not None:
+            with closing(self._connect_read_only()) as existing:
+                marker = self._core_authority_marker(existing)
+            self._assert_core_marker_matches(marker)
+            assert marker is not None
+            if (
+                clean_config_fingerprint != lease.config_fingerprint
+                or clean_build_id != lease.build_id
+                or clean_protocol_version != lease.protocol_version
+            ):
+                raise CoreAuthorityError(
+                    "core service diagnostics do not match the durable claim"
+                )
+            if (
+                marker["store_identity"] != clean_store_identity
+                or marker["request_journal_id"] != clean_request_journal_id
+                or marker["request_journal_binding_schema"]
+                != clean_journal_binding_schema
+                or marker["request_journal_schema_version"]
+                != request_journal_schema_version
+                or marker["root_generation_id"] != clean_root_generation_id
+                or marker["embedding_space_identity"]
+                != clean_embedding_space_identity
+                or marker["lock_generation_id"] != lease.lock_generation_id
+            ):
+                raise CoreAuthorityError(
+                    "core request journal does not match the durable claim"
+                )
+            existing_restored_digest = marker[
+                "restored_target_binding_receipt_digest"
+            ]
+            if (
+                clean_restored_binding_digest is not None
+                and clean_restored_binding_digest != existing_restored_digest
+            ):
+                raise CoreAuthorityError(
+                    "restored-target binding does not match the durable claim"
+                )
+            if int(marker["epoch"]) != expected_previous_epoch:
+                raise CoreAuthorityError("core authority epoch expectation changed")
+            return self._core_authority_claim_response(marker)
+        if not self.db_path.is_file():
+            raise FileNotFoundError(
+                f"SYNAPSE-S2 memory store does not exist: {self.db_path}"
+            )
+        self._assert_private_database_identity()
+        uri = self.db_path.resolve().as_uri() + "?mode=rw"
+        conn = sqlite3.connect(uri, timeout=10.0, isolation_level=None, uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 10000")
+            conn.execute("PRAGMA foreign_keys = ON")
+            self._assert_filesystem_authority()
+            self._validate_existing_schema_compatibility_markers(conn)
+            initial_marker = self._core_authority_marker(conn)
+            self._validate_core_authority_version_pair(conn, initial_marker)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_filesystem_authority()
+                marker = self._core_authority_marker(conn)
+                self._validate_core_authority_version_pair(conn, marker)
+                self._run_migrations(conn, allow_mutation=False)
+                claim_user_version = int(
+                    conn.execute("PRAGMA user_version").fetchone()[0]
+                )
+                if claim_user_version not in {5, SQLITE_USER_VERSION}:
+                    raise CoreAuthorityError(
+                        "core authority claim requires an authoritative v5 or v6 store"
+                    )
+                self._assert_exact_schema_contract(
+                    conn,
+                    user_version=claim_user_version,
+                )
+                applied = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT key FROM store_migrations"
+                    ).fetchall()
+                }
+                missing = self._base_authority_migrations() - applied
+                if missing:
+                    raise CoreAuthorityError(
+                        "core authority claim requires a fully migrated v5 store "
+                        f"(missing_migrations={len(missing)})"
+                    )
+                previous_epoch = int(marker["epoch"]) if marker is not None else 0
+                if previous_epoch >= (2**63 - 1):
+                    raise CoreAuthorityError("authoritative core epoch is exhausted")
+                epoch = previous_epoch + 1
+                if (
+                    previous_epoch != expected_previous_epoch
+                    or epoch != expected_next_epoch
+                ):
+                    raise CoreAuthorityError(
+                        "core authority epoch changed after preflight"
+                    )
+                preclaim_snapshot = self._canonical_logical_snapshot_digest(
+                    conn,
+                    install_progress_handler=False,
+                )
+                if not secrets.compare_digest(
+                    str(preclaim_snapshot["sha256"]),
+                    clean_preclaim_digest,
+                ):
+                    raise CoreAuthorityError(
+                        "memory store changed after core cutover preflight"
+                    )
+                identity_changed = marker is not None and (
+                    marker["config_fingerprint"] != clean_config_fingerprint
+                    or marker["build_id"] != clean_build_id
+                    or marker["protocol_version"] != clean_protocol_version
+                )
+                if marker is not None and (
+                    marker["store_identity"] != clean_store_identity
+                    or marker["request_journal_id"] != clean_request_journal_id
+                    or marker["request_journal_binding_schema"]
+                    != clean_journal_binding_schema
+                    or marker["request_journal_schema_version"]
+                    != request_journal_schema_version
+                ):
+                    raise CoreAuthorityError(
+                        "core request journal changed after durable adoption"
+                    )
+                if marker is not None and (
+                    marker["embedding_space_identity"]
+                    != clean_embedding_space_identity
+                ):
+                    raise CoreAuthorityError(
+                        "core embedding-space identity requires a verified reindex migration"
+                    )
+                root_generation_changed = marker is not None and (
+                    marker["root_generation_id"] != clean_root_generation_id
+                )
+                lock_generation_changed = marker is not None and (
+                    marker["lock_generation_id"] != lease.lock_generation_id
+                )
+                if root_generation_changed and not (
+                    clean_attestation_digest is not None
+                    and clean_restored_binding_digest is not None
+                ):
+                    raise CoreAuthorityError(
+                        "core root generation changed without restored-target adoption"
+                    )
+                if lock_generation_changed and not (
+                    clean_attestation_digest is not None
+                    and clean_restored_binding_digest is not None
+                ):
+                    raise CoreAuthorityError(
+                        "core authority lock generation changed without "
+                        "restored-target adoption"
+                    )
+                if (
+                    (marker is None and not self._database_created_for_initialization)
+                    or identity_changed
+                    or root_generation_changed
+                    or lock_generation_changed
+                ) and clean_attestation_digest is None:
+                    raise CoreAuthorityError(
+                        "signed cutover attestation is required for this authority claim"
+                    )
+                now = time.time()
+                claimed = {
+                    "schema_version": CORE_AUTHORITY_SCHEMA_VERSION,
+                    "service_required": True,
+                    "epoch": epoch,
+                    "instance_id": clean_instance_id,
+                    "config_fingerprint": clean_config_fingerprint,
+                    "build_id": clean_build_id,
+                    "protocol_version": clean_protocol_version,
+                    "lock_generation_id": lease.lock_generation_id,
+                    "store_identity": clean_store_identity,
+                    "request_journal_id": clean_request_journal_id,
+                    "request_journal_binding_schema": clean_journal_binding_schema,
+                    "request_journal_schema_version": request_journal_schema_version,
+                    "root_generation_id": clean_root_generation_id,
+                    "embedding_space_identity": clean_embedding_space_identity,
+                    "restored_target_binding_receipt_digest": (
+                        clean_restored_binding_digest
+                        if clean_restored_binding_digest is not None
+                        else (
+                            None
+                            if marker is None
+                            else marker[
+                                "restored_target_binding_receipt_digest"
+                            ]
+                        )
+                    ),
+                    "claimed_at": now,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    """
+                    INSERT INTO store_metadata (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (CORE_AUTHORITY_METADATA_KEY, _json_dumps(claimed), now),
+                )
+                runtime_publication = {
+                    "schema": CORE_RUNTIME_PUBLICATION_SCHEMA,
+                    "status": "pending",
+                    "marker_sha256": self._core_authority_marker_sha256(claimed),
+                    "authority_epoch_number": epoch,
+                    "lock_generation_id": lease.lock_generation_id,
+                    "instance_id": clean_instance_id,
+                    "config_fingerprint": clean_config_fingerprint,
+                    "build_id": clean_build_id,
+                    "protocol_version": clean_protocol_version,
+                    "runtime_state_path_sha256": self.runtime_state_path_sha256(
+                        self.db_path.parent / "runtime_state.json"
+                    ),
+                    "started_at": now,
+                    "completed_at": None,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    """
+                    INSERT INTO store_metadata (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        CORE_RUNTIME_PUBLICATION_METADATA_KEY,
+                        _json_dumps(runtime_publication),
+                        now,
+                    ),
+                )
+                if marker is None:
+                    existing_adoption = conn.execute(
+                        "SELECT 1 FROM store_metadata WHERE key = ?",
+                        (CORE_ADOPTION_ATTESTATION_METADATA_KEY,),
+                    ).fetchone()
+                    if existing_adoption is not None:
+                        raise CoreAuthorityError(
+                            "core adoption attestation record already exists"
+                        )
+                    adoption = {
+                        "schema": CORE_ADOPTION_ATTESTATION_SCHEMA,
+                        "mode": (
+                            "signed-cutover"
+                            if clean_attestation_digest is not None
+                            else "new-empty-bootstrap"
+                        ),
+                        "preclaim_logical_snapshot_sha256": clean_preclaim_digest,
+                        "attestation_receipt_digest": clean_attestation_digest,
+                        "config_fingerprint": clean_config_fingerprint,
+                        "build_id": clean_build_id,
+                        "protocol_version": clean_protocol_version,
+                        "lock_generation_id": lease.lock_generation_id,
+                        "store_identity": clean_store_identity,
+                        "request_journal_id": clean_request_journal_id,
+                        "request_journal_binding_schema": clean_journal_binding_schema,
+                        "request_journal_schema_version": request_journal_schema_version,
+                        "root_generation_id": clean_root_generation_id,
+                        "embedding_space_identity": clean_embedding_space_identity,
+                        "restored_target_binding_receipt_digest": (
+                            clean_restored_binding_digest
+                        ),
+                        "authority_epoch_number": epoch,
+                        "claimed_at": now,
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO store_metadata (key, value_json, updated_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            CORE_ADOPTION_ATTESTATION_METADATA_KEY,
+                            _json_dumps(adoption),
+                            now,
+                        ),
+                    )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("authoritative_core_v1", now),
+                )
+                conn.execute(f"PRAGMA application_id = {SQLITE_APPLICATION_ID}")
+                conn.execute(f"PRAGMA user_version = {SQLITE_USER_VERSION}")
+                persisted = self._core_authority_marker(conn)
+                if persisted != claimed:
+                    raise CoreAuthorityError(
+                        "authoritative core marker did not persist exactly"
+                    )
+                persisted_publication = self._core_runtime_publication(
+                    conn,
+                    persisted,
+                )
+                if persisted_publication != runtime_publication:
+                    raise CoreAuthorityError(
+                        "core runtime publication intent did not persist exactly"
+                    )
+                self._validate_core_authority_version_pair(conn, persisted)
+                self._assert_exact_schema_contract(
+                    conn,
+                    user_version=SQLITE_USER_VERSION,
+                )
+                # Claim publication is itself the first v6 write, so it
+                # cannot use the already-bound durable fence yet. Reassert
+                # the exact filesystem lock identity at the last possible
+                # point before COMMIT to prevent a replaced lock inode from
+                # publishing a stale authority epoch.
+                self._assert_filesystem_authority()
+                if (
+                    clean_attestation_digest is not None
+                    and (
+                        type(attestation_expires_at_unix_ms) is not int
+                        or int(time.time() * 1000) + 1_000
+                        >= int(attestation_expires_at_unix_ms)
+                    )
+                ):
+                    raise CoreAuthorityError(
+                        "core cutover attestation expired before durable claim"
+                    )
+                # Bind the in-process fence before the irreversible commit.
+                # The binding is process-local and disappears when startup
+                # closes the lease, whereas any failure after COMMIT could
+                # otherwise strand a durable v6 marker without a service.
+                lease.bind_durable_authority(
+                    epoch=epoch,
+                    config_fingerprint=clean_config_fingerprint,
+                    build_id=clean_build_id,
+                    protocol_version=clean_protocol_version,
+                )
+                conn.commit()
+                self._claimed_core_authority_marker_sha256 = (
+                    self._core_authority_marker_sha256(claimed)
+                )
+            except BaseException:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+        return self._core_authority_claim_response(claimed)
+
+    def _core_authority_claim_response(
+        self,
+        marker: dict[str, Any],
+    ) -> dict[str, Any]:
+        epoch = int(marker["epoch"])
+        return {
+            **marker,
+            "authority_epoch": f"epoch-{epoch}",
+            "neural_epoch": f"epoch-{epoch}",
+            "authority_epoch_number": epoch,
+            "store_identity": str(marker["store_identity"]),
+            "schema_identity": f"sqlite-{SQLITE_APPLICATION_ID:x}-v{SQLITE_USER_VERSION}",
+        }
+
+    @staticmethod
+    def store_identity_for_path(path: str | os.PathLike[str]) -> str:
+        return "store-" + hashlib.sha256(
+            str(Path(path).expanduser().resolve()).encode("utf-8")
+        ).hexdigest()[:24]
+
+    def _prepare_database_identity(self, lease: CoreAuthorityLease) -> None:
+        """Create only a genuinely missing store, then bind its exact inode."""
+
+        lease.assert_active_for(self.db_path)
+        if lease.database_device is None and lease.database_inode is None:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = -1
+            try:
+                descriptor = os.open(lease.db_path, flags, 0o600)
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.getuid()
+                    or opened.st_nlink != 1
+                ):
+                    raise CoreAuthorityError(
+                        "new memory database is not one owner-controlled regular file"
+                    )
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+                self._fsync_directory(lease.db_path.parent)
+                self._database_created_for_initialization = True
+            except FileExistsError as exc:
+                raise CoreAuthorityError(
+                    "memory database appeared during secure creation"
+                ) from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            lease.bind_database_identity(self.db_path)
+        lease.assert_active_for(self.db_path)
+
+        self._assert_private_database_identity()
+
+    def _assert_private_database_identity(self) -> os.stat_result:
+        try:
+            observed = os.lstat(self.db_path)
+        except FileNotFoundError as exc:
+            raise CoreAuthorityError("memory database does not exist") from exc
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or int(observed.st_nlink) != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            raise CoreAuthorityError(
+                "memory database must already be one private owner-controlled file"
+            )
+        return observed
+
+    @staticmethod
+    def _schema_statements() -> tuple[str, ...]:
+        statements: list[str] = []
+        pending = ""
+        for line in SCHEMA_SQL.splitlines(keepends=True):
+            pending += line
+            if sqlite3.complete_statement(pending):
+                statement = pending.strip()
+                pending = ""
+                if statement:
+                    statements.append(statement)
+        if pending.strip():
+            raise RuntimeError("SYNAPSE-S2 schema script is incomplete")
+        return tuple(statements)
+
+    def _ensure_schema_transactionally(self, conn: sqlite3.Connection) -> None:
+        # sqlite3.executescript() commits an open transaction implicitly. Execute
+        # each statement ourselves so the authority checks in _transaction cover
+        # the complete schema publication and its single COMMIT.
+        with self._transaction(conn, immediate=True):
+            for statement in self._schema_statements():
+                conn.execute(statement)
+
+    @staticmethod
+    def _schema_contract_key(user_version: int) -> str:
+        return BACKUP_SCHEMA_CONTRACT_VERSION if user_version >= 6 else "s2-schema-v5"
+
+    def _assert_exact_schema_contract(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_version: int,
+    ) -> None:
+        expected = BACKUP_SCHEMA_COMPATIBILITY_REGISTRY[
+            self._schema_contract_key(user_version)
+        ]
+        schema = self._sqlite_schema_fingerprint(conn)
+        migrations = sorted(
+            str(row[0])
+            for row in conn.execute(
+                "SELECT key FROM store_migrations ORDER BY key"
+            ).fetchall()
+        )
+        migration_digest = hashlib.sha256(
+            _json_dumps(migrations).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(schema["sha256"]) != str(expected["schema_sha256"])
+            or int(schema["table_count"]) != int(expected["table_count"])
+            or int(schema["index_count"]) != int(expected["index_count"])
+            or migration_digest != str(expected["migration_set_sha256"])
+            or len(migrations) != int(expected["migration_count"])
+        ):
+            raise CoreAuthorityError(
+                "memory database schema or migration contract is not authoritative"
+            )
+
+    def _assert_mutation_authority(self, conn: sqlite3.Connection) -> None:
+        lease = self._assert_filesystem_authority()
+        if not (
+            lease.role == "core"
+            and lease.durable_epoch is None
+            and self._initializing_authority_store
+        ):
+            self._assert_durable_authority(conn)
+
     def _connect(self) -> sqlite3.Connection:
+        lease = self._assert_filesystem_authority()
+        if (
+            lease.role == "core"
+            and lease.durable_epoch is None
+            and not self._initializing_authority_store
+        ):
+            return self._connect_read_only()
         self._ensure_directory(self.db_path.parent, owned=False)
+        self._prepare_database_identity(lease)
         conn = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 10000")
             conn.execute("PRAGMA foreign_keys = ON")
+            self._assert_filesystem_authority()
             self._validate_existing_schema_compatibility_markers(conn)
+            self._preflight_durable_authority(conn)
+            current_user_version = int(
+                conn.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if (
+                lease.role == "core"
+                and lease.durable_epoch is None
+                and self.db_path.is_file()
+                and current_user_version >= 5
+            ):
+                conn.close()
+                return self._connect_read_only()
             durability = str(
                 os.getenv("SYNAPSE_S2_SQLITE_DURABILITY", "full")
             ).strip().lower()
@@ -1333,20 +2643,54 @@ class DurableMemoryStore:
                 raise ValueError(
                     "SYNAPSE_S2_SQLITE_DURABILITY must be full or balanced"
                 )
-            schema_gate_fd = self._acquire_writer_gate()
-            try:
-                conn.execute("PRAGMA journal_mode = WAL")
-                conn.execute(
-                    "PRAGMA synchronous = FULL"
-                    if durability == "full"
-                    else "PRAGMA synchronous = NORMAL"
+            conn.execute(
+                "PRAGMA synchronous = FULL"
+                if durability == "full"
+                else "PRAGMA synchronous = NORMAL"
+            )
+            if current_user_version >= 6:
+                journal_mode = str(
+                    conn.execute("PRAGMA journal_mode").fetchone()[0]
+                ).strip().lower()
+                if journal_mode != "wal":
+                    raise CoreAuthorityError(
+                        "authoritative memory database journal mode is not WAL"
+                    )
+                self._assert_exact_schema_contract(
+                    conn,
+                    user_version=current_user_version,
                 )
-                conn.executescript(SCHEMA_SQL)
-                self._protect_path(self.db_path, directory=False)
-            finally:
-                self._release_file_lock(schema_gate_fd)
-            self._run_migrations(conn)
-            self._publish_schema_compatibility_markers(conn)
+                self._run_migrations(conn, allow_mutation=False)
+                self._assert_durable_authority(conn)
+                return conn
+
+            journal_mode = str(
+                conn.execute("PRAGMA journal_mode").fetchone()[0]
+            ).strip().lower()
+            if journal_mode != "wal":
+                writer_gate_fd = self._acquire_writer_gate()
+                try:
+                    # Re-read after taking the maintenance-coordination gate;
+                    # another initializer may have completed while we waited.
+                    journal_mode = str(
+                        conn.execute("PRAGMA journal_mode").fetchone()[0]
+                    ).strip().lower()
+                    if journal_mode != "wal":
+                        self._assert_mutation_authority(conn)
+                        configured_journal_mode = str(
+                            conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                        ).strip().lower()
+                        self._assert_mutation_authority(conn)
+                        if configured_journal_mode != "wal":
+                            raise RuntimeError(
+                                "failed to configure SQLite WAL journal mode"
+                            )
+                finally:
+                    self._release_file_lock(writer_gate_fd)
+            self._ensure_schema_transactionally(conn)
+            self._assert_filesystem_authority()
+            self._run_migrations(conn, allow_mutation=True)
+            self._publish_schema_compatibility_markers(conn, user_version=5)
             return conn
         except BaseException:
             conn.close()
@@ -1380,31 +2724,37 @@ class DurableMemoryStore:
     def _publish_schema_compatibility_markers(
         self,
         conn: sqlite3.Connection,
+        *,
+        user_version: int = SQLITE_USER_VERSION,
     ) -> None:
         """Publish the schema identity only after every migration gate succeeds."""
 
         if self._schema_compatibility_markers(conn) == (
             SQLITE_APPLICATION_ID,
-            SQLITE_USER_VERSION,
+            user_version,
         ):
             return
         with self._transaction(conn, immediate=True):
             self._validate_existing_schema_compatibility_markers(conn)
             conn.execute(f"PRAGMA application_id = {SQLITE_APPLICATION_ID}")
-            conn.execute(f"PRAGMA user_version = {SQLITE_USER_VERSION}")
+            conn.execute(f"PRAGMA user_version = {user_version}")
             if self._schema_compatibility_markers(conn) != (
                 SQLITE_APPLICATION_ID,
-                SQLITE_USER_VERSION,
+                user_version,
             ):
                 raise RuntimeError(
                     "failed to publish SYNAPSE-S2 schema compatibility markers"
                 )
 
     def _connect_read_only(self) -> sqlite3.Connection:
+        lease = self._authority_lease
+        if lease is not None:
+            lease.assert_active_for(self.db_path)
         if not self.db_path.is_file():
             raise FileNotFoundError(
                 f"SYNAPSE-S2 memory store does not exist: {self.db_path}"
             )
+        self._assert_private_database_identity()
         uri = self.db_path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(
             uri,
@@ -1417,6 +2767,8 @@ class DurableMemoryStore:
             conn.execute("PRAGMA busy_timeout = 10000")
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA query_only = ON")
+            if lease is not None:
+                lease.assert_active_for(self.db_path)
             return conn
         except BaseException:
             conn.close()
@@ -1425,10 +2777,17 @@ class DurableMemoryStore:
     def _connect_existing_write(self) -> sqlite3.Connection:
         """Open an existing store read/write without implicit schema migration."""
 
+        acquired_for_governed_write = False
+        if self._authority_lease is None:
+            self._authority_lease = CoreAuthorityLease.acquire_local(self.db_path)
+            self._owns_authority_lease = True
+            acquired_for_governed_write = True
+        self._assert_filesystem_authority()
         if not self.db_path.is_file():
             raise FileNotFoundError(
                 f"SYNAPSE-S2 memory store does not exist: {self.db_path}"
             )
+        self._assert_private_database_identity()
         uri = self.db_path.resolve().as_uri() + "?mode=rw"
         conn = sqlite3.connect(
             uri,
@@ -1440,6 +2799,9 @@ class DurableMemoryStore:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 10000")
             conn.execute("PRAGMA foreign_keys = ON")
+            self._assert_filesystem_authority()
+            self._validate_existing_schema_compatibility_markers(conn)
+            self._preflight_durable_authority(conn)
             durability = str(
                 os.getenv("SYNAPSE_S2_SQLITE_DURABILITY", "full")
             ).strip().lower()
@@ -1455,6 +2817,10 @@ class DurableMemoryStore:
             return conn
         except BaseException:
             conn.close()
+            if acquired_for_governed_write and self._authority_lease is not None:
+                self._authority_lease.close()
+                self._authority_lease = None
+                self._owns_authority_lease = False
             raise
 
     @contextmanager
@@ -1494,11 +2860,21 @@ class DurableMemoryStore:
         try:
             conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
+                query_only = bool(int(conn.execute("PRAGMA query_only").fetchone()[0]))
+                if not query_only:
+                    self._assert_mutation_authority(conn)
                 yield
             except BaseException:
                 conn.rollback()
                 raise
             else:
+                # The lease and durable epoch may have been replaced while a
+                # long-running mutation held its SQLite transaction.  Recheck
+                # immediately before COMMIT so that work begun by a stale core
+                # is rolled back instead of crossing an authority handoff.
+                query_only = bool(int(conn.execute("PRAGMA query_only").fetchone()[0]))
+                if not query_only:
+                    self._assert_mutation_authority(conn)
                 conn.commit()
         finally:
             if writer_gate_fd is not None:
@@ -5103,21 +6479,19 @@ class DurableMemoryStore:
         conn.execute(f'DROP TABLE "{table_name}"')
         return True
 
-    def _run_migrations(self, conn: sqlite3.Connection) -> None:
-        required_migrations = {
-            "capture_operations_v1",
-            "capture_operations_private_receipts_v1",
-            "secret_content_scrub_v1",
-            "secret_content_scrub_v2",
-            "secret_content_scrub_v3",
-            "raw_digest_oracle_scrub_v1",
-            "secret_identifier_audit_v1",
-            "legacy_ack_receipts_retirement_v1",
-            "memory_spikes_v1",
-            "memory_surface_terms_v1",
-            "context_event_targets_v2",
-            "context_deliveries_v2",
-        }
+    def _run_migrations(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        allow_mutation: bool = True,
+    ) -> None:
+        lease = self._assert_filesystem_authority()
+        required_migrations = set(self._base_authority_migrations())
+        core_migration_required = bool(
+            lease.role == "core" and lease.durable_epoch is not None
+        )
+        if core_migration_required:
+            required_migrations.add("authoritative_core_v1")
         migration_placeholders = ", ".join("?" for _ in required_migrations)
         applied_migrations = {
             str(row["key"])
@@ -5190,6 +6564,11 @@ class DurableMemoryStore:
             self._target_integrity_verified = True
             self._capture_integrity_verified = True
             return
+
+        if not allow_mutation:
+            raise CoreAuthorityError(
+                "authoritative v6 memory requires governed repair before startup"
+            )
 
         # Recheck after acquiring the writer lock. Another process may have
         # completed the migration between the optimistic read and this point.
@@ -5524,6 +6903,18 @@ class DurableMemoryStore:
                     f"samples={capture_integrity_samples[:3]!r})"
                 )
 
+            if core_migration_required and not conn.execute(
+                "SELECT 1 FROM store_migrations WHERE key = ?",
+                ("authoritative_core_v1",),
+            ).fetchone():
+                conn.execute(
+                    """
+                    INSERT INTO store_migrations (key, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    ("authoritative_core_v1", time.time()),
+                )
+
             if index_rows_changed:
                 generation_row = conn.execute(
                     "SELECT value_json FROM store_metadata WHERE key = ?",
@@ -5562,12 +6953,73 @@ class DurableMemoryStore:
             LOGGER.warning("could not chmod private memory-store path %s", path)
 
     def _ensure_directory(self, path: Path, *, owned: bool) -> None:
-        """Create a private directory without chmoding caller-owned parents."""
+        """Create a directory without silently repairing an unsafe existing path.
 
-        existed = path.exists()
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if owned or not existed:
-            self._protect_path(path, directory=True)
+        Directories owned by SYNAPSE-S2 are part of the persistence trust
+        boundary.  An existing directory therefore has to arrive with the
+        exact owner and mode we require; changing it in place would turn a
+        pre-existing shared path into an apparently trusted one.  Missing
+        components are created one at a time so every pathname transition is
+        inspected instead of delegated to ``mkdir(parents=True)``.
+        """
+
+        target = Path(path).expanduser().absolute()
+        missing: list[Path] = []
+        cursor = target
+        while True:
+            try:
+                metadata = os.lstat(cursor)
+            except FileNotFoundError:
+                missing.append(cursor)
+                parent = cursor.parent
+                if parent == cursor:
+                    raise PermissionError(
+                        f"directory has no existing trusted ancestor: {target}"
+                    )
+                cursor = parent
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise PermissionError(
+                    f"directory path component is not a real directory: {cursor}"
+                )
+            break
+
+        for candidate in reversed(missing):
+            created = False
+            try:
+                os.mkdir(candidate, 0o700)
+                created = True
+            except FileExistsError:
+                # A concurrent creator is acceptable only when it published the
+                # exact private directory contract expected below.
+                pass
+            metadata = os.lstat(candidate)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise PermissionError(
+                    f"directory path component changed during creation: {candidate}"
+                )
+            if created:
+                os.chmod(candidate, 0o700, follow_symlinks=False)
+                metadata = os.lstat(candidate)
+                self._fsync_directory(candidate.parent)
+            if owned and (
+                metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise PermissionError(
+                    f"owned directory must already be private: {candidate}"
+                )
+
+        final = os.lstat(target)
+        if stat.S_ISLNK(final.st_mode) or not stat.S_ISDIR(final.st_mode):
+            raise PermissionError(f"directory path is not a real directory: {target}")
+        if owned and (
+            final.st_uid != os.getuid()
+            or stat.S_IMODE(final.st_mode) != 0o700
+        ):
+            raise PermissionError(
+                f"owned directory must already be private: {target}"
+            )
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -8981,33 +10433,43 @@ class DurableMemoryStore:
         context = str(context_id or "").strip()
         agent = self._normalize_delivery_agent_id(agent_id)
         if not context or not agent:
-            raise ValueError("context_id and agent_id are required for acknowledgement")
+            raise ContextDeliveryRejected(
+                "context_id and agent_id are required for acknowledgement"
+            )
         current_time = time.time() if now is None else float(now)
         if not math.isfinite(current_time):
-            raise ValueError("now must be finite")
+            raise ContextDeliveryRejected("now must be finite")
         requested: list[str] = []
         seen: set[str] = set()
         for raw_ack in acknowledgements:
             if not isinstance(raw_ack, dict):
-                raise ValueError("each acknowledgement must be an object")
+                raise ContextDeliveryRejected(
+                    "each acknowledgement must be an object"
+                )
             receipt_id = str(
                 raw_ack.get("receipt_id")
                 or raw_ack.get("lease_token")
                 or ""
             ).strip()
             if not receipt_id:
-                raise ValueError("receipt_id is required for acknowledgement")
+                raise ContextDeliveryRejected(
+                    "receipt_id is required for acknowledgement"
+                )
             if receipt_id in seen:
                 continue
             seen.add(receipt_id)
             requested.append(receipt_id)
             if len(requested) > 500:
-                raise ValueError("at most 500 delivery receipts may be acknowledged")
+                raise ContextDeliveryRejected(
+                    "at most 500 delivery receipts may be acknowledged"
+                )
         if any(
             not self._context_delivery_receipt_id_is_valid(receipt_id)
             for receipt_id in requested
         ):
-            raise ValueError("receipt_id has an invalid context delivery format")
+            raise ContextDeliveryRejected(
+                "receipt_id has an invalid context delivery format"
+            )
 
         try:
             with closing(self._connect()) as conn:
@@ -9017,7 +10479,9 @@ class DurableMemoryStore:
                         (agent,),
                     ).fetchone()
                     if consumer_row is None or not bool(consumer_row["enabled"]):
-                        raise ValueError(f"unknown or disabled context consumer {agent!r}")
+                        raise ContextDeliveryRejected(
+                            f"unknown or disabled context consumer {agent!r}"
+                        )
                     acknowledged: list[dict[str, Any]] = []
                     for receipt_id in requested:
                         row = conn.execute(
@@ -9046,12 +10510,14 @@ class DurableMemoryStore:
                                 (self._context_delivery_receipt_digest(receipt_id),),
                             ).fetchone()
                             if tombstone is None:
-                                raise ValueError("unknown context delivery receipt")
+                                raise ContextDeliveryRejected(
+                                    "unknown context delivery receipt"
+                                )
                             if (
                                 str(tombstone["context_id"]) != context
                                 or str(tombstone["agent_id"]) != agent
                             ):
-                                raise ValueError(
+                                raise ContextDeliveryRejected(
                                     "delivery receipt does not belong to the supplied context and agent"
                                 )
                             acknowledged.append(
@@ -9069,7 +10535,7 @@ class DurableMemoryStore:
                             )
                             continue
                         if str(row["context_id"]) != context or str(row["agent_id"]) != agent:
-                            raise ValueError(
+                            raise ContextDeliveryRejected(
                                 "delivery receipt does not belong to the supplied context and agent"
                             )
                         receipt_state = str(row["state"])
@@ -9087,7 +10553,7 @@ class DurableMemoryStore:
                             )
                             continue
                         if receipt_state != "leased" or delivery_state != "leased":
-                            raise ValueError(
+                            raise ContextDeliveryRejected(
                                 "context delivery receipt is stale, expired, or no longer acknowledgeable"
                             )
                         if float(row["lease_expires_at"]) <= current_time:
@@ -9099,11 +10565,11 @@ class DurableMemoryStore:
                                 """,
                                 (current_time, receipt_id),
                             )
-                            raise ValueError(
+                            raise ContextDeliveryRejected(
                                 "context delivery receipt lease has expired"
                             )
                         if str(row["current_receipt_id"]) != receipt_id:
-                            raise ValueError(
+                            raise ContextDeliveryRejected(
                                 "context delivery receipt was superseded by a retry"
                             )
                         conn.execute(
@@ -9181,34 +10647,40 @@ class DurableMemoryStore:
         instance = str(consumer_instance_id or "").strip()
         current_time = time.time() if now is None else float(now)
         if not math.isfinite(current_time):
-            raise ValueError("now must be finite")
+            raise ContextDeliveryRejected("now must be finite")
         requested: list[str] = []
         seen: set[str] = set()
         for raw_receipt_id in receipt_ids:
             receipt_id = str(raw_receipt_id or "").strip()
             if not receipt_id:
-                raise ValueError("receipt_ids must not contain empty values")
+                raise ContextDeliveryRejected(
+                    "receipt_ids must not contain empty values"
+                )
             if receipt_id in seen:
                 continue
             seen.add(receipt_id)
             requested.append(receipt_id)
             if len(requested) > 500:
-                raise ValueError("at most 500 delivery receipts may be released")
+                raise ContextDeliveryRejected(
+                    "at most 500 delivery receipts may be released"
+                )
         if not context or not agent or not instance or not requested:
-            raise ValueError(
+            raise ContextDeliveryRejected(
                 "context_id, agent_id, consumer_instance_id, and receipt_ids are required"
             )
         if len(context) > 128:
-            raise ValueError("context_id exceeds 128 characters")
+            raise ContextDeliveryRejected("context_id exceeds 128 characters")
         if not self._context_delivery_owner_is_valid(instance):
-            raise ValueError(
+            raise ContextDeliveryRejected(
                 "consumer_instance_id must be 1-256 printable ASCII characters"
             )
         if any(
             not self._context_delivery_receipt_id_is_valid(receipt_id)
             for receipt_id in requested
         ):
-            raise ValueError("receipt_id has an invalid context delivery format")
+            raise ContextDeliveryRejected(
+                "receipt_id has an invalid context delivery format"
+            )
         try:
             with closing(self._connect()) as conn:
                 with self._transaction(conn, immediate=True):
@@ -9226,7 +10698,9 @@ class DurableMemoryStore:
                             (receipt_id,),
                         ).fetchone()
                         if row is None:
-                            raise ValueError("unknown context delivery receipt")
+                            raise ContextDeliveryRejected(
+                                "unknown context delivery receipt"
+                            )
                         if (
                             str(row["context_id"]) != context
                             or str(row["agent_id"]) != agent
@@ -9236,7 +10710,7 @@ class DurableMemoryStore:
                             or str(row["delivery_state"]) != "leased"
                             or float(row["lease_expires_at"]) <= current_time
                         ):
-                            raise ValueError(
+                            raise ContextDeliveryRejected(
                                 "context delivery receipt is not releasable by this consumer"
                             )
                         conn.execute(
@@ -9302,14 +10776,16 @@ class DurableMemoryStore:
         rationale, _ = redact_capture_text(str(reason or "").strip())
         rationale = rationale[:2000]
         if not confirm:
-            raise ValueError("dead-letter quarantine requires confirm=True")
+            raise ContextDeliveryRejected(
+                "dead-letter quarantine requires confirm=True"
+            )
         if not context or not agent or not delivery_key or not rationale:
-            raise ValueError(
+            raise ContextDeliveryRejected(
                 "context_id, agent_id, delivery_id, and reason are required"
             )
         current_time = time.time() if now is None else float(now)
         if not math.isfinite(current_time):
-            raise ValueError("now must be finite")
+            raise ContextDeliveryRejected("now must be finite")
         max_delivery_attempts = self._context_delivery_max_attempts()
         try:
             with closing(self._connect()) as conn:
@@ -9327,14 +10803,14 @@ class DurableMemoryStore:
                         (delivery_key,),
                     ).fetchone()
                     if row is None:
-                        raise ValueError(
+                        raise ContextDeliveryRejected(
                             f"unknown context delivery {delivery_key!r}"
                         )
                     if (
                         str(row["context_id"]) != context
                         or str(row["agent_id"]) != agent
                     ):
-                        raise ValueError(
+                        raise ContextDeliveryRejected(
                             "delivery does not belong to the supplied context and agent"
                         )
                     if str(row["state"]) == "dead_letter":
@@ -9375,10 +10851,12 @@ class DurableMemoryStore:
                             "cursor": cursor,
                         }
                     if str(row["state"]) != "leased":
-                        raise ValueError("only a leased retry history can be dead-lettered")
+                        raise ContextDeliveryRejected(
+                            "only a leased retry history can be dead-lettered"
+                        )
                     attempt_count = int(row["attempt_count"])
                     if attempt_count < max_delivery_attempts:
-                        raise ValueError(
+                        raise ContextDeliveryRejected(
                             "delivery has not exhausted the configured retry budget "
                             f"({attempt_count}/{max_delivery_attempts})"
                         )
@@ -9386,7 +10864,7 @@ class DurableMemoryStore:
                         str(row["receipt_state"]) == "leased"
                         and float(row["receipt_lease_expires_at"]) > current_time
                     ):
-                        raise ValueError(
+                        raise ContextDeliveryRejected(
                             "delivery still has an active lease; release it or wait for expiry"
                         )
                     if str(row["receipt_state"]) not in {
@@ -9394,7 +10872,7 @@ class DurableMemoryStore:
                         "expired",
                         "released",
                     }:
-                        raise ValueError(
+                        raise ContextDeliveryRejected(
                             "current delivery receipt is not quarantineable"
                         )
 
@@ -9501,7 +10979,7 @@ class DurableMemoryStore:
             context_id,
             agent_id,
         )
-        raise ValueError(
+        raise ContextDeliveryRejected(
             "legacy watermark acknowledgement is disabled; lease events and acknowledge exact receipt_id values"
         )
 
@@ -10572,12 +12050,70 @@ class DurableMemoryStore:
         mode: int,
         timeout_seconds: float,
     ) -> int:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        observed: os.stat_result | None = None
+        try:
+            try:
+                descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+                os.fchmod(descriptor, 0o600)
+            except FileExistsError:
+                observed = os.lstat(path)
+                descriptor = os.open(path, flags)
+        except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise PermissionError(
+                f"maintenance gate is not a safe private lock file: {path}"
+            ) from exc
+
+        opened = os.fstat(descriptor)
+        if observed is None:
+            try:
+                observed = os.lstat(path)
+            except OSError as exc:
+                os.close(descriptor)
+                raise PermissionError(
+                    f"maintenance gate disappeared during creation: {path}"
+                ) from exc
+
+        def valid_lock(metadata: os.stat_result) -> bool:
+            return bool(
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_uid == os.getuid()
+                and int(metadata.st_nlink) == 1
+                and stat.S_IMODE(metadata.st_mode) == 0o600
+            )
+
+        visible_identity = (int(observed.st_dev), int(observed.st_ino))
+        opened_identity = (int(opened.st_dev), int(opened.st_ino))
+        if (
+            not valid_lock(observed)
+            or not valid_lock(opened)
+            or visible_identity != opened_identity
+        ):
+            os.close(descriptor)
+            raise PermissionError(
+                f"maintenance gate must already be one private owner-controlled file: {path}"
+            )
+
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         while True:
             try:
                 fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-                os.fchmod(descriptor, 0o600)
+                held = os.fstat(descriptor)
+                visible = os.lstat(path)
+                if (
+                    not valid_lock(held)
+                    or not valid_lock(visible)
+                    or (int(held.st_dev), int(held.st_ino)) != opened_identity
+                    or (int(visible.st_dev), int(visible.st_ino))
+                    != opened_identity
+                ):
+                    raise PermissionError(
+                        "maintenance gate identity or permissions changed while acquiring it"
+                    )
                 return descriptor
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -12460,9 +13996,12 @@ class DurableMemoryStore:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("backup receipt is not valid JSON") from exc
-        if not isinstance(payload, dict) or payload.get("schema") != BACKUP_RECEIPT_SCHEMA:
+        if not isinstance(payload, dict) or payload.get("schema") not in {
+            BACKUP_RECEIPT_SCHEMA,
+            LEGACY_BACKUP_RECEIPT_SCHEMA,
+        }:
             raise ValueError("backup receipt schema is not supported")
-        expected_keys = {
+        legacy_expected_keys = {
             "schema",
             "artifact_name",
             "artifact_sha256",
@@ -12485,6 +14024,19 @@ class DurableMemoryStore:
             "receipt_digest",
             "receipt_signature",
         }
+        expected_keys = (
+            legacy_expected_keys
+            | {
+                "logical_snapshot_schema",
+                "logical_snapshot_sha256",
+                "logical_snapshot_table_count",
+                "logical_snapshot_column_count",
+                "logical_snapshot_row_count",
+                "logical_snapshot_value_bytes",
+            }
+            if payload.get("schema") == BACKUP_RECEIPT_SCHEMA
+            else legacy_expected_keys
+        )
         if set(payload) != expected_keys:
             raise ValueError("backup receipt fields do not match the supported contract")
         artifact_name = self._validate_backup_artifact_name(
@@ -12493,8 +14045,19 @@ class DurableMemoryStore:
         if artifact_name != artifact.name or artifact.parent != path.parent:
             raise ValueError("backup receipt does not identify this artifact")
         artifact_digest = str(payload.get("artifact_sha256") or "").lower()
-        if not BACKUP_DIGEST_RE.fullmatch(artifact_digest):
-            raise ValueError("backup receipt artifact digest is invalid")
+        signed_digest_fields = (
+            "artifact_sha256",
+            "schema_sha256",
+            "snapshot_revision",
+            "receipt_digest",
+        )
+        if payload.get("schema") == BACKUP_RECEIPT_SCHEMA:
+            signed_digest_fields += ("logical_snapshot_sha256",)
+        if any(
+            not BACKUP_DIGEST_RE.fullmatch(str(payload.get(field) or "").lower())
+            for field in signed_digest_fields
+        ):
+            raise ValueError("backup receipt digest field is invalid")
         if (
             type(payload.get("artifact_size_bytes")) is not int
             or int(payload["artifact_size_bytes"]) <= 0
@@ -12506,6 +14069,22 @@ class DurableMemoryStore:
             or not math.isfinite(float(payload["created_at"]))
         ):
             raise ValueError("backup receipt field types are invalid")
+        if payload.get("schema") == BACKUP_RECEIPT_SCHEMA:
+            if (
+                payload.get("logical_snapshot_schema")
+                != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+                or any(
+                    type(payload.get(field)) is not int
+                    or int(payload[field]) < 0
+                    for field in (
+                        "logical_snapshot_table_count",
+                        "logical_snapshot_column_count",
+                        "logical_snapshot_row_count",
+                        "logical_snapshot_value_bytes",
+                    )
+                )
+            ):
+                raise ValueError("backup logical snapshot fields are invalid")
         for count_map_name in ("critical_counts", "highwaters"):
             count_map = payload[count_map_name]
             if any(
@@ -12547,6 +14126,347 @@ class DurableMemoryStore:
             "missing_critical_table_count": len(BACKUP_CRITICAL_TABLES - set(tables)),
         }
 
+    @staticmethod
+    def _logical_snapshot_value_frame(value: Any) -> bytes:
+        """Encode one SQLite value without lossy text coercion.
+
+        The encoding is deliberately small, versioned by
+        ``LOGICAL_SNAPSHOT_DIGEST_SCHEMA``, and shared by hashing and SQL sort
+        order.  Sorting the exact frames avoids declared-collation ties and
+        makes the digest independent of page layout, rowid allocation, vacuum,
+        and SQLite query-plan choices.
+        """
+
+        if value is None:
+            tag, payload = b"n", b""
+        elif isinstance(value, bytes):
+            tag, payload = b"b", value
+        elif isinstance(value, str):
+            tag, payload = b"s", value.encode("utf-8")
+        elif type(value) is int:
+            tag, payload = b"i", str(value).encode("ascii")
+        elif type(value) is float:
+            tag, payload = b"f", struct.pack(">d", value)
+        else:
+            raise TypeError(
+                f"unsupported SQLite value type in logical snapshot: {type(value).__name__}"
+            )
+        return tag + len(payload).to_bytes(8, "big") + payload
+
+    @staticmethod
+    def _logical_snapshot_hash_frame(
+        digest: Any,
+        tag: bytes,
+        payload: bytes,
+    ) -> None:
+        digest.update(tag)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    @classmethod
+    def _canonical_logical_snapshot_digest(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        install_progress_handler: bool = True,
+    ) -> dict[str, Any]:
+        """Hash the complete logical store through a bounded streaming scan."""
+
+        maximum_tables = int(
+            os.getenv("SYNAPSE_S2_LOGICAL_DIGEST_MAX_TABLES", "128")
+        )
+        maximum_columns = int(
+            os.getenv("SYNAPSE_S2_LOGICAL_DIGEST_MAX_COLUMNS", "4096")
+        )
+        maximum_rows = int(
+            os.getenv("SYNAPSE_S2_LOGICAL_DIGEST_MAX_ROWS", "20000000")
+        )
+        maximum_value_bytes = int(
+            os.getenv(
+                "SYNAPSE_S2_LOGICAL_DIGEST_MAX_VALUE_BYTES",
+                str(64 * 1024**2),
+            )
+        )
+        maximum_total_value_bytes = int(
+            os.getenv(
+                "SYNAPSE_S2_LOGICAL_DIGEST_MAX_TOTAL_VALUE_BYTES",
+                str(64 * 1024**3),
+            )
+        )
+        maximum_seconds = float(
+            os.getenv("SYNAPSE_S2_LOGICAL_DIGEST_TIMEOUT_SECONDS", "120")
+        )
+        maximum_vm_steps = int(
+            os.getenv(
+                "SYNAPSE_S2_LOGICAL_DIGEST_MAX_VM_STEPS",
+                "500000000",
+            )
+        )
+        if (
+            maximum_tables <= 0
+            or maximum_columns <= 0
+            or maximum_rows < 0
+            or maximum_value_bytes <= 0
+            or maximum_total_value_bytes <= 0
+            or not math.isfinite(maximum_seconds)
+            or maximum_seconds <= 0
+            or maximum_vm_steps <= 0
+        ):
+            raise ValueError("logical snapshot digest limits must be positive and finite")
+
+        deadline = time.monotonic() + maximum_seconds
+        progress_calls = 0
+        steps_per_callback = 10_000
+
+        def digest_progress() -> int:
+            nonlocal progress_calls
+            progress_calls += 1
+            return int(
+                time.monotonic() >= deadline
+                or progress_calls * steps_per_callback > maximum_vm_steps
+            )
+
+        if install_progress_handler:
+            conn.set_progress_handler(digest_progress, steps_per_callback)
+        conn.create_function(
+            "s2_logical_value_frame",
+            1,
+            cls._logical_snapshot_value_frame,
+            deterministic=True,
+        )
+        try:
+            schema_rows = conn.execute(
+                """
+                SELECT type, name, tbl_name, COALESCE(sql, '') AS sql
+                FROM sqlite_schema
+                WHERE name NOT LIKE 'sqlite_%'
+                ORDER BY type COLLATE BINARY, name COLLATE BINARY,
+                         tbl_name COLLATE BINARY, sql COLLATE BINARY
+                """
+            ).fetchall()
+            canonical_schema = [
+                [str(row[0]), str(row[1]), str(row[2]), str(row[3])]
+                for row in schema_rows
+            ]
+            schema_sha256 = hashlib.sha256(
+                _json_dumps(canonical_schema).encode("utf-8")
+            ).hexdigest()
+            application_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
+            user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            table_names = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_schema
+                    WHERE type = 'table'
+                      AND (name NOT LIKE 'sqlite_%' OR name = 'sqlite_sequence')
+                    ORDER BY name COLLATE BINARY
+                    """
+                ).fetchall()
+            ]
+            if len(table_names) > maximum_tables:
+                raise RuntimeError("logical snapshot exceeds its table limit")
+
+            table_specs: list[tuple[str, list[list[Any]], int]] = []
+            total_columns = 0
+            total_rows = 0
+            for table_name in table_names:
+                escaped_table = table_name.replace('"', '""')
+                column_rows = conn.execute(
+                    f'PRAGMA table_xinfo("{escaped_table}")'
+                ).fetchall()
+                columns = [
+                    [
+                        int(row[0]),
+                        str(row[1]),
+                        str(row[2] or ""),
+                        int(row[3]),
+                        row[4],
+                        int(row[5]),
+                        int(row[6]),
+                    ]
+                    for row in column_rows
+                ]
+                if not columns:
+                    raise RuntimeError(
+                        "logical snapshot encountered a table without columns"
+                    )
+                total_columns += len(columns)
+                if total_columns > maximum_columns:
+                    raise RuntimeError("logical snapshot exceeds its column limit")
+                row_count = int(
+                    conn.execute(
+                        f'SELECT COUNT(*) FROM "{escaped_table}"'
+                    ).fetchone()[0]
+                )
+                total_rows += row_count
+                if total_rows > maximum_rows:
+                    raise RuntimeError("logical snapshot exceeds its row limit")
+                table_specs.append((table_name, columns, row_count))
+
+            digest = hashlib.sha256()
+            cls._logical_snapshot_hash_frame(
+                digest,
+                b"V",
+                LOGICAL_SNAPSHOT_DIGEST_SCHEMA.encode("ascii"),
+            )
+            cls._logical_snapshot_hash_frame(
+                digest,
+                b"A",
+                str(application_id).encode("ascii"),
+            )
+            cls._logical_snapshot_hash_frame(
+                digest,
+                b"U",
+                str(user_version).encode("ascii"),
+            )
+            cls._logical_snapshot_hash_frame(
+                digest,
+                b"S",
+                _json_dumps(canonical_schema).encode("utf-8"),
+            )
+            cls._logical_snapshot_hash_frame(
+                digest,
+                b"T",
+                str(len(table_specs)).encode("ascii"),
+            )
+            total_value_bytes = 0
+            for table_name, columns, expected_row_count in table_specs:
+                cls._logical_snapshot_hash_frame(
+                    digest,
+                    b"t",
+                    table_name.encode("utf-8"),
+                )
+                cls._logical_snapshot_hash_frame(
+                    digest,
+                    b"c",
+                    _json_dumps(columns).encode("utf-8"),
+                )
+                cls._logical_snapshot_hash_frame(
+                    digest,
+                    b"r",
+                    str(expected_row_count).encode("ascii"),
+                )
+                escaped_table = table_name.replace('"', '""')
+                escaped_columns = [
+                    str(column[1]).replace('"', '""') for column in columns
+                ]
+                select_columns = ", ".join(
+                    f'"{column}"' for column in escaped_columns
+                )
+                order_columns = ", ".join(
+                    f's2_logical_value_frame("{column}") COLLATE BINARY'
+                    for column in escaped_columns
+                )
+                cursor = conn.execute(
+                    f'SELECT {select_columns} FROM "{escaped_table}" '
+                    f'ORDER BY {order_columns}'
+                )
+                streamed_rows = 0
+                while True:
+                    rows = cursor.fetchmany(512)
+                    if not rows:
+                        break
+                    for row in rows:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("logical snapshot digest timed out")
+                        cls._logical_snapshot_hash_frame(digest, b"R", b"")
+                        for value in row:
+                            value_frame = cls._logical_snapshot_value_frame(value)
+                            value_bytes = len(value_frame) - 9
+                            if value_bytes > maximum_value_bytes:
+                                raise RuntimeError(
+                                    "logical snapshot value exceeds its byte limit"
+                                )
+                            total_value_bytes += value_bytes
+                            if total_value_bytes > maximum_total_value_bytes:
+                                raise RuntimeError(
+                                    "logical snapshot exceeds its total byte limit"
+                                )
+                            cls._logical_snapshot_hash_frame(
+                                digest,
+                                b"v",
+                                value_frame,
+                            )
+                        streamed_rows += 1
+                if streamed_rows != expected_row_count:
+                    raise RuntimeError(
+                        "logical snapshot row count changed during its read transaction"
+                    )
+            return {
+                "schema": LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
+                "sha256": digest.hexdigest(),
+                "schema_sha256": schema_sha256,
+                "application_id": application_id,
+                "user_version": user_version,
+                "table_count": len(table_specs),
+                "column_count": total_columns,
+                "row_count": total_rows,
+                "value_bytes": total_value_bytes,
+            }
+        finally:
+            conn.create_function("s2_logical_value_frame", 1, None)
+            if install_progress_handler:
+                conn.set_progress_handler(None, 0)
+
+    def recompute_logical_snapshot_digest(
+        self,
+        path: str | os.PathLike[str] | None = None,
+    ) -> dict[str, Any]:
+        """Read-only exact-state digest for authority/cutover comparisons.
+
+        The live path is read through a WAL-aware transaction.  Non-live
+        artifacts must be stable standalone SQLite files and are opened
+        immutable only after sidecar ambiguity is excluded.
+        """
+
+        live_path = self.db_path.expanduser().absolute()
+        candidate = live_path if path is None else Path(path).expanduser().absolute()
+        is_live = candidate == live_path
+        if not is_live:
+            metadata_before = os.lstat(candidate)
+            if not stat.S_ISREG(metadata_before.st_mode) or stat.S_ISLNK(
+                metadata_before.st_mode
+            ):
+                raise ValueError("logical snapshot path must be a regular file")
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = Path(str(candidate) + suffix)
+                if sidecar.exists() or sidecar.is_symlink():
+                    raise RuntimeError(
+                        "logical snapshot artifact has an ambiguous SQLite sidecar"
+                    )
+            uri = candidate.resolve().as_uri() + "?mode=ro&immutable=1"
+            conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+        else:
+            metadata_before = None
+            conn = self._connect_read_only()
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("BEGIN")
+            try:
+                result = self._canonical_logical_snapshot_digest(conn)
+            finally:
+                conn.execute("ROLLBACK")
+            if self._authority_lease is not None and is_live:
+                self._authority_lease.assert_active_for(self.db_path)
+        finally:
+            conn.close()
+        if metadata_before is not None:
+            metadata_after = os.lstat(candidate)
+            if (
+                self._regular_file_identity(metadata_before)
+                != self._regular_file_identity(metadata_after)
+                or int(metadata_before.st_size) != int(metadata_after.st_size)
+                or int(metadata_before.st_mtime_ns) != int(metadata_after.st_mtime_ns)
+            ):
+                raise RuntimeError(
+                    "logical snapshot artifact changed during recomputation"
+                )
+        return {**result, "path": str(candidate), "verified": True}
+
     @classmethod
     def _canonical_backup_contract(cls) -> dict[str, Any]:
         """Build the exact code-owned schema/migration allowlist once per process."""
@@ -12555,7 +14475,40 @@ class DurableMemoryStore:
         if _CANONICAL_BACKUP_CONTRACT is not None:
             return dict(_CANONICAL_BACKUP_CONTRACT)
         with tempfile.TemporaryDirectory(prefix="synapse-s2-schema-contract-") as raw_root:
-            canonical_store = cls(Path(raw_root) / "canonical.sqlite3")
+            canonical_path = Path(raw_root) / "canonical.sqlite3"
+            bootstrap_store = cls(canonical_path)
+            bootstrap_store.close()
+            authority = CoreAuthorityLease.acquire_core(
+                canonical_path,
+                timeout_seconds=0.0,
+                instance_id="core-schema-contract",
+            )
+            try:
+                canonical_store = cls(canonical_path, authority_lease=authority)
+                preclaim = canonical_store.recompute_logical_snapshot_digest()
+                canonical_store.claim_core_authority(
+                    instance_id=authority.instance_id,
+                    config_fingerprint="0" * 64,
+                    build_id="schema-contract",
+                    protocol_version="synapse-core.v1",
+                    expected_store_identity=cls.store_identity_for_path(
+                        canonical_path
+                    ),
+                    request_journal_id="journal-" + ("0" * 24),
+                    request_journal_binding_schema=JOURNAL_BINDING_SCHEMA,
+                    request_journal_schema_version=JOURNAL_SCHEMA_VERSION,
+                    expected_preclaim_logical_snapshot_sha256=str(
+                        preclaim["sha256"]
+                    ),
+                    expected_previous_epoch=0,
+                    expected_next_epoch=1,
+                    root_generation_id="generation-" + ("0" * 24),
+                    embedding_space_identity="0" * 64,
+                    attestation_receipt_digest="0" * 64,
+                    attestation_expires_at_unix_ms=int(time.time() * 1000) + 60_000,
+                )
+            finally:
+                authority.close()
             with closing(sqlite3.connect(canonical_store.db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 schema = cls._sqlite_schema_fingerprint(conn)
@@ -12735,6 +14688,46 @@ class DurableMemoryStore:
                 "application_id": int(conn.execute("PRAGMA application_id").fetchone()[0]),
                 "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
             }
+            logical_snapshot = self._canonical_logical_snapshot_digest(
+                conn,
+                install_progress_handler=False,
+            )
+            authority_marker = self._core_authority_marker(conn)
+            self._validate_core_authority_version_pair(conn, authority_marker)
+            if authority_marker is None:
+                if int(schema_contract["user_version"]) != 5:
+                    raise CoreAuthorityError(
+                        "journal-less recovery is supported only for a pre-governed v5 store"
+                    )
+                authority_binding = {
+                    "governance_mode": "pre-governed-v5",
+                    "store_generation": "legacy-v5",
+                    "authority_epoch_number": None,
+                    "store_identity": self.store_identity_for_path(self.db_path),
+                    "request_journal_id": None,
+                    "schema_identity": (
+                        f"sqlite-{int(schema_contract['application_id']):x}-"
+                        f"v{int(schema_contract['user_version'])}"
+                    ),
+                }
+            else:
+                if int(schema_contract["user_version"]) != SQLITE_USER_VERSION:
+                    raise CoreAuthorityError(
+                        "governed recovery requires the current authoritative schema"
+                    )
+                authority_binding = {
+                    "governance_mode": "authoritative-v6",
+                    "store_generation": f"epoch-{int(authority_marker['epoch'])}",
+                    "authority_epoch_number": int(authority_marker["epoch"]),
+                    "store_identity": str(authority_marker["store_identity"]),
+                    "request_journal_id": str(
+                        authority_marker["request_journal_id"]
+                    ),
+                    "schema_identity": (
+                        f"sqlite-{int(schema_contract['application_id']):x}-"
+                        f"v{int(schema_contract['user_version'])}"
+                    ),
+                }
             canonical_contract = self._canonical_backup_contract()
             matching_contract_versions = sorted(
                 version
@@ -12868,6 +14861,8 @@ class DurableMemoryStore:
                 matching_contract_versions[-1] if matching_contract_versions else ""
             ),
             "schema_contract_error_count": schema_contract_error_count,
+            "authority_binding": authority_binding,
+            "logical_snapshot": logical_snapshot,
             "critical_counts": counts,
             "highwaters": highwaters,
             "snapshot_revision": hashlib.sha256(
@@ -12955,6 +14950,14 @@ class DurableMemoryStore:
             if not inspection["restore_eligible"]:
                 raise RuntimeError("backup artifact failed SYNAPSE recovery invariants")
             if receipt is not None:
+                if (
+                    receipt.get("schema") == LEGACY_BACKUP_RECEIPT_SCHEMA
+                    and inspection["authority_binding"]["governance_mode"]
+                    != "pre-governed-v5"
+                ):
+                    raise RuntimeError(
+                        "legacy backup receipts are valid only for pre-governed v5 stores"
+                    )
                 if str(receipt.get("schema_sha256") or "") != str(
                     inspection["schema"]["sha256"]
                 ):
@@ -12975,6 +14978,28 @@ class DurableMemoryStore:
                     inspection["schema_contract_version"]
                 ):
                     raise RuntimeError("backup schema contract version does not match its receipt")
+                if receipt.get("schema") == BACKUP_RECEIPT_SCHEMA:
+                    logical_snapshot = inspection["logical_snapshot"]
+                    logical_mismatches = (
+                        receipt.get("logical_snapshot_schema")
+                        != logical_snapshot["schema"],
+                        not secrets.compare_digest(
+                            str(receipt.get("logical_snapshot_sha256") or ""),
+                            str(logical_snapshot["sha256"]),
+                        ),
+                        int(receipt["logical_snapshot_table_count"])
+                        != int(logical_snapshot["table_count"]),
+                        int(receipt["logical_snapshot_column_count"])
+                        != int(logical_snapshot["column_count"]),
+                        int(receipt["logical_snapshot_row_count"])
+                        != int(logical_snapshot["row_count"]),
+                        int(receipt["logical_snapshot_value_bytes"])
+                        != int(logical_snapshot["value_bytes"]),
+                    )
+                    if any(logical_mismatches):
+                        raise RuntimeError(
+                            "backup logical snapshot digest does not match its receipt"
+                        )
             return {
                 "action": "verify-backup",
                 "backup_path": str(artifact),
@@ -12985,9 +15010,43 @@ class DurableMemoryStore:
                 "sha256": str(copied["sha256"]),
                 "size_bytes": int(copied["size_bytes"]),
                 "snapshot_revision": str(inspection["snapshot_revision"]),
+                "logical_snapshot_schema": str(
+                    inspection["logical_snapshot"]["schema"]
+                ),
+                "logical_snapshot_sha256": str(
+                    inspection["logical_snapshot"]["sha256"]
+                ),
+                "logical_snapshot_table_count": int(
+                    inspection["logical_snapshot"]["table_count"]
+                ),
+                "logical_snapshot_column_count": int(
+                    inspection["logical_snapshot"]["column_count"]
+                ),
+                "logical_snapshot_row_count": int(
+                    inspection["logical_snapshot"]["row_count"]
+                ),
+                "logical_snapshot_value_bytes": int(
+                    inspection["logical_snapshot"]["value_bytes"]
+                ),
                 "schema_sha256": str(inspection["schema"]["sha256"]),
                 "schema_contract_version": str(
                     inspection["schema_contract_version"]
+                ),
+                "governance_mode": str(
+                    inspection["authority_binding"]["governance_mode"]
+                ),
+                "store_generation": str(
+                    inspection["authority_binding"]["store_generation"]
+                ),
+                "authority_epoch_number": inspection["authority_binding"][
+                    "authority_epoch_number"
+                ],
+                "store_identity": inspection["authority_binding"]["store_identity"],
+                "request_journal_id": inspection["authority_binding"][
+                    "request_journal_id"
+                ],
+                "schema_identity": str(
+                    inspection["authority_binding"]["schema_identity"]
                 ),
                 "recovery_runtime_id": BACKUP_RECOVERY_RUNTIME_ID,
                 "entry_count": int(inspection["critical_counts"].get("memory_entries", 0)),
@@ -13125,6 +15184,24 @@ class DurableMemoryStore:
                 ),
                 "recovery_runtime_id": BACKUP_RECOVERY_RUNTIME_ID,
                 "snapshot_revision": str(inspection["snapshot_revision"]),
+                "logical_snapshot_schema": str(
+                    inspection["logical_snapshot"]["schema"]
+                ),
+                "logical_snapshot_sha256": str(
+                    inspection["logical_snapshot"]["sha256"]
+                ),
+                "logical_snapshot_table_count": int(
+                    inspection["logical_snapshot"]["table_count"]
+                ),
+                "logical_snapshot_column_count": int(
+                    inspection["logical_snapshot"]["column_count"]
+                ),
+                "logical_snapshot_row_count": int(
+                    inspection["logical_snapshot"]["row_count"]
+                ),
+                "logical_snapshot_value_bytes": int(
+                    inspection["logical_snapshot"]["value_bytes"]
+                ),
                 "critical_counts": inspection["critical_counts"],
                 "highwaters": inspection["highwaters"],
                 "semantic_index_revision": str(inspection["semantic_index_revision"]),
@@ -13173,6 +15250,8 @@ class DurableMemoryStore:
         expected_sha256: str | None = None,
         receipt_path: str | os.PathLike[str] | None = None,
         confirm: bool = False,
+        _paired_request_journal_binding: dict[str, Any] | None = None,
+        _paired_request_journal_expected_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Materialize a verified backup as an isolated, no-overwrite database.
 
@@ -13211,6 +15290,83 @@ class DurableMemoryStore:
         )
         if not verification.get("receipt_verified"):
             raise ValueError("restore requires a trusted immutable backup receipt")
+        if verification.get("governance_mode") == "authoritative-v6":
+            binding = _paired_request_journal_binding
+            reviewed_journal_sha256 = str(
+                _paired_request_journal_expected_sha256 or ""
+            ).strip().lower()
+            if reviewed_journal_sha256 and not BACKUP_DIGEST_RE.fullmatch(
+                reviewed_journal_sha256
+            ):
+                raise ValueError(
+                    "reviewed request-journal digest must be a lowercase SHA-256"
+                )
+            if (
+                not isinstance(binding, dict)
+                or binding.get("schema")
+                != RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA
+                or binding.get("journal_schema_identity")
+                != "sqlite-5332524a-v3"
+                or CORE_REQUEST_JOURNAL_ID_RE.fullmatch(
+                    str(binding.get("request_journal_id") or "")
+                )
+                is None
+            ):
+                raise ValueError(
+                    "governed v6 restore requires verified paired request-journal evidence"
+                )
+            digest_fields = (
+                "database_sha256",
+                "database_snapshot_revision",
+                "database_logical_snapshot_sha256",
+                "journal_sha256",
+                "receipt_digest",
+            )
+            if any(
+                not BACKUP_DIGEST_RE.fullmatch(str(binding.get(field) or ""))
+                for field in digest_fields
+            ):
+                raise ValueError("paired request-journal evidence is invalid")
+            if (
+                not secrets.compare_digest(
+                    str(binding["receipt_digest"]),
+                    self._canonical_payload_digest(binding),
+                )
+            ):
+                raise ValueError("paired request-journal evidence digest is invalid")
+            binding_identity_trusted = self._verify_receipt_authenticator(binding)
+            binding_journal_sha256 = str(binding["journal_sha256"])
+            if reviewed_journal_sha256 and not secrets.compare_digest(
+                reviewed_journal_sha256,
+                binding_journal_sha256,
+            ):
+                raise ValueError(
+                    "reviewed request-journal digest does not match paired evidence"
+                )
+            if not binding_identity_trusted and not reviewed_journal_sha256:
+                raise ValueError(
+                    "foreign paired request-journal evidence requires a reviewed SHA-256"
+                )
+            if (
+                not secrets.compare_digest(
+                    str(binding["database_sha256"]), str(verification["sha256"])
+                )
+                or not secrets.compare_digest(
+                    str(binding["database_snapshot_revision"]),
+                    str(verification["snapshot_revision"]),
+                )
+                or not secrets.compare_digest(
+                    str(binding["database_logical_snapshot_sha256"]),
+                    str(verification["logical_snapshot_sha256"]),
+                )
+                or str(binding["store_generation"])
+                != str(verification["store_generation"])
+                or str(binding["request_journal_id"])
+                != str(verification["request_journal_id"])
+            ):
+                raise ValueError(
+                    "paired request-journal evidence does not match the governed store"
+                )
         temporary = self._unique_private_temp_path(
             target.parent, prefix=f".{target.name}.restore."
         )
@@ -13227,6 +15383,10 @@ class DurableMemoryStore:
                 not inspection["restore_eligible"]
                 or str(inspection["snapshot_revision"])
                 != str(verification["snapshot_revision"])
+                or not secrets.compare_digest(
+                    str(inspection["logical_snapshot"]["sha256"]),
+                    str(verification["logical_snapshot_sha256"]),
+                )
             ):
                 raise RuntimeError("restore candidate failed post-copy verification")
             os.link(temporary, target, follow_symlinks=False)
@@ -13263,6 +15423,24 @@ class DurableMemoryStore:
                     trusted_backup_receipt["receipt_digest"]
                 ),
                 "snapshot_revision": str(inspection["snapshot_revision"]),
+                "logical_snapshot_schema": str(
+                    inspection["logical_snapshot"]["schema"]
+                ),
+                "logical_snapshot_sha256": str(
+                    inspection["logical_snapshot"]["sha256"]
+                ),
+                "logical_snapshot_table_count": int(
+                    inspection["logical_snapshot"]["table_count"]
+                ),
+                "logical_snapshot_column_count": int(
+                    inspection["logical_snapshot"]["column_count"]
+                ),
+                "logical_snapshot_row_count": int(
+                    inspection["logical_snapshot"]["row_count"]
+                ),
+                "logical_snapshot_value_bytes": int(
+                    inspection["logical_snapshot"]["value_bytes"]
+                ),
                 "mode": "isolated-candidate",
                 "verified": True,
                 "created_at": created_at,
@@ -13285,6 +15463,12 @@ class DurableMemoryStore:
                 "sha256": final_digest,
                 "size_bytes": final_size,
                 "snapshot_revision": str(inspection["snapshot_revision"]),
+                "logical_snapshot_schema": str(
+                    inspection["logical_snapshot"]["schema"]
+                ),
+                "logical_snapshot_sha256": str(
+                    inspection["logical_snapshot"]["sha256"]
+                ),
                 "quick_check": inspection["quick_check"],
                 "integrity_check": inspection["integrity_check"],
                 "verified": True,

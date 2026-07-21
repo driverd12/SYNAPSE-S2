@@ -2050,8 +2050,8 @@ class DurableMemoryStoreTests(unittest.TestCase):
                         """
                     ).fetchone()[0]
                 )
+            self.assertIsNone(reopened.get_entry(entry["memory_id"]))
 
-        self.assertIsNone(reopened.get_entry(entry["memory_id"]))
         self.assertNotIn(marker, json.dumps(scrubbed_event, sort_keys=True))
         self.assertEqual(migration_count, 1)
         self.assertGreaterEqual(receipt_count, 1)

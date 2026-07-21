@@ -15,6 +15,7 @@ from unittest import mock
 import mlx_backend
 import mcp_server
 from capture_daemon import CaptureInboxDaemon
+from core_client import CoreOutcomeUnknown
 
 
 class McpServerTests(unittest.TestCase):
@@ -56,6 +57,55 @@ class McpServerTests(unittest.TestCase):
         self.addCleanup(self._restore_capture_root)
         self.addCleanup(self._restore_client_agent_id)
         self.addCleanup(self._restore_response_contract_environment)
+
+    def test_recovery_tools_forward_expected_journal_and_runtime_digests(self):
+        digest = "b" * 64
+        runtime_digest = "c" * 64
+        backend = mock.Mock()
+        backend.verify_recovery_bundle.return_value = {"verified": True}
+        backend.restore_recovery_bundle_isolated.return_value = {"verified": True}
+        receipt = str(Path(self.tmpdir.name) / "bundle.receipt.json")
+        output_root = str(Path(self.tmpdir.name) / "restore-proof")
+        with mock.patch.object(
+            mcp_server,
+            "_load_backend",
+            return_value=(None, backend),
+        ):
+            verified = json.loads(
+                mcp_server.verify_spiking_recovery(
+                    receipt,
+                    expected_request_journal_sha256=digest,
+                    expected_runtime_state_sha256=runtime_digest,
+                )
+            )
+            restored = json.loads(
+                mcp_server.restore_spiking_recovery_proof(
+                    receipt,
+                    output_root,
+                    expected_request_journal_sha256=digest,
+                    expected_runtime_state_sha256=runtime_digest,
+                    confirm=True,
+                )
+            )
+
+        self.assertTrue(verified["verified"])
+        self.assertTrue(restored["verified"])
+        backend.verify_recovery_bundle.assert_called_once_with(
+            str(Path(receipt).resolve()),
+            expected_database_sha256=None,
+            expected_capture_sha256=None,
+            expected_request_journal_sha256=digest,
+            expected_runtime_state_sha256=runtime_digest,
+        )
+        backend.restore_recovery_bundle_isolated.assert_called_once_with(
+            str(Path(receipt).resolve()),
+            str(Path(output_root).resolve()),
+            expected_database_sha256=None,
+            expected_capture_sha256=None,
+            expected_request_journal_sha256=digest,
+            expected_runtime_state_sha256=runtime_digest,
+            confirm=True,
+        )
 
     def _contract_payload(self, response) -> dict:
         if isinstance(response, dict):
@@ -127,6 +177,67 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("[LOCAL_PATH]", result)
         self.assertNotIn(secret, result)
         self.assertNotIn(local_path, result)
+
+    def test_mutation_outcome_unknown_returns_fixed_reconciliation_handle(self):
+        error = CoreOutcomeUnknown(
+            caller="mcp-caller",
+            request_id="req-mcp-ambiguous",
+            operation="set_enabled",
+        )
+        with mock.patch.object(mcp_server, "_load_backend", side_effect=error):
+            payload = json.loads(
+                mcp_server.set_spiking_attention_enabled(
+                    False,
+                    context_id="default",
+                )
+            )
+
+        self.assertEqual(
+            payload["error"],
+            {
+                "code": "outcome_unknown",
+                "message": "mutation outcome requires reconciliation",
+                "reconciliation": {
+                    "code": "outcome_unknown",
+                    "caller": "mcp-caller",
+                    "request_id": "req-mcp-ambiguous",
+                    "operation": "set_enabled",
+                    "replay_safe": False,
+                },
+            },
+        )
+        rendered = json.dumps(payload, sort_keys=True)
+        for forbidden in ("arguments", "fingerprint", "response_sha256", "canary"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_core_request_status_tool_reconciles_without_replay(self):
+        client = mock.Mock()
+        client.request_status.return_value = {
+            "caller": "mcp-caller",
+            "request_id": "req-mcp-status",
+            "state": "ambiguous",
+            "operation": "set_enabled",
+            "replay_safe": False,
+            "retention_expiry_possible": False,
+        }
+        with mock.patch.object(
+            mcp_server.CoreClient,
+            "from_environment",
+            return_value=client,
+        ):
+            payload = json.loads(
+                mcp_server.get_core_request_status(
+                    "mcp-caller",
+                    "req-mcp-status",
+                )
+            )
+
+        self.assertEqual(payload["state"], "ambiguous")
+        self.assertFalse(payload["replay_safe"])
+        client.request_status.assert_called_once_with(
+            caller="mcp-caller",
+            request_id="req-mcp-status",
+        )
 
     def test_token_contract_tools_default_compact_and_honor_byte_budgets(self):
         registration = json.loads(
@@ -1091,6 +1202,37 @@ class McpServerTests(unittest.TestCase):
 
         self.assertEqual(violations, [])
 
+    def test_direct_main_applies_binding_before_starting_session_bridge(self):
+        order: list[str] = []
+
+        def apply_binding():
+            order.append("binding")
+
+        def run_bridge(_run_server):
+            order.append("bridge")
+
+        with mock.patch.object(
+            mcp_server,
+            "apply_binding_environment",
+            side_effect=apply_binding,
+        ), mock.patch(
+            "client_session_bridge.run_with_client_session_bridge",
+            side_effect=run_bridge,
+        ):
+            mcp_server.main()
+
+        self.assertEqual(order, ["binding", "bridge"])
+
+    def test_capture_adapter_loader_applies_binding_before_returning_module(self):
+        with mock.patch.object(
+            mcp_server,
+            "apply_binding_environment",
+        ) as apply_binding:
+            loaded = mcp_server._load_capture_daemon()
+
+        apply_binding.assert_called_once_with()
+        self.assertEqual(loaded.__name__, "capture_daemon")
+
     def test_unavailable_mcp_startup_error_is_sanitized(self):
         secret = "sk-startup-secret-1234567890"
         local_path = "/Users/dan.driver/private/fastmcp.py"
@@ -1354,7 +1496,7 @@ class McpServerTests(unittest.TestCase):
         self.assertFalse(output.with_name(output.name + ".receipt.json").exists())
 
     def test_capture_ledger_tools_require_a_reviewed_repair(self):
-        CaptureInboxDaemon(root=self.tmpdir.name).status()
+        CaptureInboxDaemon(root=self.tmpdir.name).prepare_transport()
         audit = json.loads(
             mcp_server.audit_capture_ledger_integrity(sample_limit=7)
         )
@@ -1428,7 +1570,7 @@ class McpServerTests(unittest.TestCase):
     def test_paired_recovery_tools_create_verify_and_restore_isolated_proof(self):
         capture_root = Path(self.tmpdir.name)
         os.environ["SYNAPSE_S2_CAPTURE_ROOT"] = str(capture_root)
-        CaptureInboxDaemon(root=capture_root).status()
+        CaptureInboxDaemon(root=capture_root).prepare_transport()
         bundle = json.loads(
             mcp_server.backup_spiking_recovery(
                 output_path=str(capture_root / "paired.sqlite3"),
@@ -1690,6 +1832,7 @@ class McpServerTests(unittest.TestCase):
         root = Path(os.environ["SYNAPSE_S2_CAPTURE_ROOT"])
         status = json.loads(mcp_server.get_spiking_capture_inbox_status())
         del status
+        CaptureInboxDaemon(root=root).prepare_transport()
         error_path = root / "capture_errors" / "terminal.evidence.json"
         error_path.write_text(
             json.dumps(

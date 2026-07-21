@@ -11,6 +11,8 @@ from typing import Annotated, Any
 
 from pydantic import BeforeValidator, WithJsonSchema
 
+from core_client import CoreClient, CoreOutcomeUnknown, outcome_unknown_projection
+from core_client_binding import apply_binding_environment
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
     install_secret_safe_formatters,
@@ -354,9 +356,15 @@ mcp = (
 )
 
 
-def _public_error(label: str, error: BaseException) -> str:
+def _public_error(label: str, error: BaseException) -> Any:
     """Preserve the public error label while bounding and redacting details."""
 
+    if isinstance(error, CoreOutcomeUnknown):
+        return {
+            "code": "outcome_unknown",
+            "message": "mutation outcome requires reconciliation",
+            "reconciliation": outcome_unknown_projection(error),
+        }
     return f"{label}: {safe_public_error(error, fallback=label)}"
 
 
@@ -904,6 +912,52 @@ def _required_output_directory(output_path: str | None) -> str:
     return str(resolved_candidate)
 
 
+def _core_owned_path(
+    value: str | None,
+    *,
+    core: CoreClient,
+    root_name: str,
+    field: str,
+    allowed_suffixes: set[str] | None = None,
+    required: bool = False,
+) -> str | None:
+    """Normalize an MCP path within one authoritative server-owned root."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        if required:
+            raise ValueError(f"{field} is required")
+        return None
+    if len(raw) > 4096:
+        raise ValueError(f"{field} exceeds 4096 characters")
+    raw = reject_sensitive_identifier(raw, field=field)
+    root = core.state_path.parent / root_name
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    normalized = Path(os.path.normpath(str(candidate)))
+    if not normalized.is_absolute() or ".." in normalized.parts:
+        raise ValueError(f"{field} must be a normalized path")
+    try:
+        relative = normalized.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{field} must stay within the authoritative {root_name} root") from exc
+    if not relative.parts:
+        raise ValueError(f"{field} must name a child of the authoritative {root_name} root")
+    if allowed_suffixes is not None and normalized.suffix.lower() not in allowed_suffixes:
+        allowed = ", ".join(sorted(allowed_suffixes))
+        raise ValueError(f"{field} suffix must be one of: {allowed}")
+    return str(normalized)
+
+
+def _loaded_core_client(mlx_backend_module: Any) -> CoreClient | None:
+    getter = getattr(mlx_backend_module, "get_backend", None)
+    if not callable(getter):
+        return None
+    backend = getter()
+    return backend if isinstance(backend, CoreClient) else None
+
+
 def _load_backend():
     import mlx.core as mx
     import mlx_backend
@@ -912,12 +966,14 @@ def _load_backend():
 
 
 def _load_capture_daemon():
+    apply_binding_environment()
     import capture_daemon
 
     return capture_daemon
 
 
 def _load_transcript_capture():
+    apply_binding_environment()
     import transcript_capture
 
     return transcript_capture
@@ -966,10 +1022,10 @@ def query_spiking_attention(
         )
     except ValueError as exc:
         LOGGER.warning("invalid prompt_embedding for context_id=%s: %s", context, exc)
-        return _public_error("invalid prompt_embedding", exc)
+        return json.dumps({"error": _public_error("invalid prompt_embedding", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("spiking attention query failed for context_id=%s", context)
-        return _public_error("spiking attention unavailable", exc)
+        return json.dumps({"error": _public_error("spiking attention unavailable", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -997,10 +1053,10 @@ def query_spiking_attention_text(
         )
     except ValueError as exc:
         LOGGER.warning("invalid prompt text for context_id=%s: %s", context, exc)
-        return _public_error("invalid prompt", exc)
+        return json.dumps({"error": _public_error("invalid prompt", exc)}, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("text spiking attention query failed for context_id=%s", context)
-        return _public_error("spiking attention unavailable", exc)
+        return json.dumps({"error": _public_error("spiking attention unavailable", exc)}, sort_keys=True)
 
 
 @mcp.tool(
@@ -1163,6 +1219,46 @@ def get_spiking_attention_status(context_id: str = "default") -> str:
     except Exception as exc:
         LOGGER.exception("status check failed for context_id=%s", context)
         return json.dumps({"error": _public_error("status failed", exc)}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Reconcile Authoritative Core Request",
+        "readOnlyHint": True,
+    }
+)
+def get_core_request_status(caller: str, request_id: str) -> str:
+    """Inspect one ambiguous core mutation by handle without replaying it."""
+
+    try:
+        clean_caller = reject_sensitive_identifier(caller, field="caller").strip()
+        clean_request_id = reject_sensitive_identifier(
+            request_id,
+            field="request_id",
+        ).strip()
+        identifier_pattern = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+        if (
+            identifier_pattern.fullmatch(clean_caller) is None
+            or identifier_pattern.fullmatch(clean_request_id) is None
+        ):
+            raise ValueError("reconciliation identifiers are invalid")
+        payload = CoreClient.from_environment().request_status(
+            caller=clean_caller,
+            request_id=clean_request_id,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        LOGGER.warning("invalid core request status inspection")
+        return json.dumps(
+            {"error": _public_error("invalid core request status inspection", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("core request status inspection failed")
+        return json.dumps(
+            {"error": _public_error("core request status inspection failed", exc)},
+            sort_keys=True,
+        )
 
 
 @mcp.tool(
@@ -1740,6 +1836,7 @@ def prune_spiking_memory(
             event_id=max(0, int(event_id)),
             reason=reason,
             source_surface="mcp",
+            confirm=True,
         )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
@@ -2689,11 +2786,22 @@ def export_spiking_memory(
 def backup_spiking_memory(output_path: str = "") -> str:
     """Create a segregated SQLite-only diagnostic, not a recovery point."""
     try:
-        path = _optional_output_path(
-            output_path,
-            allowed_suffixes={".db", ".sqlite", ".sqlite3"},
-        )
         _, mlx_backend = _load_backend()
+        core = _loaded_core_client(mlx_backend)
+        path = (
+            _core_owned_path(
+                output_path,
+                core=core,
+                root_name="backups",
+                field="output_path",
+                allowed_suffixes={".db", ".sqlite", ".sqlite3"},
+            )
+            if core is not None
+            else _optional_output_path(
+                output_path,
+                allowed_suffixes={".db", ".sqlite", ".sqlite3"},
+            )
+        )
         payload = mlx_backend.backup_memory(path=path)
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
@@ -2762,11 +2870,25 @@ def backup_spiking_recovery(
 ) -> str:
     """Create and verify a signed SQLite plus exactly-once capture recovery bundle."""
     try:
-        path = _optional_output_path(
-            output_path,
-            allowed_suffixes={".db", ".sqlite", ".sqlite3"},
-        )
         _, mlx_backend = _load_backend()
+        core = _loaded_core_client(mlx_backend)
+        path = (
+            _core_owned_path(
+                output_path,
+                core=core,
+                root_name="backups",
+                field="output_path",
+                allowed_suffixes={".db", ".sqlite", ".sqlite3"},
+            )
+            if core is not None
+            else _optional_output_path(
+                output_path,
+                allowed_suffixes={".db", ".sqlite", ".sqlite3"},
+            )
+        )
+        if core is None:
+            capture_daemon = _load_capture_daemon()
+            capture_daemon.CaptureInboxDaemon().prepare_transport()
         payload = mlx_backend.backup_recovery_bundle(
             path=path,
             purpose=purpose,
@@ -2792,20 +2914,38 @@ def verify_spiking_recovery(
     receipt_path: str,
     expected_database_sha256: str = "",
     expected_capture_sha256: str = "",
+    expected_request_journal_sha256: str = "",
+    expected_runtime_state_sha256: str = "",
 ) -> str:
     """Cryptographically verify a paired recovery bundle without restoring it."""
     try:
-        receipt = _optional_output_path(
-            receipt_path,
-            allowed_suffixes={".json"},
+        _, mlx_backend = _load_backend()
+        core = _loaded_core_client(mlx_backend)
+        receipt = (
+            _core_owned_path(
+                receipt_path,
+                core=core,
+                root_name="backups",
+                field="receipt_path",
+                allowed_suffixes={".json"},
+                required=True,
+            )
+            if core is not None
+            else _optional_output_path(
+                receipt_path,
+                allowed_suffixes={".json"},
+            )
         )
         if receipt is None:
             raise ValueError("receipt_path is required")
-        _, mlx_backend = _load_backend()
         payload = mlx_backend.verify_recovery_bundle(
             receipt,
             expected_database_sha256=expected_database_sha256 or None,
             expected_capture_sha256=expected_capture_sha256 or None,
+            expected_request_journal_sha256=(
+                expected_request_journal_sha256 or None
+            ),
+            expected_runtime_state_sha256=expected_runtime_state_sha256 or None,
         )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
@@ -2828,23 +2968,52 @@ def restore_spiking_recovery_proof(
     output_directory: str,
     expected_database_sha256: str = "",
     expected_capture_sha256: str = "",
+    expected_request_journal_sha256: str = "",
+    expected_runtime_state_sha256: str = "",
     confirm: bool = False,
 ) -> str:
     """Materialize an isolated paired restore proof; never overwrite live state."""
     try:
-        receipt = _optional_output_path(
-            receipt_path,
-            allowed_suffixes={".json"},
+        _, mlx_backend = _load_backend()
+        core = _loaded_core_client(mlx_backend)
+        receipt = (
+            _core_owned_path(
+                receipt_path,
+                core=core,
+                root_name="backups",
+                field="receipt_path",
+                allowed_suffixes={".json"},
+                required=True,
+            )
+            if core is not None
+            else _optional_output_path(
+                receipt_path,
+                allowed_suffixes={".json"},
+            )
         )
         if receipt is None:
             raise ValueError("receipt_path is required")
-        output_root = _required_output_directory(output_directory)
-        _, mlx_backend = _load_backend()
+        output_root = (
+            _core_owned_path(
+                output_directory,
+                core=core,
+                root_name="recovery",
+                field="output_directory",
+                required=True,
+            )
+            if core is not None
+            else _required_output_directory(output_directory)
+        )
+        assert output_root is not None
         payload = mlx_backend.restore_recovery_bundle_isolated(
             receipt,
             output_root,
             expected_database_sha256=expected_database_sha256 or None,
             expected_capture_sha256=expected_capture_sha256 or None,
+            expected_request_journal_sha256=(
+                expected_request_journal_sha256 or None
+            ),
+            expected_runtime_state_sha256=expected_runtime_state_sha256 or None,
             confirm=bool(confirm),
         )
         return json.dumps(payload, sort_keys=True)
@@ -2958,7 +3127,7 @@ def trigger_sleep_consolidation() -> str:
         return json.dumps(status, sort_keys=True)
     except Exception as exc:
         LOGGER.exception("sleep consolidation failed")
-        return _public_error("sleep consolidation failed", exc)
+        return json.dumps({"error": _public_error("sleep consolidation failed", exc)}, sort_keys=True)
 
 
 @mcp.tool()
@@ -3006,7 +3175,14 @@ def _install_contract_tool_guards() -> None:
 _install_contract_tool_guards()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    # Direct execution is supported for operators and must establish the same
+    # reviewed layout before the session bridge chooses its capture root.
+    apply_binding_environment()
     from client_session_bridge import run_with_client_session_bridge
 
     run_with_client_session_bridge(mcp.run)
+
+
+if __name__ == "__main__":
+    main()

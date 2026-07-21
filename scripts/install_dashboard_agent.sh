@@ -11,23 +11,27 @@ PORT="${SYNAPSE_S2_DASHBOARD_PORT:-8765}"
 CONTEXT="${SYNAPSE_S2_DASHBOARD_CONTEXT:-default}"
 LOG_PATH="${SYNAPSE_S2_DASHBOARD_LOG:-$ROOT/.synapse_s2/dashboard.log}"
 PYTHON="${SYNAPSE_S2_PYTHON:-$ROOT/.venv/bin/python}"
+CORE_BINDING=""
+CANONICAL_DATA_ROOT="$ROOT/.synapse_s2"
+STATE_PATH="$CANONICAL_DATA_ROOT/runtime_state.json"
+MEMORY_DB="$CANONICAL_DATA_ROOT/memory.sqlite3"
+EXPORT_DIR="$CANONICAL_DATA_ROOT"
+CAPTURE_ROOT="$CANONICAL_DATA_ROOT"
+DASHBOARD_AUTH_FILE="${SYNAPSE_S2_DASHBOARD_AUTH_FILE:-$CANONICAL_DATA_ROOT/dashboard-auth.json}"
+NEURAL_CACHE_DIR="$CANONICAL_DATA_ROOT/models"
 EMBEDDING_PROVIDER="${SYNAPSE_S2_EMBEDDING_PROVIDER:-mlx-neural}"
 NEURAL_MODEL="${SYNAPSE_S2_NEURAL_MODEL:-mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ}"
-NEURAL_CACHE_DIR="${SYNAPSE_S2_NEURAL_CACHE_DIR:-$ROOT/.synapse_s2/models}"
 NEURAL_LOCAL_FILES_ONLY="${SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY:-1}"
 DIMENSION="${SYNAPSE_S2_DIMENSION:-1024}"
 NEURONS="${SYNAPSE_S2_NEURONS:-8192}"
 TOP_K="${SYNAPSE_S2_TOP_K:-256}"
 RECALL_COUNT="${SYNAPSE_S2_RECALL_COUNT:-10}"
-STATE_PATH="${SYNAPSE_S2_STATE_PATH:-$ROOT/.synapse_s2/runtime_state.json}"
-MEMORY_DB="${SYNAPSE_S2_MEMORY_DB:-$ROOT/.synapse_s2/memory.sqlite3}"
-EXPORT_DIR="${SYNAPSE_S2_EXPORT_DIR:-$ROOT/.synapse_s2}"
-CAPTURE_ROOT="${SYNAPSE_S2_CAPTURE_ROOT:-$ROOT/.synapse_s2}"
+DEFAULT_RESPONSE_MODE="${SYNAPSE_S2_DEFAULT_RESPONSE_MODE:-compact}"
+MAX_RESPONSE_BYTES="${SYNAPSE_S2_MAX_RESPONSE_BYTES:-12288}"
 UID_VALUE="$(id -u)"
 PLIST_DIR="$(dirname "$PLIST")"
 PLIST_TEMP=""
 PLIST_ROLLBACK=""
-INSTALL_LOCK=""
 PLIST_REPLACED=0
 INSTALL_HEALTHY=0
 HAD_PRIOR_PLIST=0
@@ -36,11 +40,77 @@ PRIOR_DISABLED=0
 PRIOR_RUNNING=0
 PRIOR_PID=""
 NEW_PID=""
+HEALTH_COOKIE_FILE=""
 HEALTH_ATTEMPTS="${SYNAPSE_S2_INSTALL_HEALTH_ATTEMPTS:-120}"
 HEALTH_DELAY="${SYNAPSE_S2_INSTALL_HEALTH_DELAY:-0.25}"
 STABLE_CHECKS="${SYNAPSE_S2_INSTALL_STABLE_CHECKS:-3}"
 STABILIZATION_SECONDS="${SYNAPSE_S2_INSTALL_STABILIZATION_SECONDS:-1.0}"
 REQUIRED_STABLE_CHECKS=0
+
+if [ ! -x "$PYTHON" ]; then
+  echo "Python runtime is missing or not executable" >&2
+  echo "Run uv sync first." >&2
+  exit 2
+fi
+
+resolve_core_binding() {
+  "$PYTHON" - "$ROOT" "$HOME" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1]).absolute()
+home = Path(sys.argv[2]).expanduser().absolute()
+sys.path.insert(0, str(repo_root))
+
+from core_client_binding import (  # noqa: E402
+    BINDING_ENV,
+    CoreClientBindingError,
+    default_binding_path,
+    load_core_client_binding,
+)
+
+raw = str(os.environ.get(BINDING_ENV, "") or "").strip()
+binding_path = Path(raw).expanduser() if raw else default_binding_path(home)
+if not raw and not (binding_path.exists() or binding_path.is_symlink()):
+    raise SystemExit(0)
+try:
+    binding = load_core_client_binding(binding_path)
+except CoreClientBindingError:
+    raise SystemExit(2) from None
+if binding.repo_root != repo_root:
+    raise SystemExit(2)
+print(binding_path.absolute())
+PY
+}
+
+if ! CORE_BINDING="$(resolve_core_binding)"; then
+  echo "Dashboard core binding is invalid" >&2
+  exit 2
+fi
+
+require_canonical_or_unset() {
+  local variable_name="$1"
+  local expected="$2"
+  local configured="${!variable_name:-}"
+  if [ -n "$configured" ] && [ "$configured" != "$expected" ]; then
+    echo "Noncanonical dashboard paths require a reviewed core binding" >&2
+    exit 2
+  fi
+}
+
+if [ -z "$CORE_BINDING" ]; then
+  if [ -n "${SYNAPSE_S2_CORE_SOCKET:-}" ] \
+    || [ -n "${SYNAPSE_S2_EXPECTED_CORE_CONFIG_FINGERPRINT:-}" ]; then
+    echo "Authoritative dashboard routing requires a reviewed core binding" >&2
+    exit 2
+  fi
+  require_canonical_or_unset SYNAPSE_S2_STATE_PATH "$STATE_PATH"
+  require_canonical_or_unset SYNAPSE_S2_MEMORY_DB "$MEMORY_DB"
+  require_canonical_or_unset SYNAPSE_S2_EXPORT_DIR "$EXPORT_DIR"
+  require_canonical_or_unset SYNAPSE_S2_CAPTURE_ROOT "$CAPTURE_ROOT"
+  require_canonical_or_unset SYNAPSE_S2_NEURAL_CACHE_DIR "$NEURAL_CACHE_DIR"
+fi
 
 case "$LABEL" in
   ""|*[!A-Za-z0-9._-]*)
@@ -131,14 +201,25 @@ contains_secret_shape() {
 }
 
 for configured_value in \
-  "$LABEL" "$PLIST" "$LOG_PATH" "$PYTHON" "$STATE_PATH" "$MEMORY_DB" \
-  "$EXPORT_DIR" "$CAPTURE_ROOT" "$NEURAL_CACHE_DIR" "$EMBEDDING_PROVIDER" \
-  "$NEURAL_MODEL" "${MLX_DEVICE:-gpu}" "$CONTEXT"; do
+  "$LABEL" "$PLIST" "$LOG_PATH" "$PYTHON" "$CORE_BINDING" \
+  "$DEFAULT_RESPONSE_MODE" "$MAX_RESPONSE_BYTES" "$CONTEXT" \
+  "$DASHBOARD_AUTH_FILE"; do
   if contains_secret_shape "$configured_value"; then
     echo "Dashboard installer rejected credential-shaped configuration" >&2
     exit 2
   fi
 done
+if [ -z "$CORE_BINDING" ]; then
+  for configured_value in \
+    "$STATE_PATH" "$MEMORY_DB" "$EXPORT_DIR" "$CAPTURE_ROOT" \
+    "$NEURAL_CACHE_DIR" "$EMBEDDING_PROVIDER" "$NEURAL_MODEL" \
+    "${MLX_DEVICE:-gpu}"; do
+    if contains_secret_shape "$configured_value"; then
+      echo "Dashboard installer rejected credential-shaped configuration" >&2
+      exit 2
+    fi
+  done
+fi
 
 service_running() {
   launchctl print "gui/$UID_VALUE/$LABEL" 2>/dev/null \
@@ -146,7 +227,16 @@ service_running() {
 }
 
 service_loaded() {
-  launchctl print "gui/$UID_VALUE/$LABEL" >/dev/null 2>&1
+  local domain_inventory=""
+  if launchctl print "gui/$UID_VALUE/$LABEL" >/dev/null 2>&1; then
+    return 0
+  fi
+  domain_inventory="$(launchctl print "gui/$UID_VALUE" 2>/dev/null)" || return 2
+  if printf '%s\n' "$domain_inventory" \
+    | awk -v label="$LABEL" '$NF == label { found = 1 } END { exit(found ? 0 : 1) }'; then
+    return 2
+  fi
+  return 1
 }
 
 service_disabled() {
@@ -219,19 +309,119 @@ finally:
 PY
 }
 
+dashboard_curl_config() {
+  "$PYTHON" - "$DASHBOARD_AUTH_FILE" "$HOST" "$PORT" "$CONTEXT" "$1" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+import urllib.parse
+from pathlib import Path
+
+path = Path(sys.argv[1])
+host = sys.argv[2]
+port = int(sys.argv[3])
+context = sys.argv[4]
+mode = sys.argv[5]
+visible = path.lstat()
+if (
+    stat.S_ISLNK(visible.st_mode)
+    or not stat.S_ISREG(visible.st_mode)
+    or visible.st_uid != os.geteuid()
+    or visible.st_nlink != 1
+    or stat.S_IMODE(visible.st_mode) != 0o600
+    or visible.st_size > 4096
+):
+    raise SystemExit(1)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    chunks = []
+    remaining = 4097
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    finished = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+raw = b"".join(chunks)
+if (
+    (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+    or (finished.st_size, finished.st_mtime_ns) != (opened.st_size, opened.st_mtime_ns)
+    or len(raw) > 4096
+):
+    raise SystemExit(1)
+auth = json.loads(raw)
+bootstrap_url = auth.get("bootstrap_url")
+session_header = auth.get("session_header")
+parsed = urllib.parse.urlparse(bootstrap_url)
+params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+tokens = params.get("token", [])
+if (
+    auth.get("schema") != "synapse-s2.dashboard-auth.v1"
+    or parsed.scheme != "http"
+    or parsed.hostname != host
+    or int(parsed.port or 80) != port
+    or parsed.path != "/__dashboard_bootstrap"
+    or parsed.username is not None
+    or parsed.password is not None
+    or parsed.params
+    or parsed.fragment
+    or set(params) != {"token"}
+    or len(tokens) != 1
+    or re.fullmatch(r"[A-Za-z0-9_-]{40,128}", tokens[0]) is None
+    or not isinstance(session_header, str)
+    or re.fullmatch(r"[A-Za-z0-9_-]{40,128}", session_header) is None
+):
+    raise SystemExit(1)
+if any(character in bootstrap_url for character in ('"', "\\", "\r", "\n")):
+    raise SystemExit(1)
+if mode == "bootstrap":
+    print(f'url = "{bootstrap_url}"')
+elif mode == "health":
+    rendered_host = f"[{host}]" if ":" in host else host
+    health_url = (
+        f"http://{rendered_host}:{port}/api/status?"
+        f"{urllib.parse.urlencode({'context': context})}"
+    )
+    print(f'url = "{health_url}"')
+    print(f'header = "X-Synapse-Dashboard-Session: {session_header}"')
+else:
+    raise SystemExit(1)
+PY
+}
+
 dashboard_http_healthy() {
-  local health_url=""
+  local bootstrap_status=""
   local response=""
-  case "$HOST" in
-    ::1) health_url="http://[::1]:$PORT/api/status" ;;
-    *) health_url="http://$HOST:$PORT/api/status" ;;
-  esac
-  response="$(curl --fail --silent --show-error --noproxy '*' \
-    --connect-timeout 1 --max-time 3 --get \
-    --data-urlencode "context=$CONTEXT" "$health_url" 2>/dev/null)" || return 1
+  if [ -z "$HEALTH_COOKIE_FILE" ]; then
+    HEALTH_COOKIE_FILE="$(mktemp "$(dirname "$DASHBOARD_AUTH_FILE")/.dashboard-health-cookie.XXXXXX")"
+    chmod 600 "$HEALTH_COOKIE_FILE"
+  else
+    : > "$HEALTH_COOKIE_FILE"
+    chmod 600 "$HEALTH_COOKIE_FILE"
+  fi
+  bootstrap_status="$(
+    dashboard_curl_config bootstrap \
+      | curl --fail --silent --show-error --noproxy '*' \
+          --connect-timeout 1 --max-time 3 --proto '=http' \
+          --cookie-jar "$HEALTH_COOKIE_FILE" --cookie "$HEALTH_COOKIE_FILE" \
+          --output /dev/null --write-out '%{http_code}' --config -
+  )" || return 1
+  [ "$bootstrap_status" = "303" ] || return 1
+  response="$(
+    dashboard_curl_config health \
+      | curl --fail --silent --show-error --noproxy '*' \
+          --connect-timeout 1 --max-time 3 --proto '=http' \
+          --cookie "$HEALTH_COOKIE_FILE" --config - 2>/dev/null
+  )" || return 1
   printf '%s' "$response" | "$PYTHON" -c '
 import json, sys
-from pathlib import Path
 payload = json.load(sys.stdin)
 if not isinstance(payload, dict):
     raise SystemExit(1)
@@ -239,12 +429,10 @@ if payload.get("runtime") != "ready" or payload.get("effective_enabled") is not 
     raise SystemExit(1)
 if not isinstance(payload.get("memory_db_path"), str) or not payload["memory_db_path"]:
     raise SystemExit(1)
-if Path(payload["memory_db_path"]).expanduser().resolve() != Path(sys.argv[1]).expanduser().resolve():
-    raise SystemExit(1)
 count = payload.get("memory_context_entry_count")
 if type(count) is not int or count < 0:
     raise SystemExit(1)
-' "$MEMORY_DB" >/dev/null 2>&1
+' >/dev/null 2>&1
 }
 
 verify_dashboard_health() {
@@ -319,10 +507,17 @@ wait_until_service_stops() {
 
 wait_until_service_unloads() {
   local attempt=1
+  local load_status=0
   while [ "$attempt" -le "$HEALTH_ATTEMPTS" ]; do
-    if ! service_loaded; then
-      return 0
-    fi
+    set +e
+    service_loaded
+    load_status=$?
+    set -e
+    case "$load_status" in
+      0) ;;
+      1) return 0 ;;
+      *) return 1 ;;
+    esac
     if [ "$attempt" -lt "$HEALTH_ATTEMPTS" ]; then
       sleep "$HEALTH_DELAY"
     fi
@@ -332,9 +527,16 @@ wait_until_service_unloads() {
 }
 
 bootout_service() {
-  if ! service_loaded; then
-    return 0
-  fi
+  local load_status=0
+  set +e
+  service_loaded
+  load_status=$?
+  set -e
+  case "$load_status" in
+    0) ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
   launchctl bootout "gui/$UID_VALUE/$LABEL" >/dev/null 2>&1 || true
   wait_until_service_unloads
 }
@@ -404,9 +606,9 @@ rollback_definition() {
     rollback_status=1
   fi
   if [ "$HAD_PRIOR_PLIST" -eq 1 ] && [ -n "$PLIST_ROLLBACK" ] && [ -f "$PLIST_ROLLBACK" ]; then
-    if mv -f -- "$PLIST_ROLLBACK" "$PLIST"; then
+    if "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" replace-regular \
+      --source "$PLIST_ROLLBACK" --target "$PLIST"; then
       PLIST_ROLLBACK=""
-      chmod 600 "$PLIST"
       fsync_file_and_parent "$PLIST" || rollback_status=1
     else
       echo "Dashboard LaunchAgent rollback could not restore the prior plist" >&2
@@ -454,8 +656,8 @@ cleanup() {
   if [ -n "$PLIST_TEMP" ]; then
     rm -f -- "$PLIST_TEMP"
   fi
-  if [ -n "$INSTALL_LOCK" ]; then
-    rmdir -- "$INSTALL_LOCK" >/dev/null 2>&1 || true
+  if [ -n "$HEALTH_COOKIE_FILE" ]; then
+    rm -f -- "$HEALTH_COOKIE_FILE"
   fi
   if { [ "$INSTALL_HEALTHY" -eq 1 ] || [ "$PLIST_REPLACED" -eq 0 ]; } \
     && [ -n "$PLIST_ROLLBACK" ]; then
@@ -466,26 +668,21 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
-ensure_private_directory() {
-  local target="$1"
-  if [ -d "$target" ]; then
-    return 0
-  fi
-  if [ -e "$target" ]; then
-    echo "Expected directory but found another file type: $target" >&2
-    return 2
-  fi
-  local parent
-  parent="$(dirname "$target")"
-  if [ "$parent" != "$target" ]; then
-    ensure_private_directory "$parent"
-  fi
-  mkdir -m 700 "$target"
-}
-
-if [ ! -x "$PYTHON" ]; then
-  echo "Python runtime is missing or not executable" >&2
-  echo "Run uv sync first." >&2
+case "$DEFAULT_RESPONSE_MODE" in
+  compact|full) ;;
+  *)
+    echo "Dashboard response mode must be compact or full" >&2
+    exit 2
+    ;;
+esac
+case "$MAX_RESPONSE_BYTES" in
+  ""|*[!0-9]*)
+    echo "Dashboard response budget must be an integer" >&2
+    exit 2
+    ;;
+esac
+if [ "$MAX_RESPONSE_BYTES" -lt 1024 ] || [ "$MAX_RESPONSE_BYTES" -gt 1048576 ]; then
+  echo "Dashboard response budget is outside its safety bound" >&2
   exit 2
 fi
 
@@ -497,16 +694,27 @@ case "$HOST" in
     ;;
 esac
 
-ensure_private_directory "$PLIST_DIR"
-ensure_private_directory "$EXPORT_DIR"
-ensure_private_directory "$(dirname "$LOG_PATH")"
-INSTALL_LOCK_CANDIDATE="$PLIST_DIR/.${LABEL}.install.lock"
-if ! mkdir -m 700 "$INSTALL_LOCK_CANDIDATE" 2>/dev/null; then
-  echo "Another Dashboard LaunchAgent install is already in progress" >&2
-  exit 1
+LOCK_MARKER="dashboard:$LABEL"
+INSTALL_LOCK_PATH="$PLIST_DIR/.${LABEL}.install.lock"
+if [ "${SYNAPSE_S2_INSTALL_LOCK_HELD:-}" != "$LOCK_MARKER" ]; then
+  exec "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" run-locked \
+    --lock "$INSTALL_LOCK_PATH" \
+    --marker "$LOCK_MARKER" \
+    -- /bin/bash "$0" "$@"
 fi
-INSTALL_LOCK="$INSTALL_LOCK_CANDIDATE"
-if ! prepare_private_log "$LOG_PATH"; then
+
+"$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" ensure-directory \
+  --path "$PLIST_DIR" --shared
+"$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" ensure-directory \
+  --path "$CANONICAL_DATA_ROOT"
+"$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" ensure-directory \
+  --path "$(dirname "$DASHBOARD_AUTH_FILE")"
+if [ -z "$CORE_BINDING" ]; then
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" ensure-directory \
+    --path "$EXPORT_DIR"
+fi
+if ! "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" prepare-log \
+  --path "$LOG_PATH"; then
   echo "Dashboard log target must be a regular non-symlink file" >&2
   exit 2
 fi
@@ -523,20 +731,28 @@ plutil -insert ProgramArguments.4 -string "--port" "$PLIST_TEMP"
 plutil -insert ProgramArguments.5 -string "$PORT" "$PLIST_TEMP"
 plutil -insert ProgramArguments.6 -string "--context" "$PLIST_TEMP"
 plutil -insert ProgramArguments.7 -string "$CONTEXT" "$PLIST_TEMP"
+plutil -insert ProgramArguments.8 -string "--auth-file" "$PLIST_TEMP"
+plutil -insert ProgramArguments.9 -string "$DASHBOARD_AUTH_FILE" "$PLIST_TEMP"
 plutil -insert EnvironmentVariables -xml '<dict/>' "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.MLX_DEVICE -string "${MLX_DEVICE:-gpu}" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_EMBEDDING_PROVIDER -string "$EMBEDDING_PROVIDER" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURAL_MODEL -string "$NEURAL_MODEL" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURAL_CACHE_DIR -string "$NEURAL_CACHE_DIR" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY -string "$NEURAL_LOCAL_FILES_ONLY" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_DIMENSION -string "$DIMENSION" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURONS -string "$NEURONS" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_TOP_K -string "$TOP_K" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_RECALL_COUNT -string "$RECALL_COUNT" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_STATE_PATH -string "$STATE_PATH" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_MEMORY_DB -string "$MEMORY_DB" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_EXPORT_DIR -string "$EXPORT_DIR" "$PLIST_TEMP"
-plutil -insert EnvironmentVariables.SYNAPSE_S2_CAPTURE_ROOT -string "$CAPTURE_ROOT" "$PLIST_TEMP"
+if [ -n "$CORE_BINDING" ]; then
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_CORE_BINDING -string "$CORE_BINDING" "$PLIST_TEMP"
+else
+  plutil -insert EnvironmentVariables.MLX_DEVICE -string "${MLX_DEVICE:-gpu}" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_EMBEDDING_PROVIDER -string "$EMBEDDING_PROVIDER" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURAL_MODEL -string "$NEURAL_MODEL" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURAL_CACHE_DIR -string "$NEURAL_CACHE_DIR" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY -string "$NEURAL_LOCAL_FILES_ONLY" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_DIMENSION -string "$DIMENSION" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_NEURONS -string "$NEURONS" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_TOP_K -string "$TOP_K" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_RECALL_COUNT -string "$RECALL_COUNT" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_STATE_PATH -string "$STATE_PATH" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_MEMORY_DB -string "$MEMORY_DB" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_EXPORT_DIR -string "$EXPORT_DIR" "$PLIST_TEMP"
+  plutil -insert EnvironmentVariables.SYNAPSE_S2_CAPTURE_ROOT -string "$CAPTURE_ROOT" "$PLIST_TEMP"
+fi
+plutil -insert EnvironmentVariables.SYNAPSE_S2_DEFAULT_RESPONSE_MODE -string "$DEFAULT_RESPONSE_MODE" "$PLIST_TEMP"
+plutil -insert EnvironmentVariables.SYNAPSE_S2_MAX_RESPONSE_BYTES -string "$MAX_RESPONSE_BYTES" "$PLIST_TEMP"
 plutil -insert RunAtLoad -bool YES "$PLIST_TEMP"
 plutil -insert KeepAlive -bool YES "$PLIST_TEMP"
 plutil -insert Umask -integer 63 "$PLIST_TEMP"
@@ -548,21 +764,25 @@ chmod 600 "$PLIST_TEMP"
 plutil -lint "$PLIST_TEMP" >/dev/null
 fsync_file_and_parent "$PLIST_TEMP"
 
-if [ -L "$PLIST" ]; then
-  echo "Refusing to replace a symlinked Dashboard LaunchAgent plist" >&2
-  exit 2
-fi
-if [ -e "$PLIST" ] && [ ! -f "$PLIST" ]; then
-  echo "Refusing to replace a non-regular Dashboard LaunchAgent plist" >&2
+if ! "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" validate-regular \
+  --path "$PLIST" --allow-missing; then
+  echo "Refusing to replace an unsafe Dashboard LaunchAgent plist" >&2
   exit 2
 fi
 
-if service_loaded; then
+set +e
+service_loaded
+SERVICE_LOAD_STATUS=$?
+set -e
+if [ "$SERVICE_LOAD_STATUS" -eq 0 ]; then
   PRIOR_LOADED=1
   if service_running; then
     PRIOR_RUNNING=1
     PRIOR_PID="$(service_pid 2>/dev/null || true)"
   fi
+elif [ "$SERVICE_LOAD_STATUS" -ne 1 ]; then
+  echo "Dashboard LaunchAgent state could not be classified safely" >&2
+  exit 2
 fi
 if service_disabled; then
   PRIOR_DISABLED=1
@@ -574,13 +794,21 @@ fi
 if [ -f "$PLIST" ]; then
   HAD_PRIOR_PLIST=1
   PLIST_ROLLBACK="$(mktemp "$PLIST_DIR/.${LABEL}.rollback.XXXXXX")"
-  cp -- "$PLIST" "$PLIST_ROLLBACK"
   chmod 600 "$PLIST_ROLLBACK"
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" backup-regular \
+    --source "$PLIST" --target "$PLIST_ROLLBACK"
   fsync_file_and_parent "$PLIST_ROLLBACK"
 fi
 
 PLIST_REPLACED=1
-mv -f -- "$PLIST_TEMP" "$PLIST"
+if [ "$HAD_PRIOR_PLIST" -eq 1 ]; then
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" replace-regular \
+    --source "$PLIST_TEMP" --target "$PLIST" \
+    --expected-current "$PLIST_ROLLBACK"
+else
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" replace-regular \
+    --source "$PLIST_TEMP" --target "$PLIST" --expect-absent
+fi
 PLIST_TEMP=""
 fsync_file_and_parent "$PLIST"
 if ! bootout_service; then
@@ -600,3 +828,4 @@ fi
 
 INSTALL_HEALTHY=1
 echo "Dashboard LaunchAgent installed and healthy"
+echo "Open it with: $PYTHON $SCRIPT_DIR/open_dashboard.py"

@@ -13,7 +13,10 @@ from unittest.mock import patch
 
 import mlx.core as mx
 
+import embedding_providers
 import mlx_backend
+from core_authority import CoreAuthorityError, CoreAuthorityLease
+from memory_store import ContextDeliveryRejected
 from mlx_backend import BackendUnavailable
 from mlx_backend import SpikingAttentionBackend
 
@@ -23,6 +26,86 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.tmpdir = TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.state_path = Path(self.tmpdir.name) / "state.json"
+
+    def test_neural_resource_envelope_precedes_constructor_allocation(self):
+        with patch.object(
+            mlx_backend,
+            "_require_mx",
+            side_effect=AssertionError("MLX must not be reached"),
+        ) as require_mx:
+            with self.assertRaisesRegex(ValueError, "384 MiB resource envelope"):
+                SpikingAttentionBackend(
+                    dimension=10_000,
+                    num_neurons=8_192,
+                    compile_graph=False,
+                    state_path=self.state_path,
+                )
+        require_mx.assert_not_called()
+
+    def test_oversized_embedding_is_rejected_before_materialization_or_resize(self):
+        class OversizedEmbeddingProbe:
+            shape = (10_000,)
+
+            def __iter__(self):
+                raise AssertionError("probe must not be materialized")
+
+        class RejectingArrayAPI:
+            float32 = object()
+
+            def __init__(self) -> None:
+                self.array_calls = 0
+
+            def array(self, _value, *, dtype):
+                self.array_calls += 1
+                raise AssertionError(f"unexpected materialization as {dtype}")
+
+        backend = object.__new__(SpikingAttentionBackend)
+        backend.dimension = 1_024
+        backend.num_neurons = 8_192
+        backend.W_syn = object()
+        backend.W_syn_decay_multiplier = 0.5
+        backend._mx = RejectingArrayAPI()
+        original_projection = backend.W_syn
+
+        with self.assertRaisesRegex(ValueError, "384 MiB resource envelope"):
+            backend._coerce_embedding(OversizedEmbeddingProbe())
+        self.assertEqual(backend._mx.array_calls, 0)
+
+        with patch.object(
+            backend,
+            "_balanced_matrix",
+            side_effect=AssertionError("projection allocation must not run"),
+        ) as allocate:
+            with self.assertRaisesRegex(ValueError, "384 MiB resource envelope"):
+                backend._ensure_projection_shape(10_000)
+        allocate.assert_not_called()
+        self.assertEqual(backend.dimension, 1_024)
+        self.assertIs(backend.W_syn, original_projection)
+        self.assertEqual(backend.W_syn_decay_multiplier, 0.5)
+
+    def test_in_budget_projection_resize_preserves_configurable_topology(self):
+        backend = object.__new__(SpikingAttentionBackend)
+        backend.dimension = 8
+        backend.num_neurons = 16
+        backend.W_syn = object()
+        backend.W_syn_decay_multiplier = 0.5
+        resized_projection = object()
+
+        with patch.object(
+            backend,
+            "_balanced_matrix",
+            return_value=resized_projection,
+        ) as allocate:
+            backend._ensure_projection_shape(12)
+
+        allocate.assert_called_once_with(
+            (12, 16),
+            scale=0.01,
+            excitatory_ratio=0.8,
+        )
+        self.assertEqual(backend.dimension, 12)
+        self.assertIs(backend.W_syn, resized_projection)
+        self.assertEqual(backend.W_syn_decay_multiplier, 1.0)
 
     def test_private_json_writer_preserves_existing_parent_mode(self):
         parent = Path(self.tmpdir.name) / "caller-owned"
@@ -47,6 +130,150 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(target.parent.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_runtime_state_lock_rejects_unsafe_existing_identity_without_repair(self):
+        root = Path(self.tmpdir.name)
+
+        wrong_mode_state = root / "wrong-mode.json"
+        wrong_mode_lock = root / ".wrong-mode.json.lock"
+        wrong_mode_lock.write_text("preserve", encoding="utf-8")
+        wrong_mode_lock.chmod(0o644)
+        wrong_mode_inode = wrong_mode_lock.stat().st_ino
+        with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+            with mlx_backend._exclusive_runtime_state_lock(wrong_mode_state):
+                self.fail("unsafe lock must not be acquired")
+        self.assertEqual(wrong_mode_lock.read_text(encoding="utf-8"), "preserve")
+        self.assertEqual(wrong_mode_lock.stat().st_ino, wrong_mode_inode)
+        self.assertEqual(wrong_mode_lock.stat().st_mode & 0o777, 0o644)
+
+        hardlink_state = root / "hardlink.json"
+        hardlink_target = root / "hardlink-target"
+        hardlink_target.write_text("preserve", encoding="utf-8")
+        hardlink_target.chmod(0o600)
+        hardlink_lock = root / ".hardlink.json.lock"
+        os.link(hardlink_target, hardlink_lock)
+        with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+            with mlx_backend._exclusive_runtime_state_lock(hardlink_state):
+                self.fail("hard-linked lock must not be acquired")
+        self.assertEqual(hardlink_target.read_text(encoding="utf-8"), "preserve")
+        self.assertEqual(hardlink_target.stat().st_nlink, 2)
+
+        symlink_state = root / "symlink-lock.json"
+        symlink_target = root / "symlink-lock-target"
+        symlink_target.write_text("preserve", encoding="utf-8")
+        symlink_target.chmod(0o600)
+        (root / ".symlink-lock.json.lock").symlink_to(symlink_target)
+        with self.assertRaises(OSError):
+            with mlx_backend._exclusive_runtime_state_lock(symlink_state):
+                self.fail("symlink lock must not be acquired")
+        self.assertEqual(symlink_target.read_text(encoding="utf-8"), "preserve")
+
+    @staticmethod
+    def _logical_database_dump(path: Path) -> str:
+        connection = sqlite3.connect(path)
+        try:
+            return "\n".join(connection.iterdump())
+        finally:
+            connection.close()
+
+    def test_core_preclaim_bootstrap_observes_canonical_state_without_writes(self):
+        memory_path = Path(self.tmpdir.name) / "memory.sqlite3"
+        local = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            compile_graph=False,
+            state_path=self.state_path,
+            memory_path=memory_path,
+        )
+        local._persist_runtime_state()
+        local.memory_store.close()
+        state_before = self.state_path.read_bytes()
+        state_inode = self.state_path.stat().st_ino
+        database_before = self._logical_database_dump(memory_path)
+
+        lease = CoreAuthorityLease.acquire_core(
+            memory_path,
+            timeout_seconds=0.0,
+            instance_id="core-observation-test",
+        )
+        try:
+            core_backend = SpikingAttentionBackend(
+                dimension=16,
+                num_neurons=12,
+                compile_graph=False,
+                state_path=self.state_path,
+                memory_path=memory_path,
+                authority_lease=lease,
+            )
+            self.assertTrue(core_backend._core_preclaim_bootstrap)
+        finally:
+            lease.close()
+
+        self.assertEqual(self.state_path.read_bytes(), state_before)
+        self.assertEqual(self.state_path.stat().st_ino, state_inode)
+        self.assertEqual(self._logical_database_dump(memory_path), database_before)
+
+    def test_core_preclaim_rejects_legacy_trace_migration_without_writing(self):
+        memory_path = Path(self.tmpdir.name) / "memory.sqlite3"
+        local = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            compile_graph=False,
+            state_path=self.state_path,
+            memory_path=memory_path,
+        )
+        local.memory_store.close()
+        legacy_payload = {
+            "version": 1,
+            "global_enabled": True,
+            "context_overrides": {},
+            "cortex_sessions": {},
+            "registered_traces": [
+                {
+                    "tag": "must-not-migrate",
+                    "context_id": "default",
+                    "source_text": "legacy trace",
+                    "metadata": {},
+                    "embedding_dimensions": 16,
+                    "spike_indices": [0],
+                    "neuron_indices": [0],
+                    "registered_at": 123.0,
+                }
+            ],
+        }
+        self.state_path.write_text(
+            json.dumps(legacy_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.state_path.chmod(0o600)
+        state_before = self.state_path.read_bytes()
+        state_inode = self.state_path.stat().st_ino
+        database_before = self._logical_database_dump(memory_path)
+
+        lease = CoreAuthorityLease.acquire_core(
+            memory_path,
+            timeout_seconds=0.0,
+            instance_id="core-legacy-rejection-test",
+        )
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "requires canonical runtime state",
+            ):
+                SpikingAttentionBackend(
+                    dimension=16,
+                    num_neurons=12,
+                    compile_graph=False,
+                    state_path=self.state_path,
+                    memory_path=memory_path,
+                    authority_lease=lease,
+                )
+        finally:
+            lease.close()
+
+        self.assertEqual(self.state_path.read_bytes(), state_before)
+        self.assertEqual(self.state_path.stat().st_ino, state_inode)
+        self.assertEqual(self._logical_database_dump(memory_path), database_before)
 
     def test_runtime_state_path_rejects_credentials_before_file_or_lock_creation(self):
         marker = "SYNTHETIC_ONLY_RUNTIME_PATH_SECRET_42"
@@ -819,6 +1046,89 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
         self.assertEqual(memory["entries"][0]["metadata"]["source"], "unit-test")
 
+    def test_backend_accepts_closed_embedding_configuration_without_env_drift(self):
+        cache_dir = str((Path(self.tmpdir.name) / "model-cache").resolve())
+        config = embedding_providers.EmbeddingProviderConfig(
+            provider="mlx-neural-v1",
+            neural=embedding_providers.MLXNeuralEmbeddingConfig(
+                model_id="unit/pinned-backend-model",
+                cache_dir=cache_dir,
+                revision="c" * 40,
+                pooling="first",
+                max_tokens=211,
+                normalize=False,
+                local_files_only=True,
+            ),
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SYNAPSE_S2_EMBEDDING_PROVIDER": "lexical-hash",
+                "SYNAPSE_S2_NEURAL_MODEL": "environment/other-model",
+                "SYNAPSE_S2_NEURAL_REVISION": "d" * 40,
+                "SYNAPSE_S2_NEURAL_POOLING": "last",
+                "SYNAPSE_S2_NEURAL_MAX_TOKENS": "3",
+                "SYNAPSE_S2_NEURAL_NORMALIZE": "true",
+                "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY": "false",
+            },
+            clear=False,
+        ):
+            backend = SpikingAttentionBackend(
+                dimension=16,
+                num_neurons=12,
+                compile_graph=False,
+                state_path=self.state_path,
+                embedding_provider_config=config,
+            )
+            info = backend.embedding_provider_info()
+
+        self.assertEqual(backend.embedding_provider_name, "mlx-neural-v1")
+        self.assertEqual(info["configuration_source"], "explicit")
+        self.assertEqual(info["runtime_config"]["model_id"], "unit/pinned-backend-model")
+        self.assertEqual(info["runtime_config"]["revision"], "c" * 40)
+        self.assertEqual(info["runtime_config"]["cache_dir"], cache_dir)
+        self.assertEqual(info["runtime_config"]["pooling"], "first")
+        self.assertEqual(info["runtime_config"]["max_tokens"], 211)
+        self.assertFalse(info["runtime_config"]["normalize"])
+        self.assertTrue(info["runtime_config"]["local_files_only"])
+
+    def test_backend_accepts_preconstructed_embedding_provider_exclusively(self):
+        class FakeRuntime:
+            model_id = "unit/injected-model"
+            source = "unit/injected-model"
+            native_mlx = True
+
+            def embed_text(self, text, *, pooling, max_tokens):
+                return [1.0, 2.0, 3.0]
+
+        provider = embedding_providers.MLXNeuralEmbeddingProvider(
+            model_id="unit/injected-model",
+            runtime_factory=lambda _config: FakeRuntime(),
+            normalize=False,
+        )
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider=provider,
+        )
+
+        payload = backend.embed_text_payload("injected provider", dimensions=8)
+
+        self.assertIs(backend.embedding_provider, provider)
+        self.assertEqual(backend.embedding_provider_name, "mlx-neural-v1")
+        self.assertEqual(payload["provenance"]["model_id"], "unit/injected-model")
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            SpikingAttentionBackend(
+                dimension=8,
+                num_neurons=6,
+                compile_graph=False,
+                state_path=Path(self.tmpdir.name) / "conflict-state.json",
+                embedding_provider=provider,
+                embedding_provider_name="semantic-hash",
+            )
+
     def test_semantic_provider_improves_related_phrase_recall_without_exact_tokens(self):
         backend = SpikingAttentionBackend(
             dimension=96,
@@ -1027,7 +1337,10 @@ class SpikingAttentionBackendTests(unittest.TestCase):
                 state_path=state_path,
             )
 
-        status = restored.status(context_id="demo")
+            # Exercise the restored backend while its durable store and
+            # authority lock still exist.  A backend must fail closed once
+            # its entire temporary state directory has been removed.
+            status = restored.status(context_id="demo")
 
         self.assertTrue(status["global_enabled"])
         self.assertFalse(status["effective_enabled"])
@@ -1104,6 +1417,42 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
         self.assertFalse(restored.global_enabled)
         self.assertEqual(restored.context_overrides, {"alpha": False})
+
+    def test_runtime_state_commit_revalidates_authority_before_replace(self):
+        backend = SpikingAttentionBackend(
+            dimension=4,
+            num_neurons=6,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        backend._persist_runtime_state()
+        before = self.state_path.read_bytes()
+        before_inode = self.state_path.stat().st_ino
+        lock_path = backend.memory_store.db_path.parent / "core" / "authority.lock"
+        displaced = lock_path.with_name("authority.lock.displaced")
+        original_assert = backend.memory_store.assert_active_authority
+        calls = 0
+
+        def replace_before_commit() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                lock_path.rename(displaced)
+                lock_path.write_bytes(b"replacement")
+                lock_path.chmod(0o600)
+            original_assert()
+
+        with patch.object(
+            backend.memory_store,
+            "assert_active_authority",
+            side_effect=replace_before_commit,
+        ):
+            with self.assertRaises(CoreAuthorityError):
+                backend.set_enabled(False, context_id="alpha")
+
+        self.assertGreaterEqual(calls, 2)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(self.state_path.stat().st_ino, before_inode)
 
     def test_status_reports_demo_readiness_fields(self):
         backend = SpikingAttentionBackend(
@@ -1276,12 +1625,36 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             state_path=self.state_path,
         )
 
-        with self.assertRaisesRegex(ValueError, "exact receipt_id"):
+        with self.assertRaisesRegex(ContextDeliveryRejected, "exact receipt_id"):
             backend.ack_context_events(
                 context_id="demo",
                 agent_id="codex-desktop",
                 last_event_id=0,
             )
+
+    def test_delivery_rejection_class_excludes_invalid_runtime_configuration(self):
+        backend = SpikingAttentionBackend(
+            dimension=6,
+            num_neurons=10,
+            default_top_k=2,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SYNAPSE_S2_CONTEXT_MAX_DELIVERY_ATTEMPTS": "not-an-integer"},
+        ), self.assertRaises(ValueError) as raised:
+            backend.dead_letter_context_delivery(
+                context_id="demo",
+                agent_id="codex-desktop",
+                delivery_id="ctxdel_" + "a" * 32,
+                reason="retry budget exhausted",
+                confirm=True,
+            )
+
+        self.assertNotIsInstance(raised.exception, ContextDeliveryRejected)
 
     def test_backend_status_reports_ack_tombstones_after_safe_prune(self):
         backend = SpikingAttentionBackend(
@@ -1979,6 +2352,109 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertIn("## Cortex Governor", hydrated["briefing_markdown"])
         self.assertIn("Active Sessions", hydrated["briefing_markdown"])
 
+    def test_public_memory_read_surface_preserves_dashboard_contracts(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        registered = backend.register_trace(
+            tag="public-memory-surface",
+            embedding=backend.embed_text("Public memory surface"),
+            context_id="demo",
+            source_text="Public memory surface",
+            metadata={"source": "unit-test"},
+        )
+
+        entry = backend.get_memory_entry(registered["memory_id"])
+        vector_entry = backend.get_memory_entry(
+            registered["memory_id"],
+            include_vectors=True,
+        )
+        recall_contexts = backend.resolve_recall_contexts(
+            context_id="demo",
+            recall_scope="local",
+        )
+        revision = backend.memory_entries_revision(
+            context_ids=[record["context_id"] for record in recall_contexts],
+        )
+        audit = backend.audit_semantic_indexes(
+            context_id="demo",
+            sample_limit=5,
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["memory_id"], registered["memory_id"])
+        self.assertEqual(entry["source_text"], "Public memory surface")
+        self.assertNotIn("spike_indices", entry)
+        self.assertIn("spike_count", entry)
+        self.assertIsNotNone(vector_entry)
+        assert vector_entry is not None
+        self.assertIn("spike_indices", vector_entry)
+        self.assertEqual(
+            [record["context_id"] for record in recall_contexts],
+            ["demo", "global"],
+        )
+        self.assertEqual(revision["entry_count"], 1)
+        self.assertTrue(revision["revision"])
+        self.assertEqual(audit["status"], "ready")
+        self.assertTrue(audit["snapshot_stable"])
+
+    def test_public_client_cortex_ownership_surface_is_scoped_and_persisted(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        entered = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Exercise the public client Cortex lifecycle.",
+            recall_mode="disabled",
+        )
+        attached = backend.attach_client_cortex_session(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entered["session_id"],
+            client_bridge_session_id="unit-test-bridge",
+            owner_pid=os.getpid(),
+            owner_ppid=os.getppid(),
+            owner_started_at=time.time(),
+        )
+
+        self.assertEqual(attached["lease_kind"], "mcp-client")
+        self.assertEqual(
+            attached["client_bridge_session_id"],
+            "unit-test-bridge",
+        )
+        with self.assertRaisesRegex(ValueError, "client bridge mismatch"):
+            backend.finish_client_cortex_session(
+                context_id="demo",
+                agent_id="codex",
+                session_id=entered["session_id"],
+                client_bridge_session_id="different-bridge",
+            )
+
+        finished = backend.finish_client_cortex_session(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entered["session_id"],
+            client_bridge_session_id="unit-test-bridge",
+            reason="unit-test-complete",
+        )
+        state = backend.get_cortex_state(context_id="demo", agent_id="codex")
+
+        self.assertEqual(finished["status"], "finished")
+        self.assertEqual(finished["finish_reason"], "unit-test-complete")
+        self.assertEqual(state["active_session_count"], 0)
+
     def test_cortex_state_scans_beyond_visible_limit_for_typed_counts(self):
         backend = SpikingAttentionBackend(
             dimension=32,
@@ -2016,7 +2492,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
         self.assertLessEqual(len(state["working_memory"]), 2)
 
-    def test_cortex_state_reaps_dead_client_bridge_sessions(self):
+    def test_cortex_state_is_pure_and_explicit_maintenance_reaps_dead_sessions(self):
         backend = SpikingAttentionBackend(
             dimension=32,
             num_neurons=24,
@@ -2046,9 +2522,22 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
         backend._persist_runtime_state()
 
+        state_before = backend.get_cortex_state(context_id="demo", agent_id="codex")
+        self.assertEqual(state_before["active_session_count"], 1)
+        self.assertEqual(
+            backend.cortex_sessions[session["session_id"]]["status"],
+            "active",
+        )
+
+        maintenance = backend.reap_orphaned_cortex_sessions(
+            context_id="demo",
+            agent_id="codex",
+        )
         state = backend.get_cortex_state(context_id="demo", agent_id="codex")
 
         self.assertEqual(state["active_session_count"], 0)
+        self.assertEqual(maintenance["reaped_count"], 1)
+        self.assertEqual(maintenance["session_ids"], [session["session_id"]])
         self.assertEqual(
             backend.cortex_sessions[session["session_id"]]["status"],
             "orphaned",
@@ -3090,28 +3579,50 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         )
         first_relationship = graph["relationships"][0]
 
+        with self.assertRaisesRegex(TypeError, "confirm"):
+            backend.prune_memory(
+                context_id="demo",
+                target_type="relationship",
+                relationship_id=first_relationship["relationship_id"],
+                reason="direct callers cannot bypass confirmation",
+            )
+        self.assertTrue(
+            any(
+                relationship["relationship_id"]
+                == first_relationship["relationship_id"]
+                for relationship in backend.list_memory_graph(
+                    context_id="demo",
+                    limit=20,
+                )["relationships"]
+            )
+        )
+
         edge_deletion = backend.prune_memory(
             context_id="demo",
             target_type="relationship",
             relationship_id=first_relationship["relationship_id"],
             reason="bad edge",
+            confirm=True,
         )
         entry_deletion = backend.prune_memory(
             context_id="demo",
             target_type="event",
             memory_id=first_entry["memory_id"],
             reason="sensitive event",
+            confirm=True,
         )
         mode_deletion = backend.prune_memory(
             context_id="demo",
             target_type="temporal",
             reason="drop temporal links",
+            confirm=True,
         )
         event_deletion = backend.prune_memory(
             context_id="demo",
             target_type="context_event",
             event_id=capture["agent_deployment"]["event_id"],
             reason="remove deployment record",
+            confirm=True,
         )
         remaining_graph = backend.list_memory_graph(context_id="demo", limit=20)
         remaining_deployments = backend.list_context_events(context_id="demo", limit=10)
@@ -3156,6 +3667,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             context_id="demo",
             target_type="temporal",
             reason="drop all temporal ordering",
+            confirm=True,
         )
         remaining_graph = backend.list_memory_graph(context_id="demo", limit=80)
 

@@ -2,18 +2,38 @@ import hashlib
 import http.client
 import json
 import os
+import socket
+import stat
+import subprocess
+import sys
 import threading
+import time
 import unittest
 from contextlib import closing
 from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
+from urllib.parse import parse_qs, urlparse
 from unittest import mock
 
 from capture_daemon import write_capture_drop
+from core_client import CoreOutcomeUnknown
+from core_client_binding import (
+    BINDING_ENV,
+    binding_for_config,
+    write_core_client_binding,
+)
+from core_service import CORE_OPERATION_CONTRACTS
+from core_service import CoreConfig, write_core_config
 from dashboard_server import (
+    DASHBOARD_BOOTSTRAP_PATH,
+    DASHBOARD_MAX_ACTIVE_HANDLERS,
+    DASHBOARD_SESSION_COOKIE_NAME,
+    DASHBOARD_SESSION_FRAGMENT_KEY,
+    DASHBOARD_SESSION_HEADER_NAME,
     DEFAULT_CONTEXT,
     DashboardRuntime,
     SynapseDashboardHandler,
@@ -24,7 +44,97 @@ from mlx_backend import SpikingAttentionBackend
 from transcript_capture import TranscriptCaptureManager
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 class DashboardRuntimeTests(unittest.TestCase):
+    def test_dashboard_applies_binding_before_adapter_imports(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            data_root = root / "reviewed-dashboard-data"
+            core = data_root / "core"
+            core.mkdir(parents=True, mode=0o700)
+            data_root.chmod(0o700)
+            config = CoreConfig(
+                socket_path=data_root / "core" / "service.sock",
+                state_path=data_root / "runtime_state.json",
+                memory_path=data_root / "memory.sqlite3",
+                capture_root=data_root,
+                dimension=8,
+                num_neurons=16,
+                default_top_k=4,
+            )
+            write_core_config(core / "service.json", config)
+            binding = binding_for_config(
+                repo_root=ROOT,
+                data_root=data_root,
+                config=config,
+                core_label="aero.boom.synapse-s2.core",
+                authority_mode="candidate-local-v5",
+            )
+            binding_path = root / "binding" / "core-binding.json"
+            write_core_client_binding(binding_path, binding)
+            marker = root / "adapter-imported"
+            fake_modules = root / "fake-modules"
+            fake_modules.mkdir(mode=0o700)
+            assertion = (
+                "import os\n"
+                "from pathlib import Path\n"
+                "assert os.environ.get('SYNAPSE_S2_MEMORY_DB') == os.environ['EXPECTED_MEMORY']\n"
+                "assert 'SYNAPSE_S2_CORE_SOCKET' not in os.environ\n"
+                "Path(os.environ['ADAPTER_MARKER']).touch()\n"
+            )
+            (fake_modules / "capture_daemon.py").write_text(
+                assertion + "class CaptureInboxDaemon: pass\n",
+                encoding="utf-8",
+            )
+            (fake_modules / "mlx_backend.py").write_text(
+                assertion + "class SpikingAttentionBackend: pass\n",
+                encoding="utf-8",
+            )
+            (fake_modules / "transcript_capture.py").write_text(
+                assertion + "class TranscriptCaptureManager: pass\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            for key in (
+                "SYNAPSE_S2_CORE_SOCKET",
+                "SYNAPSE_S2_MEMORY_DB",
+                "SYNAPSE_S2_STATE_PATH",
+                "SYNAPSE_S2_CAPTURE_ROOT",
+                "SYNAPSE_S2_EXPORT_DIR",
+            ):
+                environment.pop(key, None)
+            environment.update(
+                {
+                    BINDING_ENV: str(binding_path),
+                    "EXPECTED_MEMORY": str(config.memory_path),
+                    "ADAPTER_MARKER": str(marker),
+                    "PYTHONPATH": f"{fake_modules}:{ROOT}",
+                }
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import runpy; "
+                        f"runpy.run_path({str(ROOT / 'dashboard_server.py')!r}, "
+                        "run_name='dashboard_import_probe')"
+                    ),
+                ],
+                cwd=fake_modules,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            adapter_imported = marker.exists()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(adapter_imported)
+
     def test_metadata_boundary_redacts_wrapped_secrets_and_raw_digests(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -45,9 +155,45 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertNotIn("payload_sha256", metadata["nested"])
         self.assertEqual(metadata["safe"], "retained")
 
-    def test_dashboard_server_preserves_single_threaded_mlx_affinity(self):
+    def test_dashboard_server_bounds_network_threads_and_serializes_runtime(self):
         self.assertTrue(issubclass(SynapseDashboardServer, HTTPServer))
-        self.assertFalse(issubclass(SynapseDashboardServer, ThreadingHTTPServer))
+        self.assertTrue(issubclass(SynapseDashboardServer, ThreadingHTTPServer))
+        self.assertGreaterEqual(SynapseDashboardServer.request_queue_size, 16)
+        self.assertTrue(SynapseDashboardServer.daemon_threads)
+
+        class RuntimeProbe:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.active = 0
+                self.peak = 0
+
+            def handle(self, _method, _path, _body):
+                with self.lock:
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+                time.sleep(0.03)
+                with self.lock:
+                    self.active -= 1
+                return 200, {}, b""
+
+        runtime = RuntimeProbe()
+        server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+        workers = [
+            threading.Thread(
+                target=server.handle_runtime_request,
+                args=("GET", "/", b""),
+            )
+            for _index in range(3)
+        ]
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=2)
+        finally:
+            server.server_close()
+
+        self.assertEqual(runtime.peak, 1)
 
     def test_doctor_global_audit_detects_corruption_outside_active_namespace(self):
         with TemporaryDirectory() as tmp:
@@ -89,7 +235,7 @@ class DashboardRuntimeTests(unittest.TestCase):
             waiter_started = threading.Event()
             waiter_finished = threading.Event()
             waiter_payload: dict[str, object] = {}
-            original = runtime.backend.memory_store.audit_semantic_indexes
+            original = runtime.backend.audit_semantic_indexes
 
             def delayed_audit(*args, **kwargs):
                 started.set()
@@ -105,7 +251,7 @@ class DashboardRuntimeTests(unittest.TestCase):
                 waiter_finished.set()
 
             with mock.patch.object(
-                runtime.backend.memory_store,
+                runtime.backend,
                 "audit_semantic_indexes",
                 side_effect=delayed_audit,
             ) as audit_mock:
@@ -188,7 +334,7 @@ class DashboardRuntimeTests(unittest.TestCase):
     def test_doctor_treats_terminal_capture_evidence_as_history(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
-            runtime.capture_daemon().status()
+            runtime.capture_daemon().prepare_transport()
             evidence = Path(tmp) / "capture_errors" / "terminal.evidence.json"
             evidence.write_text(
                 json.dumps(
@@ -246,6 +392,7 @@ class DashboardRuntimeTests(unittest.TestCase):
             state_path=Path(tmp) / "state.json",
             memory_path=Path(tmp) / "memory.sqlite3",
         )
+        self.addCleanup(backend.memory_store.close)
         backend.register_trace(
             tag="dashboard-memory",
             embedding=backend.embed_text("SYNAPSE-S2 dashboard recalls local memory"),
@@ -270,6 +417,39 @@ class DashboardRuntimeTests(unittest.TestCase):
         status, headers, body = response
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
         return status, json.loads(body.decode("utf-8"))
+
+    def bootstrap_credentials(
+        self,
+        server: SynapseDashboardServer,
+    ) -> tuple[str, str]:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            server.server_port,
+            timeout=10,
+        )
+        host = f"127.0.0.1:{server.server_port}"
+        token = server._dashboard_bootstrap_capability
+        connection.request(
+            "GET",
+            f"{DASHBOARD_BOOTSTRAP_PATH}?token={token}",
+            headers={"Host": host},
+        )
+        response = connection.getresponse()
+        response.read()
+        cookie = response.getheader("Set-Cookie")
+        location = response.getheader("Location") or ""
+        connection.close()
+        self.assertEqual(response.status, 303)
+        self.assertIsNotNone(cookie)
+        fragment = parse_qs(urlparse(location).fragment, keep_blank_values=True)
+        self.assertEqual(
+            set(fragment),
+            {DASHBOARD_SESSION_FRAGMENT_KEY, "target"},
+        )
+        self.assertEqual(fragment["target"], ["namespaceGalaxy"])
+        header_capability = fragment[DASHBOARD_SESSION_FRAGMENT_KEY][0]
+        self.assertEqual(header_capability, server._dashboard_header_capability)
+        return str(cookie).split(";", 1)[0], header_capability
 
     def test_snapshot_reports_status_profile_and_graph(self):
         with TemporaryDirectory() as tmp:
@@ -324,6 +504,140 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(DEFAULT_CONTEXT, "default")
         self.assertEqual(payload["context_id"], "default")
+
+    def test_every_get_route_is_guarded_from_authoritative_mutations(self):
+        with TemporaryDirectory() as tmp:
+            backend = self.make_runtime(tmp).backend
+            mutation_calls: list[str] = []
+
+            class MutationGuard:
+                def __getattr__(self, name):
+                    target = getattr(backend, name)
+                    contract = CORE_OPERATION_CONTRACTS.get(name)
+                    if contract is None or not contract.mutation:
+                        return target
+
+                    def forbidden(*_args, **_kwargs):
+                        mutation_calls.append(name)
+                        raise AssertionError(f"GET invoked mutation operation {name}")
+
+                    return forbidden
+
+            runtime = DashboardRuntime(MutationGuard())
+            capture_root = Path(tmp)
+            runtime_state = Path(backend.state_path)
+            before_state = runtime_state.read_bytes()
+            before_identity = runtime_state.lstat().st_ino
+            routes = (
+                "/api/status?context_id=demo",
+                "/api/profile",
+                "/api/graph?context_id=demo&limit=10",
+                "/api/namespace-map?context_id=demo&limit=10",
+                "/api/namespace-detail?context_id=demo&level=cortex&limit=10",
+                "/api/context-events?context_id=demo&limit=1",
+                "/api/context-cursors?context_id=demo&limit=1",
+                "/api/context-delivery-health",
+                "/api/capture-inbox",
+                "/api/apps",
+                "/api/app-connections",
+                "/api/self-test?context_id=demo&include_apps=false",
+                "/api/context-health?context_id=demo",
+                "/api/memory-hygiene?context_id=demo&limit=5",
+                "/api/doctor?context_id=demo&include_apps=false&repair_plan=false",
+                "/api/cortex/state?context_id=demo&limit=5",
+                "/api/snapshot?context_id=demo&limit=5&include_graph=false",
+            )
+            for route in routes:
+                with self.subTest(route=route):
+                    status, _headers, _body = runtime.handle("GET", route)
+                    self.assertEqual(status, 200)
+
+            for route in (
+                "/api/profile?benchmark_quick_prune=true",
+                "/api/start-work?context_id=demo",
+                "/api/monday-readiness?context_id=demo",
+            ):
+                with self.subTest(rejected_route=route):
+                    status, _headers, _body = runtime.handle("GET", route)
+                    self.assertEqual(status, 405)
+
+            self.assertEqual(mutation_calls, [])
+            self.assertEqual(runtime_state.read_bytes(), before_state)
+            self.assertEqual(runtime_state.lstat().st_ino, before_identity)
+            for hidden_write in (
+                "capture_inbox",
+                "capture_processing",
+                "capture_processed",
+                "capture_errors",
+                "app_connections.json",
+                "transcript_sources.json",
+            ):
+                self.assertFalse((capture_root / hidden_write).exists(), hidden_write)
+
+    def test_dashboard_outcome_unknown_is_a_copyable_content_free_handle(self):
+        backend = mock.Mock()
+        backend.set_enabled.side_effect = CoreOutcomeUnknown(
+            caller="dashboard-ui",
+            request_id="req-dashboard-ambiguous",
+            operation="set_enabled",
+        )
+        runtime = DashboardRuntime(backend)
+
+        status, payload = self.decode(
+            runtime.handle(
+                "POST",
+                "/api/toggle",
+                json.dumps({"context_id": "default", "enabled": False}).encode(),
+            )
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "outcome_unknown")
+        self.assertEqual(
+            payload["reconciliation"],
+            {
+                "code": "outcome_unknown",
+                "caller": "dashboard-ui",
+                "request_id": "req-dashboard-ambiguous",
+                "operation": "set_enabled",
+                "replay_safe": False,
+            },
+        )
+        rendered = json.dumps(payload, sort_keys=True)
+        for forbidden in ("arguments", "fingerprint", "response_sha256", "canary"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_dashboard_request_status_reconciles_without_replay(self):
+        backend = mock.Mock()
+        backend.request_status.return_value = {
+            "caller": "dashboard-ui",
+            "request_id": "req-dashboard-status",
+            "state": "not_found",
+            "replay_safe": False,
+            "retention_expiry_possible": True,
+        }
+        runtime = DashboardRuntime(backend)
+
+        status, payload = self.decode(
+            runtime.handle(
+                "POST",
+                "/api/request-status",
+                json.dumps(
+                    {
+                        "caller": "dashboard-ui",
+                        "request_id": "req-dashboard-status",
+                    }
+                ).encode(),
+            )
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "not_found")
+        self.assertFalse(payload["replay_safe"])
+        backend.request_status.assert_called_once_with(
+            caller="dashboard-ui",
+            request_id="req-dashboard-status",
+        )
 
     def test_toggle_and_query_use_real_backend_state(self):
         with TemporaryDirectory() as tmp:
@@ -640,13 +954,23 @@ class DashboardRuntimeTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
 
-            profile_status, profile_payload = self.decode(
+            pure_status, pure_payload = self.decode(
+                runtime.handle("GET", "/api/profile")
+            )
+            rejected_status, rejected_payload = self.decode(
                 runtime.handle("GET", "/api/profile?benchmark_quick_prune=true")
+            )
+            profile_status, profile_payload = self.decode(
+                runtime.handle("POST", "/api/profile-benchmark", b"{}")
             )
             prune_status, prune_payload = self.decode(
                 runtime.handle("POST", "/api/quick-prune", b"{}")
             )
 
+        self.assertEqual(pure_status, 200)
+        self.assertNotIn("quick_pruning", pure_payload)
+        self.assertEqual(rejected_status, 405)
+        self.assertIn("requires POST", rejected_payload["error"])
         self.assertEqual(profile_status, 200)
         self.assertTrue(profile_payload["quick_pruning"]["within_60ms_budget"])
         self.assertEqual(prune_status, 200)
@@ -1170,6 +1494,10 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("STDP update", index)
         self.assertIn("Locked. Press Unlock", index)
         self.assertIn("CORE_TOGGLE_UNLOCK_WINDOW_MS", app)
+        self.assertIn('const DASHBOARD_SESSION_HEADER_NAME = "X-Synapse-Dashboard-Session"', app)
+        self.assertIn("window.sessionStorage.setItem", app)
+        self.assertIn("window.history.replaceState", app)
+        self.assertIn("headers[DASHBOARD_SESSION_HEADER_NAME]", app)
         self.assertIn("renderContextBus", app)
         self.assertIn("renderRelationshipLedger", app)
         self.assertIn("renderNeuralInspector", app)
@@ -1576,7 +1904,13 @@ class DashboardRuntimeTests(unittest.TestCase):
             runtime = self.make_runtime(tmp)
 
             status, payload = self.decode(
-                runtime.handle("GET", "/api/monday-readiness?context_id=demo&include_apps=false")
+                runtime.handle(
+                    "POST",
+                    "/api/monday-readiness",
+                    json.dumps(
+                        {"context_id": "demo", "include_apps": False}
+                    ).encode(),
+                )
             )
 
         self.assertEqual(status, 200)
@@ -1842,30 +2176,45 @@ class DashboardRuntimeTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
             server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
-            self.assertNotIsInstance(server, ThreadingHTTPServer)
+            self.assertIsInstance(server, ThreadingHTTPServer)
             self.assertGreaterEqual(server.request_queue_size, 32)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
+                session_cookie, session_header = self.bootstrap_credentials(server)
                 url = f"http://127.0.0.1:{server.server_port}/api/toggle"
                 blocked_request = urllib.request.Request(
                     url,
                     data=json.dumps({"context_id": "demo", "enabled": False}).encode(),
                     headers={
                         "Content-Type": "application/json",
+                        "Cookie": session_cookie,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
                         "Origin": "https://example.invalid",
                     },
                     method="POST",
                 )
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    urllib.request.urlopen(blocked_request, timeout=10)
-                with closing(raised.exception) as blocked_response:
-                    self.assertEqual(blocked_response.code, 403)
+                blocked_origins = (
+                    "https://example.invalid",
+                    f"http://localhost:{server.server_port}",
+                )
+                for blocked_origin in blocked_origins:
+                    blocked_request.headers["Origin"] = blocked_origin
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(blocked_request, timeout=10)
+                    with closing(raised.exception) as blocked_response:
+                        self.assertEqual(blocked_response.code, 403)
+                        self.assertEqual(
+                            json.loads(blocked_response.read()),
+                            {"error": "mutation forbidden"},
+                        )
                 allowed_request = urllib.request.Request(
                     url,
                     data=json.dumps({"context_id": "demo", "enabled": False}).encode(),
                     headers={
                         "Content-Type": "application/json",
+                        "Cookie": session_cookie,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
                         "Origin": f"http://127.0.0.1:{server.server_port}",
                     },
                     method="POST",
@@ -1878,6 +2227,706 @@ class DashboardRuntimeTests(unittest.TestCase):
                 thread.join(timeout=5)
 
         self.assertFalse(allowed_payload["effective_enabled"])
+
+    def test_partial_preauth_request_does_not_delay_authenticated_request(self):
+        with TemporaryDirectory() as tmp, mock.patch(
+            "dashboard_server.DASHBOARD_PREAUTH_TIMEOUT_SECONDS",
+            0.5,
+        ):
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            blocker = None
+            try:
+                cookie_pair, session_header = self.bootstrap_credentials(server)
+                blocker = socket.create_connection(
+                    ("127.0.0.1", server.server_port),
+                    timeout=2,
+                )
+                blocker.sendall(b"GET /")
+                deadline = time.monotonic() + 1
+                while server.active_handler_count < 1 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/api/status",
+                    headers={
+                        "Cookie": cookie_pair,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    },
+                )
+                started = time.monotonic()
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    payload = json.loads(response.read())
+                elapsed = time.monotonic() - started
+            finally:
+                if blocker is not None:
+                    blocker.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(payload["runtime"], "ready")
+        self.assertLess(elapsed, 0.3)
+
+    def test_full_preauth_saturation_is_bounded_and_recovers_at_deadline(self):
+        preauth_deadline = 0.25
+        with TemporaryDirectory() as tmp, mock.patch(
+            "dashboard_server.DASHBOARD_PREAUTH_TIMEOUT_SECONDS",
+            preauth_deadline,
+        ):
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            blockers = []
+            try:
+                cookie_pair, session_header = self.bootstrap_credentials(server)
+                started = time.monotonic()
+                for _index in range(DASHBOARD_MAX_ACTIVE_HANDLERS):
+                    blocker = socket.create_connection(
+                        ("127.0.0.1", server.server_port),
+                        timeout=2,
+                    )
+                    blocker.sendall(b"GET /")
+                    blockers.append(blocker)
+                saturation_deadline = time.monotonic() + 1
+                while (
+                    server.active_handler_count < DASHBOARD_MAX_ACTIVE_HANDLERS
+                    and time.monotonic() < saturation_deadline
+                ):
+                    time.sleep(0.005)
+                observed_at_saturation = server.active_handler_count
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/api/status",
+                    headers={
+                        "Cookie": cookie_pair,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    },
+                )
+                payload = None
+                recovery_deadline = started + 1.0
+                while payload is None and time.monotonic() < recovery_deadline:
+                    try:
+                        with urllib.request.urlopen(request, timeout=0.3) as response:
+                            payload = json.loads(response.read())
+                    except (
+                        urllib.error.URLError,
+                        http.client.RemoteDisconnected,
+                        ConnectionResetError,
+                    ):
+                        time.sleep(0.02)
+                recovered_after = time.monotonic() - started
+                peak_handlers = server.peak_active_handler_count
+            finally:
+                for blocker in blockers:
+                    blocker.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(observed_at_saturation, DASHBOARD_MAX_ACTIVE_HANDLERS)
+        self.assertLessEqual(peak_handlers, DASHBOARD_MAX_ACTIVE_HANDLERS)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["runtime"], "ready")
+        self.assertLess(recovered_after, 0.8)
+
+    def test_http_parser_rejects_ambiguous_framing_and_recovers(self):
+        def receive_response(client: socket.socket) -> tuple[int, dict[str, object]]:
+            chunks: list[bytes] = []
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            head, _separator, body = raw.partition(b"\r\n\r\n")
+            status = int(head.split(b"\r\n", 1)[0].split()[1])
+            return status, json.loads(body or b"{}")
+
+        with TemporaryDirectory() as tmp, mock.patch(
+            "dashboard_server.DASHBOARD_IO_TIMEOUT_SECONDS",
+            0.15,
+        ):
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                authority = f"127.0.0.1:{server.server_port}"
+                mutation_headers = (
+                    f"Host: {authority}\r\n"
+                    f"Origin: http://{authority}\r\n"
+                    f"Cookie: {server._dashboard_cookie_name}="
+                    f"{server._dashboard_session_capability}\r\n"
+                    f"{DASHBOARD_SESSION_HEADER_NAME}: "
+                    f"{server._dashboard_header_capability}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                ).encode("ascii")
+                cases = (
+                    (
+                        "missing-length",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"\r\n{}",
+                        411,
+                    ),
+                    (
+                        "duplicate-length",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+                        400,
+                    ),
+                    (
+                        "transfer-encoding",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Transfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n{}",
+                        400,
+                    ),
+                    (
+                        "negative-length",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Content-Length: -1\r\n\r\n",
+                        400,
+                    ),
+                    (
+                        "signed-length",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Content-Length: +2\r\n\r\n{}",
+                        400,
+                    ),
+                    (
+                        "leading-zero-length",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Content-Length: 02\r\n\r\n{}",
+                        400,
+                    ),
+                    (
+                        "oversized-length",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Content-Length: 131073\r\n\r\n",
+                        413,
+                    ),
+                    (
+                        "short-body",
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Content-Length: 10\r\n\r\n{}",
+                        400,
+                    ),
+                    (
+                        "get-body",
+                        (
+                            f"GET /api/status HTTP/1.1\r\nHost: {authority}\r\n"
+                            "Content-Length: 1\r\nConnection: close\r\n\r\nx"
+                        ).encode("ascii"),
+                        403,
+                    ),
+                )
+                for label, request, expected in cases:
+                    with self.subTest(label=label):
+                        with socket.create_connection(
+                            ("127.0.0.1", server.server_port),
+                            timeout=2.0,
+                        ) as client:
+                            client.sendall(request)
+                            client.shutdown(socket.SHUT_WR)
+                            status, payload = receive_response(client)
+                        self.assertEqual(status, expected)
+                        self.assertIn("error", payload)
+
+                with socket.create_connection(
+                    ("127.0.0.1", server.server_port),
+                    timeout=2.0,
+                ) as slow_client:
+                    slow_client.sendall(
+                        b"POST /api/toggle HTTP/1.1\r\n"
+                        + mutation_headers
+                        + b"Content-Length: 10\r\n\r\n{}"
+                    )
+                    status, payload = receive_response(slow_client)
+                self.assertEqual(status, 408)
+                self.assertEqual(payload, {"error": "request body timed out"})
+
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://{authority}/api/status",
+                        headers={
+                            "Cookie": (
+                                f"{server._dashboard_cookie_name}="
+                                f"{server._dashboard_session_capability}"
+                            ),
+                            DASHBOARD_SESSION_HEADER_NAME: (
+                                server._dashboard_header_capability
+                            ),
+                        },
+                    ),
+                    timeout=2,
+                ) as response:
+                    healthy = json.loads(response.read())
+                self.assertEqual(healthy["runtime"], "ready")
+                self.assertTrue(healthy["effective_enabled"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_dashboard_server_rotates_cookie_and_header_capabilities_on_restart(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            first = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            first_capability = first._dashboard_session_capability
+            first_header_capability = first._dashboard_header_capability
+            first.server_close()
+            second = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            second_capability = second._dashboard_session_capability
+            second_header_capability = second._dashboard_header_capability
+            second.server_close()
+
+        self.assertNotEqual(first_capability, second_capability)
+        self.assertNotEqual(first_header_capability, second_header_capability)
+        self.assertGreaterEqual(len(first_capability), 40)
+        self.assertGreaterEqual(len(second_capability), 40)
+        self.assertGreaterEqual(len(first_header_capability), 40)
+        self.assertGreaterEqual(len(second_header_capability), 40)
+
+    def test_dashboard_cookie_names_are_port_specific_for_coexisting_instances(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            first = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            second = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            try:
+                self.assertNotEqual(first.server_port, second.server_port)
+                self.assertNotEqual(
+                    first._dashboard_cookie_name,
+                    second._dashboard_cookie_name,
+                )
+                self.assertEqual(
+                    first._dashboard_cookie_name,
+                    f"{DASHBOARD_SESSION_COOKIE_NAME}_{first.server_port}",
+                )
+                self.assertEqual(
+                    second._dashboard_cookie_name,
+                    f"{DASHBOARD_SESSION_COOKIE_NAME}_{second.server_port}",
+                )
+            finally:
+                first.server_close()
+                second.server_close()
+
+    def test_dashboard_bootstrap_is_owner_only_rotating_and_required_for_api_reads(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve() / "private-dashboard"
+            auth_file = root / "dashboard-auth.json"
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(
+                ("127.0.0.1", 0),
+                runtime,
+                auth_file=auth_file,
+                default_context="demo",
+            )
+            initial_payload = json.loads(auth_file.read_text(encoding="utf-8"))
+            initial_token = initial_payload["bootstrap_url"].split("token=", 1)[1]
+            self.assertEqual(
+                initial_payload["session_header"],
+                server._dashboard_header_capability,
+            )
+            self.assertNotIn(
+                server._dashboard_session_capability,
+                json.dumps(initial_payload),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                with urllib.request.urlopen(f"{base_url}/", timeout=10) as response:
+                    self.assertIsNone(response.headers["Set-Cookie"])
+                with self.assertRaises(urllib.error.HTTPError) as unauthenticated:
+                    urllib.request.urlopen(f"{base_url}/api/status", timeout=10)
+                with closing(unauthenticated.exception) as response:
+                    self.assertEqual(response.code, 403)
+                    self.assertEqual(
+                        json.loads(response.read()),
+                        {"error": "dashboard authorization required"},
+                    )
+
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=10,
+                )
+                connection.request(
+                    "GET",
+                    f"{DASHBOARD_BOOTSTRAP_PATH}?token={initial_token}",
+                )
+                bootstrap = connection.getresponse()
+                bootstrap.read()
+                cookie = bootstrap.getheader("Set-Cookie")
+                self.assertEqual(bootstrap.status, 303)
+                location = bootstrap.getheader("Location") or ""
+                parsed_location = urlparse(location)
+                fragment = parse_qs(parsed_location.fragment, keep_blank_values=True)
+                self.assertEqual(parsed_location.path, "/")
+                self.assertEqual(parsed_location.query, "context_id=demo")
+                self.assertEqual(fragment["target"], ["namespaceGalaxy"])
+                session_header = fragment[DASHBOARD_SESSION_FRAGMENT_KEY][0]
+                self.assertEqual(session_header, server._dashboard_header_capability)
+                self.assertIn("HttpOnly", cookie)
+                self.assertIn("SameSite=Strict", cookie)
+                self.assertIn("Path=/", cookie)
+                cookie_pair = cookie.split(";", 1)[0]
+
+                connection.request(
+                    "GET",
+                    f"{DASHBOARD_BOOTSTRAP_PATH}?token={initial_token}",
+                )
+                replay = connection.getresponse()
+                replay_body = replay.read()
+                self.assertEqual(replay.status, 403)
+                self.assertEqual(
+                    json.loads(replay_body),
+                    {"error": "dashboard authorization required"},
+                )
+                connection.close()
+
+                stolen_cookie_request = urllib.request.Request(
+                    f"{base_url}/api/status?context=demo",
+                    headers={"Cookie": cookie_pair},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as stolen_cookie:
+                    urllib.request.urlopen(stolen_cookie_request, timeout=10)
+                with closing(stolen_cookie.exception) as response:
+                    self.assertEqual(response.code, 403)
+
+                request = urllib.request.Request(
+                    f"{base_url}/api/status?context=demo",
+                    headers={
+                        "Cookie": cookie_pair,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    status_payload = json.loads(response.read())
+                rotated_payload = json.loads(auth_file.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            root_mode = stat.S_IMODE(root.stat().st_mode)
+            auth_file_exists = auth_file.exists()
+
+        self.assertEqual(status_payload["runtime"], "ready")
+        self.assertEqual(root_mode, 0o700)
+        self.assertNotEqual(rotated_payload["bootstrap_url"], initial_payload["bootstrap_url"])
+        self.assertNotIn(server._dashboard_session_capability, json.dumps(rotated_payload))
+        self.assertEqual(
+            rotated_payload["session_header"],
+            server._dashboard_header_capability,
+        )
+        self.assertFalse(auth_file_exists)
+
+    def test_dashboard_auth_publication_rejects_nonprivate_directory(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve() / "shared-dashboard"
+            root.mkdir(mode=0o755)
+            runtime = self.make_runtime(tmp)
+            with self.assertRaisesRegex(RuntimeError, "owner-only"):
+                SynapseDashboardServer(
+                    ("127.0.0.1", 0),
+                    runtime,
+                    auth_file=root / "dashboard-auth.json",
+                )
+
+    def test_http_handler_rejects_missing_origin_even_with_valid_cookie(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                session_cookie, session_header = self.bootstrap_credentials(server)
+                request = urllib.request.Request(
+                    f"{base_url}/api/toggle",
+                    data=json.dumps({"context_id": "demo", "enabled": False}).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": session_cookie,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=10)
+                with closing(raised.exception) as response:
+                    body = response.read()
+                    status = response.code
+                    headers = response.headers
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "mutation forbidden"})
+        self.assertLess(len(body), 128)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_http_handler_rejects_missing_wrong_and_duplicate_session_cookies(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                session_cookie, session_header = self.bootstrap_credentials(server)
+                origin = f"http://127.0.0.1:{server.server_port}"
+                rejected_payloads = []
+                cookie_headers = (
+                    None,
+                    f"{DASHBOARD_SESSION_COOKIE_NAME}=wrong-capability",
+                    f"{session_cookie}; {session_cookie}",
+                )
+                for cookie_header in cookie_headers:
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Origin": origin,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    }
+                    if cookie_header is not None:
+                        headers["Cookie"] = cookie_header
+                    request = urllib.request.Request(
+                        f"{base_url}/api/toggle",
+                        data=json.dumps(
+                            {"context_id": "demo", "enabled": False}
+                        ).encode(),
+                        headers=headers,
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request, timeout=10)
+                    with closing(raised.exception) as response:
+                        self.assertEqual(response.code, 403)
+                        rejected_payloads.append(json.loads(response.read()))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(
+            rejected_payloads,
+            [{"error": "mutation forbidden"}] * 3,
+        )
+
+    def test_stolen_cookie_without_fragment_header_cannot_read_or_mutate(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                cookie_pair, session_header = self.bootstrap_credentials(server)
+                cookie_only_read = urllib.request.Request(
+                    f"{base_url}/api/status",
+                    headers={"Cookie": cookie_pair},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as blocked_read:
+                    urllib.request.urlopen(cookie_only_read, timeout=10)
+                with closing(blocked_read.exception) as response:
+                    read_status = response.code
+                cookie_only_mutation = urllib.request.Request(
+                    f"{base_url}/api/toggle",
+                    data=json.dumps({"context_id": "demo", "enabled": False}).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": cookie_pair,
+                        "Origin": base_url,
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as blocked_mutation:
+                    urllib.request.urlopen(cookie_only_mutation, timeout=10)
+                with closing(blocked_mutation.exception) as response:
+                    mutation_status = response.code
+                authenticated_read = urllib.request.Request(
+                    f"{base_url}/api/status",
+                    headers={
+                        "Cookie": cookie_pair,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    },
+                )
+                with urllib.request.urlopen(authenticated_read, timeout=10) as response:
+                    authenticated_payload = json.loads(response.read())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(read_status, 403)
+        self.assertEqual(mutation_status, 403)
+        self.assertEqual(authenticated_payload["runtime"], "ready")
+
+    def test_http_handler_rejects_missing_wrong_and_duplicate_session_headers(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                authority = f"127.0.0.1:{server.server_port}"
+                base_url = f"http://{authority}"
+                cookie_pair, _session_header = self.bootstrap_credentials(server)
+                statuses = []
+                for value in (None, "wrong-capability"):
+                    headers = {"Cookie": cookie_pair}
+                    if value is not None:
+                        headers[DASHBOARD_SESSION_HEADER_NAME] = value
+                    request = urllib.request.Request(
+                        f"{base_url}/api/status",
+                        headers=headers,
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as blocked:
+                        urllib.request.urlopen(request, timeout=10)
+                    with closing(blocked.exception) as response:
+                        statuses.append(response.code)
+
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=10,
+                )
+                connection.putrequest("GET", "/api/status", skip_host=True)
+                connection.putheader("Host", authority)
+                connection.putheader("Cookie", cookie_pair)
+                connection.putheader(
+                    DASHBOARD_SESSION_HEADER_NAME,
+                    server._dashboard_header_capability,
+                )
+                connection.putheader(
+                    DASHBOARD_SESSION_HEADER_NAME,
+                    server._dashboard_header_capability,
+                )
+                connection.endheaders()
+                duplicate = connection.getresponse()
+                duplicate.read()
+                statuses.append(duplicate.status)
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(statuses, [403, 403, 403])
+
+    def test_http_session_cookie_is_private_stable_and_not_reflected(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                cookie_pair, session_header = self.bootstrap_credentials(server)
+                with urllib.request.urlopen(f"{base_url}/", timeout=10) as response:
+                    static_body = response.read()
+                    static_cookie = response.headers["Set-Cookie"]
+                    static_headers = response.headers
+                cookie_name, cookie_value = cookie_pair.split("=", 1)
+                request = urllib.request.Request(
+                    f"{base_url}/api/status?context_id=demo",
+                    headers={
+                        "Cookie": cookie_pair,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    },
+                )
+                with mock.patch("dashboard_server.LOGGER.info") as info:
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        api_body = response.read()
+                        api_cookie = response.headers["Set-Cookie"]
+                        api_headers = response.headers
+                rendered_logs = " ".join(
+                    str(value)
+                    for call in info.call_args_list
+                    for value in call.args
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(cookie_name, server._dashboard_cookie_name)
+        self.assertGreaterEqual(len(cookie_value), 40)
+        self.assertIsNone(static_cookie)
+        self.assertIsNone(api_cookie)
+        self.assertNotIn(cookie_value.encode("ascii"), static_body)
+        self.assertNotIn(cookie_value.encode("ascii"), api_body)
+        self.assertNotIn(cookie_value, rendered_logs)
+        self.assertNotIn(session_header.encode("ascii"), static_body)
+        self.assertNotIn(session_header.encode("ascii"), api_body)
+        self.assertNotIn(session_header, rendered_logs)
+        for headers in (static_headers, api_headers):
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(headers["X-Frame-Options"], "DENY")
+            self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+            self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
+            self.assertIsNone(headers["Access-Control-Allow-Origin"])
+            self.assertIsNone(headers["Access-Control-Allow-Credentials"])
+
+    def test_http_options_requires_mutation_invariants_and_grants_no_cors(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=10,
+                )
+                host = f"127.0.0.1:{server.server_port}"
+                cookie_pair, session_header = self.bootstrap_credentials(server)
+                connection.request(
+                    "OPTIONS",
+                    "/api/toggle",
+                    headers={"Host": host},
+                )
+                blocked = connection.getresponse()
+                blocked_body = blocked.read()
+                connection.request(
+                    "OPTIONS",
+                    "/api/toggle",
+                    headers={
+                        "Host": host,
+                        "Origin": f"http://{host}",
+                        "Cookie": cookie_pair,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                    },
+                )
+                allowed = connection.getresponse()
+                allowed_body = allowed.read()
+                allowed_headers = allowed.headers
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(blocked.status, 403)
+        self.assertEqual(json.loads(blocked_body), {"error": "mutation forbidden"})
+        self.assertEqual(allowed.status, 204)
+        self.assertEqual(allowed_body, b"")
+        self.assertIsNone(allowed_headers["Access-Control-Allow-Origin"])
+        self.assertIsNone(allowed_headers["Access-Control-Allow-Methods"])
 
     def test_http_handler_rejects_misdirected_host_headers(self):
         with TemporaryDirectory() as tmp:
@@ -1908,6 +2957,47 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(status, 421)
         self.assertEqual(payload["error"], "host not allowed")
 
+    def test_http_mutation_rejects_misdirected_host_with_content_free_403(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=10,
+                )
+                local_host = f"127.0.0.1:{server.server_port}"
+                cookie_pair, session_header = self.bootstrap_credentials(server)
+                connection.request(
+                    "POST",
+                    "/api/toggle",
+                    body=json.dumps(
+                        {"context_id": "demo", "enabled": False}
+                    ).encode(),
+                    headers={
+                        "Host": "attacker.example",
+                        "Origin": f"http://{local_host}",
+                        "Cookie": cookie_pair,
+                        DASHBOARD_SESSION_HEADER_NAME: session_header,
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                body = response.read()
+                status = response.status
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "mutation forbidden"})
+        self.assertLess(len(body), 128)
+
     def test_http_access_log_omits_query_strings(self):
         marker = "SYNTHETIC_ONLY_SECRET_VALUE_42"
         handler = object.__new__(SynapseDashboardHandler)
@@ -1923,6 +3013,16 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertNotIn(marker, rendered)
         self.assertNotIn("api_key", rendered)
         self.assertIn("/api/status", rendered)
+
+    def test_http_timeout_log_is_safe_before_request_fields_are_initialized(self):
+        handler = object.__new__(SynapseDashboardHandler)
+        handler.client_address = ("127.0.0.1", 4242)
+
+        with mock.patch("dashboard_server.LOGGER.info") as info:
+            handler.log_message("Request timed out")
+
+        rendered = " ".join(str(value) for value in info.call_args.args)
+        self.assertIn("<unparsed>", rendered)
 
     def test_remember_endpoint_persists_new_memory(self):
         with TemporaryDirectory() as tmp:

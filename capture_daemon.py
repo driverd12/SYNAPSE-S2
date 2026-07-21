@@ -611,20 +611,46 @@ class CaptureInboxDaemon:
                 raise ValueError("capture transport directory escaped its root")
             _ensure_private_dir(paths[key], tighten_existing=True)
 
+    def _observe_transport_dirs(
+        self,
+        paths: dict[str, Path],
+    ) -> tuple[list[str], list[str]]:
+        """Validate transport directories without creating or chmodding them."""
+
+        keys = (
+            "root",
+            "inbox_dir",
+            "processing_dir",
+            "processed_dir",
+            "error_dir",
+            "error_archive_dir",
+            "error_resolution_dir",
+            "receipt_dir",
+            "lock_dir",
+        )
+        missing: list[str] = []
+        unsafe: list[str] = []
+        for key in keys:
+            path = paths[key]
+            try:
+                observed = path.lstat()
+            except FileNotFoundError:
+                missing.append(key)
+                continue
+            if (
+                stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != os.getuid()
+                or stat.S_IMODE(observed.st_mode) != 0o700
+            ):
+                unsafe.append(key)
+        return missing, unsafe
+
     def status(self) -> dict[str, Any]:
         paths = self.paths()
-        self._ensure_transport_dirs(paths)
-        pending = self._capture_files(paths["inbox_dir"])
-        temp_diagnostics = self._inbox_temp_diagnostics(paths["inbox_dir"])
-        processing = self._processing_claims(paths["processing_dir"])
-        processing_diagnostics = self._processing_diagnostics(paths["processing_dir"])
-        processed = self._capture_files(paths["processed_dir"])
-        error_diagnostics = self._error_artifact_diagnostics(paths)
-        resolution_diagnostics = self._error_resolution_diagnostics(paths)
-        resolved_errors = self._capture_files(paths["error_archive_dir"])
-        receipts = self._receipt_files(paths["receipt_dir"])
-        last_result = self._read_state(paths["state_path"])
-        return {
+        missing_dirs, unsafe_dirs = self._observe_transport_dirs(paths)
+        transport_ready = not missing_dirs and not unsafe_dirs
+        base = {
             "root": str(paths["root"]),
             "inbox_dir": str(paths["inbox_dir"]),
             "processing_dir": str(paths["processing_dir"]),
@@ -632,6 +658,59 @@ class CaptureInboxDaemon:
             "error_dir": str(paths["error_dir"]),
             "error_archive_dir": str(paths["error_archive_dir"]),
             "receipt_dir": str(paths["receipt_dir"]),
+            "transport_ready": transport_ready,
+            "missing_transport_directories": missing_dirs,
+            "unsafe_transport_directories": unsafe_dirs,
+            "enabled": transport_ready,
+            "mode": "capture-inbox",
+        }
+        if unsafe_dirs:
+            return {
+                **base,
+                "pending_file_count": 0,
+                "inbox_temp_file_count": 0,
+                "fresh_inbox_temp_file_count": 0,
+                "stale_inbox_temp_file_count": 0,
+                "ignored_inbox_temp_file_count": 0,
+                "inbox_temp_stale_after_seconds": STALE_INBOX_TEMP_SECONDS,
+                "processing_file_count": 0,
+                "processing_empty_claim_count": 0,
+                "processing_malformed_claim_count": 0,
+                "processed_file_count": 0,
+                "error_file_count": 0,
+                "unresolved_error_count": 0,
+                "terminal_error_evidence_count": 0,
+                "historical_error_evidence_count": 0,
+                "unsafe_error_artifact_count": 0,
+                "resolved_error_count": 0,
+                "error_resolution_pending_count": 0,
+                "error_resolution_failed_count": 0,
+                "receipt_count": 0,
+                "pending_files": [],
+                "processing_files": [],
+                "last_result": {},
+            }
+        pending = self._capture_files(paths["inbox_dir"])
+        temp_diagnostics = self._inbox_temp_diagnostics(paths["inbox_dir"])
+        processing = self._processing_claims(paths["processing_dir"])
+        processing_diagnostics = self._processing_diagnostics(paths["processing_dir"])
+        processed = self._capture_files(paths["processed_dir"])
+        error_diagnostics = (
+            self._error_artifact_diagnostics(paths)
+            if paths["error_dir"].is_dir()
+            else {
+                "unresolved_error_count": 0,
+                "terminal_evidence_count": 0,
+                "historical_evidence_count": 0,
+                "unsafe_error_count": 0,
+            }
+        )
+        resolution_diagnostics = self._error_resolution_diagnostics(paths)
+        resolved_errors = self._capture_files(paths["error_archive_dir"])
+        receipts = self._receipt_files(paths["receipt_dir"])
+        last_result = self._read_state(paths["state_path"])
+        return {
+            **base,
             "pending_file_count": len(pending),
             "inbox_temp_file_count": temp_diagnostics["total"],
             "fresh_inbox_temp_file_count": temp_diagnostics["fresh"],
@@ -675,9 +754,14 @@ class CaptureInboxDaemon:
                 for _, path in processing[:20]
             ],
             "last_result": last_result,
-            "enabled": True,
-            "mode": "capture-inbox",
         }
+
+    def prepare_transport(self) -> dict[str, Any]:
+        """Create/tighten capture transport directories as an explicit mutation."""
+
+        paths = self.paths()
+        self._ensure_transport_dirs(paths)
+        return self.status()
 
     def error_resolution_preflight(
         self,
@@ -2115,6 +2199,7 @@ class CaptureInboxDaemon:
         ) as acquired:
             if not acquired:
                 raise RuntimeError("capture maintenance lock is unavailable")
+            self._repair_legacy_state(paths["state_path"])
             return self._process_once_locked(paths=paths, max_files=max_files)
 
     def _process_once_locked(
@@ -2261,19 +2346,28 @@ class CaptureInboxDaemon:
             return {}
         if not isinstance(parsed, dict):
             return {}
+        return self._compact_process_result(parsed)
+
+    def _repair_legacy_state(self, state_path: Path) -> bool:
+        """Canonicalize old daemon state only on an explicit process mutation."""
+
+        if not state_path.exists():
+            return False
+        try:
+            parsed = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            LOGGER.warning("failed to read capture daemon state", exc_info=True)
+            return False
+        if not isinstance(parsed, dict):
+            return False
         compact = self._compact_process_result(parsed)
-        if compact != parsed:
-            try:
-                _atomic_write_private_text(
-                    state_path,
-                    json.dumps(compact, indent=2, sort_keys=True, default=str),
-                )
-            except Exception:
-                LOGGER.warning(
-                    "failed to scrub legacy capture daemon state",
-                    exc_info=True,
-                )
-        return compact
+        if compact == parsed:
+            return False
+        _atomic_write_private_text(
+            state_path,
+            json.dumps(compact, indent=2, sort_keys=True, default=str),
+        )
+        return True
 
     def _compact_process_result(self, result: dict[str, Any]) -> dict[str, Any]:
         """Return the content-free durable/status form of one daemon receipt."""
@@ -2669,18 +2763,47 @@ class CaptureInboxDaemon:
         *,
         blocking: bool = False,
     ) -> Iterator[bool]:
-        flags = os.O_RDWR | os.O_CREAT
+        flags = os.O_RDWR
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        created = False
         try:
-            fd = os.open(lock_path, flags, 0o600)
+            fd = os.open(
+                lock_path,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            fd = os.open(lock_path, flags)
         except FileNotFoundError:
             yield False
             return
         acquired = False
         try:
+            opened = os.fstat(fd)
+            if created:
+                os.fchmod(fd, 0o600)
+                opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+            ):
+                raise RuntimeError("capture lock identity is unsafe")
+            visible = lock_path.lstat()
+            if (
+                stat.S_ISLNK(visible.st_mode)
+                or visible.st_dev != opened.st_dev
+                or visible.st_ino != opened.st_ino
+                or visible.st_uid != opened.st_uid
+                or visible.st_nlink != 1
+                or stat.S_IMODE(visible.st_mode) != 0o600
+            ):
+                raise RuntimeError("capture lock path changed during open")
             try:
                 operation = fcntl.LOCK_EX
                 if not blocking:
@@ -2689,6 +2812,19 @@ class CaptureInboxDaemon:
                 acquired = True
             except BlockingIOError:
                 acquired = False
+            if acquired:
+                held = os.fstat(fd)
+                visible = lock_path.lstat()
+                if (
+                    held.st_dev != opened.st_dev
+                    or held.st_ino != opened.st_ino
+                    or visible.st_dev != opened.st_dev
+                    or visible.st_ino != opened.st_ino
+                    or visible.st_uid != opened.st_uid
+                    or visible.st_nlink != 1
+                    or stat.S_IMODE(visible.st_mode) != 0o600
+                ):
+                    raise RuntimeError("capture lock identity changed after acquisition")
             yield acquired
         finally:
             if acquired:
@@ -3611,7 +3747,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def backend_from_args(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBackend:
+def backend_from_args(args: argparse.Namespace) -> Any:
+    from backend_router import core_client_if_required
+
+    client = core_client_if_required(
+        memory_path=args.memory_db,
+        state_path=args.state,
+        capture_root=args.capture_root,
+        local_config={
+            "dimension": args.dimension,
+            "num_neurons": args.neurons,
+            "default_top_k": args.top_k,
+        },
+        local_defaults={
+            "dimension": 1024,
+            "num_neurons": 5400,
+            "default_top_k": 256,
+        },
+    )
+    if client is not None:
+        return client
     return mlx_backend.SpikingAttentionBackend(
         dimension=args.dimension,
         num_neurons=args.neurons,
@@ -3650,7 +3805,7 @@ def main(argv: list[str] | None = None) -> int:
 def _poll_transcript_sources(
     *,
     root: str | os.PathLike[str] | None,
-    backend: mlx_backend.SpikingAttentionBackend,
+    backend: Any,
     max_bytes: int,
 ) -> dict[str, Any]:
     try:

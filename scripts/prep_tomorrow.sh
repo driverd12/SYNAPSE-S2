@@ -6,85 +6,191 @@ LAUNCHER="/Users/dan.driver/.local/bin/synapse-s2-mcp"
 CONTEXT="${SYNAPSE_S2_PREFLIGHT_CONTEXT:-default}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 VERIFY_ONLY="${SYNAPSE_S2_PREFLIGHT_VERIFY_ONLY:-0}"
+APPLY=0
+INSTALL_CORE=0
+EVIDENCE_MANIFEST=""
 
-case "${1:-}" in
-  --verify-only|--check-only|--dry-run)
-    VERIFY_ONLY=1
-    shift
-    ;;
-  "")
-    ;;
-  *)
-    echo "usage: scripts/prep_tomorrow.sh [--verify-only]" >&2
-    exit 2
-    ;;
-esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --verify-only|--check-only|--dry-run)
+      VERIFY_ONLY=1
+      shift
+      ;;
+    --apply)
+      APPLY=1
+      VERIFY_ONLY=0
+      shift
+      ;;
+    --install-core)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "--install-core requires a fresh operator-readiness evidence manifest" >&2
+        exit 2
+      fi
+      INSTALL_CORE=1
+      EVIDENCE_MANIFEST="$2"
+      shift 2
+      ;;
+    *)
+      echo "usage: scripts/prep_tomorrow.sh [--verify-only] [--apply --install-core /absolute/path/to/manifest.json]" >&2
+      exit 2
+      ;;
+  esac
+done
+if [ "$INSTALL_CORE" = "1" ] && [ "$APPLY" != "1" ]; then
+  echo "--install-core requires the explicit --apply stage" >&2
+  exit 2
+fi
+if [ "$APPLY" = "1" ] && [ -z "$EVIDENCE_MANIFEST" ]; then
+  echo "--apply requires a fresh operator-readiness evidence manifest via --install-core" >&2
+  exit 2
+fi
 
 cd "$ROOT"
+export PYTHONDONTWRITEBYTECODE=1
 
-export MLX_DEVICE="${MLX_DEVICE:-gpu}"
-export SYNAPSE_S2_EMBEDDING_PROVIDER="${SYNAPSE_S2_EMBEDDING_PROVIDER:-mlx-neural}"
-export SYNAPSE_S2_NEURAL_MODEL="${SYNAPSE_S2_NEURAL_MODEL:-mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ}"
-export SYNAPSE_S2_NEURAL_CACHE_DIR="${SYNAPSE_S2_NEURAL_CACHE_DIR:-$ROOT/.synapse_s2/models}"
-export SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY="${SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY:-1}"
-export SYNAPSE_S2_DIMENSION="${SYNAPSE_S2_DIMENSION:-1024}"
-export SYNAPSE_S2_NEURONS="${SYNAPSE_S2_NEURONS:-8192}"
-export SYNAPSE_S2_TOP_K="${SYNAPSE_S2_TOP_K:-256}"
-export SYNAPSE_S2_RECALL_COUNT="${SYNAPSE_S2_RECALL_COUNT:-10}"
-export SYNAPSE_S2_STATE_PATH="${SYNAPSE_S2_STATE_PATH:-$ROOT/.synapse_s2/runtime_state.json}"
-export SYNAPSE_S2_MEMORY_DB="${SYNAPSE_S2_MEMORY_DB:-$ROOT/.synapse_s2/memory.sqlite3}"
 export SYNAPSE_S2_EXPORT_DIR="${SYNAPSE_S2_EXPORT_DIR:-$ROOT/.synapse_s2}"
 export SYNAPSE_S2_CAPTURE_ROOT="${SYNAPSE_S2_CAPTURE_ROOT:-$ROOT/.synapse_s2}"
 export SYNAPSE_S2_DEFAULT_RESPONSE_MODE="${SYNAPSE_S2_DEFAULT_RESPONSE_MODE:-compact}"
 export SYNAPSE_S2_MAX_RESPONSE_BYTES="${SYNAPSE_S2_MAX_RESPONSE_BYTES:-12288}"
 
-mkdir -p "$SYNAPSE_S2_EXPORT_DIR"
-
 if [ ! -x ".venv/bin/python" ]; then
-  if command -v uv >/dev/null 2>&1; then
-    uv sync
-  elif [ -x "/opt/homebrew/bin/uv" ]; then
-    /opt/homebrew/bin/uv sync
-  else
-    echo "uv is required to create .venv" >&2
-    exit 2
-  fi
+  echo "Certification requires the existing reviewed .venv; run uv sync separately, then rerun." >&2
+  exit 2
 fi
 
-if [ "$VERIFY_ONLY" = "1" ]; then
-  echo "=== verify-only mode ==="
-  echo "Skipping launcher/client/LaunchAgent installs, memory writes, inbox processing, MCP wrapper launches, dashboard smoke, maintenance, and backup."
+# Resolve the same owner-only layout binding consumed by installed clients.
+# Apply/cutover is never allowed to invent a direct socket or data layout.
+CORE_BINDING_PATH="${SYNAPSE_S2_CORE_BINDING:-}"
+if [ -z "$CORE_BINDING_PATH" ] \
+  && { [ -e "$HOME/.config/synapse-s2/core-binding.json" ] \
+    || [ -L "$HOME/.config/synapse-s2/core-binding.json" ]; }; then
+  CORE_BINDING_PATH="$HOME/.config/synapse-s2/core-binding.json"
+fi
+unset SYNAPSE_S2_CORE_SOCKET SYNAPSE_S2_EXPECTED_CORE_CONFIG_FINGERPRINT
+unset SYNAPSE_S2_STATE_PATH SYNAPSE_S2_MEMORY_DB
+if [ -n "$CORE_BINDING_PATH" ]; then
+  BINDING_VALUES="$(.venv/bin/python - "$CORE_BINDING_PATH" "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+from core_client_binding import load_core_client_binding
+
+binding = load_core_client_binding(Path(sys.argv[1]))
+if binding.repo_root != Path(sys.argv[2]).absolute():
+    raise SystemExit("core binding belongs to a different repository")
+print(
+    "\t".join(
+        (
+            str(binding.export_root),
+            str(binding.capture_root),
+            binding.authority_mode,
+        )
+    )
+)
+PY
+)"
+  IFS=$'\t' read -r SYNAPSE_S2_EXPORT_DIR SYNAPSE_S2_CAPTURE_ROOT BINDING_MODE \
+    <<< "$BINDING_VALUES"
+  if [ -z "$SYNAPSE_S2_EXPORT_DIR" ] || [ -z "$SYNAPSE_S2_CAPTURE_ROOT" ] \
+    || [ -z "$BINDING_MODE" ]; then
+    echo "Core binding did not resolve a complete reviewed layout" >&2
+    exit 2
+  fi
+  SYNAPSE_S2_CORE_BINDING="$CORE_BINDING_PATH"
+  export SYNAPSE_S2_CORE_BINDING SYNAPSE_S2_EXPORT_DIR SYNAPSE_S2_CAPTURE_ROOT
+elif [ "$APPLY" = "1" ]; then
+  echo "Apply requires a reviewed candidate or authoritative core binding" >&2
+  exit 2
 else
-  echo "=== install launcher ==="
-  scripts/install_local_launcher.sh
+  unset SYNAPSE_S2_CORE_BINDING
+  export SYNAPSE_S2_STATE_PATH="$ROOT/.synapse_s2/runtime_state.json"
+  export SYNAPSE_S2_MEMORY_DB="$ROOT/.synapse_s2/memory.sqlite3"
+fi
 
-  echo "=== install client configs ==="
-  scripts/install_client_configs.py
+echo "=== immutable certification preflight ==="
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "Certification requires a clean worktree before any apply-stage mutation." >&2
+  exit 1
+fi
+if [ "$INSTALL_CORE" = "1" ]; then
+  case "$EVIDENCE_MANIFEST" in
+    /*) ;;
+    *)
+      echo "Core evidence manifest must be an absolute path" >&2
+      exit 2
+      ;;
+  esac
+  EVIDENCE_MANIFEST="$EVIDENCE_MANIFEST" .venv/bin/python - <<'PY'
+import os
+from pathlib import Path
+from scripts.core_cutover_preflight import validate_evidence_contract
 
-  echo "=== install capture inbox daemon ==="
-  scripts/install_capture_daemon.sh
+validate_evidence_contract(
+    Path(os.environ["EVIDENCE_MANIFEST"]),
+    root=Path.cwd(),
+    maximum_age_seconds=7200,
+    require_git_binding=True,
+)
+PY
 fi
 
 echo "=== unit tests ==="
 (
+  export PYTHONDONTWRITEBYTECODE=1
   # The exported paths above belong to the live operational checks below.
   # Keep unit tests hermetic so injected TemporaryDirectory state is authoritative.
   unset MLX_DEVICE
-  unset SYNAPSE_S2_NEURAL_MODEL SYNAPSE_S2_NEURAL_CACHE_DIR
-  unset SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY SYNAPSE_S2_DIMENSION
-  unset SYNAPSE_S2_NEURONS SYNAPSE_S2_TOP_K SYNAPSE_S2_RECALL_COUNT
+  unset SYNAPSE_S2_CORE_BINDING SYNAPSE_S2_CORE_SOCKET SYNAPSE_S2_CORE_CONFIG
+  unset SYNAPSE_S2_CORE_DATA_ROOT SYNAPSE_S2_CORE_RUNTIME_ROOT
+  unset SYNAPSE_S2_CORE_STATE SYNAPSE_S2_CORE_LOG SYNAPSE_S2_CORE_PYTHON
+  unset SYNAPSE_S2_CORE_LABEL SYNAPSE_S2_CORE_REQUIRE_NATIVE SYNAPSE_S2_BUILD_ID
+  unset SYNAPSE_S2_EMBEDDING_PROVIDER SYNAPSE_S2_NEURAL_MODEL
+  unset SYNAPSE_S2_NEURAL_CACHE_DIR SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY
+  unset SYNAPSE_S2_DIMENSION SYNAPSE_S2_NEURONS SYNAPSE_S2_TOP_K
+  unset SYNAPSE_S2_RECALL_COUNT SYNAPSE_S2_REQUIRE_NATIVE
+  unset SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS
   unset SYNAPSE_S2_STATE_PATH SYNAPSE_S2_MEMORY_DB
   unset SYNAPSE_S2_EXPORT_DIR SYNAPSE_S2_CAPTURE_ROOT
+  unset SYNAPSE_S2_CAPTURE_POLL_INTERVAL SYNAPSE_S2_CAPTURE_MAX_FILES
+  unset SYNAPSE_S2_TRANSCRIPT_POLL SYNAPSE_S2_MAX_TRANSCRIPT_BYTES
   unset SYNAPSE_S2_DEFAULT_RESPONSE_MODE SYNAPSE_S2_MAX_RESPONSE_BYTES
-  SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash \
-    .venv/bin/python -m unittest discover -s tests -v
+  unset SYNAPSE_S2_PREFLIGHT_CONTEXT SYNAPSE_S2_PREFLIGHT_VERIFY_ONLY
+  unset CODEX_PROJECT_DIR CLAUDE_PROJECT_DIR
+  .venv/bin/python -m unittest discover -s tests -v
 )
 
 echo "=== compile check ==="
-.venv/bin/python -m py_compile capture_daemon.py client_session_bridge.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py token_contracts.py dashboard_server.py client_config.py scripts/install_client_configs.py scripts/smoke_dashboard.py scripts/operator_readiness_certify.py scripts/measure_token_contracts.py
+.venv/bin/python - <<'PY'
+from pathlib import Path
 
-if [ "$VERIFY_ONLY" = "1" ]; then
+paths = """backend_router.py capture_daemon.py client_session_bridge.py core_authority.py core_client.py core_client_binding.py core_protocol.py core_request_journal.py core_service.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py token_contracts.py dashboard_server.py client_config.py scripts/core_agent_installer.py scripts/core_cutover_preflight.py scripts/install_client_configs.py scripts/secure_installer_support.py scripts/smoke_dashboard.py scripts/operator_readiness_certify.py scripts/measure_token_contracts.py""".split()
+for raw in paths:
+    path = Path(raw)
+    compile(path.read_text(encoding="utf-8"), str(path), "exec")
+PY
+
+echo "=== build identity ==="
+BUILD_ID="$(.venv/bin/python - <<'PY'
+from pathlib import Path
+from core_service import _manifest_build_id
+print(_manifest_build_id(Path.cwd()))
+PY
+)"
+case "$BUILD_ID" in
+  ""|*[!A-Za-z0-9._:-]*)
+    echo "Build identity validation failed" >&2
+    exit 1
+    ;;
+esac
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "Certification changed the worktree or the worktree was not stable." >&2
+  exit 1
+fi
+echo "certified build: $BUILD_ID"
+
+if [ "$APPLY" != "1" ]; then
   echo "=== verify-only read-only-ish checks ==="
+  echo "Skipping launcher/client/LaunchAgent installs, memory writes, inbox processing, MCP wrapper launches, dashboard smoke, maintenance, and backup."
   .venv/bin/python synapse_cli.py --json status --context "$CONTEXT"
   .venv/bin/python synapse_cli.py --json profile
   .venv/bin/python synapse_cli.py --json certify-runtime \
@@ -98,6 +204,43 @@ if [ "$VERIFY_ONLY" = "1" ]; then
   echo "=== verify-only ready ==="
   exit 0
 fi
+
+echo "=== apply stage (all immutable gates passed) ==="
+mkdir -p "$SYNAPSE_S2_EXPORT_DIR"
+echo "=== explicit authoritative core install ==="
+scripts/install_core_agent.sh install \
+  --evidence-manifest "$EVIDENCE_MANIFEST" \
+  --maximum-evidence-age-seconds 7200
+
+echo "=== authoritative core status ==="
+CORE_STATUS_PAYLOAD="$(scripts/install_core_agent.sh status)"
+printf '%s\n' "$CORE_STATUS_PAYLOAD"
+printf '%s' "$CORE_STATUS_PAYLOAD" | .venv/bin/python -c '
+import json, sys
+payload = json.load(sys.stdin)
+if payload.get("ok") is not True:
+    raise SystemExit(1)
+if not all(payload.get(key) is True for key in ("loaded", "running", "healthy", "capture_ready")):
+    raise SystemExit(1)
+binding = payload.get("client_binding")
+if not isinstance(binding, dict) or binding.get("ready") is not True:
+    raise SystemExit(1)
+' || {
+  echo "Authoritative core or active client binding is not ready; apply stopped before client publication." >&2
+  exit 1
+}
+
+echo "=== install lightweight launcher ==="
+scripts/install_local_launcher.sh
+
+echo "=== install lightweight client configs ==="
+scripts/install_client_configs.py
+
+echo "=== install binding-routed dashboard adapter ==="
+scripts/install_dashboard_agent.sh
+
+# install_capture_daemon.sh is a v5-only maintenance compatibility lane.
+# The authoritative core owns the single embedded capture worker.
 
 echo "=== factual preflight evidence ==="
 .venv/bin/python synapse_cli.py --json remember-text \
@@ -299,8 +442,6 @@ echo "=== proposal lifecycle smoke ==="
 
 echo "=== create verified paired recovery point ==="
 .venv/bin/python synapse_cli.py --json backup-recovery \
-  --output "$SYNAPSE_S2_EXPORT_DIR/preflight-recovery-$STAMP.sqlite3" \
-  --capture-root "$SYNAPSE_S2_CAPTURE_ROOT" \
   --purpose preflight \
   --pinned
 

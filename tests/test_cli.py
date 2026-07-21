@@ -12,12 +12,72 @@ from unittest import mock
 from memory_store import DurableMemoryStore
 from mlx_backend import SpikingAttentionBackend
 from capture_daemon import CaptureInboxDaemon
+from core_client import CoreOutcomeUnknown
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
+    def test_recovery_commands_forward_expected_journal_and_runtime_digests(self):
+        import synapse_cli
+
+        digest = "a" * 64
+        runtime_digest = "c" * 64
+        backend = mock.Mock()
+        backend.verify_recovery_bundle.return_value = {"verified": True}
+        backend.restore_recovery_bundle_isolated.return_value = {"verified": True}
+        with TemporaryDirectory() as tmp, mock.patch(
+            "synapse_cli.build_backend",
+            return_value=backend,
+        ):
+            receipt = str(Path(tmp) / "bundle.receipt.json")
+            output_root = str(Path(tmp) / "restore-proof")
+            verify_args = mock.Mock(
+                receipt=receipt,
+                capture_root=None,
+                expected_database_sha256=None,
+                expected_capture_sha256=None,
+                expected_request_journal_sha256=digest,
+                expected_runtime_state_sha256=runtime_digest,
+            )
+            restore_args = mock.Mock(
+                receipt=receipt,
+                output_root=output_root,
+                capture_root=None,
+                expected_database_sha256=None,
+                expected_capture_sha256=None,
+                expected_request_journal_sha256=digest,
+                expected_runtime_state_sha256=runtime_digest,
+                confirm=True,
+            )
+
+            self.assertTrue(
+                synapse_cli.command_verify_recovery_bundle(verify_args)["verified"]
+            )
+            self.assertTrue(
+                synapse_cli.command_restore_recovery_bundle(restore_args)["verified"]
+            )
+
+        backend.verify_recovery_bundle.assert_called_once_with(
+            receipt,
+            capture_root=None,
+            expected_database_sha256=None,
+            expected_capture_sha256=None,
+            expected_request_journal_sha256=digest,
+            expected_runtime_state_sha256=runtime_digest,
+        )
+        backend.restore_recovery_bundle_isolated.assert_called_once_with(
+            receipt,
+            output_root,
+            capture_root=None,
+            expected_database_sha256=None,
+            expected_capture_sha256=None,
+            expected_request_journal_sha256=digest,
+            expected_runtime_state_sha256=runtime_digest,
+            confirm=True,
+        )
+
     def run_cli(
         self,
         *args: str,
@@ -126,6 +186,64 @@ class SynapseCliTests(unittest.TestCase):
         self.assertNotIn(secret, payload["error"])
         self.assertNotIn(local_path, payload["error"])
         self.assertTrue(emit_mock.call_args.kwargs["as_json"])
+
+    def test_cli_outcome_unknown_emits_only_fixed_reconciliation_handle(self):
+        import synapse_cli
+
+        parsed_args = mock.Mock(json=True)
+        parsed_args.func = mock.Mock(
+            side_effect=CoreOutcomeUnknown(
+                caller="cli-caller",
+                request_id="req-cli-ambiguous",
+                operation="set_enabled",
+            )
+        )
+        parser = mock.Mock()
+        parser.parse_args.return_value = parsed_args
+        with (
+            mock.patch.object(synapse_cli, "build_parser", return_value=parser),
+            mock.patch.object(synapse_cli, "emit") as emit_mock,
+        ):
+            return_code = synapse_cli.main(["--json"])
+
+        self.assertEqual(return_code, 1)
+        payload = emit_mock.call_args.args[0]
+        self.assertEqual(payload["error"], "outcome_unknown")
+        self.assertEqual(
+            payload["reconciliation"],
+            {
+                "code": "outcome_unknown",
+                "caller": "cli-caller",
+                "request_id": "req-cli-ambiguous",
+                "operation": "set_enabled",
+                "replay_safe": False,
+            },
+        )
+        rendered = json.dumps(payload, sort_keys=True)
+        for forbidden in ("arguments", "fingerprint", "response_sha256", "canary"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_request_status_command_uses_authoritative_backend_without_replay(self):
+        import synapse_cli
+
+        backend = mock.Mock()
+        backend.request_status.return_value = {
+            "caller": "cli-caller",
+            "request_id": "req-cli-status",
+            "state": "not_found",
+            "replay_safe": False,
+            "retention_expiry_possible": True,
+        }
+        args = mock.Mock(caller="cli-caller", request_id="req-cli-status")
+        with mock.patch.object(synapse_cli, "build_backend", return_value=backend):
+            payload = synapse_cli.command_request_status(args)
+
+        self.assertEqual(payload["state"], "not_found")
+        self.assertFalse(payload["replay_safe"])
+        backend.request_status.assert_called_once_with(
+            caller="cli-caller",
+            request_id="req-cli-status",
+        )
 
     def test_cli_startup_import_error_is_sanitized(self):
         import synapse_cli
@@ -353,7 +471,7 @@ class SynapseCliTests(unittest.TestCase):
             state_path = root / "state.json"
             memory_path = root / "memory.sqlite3"
             DurableMemoryStore(memory_path)
-            CaptureInboxDaemon(root=root).status()
+            CaptureInboxDaemon(root=root).prepare_transport()
 
             audit = self.run_cli(
                 "capture-ledger-integrity",
@@ -1251,7 +1369,7 @@ class SynapseCliTests(unittest.TestCase):
             root = Path(tmp)
             state_path = root / "state.json"
             memory_path = root / "memory.sqlite3"
-            CaptureInboxDaemon(root=root).status()
+            CaptureInboxDaemon(root=root).prepare_transport()
             backup = self.run_cli(
                 "backup-recovery",
                 "--capture-root",
@@ -1605,6 +1723,7 @@ class SynapseCliTests(unittest.TestCase):
                 memory_path=memory_path,
             )
             self.assertEqual(initial.returncode, 0, initial.stderr)
+            CaptureInboxDaemon(root=capture_root).prepare_transport()
             evidence = capture_root / "capture_errors" / "terminal.evidence.json"
             evidence.write_text(
                 json.dumps(

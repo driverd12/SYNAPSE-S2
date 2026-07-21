@@ -1,19 +1,62 @@
 from pathlib import Path
 import stat
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from core_client_binding import (
+    BINDING_ENV,
+    binding_for_config,
+    write_core_client_binding,
+)
+from core_service import CoreConfig, write_core_config
 from scripts.synapse_status_report import (
+    ROOT,
     main,
     render_status_markdown,
     sorted_context_rows,
+    status_subprocess_environment,
     validate_status_output_path,
     write_private_status_report,
 )
 
 
 class SynapseStatusReportTests(unittest.TestCase):
+    @staticmethod
+    def _write_binding(
+        root: Path,
+        *,
+        authority_mode: str = "candidate-local-v5",
+        repo_root: Path = ROOT,
+    ) -> tuple[Path, object]:
+        root = root.resolve()
+        data = root / "bound-data"
+        core = data / "core"
+        core.mkdir(parents=True, mode=0o700)
+        data.chmod(0o700)
+        core.chmod(0o700)
+        config = CoreConfig(
+            socket_path=core / "service.sock",
+            state_path=data / "runtime_state.json",
+            memory_path=data / "memory.sqlite3",
+            capture_root=data,
+            dimension=8,
+            num_neurons=16,
+            default_top_k=4,
+        )
+        write_core_config(core / "service.json", config)
+        binding = binding_for_config(
+            repo_root=repo_root,
+            data_root=data,
+            config=config,
+            core_label="aero.boom.synapse-s2.core",
+            authority_mode=authority_mode,
+        )
+        binding_path = root / "home" / ".config" / "synapse-s2" / "core-binding.json"
+        write_core_client_binding(binding_path, binding)
+        return binding_path, binding
+
     def test_status_output_rejects_credentials_before_live_collection(self):
         marker = "SYNTHETIC_ONLY_STATUS_OUTPUT_SECRET_42"
         with TemporaryDirectory() as tmp:
@@ -75,6 +118,73 @@ class SynapseStatusReportTests(unittest.TestCase):
 
         self.assertEqual(rows[0], ("default", 10))
         self.assertEqual(rows[1:], [("james", 2), ("servus", 3)])
+
+    def test_binding_backed_report_children_receive_only_binding_route(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binding_path, _binding = self._write_binding(root)
+            environment = status_subprocess_environment(
+                SimpleNamespace(core_socket=""),
+                environ={
+                    BINDING_ENV: str(binding_path),
+                    "SYNAPSE_S2_CORE_SOCKET": "/tmp/stale/core/service.sock",
+                    "SYNAPSE_S2_EXPECTED_CORE_CONFIG_FINGERPRINT": "c" * 64,
+                    "SYNAPSE_S2_MEMORY_DB": "/tmp/stale/memory.sqlite3",
+                    "SYNAPSE_S2_STATE_PATH": "/tmp/stale/runtime.json",
+                    "SYNAPSE_S2_CAPTURE_ROOT": "/tmp/stale/captures",
+                    "SYNAPSE_S2_EXPORT_DIR": "/tmp/stale/exports",
+                    "SYNAPSE_S2_NEURONS": "1",
+                    "MLX_DEVICE": "gpu",
+                },
+            )
+
+            self.assertEqual(environment, {BINDING_ENV: str(binding_path)})
+
+    def test_status_report_rejects_socket_assertion_that_conflicts_with_binding(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binding_path, _binding = self._write_binding(root)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "conflicts with the reviewed core binding",
+            ):
+                status_subprocess_environment(
+                    SimpleNamespace(core_socket="/tmp/other/core/service.sock"),
+                    environ={BINDING_ENV: str(binding_path)},
+                )
+
+    def test_status_report_accepts_matching_authoritative_socket_assertion(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binding_path, binding = self._write_binding(
+                root,
+                authority_mode="authoritative-core-v6",
+            )
+
+            environment = status_subprocess_environment(
+                SimpleNamespace(core_socket=str(binding.socket_path)),
+                environ={BINDING_ENV: str(binding_path)},
+            )
+
+            self.assertEqual(environment, {BINDING_ENV: str(binding_path)})
+
+    def test_status_report_rejects_binding_for_a_different_checkout(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binding_path, _binding = self._write_binding(
+                root,
+                repo_root=root / "other-repo",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not match the status report checkout",
+            ):
+                status_subprocess_environment(
+                    SimpleNamespace(core_socket=""),
+                    environ={BINDING_ENV: str(binding_path)},
+                )
 
     def test_status_report_renders_current_features_stack_and_non_claims(self):
         markdown = render_status_markdown(

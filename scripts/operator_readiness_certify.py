@@ -29,6 +29,21 @@ from redaction import (
     reject_sensitive_identifier,
     strip_untrusted_raw_digest_fields,
 )
+from backend_router import LEGACY_CORE_CONFIG_ENV, database_requires_core
+from core_client_binding import (
+    BINDING_ENV,
+    EXPECTED_CONFIG_ENV,
+    CoreClientBinding,
+    default_binding_path,
+    load_bound_core_config,
+    load_core_client_binding,
+)
+from scripts.core_agent_installer import (
+    DEFAULT_LABEL as DEFAULT_CORE_LABEL,
+    build_config as build_candidate_core_config,
+    resolve_paths as resolve_candidate_core_paths,
+)
+from scripts.core_cutover_preflight import core_config_evidence_contract
 
 
 DEFAULT_LAUNCHER = Path.home() / ".local" / "bin" / "synapse-s2-mcp"
@@ -45,6 +60,15 @@ RAW_DIGEST_TEXT_RE = re.compile(
     r"raw_[A-Za-z0-9_-]*sha(?:256)?)(?:['\"]?)\s*[:=]\s*"
     r"(?:['\"](?:\\.|[^'\"\\])*['\"]|[^\s,;}\]]+)"
 )
+
+_PROVIDER_EXPECTATIONS = {
+    "semantic-hash": ("semantic-hash-v1", "semantic-hash"),
+    "semantic-hash-v1": ("semantic-hash-v1", "semantic-hash"),
+    "lexical-hash": ("lexical-hash-v1", "lexical-hash"),
+    "lexical-hash-v1": ("lexical-hash-v1", "lexical-hash"),
+    "mlx-neural": ("mlx-neural-v1", "mlx-neural"),
+    "mlx-neural-v1": ("mlx-neural-v1", "mlx-neural"),
+}
 REQUIRED_PROOFS = [
     "client_config",
     "mcp_connect",
@@ -792,6 +816,37 @@ def choose_app(apps: list[dict[str, Any]], preferred: str = "") -> dict[str, Any
     return sorted(apps, key=lambda item: str(item.get("app_name") or "").lower())[0]
 
 
+def find_runtime_status(value: Any, *, _depth: int = 0) -> dict[str, Any] | None:
+    """Find the bounded runtime payload inside FastMCP's transport envelope."""
+
+    if _depth > 8:
+        return None
+    if isinstance(value, dict):
+        required = {"runtime", "dimension", "num_neurons", "embedding_provider"}
+        if required.issubset(value):
+            return value
+        for child in list(value.values())[:128]:
+            found = find_runtime_status(child, _depth=_depth + 1)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, list):
+        for child in value[:128]:
+            found = find_runtime_status(child, _depth=_depth + 1)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, str) and len(value.encode("utf-8")) <= 1_048_576:
+        candidate = value.strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            try:
+                decoded = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            return find_runtime_status(decoded, _depth=_depth + 1)
+    return None
+
+
 def app_preview_status(parsed: Any) -> tuple[str, str, str, dict[str, Any]]:
     if not isinstance(parsed, dict):
         return (
@@ -888,30 +943,281 @@ class OperatorReadinessCertifier:
             args.launcher,
             field="readiness launcher path",
         ).resolve()
-        self.args.embedding_provider = reject_sensitive_identifier(
-            args.embedding_provider,
-            field="readiness embedding provider",
+        self.args.core_label = reject_sensitive_identifier(
+            getattr(args, "core_label", DEFAULT_CORE_LABEL),
+            field="readiness core label",
         ).strip()
-        if not self.args.embedding_provider:
-            raise ValueError("readiness embedding provider must not be empty")
-        self.args.neural_model = reject_sensitive_identifier(
-            args.neural_model,
-            field="readiness neural model",
+        raw_layout_manifest = str(
+            getattr(args, "noncanonical_layout_manifest", "") or ""
         ).strip()
-        if not self.args.neural_model:
-            raise ValueError("readiness neural model must not be empty")
-        self.args.neural_cache_dir = str(
+        layout_manifest = (
             validate_evidence_path(
-                args.neural_cache_dir,
-                field="readiness neural cache path",
+                raw_layout_manifest,
+                field="readiness noncanonical layout manifest",
             )
+            if raw_layout_manifest
+            else None
         )
+        self.core_paths = resolve_candidate_core_paths(
+            label=self.args.core_label,
+            noncanonical_layout_manifest=layout_manifest,
+        )
+        self.core_binding_path = self._discover_core_binding(args)
+        self.core_binding = (
+            load_core_client_binding(self.core_binding_path)
+            if self.core_binding_path is not None
+            else None
+        )
+        if self.core_binding is None:
+            self.candidate_config = build_candidate_core_config(self.core_paths)
+        else:
+            try:
+                self.candidate_config = load_bound_core_config(self.core_binding)
+            except Exception as exc:
+                raise ValueError(
+                    "readiness core binding fingerprint does not match, or its config "
+                    "digest drifted from, "
+                    "the private reviewed configuration"
+                ) from exc
+        self.core_config_contract = core_config_evidence_contract(
+            self.candidate_config
+        )
+        self._validate_candidate_expectations(args)
+        if self.core_binding is not None:
+            self._validate_core_binding(self.core_binding)
+        self.core_config_attestation = {
+            "source": "core-binding" if self.core_binding is not None else "legacy",
+            "observed_effective_config_fingerprint": (
+                self.candidate_config.fingerprint
+            ),
+            "observed_embedding_space_identity": (
+                self.candidate_config.embedding_space_identity
+            ),
+            "config_digest": (
+                self.core_binding.config_digest
+                if self.core_binding is not None
+                else self.candidate_config.fingerprint
+            ),
+        }
         self.args.app_name = reject_sensitive_identifier(
             args.app_name,
             field="readiness app name",
         ).strip()
+        configured_socket = str(getattr(args, "core_socket", "") or "").strip()
+        if configured_socket:
+            socket_path = validate_evidence_path(
+                configured_socket,
+                field="readiness core socket",
+            )
+            if not socket_path.is_absolute() or ".." in socket_path.parts:
+                raise ValueError("readiness core socket must be an absolute normalized path")
+            if socket_path != self.candidate_config.socket_path:
+                raise ValueError(
+                    "readiness core socket does not match the candidate core configuration"
+                )
+            self.args.core_socket = str(socket_path)
+        else:
+            self.args.core_socket = ""
         self.results: list[CheckResult] = []
         self.metadata: dict[str, Any] = {}
+
+    @staticmethod
+    def _discover_core_binding(args: argparse.Namespace) -> Path | None:
+        configured = str(getattr(args, "core_binding", "") or "").strip()
+        if not configured:
+            configured = str(os.getenv(BINDING_ENV, "") or "").strip()
+        if configured:
+            reject_sensitive_identifier(
+                configured,
+                field="readiness core binding",
+            )
+            path = Path(configured).expanduser()
+        else:
+            candidate = default_binding_path()
+            if not (candidate.exists() or candidate.is_symlink()):
+                return None
+            path = candidate
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or "\x00" in str(path)
+            or Path(os.path.normpath(str(path))) != path
+        ):
+            raise ValueError(
+                "readiness core binding must be an absolute normalized path"
+            )
+        return path
+
+    def _validate_core_binding(self, binding: CoreClientBinding) -> None:
+        config = self.candidate_config
+        expected_paths = {
+            "repo_root": ROOT,
+            "data_root": self.core_paths.data_root,
+            "config_path": self.core_paths.config,
+            "socket_path": config.socket_path,
+            "state_path": config.state_path,
+            "memory_path": config.memory_path,
+            "capture_root": config.capture_root,
+            "export_root": self.core_paths.data_root / "exports",
+            "backup_root": self.core_paths.data_root / "backups",
+            "recovery_root": self.core_paths.data_root / "recovery",
+        }
+        if any(getattr(binding, field) != path for field, path in expected_paths.items()):
+            raise ValueError(
+                "readiness core binding layout does not match the candidate core configuration"
+            )
+        expected_layout = (
+            "canonical"
+            if self.core_paths.data_root == ROOT / ".synapse_s2"
+            else "reviewed-noncanonical"
+        )
+        if binding.layout != expected_layout:
+            raise ValueError(
+                "readiness core binding layout mode does not match the candidate layout"
+            )
+        if binding.core_label != self.args.core_label:
+            raise ValueError(
+                "readiness core binding label does not match the candidate core label"
+            )
+        if (
+            binding.config_fingerprint != config.fingerprint
+            or binding.embedding_space_identity != config.embedding_space_identity
+        ):
+            raise ValueError(
+                "readiness core binding fingerprint does not match the candidate core configuration"
+            )
+        try:
+            governed = database_requires_core(binding.memory_path)
+        except Exception as exc:
+            raise ValueError(
+                "readiness core binding database governance could not be verified"
+            ) from exc
+        if (
+            binding.authority_mode == "candidate-local-v5" and governed
+        ) or (
+            binding.authority_mode == "authoritative-core-v6" and not governed
+        ):
+            raise ValueError(
+                "readiness core binding authority mode does not match database governance"
+            )
+
+    @staticmethod
+    def _argument_expectation(
+        args: argparse.Namespace,
+        preferred: str,
+        legacy: str,
+    ) -> Any:
+        value = getattr(args, preferred, None)
+        return value if value is not None else getattr(args, legacy, None)
+
+    def _validate_candidate_expectations(self, args: argparse.Namespace) -> None:
+        """Fail closed when a caller's acceptance claims differ from the candidate."""
+
+        provider = self._argument_expectation(
+            args,
+            "expected_embedding_provider",
+            "embedding_provider",
+        )
+        if provider is not None:
+            safe_provider = reject_sensitive_identifier(
+                provider,
+                field="readiness expected embedding provider",
+            ).strip().lower()
+            if not safe_provider or safe_provider not in _PROVIDER_EXPECTATIONS:
+                raise ValueError("readiness expected embedding provider is invalid")
+            candidate_provider = self.candidate_config.embedding_provider_name.strip().lower()
+            if _PROVIDER_EXPECTATIONS[safe_provider] != _PROVIDER_EXPECTATIONS[candidate_provider]:
+                raise ValueError(
+                    "readiness embedding provider expectation does not match candidate config"
+                )
+
+        for preferred, legacy, expected, label in (
+            (
+                "expected_dimension",
+                "dimension",
+                self.candidate_config.dimension,
+                "dimension",
+            ),
+            (
+                "expected_neurons",
+                "neurons",
+                self.candidate_config.num_neurons,
+                "neurons",
+            ),
+            (
+                "expected_top_k",
+                "top_k",
+                self.candidate_config.default_top_k,
+                "top_k",
+            ),
+        ):
+            value = self._argument_expectation(args, preferred, legacy)
+            if value is not None and (type(value) is not int or value != expected):
+                raise ValueError(
+                    f"readiness {label} expectation does not match candidate config"
+                )
+
+        neural = self.candidate_config.embedding_provider_name.strip().lower() in {
+            "mlx-neural",
+            "mlx-neural-v1",
+        }
+        neural_values = {
+            "model": self._argument_expectation(
+                args, "expected_neural_model", "neural_model"
+            ),
+            "revision": getattr(args, "expected_neural_revision", None),
+            "pooling": getattr(args, "expected_neural_pooling", None),
+            "max_tokens": getattr(args, "expected_neural_max_tokens", None),
+            "normalize": getattr(args, "expected_neural_normalize", None),
+            "local_files_only": self._argument_expectation(
+                args,
+                "expected_neural_local_files_only",
+                "neural_local_files_only",
+            ),
+            "cache_dir": self._argument_expectation(
+                args, "expected_neural_cache_dir", "neural_cache_dir"
+            ),
+        }
+        for key in ("model", "revision", "pooling"):
+            value = neural_values[key]
+            if value is not None:
+                neural_values[key] = reject_sensitive_identifier(
+                    value,
+                    field=f"readiness expected neural {key}",
+                ).strip()
+        if neural_values["cache_dir"] is not None:
+            neural_values["cache_dir"] = str(
+                validate_evidence_path(
+                    neural_values["cache_dir"],
+                    field="readiness expected neural cache path",
+                )
+            )
+        if not neural:
+            if any(value is not None for value in neural_values.values()):
+                raise ValueError(
+                    "readiness neural expectations require a neural candidate config"
+                )
+            return
+        expected_neural = {
+            "model": self.candidate_config.embedding_neural_model_id,
+            "revision": self.candidate_config.embedding_neural_revision,
+            "pooling": self.candidate_config.embedding_neural_pooling,
+            "max_tokens": self.candidate_config.embedding_neural_max_tokens,
+            "normalize": self.candidate_config.embedding_neural_normalize,
+            "local_files_only": (
+                self.candidate_config.embedding_neural_local_files_only
+            ),
+            "cache_dir": (
+                None
+                if self.candidate_config.embedding_neural_cache_dir is None
+                else str(self.candidate_config.embedding_neural_cache_dir)
+            ),
+        }
+        for key, value in neural_values.items():
+            if value is not None and value != expected_neural[key]:
+                raise ValueError(
+                    f"readiness neural {key} expectation does not match candidate config"
+                )
 
     def run(self) -> dict[str, Any]:
         if self.pack_dir.exists() or self.pack_dir.is_symlink():
@@ -941,6 +1247,7 @@ class OperatorReadinessCertifier:
         return self._finalize()
 
     def _run_metadata(self) -> dict[str, Any]:
+        config = self.candidate_config
         return {
             "action": "operator-readiness-certification",
             "run_id": self.run_id,
@@ -958,15 +1265,36 @@ class OperatorReadinessCertifier:
                 "python": sys.version.split()[0],
             },
             "launcher": str(self.launcher),
-            "embedding_provider": self.args.embedding_provider,
+            "core_config_contract": self.core_config_contract,
+            "embedding_provider": config.embedding_provider_name,
             "topology": {
-                "dimension": int(self.args.dimension),
-                "neurons": int(self.args.neurons),
-                "top_k": int(self.args.top_k),
+                "dimension": config.dimension,
+                "neurons": config.num_neurons,
+                "top_k": config.default_top_k,
             },
-            "neural_model": self.args.neural_model,
-            "neural_local_files_only": bool(self.args.neural_local_files_only),
-            "memory_db": str((ROOT / ".synapse_s2" / "memory.sqlite3").resolve()),
+            "neural_model": config.embedding_neural_model_id,
+            "neural_revision": config.embedding_neural_revision,
+            "neural_pooling": config.embedding_neural_pooling,
+            "neural_max_tokens": config.embedding_neural_max_tokens,
+            "neural_normalize": config.embedding_neural_normalize,
+            "neural_local_files_only": config.embedding_neural_local_files_only,
+            "authority_route": {
+                "mode": (
+                    self.core_binding.authority_mode
+                    if self.core_binding is not None
+                    else "explicit-socket"
+                    if self.args.core_socket
+                    else "durable-marker"
+                ),
+                "source": "core-binding" if self.core_binding is not None else "legacy",
+                "socket": str(config.socket_path),
+                "candidate_config_fingerprint": config.fingerprint,
+                "binding_digest": (
+                    self.core_binding.digest
+                    if self.core_binding is not None
+                    else None
+                ),
+            },
         }
 
     def _git_metadata(self) -> dict[str, Any]:
@@ -989,22 +1317,28 @@ class OperatorReadinessCertifier:
 
     def _base_env(self) -> dict[str, str]:
         env = dict(os.environ)
-        env.setdefault("MLX_DEVICE", "gpu")
-        env["SYNAPSE_S2_EMBEDDING_PROVIDER"] = str(self.args.embedding_provider)
-        env["SYNAPSE_S2_DIMENSION"] = str(self.args.dimension)
-        env["SYNAPSE_S2_NEURONS"] = str(self.args.neurons)
-        env["SYNAPSE_S2_TOP_K"] = str(self.args.top_k)
-        env.setdefault("SYNAPSE_S2_RECALL_COUNT", "10")
-        env.setdefault("SYNAPSE_S2_STATE_PATH", str(ROOT / ".synapse_s2" / "runtime_state.json"))
-        env.setdefault("SYNAPSE_S2_MEMORY_DB", str(ROOT / ".synapse_s2" / "memory.sqlite3"))
-        env.setdefault("SYNAPSE_S2_EXPORT_DIR", str(ROOT / ".synapse_s2"))
-        env.setdefault("SYNAPSE_S2_CAPTURE_ROOT", str(ROOT / ".synapse_s2"))
-        if str(self.args.embedding_provider).startswith("mlx-neural"):
-            env["SYNAPSE_S2_NEURAL_MODEL"] = str(self.args.neural_model)
-            env["SYNAPSE_S2_NEURAL_CACHE_DIR"] = str(
-                Path(self.args.neural_cache_dir).expanduser().resolve()
-            )
-            env["SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY"] = "1" if self.args.neural_local_files_only else "0"
+        for name in (
+            BINDING_ENV,
+            EXPECTED_CONFIG_ENV,
+            "MLX_DEVICE",
+            "SYNAPSE_S2_CORE_SOCKET",
+            "SYNAPSE_S2_STATE_PATH",
+            "SYNAPSE_S2_MEMORY_DB",
+            "SYNAPSE_S2_EXPORT_DIR",
+            "SYNAPSE_S2_CAPTURE_ROOT",
+        ):
+            env.pop(name, None)
+        for name in LEGACY_CORE_CONFIG_ENV:
+            env.pop(name, None)
+        if self.core_binding is not None:
+            env[BINDING_ENV] = str(self.core_binding_path)
+        elif self.args.core_socket:
+            env["SYNAPSE_S2_CORE_SOCKET"] = self.args.core_socket
+        else:
+            env["SYNAPSE_S2_STATE_PATH"] = str(self.candidate_config.state_path)
+            env["SYNAPSE_S2_MEMORY_DB"] = str(self.candidate_config.memory_path)
+            env["SYNAPSE_S2_EXPORT_DIR"] = str(self.core_paths.data_root / "exports")
+            env["SYNAPSE_S2_CAPTURE_ROOT"] = str(self.candidate_config.capture_root)
         return env
 
     def _cli_command(self, *parts: str) -> list[str]:
@@ -1012,14 +1346,6 @@ class OperatorReadinessCertifier:
             self.python,
             str(ROOT / "synapse_cli.py"),
             "--json",
-            "--embedding-provider",
-            str(self.args.embedding_provider),
-            "--dimension",
-            str(self.args.dimension),
-            "--neurons",
-            str(self.args.neurons),
-            "--top-k",
-            str(self.args.top_k),
             *parts,
         ]
 
@@ -1181,10 +1507,17 @@ class OperatorReadinessCertifier:
                 {"client_count": len(clients), "pending_changes": changed},
             )
 
+        command = [
+            self.python,
+            str(ROOT / "scripts" / "install_client_configs.py"),
+            "--dry-run",
+        ]
+        if self.core_binding_path is not None:
+            command.extend(["--core-binding", str(self.core_binding_path)])
         self._run_command(
             "client_config",
             label="Client config dry-run",
-            command=[self.python, str(ROOT / "scripts" / "install_client_configs.py"), "--dry-run"],
+            command=command,
             required=True,
             timeout=30,
             evaluator=evaluate,
@@ -1249,12 +1582,79 @@ class OperatorReadinessCertifier:
                     "Open the parsed artifact and fix the launcher or MCP server import error.",
                     {},
                 )
-            ready = "runtime" in stdout and "ready" in stdout.lower()
+            runtime = find_runtime_status(parsed)
+            if runtime is None:
+                return (
+                    "blocked",
+                    "FastMCP status call omitted a machine-verifiable runtime payload.",
+                    "Inspect the installed launcher status response and restore the closed runtime contract.",
+                    {},
+                )
+            config = self.candidate_config
+            provider = dict(runtime.get("embedding_provider") or {})
+            expected_provider_id, _provider_type = _PROVIDER_EXPECTATIONS[
+                config.embedding_provider_name.strip().lower()
+            ]
+            exact_matches = {
+                "runtime_ready": runtime.get("runtime") == "ready",
+                "dimension": runtime.get("dimension") == config.dimension,
+                "num_neurons": runtime.get("num_neurons") == config.num_neurons,
+                "default_top_k": runtime.get("default_top_k") == config.default_top_k,
+                "recall_count": runtime.get("recall_count") == config.recall_count,
+                "quick_pruning_interval_seconds": runtime.get(
+                    "quick_pruning_interval_seconds"
+                )
+                == config.quick_pruning_interval_seconds,
+                "idle_deep_sleep_seconds": runtime.get("idle_deep_sleep_seconds")
+                == config.idle_deep_sleep_seconds,
+                "mlx_device": str(runtime.get("mlx_device") or "").lower()
+                == config.mlx_device,
+                "embedding_provider": provider.get("provider")
+                == expected_provider_id,
+            }
+            if config.embedding_provider_name.strip().lower() in {
+                "mlx-neural",
+                "mlx-neural-v1",
+            }:
+                details = dict(provider.get("details") or {})
+                exact_matches.update(
+                    {
+                        "neural_model_id": provider.get("model_id")
+                        == config.embedding_neural_model_id,
+                        "neural_revision": details.get("revision")
+                        == (config.embedding_neural_revision or ""),
+                        "neural_pooling": provider.get("pooling")
+                        == config.embedding_neural_pooling,
+                        "neural_max_tokens": details.get("max_tokens")
+                        == config.embedding_neural_max_tokens,
+                        "neural_normalize": provider.get("normalized")
+                        is config.embedding_neural_normalize,
+                        "neural_local_files_only": details.get(
+                            "local_files_only"
+                        )
+                        is config.embedding_neural_local_files_only,
+                    }
+                )
+            if config.require_native:
+                exact_matches["native_runtime"] = runtime.get("mlx_available") is True
+            ready = all(exact_matches.values())
+            attestation = dict(self.core_config_attestation)
             return (
-                "ready" if ready else "degraded",
-                "FastMCP status call returned runtime payload." if ready else "FastMCP status call returned without a clear ready payload.",
-                "Inspect FastMCP call stdout and resolve runtime status if not ready.",
-                {"runtime_ready_text_seen": ready},
+                "ready" if ready else "blocked",
+                (
+                    "Installed launcher runtime exactly matched the reviewed CoreConfig."
+                    if ready
+                    else "Installed launcher runtime drifted from the reviewed CoreConfig."
+                ),
+                (
+                    ""
+                    if ready
+                    else "Republish the candidate config and binding, reinstall client configs, then rerun readiness."
+                ),
+                {
+                    "exact_matches": exact_matches,
+                    **attestation,
+                },
             )
 
         self._run_command(
@@ -1309,6 +1709,12 @@ class OperatorReadinessCertifier:
         )
 
     def _check_neural_embedding(self) -> None:
+        config = self.candidate_config
+        provider_id, provider_type_expected = _PROVIDER_EXPECTATIONS[
+            config.embedding_provider_name.strip().lower()
+        ]
+        expected_neural = provider_type_expected == "mlx-neural"
+
         def evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0 or not isinstance(parsed, dict):
                 return (
@@ -1319,44 +1725,149 @@ class OperatorReadinessCertifier:
                 )
             provider = dict(parsed.get("embedding_provider") or {})
             provider_type = str(provider.get("provider_type") or "")
+            observed_provider_id = str(provider.get("provider") or "")
             nonzero = int(parsed.get("vector_nonzero_count") or 0)
             native = bool(provider.get("native_mlx"))
-            expected_neural = str(self.args.embedding_provider).startswith("mlx-neural")
-            ready = nonzero > 0 and (not expected_neural or (provider_type == "mlx-neural" and native))
+            details = dict(provider.get("details") or {})
+            exact_matches: dict[str, bool] = {
+                "provider": observed_provider_id == provider_id,
+                "provider_type": provider_type == provider_type_expected,
+                "result_dimensions": parsed.get("dimensions") == config.dimension,
+                "provider_dimensions": provider.get("dimensions") == config.dimension,
+                "local_only": provider.get("local_only") is True,
+            }
+            if expected_neural:
+                exact_matches.update(
+                    {
+                        "model_id": (
+                            provider.get("model_id")
+                            == config.embedding_neural_model_id
+                        ),
+                        "revision": (
+                            details.get("revision")
+                            == (config.embedding_neural_revision or "")
+                        ),
+                        "pooling": (
+                            provider.get("pooling")
+                            == config.embedding_neural_pooling
+                        ),
+                        "max_tokens": (
+                            details.get("max_tokens")
+                            == config.embedding_neural_max_tokens
+                        ),
+                        "normalize": (
+                            provider.get("normalized")
+                            is config.embedding_neural_normalize
+                        ),
+                        "local_files_only": (
+                            details.get("local_files_only")
+                            is config.embedding_neural_local_files_only
+                        ),
+                        "native_mlx": native,
+                    }
+                )
+            ready = nonzero > 0 and all(exact_matches.values())
             detail = (
-                f"{provider_type or provider.get('provider', 'unknown')} produced {nonzero} nonzero dims "
-                f"in {parsed.get('average_latency_ms')} ms; native_mlx={native}."
+                f"{provider_type or observed_provider_id or 'unknown'} produced "
+                f"{nonzero} nonzero dims in {parsed.get('average_latency_ms')} ms; "
+                f"candidate_config_match={all(exact_matches.values())}."
             )
             repair = ""
             if not ready:
-                repair = "Run with --embedding-provider mlx-neural after the model is cached locally, or repair MLX neural dependencies."
+                repair = (
+                    "Run the exact candidate core configuration; for neural mode, "
+                    "cache its pinned immutable model revision and repair MLX dependencies."
+                )
             return (
                 "ready" if ready else "blocked",
                 detail,
                 repair,
                 {
                     "provider_type": provider_type,
+                    "provider": observed_provider_id,
                     "native_mlx": native,
                     "vector_nonzero_count": nonzero,
                     "average_latency_ms": parsed.get("average_latency_ms"),
                     "model_id": provider.get("model_id"),
                     "runtime_source": (provider.get("details") or {}).get("runtime_source"),
+                    "candidate_config_fingerprint": config.fingerprint,
+                    "exact_matches": exact_matches,
                 },
             )
 
-        self._run_command(
-            "neural_embedding",
-            label="Embedding provider proof",
-            command=self._cli_command(
+        routed_to_core = (
+            (
+                self.core_binding is not None
+                and self.core_binding.authority_mode == "authoritative-core-v6"
+            )
+            or bool(self.args.core_socket)
+            or database_requires_core(config.memory_path)
+        )
+        command = [self.python, str(ROOT / "synapse_cli.py"), "--json"]
+        probe_env = self._base_env()
+        if not routed_to_core and self.core_binding is None:
+            command.extend(
+                [
+                    "--dimension",
+                    str(config.dimension),
+                    "--neurons",
+                    str(config.num_neurons),
+                    "--top-k",
+                    str(config.default_top_k),
+                    "--embedding-provider",
+                    config.embedding_provider_name,
+                ]
+            )
+            if expected_neural:
+                probe_env.update(
+                    {
+                        "SYNAPSE_S2_NEURAL_MODEL": str(
+                            config.embedding_neural_model_id
+                        ),
+                        "SYNAPSE_S2_NEURAL_REVISION": str(
+                            config.embedding_neural_revision
+                        ),
+                        "SYNAPSE_S2_NEURAL_POOLING": str(
+                            config.embedding_neural_pooling
+                        ),
+                        "SYNAPSE_S2_NEURAL_MAX_TOKENS": str(
+                            config.embedding_neural_max_tokens
+                        ),
+                        "SYNAPSE_S2_NEURAL_NORMALIZE": (
+                            "true"
+                            if config.embedding_neural_normalize
+                            else "false"
+                        ),
+                        "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY": (
+                            "true"
+                            if config.embedding_neural_local_files_only
+                            else "false"
+                        ),
+                    }
+                )
+                if config.embedding_neural_cache_dir is not None:
+                    probe_env["SYNAPSE_S2_NEURAL_CACHE_DIR"] = str(
+                        config.embedding_neural_cache_dir
+                    )
+        command.extend(
+            [
                 "provider-benchmark",
                 "--text",
                 f"SYNAPSE-S2 readiness neural embedding proof {self.run_id}",
                 "--runs",
                 "1",
-            ),
+                "--embedding-dimensions",
+                str(config.dimension),
+            ]
+        )
+        self._run_command(
+            "neural_embedding",
+            label="Embedding provider proof",
+            command=command,
             required=True,
             timeout=120,
             evaluator=evaluate,
+            env=probe_env,
         )
 
     def _check_doctor(self) -> None:
@@ -1830,8 +2341,6 @@ class OperatorReadinessCertifier:
             label="Capture ledger integrity audit",
             command=self._cli_command(
                 "capture-ledger-integrity",
-                "--capture-root",
-                str(ROOT / ".synapse_s2"),
                 "--sample-limit",
                 "20",
             ),
@@ -1857,12 +2366,6 @@ class OperatorReadinessCertifier:
                     repair="Repair and re-audit the capture ledger before creating recovery artifacts.",
                 )
             return
-
-        recovery_root = ROOT / ".synapse_s2" / "backups" / "verified"
-        ensure_private_directory(recovery_root)
-        database_path = recovery_root / (
-            f"readiness-{safe_filename(self.run_id)}.sqlite3"
-        )
 
         def backup_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0 or not isinstance(parsed, dict):
@@ -1907,10 +2410,6 @@ class OperatorReadinessCertifier:
             label="Paired recovery backup",
             command=self._cli_command(
                 "backup-recovery",
-                "--output",
-                str(database_path),
-                "--capture-root",
-                str(ROOT / ".synapse_s2"),
                 "--purpose",
                 "operator-readiness",
                 "--pinned",
@@ -1975,8 +2474,6 @@ class OperatorReadinessCertifier:
                 "verify-recovery",
                 "--receipt",
                 receipt_path,
-                "--capture-root",
-                str(ROOT / ".synapse_s2"),
             ),
             required=True,
             timeout=300,
@@ -1993,7 +2490,11 @@ class OperatorReadinessCertifier:
             )
             return
 
-        staging_root = ROOT / ".synapse_s2" / "recovery-staging"
+        staging_root = (
+            self.core_binding.recovery_root
+            if self.core_binding is not None
+            else self.core_paths.data_root / "recovery"
+        )
         ensure_private_directory(staging_root)
 
         def restore_evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
@@ -2045,8 +2546,6 @@ class OperatorReadinessCertifier:
                     receipt_path,
                     "--output-root",
                     str(restore_root),
-                    "--capture-root",
-                    str(ROOT / ".synapse_s2"),
                     "--confirm",
                 ),
                 required=True,
@@ -2280,8 +2779,10 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         str(manifest["context_id"]),
         "--agent-id",
         str(manifest["agent_id"]),
-        "--embedding-provider",
-        str(manifest["embedding_provider"]),
+        # This is an acceptance expectation for the provider reported by the
+        # core, not a client-side request to configure a neural backend.
+        "--expect-embedding-provider",
+        str(manifest.get("embedding_provider") or "mlx-neural"),
     ]
     lines = [
         "# Operator Readiness Runbook",
@@ -2299,7 +2800,7 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         "- Client configs dry-run without pending changes.",
         "- FastMCP connects to the installed local launcher and lists SYNAPSE-S2 tools.",
         "- The installed launcher returns the compact MCP contract within the separate 12,288-byte structured and 4,096-byte safety-channel ceilings.",
-        "- The requested embedding provider produces a non-empty local vector; `mlx-neural` must report native MLX.",
+        "- The exact candidate core configuration is embedded in the manifest and its provider produces a non-empty local vector; `mlx-neural` must match every pinned model setting and report native MLX.",
         "- Doctor is clean or returns concrete repair steps.",
         "- Start Work generates an operator brief from real memory.",
         "- A unique readiness trace is written to the local SQLite memory DB.",
@@ -2324,13 +2825,80 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--output-dir", default=str(ROOT / ".synapse_s2" / "evidence_packs"))
     parser.add_argument("--launcher", default=str(DEFAULT_LAUNCHER))
-    parser.add_argument("--embedding-provider", default="mlx-neural")
-    parser.add_argument("--dimension", type=int, default=1024)
-    parser.add_argument("--neurons", type=int, default=8192)
-    parser.add_argument("--top-k", type=int, default=256)
-    parser.add_argument("--neural-model", default=DEFAULT_NEURAL_MODEL)
-    parser.add_argument("--neural-cache-dir", default=str(ROOT / ".synapse_s2" / "models"))
-    parser.add_argument("--neural-local-files-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--core-socket",
+        default=os.getenv("SYNAPSE_S2_CORE_SOCKET", ""),
+        help="Optional matching legacy socket assertion; a reviewed core binding remains authoritative.",
+    )
+    parser.add_argument(
+        "--core-binding",
+        default="",
+        help="Owner-only core binding; defaults to SYNAPSE_S2_CORE_BINDING or ~/.config/synapse-s2/core-binding.json.",
+    )
+    parser.add_argument(
+        "--core-label",
+        default=os.getenv("SYNAPSE_S2_CORE_LABEL", DEFAULT_CORE_LABEL),
+    )
+    parser.add_argument(
+        "--noncanonical-layout-manifest",
+        default=os.getenv("SYNAPSE_S2_NONCANONICAL_LAYOUT_MANIFEST", ""),
+        help="Private reviewed manifest authorizing the candidate noncanonical layout.",
+    )
+    parser.add_argument(
+        "--expect-embedding-provider",
+        "--embedding-provider",
+        dest="expected_embedding_provider",
+        default=None,
+        help="Optional assertion; the candidate installer configuration remains authoritative.",
+    )
+    parser.add_argument(
+        "--expect-dimension",
+        "--dimension",
+        dest="expected_dimension",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--expect-neurons",
+        "--neurons",
+        dest="expected_neurons",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--expect-top-k",
+        "--top-k",
+        dest="expected_top_k",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--expect-neural-model",
+        "--neural-model",
+        dest="expected_neural_model",
+        default=None,
+    )
+    parser.add_argument("--expect-neural-revision", default=None)
+    parser.add_argument("--expect-neural-pooling", default=None)
+    parser.add_argument("--expect-neural-max-tokens", type=int, default=None)
+    parser.add_argument(
+        "--expect-neural-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--expect-neural-cache-dir",
+        "--neural-cache-dir",
+        dest="expected_neural_cache_dir",
+        default=None,
+    )
+    parser.add_argument(
+        "--expect-neural-local-files-only",
+        "--neural-local-files-only",
+        dest="expected_neural_local_files_only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--app-name", default="")
     parser.add_argument("--no-zip", dest="zip", action="store_false", default=True)
     parser.add_argument("--json", action="store_true")

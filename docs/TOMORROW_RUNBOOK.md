@@ -2,32 +2,114 @@
 
 This is the fast operator path for using SYNAPSE-S2 from this Mac tomorrow.
 
+Rollout status remains separate from repository capability: live production is
+still the untouched legacy-v5 service. None of the Phase 7 implementation,
+tests, or runbook text below claims deployment or publication to either remote.
+
 ## Monday operator-trust certification
 
-Run this first when the question is "can we trust SYNAPSE-S2 for real work right now?"
+On an already bound installation, run this first when the question is "can we
+trust SYNAPSE-S2 for real work right now?" For the first local-v5 cutover,
+publish the candidate binding described below before running it.
 
 ```bash
 cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
 .venv/bin/python scripts/operator_readiness_certify.py \
   --context default \
   --agent-id codex-desktop \
-  --embedding-provider mlx-neural
+  --expect-embedding-provider mlx-neural
 ```
 
-The certifier writes one evidence pack under `.synapse_s2/evidence_packs/` and exits non-zero unless client config, MCP connection, the required compact MCP contract probe, native neural embedding, Doctor, Start Work, real memory write and recall, App Connect no-write preview, Wrap Session persistence, and dashboard smoke are all ready. Start with this pack before showing coworkers the system.
+The certifier derives the exact candidate configuration through the same
+installer path used at cutover. The optional `--expect-*` arguments are
+assertions against that candidate, not client-side configuration overrides. Its
+manifest embeds the canonical `synapse-s2.core-config-evidence.v1` contract and
+candidate configuration fingerprint. The certifier exits non-zero unless client
+config, MCP connection, the required compact MCP contract probe, native neural
+embedding, Doctor, Start Work, real memory write and recall, App Connect
+no-write preview, Wrap Session persistence, dashboard smoke, signed recovery,
+and isolated restore are all ready.
 
 The detailed certification runbook is `docs/OPERATOR_READINESS_CERTIFICATION.md`.
 The installed-client response schema and byte-budget contract are documented in
 `docs/TOKEN_CONTRACTS.md`.
 
-## One-command install and preflight
+## Authoritative-core status, cutover, and preflight
+
+Every production surface uses one authority. Check it first:
+
+```bash
+scripts/install_core_agent.sh status
+```
+
+Installed clients read only the binding pointer from their configuration. The
+canonical owner-only binding is
+`~/.config/synapse-s2/core-binding.json`. It pins one complete reviewed layout,
+the core label, private canonical CoreConfig path and digest, exact
+configuration fingerprint, embedding-space identity, and
+one of two modes: `candidate-local-v5` before first adoption or
+`authoritative-core-v6` after stable activation.
+
+For a first cutover, publish the candidate binding before certification, then
+install the launcher and client configs that consume it:
+
+```bash
+scripts/install_core_agent.sh publish-binding
+scripts/install_local_launcher.sh
+.venv/bin/python scripts/install_client_configs.py
+.venv/bin/python scripts/operator_readiness_certify.py \
+  --context default \
+  --agent-id codex-desktop \
+  --expect-embedding-provider mlx-neural
+```
+
+`publish-binding` refuses a database already governed by schema v6. For a v6
+replacement, require the existing status response to report
+`client_binding.ready: true`; never downgrade it to candidate mode. A reviewed
+noncanonical layout must pass the same `--noncanonical-layout-manifest` to
+`publish-binding`, the readiness certifier, and `install`.
+
+After the certifier's last accepted write, stop the exact legacy
+dashboard/capture/MCP writer processes and follow
+`docs/AUTHORITATIVE_CORE_OPERATIONS.md`. The only prep command allowed to claim
+the store requires the fresh evidence path explicitly:
+
+```bash
+scripts/prep_tomorrow.sh --apply \
+  --install-core /absolute/path/to/manifest.json
+```
+
+The apply path does not trust a coarse backup timestamp or row-count match. It
+recomputes the live logical memory digest, capture manifest, runtime-state
+canonical digest, and authoritative-v6 request-journal digest, compares them
+to the signed bundle and isolated restore, then publishes the private signed
+`core/cutover-attestation.json`. That receipt is bound to the exact build,
+config, clean HEAD, and evidence pack and expires within ten minutes. A missing,
+drifted, near-expiry, or signer-mismatched binding stops before installation.
+After stable authenticated health and an embedded-capture heartbeat, the
+installer atomically replaces the candidate document with an
+`authoritative-core-v6` binding. Every CoreClient request carries its expected
+configuration fingerprint, so stale or cross-layout clients fail before
+journal acceptance or dispatch. Confirm the transition:
+
+```bash
+scripts/install_core_agent.sh status
+# Require healthy=true, capture_ready=true, and client_binding.ready=true.
+```
+
+The prep command is certification-only by default:
 
 ```bash
 cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
-scripts/prep_tomorrow.sh
+scripts/prep_tomorrow.sh --verify-only
 ```
 
-The prep script installs or refreshes the local launcher and capture sidecar, runs the unit suite, checks bytecode compilation, writes factual preflight evidence into the selected context, verifies graph ingestion, profiles the runtime resource envelope, writes a native certification evidence payload, runs CLI preflight, exercises the FastMCP launcher and client-session bridge, verifies context-bus pull and acknowledgement, smokes the local dashboard, and writes a signed paired SQLite plus exactly-once capture recovery point into `.synapse_s2/backups/verified`.
+Before any production directory, installer, client configuration, LaunchAgent,
+or memory state is changed, the prep script requires an existing environment,
+a clean and stable worktree, fresh clean-HEAD evidence when applying, the full
+unit suite, an in-memory source compile pass, and a valid deterministic build
+identity. It never runs `uv sync` on the operator's behalf. It never starts the
+legacy standalone capture daemon.
 
 For an audit pass that avoids installs, memory writes, inbox processing, MCP wrapper launches, dashboard smoke, maintenance, and backup writes:
 
@@ -35,21 +117,34 @@ For an audit pass that avoids installs, memory writes, inbox processing, MCP wra
 scripts/prep_tomorrow.sh --verify-only
 ```
 
-Use the full command after verify-only passes and before the presentation, because the full path proves the mutating capture, context-bus, dashboard, maintenance, and backup lifecycle.
+Only the explicit `--apply --install-core <manifest>` stage may install the
+core, launcher, and all client configs, then write factual preflight evidence,
+exercise graph/capture/context-bus/dashboard/maintenance flows, and create the
+signed paired recovery point. All immutable gates rerun in the same invocation
+before that apply marker, so an earlier verification run cannot be substituted
+for current source or evidence.
 
 To refresh local client registration directly:
 
 ```bash
 scripts/install_local_launcher.sh
 scripts/install_client_configs.py
-scripts/install_capture_daemon.sh
+scripts/install_dashboard_agent.sh
 ```
+
+`scripts/install_capture_daemon.sh` is retained only for deliberate pre-cutover
+v5 maintenance. It fails closed before any launchd or filesystem mutation when
+the v6 authority marker or core LaunchAgent is present.
 
 Restart Codex, Claude Desktop, and Claude Code after the client-config installer reports changes. Existing sessions usually do not hot-reload newly added MCP server definitions. New SYNAPSE-S2 MCP server processes perform observation-only startup hydration, enter a strict Cortex Governor session, and drop a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the process exits. Startup never leases or acknowledges unseen events. A client leases events only through an explicit hydrate/pull call and acknowledges the returned receipt ids only after successful use. The exit path also commits a typed `follow_up` cortical trace so the lifecycle is visible in Cortex state.
 
 ## Hardened local contract
 
 - Dashboard HTTP is strictly local. Binding to `0.0.0.0` or any non-loopback interface fails; remote access requires a separately authenticated and reviewed gateway.
+- Dashboard API GET and POST calls require both a port-specific HttpOnly, SameSite=Strict cookie and the distinct `X-Synapse-Dashboard-Session` capability obtained through the rotating owner-only bootstrap. POST also requires the exact configured Host and same-origin Origin. The auth file is `0600` inside a `0700` directory and contains no cookie secret; the browser keeps the header capability only in port-scoped `sessionStorage` and scrubs it from the bootstrap fragment.
+- Schema v6 is service-owned. If the core socket is unavailable, adapters return service unavailable/outcome unknown; they do not construct a local backend or replay an ambiguous mutation.
+- Client layout is binding-owned. Direct socket, database, state, capture, export, or neural settings that conflict with the owner-only binding fail closed; a candidate binding cannot operate a governed v6 database and an authoritative binding cannot operate an ungoverned v5 database.
+- The core is the only capture worker. The separate legacy capture LaunchAgent must remain absent after cutover.
 - Capture inbox payloads are redacted before the pending file is written. Pending, processed, error, export, backup, runtime, and SQLite paths are created private to the local user where the filesystem permits it.
 - Capture processing refuses symlinks and oversized payloads. It does not follow arbitrary filesystem targets from the inbox.
 - Direct `capture-session`, MCP `capture_spiking_conversation`, context-bus deployments, graph metadata, and returned API payloads all share the same redaction layer.
@@ -62,6 +157,8 @@ Restart Codex, Claude Desktop, and Claude Code after the client-config installer
 - Installed MCP clients default to `synapse-s2.token-contract.v1` compact responses with a 12,288-byte post-redaction UTF-8 ceiling for authoritative `structuredContent` on memory list, graph, agent hydration, and Cortex state calls. MCP also emits one separate compact safety `TextContent` item bounded to 4,096 bytes; full-mode safety text is bounded separately to 131,072 bytes. Outer JSON-RPC framing is excluded from all three ceilings. `response_mode="full"` is an explicit bounded diagnostic choice, never an automatic fallback.
 - CLI `agent-brief`, `list-memory`, `graph`, and `cortex-state` use the same compact envelope by default. Use `--response-mode full --max-response-bytes <4096..131072>` for bounded diagnostics or `--response-mode legacy` only for a known compatibility consumer.
 - Compact hydration preserves a one-to-one mapping from every leased `receipt_id` to a visible deployment event. Projection failure releases acquired leases; only a later exact-receipt acknowledgement advances durable delivery state.
+- A deterministic no-effect ACK, release, or dead-letter request becomes a terminal `failed` / `invalid_request` journal row; a genuinely uncertain commit remains `outcome_unknown` and is never replayed. Credential-shaped delivery identifiers fail before journal admission. Terminal rows retain dedup evidence until age-based pruning, so total retained-row throughput remains finite even though deterministic rejects do not consume accepted-row capacity.
+- Raw `register_trace` and `query` vectors must match the configured dimension before journal admission. The exact steady float32 dense topology must fit 384 MiB before MLX loading, materialization, or resize; this is not peak-residency, target-hardware, or execution-time proof.
 - Critical/high, action-required, and protected contract warnings survive compact projection. Noncritical warnings may be omitted only as complete items with a truthful omission count. MCP consumers must treat `structuredContent` as authoritative; safety text is a bounded decision aid.
 - The loopback dashboard stays on its rich local API. The MCP compact profile does not reduce Namespace Galaxy, ganglion, neuron, or graph inspection payloads in the browser.
 
@@ -85,7 +182,7 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | `mcp_contract_probe` | The installed launcher did not return the exact compact schema/budget, independently verified canonical size, or the separate bounded safety summary. | Reinstall the launcher and client configs, restart the MCP client, then rerun certification. Inspect `docs/TOKEN_CONTRACTS.md` before changing a ceiling. |
 | `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Capture a real trace with `synapse_cli.py --json remember-text --context default --tag <tag> --text <text>`. |
 | `relationship_minimum_met` | The selected context has too few persisted event relationships for the requested gate. | Run the event graph ingestion command below. |
-| `resource_envelope_met` | The default topology is outside the configured 96-384 MB estimated resource envelope. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then adjust `SYNAPSE_S2_NEURONS` or topology CLI args. |
+| `resource_envelope_met` | The steady float32 topology exceeds the configured operating target or 384 MiB admission ceiling. | Inspect `synapse_cli.py --json profile --benchmark-quick-prune`, then review the bound topology; do not claim peak-residency or hardware proof from this calculation. |
 | `native_certification_ready` | Strict MLX/mlxsnn certification failed. | Run `synapse_cli.py --json certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope` and inspect `failed_checks`. |
 | `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context default`. |
 | `query_returned_context` | Recall did not return a registered context. | Seed or remember a matching trace, then query again. |
@@ -369,7 +466,7 @@ Native certification:
   --output .synapse_s2/native-certification.json
 ```
 
-The default topology should report `within_target_envelope: true` for the 96-384 MB Mac-optimized target and a quick-pruning result with `within_60ms_budget: true`. Certification additionally checks MLX availability, `mx.compile`, `mlxsnn`, active `mlxsnn.Leaky` execution path, local embedding provider provenance, and any requested GPU/envelope gates. This is implementation-level runtime evidence from the live MLX arrays, not an external Apple Instruments profiler trace.
+The default topology should report `within_target_envelope: true` for the 96-384 MiB Mac-optimized target and a quick-pruning result with `within_60ms_budget: true`. Independently, core admission requires the exact steady float32 topology to fit the 384 MiB ceiling before MLX load or array materialization/resize, and raw query/register vectors must match the configured dimension before journaling. Certification additionally checks MLX availability, `mx.compile`, `mlxsnn`, active `mlxsnn.Leaky` execution path, local embedding provider provenance, and any requested GPU/envelope gates. These are steady-array and implementation-level runtime signals, not an external Instruments measurement of peak residency, a guarantee for every target Mac, or timing proof beyond the measured quick-prune run.
 
 Embedding provider provenance:
 
@@ -393,8 +490,7 @@ The benchmark should report `embedding_provider.provider: mlx-neural-v1`, `model
 Audit capture-ledger authority before backup:
 
 ```bash
-.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
-  --capture-root .synapse_s2
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity
 ```
 
 Proceed only when the result is `ready`, `verification_passed` is true, and the
@@ -404,11 +500,9 @@ then run the separately confirmed repair and repeat the read-only audit:
 
 ```bash
 .venv/bin/python synapse_cli.py --json capture-ledger-integrity \
-  --capture-root .synapse_s2 \
   --repair --confirm \
   --expected-revision '<audit_revision>'
-.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
-  --capture-root .synapse_s2
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity
 ```
 
 This repair does not replay capture text or graph effects and does not synthesize
@@ -423,11 +517,17 @@ Create the recovery point only after that gate is ready:
 
 ```bash
 .venv/bin/python synapse_cli.py --json backup-recovery \
-  --output ".synapse_s2/backups/verified/manual-recovery-$(date +%Y%m%d-%H%M%S).sqlite3" \
-  --capture-root .synapse_s2 \
   --purpose manual \
   --pinned
 ```
+
+The authoritative core chooses the capture root and retention directory from
+its reviewed binding. Do not pass `--capture-root`,
+`--allow-noncanonical-capture-root`, or retention `--directory` on the core
+lane; they are retained only for explicitly offline local-v5 maintenance.
+Omitting `--output` selects a unique server-owned destination. Client-selected
+bundle, receipt, and isolated-restore paths must be absolute and remain confined
+to the configured backup or recovery roots.
 
 Recovery destinations are exclusive: existing files are never replaced. A
 successful result binds and verifies four artifacts—the SQLite snapshot, its
@@ -444,16 +544,28 @@ isolated restore drill:
 
 ```bash
 .venv/bin/python synapse_cli.py --json verify-recovery \
-  --receipt ".synapse_s2/backups/verified/<bundle>.bundle.receipt.json"
+  --receipt "/absolute/path/returned/by/backup-recovery.bundle.receipt.json"
 .venv/bin/python synapse_cli.py --json restore-recovery-proof \
-  --receipt ".synapse_s2/backups/verified/<bundle>.bundle.receipt.json" \
-  --output-root ".synapse_s2/recovery-staging/manual-proof-$(date +%Y%m%d-%H%M%S)" \
+  --receipt "/absolute/path/returned/by/backup-recovery.bundle.receipt.json" \
+  --output-root "$PWD/.synapse_s2/recovery/manual-proof-$(date +%Y%m%d-%H%M%S)" \
   --confirm
 ```
 
 The restore proof must reproduce the same content-free
 `capture_ledger_binding` count/revision returned by `verify-recovery`; raw
 request fingerprints, metadata, and archive paths are never exposed in it.
+
+When the bundle came from another Mac or signer, independently review and pass
+the digest for every included artifact. In addition to
+`--expected-database-sha256` and `--expected-capture-sha256`, governed bundles
+require `--expected-request-journal-sha256`, and any bundle carrying runtime
+state requires `--expected-runtime-state-sha256`. A foreign-signed bundle with
+even one missing pin is not verification- or restore-eligible. Verification
+binds the exact bundle receipt plus its dependent database, capture,
+journal-binding, and runtime receipt identities through materialization; a
+receipt or artifact swap fails before the output root is created. A fully
+pinned foreign governed bundle is supported and must reverify its restored
+journal binding and runtime state.
 
 To retire old verified bundles, first persist a signed exact-inventory plan,
 review every protected/retiring disposition, and then apply that same plan with
@@ -485,14 +597,35 @@ The deep-sleep response should include `phase_count: 7` and phase names for conn
 
 ## Local Dashboard
 
-Launch the loopback dashboard:
+Install or refresh the loopback adapter, then launch it through the authenticated
+helper:
 
 ```bash
-.venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8765 --context default
-open "http://127.0.0.1:8765/?context_id=default"
+scripts/install_dashboard_agent.sh
+.venv/bin/python scripts/open_dashboard.py
 ```
 
-The dashboard shows runtime status, context enablement, topology resource envelope, durable trace capture, conversation capture, App Connect local app detection/attachment/snapshot capture, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, memory graph edges, context deployments, guarded graph pruning, recall results, quick-pruning, deep-sleep, and backup controls. Its loopback HTTP API intentionally keeps the rich graph and visualization payloads; installed MCP compact budgets do not reduce browser data. Its API smoke check can run without a fixed port:
+Never open the bare loopback URL. `open_dashboard.py` validates the owner-only
+`dashboard-auth.json` (`0600` inside a `0700` directory), consumes its rotating
+bootstrap without putting it in argv, and opens the browser. The bootstrap sets
+the port-specific HttpOnly, SameSite=Strict cookie and carries the distinct
+`X-Synapse-Dashboard-Session` capability in a redirect fragment. The browser
+stores the latter only in port-scoped `sessionStorage`, scrubs the fragment, and
+sends both on every API GET/POST; POST additionally needs exact Host and Origin.
+The auth file has the header capability but no cookie secret.
+
+The server admits eight active handlers behind backlog 32, applies an absolute
+one-second deadline for complete request headers, uses five-second post-header
+I/O timeouts, and bounds shutdown. The dashboard shows runtime status, context
+enablement, topology resource envelope, durable trace capture, conversation
+capture, App Connect local app detection/attachment/snapshot capture, event
+ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune
+controls, memory graph edges, context deployments, guarded graph pruning,
+recall results, quick-pruning, deep-sleep, and backup controls. Its loopback HTTP
+API intentionally keeps the rich graph and visualization payloads; installed
+MCP compact budgets do not reduce browser data. The installer health check and
+the fixed-port-free smoke below authenticate through the same cookie-plus-header
+contract:
 
 ```bash
 .venv/bin/python scripts/smoke_dashboard.py default

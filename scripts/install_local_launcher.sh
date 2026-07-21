@@ -90,19 +90,69 @@ if [ -n "\${PYTHONPATH:-}" ]; then
 else
   PYTHONPATH="\$REPO_ROOT"
 fi
-: "\${MLX_DEVICE:=gpu}"
-: "\${SYNAPSE_S2_EMBEDDING_PROVIDER:=mlx-neural}"
-: "\${SYNAPSE_S2_NEURAL_MODEL:=mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ}"
-: "\${SYNAPSE_S2_NEURAL_CACHE_DIR:=\$REPO_ROOT/.synapse_s2/models}"
-: "\${SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY:=1}"
-: "\${SYNAPSE_S2_DIMENSION:=1024}"
-: "\${SYNAPSE_S2_NEURONS:=8192}"
-: "\${SYNAPSE_S2_TOP_K:=256}"
-: "\${SYNAPSE_S2_RECALL_COUNT:=10}"
-: "\${SYNAPSE_S2_STATE_PATH:=\$REPO_ROOT/.synapse_s2/runtime_state.json}"
-: "\${SYNAPSE_S2_MEMORY_DB:=\$REPO_ROOT/.synapse_s2/memory.sqlite3}"
-: "\${SYNAPSE_S2_EXPORT_DIR:=\$REPO_ROOT/.synapse_s2}"
-: "\${SYNAPSE_S2_CAPTURE_ROOT:=\$REPO_ROOT/.synapse_s2}"
+unset MLX_DEVICE SYNAPSE_S2_DIMENSION SYNAPSE_S2_EMBEDDING_PROVIDER
+unset SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS SYNAPSE_S2_MEMORY_DB
+unset SYNAPSE_S2_NEURAL_CACHE_DIR SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY
+unset SYNAPSE_S2_NEURAL_MODEL SYNAPSE_S2_NEURAL_MODEL_ID
+unset SYNAPSE_S2_NEURAL_REVISION SYNAPSE_S2_NEURAL_POOLING
+unset SYNAPSE_S2_NEURAL_MAX_TOKENS SYNAPSE_S2_NEURAL_NORMALIZE
+unset SYNAPSE_S2_NEURONS
+unset SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS SYNAPSE_S2_RECALL_COUNT
+unset SYNAPSE_S2_REQUIRE_NATIVE SYNAPSE_S2_STATE_PATH SYNAPSE_S2_TOP_K
+unset SYNAPSE_S2_EXPECTED_CORE_CONFIG_FINGERPRINT
+unset SYNAPSE_S2_CORE_SOCKET SYNAPSE_S2_EXPORT_DIR SYNAPSE_S2_CAPTURE_ROOT
+if [ "\${SYNAPSE_S2_CORE_BINDING+x}" = x ]; then
+  if [ -z "\$SYNAPSE_S2_CORE_BINDING" ]; then
+    echo "SYNAPSE-S2 core binding is empty" >&2
+    exit 2
+  fi
+  : # An explicit client registration must fail closed if its binding is bad.
+elif [ -e "\$HOME/.config/synapse-s2/core-binding.json" ] || \
+     [ -L "\$HOME/.config/synapse-s2/core-binding.json" ]; then
+  SYNAPSE_S2_CORE_BINDING="\$HOME/.config/synapse-s2/core-binding.json"
+else
+  # Preserve the canonical local-v5 route until a reviewed binding exists, but
+  # inspect durable governance before exporting neural fields.  A governed v6
+  # store keeps only its canonical memory/state constraint so backend_router
+  # derives the core socket from the marker and cannot fall back locally.
+  SYNAPSE_S2_STATE_PATH="\$REPO_ROOT/.synapse_s2/runtime_state.json"
+  SYNAPSE_S2_MEMORY_DB="\$REPO_ROOT/.synapse_s2/memory.sqlite3"
+  SYNAPSE_S2_EXPORT_DIR="\$REPO_ROOT/.synapse_s2"
+  SYNAPSE_S2_CAPTURE_ROOT="\$REPO_ROOT/.synapse_s2"
+  MARKER_STATUS=0
+  "\$REPO_ROOT/.venv/bin/python" - "\$SYNAPSE_S2_MEMORY_DB" <<'PY' || MARKER_STATUS=\$?
+import sys
+from pathlib import Path
+
+from backend_router import database_requires_core
+
+try:
+    governed = database_requires_core(Path(sys.argv[1]))
+except Exception:
+    raise SystemExit(11)
+raise SystemExit(0 if governed else 10)
+PY
+  case "\$MARKER_STATUS" in
+    0)
+      : # Durable v6 marker: backend_router derives and requires the core.
+      ;;
+    10)
+      MLX_DEVICE="gpu"
+      SYNAPSE_S2_EMBEDDING_PROVIDER="mlx-neural"
+      SYNAPSE_S2_NEURAL_MODEL="mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+      SYNAPSE_S2_NEURAL_CACHE_DIR="\$REPO_ROOT/.synapse_s2/models"
+      SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY="1"
+      SYNAPSE_S2_DIMENSION="1024"
+      SYNAPSE_S2_NEURONS="8192"
+      SYNAPSE_S2_TOP_K="256"
+      SYNAPSE_S2_RECALL_COUNT="10"
+      ;;
+    *)
+      echo "SYNAPSE-S2 database governance could not be verified" >&2
+      exit 2
+      ;;
+  esac
+fi
 : "\${SYNAPSE_S2_DEFAULT_RESPONSE_MODE:=compact}"
 : "\${SYNAPSE_S2_MAX_RESPONSE_BYTES:=12288}"
 : "\${SYNAPSE_S2_CLIENT_SESSION_BRIDGE:=1}"
@@ -119,6 +169,8 @@ export SYNAPSE_S2_TOP_K
 export SYNAPSE_S2_RECALL_COUNT
 export SYNAPSE_S2_STATE_PATH
 export SYNAPSE_S2_MEMORY_DB
+export SYNAPSE_S2_CORE_BINDING
+export SYNAPSE_S2_CORE_SOCKET
 export SYNAPSE_S2_EXPORT_DIR
 export SYNAPSE_S2_CAPTURE_ROOT
 export SYNAPSE_S2_DEFAULT_RESPONSE_MODE

@@ -143,9 +143,12 @@ not as permission to replay the capture.
 Run the read-only audit first:
 
 ```bash
-.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
-  --capture-root .synapse_s2
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity
 ```
+
+On the authoritative-core lane, the service injects the capture root from the
+reviewed binding; public calls must not pass `--capture-root`. That option is
+retained only for an explicitly offline local-v5 maintenance audit.
 
 The audit binds processed payload identity, the normalized redacted request,
 namespace entries, relationship identities and endpoints, the unique durable
@@ -159,11 +162,9 @@ explicit second action:
 
 ```bash
 .venv/bin/python synapse_cli.py --json capture-ledger-integrity \
-  --capture-root .synapse_s2 \
   --repair --confirm \
   --expected-revision '<audit_revision>'
-.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
-  --capture-root .synapse_s2
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity
 ```
 
 The revision binds both missing-row evidence and every processed ledger-backed

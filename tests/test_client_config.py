@@ -1,14 +1,69 @@
 import json
 import os
+import hashlib
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
 import client_config
+from core_client_binding import (
+    BINDING_ENV,
+    CoreClientBinding,
+    binding_for_config,
+    write_core_client_binding,
+)
+from core_service import CoreConfig, write_core_config
+
+
+DIRECT_ROUTE_ENV = {
+    "MLX_DEVICE",
+    "SYNAPSE_S2_CORE_SOCKET",
+    "SYNAPSE_S2_CAPTURE_ROOT",
+    "SYNAPSE_S2_DIMENSION",
+    "SYNAPSE_S2_EMBEDDING_PROVIDER",
+    "SYNAPSE_S2_EXPORT_DIR",
+    "SYNAPSE_S2_MEMORY_DB",
+    "SYNAPSE_S2_NEURAL_CACHE_DIR",
+    "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY",
+    "SYNAPSE_S2_NEURAL_MODEL",
+    "SYNAPSE_S2_NEURONS",
+    "SYNAPSE_S2_RECALL_COUNT",
+    "SYNAPSE_S2_STATE_PATH",
+    "SYNAPSE_S2_TOP_K",
+}
 
 
 class ClientConfigTests(unittest.TestCase):
+    @staticmethod
+    def _write_binding(*, home: Path, repo: Path) -> tuple[Path, CoreClientBinding]:
+        repo = repo.resolve()
+        data = repo / ".synapse_s2"
+        core = data / "core"
+        core.mkdir(mode=0o700, parents=True, exist_ok=True)
+        data.chmod(0o700)
+        core.chmod(0o700)
+        config = CoreConfig(
+            socket_path=core / "service.sock",
+            state_path=data / "runtime_state.json",
+            memory_path=data / "memory.sqlite3",
+            capture_root=data,
+            dimension=8,
+            num_neurons=16,
+            default_top_k=4,
+        )
+        write_core_config(core / "service.json", config)
+        binding = binding_for_config(
+            repo_root=repo,
+            data_root=data,
+            config=config,
+            core_label="aero.boom.synapse-s2.core",
+            authority_mode="candidate-local-v5",
+        )
+        binding_path = home / ".config" / "synapse-s2" / "core-binding.json"
+        write_core_client_binding(binding_path, binding)
+        return binding_path, binding
+
     def test_json_writer_is_idempotent_across_formatting_and_key_order(self):
         with TemporaryDirectory() as tmp:
             target = Path(tmp) / "config.json"
@@ -89,6 +144,44 @@ class ClientConfigTests(unittest.TestCase):
 
             self.assertEqual(real.read_text(encoding="utf-8"), '{"safe": true}\n')
 
+    def test_install_rejects_symlinked_or_broad_roots_before_mutating(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real_repo = root / "repo"
+            real_repo.mkdir(mode=0o700)
+            repo_alias = root / "repo-alias"
+            os.symlink(real_repo, repo_alias)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+
+            with self.assertRaisesRegex(OSError, "symlink component"):
+                client_config.install_client_configs(
+                    home=home,
+                    repo_root=repo_alias,
+                    launcher_path=root / "bin" / "synapse-s2-mcp",
+                    dry_run=True,
+                )
+            with self.assertRaisesRegex(OSError, "too broad"):
+                client_config.install_client_configs(
+                    home=home,
+                    repo_root=Path("/"),
+                    launcher_path=root / "bin" / "synapse-s2-mcp",
+                    dry_run=True,
+                )
+
+            self.assertFalse((real_repo / ".mcp.json").exists())
+
+    def test_server_definition_rejects_secret_shaped_path_without_reflection(self):
+        with TemporaryDirectory() as tmp:
+            secret = "api_key=secretvalue123456"
+            with self.assertRaises(ValueError) as raised:
+                client_config.build_server_definition(
+                    repo_root=Path(tmp) / secret,
+                    launcher_path=Path(tmp) / "synapse-s2-mcp",
+                )
+
+            self.assertNotIn(secret, str(raised.exception))
+
     def test_private_config_writer_preserves_existing_parent_mode(self):
         with TemporaryDirectory() as tmp:
             parent = Path(tmp) / "caller-owned"
@@ -141,7 +234,7 @@ class ClientConfigTests(unittest.TestCase):
             lock_path = target.with_name(f".{target.name}.synapse-config.lock")
             self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
 
-    def test_server_definition_uses_shared_local_state_paths(self):
+    def test_server_definition_without_binding_preserves_canonical_v5_route(self):
         with TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "SYNAPSE-S2"
             launcher = Path(tmp) / "bin" / "synapse-s2-mcp"
@@ -154,25 +247,25 @@ class ClientConfigTests(unittest.TestCase):
             resolved_repo = repo_root.resolve()
 
         self.assertEqual(server["type"], "stdio")
-        self.assertEqual(server["command"], str(launcher))
+        self.assertEqual(server["command"], str(launcher.resolve()))
         self.assertEqual(server["env"]["PYTHONPATH"], str(resolved_repo))
+        self.assertNotIn(BINDING_ENV, server["env"])
+        self.assertNotIn("SYNAPSE_S2_CORE_SOCKET", server["env"])
         self.assertEqual(server["env"]["MLX_DEVICE"], "gpu")
-        self.assertEqual(server["env"]["SYNAPSE_S2_EMBEDDING_PROVIDER"], "mlx-neural")
         self.assertEqual(
-            server["env"]["SYNAPSE_S2_NEURAL_MODEL"],
-            "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
-        )
-        self.assertEqual(
-            server["env"]["SYNAPSE_S2_NEURAL_CACHE_DIR"],
-            str(resolved_repo / ".synapse_s2" / "models"),
+            server["env"]["SYNAPSE_S2_EMBEDDING_PROVIDER"],
+            "mlx-neural",
         )
         self.assertEqual(
             server["env"]["SYNAPSE_S2_MEMORY_DB"],
             str(resolved_repo / ".synapse_s2" / "memory.sqlite3"),
         )
+        self.assertEqual(
+            server["env"]["SYNAPSE_S2_STATE_PATH"],
+            str(resolved_repo / ".synapse_s2" / "runtime_state.json"),
+        )
         self.assertEqual(server["env"]["SYNAPSE_S2_CAPTURE_ROOT"], str(resolved_repo / ".synapse_s2"))
         self.assertEqual(server["env"]["SYNAPSE_S2_CONTEXT_ID"], "default")
-        self.assertEqual(server["env"]["SYNAPSE_S2_NEURONS"], "8192")
         self.assertEqual(
             server["env"]["SYNAPSE_S2_DEFAULT_RESPONSE_MODE"],
             "compact",
@@ -183,6 +276,42 @@ class ClientConfigTests(unittest.TestCase):
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_CORTEX"], "1")
         self.assertEqual(server["env"]["SYNAPSE_S2_CLIENT_CORTEX_MODE"], "strict")
         self.assertIn("codex-desktop", server["env"]["SYNAPSE_S2_CLIENT_STARTUP_PROMPT"])
+        self.assertTrue(DIRECT_ROUTE_ENV - {"SYNAPSE_S2_CORE_SOCKET"} <= set(server["env"]))
+
+    def test_server_definition_with_binding_is_binding_only(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir(mode=0o700)
+            repo.mkdir(mode=0o700)
+            binding_path, binding = self._write_binding(home=home, repo=repo)
+
+            server = client_config.build_server_definition(
+                repo_root=repo,
+                launcher_path=home / ".local" / "bin" / "synapse-s2-mcp",
+                core_binding_path=binding_path,
+                core_binding=binding,
+            )
+
+        self.assertEqual(server["env"][BINDING_ENV], str(binding_path))
+        self.assertFalse(DIRECT_ROUTE_ENV & set(server["env"]))
+
+    def test_server_definition_rejects_binding_without_its_reviewed_path(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir(mode=0o700)
+            repo.mkdir(mode=0o700)
+            _binding_path, binding = self._write_binding(home=home, repo=repo)
+
+            with self.assertRaisesRegex(OSError, "supplied together"):
+                client_config.build_server_definition(
+                    repo_root=repo,
+                    launcher_path=home / ".local" / "bin" / "synapse-s2-mcp",
+                    core_binding=binding,
+                )
 
     def test_install_merges_claude_codex_and_project_configs_without_clobbering(self):
         with TemporaryDirectory() as tmp:
@@ -263,11 +392,11 @@ class ClientConfigTests(unittest.TestCase):
             codex_text,
         )
         self.assertEqual(set(config_modes.values()), {0o600})
+        self.assertNotIn("SYNAPSE_S2_CORE_SOCKET", codex_text)
+        self.assertNotIn(BINDING_ENV, codex_text)
         self.assertIn('SYNAPSE_S2_EMBEDDING_PROVIDER = "mlx-neural"', codex_text)
-        self.assertIn(
-            'SYNAPSE_S2_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"',
-            codex_text,
-        )
+        self.assertIn("SYNAPSE_S2_MEMORY_DB", codex_text)
+        self.assertIn("SYNAPSE_S2_STATE_PATH", codex_text)
         self.assertIn("synapse-s2", project_manifest["mcpServers"])
         self.assertEqual(
             project_manifest["mcpServers"]["synapse-s2"]["env"]["SYNAPSE_S2_CLIENT_AGENT_ID"],
@@ -278,6 +407,48 @@ class ClientConfigTests(unittest.TestCase):
             sorted(result["clients"]),
             ["claude_code", "claude_desktop", "codex", "project_mcp"],
         )
+
+    def test_install_auto_discovers_binding_and_removes_all_direct_route_fields(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir(mode=0o700)
+            repo.mkdir(mode=0o700)
+            launcher = home / ".local" / "bin" / "synapse-s2-mcp"
+            binding_path, binding = self._write_binding(home=home, repo=repo)
+
+            result = client_config.install_client_configs(
+                home=home,
+                repo_root=repo,
+                launcher_path=launcher,
+            )
+
+            project = json.loads((repo / ".mcp.json").read_text(encoding="utf-8"))
+            desktop = json.loads(
+                (
+                    home
+                    / "Library"
+                    / "Application Support"
+                    / "Claude"
+                    / "claude_desktop_config.json"
+                ).read_text(encoding="utf-8")
+            )
+            claude = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+            codex = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+
+        definitions = (
+            project["mcpServers"]["synapse-s2"],
+            desktop["mcpServers"]["synapse-s2"],
+            claude["mcpServers"]["synapse-s2"],
+        )
+        for definition in definitions:
+            self.assertEqual(definition["env"][BINDING_ENV], str(binding_path))
+            self.assertFalse(DIRECT_ROUTE_ENV & set(definition["env"]))
+        self.assertIn(f'{BINDING_ENV} = "{binding_path}"', codex)
+        self.assertFalse(DIRECT_ROUTE_ENV & set(key for key in DIRECT_ROUTE_ENV if key in codex))
+        self.assertEqual(result["core_binding"]["digest"], binding.digest)
+        self.assertEqual(result["core_binding"]["authority_mode"], "candidate-local-v5")
 
     def test_codex_config_updates_existing_synapse_server_block(self):
         with TemporaryDirectory() as tmp:
@@ -307,11 +478,11 @@ command = "node"
         self.assertIn("[mcp_servers.other]", merged)
         self.assertIn(str(launcher), merged)
         self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', merged)
+        self.assertNotIn("SYNAPSE_S2_CORE_SOCKET", merged)
+        self.assertNotIn(BINDING_ENV, merged)
         self.assertIn('SYNAPSE_S2_EMBEDDING_PROVIDER = "mlx-neural"', merged)
-        self.assertIn(
-            'SYNAPSE_S2_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"',
-            merged,
-        )
+        self.assertIn("SYNAPSE_S2_MEMORY_DB", merged)
+        self.assertIn("SYNAPSE_S2_STATE_PATH", merged)
         self.assertNotIn("/old/synapse-s2-mcp", merged)
         self.assertNotIn("old-agent", merged)
 
@@ -334,6 +505,165 @@ command = "node"
 
             self.assertIn("refusing to overwrite", str(raised.exception))
             self.assertEqual(desktop_config.read_text(encoding="utf-8"), "{not valid json")
+
+    def test_all_client_publication_rolls_back_if_one_replace_fails(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            home.mkdir(mode=0o700)
+            targets = {
+                repo / ".mcp.json": '{"prior":"project"}\n',
+                home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json": '{"prior":"desktop"}\n',
+                home / ".claude.json": '{"prior":"claude"}\n',
+                home / ".codex" / "config.toml": 'model = "prior"\n',
+            }
+            for path, value in targets.items():
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                path.write_text(value, encoding="utf-8")
+                path.chmod(0o600)
+            desktop = next(path for path in targets if path.name == "claude_desktop_config.json")
+            real_replace = os.replace
+            failed = False
+
+            def fail_once(source, destination):
+                nonlocal failed
+                if Path(destination) == desktop and not failed:
+                    failed = True
+                    raise OSError("injected publication failure")
+                return real_replace(source, destination)
+
+            with mock.patch("client_config.os.replace", side_effect=fail_once):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    client_config.install_client_configs(
+                        home=home,
+                        repo_root=repo,
+                        launcher_path=home / ".local" / "bin" / "synapse-s2-mcp",
+                    )
+
+            self.assertTrue(failed)
+            for path, value in targets.items():
+                self.assertEqual(path.read_text(encoding="utf-8"), value)
+            journal = repo / ".synapse_s2" / "client-config-publication.journal.json"
+            self.assertFalse(journal.exists())
+            self.assertEqual(list(repo.rglob("*.tmp")), [])
+
+    def test_prepared_publication_journal_recovers_after_process_crash(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            target = root / "config.json"
+            target.write_text('{"version":1}\n', encoding="utf-8")
+            target.chmod(0o600)
+            original = target.read_bytes()
+            desired = b'{"version":2}\n'
+            backup = client_config._create_exclusive_private_backup(target)
+            temporary = client_config._stage_private_payload(target, desired)
+            journal = root / "journal.json"
+            payload = {
+                "schema": client_config.PUBLICATION_SCHEMA,
+                "state": "prepared",
+                "entries": [
+                    {
+                        "client": "test",
+                        "target": str(target),
+                        "original_exists": True,
+                        "original_sha256": hashlib.sha256(original).hexdigest(),
+                        "desired_sha256": hashlib.sha256(desired).hexdigest(),
+                        "backup_path": str(backup),
+                        "temp_path": str(temporary),
+                    }
+                ],
+            }
+            client_config._write_publication_journal(journal, payload)
+            os.replace(temporary, target)
+
+            recovered = client_config._recover_config_transaction(
+                journal,
+                allowed_targets={target},
+            )
+
+            self.assertTrue(recovered)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertFalse(journal.exists())
+            self.assertTrue(backup.exists())
+
+    def test_install_recovers_pending_publication_before_reading_configs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir(mode=0o700)
+            repo.mkdir(mode=0o700)
+            target = repo / ".mcp.json"
+            target.write_text('{"prior":"project"}\n', encoding="utf-8")
+            target.chmod(0o600)
+            original = target.read_bytes()
+            interrupted_payload = b"{interrupted-publication"
+            backup = client_config._create_exclusive_private_backup(target)
+            temporary = client_config._stage_private_payload(
+                target,
+                interrupted_payload,
+            )
+            journal = (
+                repo
+                / ".synapse_s2"
+                / "client-config-publication.journal.json"
+            )
+            client_config._write_publication_journal(
+                journal,
+                {
+                    "schema": client_config.PUBLICATION_SCHEMA,
+                    "state": "prepared",
+                    "entries": [
+                        {
+                            "client": "project_mcp",
+                            "target": str(target),
+                            "original_exists": True,
+                            "original_sha256": hashlib.sha256(original).hexdigest(),
+                            "desired_sha256": hashlib.sha256(
+                                interrupted_payload
+                            ).hexdigest(),
+                            "backup_path": str(backup),
+                            "temp_path": str(temporary),
+                        }
+                    ],
+                },
+            )
+            os.replace(temporary, target)
+
+            result = client_config.install_client_configs(
+                home=home,
+                repo_root=repo,
+                launcher_path=home / ".local" / "bin" / "synapse-s2-mcp",
+            )
+
+            project = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(project["prior"], "project")
+            self.assertIn("synapse-s2", project["mcpServers"])
+            self.assertTrue(result["clients"]["project_mcp"]["changed"])
+            self.assertFalse(journal.exists())
+            self.assertTrue(backup.exists())
+
+    def test_hardlinked_client_config_and_lock_are_rejected(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            original = root / "original.json"
+            target = root / "config.json"
+            original.write_text("{}\n", encoding="utf-8")
+            os.link(original, target)
+            with self.assertRaises(OSError):
+                client_config._write_text_if_changed(target, '{"safe":true}\n', dry_run=False)
+
+            independent = root / "independent.json"
+            independent.write_text("{}\n", encoding="utf-8")
+            lock = root / ".independent.json.synapse-config.lock"
+            lock.write_text("", encoding="utf-8")
+            alias = root / "lock-alias"
+            os.link(lock, alias)
+            with self.assertRaisesRegex(ValueError, "lock is unsafe"):
+                with client_config._exclusive_config_lock(independent):
+                    pass
 
 
 if __name__ == "__main__":

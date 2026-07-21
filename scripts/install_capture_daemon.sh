@@ -5,7 +5,9 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LABEL="${SYNAPSE_S2_CAPTURE_LABEL:-aero.boom.synapse-s2.capture-daemon}"
+CORE_LABEL="${SYNAPSE_S2_CORE_LABEL:-aero.boom.synapse-s2.core}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+CORE_PLIST="$HOME/Library/LaunchAgents/$CORE_LABEL.plist"
 CAPTURE_ROOT="${SYNAPSE_S2_CAPTURE_ROOT:-$ROOT/.synapse_s2}"
 STATE_PATH="${SYNAPSE_S2_STATE_PATH:-$ROOT/.synapse_s2/runtime_state.json}"
 MEMORY_DB="${SYNAPSE_S2_MEMORY_DB:-$ROOT/.synapse_s2/memory.sqlite3}"
@@ -26,7 +28,6 @@ UID_VALUE="$(id -u)"
 PLIST_DIR="$(dirname "$PLIST")"
 PLIST_TEMP=""
 PLIST_ROLLBACK=""
-INSTALL_LOCK=""
 PLIST_REPLACED=0
 INSTALL_HEALTHY=0
 HAD_PRIOR_PLIST=0
@@ -44,6 +45,12 @@ REQUIRED_STABLE_CHECKS=0
 case "$LABEL" in
   ""|*[!A-Za-z0-9._-]*)
     echo "Capture LaunchAgent label contains unsupported characters" >&2
+    exit 2
+    ;;
+esac
+case "$CORE_LABEL" in
+  ""|*[!A-Za-z0-9._-]*)
+    echo "Authoritative core LaunchAgent label contains unsupported characters" >&2
     exit 2
     ;;
 esac
@@ -134,7 +141,16 @@ service_running() {
 }
 
 service_loaded() {
-  launchctl print "gui/$UID_VALUE/$LABEL" >/dev/null 2>&1
+  local domain_inventory=""
+  if launchctl print "gui/$UID_VALUE/$LABEL" >/dev/null 2>&1; then
+    return 0
+  fi
+  domain_inventory="$(launchctl print "gui/$UID_VALUE" 2>/dev/null)" || return 2
+  if printf '%s\n' "$domain_inventory" \
+    | awk -v label="$LABEL" '$NF == label { found = 1 } END { exit(found ? 0 : 1) }'; then
+    return 2
+  fi
+  return 1
 }
 
 service_disabled() {
@@ -309,10 +325,17 @@ wait_until_service_stops() {
 
 wait_until_service_unloads() {
   local attempt=1
+  local load_status=0
   while [ "$attempt" -le "$HEALTH_ATTEMPTS" ]; do
-    if ! service_loaded; then
-      return 0
-    fi
+    set +e
+    service_loaded
+    load_status=$?
+    set -e
+    case "$load_status" in
+      0) ;;
+      1) return 0 ;;
+      *) return 1 ;;
+    esac
     if [ "$attempt" -lt "$HEALTH_ATTEMPTS" ]; then
       sleep "$HEALTH_DELAY"
     fi
@@ -322,9 +345,16 @@ wait_until_service_unloads() {
 }
 
 bootout_service() {
-  if ! service_loaded; then
-    return 0
-  fi
+  local load_status=0
+  set +e
+  service_loaded
+  load_status=$?
+  set -e
+  case "$load_status" in
+    0) ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
   launchctl bootout "gui/$UID_VALUE/$LABEL" >/dev/null 2>&1 || true
   wait_until_service_unloads
 }
@@ -394,9 +424,9 @@ rollback_definition() {
     rollback_status=1
   fi
   if [ "$HAD_PRIOR_PLIST" -eq 1 ] && [ -n "$PLIST_ROLLBACK" ] && [ -f "$PLIST_ROLLBACK" ]; then
-    if mv -f -- "$PLIST_ROLLBACK" "$PLIST"; then
+    if "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" replace-regular \
+      --source "$PLIST_ROLLBACK" --target "$PLIST"; then
       PLIST_ROLLBACK=""
-      chmod 600 "$PLIST"
       fsync_file_and_parent "$PLIST" || rollback_status=1
     else
       echo "Capture LaunchAgent rollback could not restore the prior plist" >&2
@@ -444,9 +474,6 @@ cleanup() {
   if [ -n "$PLIST_TEMP" ]; then
     rm -f -- "$PLIST_TEMP"
   fi
-  if [ -n "$INSTALL_LOCK" ]; then
-    rmdir -- "$INSTALL_LOCK" >/dev/null 2>&1 || true
-  fi
   if { [ "$INSTALL_HEALTHY" -eq 1 ] || [ "$PLIST_REPLACED" -eq 0 ]; } \
     && [ -n "$PLIST_ROLLBACK" ]; then
     rm -f -- "$PLIST_ROLLBACK"
@@ -456,41 +483,157 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
-ensure_private_directory() {
-  local target="$1"
-  if [ -d "$target" ]; then
-    return 0
-  fi
-  if [ -e "$target" ]; then
-    echo "Expected directory but found another file type: $target" >&2
-    return 2
-  fi
-  local parent
-  parent="$(dirname "$target")"
-  if [ "$parent" != "$target" ]; then
-    ensure_private_directory "$parent"
-  fi
-  mkdir -m 700 "$target"
-}
-
 if [ ! -x "$PYTHON" ]; then
   echo "Python runtime is missing or not executable" >&2
   echo "Run uv sync first." >&2
   exit 2
 fi
 
-ensure_private_directory "$CAPTURE_ROOT"
-ensure_private_directory "$(dirname "$STATE_PATH")"
-ensure_private_directory "$(dirname "$MEMORY_DB")"
-ensure_private_directory "$(dirname "$LOG_PATH")"
-ensure_private_directory "$PLIST_DIR"
-INSTALL_LOCK_CANDIDATE="$PLIST_DIR/.${LABEL}.install.lock"
-if ! mkdir -m 700 "$INSTALL_LOCK_CANDIDATE" 2>/dev/null; then
-  echo "Another Capture LaunchAgent install is already in progress" >&2
-  exit 1
+# This installer is retained only for an explicit pre-cutover/v5 maintenance
+# lane.  Once the authoritative core is installed or the store has adopted its
+# durable v6 service marker, capture is embedded in that one process.  Refuse
+# before creating a log, plist, directory, or launchd definition so an old
+# helper can never become a second capture worker after cutover.
+if [ -e "$CORE_PLIST" ] || [ -L "$CORE_PLIST" ]; then
+  echo "superseded-by-authoritative-core: legacy capture LaunchAgent was not installed" >&2
+  exit 4
 fi
-INSTALL_LOCK="$INSTALL_LOCK_CANDIDATE"
-if ! prepare_private_log "$LOG_PATH"; then
+
+set +e
+"$PYTHON" - "$MEMORY_DB" >/dev/null 2>&1 <<'PY'
+import json
+import fcntl
+import os
+import sqlite3
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+path = Path(sys.argv[1]).expanduser()
+lock_path = path.parent / "core" / "authority.lock"
+lock_descriptor = None
+try:
+    lock_stat = lock_path.lstat()
+except FileNotFoundError:
+    lock_stat = None
+if lock_stat is not None:
+    if (
+        stat.S_ISLNK(lock_stat.st_mode)
+        or not stat.S_ISREG(lock_stat.st_mode)
+        or lock_stat.st_uid != os.getuid()
+        or lock_stat.st_nlink != 1
+        or stat.S_IMODE(lock_stat.st_mode) != 0o600
+    ):
+        raise SystemExit(3)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_descriptor = os.open(lock_path, flags)
+        opened_lock = os.fstat(lock_descriptor)
+        visible_lock = lock_path.lstat()
+        if (
+            opened_lock.st_nlink != 1
+            or (opened_lock.st_dev, opened_lock.st_ino)
+            != (visible_lock.st_dev, visible_lock.st_ino)
+        ):
+            raise OSError("authority lock identity changed")
+        fcntl.flock(lock_descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        raise SystemExit(42)
+    except OSError:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        raise SystemExit(3)
+try:
+    observed = path.lstat()
+except FileNotFoundError:
+    if lock_descriptor is not None:
+        os.close(lock_descriptor)
+    raise SystemExit(0)
+if (
+    stat.S_ISLNK(observed.st_mode)
+    or not stat.S_ISREG(observed.st_mode)
+    or observed.st_uid != os.getuid()
+    or observed.st_nlink != 1
+):
+    raise SystemExit(3)
+try:
+    connection = sqlite3.connect(
+        f"file:{quote(str(path.absolute()), safe='/')}?mode=ro",
+        uri=True,
+        timeout=1.0,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' "
+            "AND name='store_metadata' LIMIT 1"
+        ).fetchone()
+        marker = None
+        if table is not None:
+            row = connection.execute(
+                "SELECT value_json FROM store_metadata WHERE key='core_authority'"
+            ).fetchone()
+            if row is not None:
+                value = json.loads(str(row[0]))
+                if not isinstance(value, dict) or type(value.get("service_required")) is not bool:
+                    raise ValueError("invalid marker")
+                marker = value["service_required"]
+    finally:
+        connection.close()
+except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(3)
+finally:
+    if lock_descriptor is not None:
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+raise SystemExit(42 if version >= 6 or marker is True else 0)
+PY
+LEGACY_GUARD_STATUS=$?
+set -e
+case "$LEGACY_GUARD_STATUS" in
+  0) ;;
+  42)
+    echo "superseded-by-authoritative-core: legacy capture LaunchAgent was not installed" >&2
+    exit 4
+    ;;
+  *)
+    echo "Legacy capture installer could not safely classify the target store; refusing to start" >&2
+    exit 2
+    ;;
+esac
+
+LOCK_MARKER="capture:$LABEL"
+INSTALL_LOCK_PATH="$PLIST_DIR/.${LABEL}.install.lock"
+if [ "${SYNAPSE_S2_INSTALL_LOCK_HELD:-}" != "$LOCK_MARKER" ]; then
+  exec "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" run-locked \
+    --lock "$INSTALL_LOCK_PATH" \
+    --marker "$LOCK_MARKER" \
+    -- /bin/bash "$0" "$@"
+fi
+
+"$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" ensure-directory \
+  --path "$PLIST_DIR" --shared
+for PRIVATE_DIRECTORY in \
+  "$CAPTURE_ROOT" "$(dirname "$STATE_PATH")" \
+  "$(dirname "$MEMORY_DB")" "$(dirname "$LOG_PATH")"; do
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" ensure-directory \
+    --path "$PRIVATE_DIRECTORY"
+done
+for PRIVATE_FILE in "$STATE_PATH" "$MEMORY_DB"; do
+  if ! "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" validate-regular \
+    --path "$PRIVATE_FILE" --allow-missing; then
+    echo "Capture state or database target is unsafe" >&2
+    exit 2
+  fi
+done
+if ! "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" prepare-log \
+  --path "$LOG_PATH"; then
   echo "Capture log target must be a regular non-symlink file" >&2
   exit 2
 fi
@@ -553,21 +696,25 @@ chmod 600 "$PLIST_TEMP"
 plutil -lint "$PLIST_TEMP" >/dev/null
 fsync_file_and_parent "$PLIST_TEMP"
 
-if [ -L "$PLIST" ]; then
-  echo "Refusing to replace a symlinked Capture LaunchAgent plist" >&2
-  exit 2
-fi
-if [ -e "$PLIST" ] && [ ! -f "$PLIST" ]; then
-  echo "Refusing to replace a non-regular Capture LaunchAgent plist" >&2
+if ! "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" validate-regular \
+  --path "$PLIST" --allow-missing; then
+  echo "Refusing to replace an unsafe Capture LaunchAgent plist" >&2
   exit 2
 fi
 
-if service_loaded; then
+set +e
+service_loaded
+SERVICE_LOAD_STATUS=$?
+set -e
+if [ "$SERVICE_LOAD_STATUS" -eq 0 ]; then
   PRIOR_LOADED=1
   if service_running; then
     PRIOR_RUNNING=1
     PRIOR_PID="$(service_pid 2>/dev/null || true)"
   fi
+elif [ "$SERVICE_LOAD_STATUS" -ne 1 ]; then
+  echo "Capture LaunchAgent state could not be classified safely" >&2
+  exit 2
 fi
 if service_disabled; then
   PRIOR_DISABLED=1
@@ -579,13 +726,21 @@ fi
 if [ -f "$PLIST" ]; then
   HAD_PRIOR_PLIST=1
   PLIST_ROLLBACK="$(mktemp "$PLIST_DIR/.${LABEL}.rollback.XXXXXX")"
-  cp -- "$PLIST" "$PLIST_ROLLBACK"
   chmod 600 "$PLIST_ROLLBACK"
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" backup-regular \
+    --source "$PLIST" --target "$PLIST_ROLLBACK"
   fsync_file_and_parent "$PLIST_ROLLBACK"
 fi
 
 PLIST_REPLACED=1
-mv -f -- "$PLIST_TEMP" "$PLIST"
+if [ "$HAD_PRIOR_PLIST" -eq 1 ]; then
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" replace-regular \
+    --source "$PLIST_TEMP" --target "$PLIST" \
+    --expected-current "$PLIST_ROLLBACK"
+else
+  "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" replace-regular \
+    --source "$PLIST_TEMP" --target "$PLIST" --expect-absent
+fi
 PLIST_TEMP=""
 fsync_file_and_parent "$PLIST"
 

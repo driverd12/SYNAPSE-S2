@@ -1,3 +1,4 @@
+import fcntl
 import os
 import sqlite3
 import stat
@@ -8,6 +9,12 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from core_client_binding import (
+    binding_for_config,
+    default_binding_path,
+    write_core_client_binding,
+)
+from core_service import CoreConfig, write_core_config
 
 ROOT = Path(__file__).resolve().parents[1]
 PRIOR_PLIST = b"PRIOR-PLIST-BYTES\n"
@@ -17,7 +24,7 @@ class LaunchAgentInstallerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir(mode=0o700)
         self.bin = self.root / "bin"
@@ -30,6 +37,32 @@ class LaunchAgentInstallerTests(unittest.TestCase):
         path = self.bin / name
         path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
+
+    def _write_dashboard_binding(self) -> Path:
+        data_root = self.root / "reviewed-dashboard-data"
+        core = data_root / "core"
+        core.mkdir(parents=True, mode=0o700)
+        data_root.chmod(0o700)
+        config = CoreConfig(
+            socket_path=data_root / "core" / "service.sock",
+            state_path=data_root / "runtime_state.json",
+            memory_path=data_root / "memory.sqlite3",
+            capture_root=data_root,
+            dimension=8,
+            num_neurons=16,
+            default_top_k=4,
+        )
+        write_core_config(core / "service.json", config)
+        binding = binding_for_config(
+            repo_root=ROOT,
+            data_root=data_root,
+            config=config,
+            core_label="aero.boom.synapse-s2.core",
+            authority_mode="authoritative-core-v6",
+        )
+        path = default_binding_path(self.home)
+        write_core_client_binding(path, binding)
+        return path
 
     def _write_stubs(self) -> None:
         self._write_executable(
@@ -57,6 +90,12 @@ command="$1"
 shift
 case "$command" in
   print)
+    target="${1:-}"
+    case "$target" in
+      gui/*/*) ;;
+      gui/*) printf '{}\n'; exit 0 ;;
+      *) exit 64 ;;
+    esac
     phase="$(cat "$state_dir/phase" 2>/dev/null || true)"
     case "$phase" in
       prior) pid=111 ;;
@@ -94,6 +133,30 @@ case "$command" in
     if [ "${STUB_FAIL_FIRST_BOOTSTRAP:-0}" = 1 ] && [ "$count" -eq 1 ]; then
       exit 42
     fi
+    case "$2" in
+      *test.synapse.capture.plist)
+        mkdir -p \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_inbox" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_processing" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_processed" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_errors" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_receipts"
+        chmod 700 \
+          "$SYNAPSE_S2_CAPTURE_ROOT" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_inbox" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_processing" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_processed" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_errors" \
+          "$SYNAPSE_S2_CAPTURE_ROOT/capture_receipts"
+        ;;
+      *test.synapse.dashboard.plist)
+        mkdir -p "$(dirname "$SYNAPSE_S2_DASHBOARD_AUTH_FILE")"
+        chmod 700 "$(dirname "$SYNAPSE_S2_DASHBOARD_AUTH_FILE")"
+        printf '{"schema":"synapse-s2.dashboard-auth.v1","host":"127.0.0.1","port":%s,"bootstrap_url":"http://127.0.0.1:%s/__dashboard_bootstrap?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","session_header":"HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH"}\n' \
+          "$STUB_PORT" "$STUB_PORT" > "$SYNAPSE_S2_DASHBOARD_AUTH_FILE"
+        chmod 600 "$SYNAPSE_S2_DASHBOARD_AUTH_FILE"
+        ;;
+    esac
     if grep -q PRIOR-PLIST-BYTES "$2"; then
       printf 'rollback\n' > "$state_dir/phase"
     else
@@ -136,6 +199,11 @@ printf 'p222\nn127.0.0.1:%s\n' "$STUB_PORT"
 set -eu
 printf '%s\n' "$*" >> "$STUB_STATE_DIR/curl.log"
 [ "${STUB_CURL_FAIL:-0}" != 1 ]
+cat >/dev/null
+if printf '%s\n' "$*" | grep -q -- '--write-out'; then
+  printf '303'
+  exit 0
+fi
 if [ "${STUB_API_DEGRADED:-0}" = 1 ]; then
   printf '{"runtime":"disabled","effective_enabled":false,"memory_db_path":"%s","memory_context_entry_count":0}\n' "$SYNAPSE_S2_MEMORY_DB"
 else
@@ -146,6 +214,7 @@ fi
 
     def _environment(self, *, dashboard: bool) -> dict[str, str]:
         env = os.environ.copy()
+        env.pop("SYNAPSE_S2_CORE_BINDING", None)
         env.update(
             {
                 "HOME": str(self.home),
@@ -174,13 +243,18 @@ fi
                     INSERT INTO memory_entries(memory_id) VALUES ('sentinel');
                     """
                 )
+        memory_db.chmod(0o600)
         if dashboard:
+            self._write_dashboard_binding()
             env.update(
                 {
                     "SYNAPSE_S2_DASHBOARD_LABEL": "test.synapse.dashboard",
                     "SYNAPSE_S2_DASHBOARD_HOST": "127.0.0.1",
                     "SYNAPSE_S2_DASHBOARD_PORT": "18765",
                     "SYNAPSE_S2_DASHBOARD_LOG": str(self.root / "logs" / "dashboard.log"),
+                    "SYNAPSE_S2_DASHBOARD_AUTH_FILE": str(
+                        self.root / "dashboard-auth" / "dashboard-auth.json"
+                    ),
                     "SYNAPSE_S2_EXPORT_DIR": str(self.root / "exports"),
                 }
             )
@@ -211,7 +285,7 @@ fi
         if prior:
             plist.parent.mkdir(parents=True, mode=0o700)
             plist.write_bytes(PRIOR_PLIST)
-            plist.chmod(0o644)
+            plist.chmod(0o600)
             if prior_loaded:
                 phase = "prior" if prior_running else "prior-waiting"
                 (self.state / "phase").write_text(f"{phase}\n", encoding="utf-8")
@@ -240,7 +314,9 @@ fi
         self.assertEqual(stat.S_IMODE(plist.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(plist.parent.stat().st_mode), 0o700)
         self.assertEqual(list(plist.parent.glob(".test.synapse.capture.rollback.*")), [])
-        self.assertFalse((plist.parent / ".test.synapse.capture.install.lock").exists())
+        install_lock = plist.parent / ".test.synapse.capture.install.lock"
+        self.assertTrue(install_lock.is_file())
+        self.assertEqual(stat.S_IMODE(install_lock.stat().st_mode), 0o600)
         with closing(
             sqlite3.connect(self.root / "data" / "memory.sqlite3")
         ) as connection:
@@ -291,10 +367,16 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stat.S_IMODE(plist.stat().st_mode), 0o600)
         self.assertIn("-iTCP:18765", (self.state / "lsof.log").read_text())
-        self.assertIn(
-            "http://127.0.0.1:18765/api/status",
-            (self.state / "curl.log").read_text(),
+        curl_argv = (self.state / "curl.log").read_text(encoding="utf-8")
+        config_call_count = curl_argv.count("--config -")
+        self.assertGreaterEqual(config_call_count, 4)
+        self.assertEqual(config_call_count % 2, 0)
+        self.assertEqual(
+            curl_argv.count("--write-out %{http_code}"),
+            config_call_count // 2,
         )
+        self.assertNotIn("A" * 43, curl_argv)
+        self.assertNotIn("H" * 43, curl_argv)
 
     def test_capture_success_from_disabled_enables_before_bootstrap(self) -> None:
         result = self._install(
@@ -483,14 +565,19 @@ fi
         plist = self._plist(dashboard=True)
         plist.parent.mkdir(parents=True, mode=0o700)
         lock = plist.parent / ".test.synapse.dashboard.install.lock"
-        lock.mkdir(mode=0o700)
-
-        result = self._install(dashboard=True)
+        lock.touch(mode=0o600)
+        descriptor = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self._install(dashboard=True)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("already in progress", result.stderr)
         self.assertFalse(plist.exists())
-        self.assertTrue(lock.is_dir())
+        self.assertTrue(lock.is_file())
 
 
 if __name__ == "__main__":

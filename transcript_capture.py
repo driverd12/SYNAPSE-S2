@@ -147,27 +147,42 @@ def _exclusive_file_lock(
 ) -> Iterator[bool]:
     """Hold a private advisory lock for the complete protected operation."""
 
-    parent_existed = path.parent.exists()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # The capture root may be a caller-owned shared directory. Tighten only a
-    # directory that SYNAPSE created; never silently chmod an existing parent.
-    if not parent_existed:
-        try:
-            os.chmod(path.parent, 0o700)
-        except OSError:
-            pass
-    flags = os.O_RDWR | os.O_CREAT
+    _ensure_private_lock_directory(path.parent)
+
+    flags = os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
+    created = False
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        descriptor = os.open(path, flags)
     acquired = False
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise RuntimeError("transcript lock must be a regular file")
-        os.fchmod(descriptor, 0o600)
+        if created:
+            os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise RuntimeError("transcript lock identity is unsafe")
+        visible = path.lstat()
+        if (
+            stat.S_ISLNK(visible.st_mode)
+            or visible.st_dev != opened.st_dev
+            or visible.st_ino != opened.st_ino
+            or visible.st_uid != opened.st_uid
+            or visible.st_nlink != 1
+            or stat.S_IMODE(visible.st_mode) != 0o600
+        ):
+            raise RuntimeError("transcript lock path changed during open")
         lock_flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
         try:
             fcntl.flock(descriptor, lock_flags)
@@ -175,11 +190,56 @@ def _exclusive_file_lock(
         except BlockingIOError:
             yield False
             return
+        held = os.fstat(descriptor)
+        visible = path.lstat()
+        if (
+            held.st_dev != opened.st_dev
+            or held.st_ino != opened.st_ino
+            or visible.st_dev != opened.st_dev
+            or visible.st_ino != opened.st_ino
+            or visible.st_uid != opened.st_uid
+            or visible.st_nlink != 1
+            or stat.S_IMODE(visible.st_mode) != 0o600
+        ):
+            raise RuntimeError("transcript lock identity changed after acquisition")
         yield True
     finally:
         if acquired:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def _ensure_private_lock_directory(path: Path) -> None:
+    """Validate an existing lock parent or create exactly one private leaf."""
+
+    try:
+        parent = path.parent.lstat()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "transcript lock directory parent must already exist"
+        ) from exc
+    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+        raise RuntimeError("transcript lock parent ancestor is unsafe")
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(mode=0o700, parents=False)
+        current = path.lstat()
+        parent_after = path.parent.lstat()
+        if (
+            parent_after.st_dev != parent.st_dev
+            or parent_after.st_ino != parent.st_ino
+        ):
+            raise RuntimeError("transcript lock parent changed during creation")
+        if stat.S_IMODE(current.st_mode) != 0o700:
+            raise RuntimeError("new transcript lock parent must have mode 0700")
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or current.st_uid != os.getuid()
+        or stat.S_IMODE(current.st_mode) & 0o022
+    ):
+        raise RuntimeError("transcript lock parent is unsafe")
 
 
 def _source_stat_snapshot(stat_result: os.stat_result) -> tuple[int, ...]:
@@ -443,10 +503,6 @@ class TranscriptCaptureManager:
         app_snapshot_provider: Callable[[dict[str, Any]], str] | None = None,
     ) -> None:
         self.root = resolve_capture_root(root)
-        # Legacy state repair is the only read-to-write transition. Normal
-        # state reads below are deliberately side-effect-free, so a stale
-        # reader can never overwrite a newer cursor or connection commit.
-        self._migrate_legacy_state()
         self.backend = backend or mlx_backend.get_backend()
         self.running_app_provider = running_app_provider or self._detect_running_apps_macos
         self.app_snapshot_provider = app_snapshot_provider or self._snapshot_app_accessibility
@@ -463,6 +519,7 @@ class TranscriptCaptureManager:
         }
 
     def _source_lock_path(self, source_id: str) -> Path:
+        _ensure_private_lock_directory(self.root)
         digest = hashlib.sha256(str(source_id).encode("utf-8")).hexdigest()[:32]
         return self.paths()["source_lock_dir"] / f"{digest}.lock"
 
@@ -471,6 +528,7 @@ class TranscriptCaptureManager:
         return self.paths()["source_lineage_dir"] / f"{digest}.json"
 
     def _migration_source_lock_path(self, source_id: str) -> Path:
+        _ensure_private_lock_directory(self.root)
         if not _identifier_is_safe(source_id, field="source_id"):
             # Do not create a durable equality oracle by hashing a credential-
             # shaped legacy identifier into a new lock filename.
@@ -751,6 +809,16 @@ class TranscriptCaptureManager:
         self._migrate_legacy_source_state()
         self._reconcile_source_lineages()
         self._migrate_legacy_app_state()
+
+    def repair_legacy_state(self) -> dict[str, Any]:
+        """Run state migration only through an explicit mutation surface."""
+
+        self._migrate_legacy_state()
+        return {
+            "action": "repair-transcript-capture-state",
+            "status": "ready",
+            "root": str(self.root),
+        }
 
     def _new_source_instance_id(self) -> str:
         return f"s2src_{secrets.token_hex(16)}"
@@ -2296,17 +2364,31 @@ class TranscriptCaptureManager:
                 continue
         if requested_pid > 0:
             for app in candidates:
-                if int(app.get("pid") or 0) == requested_pid:
-                    candidate_name = str(app.get("app_name") or "").strip().lower()
-                    candidate_bundle = str(app.get("bundle_id") or "").strip().lower()
-                    if requested_bundle and candidate_bundle == requested_bundle:
-                        return app
-                    if requested_name and candidate_name == requested_name:
-                        return app
+                candidate_name = str(app.get("app_name") or "").strip().lower()
+                candidate_bundle = str(app.get("bundle_id") or "").strip().lower()
+                if (
+                    int(app.get("pid") or 0) == requested_pid
+                    and (not requested_name or candidate_name == requested_name)
+                    and (not requested_bundle or candidate_bundle == requested_bundle)
+                ):
+                    return app
+            # An explicit PID is an identity constraint, not a hint. Falling
+            # back to a same-name or same-bundle process after PID mismatch
+            # could attach a different app after process exit or reuse.
+            return None
         if requested_bundle:
             for app in candidates:
-                if str(app.get("bundle_id") or "").strip().lower() == requested_bundle:
+                if (
+                    str(app.get("bundle_id") or "").strip().lower()
+                    == requested_bundle
+                    and (
+                        not requested_name
+                        or str(app.get("app_name") or "").strip().lower()
+                        == requested_name
+                    )
+                ):
                     return app
+            return None
         if requested_name:
             for app in candidates:
                 if str(app.get("app_name") or "").strip().lower() == requested_name:
@@ -2526,7 +2608,7 @@ class TranscriptCaptureManager:
             return False
         return " " in name and bool(name[0].isupper())
 
-    def _resolve_accessibility_app_name(self, app: dict[str, Any]) -> str:
+    def _resolve_accessibility_app_identity(self, app: dict[str, Any]) -> dict[str, Any]:
         app_name = " ".join(str(app.get("app_name") or "").split())
         if not app_name:
             raise ValueError("app_name must not be empty")
@@ -2536,25 +2618,32 @@ class TranscriptCaptureManager:
             requested_pid = int(app.get("pid") or 0)
         except (TypeError, ValueError):
             requested_pid = 0
+        if requested_pid <= 0:
+            raise ValueError(
+                "app identity is incomplete; reconnect the running app before snapshot"
+            )
         try:
             candidates = [
                 self._public_app(candidate)
                 for candidate in self._detect_visible_application_processes()
             ]
-        except Exception:
-            return app_name
-        if requested_pid > 0:
-            for candidate in candidates:
-                if int(candidate.get("pid") or 0) == requested_pid:
-                    return str(candidate.get("app_name") or app_name)
-        if requested_bundle:
-            for candidate in candidates:
-                if str(candidate.get("bundle_id") or "").strip().lower() == requested_bundle:
-                    return str(candidate.get("app_name") or app_name)
-        for candidate in candidates:
-            if str(candidate.get("app_name") or "").strip().lower() == requested_name:
-                return str(candidate.get("app_name") or app_name)
-        return app_name
+        except Exception as exc:
+            raise ValueError(
+                "app identity could not be revalidated; reconnect or use selected-text capture"
+            ) from exc
+        matches = [
+            candidate
+            for candidate in candidates
+            if int(candidate.get("pid") or 0) == requested_pid
+            and str(candidate.get("app_name") or "").strip().lower() == requested_name
+            and str(candidate.get("bundle_id") or "").strip().lower()
+            == requested_bundle
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "app identity changed; reconnect the running app before snapshot"
+            )
+        return matches[0]
 
     def _clean_accessibility_snapshot_text(self, text: str) -> str:
         lines: list[str] = []
@@ -2663,7 +2752,10 @@ class TranscriptCaptureManager:
         return clean[: max(0, limit - 14)].rstrip() + "\n[truncated]"
 
     def _snapshot_app_accessibility(self, app: dict[str, Any]) -> str:
-        app_name = self._resolve_accessibility_app_name(app)
+        identity = self._resolve_accessibility_app_identity(app)
+        app_name = str(identity["app_name"])
+        app_pid = int(identity["pid"])
+        app_bundle = str(identity.get("bundle_id") or "")
         script = """
         on appendClean(rawValue)
           try
@@ -2677,10 +2769,22 @@ class TranscriptCaptureManager:
 
         on run argv
           set appName to item 1 of argv
+          set appPid to item 2 of argv as integer
+          set appBundle to item 3 of argv
           set outputText to "Application: " & appName & linefeed
           tell application "System Events"
-            if not (exists process appName) then error "process not found: " & appName
-            tell process appName
+            set matchingProcesses to application processes whose unix id is appPid
+            if (count matchingProcesses) is not 1 then error "process identity unavailable"
+            set targetProcess to item 1 of matchingProcesses
+            if (name of targetProcess as text) is not appName then error "process name changed"
+            if appBundle is not "" then
+              set liveBundle to ""
+              try
+                set liveBundle to bundle identifier of targetProcess as text
+              end try
+              if liveBundle is not appBundle then error "process bundle changed"
+            end if
+            tell targetProcess
               try
                 set frontmost to true
               end try
@@ -2717,7 +2821,7 @@ class TranscriptCaptureManager:
         """
         try:
             result = subprocess.run(
-                ["osascript", "-e", script, app_name],
+                ["osascript", "-e", script, app_name, str(app_pid), app_bundle],
                 text=True,
                 capture_output=True,
                 check=True,
@@ -2872,7 +2976,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def backend_from_args(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBackend:
+def backend_from_args(args: argparse.Namespace) -> Any:
+    from backend_router import core_client_if_required
+
+    client = core_client_if_required(
+        memory_path=args.memory_db,
+        state_path=args.state,
+        capture_root=args.capture_root,
+        local_config={
+            "dimension": args.dimension,
+            "num_neurons": args.neurons,
+            "default_top_k": args.top_k,
+        },
+        local_defaults={
+            "dimension": 1024,
+            "num_neurons": 5400,
+            "default_top_k": 256,
+        },
+    )
+    if client is not None:
+        return client
     return mlx_backend.SpikingAttentionBackend(
         dimension=args.dimension,
         num_neurons=args.neurons,

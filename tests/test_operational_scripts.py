@@ -8,12 +8,40 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from capture_daemon import CaptureInboxDaemon
+from core_client_binding import (
+    BINDING_ENV,
+    binding_for_config,
+    default_binding_path,
+    write_core_client_binding,
+)
+from core_service import CoreConfig, write_core_config
 from scripts import operator_readiness_certify as readiness
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_test_core_config(data_root: Path) -> CoreConfig:
+    data_root = data_root.resolve()
+    core = data_root / "core"
+    core.mkdir(parents=True, mode=0o700, exist_ok=True)
+    data_root.chmod(0o700)
+    core.chmod(0o700)
+    config = CoreConfig(
+        socket_path=core / "service.sock",
+        state_path=data_root / "runtime_state.json",
+        memory_path=data_root / "memory.sqlite3",
+        capture_root=data_root,
+        dimension=8,
+        num_neurons=16,
+        default_top_k=4,
+    )
+    write_core_config(core / "service.json", config)
+    return config
 
 
 class OperationalScriptTests(unittest.TestCase):
@@ -41,6 +69,8 @@ class OperationalScriptTests(unittest.TestCase):
         certifier.run_id = "capture-ledger-binding-test"
         certifier.artifact_dir = temp_root / "artifacts"
         certifier.artifact_dir.mkdir(mode=0o700)
+        certifier.core_binding = None
+        certifier.core_paths = SimpleNamespace(data_root=temp_root)
         certifier._cli_command = lambda *parts: list(parts)
 
         valid_audit = {
@@ -116,6 +146,7 @@ class OperationalScriptTests(unittest.TestCase):
         *,
         label: str,
         extra_environment: dict[str, str],
+        install_dashboard_binding: bool = True,
     ) -> tuple[subprocess.CompletedProcess[str], dict, Path]:
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -129,14 +160,34 @@ set -eu
 state_path="$(dirname "$0")/launchctl-running"
 case "$1" in
   print)
-    test -f "$state_path"
-    printf 'state = running\npid = 222\n'
+    case "${2:-}" in
+      gui/*/*)
+        test -f "$state_path"
+        printf 'state = running\npid = 222\n'
+        ;;
+      gui/*)
+        printf 'services = {\n'
+        if test -f "$state_path"; then
+          printf '  222 - %s\n' "${SYNAPSE_S2_DASHBOARD_LABEL:-${SYNAPSE_S2_CAPTURE_LABEL:-test.service}}"
+        fi
+        printf '}\n'
+        ;;
+      *) exit 64 ;;
+    esac
     ;;
   bootout)
     rm -f -- "$state_path"
     ;;
   bootstrap)
     : > "$state_path"
+    if [ -n "${SYNAPSE_S2_DASHBOARD_AUTH_FILE:-}" ]; then
+      mkdir -p "$(dirname "$SYNAPSE_S2_DASHBOARD_AUTH_FILE")"
+      chmod 700 "$(dirname "$SYNAPSE_S2_DASHBOARD_AUTH_FILE")"
+      printf '{"schema":"synapse-s2.dashboard-auth.v1","host":"127.0.0.1","port":%s,"bootstrap_url":"http://127.0.0.1:%s/__dashboard_bootstrap?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","session_header":"HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH"}\n' \
+        "${SYNAPSE_S2_DASHBOARD_PORT:-8765}" \
+        "${SYNAPSE_S2_DASHBOARD_PORT:-8765}" > "$SYNAPSE_S2_DASHBOARD_AUTH_FILE"
+      chmod 600 "$SYNAPSE_S2_DASHBOARD_AUTH_FILE"
+    fi
     ;;
   enable|kickstart)
     ;;
@@ -161,6 +212,11 @@ printf 'p222\nn127.0.0.1:%s\n' "${SYNAPSE_S2_DASHBOARD_PORT:-8765}"
         fake_curl.write_text(
             """#!/bin/sh
 set -eu
+cat >/dev/null
+if printf '%s\n' "$*" | grep -q -- '--write-out'; then
+  printf '303'
+  exit 0
+fi
 printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memory_context_entry_count":1}\n' "$SYNAPSE_S2_MEMORY_DB"
 """,
             encoding="utf-8",
@@ -168,6 +224,8 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         fake_curl.chmod(0o755)
 
         environment = os.environ.copy()
+        if BINDING_ENV not in extra_environment:
+            environment.pop(BINDING_ENV, None)
         environment.update(extra_environment)
         environment.update(
             {
@@ -181,6 +239,24 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             }
         )
         Path(environment["HOME"]).mkdir(mode=0o700)
+        if script_name == "install_dashboard_agent.sh":
+            environment["SYNAPSE_S2_DASHBOARD_AUTH_FILE"] = str(
+                temp_root / "dashboard-auth" / "dashboard-auth.json"
+            )
+        if script_name == "install_dashboard_agent.sh" and install_dashboard_binding:
+            data_root = (temp_root / "reviewed-dashboard-data").resolve()
+            config = _write_test_core_config(data_root)
+            binding = binding_for_config(
+                repo_root=ROOT,
+                data_root=data_root,
+                config=config,
+                core_label="aero.boom.synapse-s2.core",
+                authority_mode="authoritative-core-v6",
+            )
+            write_core_client_binding(
+                default_binding_path(Path(environment["HOME"])),
+                binding,
+            )
         if script_name == "install_capture_daemon.sh":
             memory_db = Path(
                 environment.get(
@@ -198,7 +274,12 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
                         CREATE TABLE store_migrations(key TEXT PRIMARY KEY);
                         """
                     )
+            memory_db.chmod(0o600)
             environment["SYNAPSE_S2_MEMORY_DB"] = str(memory_db)
+            daemon = CaptureInboxDaemon(
+                root=environment["SYNAPSE_S2_CAPTURE_ROOT"]
+            )
+            daemon._ensure_transport_dirs(daemon.paths())
         result = subprocess.run(
             ["bash", str(ROOT / "scripts" / script_name)],
             cwd=ROOT,
@@ -245,7 +326,52 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
 
         self.assertIn("unset SYNAPSE_S2_STATE_PATH SYNAPSE_S2_MEMORY_DB", unit_test_section)
         self.assertIn("unset SYNAPSE_S2_EXPORT_DIR SYNAPSE_S2_CAPTURE_ROOT", unit_test_section)
-        self.assertIn("SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash", unit_test_section)
+        self.assertIn("unset SYNAPSE_S2_CORE_BINDING SYNAPSE_S2_CORE_SOCKET", unit_test_section)
+        self.assertIn("unset SYNAPSE_S2_EMBEDDING_PROVIDER", unit_test_section)
+        self.assertNotIn("SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash", unit_test_section)
+
+    def test_prep_tomorrow_certifies_immutably_before_explicit_apply(self):
+        script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text(encoding="utf-8")
+        apply_marker = 'echo "=== apply stage (all immutable gates passed) ==="'
+        self.assertIn("--apply", script)
+        self.assertIn(apply_marker, script)
+        pre_apply, apply_stage = script.split(apply_marker, 1)
+        self.assertIn('git status --porcelain --untracked-files=all', pre_apply)
+        self.assertIn('echo "=== unit tests ==="', pre_apply)
+        self.assertIn('echo "=== compile check ==="', pre_apply)
+        self.assertIn('echo "=== build identity ==="', pre_apply)
+        self.assertIn("validate_evidence_contract", pre_apply)
+        self.assertIn("Apply requires a reviewed candidate or authoritative core binding", pre_apply)
+        self.assertNotIn('mkdir -p "$SYNAPSE_S2_EXPORT_DIR"', pre_apply)
+        self.assertNotIn("\n    uv sync\n", pre_apply)
+        self.assertNotIn("scripts/install_local_launcher.sh\n", pre_apply)
+        self.assertNotIn("scripts/install_client_configs.py\n", pre_apply)
+        self.assertIn('mkdir -p "$SYNAPSE_S2_EXPORT_DIR"', apply_stage)
+        self.assertIn("scripts/install_core_agent.sh install", apply_stage)
+        self.assertIn('echo "=== authoritative core status ==="', apply_stage)
+        self.assertIn("scripts/install_dashboard_agent.sh", apply_stage)
+        self.assertLess(
+            apply_stage.index("scripts/install_core_agent.sh install"),
+            apply_stage.index('echo "=== authoritative core status ==="'),
+        )
+        self.assertLess(
+            apply_stage.index('echo "=== authoritative core status ==="'),
+            apply_stage.index("scripts/install_local_launcher.sh"),
+        )
+        self.assertLess(
+            apply_stage.index("scripts/install_local_launcher.sh"),
+            apply_stage.index("scripts/install_client_configs.py"),
+        )
+        self.assertLess(
+            apply_stage.index("scripts/install_client_configs.py"),
+            apply_stage.index("scripts/install_dashboard_agent.sh"),
+        )
+        self.assertIn('binding.get("ready") is not True', apply_stage)
+        cortex_commit = apply_stage.split(
+            "synapse_cli.py --json commit-cortex",
+            1,
+        )[1].split("synapse_cli.py --json cortex-state", 1)[0]
+        self.assertEqual(cortex_commit.count("--evidence"), 1)
 
     def test_capture_daemon_installer_declares_launch_agent(self):
         script = (ROOT / "scripts" / "install_capture_daemon.sh").read_text(encoding="utf-8")
@@ -264,7 +390,10 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn("prepare_private_log", script)
         self.assertIn("os.fchmod(descriptor, 0o600)", script)
         self.assertIn('plutil -lint "$PLIST_TEMP"', script)
-        self.assertIn('mv -f -- "$PLIST_TEMP" "$PLIST"', script)
+        self.assertIn("secure_installer_support.py", script)
+        self.assertIn("replace-regular", script)
+        self.assertIn("run-locked", script)
+        self.assertNotIn('mkdir -m 700 "$INSTALL_LOCK_CANDIDATE"', script)
         self.assertIn("fsync_file_and_parent", script)
         self.assertIn("SYNAPSE_S2_INSTALL_STABILIZATION_SECONDS", script)
         self.assertIn("capture_functional_probe", script)
@@ -274,7 +403,7 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             script.rindex("if ! bootout_service; then"),
         )
         self.assertLess(
-            script.index('mv -f -- "$PLIST_TEMP" "$PLIST"'),
+            script.rindex("replace-regular"),
             script.rindex("if ! bootout_service; then"),
         )
         self.assertNotIn('chmod 700 "$CAPTURE_ROOT"', script)
@@ -337,20 +466,271 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
 
         self.assertIn("osascript", script)
         self.assertIn("pbcopy < \"$CLIPBOARD_BACKUP\"", script)
+        self.assertIn("umask 077", script)
+        self.assertIn('CLIPBOARD_BACKED_UP=1', script)
         self.assertIn("capture-clipboard", script)
         self.assertNotIn("while true", script)
+
+    def test_frontmost_selection_prefers_reviewed_binding_without_direct_routes(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            data_root = (root / "reviewed-selection-data").resolve()
+            config = _write_test_core_config(data_root)
+            binding = binding_for_config(
+                repo_root=ROOT,
+                data_root=data_root,
+                config=config,
+                core_label="aero.boom.synapse-s2.core",
+                authority_mode="candidate-local-v5",
+            )
+            binding_path = default_binding_path(home)
+            write_core_client_binding(binding_path, binding)
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir(mode=0o700)
+            for name, body in {
+                "pbpaste": "#!/bin/sh\nprintf 'selected text\\n'\n",
+                "pbcopy": "#!/bin/sh\ncat > \"$PBCOPY_RECORD\"\n",
+                "osascript": "#!/bin/sh\ncat >/dev/null\n",
+            }.items():
+                path = fake_bin / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            python_shim = fake_bin / "python-shim"
+            python_shim.write_text(
+                """#!/bin/bash
+set -eu
+printf '%s\n' "-- invocation --" "$@" >> "$PYTHON_SHIM_RECORD"
+if [ "${1:-}" = - ]; then
+  exec "$REAL_PYTHON" "$@"
+fi
+env | LC_ALL=C sort > "$SELECTION_ENV_RECORD"
+printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
+""",
+                encoding="utf-8",
+            )
+            python_shim.chmod(0o755)
+            env_record = root / "selection.env"
+            args_record = root / "selection.args"
+            shim_record = root / "python-shim.log"
+            pbcopy_record = root / "clipboard-restored.txt"
+            environment = os.environ.copy()
+            environment.pop(BINDING_ENV, None)
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "REAL_PYTHON": sys.executable,
+                    "SELECTION_ENV_RECORD": str(env_record),
+                    "SELECTION_ARGS_RECORD": str(args_record),
+                    "PYTHON_SHIM_RECORD": str(shim_record),
+                    "PBCOPY_RECORD": str(pbcopy_record),
+                    "SYNAPSE_S2_PYTHON": str(python_shim),
+                    "SYNAPSE_S2_SELECTION_COPY_DELAY": "0",
+                    # Stale direct routes must be scrubbed, not allowed to
+                    # override the reviewed owner-only binding.
+                    "SYNAPSE_S2_CORE_SOCKET": str(root / "wrong" / "service.sock"),
+                    "SYNAPSE_S2_CAPTURE_ROOT": str(root / "wrong-capture"),
+                    "SYNAPSE_S2_MEMORY_DB": str(root / "wrong.sqlite3"),
+                    "SYNAPSE_S2_STATE_PATH": str(root / "wrong.json"),
+                }
+            )
+
+            completed = subprocess.run(
+                ["bash", str(ROOT / "scripts" / "capture_frontmost_selection.sh")],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(
+                env_record.exists(),
+                completed.stderr + "\n" + shim_record.read_text(encoding="utf-8"),
+            )
+            forwarded_environment = env_record.read_text(encoding="utf-8")
+            forwarded_arguments = args_record.read_text(encoding="utf-8").splitlines()
+            selection_path = Path(
+                forwarded_arguments[forwarded_arguments.index("--text-file") + 1]
+            )
+            self.assertFalse(selection_path.exists())
+            self.assertEqual(
+                pbcopy_record.read_text(encoding="utf-8"),
+                "selected text\n",
+            )
+
+        self.assertIn(f"{BINDING_ENV}={binding_path}", forwarded_environment)
+        for key in (
+            "SYNAPSE_S2_CORE_SOCKET",
+            "SYNAPSE_S2_CAPTURE_ROOT",
+            "SYNAPSE_S2_EXPORT_DIR",
+            "SYNAPSE_S2_MEMORY_DB",
+            "SYNAPSE_S2_STATE_PATH",
+            "SYNAPSE_S2_EXPECTED_CORE_CONFIG_FINGERPRINT",
+        ):
+            self.assertNotIn(f"{key}=", forwarded_environment)
+        self.assertIn("capture-clipboard", forwarded_arguments)
+        self.assertNotIn("--capture-root", forwarded_arguments)
+
+    def test_frontmost_selection_aborts_before_copy_when_clipboard_backup_fails(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            fake_bin = root / "bin"
+            fake_bin.mkdir(mode=0o700)
+            osascript_record = root / "osascript-ran"
+            pbcopy_record = root / "pbcopy-ran"
+            scripts = {
+                "pbpaste": "#!/bin/sh\nexit 9\n",
+                "pbcopy": f"#!/bin/sh\nprintf ran > {pbcopy_record!s}\n",
+                "osascript": f"#!/bin/sh\nprintf ran > {osascript_record!s}\n",
+            }
+            for name, body in scripts.items():
+                path = fake_bin / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            environment = os.environ.copy()
+            environment.pop(BINDING_ENV, None)
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "SYNAPSE_S2_PYTHON": sys.executable,
+                }
+            )
+
+            completed = subprocess.run(
+                ["bash", str(ROOT / "scripts" / "capture_frontmost_selection.sh")],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 4)
+            self.assertIn("Could not preserve the current clipboard", completed.stderr)
+            self.assertFalse(osascript_record.exists())
+            self.assertFalse(pbcopy_record.exists())
+
+    def test_frontmost_selection_without_binding_uses_canonical_v5_routes(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            fake_bin = root / "bin"
+            fake_bin.mkdir(mode=0o700)
+            for name, body in {
+                "pbpaste": "#!/bin/sh\nprintf 'selected text\\n'\n",
+                "pbcopy": "#!/bin/sh\ncat >/dev/null\n",
+                "osascript": "#!/bin/sh\ncat >/dev/null\n",
+            }.items():
+                path = fake_bin / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            python_shim = fake_bin / "python-shim"
+            python_shim.write_text(
+                """#!/bin/bash
+set -eu
+if [ "${1:-}" = - ]; then
+  exec "$REAL_PYTHON" "$@"
+fi
+env | LC_ALL=C sort > "$SELECTION_ENV_RECORD"
+printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
+""",
+                encoding="utf-8",
+            )
+            python_shim.chmod(0o755)
+            env_record = root / "selection.env"
+            args_record = root / "selection.args"
+            environment = os.environ.copy()
+            for key in (
+                BINDING_ENV,
+                "SYNAPSE_S2_CORE_SOCKET",
+                "SYNAPSE_S2_CAPTURE_ROOT",
+                "SYNAPSE_S2_EXPORT_DIR",
+            ):
+                environment.pop(key, None)
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "REAL_PYTHON": sys.executable,
+                    "SELECTION_ENV_RECORD": str(env_record),
+                    "SELECTION_ARGS_RECORD": str(args_record),
+                    "SYNAPSE_S2_PYTHON": str(python_shim),
+                    "SYNAPSE_S2_SELECTION_COPY_DELAY": "0",
+                    # Stale local-v5 database and state variables are ignored;
+                    # the no-binding compatibility lane is canonical only.
+                    "SYNAPSE_S2_MEMORY_DB": str(root / "wrong.sqlite3"),
+                    "SYNAPSE_S2_STATE_PATH": str(root / "wrong.json"),
+                }
+            )
+
+            completed = subprocess.run(
+                ["bash", str(ROOT / "scripts" / "capture_frontmost_selection.sh")],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            forwarded_environment = env_record.read_text(encoding="utf-8")
+            forwarded_arguments = args_record.read_text(encoding="utf-8").splitlines()
+
+        self.assertNotIn(f"{BINDING_ENV}=", forwarded_environment)
+        self.assertNotIn("SYNAPSE_S2_CORE_SOCKET=", forwarded_environment)
+        self.assertEqual(
+            forwarded_arguments,
+            [
+                "synapse_cli.py",
+                "--json",
+                "--state",
+                str(ROOT / ".synapse_s2" / "runtime_state.json"),
+                "--memory-db",
+                str(ROOT / ".synapse_s2" / "memory.sqlite3"),
+                "capture-clipboard",
+                "--context",
+                "default",
+                "--tag",
+                "frontmost-selection",
+                "--speaker",
+                "operator",
+                "--text-file",
+                forwarded_arguments[-3],
+                "--capture-root",
+                str(ROOT / ".synapse_s2"),
+            ],
+        )
 
     def test_local_launcher_uses_client_session_wrapper(self):
         script = (ROOT / "scripts" / "install_local_launcher.sh").read_text(encoding="utf-8")
 
         self.assertIn("mcp_client_wrapper.py", script)
         self.assertIn("SYNAPSE_S2_CLIENT_SESSION_BRIDGE", script)
-        self.assertIn("SYNAPSE_S2_EMBEDDING_PROVIDER:=mlx-neural", script)
-        self.assertIn("SYNAPSE_S2_NEURAL_MODEL", script)
-        self.assertIn("Qwen3-Embedding-0.6B-4bit-DWQ", script)
+        self.assertIn("SYNAPSE_S2_CORE_SOCKET", script)
         self.assertIn("umask 077", script)
-        self.assertIn("MLX_DEVICE:=gpu", script)
-        self.assertIn("SYNAPSE_S2_MEMORY_DB", script)
+        self.assertNotIn("MLX_DEVICE:=gpu", script)
+        self.assertNotIn(': "\\${SYNAPSE_S2_MEMORY_DB:=', script)
+        self.assertIn(
+            'SYNAPSE_S2_MEMORY_DB="\\$REPO_ROOT/.synapse_s2/memory.sqlite3"',
+            script,
+        )
+        self.assertIn("export SYNAPSE_S2_MEMORY_DB", script)
+        self.assertIn("database_requires_core", script)
+        self.assertIn("unset MLX_DEVICE SYNAPSE_S2_DIMENSION", script)
+        self.assertIn("unset SYNAPSE_S2_NEURAL_MODEL", script)
+        self.assertIn("SYNAPSE_S2_STATE_PATH SYNAPSE_S2_TOP_K", script)
         self.assertIn("SYNAPSE_S2_DEFAULT_RESPONSE_MODE:=compact", script)
         self.assertIn("SYNAPSE_S2_MAX_RESPONSE_BYTES:=12288", script)
         self.assertNotIn('"$REPO_ROOT/mcp_server.py"', script)
@@ -511,7 +891,59 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             self.assertNotIn(secret_component, result.stdout + result.stderr)
             self.assertFalse((home / ".local").exists())
 
-    def test_dashboard_agent_installer_runs_neural_dashboard_on_loopback(self):
+    def test_shared_launchagent_lock_is_reusable_and_rejects_hardlinks(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            lock = root / "agent.install.lock"
+            helper = ROOT / "scripts" / "secure_installer_support.py"
+            command = [
+                sys.executable,
+                str(helper),
+                "run-locked",
+                "--lock",
+                str(lock),
+                "--marker",
+                "test-lock",
+                "--",
+                sys.executable,
+                "-c",
+                "raise SystemExit(0)",
+            ]
+            first = subprocess.run(command, check=False, capture_output=True, text=True)
+            second = subprocess.run(command, check=False, capture_output=True, text=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertTrue(lock.is_file())
+            self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+
+            alias = root / "lock-alias"
+            os.link(lock, alias)
+            rejected = subprocess.run(command, check=False, capture_output=True, text=True)
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("unsafe", rejected.stderr)
+
+    def test_secure_installer_helper_does_not_reflect_secret_cli_values(self):
+        secret = "github_pat_secretparser123456789012345"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "secure_installer_support.py"),
+                "validate-regular",
+                "--path",
+                str(ROOT / "missing"),
+                "--unknown",
+                secret,
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(secret, result.stderr)
+
+    def test_dashboard_agent_installer_runs_lightweight_core_adapter_on_loopback(self):
         script_path = ROOT / "scripts" / "install_dashboard_agent.sh"
 
         self.assertTrue(script_path.exists(), "dashboard LaunchAgent installer must exist")
@@ -519,8 +951,8 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn("aero.boom.synapse-s2.dashboard", script)
         self.assertIn("dashboard_server.py", script)
         self.assertIn("127.0.0.1", script)
+        self.assertIn("SYNAPSE_S2_CORE_BINDING", script)
         self.assertIn("SYNAPSE_S2_EMBEDDING_PROVIDER", script)
-        self.assertIn("mlx-neural", script)
         self.assertIn("Qwen3-Embedding-0.6B-4bit-DWQ", script)
         self.assertIn("umask 077", script)
         self.assertIn("Dashboard host must be loopback-only", script)
@@ -531,7 +963,10 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn("prepare_private_log", script)
         self.assertIn("os.fchmod(descriptor, 0o600)", script)
         self.assertIn('plutil -lint "$PLIST_TEMP"', script)
-        self.assertIn('mv -f -- "$PLIST_TEMP" "$PLIST"', script)
+        self.assertIn("secure_installer_support.py", script)
+        self.assertIn("replace-regular", script)
+        self.assertIn("run-locked", script)
+        self.assertNotIn('mkdir -m 700 "$INSTALL_LOCK_CANDIDATE"', script)
         self.assertIn("fsync_file_and_parent", script)
         self.assertIn("/api/status", script)
         self.assertIn("SYNAPSE_S2_INSTALL_STABILIZATION_SECONDS", script)
@@ -541,7 +976,7 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             script.rindex("if ! bootout_service; then"),
         )
         self.assertLess(
-            script.index('mv -f -- "$PLIST_TEMP" "$PLIST"'),
+            script.rindex("replace-regular"),
             script.rindex("if ! bootout_service; then"),
         )
         self.assertNotIn('chmod 700 "$EXPORT_DIR"', script)
@@ -558,6 +993,9 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         dashboard_port = "18765"
         hostile_context = f"default'\"&<$(touch {sentinel})"
         hostile_provider = f"mlx'\"&<$(touch {sentinel})"
+        hostile_socket = str(
+            data_root / f"core'\"&<$(touch {sentinel})" / "service.sock"
+        )
         result, payload, plist_path = self._run_launch_agent_installer(
             "install_dashboard_agent.sh",
             label=label,
@@ -572,6 +1010,7 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
                 "SYNAPSE_S2_EXPORT_DIR": str(data_root / "exports"),
                 "SYNAPSE_S2_CAPTURE_ROOT": str(data_root / "capture"),
                 "SYNAPSE_S2_EMBEDDING_PROVIDER": hostile_provider,
+                "SYNAPSE_S2_CORE_SOCKET": hostile_socket,
             },
         )
 
@@ -594,11 +1033,108 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             payload["ProgramArguments"][context_index + 1],
             hostile_context,
         )
+        self.assertIn(BINDING_ENV, payload["EnvironmentVariables"])
         self.assertEqual(
-            payload["EnvironmentVariables"]["SYNAPSE_S2_EMBEDDING_PROVIDER"],
-            hostile_provider,
+            payload["EnvironmentVariables"][BINDING_ENV],
+            str(plist_path.parents[2] / ".config" / "synapse-s2" / "core-binding.json"),
+        )
+        self.assertNotIn("SYNAPSE_S2_CORE_SOCKET", payload["EnvironmentVariables"])
+        self.assertNotIn("SYNAPSE_S2_CAPTURE_ROOT", payload["EnvironmentVariables"])
+        self.assertNotIn("SYNAPSE_S2_EXPORT_DIR", payload["EnvironmentVariables"])
+        self.assertNotIn(
+            "SYNAPSE_S2_EMBEDDING_PROVIDER",
+            payload["EnvironmentVariables"],
         )
         self.assertEqual(stat.S_IMODE(plist_path.stat().st_mode), 0o600)
+
+    def test_dashboard_installer_rejects_unreviewed_noncanonical_direct_paths(self):
+        label = "aero.boom.synapse-s2.dashboard-test"
+        with TemporaryDirectory() as temporary:
+            data_root = Path(temporary)
+            result, payload, plist_path = self._run_launch_agent_installer(
+                "install_dashboard_agent.sh",
+                label=label,
+                install_dashboard_binding=False,
+                extra_environment={
+                    "SYNAPSE_S2_DASHBOARD_LABEL": label,
+                    "SYNAPSE_S2_MEMORY_DB": str(data_root / "memory.sqlite3"),
+                    "SYNAPSE_S2_STATE_PATH": str(data_root / "runtime_state.json"),
+                    "SYNAPSE_S2_CAPTURE_ROOT": str(data_root),
+                    "SYNAPSE_S2_EXPORT_DIR": str(data_root),
+                },
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("require a reviewed core binding", result.stderr)
+        self.assertEqual(payload, {})
+        self.assertFalse(plist_path.exists())
+
+    def test_dashboard_installer_prefers_explicit_reviewed_binding(self):
+        label = "aero.boom.synapse-s2.dashboard-test"
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = (root / "explicit-reviewed-data").resolve()
+            config = _write_test_core_config(data_root)
+            binding = binding_for_config(
+                repo_root=ROOT,
+                data_root=data_root,
+                config=config,
+                core_label="aero.boom.synapse-s2.core",
+                authority_mode="candidate-local-v5",
+            )
+            binding_path = root / "explicit" / "binding.json"
+            write_core_client_binding(binding_path, binding)
+            result, payload, _plist_path = self._run_launch_agent_installer(
+                "install_dashboard_agent.sh",
+                label=label,
+                extra_environment={
+                    "SYNAPSE_S2_DASHBOARD_LABEL": label,
+                    "SYNAPSE_S2_DASHBOARD_LOG": str(root / "dashboard.log"),
+                    BINDING_ENV: str(binding_path),
+                    # Used only by the test curl stub, never published.
+                    "SYNAPSE_S2_MEMORY_DB": str(config.memory_path),
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            payload["EnvironmentVariables"],
+            {
+                BINDING_ENV: str(binding_path),
+                "SYNAPSE_S2_DEFAULT_RESPONSE_MODE": "compact",
+                "SYNAPSE_S2_MAX_RESPONSE_BYTES": "12288",
+            },
+        )
+
+    def test_dashboard_installer_rejects_nonprivate_explicit_binding(self):
+        label = "aero.boom.synapse-s2.dashboard-test"
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = (root / "explicit-reviewed-data").resolve()
+            config = _write_test_core_config(data_root)
+            binding = binding_for_config(
+                repo_root=ROOT,
+                data_root=data_root,
+                config=config,
+                core_label="aero.boom.synapse-s2.core",
+                authority_mode="authoritative-core-v6",
+            )
+            binding_path = root / "explicit" / "binding.json"
+            write_core_client_binding(binding_path, binding)
+            binding_path.chmod(0o644)
+            result, payload, plist_path = self._run_launch_agent_installer(
+                "install_dashboard_agent.sh",
+                label=label,
+                extra_environment={
+                    "SYNAPSE_S2_DASHBOARD_LABEL": label,
+                    BINDING_ENV: str(binding_path),
+                },
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("core binding is invalid", result.stderr)
+        self.assertEqual(payload, {})
+        self.assertFalse(plist_path.exists())
 
     def test_dashboard_installer_rejects_hostile_port_before_writing(self):
         label = "aero.boom.synapse-s2.dashboard-test"

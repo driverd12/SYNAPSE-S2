@@ -489,7 +489,7 @@ class CaptureLedgerReconciliationTests(unittest.TestCase):
             fixture = self._seed_legacy_gap(canonical_root)
             alternate_root = Path(tmp) / "alternate"
             alternate_root.mkdir(mode=0o700)
-            CaptureInboxDaemon(root=alternate_root).status()
+            CaptureInboxDaemon(root=alternate_root).prepare_transport()
             copied = alternate_root / "capture_processed" / fixture[
                 "processed_path"
             ].name

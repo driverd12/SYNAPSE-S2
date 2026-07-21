@@ -7,7 +7,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import embedding_providers
-from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
+from embedding_providers import (
+    EmbeddingProviderConfig,
+    EmbeddingProviderError,
+    MLXNeuralEmbeddingConfig,
+    resolve_embedding_provider,
+    resolve_embedding_provider_config,
+)
 
 
 def cosine(left, right):
@@ -154,6 +160,136 @@ class EmbeddingProviderTests(unittest.TestCase):
         self.assertEqual(info["dimensions"], 32)
         self.assertTrue(info["semantic"])
         self.assertTrue(info["local_only"])
+
+    def test_explicit_neural_configuration_is_closed_against_environment(self):
+        captured: list[MLXNeuralEmbeddingConfig] = []
+
+        class FakeRuntime:
+            model_id = "unit/pinned-model"
+            source = "/private/unit/cache/pinned"
+            native_mlx = True
+            cache_fallback_used = False
+
+            def embed_text(self, text, *, pooling, max_tokens):
+                return [1.0, 2.0, 3.0]
+
+        with TemporaryDirectory() as tmp:
+            cache_dir = str((Path(tmp) / "models").resolve())
+            neural = MLXNeuralEmbeddingConfig(
+                model_id="unit/pinned-model",
+                cache_dir=cache_dir,
+                revision="a" * 40,
+                pooling="last",
+                max_tokens=321,
+                normalize=False,
+                local_files_only=True,
+            )
+            configured = EmbeddingProviderConfig(
+                provider="mlx-neural-v1",
+                neural=neural,
+            )
+            hostile_environment = {
+                "SYNAPSE_S2_EMBEDDING_PROVIDER": "lexical-hash",
+                "SYNAPSE_S2_NEURAL_MODEL": "environment/other-model",
+                "SYNAPSE_S2_NEURAL_REVISION": "b" * 40,
+                "SYNAPSE_S2_NEURAL_CACHE_DIR": "/tmp/environment-cache",
+                "SYNAPSE_S2_NEURAL_POOLING": "first",
+                "SYNAPSE_S2_NEURAL_MAX_TOKENS": "7",
+                "SYNAPSE_S2_NEURAL_NORMALIZE": "true",
+                "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY": "false",
+            }
+            with patch.dict(
+                embedding_providers.os.environ,
+                hostile_environment,
+                clear=False,
+            ):
+                provider = resolve_embedding_provider_config(
+                    configured,
+                    runtime_factory=lambda runtime_config: (
+                        captured.append(runtime_config) or FakeRuntime()
+                    ),
+                )
+                info_before = provider.info(dimensions=16)
+
+            with patch.dict(
+                embedding_providers.os.environ,
+                {key: "changed-again" for key in hostile_environment},
+                clear=False,
+            ):
+                result = provider.embed("pinned runtime", dimensions=8)
+                info_after = provider.info(dimensions=16)
+
+        self.assertEqual(captured, [neural])
+        self.assertFalse(info_before["loaded"])
+        self.assertTrue(info_after["loaded"])
+        self.assertEqual(
+            info_before["configuration_sha256"],
+            info_after["configuration_sha256"],
+        )
+        self.assertEqual(info_before["runtime_config"], info_after["runtime_config"])
+        self.assertEqual(info_after["configuration_source"], "explicit")
+        self.assertEqual(len(info_after["configuration_sha256"]), 64)
+        self.assertEqual(info_after["runtime_config"]["model_id"], "unit/pinned-model")
+        self.assertEqual(info_after["runtime_config"]["revision"], "a" * 40)
+        self.assertEqual(info_after["runtime_config"]["cache_dir"], cache_dir)
+        self.assertEqual(info_after["runtime_config"]["pooling"], "last")
+        self.assertEqual(info_after["runtime_config"]["max_tokens"], 321)
+        self.assertFalse(info_after["runtime_config"]["normalize"])
+        self.assertTrue(info_after["runtime_config"]["local_files_only"])
+        self.assertEqual(
+            result.provenance["details"]["configuration_sha256"],
+            info_after["configuration_sha256"],
+        )
+
+    def test_direct_neural_boolean_arguments_override_environment(self):
+        Provider = self._neural_provider_class()
+        with patch.dict(
+            embedding_providers.os.environ,
+            {
+                "SYNAPSE_S2_NEURAL_NORMALIZE": "true",
+                "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY": "false",
+            },
+            clear=False,
+        ):
+            provider = Provider(
+                model_id="unit-neural-model",
+                normalize=False,
+                local_files_only=True,
+            )
+
+        self.assertFalse(provider.normalize)
+        self.assertTrue(provider.local_files_only)
+
+    def test_explicit_neural_configuration_rejects_mutable_or_ambiguous_values(self):
+        with TemporaryDirectory() as tmp:
+            valid = {
+                "model_id": "unit/pinned-model",
+                "cache_dir": str((Path(tmp) / "models").resolve()),
+                "revision": "a" * 40,
+                "pooling": "mean",
+                "max_tokens": 128,
+                "normalize": True,
+                "local_files_only": True,
+            }
+            invalid = (
+                {"revision": "main"},
+                {"cache_dir": "relative/cache"},
+                {"max_tokens": True},
+                {"normalize": 1},
+                {"local_files_only": "yes"},
+                {"model_id": "../mutable-model"},
+            )
+            for override in invalid:
+                values = {**valid, **override}
+                with self.subTest(override=override), self.assertRaises(
+                    EmbeddingProviderError
+                ):
+                    resolve_embedding_provider_config(
+                        EmbeddingProviderConfig(
+                            provider="mlx-neural-v1",
+                            neural=MLXNeuralEmbeddingConfig(**values),
+                        )
+                    )
 
     def test_mlx_neural_provider_projects_runtime_embedding_with_provenance(self):
         Provider = self._neural_provider_class()
@@ -325,6 +461,48 @@ class EmbeddingProviderTests(unittest.TestCase):
         self.assertEqual(Path(resolved), snapshot)
         self.assertEqual(runtime.source, str(snapshot))
         self.assertTrue(runtime.cache_fallback_used)
+
+    def test_mlx_neural_runtime_never_falls_back_across_pinned_revision(self):
+        Runtime = embedding_providers.MLXNeuralEmbeddingRuntime
+
+        with TemporaryDirectory() as tmp:
+            cache_root = Path(tmp)
+            wrong_snapshot = (
+                cache_root
+                / "models--unit--fallback-model"
+                / "snapshots"
+                / ("b" * 40)
+            )
+            wrong_snapshot.mkdir(parents=True)
+            fake_hub = type(sys)("huggingface_hub")
+            fake_hub.snapshot_download = lambda **_kwargs: (_ for _ in ()).throw(
+                FileNotFoundError("pinned snapshot unavailable")
+            )
+            previous_hub = sys.modules.get("huggingface_hub")
+            sys.modules["huggingface_hub"] = fake_hub
+            runtime = object.__new__(Runtime)
+            runtime.source = "unit/fallback-model"
+            runtime.cache_fallback_used = False
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    runtime._resolve_model_ref(
+                        MLXNeuralEmbeddingConfig(
+                            model_id="unit/fallback-model",
+                            cache_dir=str(cache_root),
+                            revision="a" * 40,
+                            pooling="mean",
+                            max_tokens=512,
+                            normalize=True,
+                            local_files_only=True,
+                        )
+                    )
+            finally:
+                if previous_hub is None:
+                    sys.modules.pop("huggingface_hub", None)
+                else:
+                    sys.modules["huggingface_hub"] = previous_hub
+
+        self.assertFalse(runtime.cache_fallback_used)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -15,10 +16,18 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+import fcntl
+
 from capture_daemon import (
     GLOBAL_CAPTURE_LOCK,
     CaptureInboxDaemon,
     write_capture_drop,
+)
+from core_authority import CoreAuthorityError, CoreAuthorityLease
+from core_request_journal import (
+    JOURNAL_BINDING_SCHEMA,
+    JOURNAL_SCHEMA_IDENTITY,
+    CoreRequestJournal,
 )
 from memory_store import (
     BACKUP_RECEIPT_SCHEMA,
@@ -32,8 +41,10 @@ from memory_store import (
 from mlx_backend import SpikingAttentionBackend
 from recovery_manager import (
     CAPTURE_ARCHIVE_MANIFEST_SCHEMA,
+    LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
     RECOVERY_BUNDLE_RESTORE_SCHEMA,
     RECOVERY_BUNDLE_SCHEMA,
+    RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA,
     RECOVERY_RETIREMENT_RECEIPT_SCHEMA,
     VerifiedRecoveryManager,
 )
@@ -79,7 +90,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             default_top_k=4,
             recall_count=4,
             compile_graph=False,
-            state_path=root / "runtime-state.json",
+            state_path=root / "runtime_state.json",
             memory_path=root / "memory.sqlite3",
         )
         write_capture_drop(
@@ -119,6 +130,75 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             if extracted is None:
                 raise AssertionError("capture manifest is unreadable")
             return json.loads(extracted.read().decode("utf-8"))
+
+    @staticmethod
+    def _claim_governed_store(
+        db_path: Path,
+        *,
+        instance_id: str,
+    ) -> tuple[DurableMemoryStore, CoreAuthorityLease, CoreRequestJournal, dict]:
+        authority = CoreAuthorityLease.acquire_core(
+            db_path,
+            timeout_seconds=0.0,
+            instance_id=instance_id,
+        )
+        try:
+            store = DurableMemoryStore(db_path, authority_lease=authority)
+            inspection = store.inspect_core_authority_preclaim()
+            preclaim = inspection["logical_snapshot"]
+            previous_epoch = int(inspection["previous_epoch"])
+            journal = CoreRequestJournal(
+                db_path.parent / "core" / "requests.sqlite3",
+                authority_epoch=f"epoch-{previous_epoch + 1}",
+                store_identity=str(inspection["store_identity"]),
+            )
+            journal_binding = journal.binding()
+            claim = store.claim_core_authority(
+                instance_id=authority.instance_id,
+                config_fingerprint=hashlib.sha256(
+                    instance_id.encode("utf-8")
+                ).hexdigest(),
+                build_id="backup-recovery-test",
+                protocol_version="synapse-core.v1",
+                expected_store_identity=str(inspection["store_identity"]),
+                request_journal_id=str(journal_binding["journal_id"]),
+                request_journal_binding_schema=str(journal_binding["schema"]),
+                request_journal_schema_version=int(
+                    journal_binding["journal_schema_version"]
+                ),
+                expected_preclaim_logical_snapshot_sha256=str(
+                    preclaim["sha256"]
+                ),
+                expected_previous_epoch=previous_epoch,
+                expected_next_epoch=previous_epoch + 1,
+                root_generation_id="generation-" + ("b" * 24),
+                embedding_space_identity="b" * 64,
+                attestation_receipt_digest="b" * 64,
+                attestation_expires_at_unix_ms=int(time.time() * 1000) + 60_000,
+            )
+            runtime_state_path = db_path.parent / "runtime_state.json"
+            runtime_state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "global_enabled": True,
+                        "context_overrides": {},
+                        "cortex_sessions": {},
+                        "runtime_state_repair": {},
+                        "memory_db_path": str(db_path),
+                        "updated_at": 100.0,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime_state_path.chmod(0o600)
+            return store, authority, journal, claim
+        except BaseException:
+            authority.close()
+            raise
 
     @staticmethod
     def _rewrite_signed_bundle_with_processed_request_mismatch(
@@ -694,6 +774,598 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             self.assertIn(capture_id, receipt_text)
             self.assertIn(capture_id, processed_text)
 
+    def test_governed_bundle_restores_exact_request_journal_and_binding_receipt(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _legacy_bundle, _capture_id = self._capture_backed_bundle(
+                root
+            )
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store, authority, journal, claim = self._claim_governed_store(
+                db_path,
+                instance_id="core-recovery-epoch-one",
+            )
+            try:
+                decision = journal.accept(
+                    caller="backup-test",
+                    request_id="request-one",
+                    operation="capture_session",
+                    request_fingerprint="1" * 64,
+                )
+                self.assertEqual(decision.disposition, "accepted")
+                journal.finish(
+                    caller="backup-test",
+                    request_id="request-one",
+                    operation="capture_session",
+                    request_fingerprint="1" * 64,
+                    result={"stored": True},
+                    safe_error_code=None,
+                )
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                bundle = manager.create_bundle(
+                    root / "governed.sqlite3",
+                    purpose="unit-test",
+                    pinned=True,
+                )
+                verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+                self.assertEqual(verified["governance_mode"], "authoritative-v6")
+                self.assertEqual(verified["store_generation"], claim["authority_epoch"])
+                self.assertTrue(verified["request_journal"]["verified"])
+                self.assertTrue(verified["request_journal_binding"]["verified"])
+                expected_journal_id = str(journal.binding()["journal_id"])
+                self.assertEqual(
+                    verified["request_journal"]["journal_id"],
+                    expected_journal_id,
+                )
+                self.assertEqual(
+                    verified["request_journal"]["schema_identity"],
+                    JOURNAL_SCHEMA_IDENTITY,
+                )
+                self.assertEqual(
+                    verified["request_journal_binding"]["request_journal_id"],
+                    expected_journal_id,
+                )
+                self.assertEqual(
+                    verified["request_journal_binding"]["journal_schema_identity"],
+                    JOURNAL_SCHEMA_IDENTITY,
+                )
+                bundle_receipt = json.loads(
+                    Path(bundle["bundle_receipt_path"]).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    bundle_receipt["request_journal_id"], expected_journal_id
+                )
+                self.assertEqual(
+                    bundle_receipt["request_journal_schema_identity"],
+                    JOURNAL_SCHEMA_IDENTITY,
+                )
+                source_binding_receipt = json.loads(
+                    Path(bundle["request_journal_binding_receipt_path"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    journal.binding()["schema"], JOURNAL_BINDING_SCHEMA
+                )
+                self.assertEqual(
+                    source_binding_receipt["schema"],
+                    RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA,
+                )
+                self.assertNotEqual(
+                    source_binding_receipt["schema"], JOURNAL_BINDING_SCHEMA
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "paired request-journal evidence",
+                ):
+                    store.restore_backup(
+                        bundle["backup_path"],
+                        root / "unsafe-database-only-v6.sqlite3",
+                        receipt_path=bundle["receipt_path"],
+                        confirm=True,
+                    )
+
+                restored = manager.restore_bundle_isolated(
+                    bundle["bundle_receipt_path"],
+                    root / "governed-restore",
+                    confirm=True,
+                )
+                restored_root = Path(restored["restore_root"])
+                restored_journal = Path(restored["request_journal_restore_path"])
+                restored_binding = Path(
+                    restored["request_journal_binding_receipt_path"]
+                )
+                self.assertEqual(restored_journal.name, "requests.sqlite3")
+                self.assertTrue(restored_binding.is_file())
+                self.assertEqual(restored_journal.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(restored_binding.stat().st_mode & 0o777, 0o600)
+                with closing(sqlite3.connect(restored_journal)) as conn:
+                    row = conn.execute(
+                        "SELECT state, authority_epoch FROM request_journal "
+                        "WHERE caller = ? AND request_id = ?",
+                        ("backup-test", "request-one"),
+                    ).fetchone()
+                self.assertEqual(row, ("completed", claim["authority_epoch"]))
+                proof = json.loads(
+                    Path(restored["recovery_proof_path"]).read_text(encoding="utf-8")
+                )
+                self.assertEqual(proof["governance_mode"], "authoritative-v6")
+                self.assertEqual(
+                    proof["request_journal_artifact_relative"],
+                    "core/requests.sqlite3",
+                )
+                self.assertEqual(
+                    proof["request_journal_binding_receipt_relative"],
+                    "core/requests.sqlite3.binding.receipt.json",
+                )
+                self.assertTrue(proof["request_journal_binding_verified"])
+                self.assertEqual(proof["request_journal_id"], expected_journal_id)
+                self.assertEqual(
+                    proof["request_journal_schema_identity"],
+                    JOURNAL_SCHEMA_IDENTITY,
+                )
+                restored_binding_payload = json.loads(
+                    restored_binding.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    restored_binding_payload["request_journal_id"],
+                    expected_journal_id,
+                )
+                self.assertEqual(
+                    restored_binding_payload["request_journal_schema_identity"],
+                    JOURNAL_SCHEMA_IDENTITY,
+                )
+                original_restored_binding = restored_binding.read_bytes()
+                for field, value, error_type in (
+                    (
+                        "request_journal_id",
+                        "journal-" + "d" * 24,
+                        RuntimeError,
+                    ),
+                    (
+                        "request_journal_schema_identity",
+                        "sqlite-5332524a-v4",
+                        ValueError,
+                    ),
+                ):
+                    with self.subTest(restored_binding_field=field):
+                        tampered = json.loads(
+                            original_restored_binding.decode("utf-8")
+                        )
+                        tampered[field] = value
+                        manager.store._authenticate_receipt(tampered)
+                        restored_binding.write_text(
+                            json.dumps(tampered, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                        restored_binding.chmod(0o600)
+                        with self.assertRaises(error_type):
+                            manager.verify_restored_request_journal_binding(
+                                restored_root
+                            )
+                        restored_binding.write_bytes(original_restored_binding)
+                        restored_binding.chmod(0o600)
+                self.assertEqual(
+                    proof["request_journal_binding_receipt_digest"],
+                    restored["request_journal_binding"]["receipt_digest"],
+                )
+                self.assertEqual(
+                    restored["request_journal_binding"]["request_journal_id"],
+                    expected_journal_id,
+                )
+                self.assertEqual(
+                    restored["request_journal_binding"][
+                        "request_journal_schema_identity"
+                    ],
+                    JOURNAL_SCHEMA_IDENTITY,
+                )
+                self.assertTrue(proof["cutover_ready"])
+            finally:
+                journal.close()
+                store.close()
+                authority.close()
+
+    def test_governed_bundle_rejects_missing_corrupt_swapped_and_mismatched_journal(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _legacy_bundle, _capture_id = self._capture_backed_bundle(
+                root
+            )
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store, authority, journal, _claim = self._claim_governed_store(
+                db_path,
+                instance_id="core-recovery-adversarial",
+            )
+            try:
+                journal.accept(
+                    caller="backup-test",
+                    request_id="request-original",
+                    operation="capture_session",
+                    request_fingerprint="2" * 64,
+                )
+                journal.finish(
+                    caller="backup-test",
+                    request_id="request-original",
+                    operation="capture_session",
+                    request_fingerprint="2" * 64,
+                    result={"stored": True},
+                    safe_error_code=None,
+                )
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                first = manager.create_bundle(
+                    root / "governed-first.sqlite3",
+                    purpose="unit-test",
+                )
+                journal.accept(
+                    caller="backup-test",
+                    request_id="request-later",
+                    operation="capture_session",
+                    request_fingerprint="3" * 64,
+                )
+                journal.finish(
+                    caller="backup-test",
+                    request_id="request-later",
+                    operation="capture_session",
+                    request_fingerprint="3" * 64,
+                    result={"stored": True},
+                    safe_error_code=None,
+                )
+                second = manager.create_bundle(
+                    root / "governed-second.sqlite3",
+                    purpose="unit-test",
+                )
+                first_journal = Path(first["request_journal_path"])
+                binding_path = Path(first["request_journal_binding_receipt_path"])
+                original_journal = first_journal.read_bytes()
+                original_binding = binding_path.read_bytes()
+
+                held = first_journal.with_name(first_journal.name + ".held")
+                first_journal.rename(held)
+                with self.assertRaises((OSError, ValueError, RuntimeError)):
+                    manager.verify_bundle(first["bundle_receipt_path"])
+                held.rename(first_journal)
+
+                first_journal.write_bytes(b"not-a-sqlite-journal")
+                first_journal.chmod(0o600)
+                with self.assertRaises((OSError, ValueError, RuntimeError, sqlite3.Error)):
+                    manager.verify_bundle(first["bundle_receipt_path"])
+                first_journal.write_bytes(original_journal)
+                first_journal.chmod(0o600)
+
+                first_journal.write_bytes(Path(second["request_journal_path"]).read_bytes())
+                first_journal.chmod(0o600)
+                with self.assertRaisesRegex(RuntimeError, "digest|journal|binding"):
+                    manager.verify_bundle(first["bundle_receipt_path"])
+                first_journal.write_bytes(original_journal)
+                first_journal.chmod(0o600)
+
+                binding_payload = json.loads(original_binding.decode("utf-8"))
+                binding_payload["store_generation"] = "epoch-999"
+                manager.store._authenticate_receipt(binding_payload)
+                binding_path.write_text(
+                    json.dumps(binding_payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                binding_path.chmod(0o600)
+                with self.assertRaisesRegex(RuntimeError, "journal|generation|binding"):
+                    manager.verify_bundle(first["bundle_receipt_path"])
+                binding_path.write_bytes(original_binding)
+                binding_path.chmod(0o600)
+
+                for field, value, error_type in (
+                    (
+                        "request_journal_id",
+                        "journal-" + "f" * 24,
+                        RuntimeError,
+                    ),
+                    (
+                        "journal_schema_identity",
+                        "sqlite-5332524a-v4",
+                        ValueError,
+                    ),
+                    (
+                        "schema",
+                        JOURNAL_BINDING_SCHEMA,
+                        ValueError,
+                    ),
+                ):
+                    with self.subTest(binding_field=field):
+                        binding_payload = json.loads(original_binding.decode("utf-8"))
+                        binding_payload[field] = value
+                        manager.store._authenticate_receipt(binding_payload)
+                        binding_path.write_text(
+                            json.dumps(binding_payload, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                        binding_path.chmod(0o600)
+                        with self.assertRaises(error_type):
+                            manager.verify_bundle(first["bundle_receipt_path"])
+                        binding_path.write_bytes(original_binding)
+                        binding_path.chmod(0o600)
+
+                bundle_receipt_path = Path(first["bundle_receipt_path"])
+                original_bundle_receipt = bundle_receipt_path.read_bytes()
+                for field, value, error_type in (
+                    (
+                        "request_journal_id",
+                        "journal-" + "e" * 24,
+                        RuntimeError,
+                    ),
+                    (
+                        "request_journal_schema_identity",
+                        "sqlite-5332524a-v4",
+                        ValueError,
+                    ),
+                ):
+                    with self.subTest(bundle_field=field):
+                        bundle_payload = json.loads(
+                            original_bundle_receipt.decode("utf-8")
+                        )
+                        bundle_payload[field] = value
+                        manager.store._authenticate_receipt(bundle_payload)
+                        bundle_receipt_path.write_text(
+                            json.dumps(bundle_payload, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                        bundle_receipt_path.chmod(0o600)
+                        with self.assertRaises(error_type):
+                            manager.verify_bundle(bundle_receipt_path)
+                        bundle_receipt_path.write_bytes(original_bundle_receipt)
+                        bundle_receipt_path.chmod(0o600)
+
+                binding_held = binding_path.with_name(binding_path.name + ".held")
+                binding_path.rename(binding_held)
+                with self.assertRaises((OSError, ValueError, RuntimeError)):
+                    manager.verify_bundle(first["bundle_receipt_path"])
+                binding_held.rename(binding_path)
+                self.assertTrue(manager.verify_bundle(first["bundle_receipt_path"])["verified"])
+            finally:
+                journal.close()
+                store.close()
+                authority.close()
+
+    def test_newer_generation_journal_cannot_be_paired_with_older_governed_database(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _legacy_bundle, _capture_id = self._capture_backed_bundle(
+                root
+            )
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store_one, authority_one, journal_one, claim_one = (
+                self._claim_governed_store(
+                    db_path,
+                    instance_id="core-recovery-generation-one",
+                )
+            )
+            manager_one = VerifiedRecoveryManager(store_one, capture_root=root)
+            first = manager_one.create_bundle(
+                root / "generation-one.sqlite3",
+                purpose="unit-test",
+            )
+            journal_one.close()
+            store_one.close()
+            authority_one.close()
+
+            store_two, authority_two, journal_two, claim_two = (
+                self._claim_governed_store(
+                    db_path,
+                    instance_id="core-recovery-generation-two",
+                )
+            )
+            try:
+                self.assertGreater(
+                    int(claim_two["authority_epoch_number"]),
+                    int(claim_one["authority_epoch_number"]),
+                )
+                journal_two.accept(
+                    caller="backup-test",
+                    request_id="request-new-generation",
+                    operation="capture_session",
+                    request_fingerprint="4" * 64,
+                )
+                journal_two.finish(
+                    caller="backup-test",
+                    request_id="request-new-generation",
+                    operation="capture_session",
+                    request_fingerprint="4" * 64,
+                    result={"stored": True},
+                    safe_error_code=None,
+                )
+                manager_two = VerifiedRecoveryManager(store_two, capture_root=root)
+                second = manager_two.create_bundle(
+                    root / "generation-two.sqlite3",
+                    purpose="unit-test",
+                )
+                first_journal = Path(first["request_journal_path"])
+                original = first_journal.read_bytes()
+                first_binding_path = Path(
+                    first["request_journal_binding_receipt_path"]
+                )
+                original_binding = first_binding_path.read_bytes()
+                first_receipt_path = Path(first["bundle_receipt_path"])
+                original_receipt = first_receipt_path.read_bytes()
+                second_verified = manager_two.verify_bundle(
+                    second["bundle_receipt_path"]
+                )
+                second_journal = second_verified["request_journal"]
+                first_journal.write_bytes(Path(second["request_journal_path"]).read_bytes())
+                first_journal.chmod(0o600)
+                forged_binding = json.loads(original_binding.decode("utf-8"))
+                forged_binding.update(
+                    {
+                        "journal_sha256": str(second_journal["sha256"]),
+                        "journal_size_bytes": int(second_journal["size_bytes"]),
+                        "journal_application_id": int(
+                            second_journal["application_id"]
+                        ),
+                        "journal_schema_version": int(
+                            second_journal["schema_version"]
+                        ),
+                        "journal_schema_sha256": str(
+                            second_journal["schema_sha256"]
+                        ),
+                        "journal_row_count": int(second_journal["row_count"]),
+                        "journal_state_counts": dict(
+                            second_journal["state_counts"]
+                        ),
+                        "journal_current_authority_epoch_row_count": 0,
+                        "journal_maximum_observed_authority_epoch": int(
+                            second_journal[
+                                "maximum_observed_authority_epoch"
+                            ]
+                        ),
+                    }
+                )
+                manager_two.store._authenticate_receipt(forged_binding)
+                first_binding_path.write_text(
+                    json.dumps(forged_binding, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                first_binding_path.chmod(0o600)
+                forged_bundle = json.loads(original_receipt.decode("utf-8"))
+                forged_bundle.update(
+                    {
+                        "request_journal_sha256": str(second_journal["sha256"]),
+                        "request_journal_size_bytes": int(
+                            second_journal["size_bytes"]
+                        ),
+                        "request_journal_binding_receipt_digest": str(
+                            forged_binding["receipt_digest"]
+                        ),
+                        "request_journal_schema_version": int(
+                            second_journal["schema_version"]
+                        ),
+                        "request_journal_schema_sha256": str(
+                            second_journal["schema_sha256"]
+                        ),
+                        "request_journal_row_count": int(
+                            second_journal["row_count"]
+                        ),
+                        "request_journal_current_authority_epoch_row_count": 0,
+                        "request_journal_maximum_observed_authority_epoch": int(
+                            second_journal[
+                                "maximum_observed_authority_epoch"
+                            ]
+                        ),
+                    }
+                )
+                manager_two.store._authenticate_receipt(forged_bundle)
+                first_receipt_path.write_text(
+                    json.dumps(forged_bundle, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                first_receipt_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "newer store authority generation",
+                ):
+                    manager_two.verify_bundle(first["bundle_receipt_path"])
+                first_journal.write_bytes(original)
+                first_journal.chmod(0o600)
+                first_binding_path.write_bytes(original_binding)
+                first_binding_path.chmod(0o600)
+                first_receipt_path.write_bytes(original_receipt)
+                first_receipt_path.chmod(0o600)
+
+                legacy_receipt_path = first_receipt_path
+                current_receipt = json.loads(original_receipt.decode("utf-8"))
+                legacy_receipt = {
+                    key: value
+                    for key, value in current_receipt.items()
+                    if key in manager_two._legacy_bundle_receipt_expected_keys()
+                }
+                legacy_receipt["schema"] = "synapse-s2.recovery-bundle.v1"
+                manager_two.store._authenticate_receipt(legacy_receipt)
+                legacy_receipt_path.write_text(
+                    json.dumps(legacy_receipt, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                legacy_receipt_path.chmod(0o600)
+                with self.assertRaisesRegex(RuntimeError, "legacy|pre-governed v5"):
+                    manager_two.verify_bundle(legacy_receipt_path)
+                legacy_receipt_path.write_bytes(original_receipt)
+                legacy_receipt_path.chmod(0o600)
+            finally:
+                journal_two.close()
+                store_two.close()
+                authority_two.close()
+
+    def test_legacy_v1_bundle_proof_is_accepted_only_for_pre_governed_v5(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager, bundle, _capture_id = self._capture_backed_bundle(root)
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            current = json.loads(receipt_path.read_text(encoding="utf-8"))
+            legacy = {
+                key: value
+                for key, value in current.items()
+                if key in manager._legacy_bundle_receipt_expected_keys()
+            }
+            legacy["schema"] = "synapse-s2.recovery-bundle.v1"
+            manager.store._authenticate_receipt(legacy)
+            receipt_path.write_text(
+                json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            receipt_path.chmod(0o600)
+
+            restored = manager.restore_bundle_isolated(
+                receipt_path,
+                root / "legacy-v1-restore",
+                confirm=True,
+            )
+            proof = json.loads(
+                Path(restored["recovery_proof_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(proof["schema"], LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA)
+            self.assertEqual(proof["governance_mode"], "pre-governed-v5")
+            self.assertEqual(proof["store_generation"], "legacy-v5")
+            self.assertFalse(proof["request_journal_binding_verified"])
+            self.assertIsNone(proof["request_journal_artifact_relative"])
+            self.assertTrue(proof["cutover_ready"])
+
+    def test_governed_bundle_rejects_noncanonical_request_journal_identifiers(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _legacy_bundle, _capture_id = self._capture_backed_bundle(
+                root
+            )
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store, authority, journal, _claim = self._claim_governed_store(
+                db_path,
+                instance_id="core-recovery-identifiers",
+            )
+            try:
+                journal.accept(
+                    caller="backup-test",
+                    request_id="request-valid",
+                    operation="capture_session",
+                    request_fingerprint="5" * 64,
+                )
+                journal.close()
+                journal_path = db_path.parent / "core" / "requests.sqlite3"
+                with closing(sqlite3.connect(journal_path)) as conn:
+                    conn.execute(
+                        "UPDATE request_journal SET operation = ?",
+                        ("invalid operation",),
+                    )
+                    conn.commit()
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                with self.assertRaisesRegex(RuntimeError, "invalid durable row"):
+                    manager.create_bundle(
+                        root / "invalid-journal-identifier.sqlite3",
+                        purpose="unit-test",
+                    )
+            finally:
+                journal.close()
+                store.close()
+                authority.close()
+
     def test_signed_bundle_rejects_processed_request_fingerprint_mismatch(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -886,7 +1558,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             self.assertEqual(len(produced_paths), 1)
             self.assertTrue(produced_paths[0].is_file())
 
-    def test_cross_store_bundle_requires_both_reviewed_digests(self):
+    def test_cross_store_bundle_requires_every_reviewed_artifact_digest(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             _manager, bundle, _capture_id = self._capture_backed_bundle(root)
@@ -899,11 +1571,26 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             receipt_path = bundle["bundle_receipt_path"]
             database_sha256 = bundle["sha256"]
             capture_sha256 = bundle["capture_archive_sha256"]
+            receipt = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+            runtime_sha256 = receipt["runtime_state_sha256"]
 
             for supplied in (
                 {},
                 {"expected_database_sha256": database_sha256},
                 {"expected_capture_sha256": capture_sha256},
+                {"expected_runtime_state_sha256": runtime_sha256},
+                {
+                    "expected_database_sha256": database_sha256,
+                    "expected_capture_sha256": capture_sha256,
+                },
+                {
+                    "expected_database_sha256": database_sha256,
+                    "expected_runtime_state_sha256": runtime_sha256,
+                },
+                {
+                    "expected_capture_sha256": capture_sha256,
+                    "expected_runtime_state_sha256": runtime_sha256,
+                },
             ):
                 with self.subTest(supplied=sorted(supplied)):
                     with self.assertRaises(ValueError):
@@ -913,10 +1600,251 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                 receipt_path,
                 expected_database_sha256=database_sha256,
                 expected_capture_sha256=capture_sha256,
+                expected_runtime_state_sha256=runtime_sha256,
+            )
+            with self.assertRaisesRegex(ValueError, "runtime-state digest"):
+                foreign_manager.verify_bundle(
+                    receipt_path,
+                    expected_database_sha256=database_sha256,
+                    expected_capture_sha256=capture_sha256,
+                    expected_runtime_state_sha256="f" * 64,
+                )
+            self.assertTrue(verified["verified"])
+            self.assertFalse(verified["receipt_identity_trusted"])
+            self.assertTrue(verified["reviewed_digests_verified"])
+            restored = foreign_manager.restore_bundle_isolated(
+                receipt_path,
+                foreign_root / "reviewed-restore",
+                expected_database_sha256=database_sha256,
+                expected_capture_sha256=capture_sha256,
+                expected_runtime_state_sha256=runtime_sha256,
+                confirm=True,
+            )
+            self.assertTrue(restored["verified"])
+            restored_runtime = json.loads(
+                Path(restored["runtime_state_restore_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                restored_runtime["global_enabled"],
+                receipt["runtime_state_global_enabled"],
+            )
+
+    def test_foreign_bundle_runtime_pin_semantics_fail_before_materialization(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _manager, bundle, _capture_id = self._capture_backed_bundle(root)
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            foreign_root = root / "foreign-runtime-review"
+            foreign_manager = VerifiedRecoveryManager(
+                DurableMemoryStore(foreign_root / "memory.sqlite3"),
+                capture_root=foreign_root / "capture-root",
+            )
+            reviewed = {
+                "expected_database_sha256": str(receipt["database_sha256"]),
+                "expected_capture_sha256": str(receipt["capture_sha256"]),
+            }
+
+            for label, runtime_digest in (
+                ("missing", None),
+                ("malformed", "not-a-sha256"),
+                ("mismatched", "f" * 64),
+            ):
+                output_root = foreign_root / f"rejected-{label}"
+                arguments = dict(reviewed)
+                if runtime_digest is not None:
+                    arguments["expected_runtime_state_sha256"] = runtime_digest
+                with self.subTest(runtime_digest=label):
+                    with self.assertRaises(ValueError):
+                        foreign_manager.restore_bundle_isolated(
+                            receipt_path,
+                            output_root,
+                            confirm=True,
+                            **arguments,
+                        )
+                    self.assertFalse(output_root.exists())
+
+            absent_root = root / "runtime-absent-source"
+            absent_store, _absent_db = self._seed_store(absent_root)
+            absent_manager = VerifiedRecoveryManager(
+                absent_store,
+                capture_root=absent_root,
+            )
+            absent_bundle = absent_manager.create_bundle(
+                absent_root / "runtime-absent.sqlite3",
+                purpose="unit-test",
+                pinned=True,
+            )
+            absent_receipt = json.loads(
+                Path(absent_bundle["bundle_receipt_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(absent_receipt["runtime_state_required"])
+            absent_foreign_root = root / "runtime-absent-foreign"
+            absent_foreign = VerifiedRecoveryManager(
+                DurableMemoryStore(absent_foreign_root / "memory.sqlite3"),
+                capture_root=absent_foreign_root / "capture-root",
+            )
+            absent_reviewed = {
+                "expected_database_sha256": str(
+                    absent_receipt["database_sha256"]
+                ),
+                "expected_capture_sha256": str(absent_receipt["capture_sha256"]),
+            }
+            self.assertTrue(
+                absent_foreign.verify_bundle(
+                    absent_bundle["bundle_receipt_path"],
+                    **absent_reviewed,
+                )["verified"]
+            )
+            absent_output = absent_foreign_root / "extraneous-runtime-pin"
+            with self.assertRaisesRegex(ValueError, "does not contain"):
+                absent_foreign.restore_bundle_isolated(
+                    absent_bundle["bundle_receipt_path"],
+                    absent_output,
+                    expected_runtime_state_sha256="a" * 64,
+                    confirm=True,
+                    **absent_reviewed,
+                )
+            self.assertFalse(absent_output.exists())
+
+    def test_foreign_restore_rejects_bundle_receipt_swap_after_verification(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_manager, bundle, _capture_id = self._capture_backed_bundle(root)
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            original_receipt = receipt_path.read_bytes()
+            receipt = json.loads(original_receipt.decode("utf-8"))
+            reviewed = {
+                "expected_database_sha256": str(receipt["database_sha256"]),
+                "expected_capture_sha256": str(receipt["capture_sha256"]),
+                "expected_runtime_state_sha256": str(
+                    receipt["runtime_state_sha256"]
+                ),
+            }
+            foreign_root = root / "foreign-receipt-swap"
+            foreign_manager = VerifiedRecoveryManager(
+                DurableMemoryStore(foreign_root / "memory.sqlite3"),
+                capture_root=foreign_root / "capture-root",
+            )
+            original_verify = foreign_manager.verify_bundle
+
+            def verify_then_swap(*args, **kwargs):
+                verified = original_verify(*args, **kwargs)
+                swapped = json.loads(original_receipt.decode("utf-8"))
+                swapped["purpose"] = "post-verification-swap"
+                source_manager.store._authenticate_receipt(swapped)
+                receipt_path.write_text(
+                    json.dumps(swapped, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                receipt_path.chmod(0o600)
+                return verified
+
+            output_root = foreign_root / "receipt-swap-proof"
+            try:
+                with mock.patch.object(
+                    foreign_manager,
+                    "verify_bundle",
+                    side_effect=verify_then_swap,
+                ), self.assertRaisesRegex(RuntimeError, "receipt changed"):
+                    foreign_manager.restore_bundle_isolated(
+                        receipt_path,
+                        output_root,
+                        confirm=True,
+                        **reviewed,
+                    )
+                self.assertFalse(output_root.exists())
+            finally:
+                receipt_path.write_bytes(original_receipt)
+                receipt_path.chmod(0o600)
+
+    def test_foreign_governed_bundle_requires_and_accepts_all_four_pins(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _legacy_bundle, _capture_id = (
+                self._capture_backed_bundle(root)
+            )
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store, authority, journal, _claim = self._claim_governed_store(
+                db_path,
+                instance_id="core-foreign-reviewed-recovery",
+            )
+            try:
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                bundle = manager.create_bundle(
+                    root / "foreign-reviewed-governed.sqlite3",
+                    purpose="unit-test",
+                    pinned=True,
+                )
+                receipt = json.loads(
+                    Path(bundle["bundle_receipt_path"]).read_text(encoding="utf-8")
+                )
+            finally:
+                journal.close()
+                store.close()
+                authority.close()
+
+            foreign_root = root / "foreign-governed-store"
+            foreign_manager = VerifiedRecoveryManager(
+                DurableMemoryStore(foreign_root / "memory.sqlite3"),
+                capture_root=foreign_root / "capture-root",
+            )
+            reviewed = {
+                "expected_database_sha256": str(receipt["database_sha256"]),
+                "expected_capture_sha256": str(receipt["capture_sha256"]),
+                "expected_request_journal_sha256": str(
+                    receipt["request_journal_sha256"]
+                ),
+                "expected_runtime_state_sha256": str(
+                    receipt["runtime_state_sha256"]
+                ),
+            }
+            for omitted in tuple(reviewed):
+                with self.subTest(omitted=omitted):
+                    incomplete = {
+                        key: value
+                        for key, value in reviewed.items()
+                        if key != omitted
+                    }
+                    with self.assertRaises(ValueError):
+                        foreign_manager.verify_bundle(
+                            bundle["bundle_receipt_path"],
+                            **incomplete,
+                        )
+
+            rejected_output = foreign_root / "missing-runtime-proof"
+            without_runtime = dict(reviewed)
+            without_runtime.pop("expected_runtime_state_sha256")
+            with self.assertRaises(ValueError):
+                foreign_manager.restore_bundle_isolated(
+                    bundle["bundle_receipt_path"],
+                    rejected_output,
+                    confirm=True,
+                    **without_runtime,
+                )
+            self.assertFalse(rejected_output.exists())
+
+            verified = foreign_manager.verify_bundle(
+                bundle["bundle_receipt_path"],
+                **reviewed,
             )
             self.assertTrue(verified["verified"])
             self.assertFalse(verified["receipt_identity_trusted"])
             self.assertTrue(verified["reviewed_digests_verified"])
+            restored = foreign_manager.restore_bundle_isolated(
+                bundle["bundle_receipt_path"],
+                foreign_root / "reviewed-governed-proof",
+                confirm=True,
+                **reviewed,
+            )
+            self.assertTrue(restored["verified"])
+            self.assertTrue(restored["request_journal_binding"]["verified"])
+            self.assertTrue(Path(restored["runtime_state_restore_path"]).is_file())
 
     def test_schema_trigger_and_dropped_table_snapshots_are_not_restore_eligible(self):
         with TemporaryDirectory() as tmp:
@@ -956,6 +1884,414 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must not alias"):
                 store.verify_backup(alias_path, expected_sha256=digest)
 
+    def test_private_lock_directory_and_database_modes_fail_closed_without_repair(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, db_path = self._seed_store(root)
+            lock_root = root / "lock-contract"
+            lock_root.mkdir(mode=0o700)
+
+            created_lock = lock_root / "created.lock"
+            descriptor = store._acquire_file_lock(
+                created_lock,
+                mode=fcntl.LOCK_EX,
+                timeout_seconds=0.0,
+            )
+            store._release_file_lock(descriptor)
+            self.assertEqual(created_lock.stat().st_mode & 0o777, 0o600)
+
+            wrong_mode = lock_root / "wrong-mode.lock"
+            wrong_mode.write_text("", encoding="utf-8")
+            wrong_mode.chmod(0o644)
+            with self.assertRaises(PermissionError):
+                store._acquire_file_lock(
+                    wrong_mode,
+                    mode=fcntl.LOCK_EX,
+                    timeout_seconds=0.0,
+                )
+            self.assertEqual(wrong_mode.stat().st_mode & 0o777, 0o644)
+
+            symlink_target = lock_root / "symlink-target.lock"
+            symlink_target.write_text("", encoding="utf-8")
+            symlink_target.chmod(0o600)
+            symlink_lock = lock_root / "symlink.lock"
+            symlink_lock.symlink_to(symlink_target.name)
+            with self.assertRaises(PermissionError):
+                store._acquire_file_lock(
+                    symlink_lock,
+                    mode=fcntl.LOCK_EX,
+                    timeout_seconds=0.0,
+                )
+            self.assertTrue(symlink_lock.is_symlink())
+
+            hardlink_source = lock_root / "hardlink-source.lock"
+            hardlink_source.write_text("", encoding="utf-8")
+            hardlink_source.chmod(0o600)
+            hardlink_lock = lock_root / "hardlink.lock"
+            os.link(hardlink_source, hardlink_lock)
+            with self.assertRaises(PermissionError):
+                store._acquire_file_lock(
+                    hardlink_lock,
+                    mode=fcntl.LOCK_EX,
+                    timeout_seconds=0.0,
+                )
+            self.assertEqual(hardlink_source.stat().st_nlink, 2)
+
+            unsafe_directory = root / "preexisting-shared-directory"
+            unsafe_directory.mkdir(mode=0o700)
+            unsafe_directory.chmod(0o755)
+            with self.assertRaises(PermissionError):
+                store._ensure_directory(unsafe_directory, owned=True)
+            self.assertEqual(unsafe_directory.stat().st_mode & 0o777, 0o755)
+
+            db_path.chmod(0o644)
+            with self.assertRaises(CoreAuthorityError):
+                store.recompute_logical_snapshot_digest()
+            self.assertEqual(db_path.stat().st_mode & 0o777, 0o644)
+            db_path.chmod(0o600)
+
+    def test_database_logical_digest_detects_equal_size_non_highwater_mutation(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, _db_path = self._seed_store(root)
+            before = store.recompute_logical_snapshot_digest()
+            with closing(store._connect_existing_write()) as conn:
+                cursor = conn.execute(
+                    "UPDATE memory_entries "
+                    "SET source_text = 'B' || substr(source_text, 2) "
+                    "WHERE context_id = ? AND tag = ?",
+                    ("backup-tests", "verified-backup-fixture"),
+                )
+                self.assertEqual(cursor.rowcount, 1)
+            after = store.recompute_logical_snapshot_digest()
+
+            self.assertEqual(before["table_count"], after["table_count"])
+            self.assertEqual(before["column_count"], after["column_count"])
+            self.assertEqual(before["row_count"], after["row_count"])
+            self.assertEqual(before["value_bytes"], after["value_bytes"])
+            self.assertNotEqual(before["sha256"], after["sha256"])
+
+    def test_governed_exact_digests_runtime_rebinding_and_restore_binding_are_strict(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _legacy_bundle, _capture_id = self._capture_backed_bundle(
+                root
+            )
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store, authority, journal, claim = self._claim_governed_store(
+                db_path,
+                instance_id="core-recovery-exact-digests",
+            )
+            try:
+                journal.accept(
+                    caller="backup-test",
+                    request_id="request-exact",
+                    operation="capture_session",
+                    request_fingerprint="a" * 64,
+                )
+                journal.finish(
+                    caller="backup-test",
+                    request_id="request-exact",
+                    operation="capture_session",
+                    request_fingerprint="a" * 64,
+                    result={"stored": True},
+                    safe_error_code=None,
+                )
+                journal.close()
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                bundle = manager.create_bundle(
+                    root / "exact-digests.sqlite3",
+                    purpose="unit-test",
+                    pinned=True,
+                )
+                verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+
+                journal_before = manager.recompute_request_journal_logical_digest(
+                    maximum_authority_epoch=int(claim["authority_epoch_number"])
+                )
+                journal_path = db_path.parent / "core" / "requests.sqlite3"
+                with closing(sqlite3.connect(journal_path)) as conn:
+                    conn.execute(
+                        "UPDATE request_journal SET request_fingerprint = ? "
+                        "WHERE caller = ? AND request_id = ?",
+                        ("b" * 64, "backup-test", "request-exact"),
+                    )
+                    conn.commit()
+                journal_after = manager.recompute_request_journal_logical_digest(
+                    maximum_authority_epoch=int(claim["authority_epoch_number"])
+                )
+                self.assertEqual(journal_before["row_count"], journal_after["row_count"])
+                self.assertEqual(journal_before["state_counts"], journal_after["state_counts"])
+                self.assertEqual(
+                    journal_before["logical_snapshot_value_bytes"],
+                    journal_after["logical_snapshot_value_bytes"],
+                )
+                self.assertNotEqual(
+                    journal_before["logical_snapshot_sha256"],
+                    journal_after["logical_snapshot_sha256"],
+                )
+
+                runtime_before = manager.recompute_live_runtime_state_binding(
+                    required=True
+                )
+                runtime_path = db_path.parent / "runtime_state.json"
+                runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+                runtime_payload["global_enabled"] = False
+                runtime_path.write_text(
+                    json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                runtime_path.chmod(0o600)
+                runtime_after = manager.recompute_live_runtime_state_binding(
+                    required=True
+                )
+                self.assertEqual(
+                    runtime_before["context_override_count"],
+                    runtime_after["context_override_count"],
+                )
+                self.assertEqual(
+                    runtime_before["cortex_session_count"],
+                    runtime_after["cortex_session_count"],
+                )
+                self.assertNotEqual(
+                    runtime_before["canonical_sha256"],
+                    runtime_after["canonical_sha256"],
+                )
+
+                restored = manager.restore_bundle_isolated(
+                    bundle["bundle_receipt_path"],
+                    root / "strict-binding-restore",
+                    confirm=True,
+                )
+                restore_root = Path(restored["restore_root"])
+                restored_runtime_path = Path(restored["runtime_state_restore_path"])
+                restored_runtime = json.loads(
+                    restored_runtime_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    restored_runtime["memory_db_path"],
+                    str(restore_root / "memory.sqlite3"),
+                )
+                self.assertNotEqual(
+                    restored_runtime["memory_db_path"],
+                    str(db_path),
+                )
+                proof = json.loads(
+                    Path(restored["recovery_proof_path"]).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    proof["source_runtime_state_canonical_sha256"],
+                    verified["runtime_state"]["canonical_sha256"],
+                )
+                self.assertEqual(
+                    proof["runtime_state_memory_db_path"],
+                    str(restore_root / "memory.sqlite3"),
+                )
+
+                binding_path = Path(restored["request_journal_binding_receipt_path"])
+                original_binding = binding_path.read_bytes()
+                original_payload = json.loads(original_binding.decode("utf-8"))
+                manager.verify_restored_request_journal_binding(
+                    restore_root,
+                    expected_store_identity=verified["store_identity"],
+                    expected_store_generation=verified["store_generation"],
+                    expected_source_request_journal_binding_receipt_digest=verified[
+                        "request_journal_binding"
+                    ]["receipt_digest"],
+                )
+
+                forged_source = dict(original_payload)
+                forged_source[
+                    "source_request_journal_binding_receipt_digest"
+                ] = "f" * 64
+                manager.store._authenticate_receipt(forged_source)
+                binding_path.write_text(
+                    json.dumps(forged_source, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                binding_path.chmod(0o600)
+                with self.assertRaisesRegex(RuntimeError, "source chain"):
+                    manager.verify_restored_request_journal_binding(
+                        restore_root,
+                        expected_source_request_journal_binding_receipt_digest=verified[
+                            "request_journal_binding"
+                        ]["receipt_digest"],
+                    )
+
+                binding_path.write_bytes(original_binding)
+                binding_path.chmod(0o600)
+                forged_generation = dict(original_payload)
+                forged_generation["store_generation"] = "epoch-999"
+                manager.store._authenticate_receipt(forged_generation)
+                binding_path.write_text(
+                    json.dumps(forged_generation, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                binding_path.chmod(0o600)
+                with self.assertRaisesRegex(RuntimeError, "store generation"):
+                    manager.verify_restored_request_journal_binding(
+                        restore_root,
+                        expected_store_generation=verified["store_generation"],
+                    )
+
+                binding_path.write_bytes(original_binding)
+                binding_path.chmod(0o600)
+                hidden_binding = binding_path.with_suffix(".withheld")
+                binding_path.rename(hidden_binding)
+                with self.assertRaises(FileNotFoundError):
+                    manager.verify_restored_request_journal_binding(restore_root)
+                hidden_binding.rename(binding_path)
+
+                restored_journal = restore_root / "core" / "requests.sqlite3"
+                hidden_journal = restored_journal.with_suffix(".withheld")
+                restored_journal.rename(hidden_journal)
+                with self.assertRaises(FileNotFoundError):
+                    manager.verify_restored_request_journal_binding(restore_root)
+                hidden_journal.rename(restored_journal)
+
+                original_runtime = restored_runtime_path.read_bytes()
+                bad_runtime = dict(restored_runtime)
+                bad_runtime["memory_db_path"] = str(restore_root / "wrong.sqlite3")
+                restored_runtime_path.write_text(
+                    json.dumps(bad_runtime, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                restored_runtime_path.chmod(0o600)
+                with self.assertRaises(RuntimeError):
+                    manager.verify_restored_request_journal_binding(restore_root)
+                restored_runtime_path.write_bytes(original_runtime)
+                restored_runtime_path.chmod(0o600)
+            finally:
+                journal.close()
+                store.close()
+                authority.close()
+
+    def test_live_restored_binding_detects_a_wal_only_database_mutation(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_manager, _legacy_bundle, _capture_id = self._capture_backed_bundle(
+                root
+            )
+            db_path = legacy_manager.store.db_path
+            legacy_manager.store.close()
+            store, authority, journal, _claim = self._claim_governed_store(
+                db_path,
+                instance_id="core-recovery-live-wal",
+            )
+            try:
+                journal.close()
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                bundle = manager.create_bundle(
+                    root / "live-wal.sqlite3",
+                    purpose="unit-test",
+                    pinned=True,
+                )
+                verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+                restored = manager.restore_bundle_isolated(
+                    bundle["bundle_receipt_path"],
+                    root / "live-wal-restore",
+                    confirm=True,
+                )
+                restore_root = Path(restored["restore_root"])
+                restored_db = restore_root / "memory.sqlite3"
+                binding_path = Path(restored["request_journal_binding_receipt_path"])
+
+                # A promoted restore retains the local recovery trust root.
+                shutil.copytree(
+                    db_path.parent / "recovery-keys",
+                    restore_root / "recovery-keys",
+                )
+                (restore_root / "recovery-keys").chmod(0o700)
+                for key_path in (restore_root / "recovery-keys").iterdir():
+                    key_path.chmod(0o600)
+
+                with closing(sqlite3.connect(restored_db)) as conn:
+                    self.assertEqual(
+                        str(conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower(),
+                        "wal",
+                    )
+                    conn.execute("PRAGMA wal_autocheckpoint = 0")
+                    conn.commit()
+
+                    # WAL mode changes SQLite's base-file header. Rebind that
+                    # representation without changing any logical memory.
+                    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+                    binding["memory_sha256"] = hashlib.sha256(
+                        restored_db.read_bytes()
+                    ).hexdigest()
+                    binding["memory_size_bytes"] = restored_db.stat().st_size
+                    manager.store._authenticate_receipt(binding)
+                    binding_path.write_text(
+                        json.dumps(binding, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    binding_path.chmod(0o600)
+
+                    promoted_store = DurableMemoryStore.open_existing_for_audit(
+                        restored_db
+                    )
+                    promoted_manager = VerifiedRecoveryManager(
+                        promoted_store,
+                        capture_root=restore_root / "capture-root",
+                        runtime_state_path=restore_root / "runtime_state.json",
+                    )
+                    promoted_manager.verify_restored_request_journal_binding(
+                        restore_root,
+                        expected_store_identity=verified["store_identity"],
+                        expected_store_generation=verified["store_generation"],
+                    )
+
+                    cursor = conn.execute(
+                        "UPDATE memory_entries "
+                        "SET source_text = 'W' || substr(source_text, 2) "
+                        "WHERE memory_id = ("
+                        "SELECT memory_id FROM memory_entries ORDER BY memory_id LIMIT 1"
+                        ")",
+                    )
+                    self.assertEqual(cursor.rowcount, 1)
+                    conn.commit()
+                    self.assertTrue(Path(str(restored_db) + "-wal").is_file())
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "does not match its targets",
+                    ):
+                        promoted_manager.verify_restored_request_journal_binding(
+                            restore_root
+                        )
+            finally:
+                journal.close()
+                store.close()
+                authority.close()
+
+    def test_live_capture_manifest_detects_new_unacknowledged_transport_bytes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager, bundle, _capture_id = self._capture_backed_bundle(root)
+            verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+            before = manager.recompute_live_capture_manifest(
+                database_binding=verified["capture_database_binding"]
+            )
+            self.assertEqual(
+                before["manifest_sha256"],
+                verified["capture_manifest_sha256"],
+            )
+
+            write_capture_drop(
+                root=root,
+                context_id="recovery-tests",
+                source_tag="post-backup-stale-evidence",
+                speaker="codex",
+                text="A new durable capture arrived after the signed recovery point.",
+                metadata={"surface": "live-attestation-test"},
+                capture_id="s2cap_61616161616161616161616161616161",
+            )
+            after = manager.recompute_live_capture_manifest(
+                database_binding=verified["capture_database_binding"]
+            )
+            self.assertEqual(after["file_count"], before["file_count"] + 1)
+            self.assertNotEqual(after["manifest_sha256"], before["manifest_sha256"])
+
     def test_forged_receipt_with_recomputed_digest_fails_signature_verification(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -983,7 +2319,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             store, _db_path = self._seed_store(root)
             manager = VerifiedRecoveryManager(store, capture_root=root)
             paths = manager.daemon.paths()
-            manager.daemon.status()
+            manager.daemon._ensure_transport_dirs(paths)
             identifierless = paths["inbox_dir"] / "legacy-identifierless.json"
             identifierless.write_text(
                 json.dumps(
@@ -1212,6 +2548,48 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                         conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0],
                         1,
                     )
+                compatibility_backup = migrated_store.backup(
+                    root / "v5-compatible-recertified.sqlite3",
+                    purpose="compatibility-test",
+                )
+                self.assertEqual(
+                    compatibility_backup["schema_contract_version"],
+                    "s2-schema-v5",
+                )
+                migrated_store.close()
+                store.close()
+                authority = CoreAuthorityLease.acquire_core(
+                    restored_path,
+                    timeout_seconds=0.0,
+                    instance_id="core-backup-contract-test",
+                )
+                migrated_store = DurableMemoryStore(
+                    restored_path,
+                    authority_lease=authority,
+                )
+                inspection = migrated_store.inspect_core_authority_preclaim()
+                preclaim = inspection["logical_snapshot"]
+                migrated_store.claim_core_authority(
+                    instance_id=authority.instance_id,
+                    config_fingerprint="c" * 64,
+                    build_id="backup-contract-test",
+                    protocol_version="synapse-core.v1",
+                    expected_store_identity=str(inspection["store_identity"]),
+                    request_journal_id="journal-" + ("c" * 24),
+                    request_journal_binding_schema=(
+                        "synapse-s2.request-journal-binding.v1"
+                    ),
+                    request_journal_schema_version=3,
+                    expected_preclaim_logical_snapshot_sha256=str(
+                        preclaim["sha256"]
+                    ),
+                    expected_previous_epoch=0,
+                    expected_next_epoch=1,
+                    root_generation_id="generation-" + ("c" * 24),
+                    embedding_space_identity="c" * 64,
+                    attestation_receipt_digest="c" * 64,
+                    attestation_expires_at_unix_ms=int(time.time() * 1000) + 60_000,
+                )
                 migrated_backup = migrated_store.backup(
                     root / "current-schema-recertified.sqlite3",
                     purpose="compatibility-test",
@@ -1221,6 +2599,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                     BACKUP_SCHEMA_CONTRACT_VERSION,
                 )
                 self.assertTrue(migrated_backup["verified"])
+                authority.close()
 
     def test_retention_preserves_sole_latest_keep_latest_and_pinned_bundles(self):
         day = 86_400.0

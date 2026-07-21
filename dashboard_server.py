@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import importlib.util
 import json
 import logging
@@ -9,6 +10,9 @@ import math
 import os
 import platform
 import re
+import secrets
+import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -16,14 +20,27 @@ import time
 import tomllib
 import uuid
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
-from capture_daemon import CaptureInboxDaemon
-import mlx_backend
-from redaction import (
+from core_client_binding import apply_binding_environment
+
+
+# The owner-only binding is the authority pointer for persistent clients.  It
+# must populate the process environment before any adapter module can inspect
+# routing state during import.
+apply_binding_environment()
+
+from capture_daemon import CaptureInboxDaemon  # noqa: E402
+from core_client import (  # noqa: E402
+    CoreClient,
+    CoreOutcomeUnknown,
+    outcome_unknown_projection,
+)
+import mlx_backend  # noqa: E402
+from redaction import (  # noqa: E402
     SECRET_SAFE_LOG_FORMAT,
     SecretSafeArgumentParser,
     install_secret_safe_formatters,
@@ -32,7 +49,7 @@ from redaction import (
     safe_public_error,
     strip_untrusted_raw_digest_fields,
 )
-from transcript_capture import TranscriptCaptureManager
+from transcript_capture import TranscriptCaptureManager  # noqa: E402
 
 
 LOGGER = logging.getLogger("synapse_s2.dashboard")
@@ -48,6 +65,18 @@ ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 MAX_JSON_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 64 * 1024
+DASHBOARD_SESSION_COOKIE_NAME = "synapse_s2_dashboard_session"
+DASHBOARD_SESSION_HEADER_NAME = "X-Synapse-Dashboard-Session"
+DASHBOARD_SESSION_FRAGMENT_KEY = "synapse_dashboard_session"
+DASHBOARD_BOOTSTRAP_PATH = "/__dashboard_bootstrap"
+DASHBOARD_AUTH_SCHEMA = "synapse-s2.dashboard-auth.v1"
+MAX_COOKIE_HEADER_BYTES = 4096
+MAX_SESSION_HEADER_BYTES = 256
+DASHBOARD_IO_TIMEOUT_SECONDS = 5.0
+DASHBOARD_PREAUTH_TIMEOUT_SECONDS = 1.0
+DASHBOARD_MAX_ACTIVE_HANDLERS = 8
+DASHBOARD_REQUEST_BACKLOG = 32
+DASHBOARD_HANDLER_SHUTDOWN_SECONDS = 6.0
 DEFAULT_CONTEXT = os.getenv("SYNAPSE_S2_DASHBOARD_CONTEXT", "default")
 CONFIRMATION_TOKEN_TTL_SECONDS = 120.0
 MAX_CONFIRMATION_TOKENS = 256
@@ -67,6 +96,89 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
 }
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _normal_dashboard_auth_path(path: Path) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute() or ".." in candidate.parts or "\x00" in str(candidate):
+        raise RuntimeError("dashboard auth file must be a normal absolute path")
+    parent = candidate.parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    observed_parent = parent.lstat()
+    if (
+        stat.S_ISLNK(observed_parent.st_mode)
+        or not stat.S_ISDIR(observed_parent.st_mode)
+        or observed_parent.st_uid != os.geteuid()
+        or stat.S_IMODE(observed_parent.st_mode) != 0o700
+        or parent.resolve() != parent
+    ):
+        raise RuntimeError("dashboard auth directory must be owner-only and symlink-free")
+    try:
+        observed = candidate.lstat()
+    except FileNotFoundError:
+        observed = None
+    if observed is not None and (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.geteuid()
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        raise RuntimeError("dashboard auth file must be an owner-only regular file")
+    return candidate
+
+
+def _write_private_dashboard_auth(path: Path, payload: dict[str, Any]) -> None:
+    path = _normal_dashboard_auth_path(path)
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    if len(encoded) > 4096:
+        raise RuntimeError("dashboard auth payload exceeds its safety bound")
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("dashboard auth write made no progress")
+            view = view[written:]
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    observed = path.lstat()
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.geteuid()
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        raise RuntimeError("dashboard auth publication produced an unsafe file")
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 class DashboardError(Exception):
@@ -120,7 +232,7 @@ class DashboardRuntime:
 
     def _refresh_semantic_audit(self) -> None:
         try:
-            payload = self.backend.memory_store.audit_semantic_indexes(
+            payload = self.backend.audit_semantic_indexes(
                 context_id=None,
                 sample_limit=5,
             )
@@ -280,6 +392,14 @@ class DashboardRuntime:
                 },
                 status=HTTPStatus.BAD_REQUEST,
             )
+        except CoreOutcomeUnknown as exc:
+            return self._json_response(
+                {
+                    "error": "outcome_unknown",
+                    "reconciliation": outcome_unknown_projection(exc),
+                },
+                status=HTTPStatus.CONFLICT,
+            )
         except Exception as exc:
             error_id = f"dash_{uuid.uuid4().hex[:12]}"
             LOGGER.exception("dashboard request failed for %s %s", method, parsed.path)
@@ -303,9 +423,13 @@ class DashboardRuntime:
             context = self._context_from_params(params)
             return self._json_response(self.backend.status(context_id=context))
         if method == "GET" and path == "/api/profile":
-            benchmark = self._bool_param(params, "benchmark_quick_prune", False)
+            if self._bool_param(params, "benchmark_quick_prune", False):
+                raise DashboardError(
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                    "quick-prune benchmarking requires POST",
+                )
             return self._json_response(
-                self.backend.resource_profile(benchmark_quick_prune=benchmark)
+                self.backend.resource_profile(benchmark_quick_prune=False)
             )
         if method == "GET" and path == "/api/graph":
             context = self._context_from_params(params)
@@ -428,12 +552,6 @@ class DashboardRuntime:
             return self._json_response(
                 self.self_test(context_id=context, include_apps=include_apps)
             )
-        if method == "GET" and path == "/api/monday-readiness":
-            context = self._context_from_params(params)
-            include_apps = self._bool_param(params, "include_apps", True)
-            return self._json_response(
-                self.monday_readiness(context_id=context, include_apps=include_apps)
-            )
         if method == "GET" and path == "/api/context-health":
             context = self._context_from_params(params)
             return self._json_response(self.context_health(context_id=context))
@@ -456,6 +574,11 @@ class DashboardRuntime:
             raise DashboardError(
                 HTTPStatus.METHOD_NOT_ALLOWED,
                 "start-work leases context deliveries and now requires POST as dashboard-ui; use GET /api/context-events for observation-only reads",
+            )
+        if method == "GET" and path == "/api/monday-readiness":
+            raise DashboardError(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                "Monday Readiness performs governed diagnostics and requires POST",
             )
         if method == "POST" and path == "/api/start-work":
             payload = self._parse_json_body(body)
@@ -715,9 +838,9 @@ class DashboardRuntime:
             )
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
             results = self._parse_recall_result(result)
-            recall_contexts = self.backend.memory_store.resolve_recall_contexts(
+            recall_contexts = self.backend.resolve_recall_contexts(
                 context_id=context,
-                scope=recall_scope,
+                recall_scope=recall_scope,
             )
             effective_context_ids = [
                 str(record.get("context_id") or "")
@@ -738,7 +861,7 @@ class DashboardRuntime:
                         "effective_context_ids": effective_context_ids,
                         "runtime": "ready" if self.backend.is_enabled(context) else "disabled",
                         "embedding_provider": self.backend.embedding_provider_info(),
-                        "memory_entry_revision": self.backend.memory_store.entries_revision(
+                        "memory_entry_revision": self.backend.memory_entries_revision(
                             context_ids=effective_context_ids,
                         ),
                     },
@@ -973,6 +1096,7 @@ class DashboardRuntime:
                 event_id=event_id,
                 reason=str(payload.get("reason", "")),
                 source_surface="dashboard",
+                confirm=True,
             )
             return self._json_response(prune)
         if method == "POST" and path == "/api/context-ack":
@@ -1129,6 +1253,49 @@ class DashboardRuntime:
                     confirm=True,
                 )
             )
+        if method == "POST" and path == "/api/profile-benchmark":
+            self._parse_json_body(body)
+            return self._json_response(
+                self.backend.resource_profile(benchmark_quick_prune=True)
+            )
+        if method == "POST" and path == "/api/monday-readiness":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            include_apps = payload.get("include_apps", True)
+            if not isinstance(include_apps, bool):
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "include_apps must be a boolean",
+                )
+            return self._json_response(
+                self.monday_readiness(
+                    context_id=context,
+                    include_apps=include_apps,
+                )
+            )
+        if method == "POST" and path == "/api/request-status":
+            payload = self._parse_json_body(body)
+            caller = str(payload.get("caller", "") or "").strip()
+            request_id = str(payload.get("request_id", "") or "").strip()
+            if not caller or not request_id:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "caller and request_id are required",
+                )
+            if len(caller.encode("utf-8")) > 128 or len(request_id.encode("utf-8")) > 128:
+                raise DashboardError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "reconciliation handle is too large",
+                )
+            request_status = getattr(self.backend, "request_status", None)
+            if not callable(request_status):
+                raise DashboardError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "authoritative request status unavailable",
+                )
+            return self._json_response(
+                request_status(caller=caller, request_id=request_id)
+            )
         if method == "POST" and path == "/api/quick-prune":
             return self._json_response(self.backend.run_quick_pruning(trigger="dashboard"))
         if method == "POST" and path == "/api/certify-runtime":
@@ -1163,17 +1330,25 @@ class DashboardRuntime:
         if method == "POST" and path == "/api/sleep":
             return self._json_response(self.backend.run_deep_sleep_consolidation())
         if method == "POST" and path == "/api/backup":
-            export_root = self._export_root()
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            nonce = uuid.uuid4().hex[:12]
-            backup_path = export_root / f"dashboard-recovery-{stamp}-{nonce}.sqlite3"
-            self.capture_daemon().status()
-            return self._json_response(
-                self.backend.backup_recovery_bundle(
+            if isinstance(self.backend, CoreClient):
+                backup = self.backend.backup_recovery_bundle(
+                    purpose="dashboard",
+                )
+            else:
+                export_root = self._export_root()
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                nonce = uuid.uuid4().hex[:12]
+                backup_path = (
+                    export_root / f"dashboard-recovery-{stamp}-{nonce}.sqlite3"
+                )
+                self.capture_daemon().prepare_transport()
+                backup = self.backend.backup_recovery_bundle(
                     path=backup_path,
                     capture_root=self._capture_root(),
                     purpose="dashboard",
                 )
+            return self._json_response(
+                backup
             )
         if method == "POST" and path == "/api/readiness-audit":
             payload = self._parse_json_body(body)
@@ -1741,6 +1916,7 @@ class DashboardRuntime:
                 memory_id=memory_id,
                 reason=reason or "memory hygiene prune",
                 source_surface="dashboard-memory-hygiene",
+                confirm=True,
             )
             return {
                 "action": "memory-hygiene-action",
@@ -2468,7 +2644,7 @@ class DashboardRuntime:
         )
         if len(note.encode("utf-8")) > MAX_TEXT_BYTES:
             raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "note is too large")
-        entry = self.backend.memory_store.get_entry(memory_id)
+        entry = self.backend.get_memory_entry(memory_id)
         if entry is None:
             raise DashboardError(HTTPStatus.NOT_FOUND, "memory was not found")
         entry_context = str(entry.get("context_id") or "")
@@ -2882,16 +3058,24 @@ class DashboardRuntime:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         nonce = uuid.uuid4().hex[:12]
         report_path = export_root / f"evidence-pack-{context}-{stamp}-{nonce}.json"
-        backup_path = export_root / f"evidence-recovery-{context}-{stamp}-{nonce}.sqlite3"
         snapshot = self.snapshot(context_id=context, limit=250, include_graph=True)
         audit = self.readiness_audit(context_id=context)
-        self.capture_daemon().status()
-        backup = self.backend.backup_recovery_bundle(
-            path=backup_path,
-            capture_root=self._capture_root(),
-            purpose="evidence-pack",
-            pinned=True,
-        )
+        if isinstance(self.backend, CoreClient):
+            backup = self.backend.backup_recovery_bundle(
+                purpose="evidence-pack",
+                pinned=True,
+            )
+        else:
+            backup_path = (
+                export_root / f"evidence-recovery-{context}-{stamp}-{nonce}.sqlite3"
+            )
+            self.capture_daemon().prepare_transport()
+            backup = self.backend.backup_recovery_bundle(
+                path=backup_path,
+                capture_root=self._capture_root(),
+                purpose="evidence-pack",
+                pinned=True,
+            )
         payload: dict[str, Any] = {
             "action": "evidence-pack",
             "context_id": context,
@@ -3642,18 +3826,17 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
     server_version = "SYNAPSE-S2-Dashboard/0.1"
 
     def do_GET(self) -> None:
+        self.server.mark_request_headers_complete(self.connection)  # type: ignore[attr-defined]
         self._dispatch()
 
     def do_POST(self) -> None:
+        self.server.mark_request_headers_complete(self.connection)  # type: ignore[attr-defined]
         self._dispatch()
 
     def do_OPTIONS(self) -> None:
-        if not self._host_allowed():
-            status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
-                {"error": "host not allowed"},
-                status=HTTPStatus.MISDIRECTED_REQUEST,
-            )
-            self._write_response(status, headers, body)
+        self.server.mark_request_headers_complete(self.connection)  # type: ignore[attr-defined]
+        if not self._mutation_request_allowed():
+            self._write_mutation_forbidden()
             return
         self.send_response(int(HTTPStatus.NO_CONTENT))
         self.send_header("Allow", "GET, POST, OPTIONS")
@@ -3664,15 +3847,21 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         del format, args
+        command = str(getattr(self, "command", "<unparsed>"))
+        path = urlparse(str(getattr(self, "path", ""))).path or "<unparsed>"
+        request_version = str(getattr(self, "request_version", "<unparsed>"))
         LOGGER.info(
             "%s - %s %s %s",
             self.address_string(),
-            self.command,
-            urlparse(self.path).path,
-            self.request_version,
+            command,
+            path,
+            request_version,
         )
 
     def _dispatch(self) -> None:
+        if self.command == "POST" and not self._mutation_request_allowed():
+            self._write_mutation_forbidden()
+            return
         if not self._host_allowed():
             status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
                 {"error": "host not allowed"},
@@ -3680,51 +3869,275 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
             )
             self._write_response(status, headers, body)
             return
-        if self.command == "POST" and not self._origin_allowed():
-            status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
-                {"error": "origin not allowed"},
-                status=HTTPStatus.FORBIDDEN,
-            )
-            self._write_response(status, headers, body)
+        parsed_path = urlparse(self.path)
+        if self.command == "GET" and parsed_path.path == DASHBOARD_BOOTSTRAP_PATH:
+            try:
+                self._read_request_body()
+            except DashboardError as exc:
+                self.close_connection = True
+                status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
+                    {"error": exc.message},
+                    status=exc.status,
+                )
+                self._write_response(status, headers, body)
+                return
+            self._handle_dashboard_bootstrap(parsed_path.query)
             return
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length > MAX_JSON_BODY_BYTES:
+        if parsed_path.path.startswith("/api/") and not self._session_capabilities_allowed():
+            self._write_authorization_forbidden()
+            return
+        try:
+            raw_body = self._read_request_body()
+        except DashboardError as exc:
+            self.close_connection = True
             status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
-                {"error": "request body too large"},
-                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": exc.message},
+                status=exc.status,
             )
         else:
-            raw_body = self.rfile.read(length) if length else b""
-            status, headers, body = self.server.runtime.handle(  # type: ignore[attr-defined]
+            status, headers, body = self.server.handle_runtime_request(  # type: ignore[attr-defined]
                 self.command,
                 self.path,
                 raw_body,
             )
         self._write_response(status, headers, body)
 
+    def _handle_dashboard_bootstrap(self, query: str) -> None:
+        if len(query.encode("utf-8")) > 512:
+            self._write_authorization_forbidden()
+            return
+        try:
+            params = parse_qs(
+                query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=2,
+            )
+        except ValueError:
+            self._write_authorization_forbidden()
+            return
+        candidates = params.get("token", [])
+        if set(params) != {"token"} or len(candidates) != 1:
+            self._write_authorization_forbidden()
+            return
+        if not self.server.consume_dashboard_bootstrap(candidates[0]):  # type: ignore[attr-defined]
+            self._write_authorization_forbidden()
+            return
+        capability = self.server._dashboard_session_capability  # type: ignore[attr-defined]
+        header_capability = self.server._dashboard_header_capability  # type: ignore[attr-defined]
+        context = self.server._dashboard_default_context  # type: ignore[attr-defined]
+        fragment = urlencode(
+            {
+                DASHBOARD_SESSION_FRAGMENT_KEY: header_capability,
+                "target": "namespaceGalaxy",
+            }
+        )
+        location = f"/?{urlencode({'context_id': context})}#{fragment}"
+        self.send_response(int(HTTPStatus.SEE_OTHER))
+        for key, value in SECURITY_HEADERS.items():
+            self.send_header(key, value)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Location", location)
+        self.send_header(
+            "Set-Cookie",
+            (
+                f"{self.server._dashboard_cookie_name}={capability}; "  # type: ignore[attr-defined]
+                "HttpOnly; SameSite=Strict; Path=/"
+            ),
+        )
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _read_request_body(self) -> bytes:
+        if self._header_values("Transfer-Encoding"):
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "transfer encoding is not supported",
+            )
+        length_values = self._header_values("Content-Length")
+        if self.command == "POST" and not length_values:
+            raise DashboardError(
+                HTTPStatus.LENGTH_REQUIRED,
+                "exactly one content length is required",
+            )
+        if len(length_values) > 1:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "duplicate content length is not allowed",
+            )
+        if not length_values:
+            return b""
+        raw_length = str(length_values[0])
+        if (
+            raw_length != raw_length.strip()
+            or re.fullmatch(r"(?:0|[1-9][0-9]*)", raw_length) is None
+        ):
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "content length is invalid",
+            )
+        length = int(raw_length)
+        if length > MAX_JSON_BODY_BYTES:
+            raise DashboardError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "request body too large",
+            )
+        if self.command != "POST" and length != 0:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "request body is not allowed",
+            )
+        if length == 0:
+            return b""
+        try:
+            body = self.rfile.read(length)
+        except (OSError, TimeoutError, socket.timeout) as exc:
+            raise DashboardError(
+                HTTPStatus.REQUEST_TIMEOUT,
+                "request body timed out",
+            ) from exc
+        if len(body) != length:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "request body is incomplete",
+            )
+        return body
+
     def _host_allowed(self) -> bool:
-        host_header = str(self.headers.get("Host") or "").strip()
-        if not host_header:
-            return False
+        return self._host_authority() is not None
+
+    def _host_authority(self) -> tuple[str, int] | None:
+        host_values = self._header_values("Host")
+        if len(host_values) != 1:
+            return None
+        host_header = str(host_values[0] or "").strip()
+        if not host_header or len(host_header) > 255:
+            return None
         try:
             parsed = urlparse(f"//{host_header}")
             host = str(parsed.hostname or "").casefold()
             port = int(parsed.port or 80)
         except (TypeError, ValueError):
-            return False
-        return host in LOOPBACK_HOSTS and port == int(self.server.server_port)
+            return None
+        if (
+            not host
+            or host not in LOOPBACK_HOSTS
+            or port != int(self.server.server_port)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        return host, port
 
     def _origin_allowed(self) -> bool:
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        parsed = urlparse(origin)
-        if parsed.scheme not in {"http", "https"}:
+        host_authority = self._host_authority()
+        origin_values = self._header_values("Origin")
+        if host_authority is None or len(origin_values) != 1:
             return False
-        if parsed.hostname not in LOOPBACK_HOSTS:
+        origin = str(origin_values[0] or "").strip()
+        if not origin or len(origin) > 512:
             return False
-        origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        return int(origin_port) == int(self.server.server_port)
+        try:
+            parsed = urlparse(origin)
+            origin_host = str(parsed.hostname or "").casefold()
+            origin_port = int(parsed.port or 80)
+        except (TypeError, ValueError):
+            return False
+        if (
+            parsed.scheme.casefold() != "http"
+            or not origin_host
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        return (origin_host, origin_port) == host_authority
+
+    def _session_cookie_allowed(self) -> bool:
+        cookie_headers = self._header_values("Cookie")
+        if not cookie_headers:
+            return False
+        if sum(len(str(value)) for value in cookie_headers) > MAX_COOKIE_HEADER_BYTES:
+            return False
+        candidates: list[str] = []
+        for header in cookie_headers:
+            for item in str(header).split(";"):
+                name, separator, value = item.strip().partition("=")
+                if separator and name == self.server._dashboard_cookie_name:  # type: ignore[attr-defined]
+                    candidates.append(value.strip())
+        expected = self.server._dashboard_session_capability  # type: ignore[attr-defined]
+        if len(candidates) != 1:
+            return False
+        candidate_bytes = candidates[0].encode("utf-8")
+        expected_bytes = expected.encode("ascii")
+        if len(candidate_bytes) != len(expected_bytes):
+            return False
+        return hmac.compare_digest(candidate_bytes, expected_bytes)
+
+    def _session_header_allowed(self) -> bool:
+        values = self._header_values(DASHBOARD_SESSION_HEADER_NAME)
+        if len(values) != 1:
+            return False
+        candidate = str(values[0])
+        if (
+            not candidate
+            or candidate != candidate.strip()
+            or len(candidate.encode("utf-8")) > MAX_SESSION_HEADER_BYTES
+        ):
+            return False
+        try:
+            candidate_bytes = candidate.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        expected = self.server._dashboard_header_capability  # type: ignore[attr-defined]
+        expected_bytes = expected.encode("ascii")
+        if len(candidate_bytes) != len(expected_bytes):
+            return False
+        return hmac.compare_digest(candidate_bytes, expected_bytes)
+
+    def _header_values(self, name: str) -> list[str]:
+        headers = getattr(self, "headers", None)
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            return [str(value) for value in get_all(name, [])]
+        if isinstance(headers, dict):
+            value = headers.get(name)
+            return [] if value is None else [str(value)]
+        return []
+
+    def _session_capabilities_allowed(self) -> bool:
+        return self._session_cookie_allowed() and self._session_header_allowed()
+
+    def _mutation_request_allowed(self) -> bool:
+        return (
+            self._host_allowed()
+            and self._origin_allowed()
+            and self._session_capabilities_allowed()
+        )
+
+    def _write_mutation_forbidden(self) -> None:
+        self.close_connection = True
+        status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
+            {"error": "mutation forbidden"},
+            status=HTTPStatus.FORBIDDEN,
+        )
+        self._write_response(status, headers, body)
+
+    def _write_authorization_forbidden(self) -> None:
+        self.close_connection = True
+        status, headers, body = self.server.runtime._json_response(  # type: ignore[attr-defined]
+            {"error": "dashboard authorization required"},
+            status=HTTPStatus.FORBIDDEN,
+        )
+        self._write_response(status, headers, body)
 
     def _write_response(
         self,
@@ -3732,24 +4145,266 @@ class SynapseDashboardHandler(BaseHTTPRequestHandler):
         headers: dict[str, str],
         body: bytes,
     ) -> None:
-        self.send_response(status)
-        for key, value in headers.items():
-            self.send_header(key, value)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+            self.close_connection = True
 
 
-class SynapseDashboardServer(HTTPServer):
-    request_queue_size = 32
+class SynapseDashboardServer(ThreadingHTTPServer):
+    request_queue_size = DASHBOARD_REQUEST_BACKLOG
+    daemon_threads = True
+    block_on_close = False
 
     def __init__(
         self,
         server_address: tuple[str, int],
         runtime: DashboardRuntime,
+        *,
+        auth_file: Path | None = None,
+        default_context: str = DEFAULT_CONTEXT,
     ) -> None:
+        self._runtime_lock = threading.Lock()
+        self._handler_slots = threading.BoundedSemaphore(DASHBOARD_MAX_ACTIVE_HANDLERS)
+        self._handler_condition = threading.Condition()
+        self._active_handler_sockets: set[socket.socket] = set()
+        self._preauth_timers: dict[socket.socket, threading.Timer] = {}
+        self._peak_active_handlers = 0
+        self._closing = threading.Event()
         super().__init__(server_address, SynapseDashboardHandler)
-        self.runtime = runtime
+        try:
+            self.runtime = runtime
+            self._dashboard_cookie_name = (
+                f"{DASHBOARD_SESSION_COOKIE_NAME}_{int(self.server_port)}"
+            )
+            self._dashboard_session_capability = secrets.token_urlsafe(32)
+            self._dashboard_header_capability = secrets.token_urlsafe(32)
+            self._dashboard_bootstrap_capability = secrets.token_urlsafe(32)
+            self._dashboard_bootstrap_lock = threading.Lock()
+            self._dashboard_auth_file = (
+                _normal_dashboard_auth_path(auth_file) if auth_file is not None else None
+            )
+            self._dashboard_default_context = mlx_backend.sanitize_context_id(
+                default_context
+            )
+            self._dashboard_instance_id = uuid.uuid4().hex
+            self._publish_dashboard_auth(self._dashboard_bootstrap_capability)
+        except BaseException:
+            super().server_close()
+            raise
+
+    def _authority(self) -> str:
+        host = str(self.server_address[0])
+        rendered_host = f"[{host}]" if ":" in host else host
+        return f"{rendered_host}:{int(self.server_port)}"
+
+    def _publish_dashboard_auth(self, capability: str) -> None:
+        if self._dashboard_auth_file is None:
+            return
+        bootstrap_url = (
+            f"http://{self._authority()}{DASHBOARD_BOOTSTRAP_PATH}?"
+            f"{urlencode({'token': capability})}"
+        )
+        _write_private_dashboard_auth(
+            self._dashboard_auth_file,
+            {
+                "schema": DASHBOARD_AUTH_SCHEMA,
+                "instance_id": self._dashboard_instance_id,
+                "pid": os.getpid(),
+                "host": str(self.server_address[0]),
+                "port": int(self.server_port),
+                "bootstrap_url": bootstrap_url,
+                "session_header": self._dashboard_header_capability,
+                "issued_at": int(time.time()),
+            },
+        )
+
+    def handle_runtime_request(
+        self,
+        method: str,
+        path: str,
+        raw_body: bytes,
+    ) -> tuple[int, dict[str, str], bytes]:
+        # Network parsing and authentication may run concurrently, but MLX-backed
+        # runtime work remains serialized to preserve the existing device affinity.
+        with self._runtime_lock:
+            return self.runtime.handle(method, path, raw_body)
+
+    def mark_request_headers_complete(self, request: socket.socket) -> None:
+        with self._handler_condition:
+            timer = self._preauth_timers.pop(request, None)
+        if timer is not None:
+            timer.cancel()
+        try:
+            request.settimeout(DASHBOARD_IO_TIMEOUT_SECONDS)
+        except OSError:
+            pass
+
+    def _expire_preauth_request(self, request: socket.socket) -> None:
+        with self._handler_condition:
+            timer = self._preauth_timers.pop(request, None)
+        if timer is None:
+            return
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def consume_dashboard_bootstrap(self, candidate: str) -> bool:
+        try:
+            candidate_bytes = candidate.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        with self._dashboard_bootstrap_lock:
+            expected_bytes = self._dashboard_bootstrap_capability.encode("ascii")
+            if len(candidate_bytes) != len(expected_bytes) or not hmac.compare_digest(
+                candidate_bytes,
+                expected_bytes,
+            ):
+                return False
+            replacement = secrets.token_urlsafe(32)
+            self._publish_dashboard_auth(replacement)
+            self._dashboard_bootstrap_capability = replacement
+            return True
+
+    def _remove_dashboard_auth(self) -> None:
+        path = self._dashboard_auth_file
+        if path is None:
+            return
+        try:
+            observed = path.lstat()
+            if (
+                stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != 0o600
+                or observed.st_size > 4096
+            ):
+                return
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+                    return
+                chunks: list[bytes] = []
+                remaining = 4097
+                while remaining:
+                    chunk = os.read(descriptor, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                payload = json.loads(b"".join(chunks).decode("utf-8"))
+            finally:
+                os.close(descriptor)
+            if payload.get("instance_id") != self._dashboard_instance_id:
+                return
+            path.unlink()
+            directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(
+                os,
+                "O_NOFOLLOW",
+                0,
+            )
+            directory = os.open(path.parent, directory_flags)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+
+    def server_close(self) -> None:
+        self._closing.set()
+        with self._handler_condition:
+            active = tuple(self._active_handler_sockets)
+            timers = tuple(self._preauth_timers.values())
+            self._preauth_timers.clear()
+        for timer in timers:
+            timer.cancel()
+        for connection in active:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self._remove_dashboard_auth()
+        super().server_close()
+        deadline = time.monotonic() + DASHBOARD_HANDLER_SHUTDOWN_SECONDS
+        with self._handler_condition:
+            while self._active_handler_sockets:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    LOGGER.warning(
+                        "dashboard shutdown timed out with %d bounded handler(s)",
+                        len(self._active_handler_sockets),
+                    )
+                    break
+                self._handler_condition.wait(timeout=remaining)
+
+    @property
+    def active_handler_count(self) -> int:
+        with self._handler_condition:
+            return len(self._active_handler_sockets)
+
+    @property
+    def peak_active_handler_count(self) -> int:
+        with self._handler_condition:
+            return self._peak_active_handlers
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        if self._closing.is_set() or not self._handler_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        with self._handler_condition:
+            self._active_handler_sockets.add(request)
+            self._peak_active_handlers = max(
+                self._peak_active_handlers,
+                len(self._active_handler_sockets),
+            )
+            timer = threading.Timer(
+                DASHBOARD_PREAUTH_TIMEOUT_SECONDS,
+                self._expire_preauth_request,
+                args=(request,),
+            )
+            timer.daemon = True
+            self._preauth_timers[request] = timer
+            timer.start()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._handler_condition:
+                self._active_handler_sockets.discard(request)
+                timer = self._preauth_timers.pop(request, None)
+                self._handler_condition.notify_all()
+            if timer is not None:
+                timer.cancel()
+            self._handler_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._handler_condition:
+                self._active_handler_sockets.discard(request)
+                timer = self._preauth_timers.pop(request, None)
+                self._handler_condition.notify_all()
+            if timer is not None:
+                timer.cancel()
+            self._handler_slots.release()
+
+    def get_request(self) -> tuple[socket.socket, Any]:
+        connection, address = super().get_request()
+        connection.settimeout(DASHBOARD_PREAUTH_TIMEOUT_SECONDS)
+        return connection, address
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3757,6 +4412,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--context", default=DEFAULT_CONTEXT)
+    parser.add_argument(
+        "--auth-file",
+        default=os.getenv(
+            "SYNAPSE_S2_DASHBOARD_AUTH_FILE",
+            str(ROOT / ".synapse_s2" / "dashboard-auth.json"),
+        ),
+    )
     return parser
 
 
@@ -3770,9 +4432,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     runtime = DashboardRuntime()
-    server = SynapseDashboardServer((args.host, args.port), runtime)
+    auth_file = Path(args.auth_file).expanduser()
+    if not auth_file.is_absolute():
+        auth_file = ROOT / auth_file
+    try:
+        server = SynapseDashboardServer(
+            (args.host, args.port),
+            runtime,
+            auth_file=auth_file,
+            default_context=args.context,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        LOGGER.error("dashboard authorization bootstrap could not be published: %s", exc)
+        return 2
     url = f"http://{args.host}:{server.server_port}/?context_id={mlx_backend.sanitize_context_id(args.context)}"
     LOGGER.info("SYNAPSE-S2 dashboard listening on %s", url)
+    LOGGER.info("Open the authenticated dashboard with scripts/open_dashboard.py")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

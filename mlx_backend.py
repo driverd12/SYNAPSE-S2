@@ -14,17 +14,30 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from embedding_providers import EmbeddingProviderError, resolve_embedding_provider
+from embedding_providers import (
+    EmbeddingProvider,
+    EmbeddingProviderConfig,
+    EmbeddingProviderError,
+    resolve_embedding_provider,
+    resolve_embedding_provider_config,
+)
 from event_segmenter import BayesianSurpriseEventSegmenter
+from core_authority import (
+    CORE_AUTHORITY_LOCK_GENERATION_RE,
+    CoreAuthorityError,
+    CoreAuthorityLease,
+)
 from memory_store import (
     CAPTURE_ID_RE,
     CAPTURE_PROTOCOL_VERSION,
     DurableMemoryStore,
+    RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA,
     capture_request_fingerprint,
 )
 from redaction import (
@@ -69,6 +82,10 @@ MAX_RUNTIME_QUARANTINE_SNAPSHOT_BYTES = 1_000_000
 DEFAULT_NUM_NEURONS = 8192
 DEFAULT_RESOURCE_TARGET_MIN_MB = 96.0
 DEFAULT_RESOURCE_TARGET_MAX_MB = 384.0
+NEURAL_ARRAY_BYTES_PER_ELEMENT = 4
+MAX_NEURAL_MATRIX_BYTES = int(
+    DEFAULT_RESOURCE_TARGET_MAX_MB * 1024 * 1024
+)
 CONTEXT_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 TAG_RE = re.compile(r"[^A-Za-z0-9_.: /#-]+")
 AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
@@ -81,6 +98,30 @@ CONSOLIDATION_PHASES = (
     "relationship-extraction",
     "neurogenesis",
 )
+
+
+def _estimated_neural_substrate_bytes(*, dimension: int, num_neurons: int) -> int:
+    """Return the exact steady-state float32 dense-topology footprint."""
+
+    return NEURAL_ARRAY_BYTES_PER_ELEMENT * (
+        dimension * num_neurons
+        + num_neurons * num_neurons
+        + (3 * num_neurons)  # membrane, spikes, and active-trace vectors
+    )
+
+
+def _require_neural_resource_envelope(*, dimension: int, num_neurons: int) -> None:
+    if dimension <= 0:
+        raise ValueError("dimension must be positive")
+    if num_neurons <= 0:
+        raise ValueError("num_neurons must be positive")
+    if _estimated_neural_substrate_bytes(
+        dimension=dimension,
+        num_neurons=num_neurons,
+    ) > MAX_NEURAL_MATRIX_BYTES:
+        raise ValueError("neural topology exceeds the 384 MiB resource envelope")
+
+
 DEFAULT_AGENT_TARGETS = ("mcp-clients", "codex-desktop", "local-ide-adapters")
 CONTEXT_BUS_DELIVERY_MODE = "leased-at-least-once"
 CONTEXT_BUS_PROTOCOL_VERSION = "context-delivery.v2"
@@ -207,7 +248,13 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_write_private_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    before_replace: Callable[[], None] | None = None,
+    after_replace: Callable[[], None] | None = None,
+) -> None:
     _ensure_private_directory(path.parent)
     temp_path = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
     fd = -1
@@ -219,9 +266,13 @@ def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temp_path, path)
         path.chmod(0o600)
         _fsync_directory(path.parent)
+        if after_replace is not None:
+            after_replace()
     finally:
         if fd >= 0:
             os.close(fd)
@@ -328,15 +379,49 @@ def _exclusive_runtime_state_lock(state_path: Path):
 
     _ensure_private_directory(state_path.parent)
     lock_path = state_path.with_name(f".{state_path.name}.lock")
-    flags = os.O_RDWR | os.O_CREAT
+    flags = os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(lock_path, flags, 0o600)
+    created = False
     try:
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        descriptor = os.open(lock_path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if created:
+            os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise RuntimeError("runtime state lock identity is unsafe")
+        visible = lock_path.lstat()
+        if (
+            stat.S_ISLNK(visible.st_mode)
+            or _file_identity(visible) != _file_identity(opened)
+            or visible.st_uid != opened.st_uid
+            or visible.st_nlink != 1
+            or stat.S_IMODE(visible.st_mode) != 0o600
+        ):
+            raise RuntimeError("runtime state lock path changed during open")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        held = os.fstat(descriptor)
+        visible = lock_path.lstat()
+        if (
+            _file_identity(held) != _file_identity(opened)
+            or _file_identity(visible) != _file_identity(opened)
+            or visible.st_uid != opened.st_uid
+            or visible.st_nlink != 1
+            or stat.S_IMODE(visible.st_mode) != 0o600
+        ):
+            raise RuntimeError("runtime state lock identity changed after acquisition")
         yield
     finally:
         try:
@@ -403,14 +488,22 @@ class SpikingAttentionBackend:
         state_path: str | os.PathLike[str] | None = None,
         memory_path: str | os.PathLike[str] | None = None,
         embedding_provider_name: str | None = None,
+        embedding_provider_config: EmbeddingProviderConfig | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
         require_native: bool = False,
         control_plane_only: bool = False,
+        authority_lease: CoreAuthorityLease | None = None,
     ) -> None:
-        native_mx = _require_mx()
         if dimension <= 0:
             raise ValueError("dimension must be positive")
         if num_neurons <= 0:
             raise ValueError("num_neurons must be positive")
+        resolved_dimension = int(dimension)
+        resolved_num_neurons = int(num_neurons)
+        _require_neural_resource_envelope(
+            dimension=resolved_dimension,
+            num_neurons=resolved_num_neurons,
+        )
         if not 0.0 < beta < 1.0:
             raise ValueError("beta must be in the open interval (0, 1)")
         if threshold <= 0.0:
@@ -420,8 +513,9 @@ class SpikingAttentionBackend:
         if idle_deep_sleep_seconds < 0.0:
             raise ValueError("idle_deep_sleep_seconds must be non-negative")
 
-        self.dimension = int(dimension)
-        self.num_neurons = int(num_neurons)
+        native_mx = _require_mx()
+        self.dimension = resolved_dimension
+        self.num_neurons = resolved_num_neurons
         self.default_top_k = int(max(1, default_top_k))
         self.recall_count = int(max(1, recall_count))
         self.beta = float(beta)
@@ -455,23 +549,57 @@ class SpikingAttentionBackend:
             if self.control_plane_only
             else self._build_mlxsnn_lif_layer()
         )
-        self.embedding_provider_name = embedding_provider_name or os.getenv(
-            "SYNAPSE_S2_EMBEDDING_PROVIDER",
-            "auto",
-        )
-        self.embedding_provider = resolve_embedding_provider(self.embedding_provider_name)
+        if embedding_provider is not None:
+            if embedding_provider_name is not None or embedding_provider_config is not None:
+                raise ValueError(
+                    "embedding_provider cannot be combined with provider name or config"
+                )
+            if not isinstance(embedding_provider, EmbeddingProvider):
+                raise TypeError("embedding_provider must be an EmbeddingProvider")
+            self.embedding_provider = embedding_provider
+            self.embedding_provider_name = str(embedding_provider.provider_id)
+        elif embedding_provider_config is not None:
+            if embedding_provider_name is not None:
+                raise ValueError(
+                    "embedding_provider_config cannot be combined with provider name"
+                )
+            if not isinstance(embedding_provider_config, EmbeddingProviderConfig):
+                raise TypeError(
+                    "embedding_provider_config must be EmbeddingProviderConfig"
+                )
+            self.embedding_provider = resolve_embedding_provider_config(
+                embedding_provider_config
+            )
+            self.embedding_provider_name = str(self.embedding_provider.provider_id)
+        else:
+            self.embedding_provider_name = embedding_provider_name or os.getenv(
+                "SYNAPSE_S2_EMBEDDING_PROVIDER",
+                "auto",
+            )
+            self.embedding_provider = resolve_embedding_provider(
+                self.embedding_provider_name
+            )
         self.state_path = self._resolve_state_path(state_path)
         if memory_path is None and state_path is not None:
             resolved_memory_path = self.state_path.parent / "memory.sqlite3"
         else:
             resolved_memory_path = self._resolve_memory_path(memory_path)
-        self.memory_store = DurableMemoryStore(resolved_memory_path)
+        self.memory_store = DurableMemoryStore(
+            resolved_memory_path,
+            authority_lease=authority_lease,
+        )
+        self._core_preclaim_bootstrap = bool(
+            authority_lease is not None
+            and authority_lease.role == "core"
+            and authority_lease.durable_epoch is None
+        )
         self.delivery_instance_id = f"backend-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.global_enabled = True
         self.context_overrides: dict[str, bool] = {}
         self._global_enabled_dirty = False
         self._dirty_context_overrides: set[str] = set()
         self.runtime_state_repair: dict[str, Any] = {}
+        self._loaded_runtime_authority_binding: dict[str, Any] | None = None
         self.cortex_sessions: dict[str, dict[str, Any]] = {}
         self.registered_traces: list[dict[str, Any]] = []
         self._surface_recall_cache: dict[str, dict[str, Any]] = {}
@@ -509,7 +637,10 @@ class SpikingAttentionBackend:
         self.deep_sleep_count = 0
         self.last_maintenance: dict[str, Any] = {}
         self.consolidation_phase_history: list[dict[str, Any]] = []
-        self._load_runtime_state()
+        if self._core_preclaim_bootstrap:
+            self._load_runtime_state_observation_only()
+        else:
+            self._load_runtime_state()
         if not self.control_plane_only:
             self._refresh_registered_traces()
 
@@ -519,6 +650,22 @@ class SpikingAttentionBackend:
                 _MLXSNN_IMPORT_ERROR,
             )
         if require_native:
+            try:
+                provider_probe = self.embedding_provider.embed(
+                    "synapse-s2 authoritative provider readiness",
+                    dimensions=min(8, self.dimension),
+                )
+                if (
+                    len(provider_probe.vector) != min(8, self.dimension)
+                    or not all(math.isfinite(float(value)) for value in provider_probe.vector)
+                ):
+                    raise BackendUnavailable(
+                        "embedding provider readiness vector is invalid"
+                    )
+            except Exception as exc:
+                raise BackendUnavailable(
+                    "SYNAPSE-S2 embedding provider readiness failed"
+                ) from exc
             certification = self.certify_runtime(strict_native=True)
             if not certification["ready"]:
                 raise BackendUnavailable(
@@ -581,6 +728,290 @@ class SpikingAttentionBackend:
     def _load_runtime_state(self) -> None:
         with _exclusive_runtime_state_lock(self.state_path):
             self._load_runtime_state_locked()
+
+    def _load_runtime_state_observation_only(self) -> None:
+        """Load only an already-canonical state during core preclaim bootstrap.
+
+        A core authority lease is not yet a durable SQLite authority claim.  At
+        this point startup must remain rollback-free: it may observe a canonical
+        runtime document, but it may not create a lock file, quarantine or
+        rewrite state, or migrate retired embedded traces into SQLite.  Any
+        document that the local maintenance loader would repair is rejected so
+        an operator can repair it before retrying the authoritative service.
+        """
+
+        if self.state_path.is_symlink():
+            raise RuntimeError("runtime state path must not be a symlink")
+        if not self.state_path.exists():
+            return
+        try:
+            raw_state, observed, truncated = _read_bounded_regular_text(
+                self.state_path,
+                max_bytes=MAX_RUNTIME_STATE_BYTES,
+            )
+            if truncated:
+                raise ValueError("runtime state exceeds the supported size limit")
+            if (
+                observed.st_uid != os.getuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != 0o600
+            ):
+                raise ValueError("runtime state identity is not private")
+            payload = json.loads(raw_state)
+            if not isinstance(payload, dict):
+                raise ValueError("runtime state root must be an object")
+            self._apply_canonical_runtime_state(payload)
+            canonical = json.dumps(
+                payload,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            ) + "\n"
+            if raw_state != canonical:
+                raise ValueError("runtime state serialization is not canonical")
+            visible = self.state_path.lstat()
+            stable_fields = (
+                "st_dev",
+                "st_ino",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            if any(
+                int(getattr(observed, key)) != int(getattr(visible, key))
+                for key in stable_fields
+            ):
+                raise ValueError("runtime state changed during bootstrap")
+        except Exception as exc:
+            LOGGER.error(
+                "authoritative core refused noncanonical runtime state at %s: %s",
+                self.state_path,
+                safe_public_error(exc, fallback="invalid runtime state"),
+            )
+            raise RuntimeError(
+                "authoritative core requires canonical runtime state; "
+                "run local runtime-state repair before startup"
+            ) from None
+
+    def _apply_canonical_runtime_state(self, payload: dict[str, Any]) -> None:
+        base_keys = {
+            "version",
+            "global_enabled",
+            "context_overrides",
+            "cortex_sessions",
+            "runtime_state_repair",
+            "memory_db_path",
+            "updated_at",
+        }
+        version = payload.get("version")
+        expected_keys = (
+            base_keys if version == 2 else base_keys | {"authority_binding"}
+        )
+        authority_binding = self._validated_runtime_authority_binding(payload)
+        if (
+            set(payload) != expected_keys
+            or version not in {2, 3}
+            or (version == 3 and authority_binding is None)
+        ):
+            raise ValueError("runtime state schema is not canonical")
+        if type(payload.get("global_enabled")) is not bool:
+            raise ValueError("runtime global_enabled must be boolean")
+        raw_overrides = payload.get("context_overrides")
+        if not isinstance(raw_overrides, dict) or any(
+            type(value) is not bool for value in raw_overrides.values()
+        ):
+            raise ValueError("runtime context_overrides must be canonical")
+        normalized_overrides = self._normalize_persisted_context_overrides(
+            raw_overrides
+        )
+        if normalized_overrides != raw_overrides:
+            raise ValueError("runtime context_overrides require repair")
+        raw_sessions = payload.get("cortex_sessions")
+        if not isinstance(raw_sessions, dict):
+            raise ValueError("runtime cortex_sessions must be an object")
+        normalized_sessions = self._normalize_persisted_cortex_sessions(raw_sessions)
+        if normalized_sessions != raw_sessions:
+            raise ValueError("runtime cortex_sessions require repair")
+        raw_repair = payload.get("runtime_state_repair")
+        if not isinstance(raw_repair, dict):
+            raise ValueError("runtime_state_repair must be an object")
+        if self._json_safe_metadata(raw_repair) != raw_repair:
+            raise ValueError("runtime_state_repair requires repair")
+        if payload.get("memory_db_path") != str(self.memory_store.db_path):
+            raise ValueError("runtime memory_db_path does not match the active store")
+        updated_at = payload.get("updated_at")
+        if (
+            type(updated_at) not in {int, float}
+            or not math.isfinite(float(updated_at))
+            or float(updated_at) <= 0.0
+        ):
+            raise ValueError("runtime updated_at must be a positive finite number")
+
+        self.global_enabled = payload["global_enabled"]
+        self.context_overrides = normalized_overrides
+        self.cortex_sessions = normalized_sessions
+        self.runtime_state_repair = raw_repair
+        self._loaded_runtime_authority_binding = authority_binding
+
+    @staticmethod
+    def _validated_runtime_authority_binding(
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        version = payload.get("version")
+        if version == 2:
+            return None
+        binding = payload.get("authority_binding")
+        if (
+            version != 3
+            or not isinstance(binding, dict)
+            or set(binding)
+            != {
+                "schema",
+                "marker_sha256",
+                "authority_epoch_number",
+                "lock_generation_id",
+            }
+            or binding.get("schema") != RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA
+            or re.fullmatch(r"[0-9a-f]{64}", str(binding.get("marker_sha256") or ""))
+            is None
+            or type(binding.get("authority_epoch_number")) is not int
+            or int(binding["authority_epoch_number"]) <= 0
+            or CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(
+                str(binding.get("lock_generation_id") or "")
+            )
+            is None
+        ):
+            raise ValueError("runtime authority binding is invalid")
+        return dict(binding)
+
+    def _read_runtime_authority_binding_locked(self) -> dict[str, Any]:
+        if not self.state_path.exists() or self.state_path.is_symlink():
+            raise CoreAuthorityError("governed runtime state is unavailable")
+        raw_state, observed, truncated = _read_bounded_regular_text(
+            self.state_path,
+            max_bytes=MAX_RUNTIME_STATE_BYTES,
+        )
+        if (
+            truncated
+            or observed.st_uid != os.getuid()
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            raise CoreAuthorityError("governed runtime state is invalid")
+        try:
+            payload = json.loads(raw_state)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CoreAuthorityError("governed runtime state is invalid") from exc
+        if not isinstance(payload, dict):
+            raise CoreAuthorityError("governed runtime state is invalid")
+        try:
+            binding = self._validated_runtime_authority_binding(payload)
+        except ValueError as exc:
+            raise CoreAuthorityError("governed runtime state is invalid") from exc
+        if binding is None or payload.get("memory_db_path") != str(
+            self.memory_store.db_path
+        ):
+            raise CoreAuthorityError("governed runtime state is invalid")
+        canonical = json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ) + "\n"
+        if raw_state != canonical:
+            raise CoreAuthorityError("governed runtime state is invalid")
+        return binding
+
+    def assert_runtime_state_authority_marker(
+        self,
+        marker: dict[str, Any],
+    ) -> None:
+        """Require the runtime file to match the exact preceding v6 epoch."""
+
+        expected = self.memory_store.runtime_state_authority_binding_for_marker(
+            dict(marker)
+        )
+        with _exclusive_runtime_state_lock(self.state_path):
+            observed = self._read_runtime_authority_binding_locked()
+        if observed != expected:
+            raise CoreAuthorityError(
+                "runtime state does not match the durable authority marker"
+            )
+
+    def recover_interrupted_runtime_state_authority_publication(
+        self,
+        *,
+        marker: dict[str, Any],
+        publication: dict[str, Any],
+        expected_config_fingerprint: str,
+        expected_build_id: str,
+        expected_protocol_version: str,
+        expected_root_generation_id: str,
+        expected_embedding_space_identity: str,
+    ) -> None:
+        """Finish only the exact pending publication committed with a claim."""
+
+        def authorize() -> dict[str, Any]:
+            return self.memory_store.interrupted_runtime_publication_binding(
+                marker=marker,
+                publication=publication,
+                runtime_state_path=self.state_path,
+                expected_config_fingerprint=expected_config_fingerprint,
+                expected_build_id=expected_build_id,
+                expected_protocol_version=expected_protocol_version,
+                expected_root_generation_id=expected_root_generation_id,
+                expected_embedding_space_identity=(
+                    expected_embedding_space_identity
+                ),
+            )
+
+        with _exclusive_runtime_state_lock(self.state_path):
+            expected = authorize()
+
+            def assert_authorized() -> None:
+                if authorize() != expected:
+                    raise CoreAuthorityError(
+                        "interrupted runtime publication authority changed"
+                    )
+
+            payload = {
+                "version": 3,
+                "global_enabled": bool(self.global_enabled),
+                "context_overrides": dict(self.context_overrides),
+                "cortex_sessions": dict(self.cortex_sessions),
+                "runtime_state_repair": self._json_safe_metadata(
+                    self.runtime_state_repair
+                ),
+                "memory_db_path": str(self.memory_store.db_path),
+                "updated_at": time.time(),
+                "authority_binding": expected,
+            }
+            _atomic_write_private_json(
+                self.state_path,
+                payload,
+                before_replace=assert_authorized,
+                after_replace=assert_authorized,
+            )
+            observed = self._read_runtime_authority_binding_locked()
+            if observed != expected:
+                raise CoreAuthorityError(
+                    "interrupted runtime publication did not persist exactly"
+                )
+            self._loaded_runtime_authority_binding = dict(expected)
+
+    def publish_runtime_state_authority_binding(self) -> None:
+        """Durably stamp runtime state with this process's exact claimed epoch."""
+
+        expected = self.memory_store.runtime_state_authority_binding()
+        if expected is None:
+            raise CoreAuthorityError("runtime state authority is unavailable")
+        self._persist_runtime_state()
+        with _exclusive_runtime_state_lock(self.state_path):
+            observed = self._read_runtime_authority_binding_locked()
+        if observed != expected:
+            raise CoreAuthorityError(
+                "runtime state authority publication did not persist exactly"
+            )
 
     def _load_runtime_state_locked(self) -> None:
         if self.state_path.is_symlink():
@@ -774,6 +1205,8 @@ class SpikingAttentionBackend:
             raise
 
     def _persist_runtime_state_locked(self, *, merge_existing: bool) -> None:
+        self.memory_store.assert_active_authority()
+        authority_binding = self.memory_store.runtime_state_authority_binding()
         existing_payload: dict[str, Any] = {}
         if self.state_path.is_symlink():
             raise RuntimeError("runtime state path must not be a symlink")
@@ -828,7 +1261,7 @@ class SpikingAttentionBackend:
             merged_repair = self._json_safe_metadata(self.runtime_state_repair)
 
         payload = {
-            "version": 2,
+            "version": 3 if authority_binding is not None else 2,
             "global_enabled": merged_global_enabled,
             "context_overrides": merged_overrides,
             "cortex_sessions": merged_sessions,
@@ -836,11 +1269,21 @@ class SpikingAttentionBackend:
             "memory_db_path": str(self.memory_store.db_path),
             "updated_at": time.time(),
         }
-        _atomic_write_private_json(self.state_path, payload)
+        if authority_binding is not None:
+            payload["authority_binding"] = authority_binding
+        _atomic_write_private_json(
+            self.state_path,
+            payload,
+            before_replace=self.memory_store.assert_active_authority,
+            after_replace=self.memory_store.assert_active_authority,
+        )
         self.global_enabled = merged_global_enabled
         self.context_overrides = merged_overrides
         self.cortex_sessions = merged_sessions
         self.runtime_state_repair = merged_repair
+        self._loaded_runtime_authority_binding = (
+            None if authority_binding is None else dict(authority_binding)
+        )
         self._global_enabled_dirty = False
         self._dirty_context_overrides.clear()
 
@@ -1211,29 +1654,70 @@ class SpikingAttentionBackend:
         indices = native_mx.arange(length)
         return native_mx.where(indices < exc_count, 1.0, -1.0)
 
+    def _embedding_dimension_before_materialization(self, embedding: Any) -> int:
+        shape = getattr(embedding, "shape", None)
+        if shape is not None:
+            try:
+                if len(shape) != 1:
+                    raise ValueError(
+                        "prompt_embedding must be a one-dimensional coordinate list"
+                    )
+                embedding_size = int(shape[0])
+            except (IndexError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "prompt_embedding must be a one-dimensional coordinate list"
+                ) from exc
+        else:
+            try:
+                embedding_size = len(embedding)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "prompt_embedding must be a one-dimensional coordinate list"
+                ) from exc
+        if embedding_size <= 0:
+            raise ValueError("prompt_embedding must not be empty")
+        if embedding_size > MAX_EMBEDDING_DIMS:
+            raise ValueError(
+                f"prompt_embedding exceeds {MAX_EMBEDDING_DIMS} dimensions"
+            )
+        _require_neural_resource_envelope(
+            dimension=int(embedding_size),
+            num_neurons=self.num_neurons,
+        )
+        return int(embedding_size)
+
     def _coerce_embedding(self, embedding: Any):
+        expected_size = self._embedding_dimension_before_materialization(embedding)
         native_mx = self._mx
         arr = native_mx.array(embedding, dtype=native_mx.float32)
         if len(arr.shape) != 1:
             raise ValueError("prompt_embedding must be a one-dimensional coordinate list")
-        if arr.shape[0] == 0:
-            raise ValueError("prompt_embedding must not be empty")
-        if arr.shape[0] > MAX_EMBEDDING_DIMS:
-            raise ValueError(f"prompt_embedding exceeds {MAX_EMBEDDING_DIMS} dimensions")
+        if int(arr.shape[0]) != expected_size:
+            raise ValueError("prompt_embedding shape changed during materialization")
+        _require_neural_resource_envelope(
+            dimension=int(arr.shape[0]),
+            num_neurons=self.num_neurons,
+        )
         finite_mask = native_mx.isfinite(arr)
         if int(native_mx.sum(finite_mask).item()) != int(arr.shape[0]):
             raise ValueError("prompt_embedding must contain only finite float values")
         return arr
 
     def _ensure_projection_shape(self, embedding_size: int) -> None:
-        if int(embedding_size) == self.dimension:
+        resolved_embedding_size = int(embedding_size)
+        _require_neural_resource_envelope(
+            dimension=resolved_embedding_size,
+            num_neurons=self.num_neurons,
+        )
+        if resolved_embedding_size == self.dimension:
             return
-        self.dimension = int(embedding_size)
-        self.W_syn = self._balanced_matrix(
-            (self.dimension, self.num_neurons),
+        resized_projection = self._balanced_matrix(
+            (resolved_embedding_size, self.num_neurons),
             scale=0.01,
             excitatory_ratio=0.8,
         )
+        self.W_syn = resized_projection
+        self.dimension = resolved_embedding_size
         self.W_syn_decay_multiplier = 1.0
         LOGGER.info("resized sensory projection to %s dimensions", self.dimension)
 
@@ -2163,6 +2647,109 @@ class SpikingAttentionBackend:
             "consolidation_phase_names": list(CONSOLIDATION_PHASES),
         }
 
+    def audit_semantic_indexes(
+        self,
+        *,
+        context_id: str | None = None,
+        sample_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return the public semantic-index integrity report."""
+        context = (
+            sanitize_context_id(context_id)
+            if context_id is not None
+            else None
+        )
+        return self.memory_store.audit_semantic_indexes(
+            context_id=context,
+            sample_limit=sample_limit,
+        )
+
+    def repair_semantic_indexes(
+        self,
+        *,
+        context_id: str | None = None,
+        confirm: bool = False,
+        expected_revision: str | None = None,
+        sample_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Repair reviewed semantic-index drift through the authoritative lane."""
+        context = (
+            sanitize_context_id(context_id)
+            if context_id is not None
+            else None
+        )
+        return self.memory_store.repair_semantic_indexes(
+            context_id=context,
+            confirm=confirm,
+            expected_revision=expected_revision,
+            sample_limit=sample_limit,
+        )
+
+    def resolve_recall_contexts(
+        self,
+        *,
+        context_id: str = "default",
+        recall_scope: str = "local",
+    ) -> list[dict[str, Any]]:
+        """Resolve the backend's bounded recall scope with provenance."""
+        context = sanitize_context_id(context_id)
+        scope = sanitize_recall_scope(recall_scope)
+        return self.memory_store.resolve_recall_contexts(
+            context_id=context,
+            scope=scope,
+        )
+
+    def memory_entries_revision(
+        self,
+        *,
+        context_id: str | None = None,
+        include_global: bool = False,
+        context_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return the public cache identity for a bounded entry selection."""
+        context = (
+            sanitize_context_id(context_id)
+            if context_id is not None
+            else None
+        )
+        clean_context_ids = None
+        if context_ids is not None:
+            if isinstance(context_ids, (str, bytes)):
+                raise ValueError("context_ids must be an iterable of identifiers")
+            clean_context_ids = list(
+                dict.fromkeys(
+                    sanitize_context_id(str(value))
+                    for value in context_ids
+                    if str(value).strip()
+                )
+            )
+        return self.memory_store.entries_revision(
+            context_id=context,
+            include_global=bool(include_global),
+            context_ids=clean_context_ids,
+        )
+
+    def get_memory_entry(
+        self,
+        memory_id: str,
+        *,
+        include_vectors: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return one durable memory through the backend's safe renderer."""
+        clean_memory_id = reject_sensitive_identifier(
+            memory_id,
+            field="memory_id",
+        ).strip()
+        if not clean_memory_id:
+            raise ValueError("memory_id is required")
+        entry = self.memory_store.get_entry(clean_memory_id)
+        if entry is None:
+            return None
+        return self._render_memory_entry(
+            entry,
+            include_vectors=bool(include_vectors),
+        )
+
     def list_memory(
         self,
         *,
@@ -2592,6 +3179,122 @@ class SpikingAttentionBackend:
             "agent_deployment": deployment,
         }
 
+    def attach_client_cortex_session(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        session_id: str,
+        client_bridge_session_id: str,
+        owner_pid: int,
+        owner_ppid: int = 0,
+        owner_started_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Attach explicit process ownership to an active MCP Cortex session."""
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        clean_session_id = reject_sensitive_identifier(
+            session_id,
+            field="cortex session_id",
+        ).strip()
+        clean_bridge_session_id = reject_sensitive_identifier(
+            client_bridge_session_id,
+            field="client bridge session_id",
+        ).strip()
+        if not clean_bridge_session_id:
+            raise ValueError("client_bridge_session_id is required")
+        clean_owner_pid = int(owner_pid)
+        clean_owner_ppid = int(owner_ppid)
+        if clean_owner_pid <= 0:
+            raise ValueError("owner_pid must be positive")
+        if clean_owner_ppid < 0:
+            raise ValueError("owner_ppid must be non-negative")
+        started_at = (
+            time.time()
+            if owner_started_at is None
+            else float(owner_started_at)
+        )
+        if not math.isfinite(started_at) or started_at <= 0.0:
+            raise ValueError("owner_started_at must be a positive finite timestamp")
+
+        session = self._active_cortex_session(
+            context=context,
+            agent_id=agent,
+            session_id=clean_session_id,
+        )
+        session.update(
+            {
+                "client_bridge_session_id": clean_bridge_session_id,
+                "lease_kind": "mcp-client",
+                "owner_pid": clean_owner_pid,
+                "owner_ppid": clean_owner_ppid,
+                "owner_started_at": started_at,
+                "updated_at": time.time(),
+            }
+        )
+        self.cortex_sessions[clean_session_id] = self._normalize_cortex_session(
+            session
+        )
+        self._persist_runtime_state()
+        return dict(self.cortex_sessions[clean_session_id])
+
+    def finish_client_cortex_session(
+        self,
+        *,
+        context_id: str = "default",
+        agent_id: str = "mcp-client",
+        session_id: str,
+        client_bridge_session_id: str,
+        reason: str = "client-session-finish",
+        finished_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Mark an MCP-owned Cortex session finished without publishing twice."""
+        context = sanitize_context_id(context_id)
+        agent = sanitize_agent_id(agent_id)
+        clean_session_id = reject_sensitive_identifier(
+            session_id,
+            field="cortex session_id",
+        ).strip()
+        if not clean_session_id:
+            raise ValueError("session_id is required")
+        session = self.cortex_sessions.get(clean_session_id)
+        if not isinstance(session, dict):
+            raise ValueError(f"cortex session not found: {clean_session_id}")
+        if session.get("context_id") != context:
+            raise ValueError("cortex session context mismatch")
+        if session.get("agent_id") != agent:
+            raise ValueError("cortex session agent mismatch")
+        clean_bridge_session_id = reject_sensitive_identifier(
+            client_bridge_session_id,
+            field="client bridge session_id",
+        ).strip()
+        if not clean_bridge_session_id:
+            raise ValueError("client_bridge_session_id is required")
+        if session.get("lease_kind") != "mcp-client":
+            raise ValueError("cortex session is not owned by an MCP client")
+        if session.get("client_bridge_session_id") != clean_bridge_session_id:
+            raise ValueError("cortex session client bridge mismatch")
+        clean_reason, _ = redact_capture_text(
+            str(reason or "client-session-finish").strip()
+        )
+        ended_at = time.time() if finished_at is None else float(finished_at)
+        if not math.isfinite(ended_at) or ended_at <= 0.0:
+            raise ValueError("finished_at must be a positive finite timestamp")
+        finished_session = dict(session)
+        finished_session.update(
+            {
+                "status": "finished",
+                "finished_at": ended_at,
+                "finish_reason": clean_reason[:240] or "client-session-finish",
+                "updated_at": ended_at,
+            }
+        )
+        self.cortex_sessions[clean_session_id] = self._normalize_cortex_session(
+            finished_session
+        )
+        self._persist_runtime_state()
+        return dict(self.cortex_sessions[clean_session_id])
+
     def cortex_tick(
         self,
         *,
@@ -2893,7 +3596,6 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         context = sanitize_context_id(context_id)
         agent = sanitize_agent_id(agent_id) if agent_id else ""
-        self._reap_orphaned_cortex_sessions(context_id=context, agent_id=agent)
         visible_limit = max(1, min(int(limit), 500))
         scan_limit = max(100, visible_limit * 5)
         scan_limit = min(scan_limit, 500)
@@ -2999,6 +3701,29 @@ class SpikingAttentionBackend:
                 str(active_sessions[0].get("mode", "strict")) if active_sessions else "strict"
             ),
             "memory_db_path": str(self.memory_store.db_path),
+        }
+
+    def reap_orphaned_cortex_sessions(
+        self,
+        *,
+        context_id: str = "",
+        agent_id: str = "",
+    ) -> dict[str, Any]:
+        """Persist orphaned client-session transitions as explicit maintenance."""
+
+        context = sanitize_context_id(context_id) if context_id else ""
+        agent = sanitize_agent_id(agent_id) if agent_id else ""
+        session_ids = self._reap_orphaned_cortex_sessions(
+            context_id=context,
+            agent_id=agent,
+        )
+        return {
+            "action": "reap-orphaned-cortex-sessions",
+            "context_id": context,
+            "agent_id": agent,
+            "reaped_count": len(session_ids),
+            "session_ids": session_ids,
+            "mutation_performed": bool(session_ids),
         }
 
     def create_goal(
@@ -3272,6 +3997,7 @@ class SpikingAttentionBackend:
                 reason=clean_reason,
                 source_surface=clean_source_surface,
                 publish_audit=True,
+                confirm=True,
             )
             return {
                 "action": "moderate-cortex-trace",
@@ -3483,9 +4209,10 @@ class SpikingAttentionBackend:
         *,
         context_id: str = "",
         agent_id: str = "",
-    ) -> None:
+    ) -> list[str]:
         now = time.time()
         changed = False
+        reaped_session_ids: list[str] = []
         for session_id, session in list(self.cortex_sessions.items()):
             if session.get("status") != "active":
                 continue
@@ -3510,8 +4237,10 @@ class SpikingAttentionBackend:
             )
             self.cortex_sessions[session_id] = self._normalize_cortex_session(orphaned)
             changed = True
+            reaped_session_ids.append(str(session_id))
         if changed:
             self._persist_runtime_state()
+        return sorted(reaped_session_ids)
 
     @staticmethod
     def _process_is_alive(pid: int) -> bool:
@@ -5914,7 +6643,10 @@ class SpikingAttentionBackend:
         reason: str = "",
         source_surface: str = "operator",
         publish_audit: bool = True,
+        confirm: bool,
     ) -> dict[str, Any]:
+        if confirm is not True:
+            raise ValueError("confirm must be true before pruning memory graph data")
         context = sanitize_context_id(context_id)
         clean_reason, _ = redact_capture_text(str(reason or ""))
         clean_source_surface = reject_sensitive_identifier(
@@ -7226,7 +7958,7 @@ class SpikingAttentionBackend:
             if benchmark_quick_prune
             else None
         )
-        return {
+        profile = {
             "dimension": int(self.dimension),
             "num_neurons": int(self.num_neurons),
             "default_top_k": int(self.default_top_k),
@@ -7241,10 +7973,12 @@ class SpikingAttentionBackend:
                 float(target_min_mb) <= estimated_total_mb <= float(target_max_mb)
             ),
             "arrays": arrays,
-            "quick_pruning": quick_profile,
             "mlx_device": os.getenv("MLX_DEVICE", "default"),
             "mlxsnn_lif_execution_path": self._mlxsnn_lif_layer is not None,
         }
+        if quick_profile is not None:
+            profile["quick_pruning"] = quick_profile
+        return profile
 
     def certify_runtime(
         self,
@@ -7531,6 +8265,8 @@ class SpikingAttentionBackend:
         capture_root: str | os.PathLike[str] | None = None,
         expected_database_sha256: str | None = None,
         expected_capture_sha256: str | None = None,
+        expected_request_journal_sha256: str | None = None,
+        expected_runtime_state_sha256: str | None = None,
     ) -> dict[str, Any]:
         from recovery_manager import VerifiedRecoveryManager
 
@@ -7541,6 +8277,8 @@ class SpikingAttentionBackend:
             receipt_path,
             expected_database_sha256=expected_database_sha256,
             expected_capture_sha256=expected_capture_sha256,
+            expected_request_journal_sha256=expected_request_journal_sha256,
+            expected_runtime_state_sha256=expected_runtime_state_sha256,
         )
 
     def restore_recovery_bundle_isolated(
@@ -7551,6 +8289,8 @@ class SpikingAttentionBackend:
         capture_root: str | os.PathLike[str] | None = None,
         expected_database_sha256: str | None = None,
         expected_capture_sha256: str | None = None,
+        expected_request_journal_sha256: str | None = None,
+        expected_runtime_state_sha256: str | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
         from recovery_manager import VerifiedRecoveryManager
@@ -7563,6 +8303,8 @@ class SpikingAttentionBackend:
             output_root,
             expected_database_sha256=expected_database_sha256,
             expected_capture_sha256=expected_capture_sha256,
+            expected_request_journal_sha256=expected_request_journal_sha256,
+            expected_runtime_state_sha256=expected_runtime_state_sha256,
             confirm=confirm,
         )
 
@@ -7945,21 +8687,23 @@ class SpikingAttentionBackend:
         return [idx for idx, _ in scored[:limit]]
 
 
-_ENGINE_INSTANCE: SpikingAttentionBackend | None = None
-_CONTROL_PLANE_INSTANCE: SpikingAttentionBackend | None = None
+_ENGINE_INSTANCE: Any | None = None
+_CONTROL_PLANE_INSTANCE: Any | None = None
 _ENGINE_INSTANCE_LOCK = threading.RLock()
 
 
-def get_backend() -> SpikingAttentionBackend:
-    global _ENGINE_INSTANCE
+def get_backend() -> Any:
+    global _CONTROL_PLANE_INSTANCE, _ENGINE_INSTANCE
     if _ENGINE_INSTANCE is None:
         with _ENGINE_INSTANCE_LOCK:
             if _ENGINE_INSTANCE is None:
                 _ENGINE_INSTANCE = _build_environment_backend(control_plane_only=False)
+                if _is_authoritative_core_client(_ENGINE_INSTANCE):
+                    _CONTROL_PLANE_INSTANCE = _ENGINE_INSTANCE
     return _ENGINE_INSTANCE
 
 
-def get_control_plane_backend() -> SpikingAttentionBackend:
+def get_control_plane_backend() -> Any:
     """Return the lightweight durable control plane without neural matrices.
 
     Short-lived MCP discovery/status clients use this lane so protocol
@@ -7967,36 +8711,35 @@ def get_control_plane_backend() -> SpikingAttentionBackend:
     using :func:`get_backend` and therefore retain the full runtime contract.
     """
 
-    global _CONTROL_PLANE_INSTANCE
+    global _CONTROL_PLANE_INSTANCE, _ENGINE_INSTANCE
     if _CONTROL_PLANE_INSTANCE is None:
         with _ENGINE_INSTANCE_LOCK:
             if _CONTROL_PLANE_INSTANCE is None:
-                _CONTROL_PLANE_INSTANCE = _build_environment_backend(
-                    control_plane_only=True
-                )
+                if _is_authoritative_core_client(_ENGINE_INSTANCE):
+                    _CONTROL_PLANE_INSTANCE = _ENGINE_INSTANCE
+                else:
+                    _CONTROL_PLANE_INSTANCE = _build_environment_backend(
+                        control_plane_only=True
+                    )
+                    if _is_authoritative_core_client(_CONTROL_PLANE_INSTANCE):
+                        _ENGINE_INSTANCE = _CONTROL_PLANE_INSTANCE
     return _CONTROL_PLANE_INSTANCE
 
 
-def _build_environment_backend(*, control_plane_only: bool) -> SpikingAttentionBackend:
-    return SpikingAttentionBackend(
-        dimension=int(os.getenv("SYNAPSE_S2_DIMENSION", "1024")),
-        num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", str(DEFAULT_NUM_NEURONS))),
-        default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "256")),
-        recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "10")),
-        quick_pruning_interval_seconds=float(
-            os.getenv("SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS", "300")
-        ),
-        idle_deep_sleep_seconds=float(
-            os.getenv("SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS", "1800")
-        ),
-        embedding_provider_name=os.getenv("SYNAPSE_S2_EMBEDDING_PROVIDER", "auto"),
-        require_native=(
-            not control_plane_only
-            and os.getenv("SYNAPSE_S2_REQUIRE_NATIVE", "").lower()
-            in {"1", "true", "yes", "on"}
-        ),
-        control_plane_only=control_plane_only,
-    )
+def _is_authoritative_core_client(value: Any) -> bool:
+    if value is None:
+        return False
+    from core_client import CoreClient
+
+    return isinstance(value, CoreClient)
+
+
+def _build_environment_backend(*, control_plane_only: bool) -> Any:
+    # Import lazily so the explicit backend class remains usable by tests,
+    # recovery candidates, and the authoritative core without a cycle.
+    from backend_router import build_environment_backend
+
+    return build_environment_backend(control_plane_only=control_plane_only)
 
 
 def simulate_spiking_retrieval(
@@ -8432,6 +9175,7 @@ def prune_memory(
     reason: str = "",
     source_surface: str = "operator",
     publish_audit: bool = True,
+    confirm: bool,
 ) -> dict[str, Any]:
     return get_backend().prune_memory(
         context_id=context_id,
@@ -8443,6 +9187,7 @@ def prune_memory(
         reason=reason,
         source_surface=source_surface,
         publish_audit=publish_audit,
+        confirm=confirm,
     )
 
 
@@ -8591,7 +9336,18 @@ def backup_recovery_bundle(
     pinned: bool = False,
     allow_noncanonical_capture_root: bool = False,
 ) -> dict[str, Any]:
-    return get_backend().backup_recovery_bundle(
+    backend = get_backend()
+    if _is_authoritative_core_client(backend):
+        if capture_root is not None or allow_noncanonical_capture_root:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.backup_recovery_bundle(
+            path=path,
+            purpose=purpose,
+            pinned=pinned,
+        )
+    return backend.backup_recovery_bundle(
         path=path,
         capture_root=capture_root,
         purpose=purpose,
@@ -8605,7 +9361,14 @@ def audit_capture_ledger(
     capture_root: str | os.PathLike[str] | None = None,
     sample_limit: int = 20,
 ) -> dict[str, Any]:
-    return get_control_plane_backend().audit_capture_ledger(
+    backend = get_control_plane_backend()
+    if _is_authoritative_core_client(backend):
+        if capture_root is not None:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.audit_capture_ledger(sample_limit=sample_limit)
+    return backend.audit_capture_ledger(
         capture_root=capture_root,
         sample_limit=sample_limit,
     )
@@ -8618,7 +9381,18 @@ def repair_capture_ledger(
     expected_revision: str | None = None,
     sample_limit: int = 20,
 ) -> dict[str, Any]:
-    return get_control_plane_backend().repair_capture_ledger(
+    backend = get_control_plane_backend()
+    if _is_authoritative_core_client(backend):
+        if capture_root is not None:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.repair_capture_ledger(
+            confirm=confirm,
+            expected_revision=expected_revision,
+            sample_limit=sample_limit,
+        )
+    return backend.repair_capture_ledger(
         capture_root=capture_root,
         confirm=confirm,
         expected_revision=expected_revision,
@@ -8632,12 +9406,29 @@ def verify_recovery_bundle(
     capture_root: str | os.PathLike[str] | None = None,
     expected_database_sha256: str | None = None,
     expected_capture_sha256: str | None = None,
+    expected_request_journal_sha256: str | None = None,
+    expected_runtime_state_sha256: str | None = None,
 ) -> dict[str, Any]:
-    return get_backend().verify_recovery_bundle(
+    backend = get_backend()
+    if _is_authoritative_core_client(backend):
+        if capture_root is not None:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.verify_recovery_bundle(
+            receipt_path,
+            expected_database_sha256=expected_database_sha256,
+            expected_capture_sha256=expected_capture_sha256,
+            expected_request_journal_sha256=expected_request_journal_sha256,
+            expected_runtime_state_sha256=expected_runtime_state_sha256,
+        )
+    return backend.verify_recovery_bundle(
         receipt_path,
         capture_root=capture_root,
         expected_database_sha256=expected_database_sha256,
         expected_capture_sha256=expected_capture_sha256,
+        expected_request_journal_sha256=expected_request_journal_sha256,
+        expected_runtime_state_sha256=expected_runtime_state_sha256,
     )
 
 
@@ -8648,14 +9439,33 @@ def restore_recovery_bundle_isolated(
     capture_root: str | os.PathLike[str] | None = None,
     expected_database_sha256: str | None = None,
     expected_capture_sha256: str | None = None,
+    expected_request_journal_sha256: str | None = None,
+    expected_runtime_state_sha256: str | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    return get_backend().restore_recovery_bundle_isolated(
+    backend = get_backend()
+    if _is_authoritative_core_client(backend):
+        if capture_root is not None:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.restore_recovery_bundle_isolated(
+            receipt_path,
+            output_root,
+            expected_database_sha256=expected_database_sha256,
+            expected_capture_sha256=expected_capture_sha256,
+            expected_request_journal_sha256=expected_request_journal_sha256,
+            expected_runtime_state_sha256=expected_runtime_state_sha256,
+            confirm=confirm,
+        )
+    return backend.restore_recovery_bundle_isolated(
         receipt_path,
         output_root,
         capture_root=capture_root,
         expected_database_sha256=expected_database_sha256,
         expected_capture_sha256=expected_capture_sha256,
+        expected_request_journal_sha256=expected_request_journal_sha256,
+        expected_runtime_state_sha256=expected_runtime_state_sha256,
         confirm=confirm,
     )
 
@@ -8666,7 +9476,17 @@ def plan_recovery_retention(
     keep_latest: int = 7,
     max_age_days: float = 30.0,
 ) -> dict[str, Any]:
-    return get_backend().plan_recovery_retention(
+    backend = get_backend()
+    if _is_authoritative_core_client(backend):
+        if directory is not None:
+            raise ValueError(
+                "retention directory overrides are unavailable on the authoritative core lane"
+            )
+        return backend.plan_recovery_retention(
+            keep_latest=keep_latest,
+            max_age_days=max_age_days,
+        )
+    return backend.plan_recovery_retention(
         directory=directory,
         keep_latest=keep_latest,
         max_age_days=max_age_days,
@@ -8682,7 +9502,20 @@ def apply_recovery_retention(
     max_age_days: float = 30.0,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    return get_backend().apply_recovery_retention(
+    backend = get_backend()
+    if _is_authoritative_core_client(backend):
+        if directory is not None:
+            raise ValueError(
+                "retention directory overrides are unavailable on the authoritative core lane"
+            )
+        return backend.apply_recovery_retention(
+            plan_token=plan_token,
+            cutoff_created_at=cutoff_created_at,
+            keep_latest=keep_latest,
+            max_age_days=max_age_days,
+            confirm=confirm,
+        )
+    return backend.apply_recovery_retention(
         plan_token=plan_token,
         cutoff_created_at=cutoff_created_at,
         directory=directory,

@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from core_client import CoreClient, CoreOutcomeUnknown, outcome_unknown_projection
 from redaction import reject_sensitive_identifier, safe_public_error
 from token_contracts import (
     COMPACT_SOURCE_LIMITS,
@@ -31,6 +32,12 @@ _CONTRACT_COMMAND_SURFACES = {
     "cortex-state": "cortex-state",
 }
 try:
+    # A reviewed binding must be loaded, canonicalized, and matched to its
+    # private CoreConfig before any backend module can observe MLX/provider
+    # environment. Legacy no-binding v5 invocations remain unchanged.
+    from core_client_binding import apply_binding_environment
+
+    apply_binding_environment()
     from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
     import mlx_backend
     from mlx_backend import (
@@ -39,7 +46,6 @@ try:
         DEFAULT_RESOURCE_TARGET_MIN_MB,
     )
     from transcript_capture import TranscriptCaptureManager
-    from memory_store import DurableMemoryStore
 except Exception as startup_exc:  # pragma: no cover - dependency/environment specific
     _STARTUP_IMPORT_ERROR = startup_exc
 
@@ -62,6 +68,27 @@ class SafeArgumentParser(argparse.ArgumentParser):
             usage=self.format_usage(),
             message=safe_public_error(message, fallback="invalid command arguments"),
         )
+
+    def parse_known_args(self, args=None, namespace=None):  # type: ignore[override]
+        parsed, extras = super().parse_known_args(args, namespace)
+        raw = list(sys.argv[1:] if args is None else args)
+        explicit = set(getattr(parsed, "_explicit_local_config_fields", ()))
+        option_fields = {
+            "--dimension": "dimension",
+            "--neurons": "neurons",
+            "--top-k": "top_k",
+            "--recall-count": "recall_count",
+            "--quick-pruning-interval": "quick_pruning_interval",
+            "--idle-deep-sleep-seconds": "idle_deep_sleep_seconds",
+            "--embedding-provider": "embedding_provider",
+            "--require-native-backend": "require_native_backend",
+        }
+        for token in raw:
+            for option, field in option_fields.items():
+                if token == option or token.startswith(option + "="):
+                    explicit.add(field)
+        parsed._explicit_local_config_fields = frozenset(explicit)
+        return parsed, extras
 
 
 def _json_default(value: Any) -> str:
@@ -206,7 +233,86 @@ def _optional_public_output_path(value: Any, *, field: str) -> str | None:
     return raw
 
 
-def build_backend(args: argparse.Namespace) -> mlx_backend.SpikingAttentionBackend:
+def build_backend(args: argparse.Namespace) -> Any:
+    from backend_router import BackendRoutingError, core_client_if_required
+
+    local_config = {
+        "dimension": args.dimension,
+        "num_neurons": args.neurons,
+        "default_top_k": args.top_k,
+        "recall_count": args.recall_count,
+        "quick_pruning_interval_seconds": args.quick_pruning_interval,
+        "idle_deep_sleep_seconds": args.idle_deep_sleep_seconds,
+        "compile_graph": not args.no_compile,
+        "embedding_provider_name": args.embedding_provider,
+        "require_native": args.require_native_backend,
+    }
+    client = core_client_if_required(
+        memory_path=args.memory_db,
+        state_path=args.state,
+        capture_root=getattr(args, "capture_root", None),
+        local_config=local_config,
+        local_defaults={
+            "dimension": 1024,
+            "num_neurons": DEFAULT_NUM_NEURONS,
+            "default_top_k": 256,
+            "recall_count": 10,
+            "quick_pruning_interval_seconds": 300.0,
+            "idle_deep_sleep_seconds": 1800.0,
+            "compile_graph": True,
+            "embedding_provider_name": None,
+            "require_native": False,
+        },
+    )
+    if client is not None:
+        return client
+    from core_client_binding import binding_from_environment, load_bound_core_config
+
+    binding = binding_from_environment()
+    if binding is not None:
+        if binding.authority_mode != "candidate-local-v5":
+            raise BackendRoutingError(
+                "authoritative binding did not resolve to the core service"
+            )
+        config = load_bound_core_config(binding)
+        expected = {
+            "dimension": config.dimension,
+            "neurons": config.num_neurons,
+            "top_k": config.default_top_k,
+            "recall_count": config.recall_count,
+            "quick_pruning_interval": config.quick_pruning_interval_seconds,
+            "idle_deep_sleep_seconds": config.idle_deep_sleep_seconds,
+            "embedding_provider": config.embedding_provider_name,
+            "require_native_backend": config.require_native,
+        }
+        explicit_fields = getattr(args, "_explicit_local_config_fields", None)
+        if explicit_fields is None:
+            # Programmatic callers that did not use this parser receive the
+            # strict treatment: every supplied field is an explicit assertion.
+            explicit_fields = frozenset(expected)
+        conflicts = sorted(
+            field
+            for field in explicit_fields
+            if field in expected and getattr(args, field) != expected[field]
+        )
+        if conflicts:
+            raise BackendRoutingError(
+                "explicit local backend configuration conflicts with the reviewed "
+                "candidate binding: " + ", ".join(conflicts)
+            )
+        return mlx_backend.SpikingAttentionBackend(
+            dimension=config.dimension,
+            num_neurons=config.num_neurons,
+            default_top_k=config.default_top_k,
+            recall_count=config.recall_count,
+            quick_pruning_interval_seconds=config.quick_pruning_interval_seconds,
+            idle_deep_sleep_seconds=config.idle_deep_sleep_seconds,
+            compile_graph=not args.no_compile,
+            state_path=config.state_path,
+            memory_path=config.memory_path,
+            embedding_provider_name=config.embedding_provider_name,
+            require_native=config.require_native,
+        )
     return mlx_backend.SpikingAttentionBackend(
         dimension=args.dimension,
         num_neurons=args.neurons,
@@ -233,6 +339,14 @@ def dependency_status(module: str) -> dict[str, Any]:
 def command_status(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.status(context_id=args.context)
+
+
+def command_request_status(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    request_status = getattr(backend, "request_status", None)
+    if not callable(request_status):
+        raise RuntimeError("authoritative request status unavailable")
+    return request_status(caller=args.caller, request_id=args.request_id)
 
 
 def command_enable(args: argparse.Namespace) -> dict[str, Any]:
@@ -390,10 +504,12 @@ def command_prune_memory(args: argparse.Namespace) -> dict[str, Any]:
         event_id=args.event_id,
         reason=args.reason,
         source_surface="cli",
+        confirm=True,
     )
 
 
 def command_capture_inbox_drop(args: argparse.Namespace) -> dict[str, Any]:
+    _validate_client_layout(args)
     text = _text_from_args(args).strip()
     if not text:
         raise ValueError("--text or --text-file must provide content")
@@ -423,9 +539,23 @@ def _capture_daemon_from_args(
     *,
     require_backend: bool = True,
 ) -> CaptureInboxDaemon:
+    if not require_backend:
+        _validate_client_layout(args)
     return CaptureInboxDaemon(
         root=args.capture_root,
         backend=build_backend(args) if require_backend else None,
+    )
+
+
+def _validate_client_layout(args: argparse.Namespace) -> None:
+    """Apply and validate the reviewed route for capture-only CLI surfaces."""
+
+    from backend_router import resolve_backend_route
+
+    resolve_backend_route(
+        memory_path=args.memory_db,
+        state_path=args.state,
+        capture_root=getattr(args, "capture_root", None),
     )
 
 
@@ -1081,6 +1211,19 @@ def command_backup_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
         field="recovery bundle database output path",
     )
     backend = build_backend(args)
+    if isinstance(backend, CoreClient):
+        if args.capture_root is not None or bool(
+            args.allow_noncanonical_capture_root
+        ):
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.backup_recovery_bundle(
+            path=output_path,
+            purpose=args.purpose,
+            pinned=bool(args.pinned),
+        )
+    CaptureInboxDaemon(root=args.capture_root).prepare_transport()
     return backend.backup_recovery_bundle(
         path=output_path,
         capture_root=args.capture_root,
@@ -1093,18 +1236,40 @@ def command_backup_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_capture_ledger_integrity(args: argparse.Namespace) -> dict[str, Any]:
-    from recovery_manager import VerifiedRecoveryManager
+    from backend_router import build_maintenance_backend
 
-    store = DurableMemoryStore.open_existing_for_audit(args.memory_db)
-    capture_root = args.capture_root or store.db_path.parent
-    manager = VerifiedRecoveryManager(store, capture_root=capture_root)
-    if args.repair:
-        return manager.repair_capture_ledger(
-            confirm=bool(args.confirm),
-            expected_revision=args.expected_revision,
+    backend = build_maintenance_backend(
+        memory_path=args.memory_db,
+        state_path=args.state,
+    )
+    try:
+        if isinstance(backend, CoreClient) and args.capture_root is not None:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        if args.repair:
+            if isinstance(backend, CoreClient):
+                return backend.repair_capture_ledger(
+                    confirm=bool(args.confirm),
+                    expected_revision=args.expected_revision,
+                    sample_limit=args.sample_limit,
+                )
+            return backend.repair_capture_ledger(
+                capture_root=args.capture_root,
+                confirm=bool(args.confirm),
+                expected_revision=args.expected_revision,
+                sample_limit=args.sample_limit,
+            )
+        if isinstance(backend, CoreClient):
+            return backend.audit_capture_ledger(sample_limit=args.sample_limit)
+        return backend.audit_capture_ledger(
+            capture_root=args.capture_root,
             sample_limit=args.sample_limit,
         )
-    return manager.audit_capture_ledger(sample_limit=args.sample_limit)
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
 
 
 def command_verify_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
@@ -1115,11 +1280,25 @@ def command_verify_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
     if receipt_path is None:
         raise ValueError("recovery bundle receipt path is required")
     backend = build_backend(args)
+    if isinstance(backend, CoreClient):
+        if args.capture_root is not None:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.verify_recovery_bundle(
+            receipt_path,
+            expected_database_sha256=args.expected_database_sha256,
+            expected_capture_sha256=args.expected_capture_sha256,
+            expected_request_journal_sha256=args.expected_request_journal_sha256,
+            expected_runtime_state_sha256=args.expected_runtime_state_sha256,
+        )
     return backend.verify_recovery_bundle(
         receipt_path,
         capture_root=args.capture_root,
         expected_database_sha256=args.expected_database_sha256,
         expected_capture_sha256=args.expected_capture_sha256,
+        expected_request_journal_sha256=args.expected_request_journal_sha256,
+        expected_runtime_state_sha256=args.expected_runtime_state_sha256,
     )
 
 
@@ -1135,12 +1314,28 @@ def command_restore_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
     if receipt_path is None or output_root is None:
         raise ValueError("receipt and output root are required")
     backend = build_backend(args)
+    if isinstance(backend, CoreClient):
+        if args.capture_root is not None:
+            raise ValueError(
+                "capture root overrides are unavailable on the authoritative core lane"
+            )
+        return backend.restore_recovery_bundle_isolated(
+            receipt_path,
+            output_root,
+            expected_database_sha256=args.expected_database_sha256,
+            expected_capture_sha256=args.expected_capture_sha256,
+            expected_request_journal_sha256=args.expected_request_journal_sha256,
+            expected_runtime_state_sha256=args.expected_runtime_state_sha256,
+            confirm=bool(args.confirm),
+        )
     return backend.restore_recovery_bundle_isolated(
         receipt_path,
         output_root,
         capture_root=args.capture_root,
         expected_database_sha256=args.expected_database_sha256,
         expected_capture_sha256=args.expected_capture_sha256,
+        expected_request_journal_sha256=args.expected_request_journal_sha256,
+        expected_runtime_state_sha256=args.expected_runtime_state_sha256,
         confirm=bool(args.confirm),
     )
 
@@ -1151,6 +1346,15 @@ def command_plan_recovery_retention(args: argparse.Namespace) -> dict[str, Any]:
         field="recovery retention directory",
     )
     backend = build_backend(args)
+    if isinstance(backend, CoreClient):
+        if directory is not None:
+            raise ValueError(
+                "retention directory overrides are unavailable on the authoritative core lane"
+            )
+        return backend.plan_recovery_retention(
+            keep_latest=args.keep_latest,
+            max_age_days=args.max_age_days,
+        )
     return backend.plan_recovery_retention(
         directory=directory,
         keep_latest=args.keep_latest,
@@ -1164,6 +1368,18 @@ def command_apply_recovery_retention(args: argparse.Namespace) -> dict[str, Any]
         field="recovery retention directory",
     )
     backend = build_backend(args)
+    if isinstance(backend, CoreClient):
+        if directory is not None:
+            raise ValueError(
+                "retention directory overrides are unavailable on the authoritative core lane"
+            )
+        return backend.apply_recovery_retention(
+            plan_token=args.plan_token,
+            cutoff_created_at=args.cutoff_created_at,
+            keep_latest=args.keep_latest,
+            max_age_days=args.max_age_days,
+            confirm=bool(args.confirm),
+        )
     return backend.apply_recovery_retention(
         plan_token=args.plan_token,
         cutoff_created_at=args.cutoff_created_at,
@@ -1183,19 +1399,29 @@ def command_restore_retired_recovery(args: argparse.Namespace) -> dict[str, Any]
 
 
 def command_memory_integrity(args: argparse.Namespace) -> dict[str, Any]:
+    from backend_router import build_maintenance_backend
+
     context_id = str(args.context).strip() if args.context is not None else None
-    store = DurableMemoryStore.open_existing_for_audit(args.memory_db)
-    if args.repair:
-        return store.repair_semantic_indexes(
+    backend = build_maintenance_backend(
+        memory_path=args.memory_db,
+        state_path=args.state,
+    )
+    try:
+        if args.repair:
+            return backend.repair_semantic_indexes(
+                context_id=context_id,
+                confirm=bool(args.confirm),
+                expected_revision=args.expected_revision,
+                sample_limit=args.sample_limit,
+            )
+        return backend.audit_semantic_indexes(
             context_id=context_id,
-            confirm=bool(args.confirm),
-            expected_revision=args.expected_revision,
             sample_limit=args.sample_limit,
         )
-    return store.audit_semantic_indexes(
-        context_id=context_id,
-        sample_limit=args.sample_limit,
-    )
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
 
 
 def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
@@ -1352,6 +1578,14 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status")
     add_context(status)
     status.set_defaults(func=command_status)
+
+    request_status = subparsers.add_parser(
+        "request-status",
+        help="Reconcile an ambiguous authoritative-core mutation without replaying it.",
+    )
+    request_status.add_argument("--caller", required=True)
+    request_status.add_argument("--request-id", required=True)
+    request_status.set_defaults(func=command_request_status)
 
     enable = subparsers.add_parser("enable")
     add_context(enable)
@@ -1861,7 +2095,11 @@ def build_parser() -> argparse.ArgumentParser:
             "SQLite ledger, or apply a reviewed historical reconciliation."
         ),
     )
-    capture_ledger.add_argument("--capture-root", default=None)
+    capture_ledger.add_argument(
+        "--capture-root",
+        default=None,
+        help="offline-v5 maintenance only; the authoritative core owns this path",
+    )
     capture_ledger.add_argument("--sample-limit", type=int, default=20)
     capture_ledger.add_argument("--repair", action="store_true")
     capture_ledger.add_argument("--confirm", action="store_true")
@@ -1873,7 +2111,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create a signed paired database and exactly-once capture recovery bundle.",
     )
     backup_recovery.add_argument("--output", default=None)
-    backup_recovery.add_argument("--capture-root", default=None)
+    backup_recovery.add_argument(
+        "--capture-root",
+        default=None,
+        help="offline-v5 maintenance only; the authoritative core owns this path",
+    )
     backup_recovery.add_argument("--purpose", default="operator")
     backup_recovery.add_argument("--pinned", action="store_true")
     backup_recovery.add_argument(
@@ -1881,35 +2123,56 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Explicitly permit a pre-existing private capture root outside the "
-            "memory-store directory; the signed receipt records this exception."
+            "memory-store directory during offline-v5 maintenance; the "
+            "authoritative core rejects this override."
         ),
     )
     backup_recovery.set_defaults(func=command_backup_recovery_bundle)
 
     verify_recovery = subparsers.add_parser("verify-recovery")
     verify_recovery.add_argument("--receipt", required=True)
-    verify_recovery.add_argument("--capture-root", default=None)
+    verify_recovery.add_argument(
+        "--capture-root",
+        default=None,
+        help="offline-v5 maintenance only; the authoritative core owns this path",
+    )
     verify_recovery.add_argument("--expected-database-sha256", default=None)
     verify_recovery.add_argument("--expected-capture-sha256", default=None)
+    verify_recovery.add_argument("--expected-request-journal-sha256", default=None)
+    verify_recovery.add_argument("--expected-runtime-state-sha256", default=None)
     verify_recovery.set_defaults(func=command_verify_recovery_bundle)
 
     restore_recovery = subparsers.add_parser("restore-recovery-proof")
     restore_recovery.add_argument("--receipt", required=True)
     restore_recovery.add_argument("--output-root", required=True)
-    restore_recovery.add_argument("--capture-root", default=None)
+    restore_recovery.add_argument(
+        "--capture-root",
+        default=None,
+        help="offline-v5 maintenance only; the authoritative core owns this path",
+    )
     restore_recovery.add_argument("--expected-database-sha256", default=None)
     restore_recovery.add_argument("--expected-capture-sha256", default=None)
+    restore_recovery.add_argument("--expected-request-journal-sha256", default=None)
+    restore_recovery.add_argument("--expected-runtime-state-sha256", default=None)
     restore_recovery.add_argument("--confirm", action="store_true")
     restore_recovery.set_defaults(func=command_restore_recovery_bundle)
 
     retention_plan = subparsers.add_parser("recovery-retention-plan")
-    retention_plan.add_argument("--directory", default=None)
+    retention_plan.add_argument(
+        "--directory",
+        default=None,
+        help="offline-v5 maintenance only; the authoritative core owns this path",
+    )
     retention_plan.add_argument("--keep-latest", type=int, default=7)
     retention_plan.add_argument("--max-age-days", type=float, default=30.0)
     retention_plan.set_defaults(func=command_plan_recovery_retention)
 
     retention_apply = subparsers.add_parser("recovery-retention-apply")
-    retention_apply.add_argument("--directory", default=None)
+    retention_apply.add_argument(
+        "--directory",
+        default=None,
+        help="offline-v5 maintenance only; the authoritative core owns this path",
+    )
     retention_apply.add_argument("--keep-latest", type=int, default=7)
     retention_apply.add_argument("--max-age-days", type=float, default=30.0)
     retention_apply.add_argument("--plan-token", required=True)
@@ -2011,6 +2274,15 @@ def main(argv: list[str] | None = None) -> int:
         payload = args.func(args)
         emit(payload, as_json=args.json)
         return 0
+    except CoreOutcomeUnknown as exc:
+        emit(
+            {
+                "error": "outcome_unknown",
+                "reconciliation": outcome_unknown_projection(exc),
+            },
+            as_json=args.json,
+        )
+        return 1
     except Exception as exc:
         surface = _CONTRACT_COMMAND_SURFACES.get(str(getattr(args, "command", "")))
         response_mode = str(getattr(args, "response_mode", "") or "").strip().casefold()

@@ -317,23 +317,18 @@ class ClientSessionBridge:
                 recall_mode=self.config.startup_recall_mode,
             )
             session_id = str(session.get("session_id", "") or "")
-            if session_id and session_id in backend.cortex_sessions:
-                leased_session = dict(backend.cortex_sessions[session_id])
-                leased_session.update(
-                    {
-                        "client_bridge_session_id": self.session_id,
-                        "lease_kind": "mcp-client",
-                        "owner_pid": os.getpid(),
-                        "owner_ppid": os.getppid(),
-                        "owner_started_at": self.started_at or time.time(),
-                    }
+            if session_id:
+                leased_session = backend.attach_client_cortex_session(
+                    context_id=self.config.context_id,
+                    agent_id=self.config.agent_id,
+                    session_id=session_id,
+                    client_bridge_session_id=self.session_id,
+                    owner_pid=os.getpid(),
+                    owner_ppid=os.getppid(),
+                    owner_started_at=self.started_at or time.time(),
                 )
-                backend.cortex_sessions[session_id] = backend._normalize_cortex_session(
-                    leased_session
-                )
-                backend._persist_runtime_state()
                 session = dict(session)
-                session.update(backend.cortex_sessions[session_id])
+                session.update(leased_session)
             self.cortex_session = session
             if isinstance(self.hydration, dict):
                 self.hydration["client_cortex_enabled"] = True
@@ -448,21 +443,15 @@ class ClientSessionBridge:
         session_id = self.cortex_session_id
         if not session_id:
             return
-        session = backend.cortex_sessions.get(session_id)
-        if not isinstance(session, dict):
-            return
-        finished_session = dict(session)
-        finished_session.update(
-            {
-                "status": "finished",
-                "finished_at": ended_at,
-                "finish_reason": str(reason or "client-session-finish"),
-                "updated_at": ended_at,
-            }
-        )
-        backend.cortex_sessions[session_id] = backend._normalize_cortex_session(finished_session)
         try:
-            backend._persist_runtime_state()
+            backend.finish_client_cortex_session(
+                context_id=self.config.context_id,
+                agent_id=self.config.agent_id,
+                session_id=session_id,
+                client_bridge_session_id=self.session_id,
+                reason=reason,
+                finished_at=ended_at,
+            )
         except Exception:
             LOGGER.exception(
                 "failed to persist finished Cortex session agent_id=%s context_id=%s session_id=%s",

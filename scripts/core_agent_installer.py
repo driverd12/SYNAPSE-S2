@@ -1,0 +1,1469 @@
+#!/usr/bin/env python3
+"""Install and operate the macOS authoritative-core LaunchAgent safely."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import plistlib
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core_protocol import PROTOCOL_VERSION, contains_secret_shape  # noqa: E402
+from core_authority import CoreAuthorityError, CoreAuthorityLease  # noqa: E402
+from core_request_journal import (  # noqa: E402
+    CoreRequestJournalError,
+    repair_empty_preclaim_journal_residue,
+)
+from core_client_binding import (  # noqa: E402
+    binding_for_config,
+    default_binding_path,
+    load_bound_core_config,
+    load_core_client_binding,
+    write_core_client_binding,
+)
+from core_service import (  # noqa: E402
+    CoreConfig,
+    CoreServiceError,
+    _manifest_build_id,
+    _store_identity,
+    config_from_wire,
+    load_core_config,
+    write_core_config,
+)
+from scripts.core_cutover_preflight import (  # noqa: E402
+    CUTOVER_ATTESTATION_NAME,
+    CutoverAttestationRequest,
+    CutoverPreflightError,
+    _normal_absolute,
+    launchctl_service_snapshot,
+    run_preflight,
+)
+from redaction import SecretSafeArgumentParser  # noqa: E402
+
+
+DEFAULT_LABEL = "aero.boom.synapse-s2.core"
+DEFAULT_CAPTURE_LABEL = "aero.boom.synapse-s2.capture-daemon"
+DEFAULT_DASHBOARD_LABEL = "aero.boom.synapse-s2.dashboard"
+LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+LAYOUT_MANIFEST_SCHEMA = "synapse-s2.noncanonical-core-layout.v1"
+EXPECTED_SCHEMA_IDENTITY = "sqlite-53324442-v6"
+EPOCH_RE = re.compile(r"^epoch-[1-9][0-9]*$")
+MAX_LAYOUT_MANIFEST_BYTES = 64 * 1024
+
+
+class CoreInstallerError(RuntimeError):
+    """A bounded installer failure that is safe to show to an operator."""
+
+
+@dataclass(frozen=True)
+class InstallPaths:
+    home: Path
+    root: Path
+    data_root: Path
+    core_root: Path
+    config: Path
+    socket: Path
+    state: Path
+    memory_db: Path
+    capture_root: Path
+    log: Path
+    plist: Path
+    python: Path
+    service_program: Path
+
+
+def _env_path(name: str, default: Path) -> Path:
+    raw = os.getenv(name)
+    return _normal_absolute(raw if raw is not None else default, name=name.lower())
+
+
+def _canonical_layout(data_root: Path) -> dict[str, Path]:
+    core_root = data_root / "core"
+    return {
+        "data_root": data_root,
+        "core_root": core_root,
+        "config": core_root / "service.json",
+        "socket": core_root / "service.sock",
+        "state": data_root / "runtime_state.json",
+        "memory_db": data_root / "memory.sqlite3",
+        "capture_root": data_root,
+        "log": core_root / "service.log",
+    }
+
+
+def _read_noncanonical_layout_manifest(path: Path) -> dict[str, Any]:
+    _assert_no_symlink_components(path)
+    if contains_secret_shape(str(path)):
+        raise CoreInstallerError(
+            "noncanonical layout manifest path contains credential material"
+        )
+    try:
+        observed = path.lstat()
+    except FileNotFoundError as exc:
+        raise CoreInstallerError("noncanonical layout manifest is missing") from exc
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) & 0o077
+        or observed.st_size > MAX_LAYOUT_MANIFEST_BYTES
+    ):
+        raise CoreInstallerError("noncanonical layout manifest is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65_536, MAX_LAYOUT_MANIFEST_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_LAYOUT_MANIFEST_BYTES:
+                raise CoreInstallerError("noncanonical layout manifest is too large")
+        payload = b"".join(chunks)
+        finished = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    visible = path.lstat()
+    identities = {
+        (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+        for item in (observed, opened, finished, visible)
+    }
+    if len(identities) != 1 or len(payload) != observed.st_size:
+        raise CoreInstallerError("noncanonical layout manifest changed while being read")
+    try:
+        manifest = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CoreInstallerError("noncanonical layout manifest is invalid") from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != LAYOUT_MANIFEST_SCHEMA
+        or manifest.get("reviewed") is not True
+        or not isinstance(manifest.get("reviewed_by"), str)
+        or not manifest["reviewed_by"].strip()
+        or contains_secret_shape(manifest["reviewed_by"])
+        or not isinstance(manifest.get("paths"), dict)
+    ):
+        raise CoreInstallerError("noncanonical layout manifest is not explicitly reviewed")
+    return manifest
+
+
+def resolve_paths(
+    *,
+    label: str,
+    noncanonical_layout_manifest: Path | None = None,
+) -> InstallPaths:
+    if LABEL_RE.fullmatch(label) is None or contains_secret_shape(label):
+        raise CoreInstallerError("authoritative-core label is invalid")
+    home = _env_path("HOME", Path.home())
+    data_root = _env_path("SYNAPSE_S2_CORE_DATA_ROOT", ROOT / ".synapse_s2")
+    core_root = _env_path("SYNAPSE_S2_CORE_RUNTIME_ROOT", data_root / "core")
+    values = InstallPaths(
+        home=home,
+        root=ROOT,
+        data_root=data_root,
+        core_root=core_root,
+        config=_env_path("SYNAPSE_S2_CORE_CONFIG", core_root / "service.json"),
+        socket=_env_path("SYNAPSE_S2_CORE_SOCKET", core_root / "service.sock"),
+        state=_env_path("SYNAPSE_S2_CORE_STATE", data_root / "runtime_state.json"),
+        memory_db=_env_path("SYNAPSE_S2_MEMORY_DB", data_root / "memory.sqlite3"),
+        capture_root=_env_path("SYNAPSE_S2_CAPTURE_ROOT", data_root),
+        log=_env_path("SYNAPSE_S2_CORE_LOG", core_root / "service.log"),
+        plist=home / "Library" / "LaunchAgents" / f"{label}.plist",
+        python=_env_path("SYNAPSE_S2_CORE_PYTHON", ROOT / ".venv" / "bin" / "python"),
+        service_program=ROOT / "core_service.py",
+    )
+    for field, path in values.__dict__.items():
+        if isinstance(path, Path) and contains_secret_shape(str(path)):
+            raise CoreInstallerError(f"{field} contains a credential-shaped value")
+    expected = _canonical_layout(values.data_root)
+    for field, expected_path in expected.items():
+        if getattr(values, field) != expected_path:
+            raise CoreInstallerError(
+                "core data paths must use one internally canonical layout"
+            )
+    canonical = _canonical_layout(ROOT / ".synapse_s2")
+    observed_layout = {field: getattr(values, field) for field in canonical}
+    if observed_layout != canonical:
+        manifest_path = noncanonical_layout_manifest
+        if manifest_path is None:
+            configured = os.getenv("SYNAPSE_S2_NONCANONICAL_LAYOUT_MANIFEST")
+            if configured:
+                manifest_path = _normal_absolute(
+                    configured,
+                    name="noncanonical layout manifest",
+                )
+        if manifest_path is None:
+            raise CoreInstallerError(
+                "noncanonical core layout requires an explicit reviewed manifest"
+            )
+        manifest = _read_noncanonical_layout_manifest(manifest_path)
+        manifest_paths = manifest["paths"]
+        if set(manifest_paths) != set(canonical) or any(
+            not isinstance(manifest_paths.get(field), str)
+            or _normal_absolute(
+                manifest_paths[field],
+                name=f"noncanonical layout {field}",
+            )
+            != observed_layout[field]
+            for field in canonical
+        ):
+            raise CoreInstallerError(
+                "noncanonical layout does not match its reviewed manifest"
+            )
+    if values.socket.parent != values.core_root or values.socket.parent.parent != values.data_root:
+        raise CoreInstallerError(
+            "core socket must be data_root/core/service.sock so every adapter "
+            "resolves one authority"
+        )
+    if values.state.parent != values.data_root:
+        raise CoreInstallerError(
+            "runtime state must remain directly under data_root for adapter compatibility"
+        )
+    return values
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _assert_no_symlink_components(path: Path) -> None:
+    if not path.is_absolute() or ".." in path.parts or "\x00" in str(path):
+        raise CoreInstallerError("managed path is not a normal absolute path")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        observed = _lstat(current)
+        if observed is None:
+            continue
+        if stat.S_ISLNK(observed.st_mode):
+            if current == Path("/var") and os.readlink(current) == "private/var":
+                continue
+            raise CoreInstallerError("managed path contains a symlink component")
+        if current != path and not stat.S_ISDIR(observed.st_mode):
+            raise CoreInstallerError("managed path contains a non-directory component")
+
+
+def _assert_layout(paths: InstallPaths) -> None:
+    expected = _canonical_layout(paths.data_root)
+    if any(getattr(paths, field) != value for field, value in expected.items()):
+        raise CoreInstallerError("authoritative-core paths do not share one canonical layout")
+    broad = {
+        Path("/"),
+        paths.home,
+        paths.root,
+        *paths.home.parents,
+        *paths.root.parents,
+    }
+    if paths.data_root in broad or paths.core_root in broad:
+        raise CoreInstallerError("authoritative-core managed path is too broad")
+    if paths.plist.parent != paths.home / "Library" / "LaunchAgents":
+        raise CoreInstallerError("LaunchAgent plist escaped the user LaunchAgents directory")
+    for path in (
+        paths.data_root,
+        paths.core_root,
+        paths.config,
+        paths.socket,
+        paths.state,
+        paths.memory_db,
+        paths.log,
+        paths.plist,
+        paths.service_program,
+    ):
+        _assert_no_symlink_components(path)
+
+
+def _assert_owner_controlled(
+    path: Path,
+    *,
+    kind: str,
+    require_mode: int | None = None,
+) -> os.stat_result:
+    _assert_no_symlink_components(path)
+    observed = _lstat(path)
+    if observed is None:
+        raise CoreInstallerError(f"{kind} is missing")
+    expected = stat.S_ISDIR if kind.endswith("directory") else stat.S_ISREG
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not expected(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or (not kind.endswith("directory") and observed.st_nlink != 1)
+    ):
+        raise CoreInstallerError(f"{kind} must be owner-controlled and non-symlinked")
+    if require_mode is not None and stat.S_IMODE(observed.st_mode) != require_mode:
+        raise CoreInstallerError(f"{kind} has an unsafe permission mode")
+    return observed
+
+
+def ensure_private_directory(path: Path, *, require_private: bool = True) -> None:
+    _assert_no_symlink_components(path)
+    observed = _lstat(path)
+    if observed is None:
+        missing: list[Path] = []
+        cursor = path
+        while _lstat(cursor) is None:
+            missing.append(cursor)
+            if cursor.parent == cursor:
+                raise CoreInstallerError("private directory parent is invalid")
+            cursor = cursor.parent
+        parent_stat = cursor.lstat()
+        if (
+            stat.S_ISLNK(parent_stat.st_mode)
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != os.getuid()
+            or stat.S_IMODE(parent_stat.st_mode) & 0o022
+        ):
+            raise CoreInstallerError("private directory parent is not owner-controlled")
+        for candidate in reversed(missing):
+            try:
+                candidate.mkdir(mode=0o700, parents=False)
+            except FileExistsError:
+                pass
+            created = candidate.lstat()
+            if (
+                stat.S_ISLNK(created.st_mode)
+                or not stat.S_ISDIR(created.st_mode)
+                or created.st_uid != os.getuid()
+                or stat.S_IMODE(created.st_mode) != 0o700
+            ):
+                raise CoreInstallerError("private directory creation raced with an unsafe target")
+        observed = path.lstat()
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != os.getuid()
+    ):
+        raise CoreInstallerError("private directory must be owner-controlled and non-symlinked")
+    mode = stat.S_IMODE(observed.st_mode)
+    if (require_private and mode != 0o700) or (not require_private and mode & 0o022):
+        raise CoreInstallerError("private directory has an unsafe permission mode")
+
+
+def prepare_private_regular(path: Path) -> None:
+    ensure_private_directory(path.parent)
+    observed = _lstat(path)
+    if observed is not None and (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        raise CoreInstallerError("private file target is unsafe")
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if observed is None:
+        flags |= os.O_CREAT | os.O_EXCL
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        visible = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            )
+            != (
+                visible.st_dev,
+                visible.st_ino,
+                visible.st_size,
+                visible.st_mtime_ns,
+                visible.st_ctime_ns,
+            )
+            or (
+                observed is not None
+                and (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                )
+                != (
+                    observed.st_dev,
+                    observed.st_ino,
+                    observed.st_size,
+                    observed.st_mtime_ns,
+                    observed.st_ctime_ns,
+                )
+            )
+        ):
+            raise CoreInstallerError("private file target is unsafe")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.getuid():
+            raise CoreInstallerError("publication directory is not owner-controlled")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_private_bytes(path: Path, payload: bytes) -> None:
+    ensure_private_directory(path.parent, require_private=False)
+    existing = _lstat(path)
+    if existing is not None and (
+        stat.S_ISLNK(existing.st_mode)
+        or not stat.S_ISREG(existing.st_mode)
+        or existing.st_uid != os.getuid()
+        or existing.st_nlink != 1
+        or stat.S_IMODE(existing.st_mode) != 0o600
+    ):
+        raise CoreInstallerError("refusing to replace an unsafe LaunchAgent plist")
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(6)}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        current = _lstat(path)
+        if existing is None:
+            if current is not None:
+                raise CoreInstallerError("LaunchAgent plist appeared during publication")
+        elif current is None or (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+            current.st_uid,
+            current.st_nlink,
+            stat.S_IMODE(current.st_mode),
+        ) != (
+            existing.st_dev,
+            existing.st_ino,
+            existing.st_size,
+            existing.st_mtime_ns,
+            existing.st_ctime_ns,
+            existing.st_uid,
+            existing.st_nlink,
+            stat.S_IMODE(existing.st_mode),
+        ):
+            raise CoreInstallerError("LaunchAgent plist changed during publication")
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def build_config(paths: InstallPaths) -> CoreConfig:
+    try:
+        embedding_provider = os.getenv(
+            "SYNAPSE_S2_EMBEDDING_PROVIDER", "semantic-hash"
+        )
+        neural_selected = embedding_provider.strip().lower() in {
+            "mlx-neural",
+            "mlx-neural-v1",
+        }
+        neural_normalize = os.getenv("SYNAPSE_S2_NEURAL_NORMALIZE", "true")
+        neural_local_only = os.getenv(
+            "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY", "true"
+        )
+
+        def strict_environment_bool(raw: str, *, name: str) -> bool:
+            normalized = raw.strip().lower()
+            if normalized in {"1", "true", "yes"}:
+                return True
+            if normalized in {"0", "false", "no"}:
+                return False
+            raise CoreInstallerError(f"{name} must be an explicit boolean")
+
+        require_native = strict_environment_bool(
+            os.getenv("SYNAPSE_S2_CORE_REQUIRE_NATIVE", "true"),
+            name="SYNAPSE_S2_CORE_REQUIRE_NATIVE",
+        )
+        poll_transcripts = strict_environment_bool(
+            os.getenv("SYNAPSE_S2_TRANSCRIPT_POLL", "true"),
+            name="SYNAPSE_S2_TRANSCRIPT_POLL",
+        )
+        canonical_neural_model = os.getenv("SYNAPSE_S2_NEURAL_MODEL")
+        legacy_neural_model = os.getenv("SYNAPSE_S2_NEURAL_MODEL_ID")
+        if (
+            canonical_neural_model is not None
+            and legacy_neural_model is not None
+            and canonical_neural_model != legacy_neural_model
+        ):
+            raise CoreInstallerError(
+                "SYNAPSE_S2_NEURAL_MODEL conflicts with deprecated "
+                "SYNAPSE_S2_NEURAL_MODEL_ID"
+            )
+        neural_model = canonical_neural_model or legacy_neural_model
+
+        config = CoreConfig(
+            socket_path=paths.socket,
+            state_path=paths.state,
+            memory_path=paths.memory_db,
+            capture_root=paths.capture_root,
+            dimension=int(os.getenv("SYNAPSE_S2_DIMENSION", "1024")),
+            num_neurons=int(os.getenv("SYNAPSE_S2_NEURONS", "8192")),
+            default_top_k=int(os.getenv("SYNAPSE_S2_TOP_K", "256")),
+            recall_count=int(os.getenv("SYNAPSE_S2_RECALL_COUNT", "10")),
+            quick_pruning_interval_seconds=float(
+                os.getenv("SYNAPSE_S2_QUICK_PRUNING_INTERVAL_SECONDS", "300")
+            ),
+            idle_deep_sleep_seconds=float(
+                os.getenv("SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS", "1800")
+            ),
+            embedding_provider_name=embedding_provider,
+            embedding_neural_model_id=(
+                neural_model
+                if neural_selected
+                else None
+            ),
+            embedding_neural_revision=(
+                os.getenv("SYNAPSE_S2_NEURAL_REVISION")
+                if neural_selected
+                else None
+            ),
+            embedding_neural_cache_dir=(
+                Path(os.environ["SYNAPSE_S2_NEURAL_CACHE_DIR"]).expanduser()
+                if neural_selected and os.getenv("SYNAPSE_S2_NEURAL_CACHE_DIR")
+                else None
+            ),
+            embedding_neural_pooling=(
+                os.getenv("SYNAPSE_S2_NEURAL_POOLING", "mean")
+                if neural_selected
+                else None
+            ),
+            embedding_neural_max_tokens=(
+                int(os.getenv("SYNAPSE_S2_NEURAL_MAX_TOKENS", "512"))
+                if neural_selected
+                else None
+            ),
+            embedding_neural_normalize=(
+                strict_environment_bool(
+                    neural_normalize,
+                    name="SYNAPSE_S2_NEURAL_NORMALIZE",
+                )
+                if neural_selected
+                else None
+            ),
+            embedding_neural_local_files_only=(
+                strict_environment_bool(
+                    neural_local_only,
+                    name="SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY",
+                )
+                if neural_selected
+                else None
+            ),
+            mlx_device=os.getenv("MLX_DEVICE", "default"),
+            require_native=require_native,
+            capture_poll_seconds=float(
+                os.getenv("SYNAPSE_S2_CAPTURE_POLL_INTERVAL", "2")
+            ),
+            capture_max_files=int(os.getenv("SYNAPSE_S2_CAPTURE_MAX_FILES", "50")),
+            poll_transcript_sources=poll_transcripts,
+            max_transcript_bytes=int(
+                os.getenv("SYNAPSE_S2_MAX_TRANSCRIPT_BYTES", "256000")
+            ),
+        )
+        # Close every field through the production codec before it can be
+        # published as the reviewed client configuration.
+        return config_from_wire(config.to_wire())
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise CoreInstallerError("authoritative-core configuration is invalid") from exc
+
+
+def publish_client_binding(
+    *,
+    paths: InstallPaths,
+    label: str,
+    config: CoreConfig,
+    authority_mode: str,
+) -> dict[str, Any]:
+    try:
+        closed_config = config_from_wire(config.to_wire())
+        # The config is the first half of a fail-closed two-file publication.
+        # If binding publication is interrupted, the prior binding disagrees
+        # with this config and every new client refuses to start.
+        write_core_config(paths.config, closed_config)
+        _assert_owner_controlled(
+            paths.config,
+            kind="core service config",
+            require_mode=0o600,
+        )
+        verified_config = load_core_config(paths.config)
+    except Exception as exc:
+        raise CoreInstallerError("core client config publication failed") from exc
+    if (
+        verified_config != closed_config
+        or verified_config.fingerprint != closed_config.fingerprint
+        or verified_config.embedding_space_identity
+        != closed_config.embedding_space_identity
+    ):
+        raise CoreInstallerError("core client config publication was not stable")
+    binding = binding_for_config(
+        repo_root=paths.root,
+        data_root=paths.data_root,
+        config=verified_config,
+        core_label=label,
+        authority_mode=authority_mode,
+    )
+    binding_path = default_binding_path(paths.home)
+    try:
+        write_core_client_binding(binding_path, binding)
+        verified = load_core_client_binding(binding_path)
+        bound_config = load_bound_core_config(verified)
+    except Exception as exc:
+        raise CoreInstallerError("core client binding publication failed") from exc
+    if verified != binding or bound_config != verified_config:
+        raise CoreInstallerError("core client binding publication was not stable")
+    return {
+        "path": str(binding_path),
+        "digest": binding.digest,
+        "config_path": str(binding.config_path),
+        "config_digest": binding.config_digest,
+        "authority_mode": binding.authority_mode,
+        "config_fingerprint": binding.config_fingerprint,
+        "embedding_space_identity": binding.embedding_space_identity,
+    }
+
+
+def plist_payload(
+    *,
+    label: str,
+    paths: InstallPaths,
+    config: CoreConfig,
+) -> bytes:
+    try:
+        closed_config = config_from_wire(config.to_wire())
+    except Exception as exc:
+        raise CoreInstallerError("LaunchAgent configuration is invalid") from exc
+    if (
+        closed_config.socket_path != paths.socket
+        or closed_config.state_path != paths.state
+        or closed_config.memory_path != paths.memory_db
+        or closed_config.capture_root != paths.capture_root
+    ):
+        raise CoreInstallerError(
+            "LaunchAgent configuration does not match the reviewed layout"
+        )
+    payload = {
+        "Label": label,
+        "ProgramArguments": [
+            str(paths.python),
+            str(paths.service_program),
+            "serve",
+            "--config",
+            str(paths.config),
+        ],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Interactive",
+        "Umask": 0o077,
+        "EnvironmentVariables": {
+            # Pin the exact source manifest used by the installer. Do not let
+            # an inherited shell override make health compare unlike builds.
+            "SYNAPSE_S2_BUILD_ID": _manifest_build_id(paths.root),
+            # MLX selects its device from process environment.  Publish the
+            # exact closed CoreConfig value so launchd cannot silently fall
+            # back to "default" for a reviewed cpu/gpu configuration.
+            "MLX_DEVICE": closed_config.mlx_device,
+        },
+        "StandardOutPath": str(paths.log),
+        "StandardErrorPath": str(paths.log),
+        "WorkingDirectory": str(paths.root),
+    }
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
+
+
+class LaunchCtl:
+    def __init__(self, executable: str | os.PathLike[str], *, uid: int, label: str) -> None:
+        self.executable = str(executable)
+        self.uid = int(uid)
+        self.label = label
+        self.domain = f"gui/{self.uid}"
+        self.target = f"{self.domain}/{self.label}"
+
+    def _run(self, *arguments: str, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                [self.executable, *arguments],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CoreInstallerError("launchctl operation failed") from exc
+
+    def snapshot(self) -> dict[str, Any]:
+        try:
+            snapshot = launchctl_service_snapshot(
+                launchctl_bin=self.executable,
+                uid=self.uid,
+                label=self.label,
+            )
+        except CutoverPreflightError as exc:
+            raise CoreInstallerError(str(exc)) from exc
+        return {
+            **snapshot,
+            "running": snapshot.get("state") == "running",
+        }
+
+    def enable(self) -> None:
+        if self._run("enable", self.target).returncode != 0:
+            raise CoreInstallerError("could not enable authoritative-core LaunchAgent")
+
+    def disable(self) -> None:
+        if self._run("disable", self.target).returncode != 0:
+            raise CoreInstallerError("could not disable authoritative-core LaunchAgent")
+
+    def bootstrap(self, plist: Path) -> None:
+        if self._run("bootstrap", self.domain, str(plist)).returncode != 0:
+            raise CoreInstallerError("could not bootstrap authoritative-core LaunchAgent")
+
+    def kickstart(self) -> None:
+        if self._run("kickstart", self.target).returncode != 0:
+            raise CoreInstallerError("could not kickstart authoritative-core LaunchAgent")
+
+    def bootout(self, *, wait_seconds: float) -> None:
+        if not self.snapshot()["loaded"]:
+            return
+        completed = self._run("bootout", self.target)
+        if completed.returncode != 0 and self.snapshot()["loaded"]:
+            raise CoreInstallerError("could not boot out authoritative-core LaunchAgent")
+        deadline = time.monotonic() + wait_seconds
+        while self.snapshot()["loaded"]:
+            if time.monotonic() >= deadline:
+                raise CoreInstallerError("authoritative-core LaunchAgent did not unload")
+            time.sleep(0.1)
+
+
+def _private_socket(path: Path) -> None:
+    observed = _lstat(path)
+    if observed is None:
+        raise CoreInstallerError("authoritative-core socket is missing")
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISSOCK(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        raise CoreInstallerError("authoritative-core socket is not private")
+    _assert_owner_controlled(path.parent, kind="socket directory", require_mode=0o700)
+
+
+def _private_token(path: Path) -> None:
+    _assert_owner_controlled(path, kind="authentication token", require_mode=0o600)
+
+
+def _verify_restored_health_identity(
+    config: CoreConfig,
+    *,
+    store_identity: str,
+    authority_epoch_number: int,
+) -> dict[str, Any]:
+    """Verify a restored target's persisted identity against its lineage."""
+
+    from memory_store import DurableMemoryStore
+    from recovery_manager import VerifiedRecoveryManager
+
+    store = DurableMemoryStore.open_existing_for_audit(config.memory_path)
+    try:
+        manager = VerifiedRecoveryManager(
+            store,
+            capture_root=config.capture_root or config.memory_path.parent,
+            runtime_state_path=config.state_path,
+        )
+        return manager.verify_adopted_restored_store_identity(
+            config.memory_path.parent,
+            expected_store_identity=store_identity,
+            expected_authority_epoch_number=authority_epoch_number,
+        )
+    finally:
+        store.close()
+
+
+def probe_health(
+    config: CoreConfig,
+    *,
+    restored_target: bool = False,
+) -> dict[str, Any]:
+    from core_client import CoreClient
+
+    client = CoreClient(socket_path=config.socket_path)
+    result = client.health(timeout_seconds=2.0)
+    identity = client.authority_identity
+    if not isinstance(identity, dict):
+        raise CoreInstallerError("authoritative-core identity is missing")
+    required_identity = {
+        "authority_id",
+        "neural_epoch",
+        "config_fingerprint",
+        "build_id",
+        "store_identity",
+        "schema_identity",
+    }
+    if not required_identity.issubset(identity) or any(
+        not isinstance(identity[key], str) or not identity[key] or len(identity[key]) > 256
+        for key in required_identity
+    ):
+        raise CoreInstallerError("authoritative-core identity is incomplete")
+    capture = result.get("capture") if isinstance(result, dict) else None
+    if (
+        not isinstance(result, dict)
+        or result.get("ready") is not True
+        or result.get("protocol_version") != PROTOCOL_VERSION
+        or not isinstance(capture, dict)
+        or capture.get("enabled") is not True
+        or capture.get("ready") is not True
+        or int(capture.get("iteration_count", 0)) < 1
+    ):
+        raise CoreInstallerError("authoritative-core or embedded capture is not ready")
+    expected = {
+        "config_fingerprint": config.fingerprint,
+        "build_id": _manifest_build_id(ROOT),
+    }
+    if any(identity.get(key) != value for key, value in expected.items()):
+        raise CoreInstallerError("authoritative-core identity does not match this install")
+    if identity["schema_identity"] != EXPECTED_SCHEMA_IDENTITY:
+        raise CoreInstallerError("authoritative-core schema identity is not exact v6")
+    if EPOCH_RE.fullmatch(identity["neural_epoch"]) is None:
+        raise CoreInstallerError("authoritative-core neural epoch has an invalid format")
+    authority_epoch_number = int(identity["neural_epoch"].split("-", 1)[1])
+    path_store_identity = _store_identity(config.memory_path)
+    persisted_store_identity = str(identity["store_identity"])
+    if restored_target or persisted_store_identity != path_store_identity:
+        try:
+            lineage = _verify_restored_health_identity(
+                config,
+                store_identity=persisted_store_identity,
+                authority_epoch_number=authority_epoch_number,
+            )
+        except Exception as exc:
+            raise CoreInstallerError(
+                "authoritative-core restored identity is not verified"
+            ) from exc
+        if (
+            lineage.get("verified") is not True
+            or lineage.get("store_identity") != persisted_store_identity
+            or type(lineage.get("authority_epoch_number")) is not int
+            or int(lineage["authority_epoch_number"])
+            != authority_epoch_number
+        ):
+            raise CoreInstallerError(
+                "authoritative-core restored identity is not verified"
+            )
+    _private_socket(config.socket_path)
+    _private_token(config.socket_path.with_name(config.socket_path.name + ".token"))
+    return {
+        "ready": True,
+        "capture_ready": True,
+        "authority_id": identity["authority_id"],
+        "neural_epoch": identity["neural_epoch"],
+        "build_id": identity["build_id"],
+        "schema_identity": identity["schema_identity"],
+        "config_identity_verified": True,
+        "store_identity_verified": True,
+    }
+
+
+def wait_for_health(
+    *,
+    launchctl: LaunchCtl,
+    config: CoreConfig,
+    prior_pid: int | None,
+    wait_seconds: float,
+    restored_target: bool = False,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + wait_seconds
+    last_pid = None
+    consecutive = 0
+    while time.monotonic() < deadline:
+        snapshot = launchctl.snapshot()
+        observed_pid = snapshot.get("pid")
+        if snapshot.get("running") and isinstance(observed_pid, int) and observed_pid != prior_pid:
+            try:
+                health = probe_health(
+                    config,
+                    restored_target=restored_target,
+                )
+            except Exception:
+                health = None
+            if health is not None:
+                if last_pid == observed_pid:
+                    consecutive += 1
+                else:
+                    last_pid = observed_pid
+                    consecutive = 1
+                if consecutive >= 2:
+                    return {**health, "pid": observed_pid}
+            else:
+                consecutive = 0
+        else:
+            consecutive = 0
+        time.sleep(0.25)
+    raise CoreInstallerError("authoritative-core did not pass its stabilized health gate")
+
+
+@contextmanager
+def install_lock(paths: InstallPaths, *, label: str) -> Iterator[None]:
+    ensure_private_directory(paths.plist.parent, require_private=False)
+    lock_path = paths.plist.parent / f".{label}.install.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise CoreInstallerError("authoritative-core install lock is unsafe") from exc
+    try:
+        opened = os.fstat(descriptor)
+        visible = lock_path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+        ):
+            raise CoreInstallerError("authoritative-core install lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CoreInstallerError("another authoritative-core operation is in progress") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _validate_install_sources(paths: InstallPaths) -> None:
+    _assert_layout(paths)
+    if not paths.python.is_file() or not os.access(paths.python, os.X_OK):
+        raise CoreInstallerError("authoritative-core Python runtime is missing")
+    _assert_owner_controlled(paths.service_program, kind="core service program")
+    _assert_owner_controlled(
+        paths.memory_db,
+        kind="live memory database",
+        require_mode=0o600,
+    )
+    for path, kind, expected_type in (
+        (paths.state, "runtime state", "regular"),
+        (paths.socket, "service socket", "socket"),
+        (
+            paths.socket.with_name(paths.socket.name + ".token"),
+            "authentication token",
+            "regular",
+        ),
+    ):
+        observed = _lstat(path)
+        if observed is None:
+            continue
+        valid_type = (
+            stat.S_ISSOCK(observed.st_mode)
+            if expected_type == "socket"
+            else stat.S_ISREG(observed.st_mode)
+        )
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not valid_type
+            or observed.st_uid != os.getuid()
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            raise CoreInstallerError(f"existing {kind} is unsafe")
+
+
+def _safe_result(action: str, **values: Any) -> dict[str, Any]:
+    return {"schema": "synapse-s2.core-agent-install.v1", "action": action, **values}
+
+
+def _existing_install_is_current(
+    *,
+    launchctl: LaunchCtl,
+    config: CoreConfig,
+    config_path: Path,
+    plist: Path,
+    expected_plist: bytes,
+    restored_target: bool = False,
+) -> dict[str, Any] | None:
+    snapshot = launchctl.snapshot()
+    if not snapshot.get("running"):
+        return None
+    try:
+        _assert_owner_controlled(plist, kind="LaunchAgent plist", require_mode=0o600)
+        observed_plist = plist.read_bytes()
+        loaded_config = load_core_config(config_path)
+        if observed_plist != expected_plist or loaded_config.fingerprint != config.fingerprint:
+            return None
+        health = probe_health(config, restored_target=restored_target)
+    except Exception:
+        return None
+    return {**health, "pid": snapshot.get("pid")}
+
+
+def _preflight(
+    *,
+    paths: InstallPaths,
+    evidence_manifest: Path,
+    maximum_evidence_age_seconds: float,
+    launchctl_bin: str,
+    ps_bin: str,
+    label: str,
+    config: CoreConfig,
+    restored_target: bool = False,
+) -> dict[str, Any]:
+    try:
+        # A failed first cutover can leave the newly-created, still-empty
+        # request journal behind while SQLite remains v5.  Repair only that
+        # exact residue under the same authority lock used by the read-only
+        # proof.  v6 lineage is never routed through this path.
+        journal_path = paths.core_root / "requests.sqlite3"
+        if paths.core_root.exists() or paths.core_root.is_symlink():
+            # Recovery is never allowed to create/bootstrap the memory store.
+            # It may operate only beside an already-existing private database
+            # and private core root.  Invoke the helper even when no canonical
+            # journal remains so completed receipts, archives, interrupted
+            # temp publications, and verification scratch are authenticated
+            # exactly as they are on direct service startup.
+            _assert_owner_controlled(
+                paths.core_root,
+                kind="core directory",
+                require_mode=0o700,
+            )
+            _assert_owner_controlled(
+                paths.memory_db,
+                kind="live memory database",
+                require_mode=0o600,
+            )
+            lease = CoreAuthorityLease.acquire_core(
+                paths.memory_db,
+                timeout_seconds=0.0,
+                instance_id="core-installer-preclaim-repair",
+            )
+            store = None
+            try:
+                # Construct and inspect through the same exact v5/v6 schema
+                # contract used by the authoritative service.  A shallow
+                # PRAGMA/version probe must never authorize destructive
+                # request-journal recovery beside a malformed memory store.
+                from memory_store import DurableMemoryStore
+
+                store = DurableMemoryStore(
+                    paths.memory_db,
+                    authority_lease=lease,
+                )
+                inspection = store.inspect_core_authority_preclaim()
+                if inspection.get("governance_mode") == "pre-governed-v5":
+                    repair_empty_preclaim_journal_residue(
+                        journal_path,
+                        expected_store_identity=str(inspection["store_identity"]),
+                        memory_db_path=paths.memory_db,
+                        authority_lease=lease,
+                    )
+                    reinspected = store.inspect_core_authority_preclaim()
+                    if dict(reinspected) != dict(inspection):
+                        raise CoreAuthorityError(
+                            "memory store changed during preclaim journal repair"
+                        )
+            finally:
+                if store is not None:
+                    store.close()
+                lease.close()
+        return run_preflight(
+            root=paths.root,
+            memory_db=paths.memory_db,
+            capture_root=paths.capture_root,
+            evidence_manifest=evidence_manifest,
+            maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+            require_quiescent=True,
+            inventory_only=False,
+            launchctl_bin=launchctl_bin,
+            ps_bin=ps_bin,
+            labels={
+                "capture": os.getenv("SYNAPSE_S2_CAPTURE_LABEL", DEFAULT_CAPTURE_LABEL),
+                "dashboard": os.getenv("SYNAPSE_S2_DASHBOARD_LABEL", DEFAULT_DASHBOARD_LABEL),
+                "core": label,
+            },
+            attestation_request=CutoverAttestationRequest(
+                path=paths.core_root / CUTOVER_ATTESTATION_NAME,
+                build_id=_manifest_build_id(paths.root),
+                config_fingerprint=config.fingerprint,
+                restored_target=restored_target,
+            ),
+        )
+    except CoreInstallerError:
+        raise
+    except (
+        CutoverPreflightError,
+        CoreAuthorityError,
+        CoreRequestJournalError,
+    ) as exc:
+        raise CoreInstallerError(str(exc)) from exc
+    except Exception as exc:
+        raise CoreInstallerError("authoritative core preflight failed") from exc
+
+
+def install(
+    *,
+    paths: InstallPaths,
+    label: str,
+    launchctl: LaunchCtl,
+    launchctl_bin: str,
+    ps_bin: str,
+    evidence_manifest: Path | None,
+    maximum_evidence_age_seconds: float,
+    wait_seconds: float,
+    force_restart: bool,
+    restored_target: bool = False,
+) -> dict[str, Any]:
+    _validate_install_sources(paths)
+    config = build_config(paths)
+    expected_plist = plist_payload(label=label, paths=paths, config=config)
+    if not force_restart:
+        current = _existing_install_is_current(
+            launchctl=launchctl,
+            config=config,
+            config_path=paths.config,
+            plist=paths.plist,
+            expected_plist=expected_plist,
+            restored_target=restored_target,
+        )
+        if current is not None:
+            binding = publish_client_binding(
+                paths=paths,
+                label=label,
+                config=config,
+                authority_mode="authoritative-core-v6",
+            )
+            return _safe_result(
+                "install",
+                status="already-healthy",
+                client_binding=binding,
+                **current,
+            )
+    if evidence_manifest is None:
+        raise CoreInstallerError("install requires --evidence-manifest")
+
+    prior = launchctl.snapshot()
+    prior_pid = prior.get("pid") if isinstance(prior.get("pid"), int) else None
+    if prior.get("loaded"):
+        launchctl.bootout(wait_seconds=wait_seconds)
+    # A failed proof or replacement must stay stopped across login as well as
+    # for the remainder of this invocation.
+    launchctl.disable()
+    # A replacement is never started until the old authority is fully gone and
+    # the signed backup is proven equal to the now-quiescent live database.
+    preflight_result = _preflight(
+        paths=paths,
+        evidence_manifest=evidence_manifest,
+        maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+        launchctl_bin=launchctl_bin,
+        ps_bin=ps_bin,
+        label=label,
+        config=config,
+        restored_target=restored_target,
+    )
+
+    for directory in {
+        paths.data_root,
+        paths.core_root,
+        paths.capture_root,
+        paths.config.parent,
+        paths.socket.parent,
+        paths.state.parent,
+        paths.log.parent,
+    }:
+        ensure_private_directory(directory)
+    prepare_private_regular(paths.log)
+    write_core_config(paths.config, config)
+    _assert_owner_controlled(paths.config, kind="core service config", require_mode=0o600)
+    _atomic_private_bytes(paths.plist, expected_plist)
+    _assert_owner_controlled(paths.plist, kind="LaunchAgent plist", require_mode=0o600)
+
+    activated = False
+    try:
+        launchctl.enable()
+        launchctl.bootstrap(paths.plist)
+        launchctl.kickstart()
+        activated = True
+        health = wait_for_health(
+            launchctl=launchctl,
+            config=config,
+            prior_pid=prior_pid,
+            wait_seconds=wait_seconds,
+            restored_target=restored_target,
+        )
+        binding = publish_client_binding(
+            paths=paths,
+            label=label,
+            config=config,
+            authority_mode="authoritative-core-v6",
+        )
+    except BaseException as exc:
+        try:
+            launchctl.bootout(wait_seconds=wait_seconds)
+        except Exception:
+            pass
+        try:
+            launchctl.disable()
+        except Exception:
+            pass
+        if isinstance(exc, CoreInstallerError):
+            raise CoreInstallerError(
+                "authoritative-core activation failed; it is unloaded and disabled; "
+                "state, config, plist, token, logs, database, and captures were preserved; "
+                "if schema v6 was claimed the system remains fail-closed"
+            ) from exc
+        raise
+    if not activated:
+        raise CoreInstallerError("authoritative-core activation did not begin")
+    return _safe_result(
+        "install",
+        status="healthy",
+        cutover_attestation=preflight_result.get("cutover_attestation"),
+        client_binding=binding,
+        **health,
+    )
+
+
+def stop(*, launchctl: LaunchCtl, wait_seconds: float) -> dict[str, Any]:
+    launchctl.disable()
+    launchctl.bootout(wait_seconds=wait_seconds)
+    return _safe_result("stop", status="stopped", loaded=False)
+
+
+def _unlink_exact_private(path: Path) -> bool:
+    observed = _lstat(path)
+    if observed is None:
+        return False
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+    ):
+        raise CoreInstallerError("refusing to unlink an unsafe LaunchAgent plist")
+    path.unlink()
+    _fsync_directory(path.parent)
+    return True
+
+
+def uninstall(*, paths: InstallPaths, launchctl: LaunchCtl, wait_seconds: float) -> dict[str, Any]:
+    launchctl.disable()
+    launchctl.bootout(wait_seconds=wait_seconds)
+    removed = _unlink_exact_private(paths.plist)
+    return _safe_result(
+        "uninstall",
+        status="uninstalled",
+        plist_removed=removed,
+        data_preserved=True,
+        config_preserved=True,
+        token_preserved=True,
+        logs_preserved=True,
+        client_binding_preserved=True,
+    )
+
+
+def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
+    snapshot = launchctl.snapshot()
+    healthy = False
+    capture_ready = False
+    binding_path = default_binding_path(paths.home)
+    binding_ready = False
+    binding_digest = None
+    if snapshot.get("running") and paths.config.exists() and not paths.config.is_symlink():
+        try:
+            health = probe_health(load_core_config(paths.config))
+            healthy = bool(health.get("ready"))
+            capture_ready = bool(health.get("capture_ready"))
+        except Exception:
+            pass
+    if paths.config.exists() and not paths.config.is_symlink():
+        try:
+            config = load_core_config(paths.config)
+            expected_binding = binding_for_config(
+                repo_root=paths.root,
+                data_root=paths.data_root,
+                config=config,
+                core_label=launchctl.label,
+                authority_mode="authoritative-core-v6",
+            )
+            observed_binding = load_core_client_binding(binding_path)
+            binding_ready = observed_binding == expected_binding
+            binding_digest = observed_binding.digest
+        except Exception:
+            pass
+    return _safe_result(
+        "status",
+        loaded=bool(snapshot.get("loaded")),
+        running=bool(snapshot.get("running")),
+        pid=snapshot.get("pid"),
+        healthy=healthy,
+        capture_ready=capture_ready,
+        plist_present=paths.plist.is_file() and not paths.plist.is_symlink(),
+        config_present=paths.config.is_file() and not paths.config.is_symlink(),
+        client_binding={
+            "path": str(binding_path),
+            "ready": binding_ready,
+            "digest": binding_digest,
+        },
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = SecretSafeArgumentParser(
+        description="Operate the SYNAPSE-S2 core LaunchAgent"
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("install", "publish-binding", "status", "stop", "uninstall"),
+        default="install",
+    )
+    parser.add_argument("--label", default=os.getenv("SYNAPSE_S2_CORE_LABEL", DEFAULT_LABEL))
+    parser.add_argument("--evidence-manifest")
+    parser.add_argument("--maximum-evidence-age-seconds", type=float, default=7200.0)
+    parser.add_argument("--wait-seconds", type=float, default=180.0)
+    parser.add_argument("--force-restart", action="store_true")
+    parser.add_argument(
+        "--restored-target",
+        action="store_true",
+        help=(
+            "require and attest the exact restored memory/journal/runtime binding; "
+            "valid only for an authoritative-v6 install"
+        ),
+    )
+    parser.add_argument(
+        "--noncanonical-layout-manifest",
+        help="private reviewed manifest authorizing a noncanonical data root",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if not 2.0 <= args.wait_seconds <= 600.0:
+            raise CoreInstallerError("wait-seconds must be between 2 and 600")
+        if not 60.0 <= args.maximum_evidence_age_seconds <= 86_400.0:
+            raise CoreInstallerError("maximum evidence age must be between 60 and 86400 seconds")
+        if args.restored_target and args.action != "install":
+            raise CoreInstallerError("restored-target is valid only for install")
+        layout_manifest = (
+            _normal_absolute(
+                args.noncanonical_layout_manifest,
+                name="noncanonical layout manifest",
+            )
+            if args.noncanonical_layout_manifest
+            else None
+        )
+        paths = resolve_paths(
+            label=args.label,
+            noncanonical_layout_manifest=layout_manifest,
+        )
+        launchctl_bin = os.getenv("SYNAPSE_S2_LAUNCHCTL", "/bin/launchctl")
+        ps_bin = os.getenv("SYNAPSE_S2_PS_BIN", "/bin/ps")
+        launchctl = LaunchCtl(launchctl_bin, uid=os.getuid(), label=args.label)
+        evidence = (
+            _normal_absolute(args.evidence_manifest, name="evidence manifest")
+            if args.evidence_manifest
+            else None
+        )
+        if args.action == "status":
+            result = status(paths=paths, launchctl=launchctl)
+        else:
+            with install_lock(paths, label=args.label):
+                if args.action == "install":
+                    result = install(
+                        paths=paths,
+                        label=args.label,
+                        launchctl=launchctl,
+                        launchctl_bin=launchctl_bin,
+                        ps_bin=ps_bin,
+                        evidence_manifest=evidence,
+                        maximum_evidence_age_seconds=args.maximum_evidence_age_seconds,
+                        wait_seconds=args.wait_seconds,
+                        force_restart=args.force_restart,
+                        restored_target=args.restored_target,
+                    )
+                elif args.action == "publish-binding":
+                    from backend_router import database_requires_core
+
+                    _validate_install_sources(paths)
+                    config = build_config(paths)
+                    if database_requires_core(paths.memory_db):
+                        raise CoreInstallerError(
+                            "candidate binding cannot replace an adopted core binding"
+                        )
+                    result = _safe_result(
+                        "publish-binding",
+                        status="candidate-ready",
+                        client_binding=publish_client_binding(
+                            paths=paths,
+                            label=args.label,
+                            config=config,
+                            authority_mode="candidate-local-v5",
+                        ),
+                    )
+                elif args.action == "stop":
+                    result = stop(launchctl=launchctl, wait_seconds=args.wait_seconds)
+                else:
+                    result = uninstall(
+                        paths=paths,
+                        launchctl=launchctl,
+                        wait_seconds=args.wait_seconds,
+                    )
+    except (CoreInstallerError, CoreServiceError, CutoverPreflightError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+        return 1
+    print(json.dumps({"ok": True, **result}, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

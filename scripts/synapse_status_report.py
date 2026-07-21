@@ -23,6 +23,17 @@ from redaction import (
     redact_capture_text,
     reject_sensitive_identifier,
 )
+from backend_router import (
+    CORE_SOCKET_ENV,
+    LEGACY_CORE_CONFIG_ENV,
+    MEMORY_DB_ENV,
+    STATE_PATH_ENV,
+)
+from core_client_binding import (
+    BINDING_ENV,
+    EXPECTED_CONFIG_ENV,
+    binding_from_environment,
+)
 
 
 DEFAULT_OUTPUT = ROOT / "docs" / "CURRENT_STATUS.md"
@@ -113,7 +124,7 @@ KNOWN_NON_CLAIMS = (
     "Do not capture credentials, tokens, private keys, or unnecessary personal data; redaction is a guardrail, not permission.",
     "Do not call `test-validated` truth unless concrete command, artifact, output, commit, or report evidence exists.",
     "Do not treat dashboard detection of an app as proof that the app exposed useful internal content.",
-    "Do not assume the default CLI provider equals the installed client/dashboard provider; pass `--embedding-provider mlx-neural` when validating the neural path.",
+    "Do not configure a neural provider in a status client; the authoritative core reports the provider it actually owns.",
     "Do not claim Apple Instruments or external Metal counter certification; current certification is MLX/topology/runtime evidence.",
     "Do not push or prune memory without explicit confirmation and a focused target.",
 )
@@ -253,7 +264,7 @@ def render_status_markdown(report: dict[str, Any]) -> str:
             "## Regeneration",
             "",
             "```bash",
-            ".venv/bin/python scripts/synapse_status_report.py --context default --embedding-provider mlx-neural",
+            ".venv/bin/python scripts/synapse_status_report.py --context default",
             "```",
             "",
             "Use this report as a point-in-time status artifact. Re-run it before demos, handoffs, and readiness claims. The source-checkout row records the repository state at generation time; after committing this file, use `git log -1 --oneline` and `git status -sb` for the final commit position.",
@@ -263,10 +274,11 @@ def render_status_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_json(command: list[str]) -> dict[str, Any]:
+def run_json(command: list[str], *, env: dict[str, str]) -> dict[str, Any]:
     result = subprocess.run(
         command,
         cwd=ROOT,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -300,22 +312,21 @@ def git_snapshot() -> dict[str, Any]:
 
 
 def collect_live_report(args: argparse.Namespace) -> dict[str, Any]:
+    env = status_subprocess_environment(args)
     base = [
         sys.executable,
         str(ROOT / "synapse_cli.py"),
         "--json",
-        "--embedding-provider",
-        args.embedding_provider,
     ]
     return {
         "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "context_id": args.context,
         "agent_id": args.agent_id,
-        "status": run_json([*base, "status", "--context", args.context]),
-        "profile": run_json([*base, "profile", "--benchmark-quick-prune"]),
-        "doctor": run_json([*base, "doctor", "--context", args.context, "--include-apps", "--repair-plan"]),
-        "context_health": run_json([*base, "context-health", "--context", args.context]),
-        "memory_hygiene": run_json([*base, "memory-hygiene", "--context", args.context, "--limit", str(args.hygiene_limit)]),
+        "status": run_json([*base, "status", "--context", args.context], env=env),
+        "profile": run_json([*base, "profile", "--benchmark-quick-prune"], env=env),
+        "doctor": run_json([*base, "doctor", "--context", args.context, "--include-apps", "--repair-plan"], env=env),
+        "context_health": run_json([*base, "context-health", "--context", args.context], env=env),
+        "memory_hygiene": run_json([*base, "memory-hygiene", "--context", args.context, "--limit", str(args.hygiene_limit)], env=env),
         "cortex_state": run_json(
             [
                 *base,
@@ -326,10 +337,67 @@ def collect_live_report(args: argparse.Namespace) -> dict[str, Any]:
                 args.agent_id,
                 "--response-mode",
                 "legacy",
-            ]
+            ],
+            env=env,
         ),
         "git": git_snapshot(),
     }
+
+
+def _validated_core_socket(value: Any) -> str:
+    socket_path = Path(str(value or "")).expanduser()
+    if not socket_path.is_absolute() or ".." in socket_path.parts:
+        raise ValueError("core socket must be an absolute normalized path")
+    return str(socket_path)
+
+
+def status_subprocess_environment(
+    args: argparse.Namespace,
+    *,
+    environ: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build one deterministic child environment for every live probe."""
+
+    source = dict(os.environ if environ is None else environ)
+    binding = binding_from_environment(source)
+    requested_socket = str(getattr(args, "core_socket", "") or "").strip()
+    inherited_socket = str(source.get(CORE_SOCKET_ENV, "") or "").strip()
+    env = dict(source)
+    env.pop("MLX_DEVICE", None)
+    env.pop(STATE_PATH_ENV, None)
+    env.pop(MEMORY_DB_ENV, None)
+    for name in LEGACY_CORE_CONFIG_ENV:
+        env.pop(name, None)
+    if binding is not None:
+        if binding.repo_root != ROOT:
+            raise ValueError(
+                "core binding repository does not match the status report checkout"
+            )
+        if requested_socket:
+            asserted_socket = _validated_core_socket(requested_socket)
+            if (
+                binding.authority_mode != "authoritative-core-v6"
+                or Path(asserted_socket) != binding.socket_path
+            ):
+                raise ValueError(
+                    "core socket assertion conflicts with the reviewed core binding"
+                )
+        for name in (
+            CORE_SOCKET_ENV,
+            EXPECTED_CONFIG_ENV,
+            "SYNAPSE_S2_EXPORT_DIR",
+            "SYNAPSE_S2_CAPTURE_ROOT",
+        ):
+            env.pop(name, None)
+        env[BINDING_ENV] = str(source[BINDING_ENV]).strip()
+        return env
+
+    env.pop(BINDING_ENV, None)
+    env.pop(CORE_SOCKET_ENV, None)
+    selected_socket = requested_socket or inherited_socket
+    if selected_socket:
+        env[CORE_SOCKET_ENV] = _validated_core_socket(selected_socket)
+    return env
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -337,6 +405,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context", default="default")
     parser.add_argument("--agent-id", default="codex-desktop")
     parser.add_argument("--embedding-provider", default="mlx-neural")
+    parser.add_argument(
+        "--core-socket",
+        default="",
+        help="Optional explicit authoritative-core socket; otherwise use the durable marker.",
+    )
     parser.add_argument("--hygiene-limit", type=int, default=10)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--print", action="store_true", dest="print_report")

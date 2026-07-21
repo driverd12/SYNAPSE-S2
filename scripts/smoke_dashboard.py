@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import json
+import http.client
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import urllib.request
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dashboard_server import DashboardRuntime, SynapseDashboardServer
+from dashboard_server import (
+    DASHBOARD_BOOTSTRAP_PATH,
+    DASHBOARD_SESSION_FRAGMENT_KEY,
+    DASHBOARD_SESSION_HEADER_NAME,
+    DashboardRuntime,
+    SynapseDashboardServer,
+)
 
 
 WARNING_TOKENS = (
@@ -25,16 +34,56 @@ WARNING_TOKENS = (
 
 
 HTTP_TIMEOUT_SECONDS = 30
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{40,128}\Z")
 
 
-def fetch_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
+def fetch_json(url: str, *, headers: dict[str, str] | None = None) -> dict:
+    request = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
 def fetch_text(url: str) -> str:
     with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return response.read().decode("utf-8")
+
+
+def bootstrap_session(server: SynapseDashboardServer) -> dict[str, str]:
+    authority = f"127.0.0.1:{server.server_port}"
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        server.server_port,
+        timeout=HTTP_TIMEOUT_SECONDS,
+    )
+    try:
+        connection.request(
+            "GET",
+            f"{DASHBOARD_BOOTSTRAP_PATH}?token={server._dashboard_bootstrap_capability}",
+            headers={"Host": authority},
+        )
+        response = connection.getresponse()
+        response.read()
+        location = response.getheader("Location") or ""
+        set_cookie = response.getheader("Set-Cookie") or ""
+        if response.status != 303:
+            raise RuntimeError("dashboard bootstrap did not redirect")
+    finally:
+        connection.close()
+    fragment = parse_qs(urlparse(location).fragment, keep_blank_values=True)
+    candidates = fragment.get(DASHBOARD_SESSION_FRAGMENT_KEY, [])
+    cookie_pair = set_cookie.split(";", 1)[0]
+    if (
+        set(fragment) != {DASHBOARD_SESSION_FRAGMENT_KEY, "target"}
+        or len(candidates) != 1
+        or TOKEN_PATTERN.fullmatch(candidates[0]) is None
+        or fragment.get("target") != ["namespaceGalaxy"]
+        or not cookie_pair.startswith(f"{server._dashboard_cookie_name}=")
+    ):
+        raise RuntimeError("dashboard bootstrap credentials were invalid")
+    return {
+        "Cookie": cookie_pair,
+        DASHBOARD_SESSION_HEADER_NAME: candidates[0],
+    }
 
 
 def main() -> int:
@@ -48,17 +97,23 @@ def main() -> int:
         index = fetch_text(f"{base_url}/")
         app_js = fetch_text(f"{base_url}/app.js")
         styles = fetch_text(f"{base_url}/styles.css")
+        session_headers = bootstrap_session(server)
         # The browser intentionally hydrates its shell without the graph first,
         # then loads graph/galaxy data through their bounded endpoints.  Mirror
         # that production contract here so a cold MLX process cannot make the
         # readiness probe look hung while still proving every visual data lane.
         snapshot = fetch_json(
-            f"{base_url}/api/snapshot?context_id={context}&limit=8&include_graph=false"
+            f"{base_url}/api/snapshot?context_id={context}&limit=8&include_graph=false",
+            headers=session_headers,
         )
-        graph = fetch_json(f"{base_url}/api/graph?context_id={context}&limit=8")
+        graph = fetch_json(
+            f"{base_url}/api/graph?context_id={context}&limit=8",
+            headers=session_headers,
+        )
         namespace_map = fetch_json(
             f"{base_url}/api/namespace-map?context_id={context}"
-            "&limit=50&suggestion_limit=0&include_suggestions=false"
+            "&limit=50&suggestion_limit=0&include_suggestions=false",
+            headers=session_headers,
         )
         warnings = []
         for token in WARNING_TOKENS:

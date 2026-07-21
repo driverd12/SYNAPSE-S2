@@ -1,13 +1,23 @@
 import argparse
 import copy
+import dataclasses
 import json
+import os
 from pathlib import Path
 import stat
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zipfile
 
+from core_client_binding import (
+    BINDING_ENV,
+    EXPECTED_CONFIG_ENV,
+    binding_for_config,
+    write_core_client_binding,
+)
+from core_service import CoreConfig, write_core_config
 
 from scripts.operator_readiness_certify import (
     CheckResult,
@@ -18,6 +28,7 @@ from scripts.operator_readiness_certify import (
     MCP_SAFETY_SCHEMA,
     OperatorReadinessCertifier,
     app_preview_status,
+    build_parser,
     choose_app,
     classify_overall,
     json_safe,
@@ -168,13 +179,21 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             "run_id": "operator-readiness-unit-test",
             "output_dir": str(default_output_dir),
             "launcher": str(default_output_dir / "synapse-s2-mcp"),
-            "embedding_provider": "semantic-hash",
-            "dimension": 1024,
-            "neurons": 8192,
-            "top_k": 256,
-            "neural_model": "safe-local-model",
-            "neural_cache_dir": str(default_output_dir / "models"),
-            "neural_local_files_only": True,
+            "core_socket": "",
+            "core_binding": "",
+            "core_label": "aero.boom.synapse-s2.core",
+            "noncanonical_layout_manifest": "",
+            "expected_embedding_provider": None,
+            "expected_dimension": None,
+            "expected_neurons": None,
+            "expected_top_k": None,
+            "expected_neural_model": None,
+            "expected_neural_revision": None,
+            "expected_neural_pooling": None,
+            "expected_neural_max_tokens": None,
+            "expected_neural_normalize": None,
+            "expected_neural_cache_dir": None,
+            "expected_neural_local_files_only": None,
             "app_name": "",
             "zip": False,
             "json": True,
@@ -182,26 +201,258 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
-    def test_cli_commands_are_bound_to_certified_topology(self):
+    def _write_candidate_binding(
+        self,
+        root: Path,
+        *,
+        authority_mode: str = "candidate-local-v5",
+        fingerprint: str | None = None,
+    ):
+        repo = Path(__file__).resolve().parents[1]
+        data = root / "candidate-data"
+        core = data / "core"
+        core.mkdir(parents=True, mode=0o700)
+        data.chmod(0o700)
+        config = CoreConfig(
+            socket_path=core / "service.sock",
+            state_path=data / "runtime_state.json",
+            memory_path=data / "memory.sqlite3",
+            capture_root=data,
+            dimension=8,
+            num_neurons=16,
+            default_top_k=4,
+        )
+        write_core_config(core / "service.json", config)
+        core_paths = SimpleNamespace(
+            data_root=data,
+            config=core / "service.json",
+            socket=config.socket_path,
+            state=config.state_path,
+            memory_db=config.memory_path,
+            capture_root=data,
+        )
+        binding = binding_for_config(
+            repo_root=repo,
+            data_root=data,
+            config=config,
+            core_label="aero.boom.synapse-s2.core",
+            authority_mode=authority_mode,
+        )
+        if fingerprint is not None:
+            binding = dataclasses.replace(binding, config_fingerprint=fingerprint)
+        binding_path = root / "binding" / "core-binding.json"
+        write_core_client_binding(binding_path, binding)
+        return binding_path, binding, core_paths
+
+    def test_cli_commands_use_core_route_without_local_topology(self):
         with TemporaryDirectory() as tmp:
+            socket_path = (
+                Path(__file__).resolve().parents[1]
+                / ".synapse_s2"
+                / "core"
+                / "service.sock"
+            )
             certifier = OperatorReadinessCertifier(
                 self._args(
                     Path(tmp),
-                    dimension=768,
-                    neurons=6800,
-                    top_k=192,
+                    core_socket=str(socket_path),
                 )
             )
 
             command = certifier._cli_command("doctor", "--context", "default")
             env = certifier._base_env()
 
-        self.assertEqual(command[command.index("--dimension") + 1], "768")
-        self.assertEqual(command[command.index("--neurons") + 1], "6800")
-        self.assertEqual(command[command.index("--top-k") + 1], "192")
-        self.assertEqual(env["SYNAPSE_S2_DIMENSION"], "768")
-        self.assertEqual(env["SYNAPSE_S2_NEURONS"], "6800")
-        self.assertEqual(env["SYNAPSE_S2_TOP_K"], "192")
+        self.assertNotIn("--dimension", command)
+        self.assertNotIn("--neurons", command)
+        self.assertNotIn("--top-k", command)
+        self.assertEqual(env["SYNAPSE_S2_CORE_SOCKET"], str(socket_path.resolve()))
+        self.assertNotIn("SYNAPSE_S2_DIMENSION", env)
+        self.assertNotIn("SYNAPSE_S2_NEURONS", env)
+        self.assertNotIn("SYNAPSE_S2_TOP_K", env)
+
+    def test_default_binding_is_discovered_validated_and_isolates_subprocess_env(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, binding, core_paths = self._write_candidate_binding(root)
+            hostile = {
+                BINDING_ENV: str(root / "wrong-binding.json"),
+                EXPECTED_CONFIG_ENV: "f" * 64,
+                "MLX_DEVICE": "cpu",
+                "SYNAPSE_S2_CORE_SOCKET": str(root / "wrong.sock"),
+                "SYNAPSE_S2_MEMORY_DB": str(root / "wrong.sqlite3"),
+                "SYNAPSE_S2_STATE_PATH": str(root / "wrong.json"),
+                "SYNAPSE_S2_EXPORT_DIR": str(root / "wrong-export"),
+                "SYNAPSE_S2_CAPTURE_ROOT": str(root / "wrong-capture"),
+                "SYNAPSE_S2_DIMENSION": "7",
+            }
+            with (
+                mock.patch.dict(os.environ, {BINDING_ENV: ""}, clear=False),
+                mock.patch(
+                    "scripts.operator_readiness_certify.default_binding_path",
+                    return_value=binding_path,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+            ):
+                certifier = OperatorReadinessCertifier(self._args(root / "run"))
+                with mock.patch.dict(os.environ, hostile, clear=False):
+                    env = certifier._base_env()
+
+        self.assertEqual(certifier.core_binding, binding)
+        self.assertEqual(env[BINDING_ENV], str(binding_path))
+        for name in (
+            EXPECTED_CONFIG_ENV,
+            "MLX_DEVICE",
+            "SYNAPSE_S2_CORE_SOCKET",
+            "SYNAPSE_S2_MEMORY_DB",
+            "SYNAPSE_S2_STATE_PATH",
+            "SYNAPSE_S2_EXPORT_DIR",
+            "SYNAPSE_S2_CAPTURE_ROOT",
+            "SYNAPSE_S2_DIMENSION",
+        ):
+            self.assertNotIn(name, env)
+
+    def test_explicit_binding_rejects_candidate_fingerprint_drift(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, _, core_paths = self._write_candidate_binding(
+                root,
+                fingerprint="f" * 64,
+            )
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(ValueError, "fingerprint does not match"),
+            ):
+                OperatorReadinessCertifier(
+                    self._args(root / "run", core_binding=str(binding_path))
+                )
+
+    def test_matching_socket_is_assertion_only_when_binding_is_present(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, binding, core_paths = self._write_candidate_binding(root)
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+            ):
+                certifier = OperatorReadinessCertifier(
+                    self._args(
+                        root / "run",
+                        core_binding=str(binding_path),
+                        core_socket=str(binding.socket_path),
+                    )
+                )
+                env = certifier._base_env()
+
+        self.assertEqual(env[BINDING_ENV], str(binding_path))
+        self.assertNotIn("SYNAPSE_S2_CORE_SOCKET", env)
+
+    def test_client_config_probe_uses_the_reviewed_binding_path(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, _, core_paths = self._write_candidate_binding(root)
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+            ):
+                certifier = OperatorReadinessCertifier(
+                    self._args(root / "run", core_binding=str(binding_path))
+                )
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_client_config()
+
+        command = run_command.call_args.kwargs["command"]
+        self.assertEqual(
+            command[command.index("--core-binding") + 1],
+            str(binding_path),
+        )
+
+    def test_parser_defaults_follow_candidate_config_without_parallel_defaults(self):
+        with TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=True):
+            args = build_parser().parse_args(
+                [
+                    "--output-dir",
+                    tmp,
+                    "--launcher",
+                    str(Path(tmp) / "synapse-s2-mcp"),
+                ]
+            )
+            certifier = OperatorReadinessCertifier(args)
+
+        self.assertIsNone(args.expected_embedding_provider)
+        self.assertIsNone(args.expected_dimension)
+        self.assertEqual(
+            certifier.core_config_contract["config_fingerprint"],
+            certifier.candidate_config.fingerprint,
+        )
+        self.assertEqual(
+            certifier.candidate_config.embedding_provider_name,
+            "semantic-hash",
+        )
+
+    def test_candidate_expectation_mismatch_is_rejected_before_evidence_write(self):
+        with TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            ValueError,
+            "dimension expectation does not match",
+        ):
+            OperatorReadinessCertifier(
+                self._args(Path(tmp), expected_dimension=999)
+            )
+
+    def test_semantic_benchmark_must_match_exact_candidate_provider_and_dimensions(self):
+        with TemporaryDirectory() as tmp:
+            certifier = OperatorReadinessCertifier(self._args(Path(tmp)))
+            observed = []
+
+            def run_command(_check_id, **kwargs):
+                payload = {
+                    "dimensions": certifier.candidate_config.dimension,
+                    "vector_nonzero_count": 7,
+                    "average_latency_ms": 1.25,
+                    "embedding_provider": {
+                        "provider": "semantic-hash-v1",
+                        "provider_type": "semantic-hash",
+                        "model_id": "semantic-hash-v1",
+                        "dimensions": certifier.candidate_config.dimension,
+                        "local_only": True,
+                    },
+                }
+                observed.append(kwargs["evaluator"](0, payload, "", ""))
+                payload["embedding_provider"]["dimensions"] -= 1
+                observed.append(kwargs["evaluator"](0, payload, "", ""))
+
+            with mock.patch.object(certifier, "_run_command", side_effect=run_command):
+                certifier._check_neural_embedding()
+
+        self.assertEqual(observed[0][0], "ready")
+        self.assertEqual(observed[1][0], "blocked")
+        self.assertTrue(observed[0][3]["exact_matches"]["provider_dimensions"])
+        self.assertFalse(observed[1][3]["exact_matches"]["provider_dimensions"])
 
     def test_mcp_compact_contract_probe_accepts_snake_and_camel_wire_shapes(self):
         for camel_case in (False, True):
@@ -544,6 +795,69 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertEqual(command[command.index("--timeout") + 1], "30")
         self.assertEqual(probe.kwargs["timeout"], 60)
 
+    def test_installed_launcher_status_attests_bound_config_and_embedding_identity(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            binding_path, binding, core_paths = self._write_candidate_binding(root)
+            with (
+                mock.patch(
+                    "scripts.operator_readiness_certify.resolve_candidate_core_paths",
+                    return_value=core_paths,
+                ),
+                mock.patch(
+                    "scripts.operator_readiness_certify.database_requires_core",
+                    return_value=False,
+                ),
+            ):
+                certifier = OperatorReadinessCertifier(
+                    self._args(root / "run", core_binding=str(binding_path))
+                )
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_mcp_connect()
+            evaluator = run_command.call_args_list[1].kwargs["evaluator"]
+            config = certifier.candidate_config
+            runtime = {
+                "runtime": "ready",
+                "dimension": config.dimension,
+                "num_neurons": config.num_neurons,
+                "default_top_k": config.default_top_k,
+                "recall_count": config.recall_count,
+                "quick_pruning_interval_seconds": (
+                    config.quick_pruning_interval_seconds
+                ),
+                "idle_deep_sleep_seconds": config.idle_deep_sleep_seconds,
+                "mlx_device": config.mlx_device,
+                "mlx_available": True,
+                "embedding_provider": {
+                    "provider": "semantic-hash-v1",
+                    "provider_type": "semantic-hash",
+                },
+            }
+            envelope = {"content": [{"type": "text", "text": json.dumps(runtime)}]}
+
+            ready = evaluator(0, envelope, "", "")
+            runtime["dimension"] += 1
+            drifted = evaluator(
+                0,
+                {"content": [{"type": "text", "text": json.dumps(runtime)}]},
+                "",
+                "",
+            )
+
+        self.assertEqual(ready[0], "ready")
+        self.assertEqual(drifted[0], "blocked")
+        self.assertEqual(
+            ready[3]["observed_effective_config_fingerprint"],
+            binding.config_fingerprint,
+        )
+        self.assertEqual(
+            ready[3]["observed_embedding_space_identity"],
+            binding.embedding_space_identity,
+        )
+        self.assertEqual(ready[3]["config_digest"], binding.config_digest)
+        self.assertTrue(ready[3]["exact_matches"]["dimension"])
+        self.assertFalse(drifted[3]["exact_matches"]["dimension"])
+
     def test_private_evidence_writer_preserves_existing_parent_mode(self):
         with TemporaryDirectory() as tmp:
             parent = Path(tmp) / "caller-owned"
@@ -591,9 +905,13 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 {"run_id": f"password={marker}"},
                 {"output_dir": str(Path(tmp) / f"api_key={marker}")},
                 {"launcher": str(Path(tmp) / f"token={marker}")},
-                {"embedding_provider": f"password={marker}"},
-                {"neural_model": f"api_key={marker}"},
-                {"neural_cache_dir": str(Path(tmp) / f"token={marker}")},
+                {"expected_embedding_provider": f"password={marker}"},
+                {"expected_neural_model": f"api_key={marker}"},
+                {
+                    "expected_neural_cache_dir": str(
+                        Path(tmp) / f"token={marker}"
+                    )
+                },
             )
             for overrides in sensitive_overrides:
                 with self.subTest(overrides=tuple(overrides)), self.assertRaisesRegex(
@@ -908,7 +1226,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertIn("Operator trustworthy: `false`", summary)
         self.assertIn("Fix dashboard warnings.", summary)
         self.assertIn("scripts/operator_readiness_certify.py", runbook)
-        self.assertIn("--embedding-provider mlx-neural", runbook)
+        self.assertIn("--expect-embedding-provider mlx-neural", runbook)
         self.assertIn("compact MCP contract", runbook)
         self.assertIn("12,288-byte structured", runbook)
         self.assertIn("4,096-byte safety", runbook)

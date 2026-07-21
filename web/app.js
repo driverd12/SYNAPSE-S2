@@ -1,5 +1,9 @@
 const DEFAULT_CONTEXT = "default";
 const THEME_STORAGE_KEY = "synapse-s2-control-theme-v4";
+const DASHBOARD_SESSION_HEADER_NAME = "X-Synapse-Dashboard-Session";
+const DASHBOARD_SESSION_STORAGE_KEY = "synapse-s2-dashboard-session-v1";
+const DASHBOARD_SESSION_FRAGMENT_KEY = "synapse_dashboard_session";
+const DASHBOARD_SESSION_PATTERN = /^[A-Za-z0-9_-]{40,128}$/;
 const SNAPSHOT_LIMIT = 80;
 const GRAPH_WIDTH = 760;
 const GRAPH_HEIGHT = 420;
@@ -14,6 +18,45 @@ const NAMESPACE_DETAIL_NEURON_ZOOM = 1.42;
 const NAMESPACE_GALAXY_CONTEXT_PARAM = "galaxy_context";
 const NAMESPACE_GALAXY_CLUSTER_PARAM = "galaxy_cluster";
 const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
+
+function loadDashboardSessionCapability() {
+  const rawFragment = window.location.hash.startsWith("#")
+    ? window.location.hash.slice(1)
+    : "";
+  const fragment = new URLSearchParams(rawFragment);
+  const fragmentCapability = fragment.get(DASHBOARD_SESSION_FRAGMENT_KEY);
+  if (fragmentCapability !== null) {
+    const target = fragment.get("target");
+    try {
+      if (DASHBOARD_SESSION_PATTERN.test(fragmentCapability)) {
+        window.sessionStorage.setItem(
+          DASHBOARD_SESSION_STORAGE_KEY,
+          fragmentCapability,
+        );
+      } else {
+        window.sessionStorage.removeItem(DASHBOARD_SESSION_STORAGE_KEY);
+      }
+    } catch (_error) {
+      // A storage-disabled browser remains fail-closed at the API boundary.
+    }
+    const cleanTarget = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target || "")
+      ? `#${target}`
+      : "";
+    window.history.replaceState(
+      window.history.state,
+      "",
+      `${window.location.pathname}${window.location.search}${cleanTarget}`,
+    );
+  }
+  try {
+    const stored = window.sessionStorage.getItem(DASHBOARD_SESSION_STORAGE_KEY) || "";
+    return DASHBOARD_SESSION_PATTERN.test(stored) ? stored : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+const dashboardSessionCapability = loadDashboardSessionCapability();
 const WIZARD_FLOWS = {
   intro: {
     label: "First-time orientation",
@@ -728,14 +771,32 @@ function apiUrl(path, params = {}) {
 }
 
 async function requestJson(path, { method = "GET", params = {}, body = null } = {}) {
+  const headers = {};
+  if (dashboardSessionCapability) {
+    headers[DASHBOARD_SESSION_HEADER_NAME] = dashboardSessionCapability;
+  }
+  if (body) {
+    headers["Content-Type"] = "application/json";
+  }
   const response = await fetch(apiUrl(path, params), {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const payload = await response.json();
   if (!response.ok) {
-    throw new Error(payload.error || `HTTP ${response.status}`);
+    const reconciliation = payload?.reconciliation;
+    const handle = reconciliation && typeof reconciliation === "object"
+      ? JSON.stringify(reconciliation)
+      : "";
+    const message = handle
+      ? `${payload.error || `HTTP ${response.status}`} — copy reconciliation handle: ${handle}`
+      : payload.error || `HTTP ${response.status}`;
+    const error = new Error(message);
+    if (handle) {
+      error.reconciliation = reconciliation;
+    }
+    throw error;
   }
   return payload;
 }
@@ -6656,9 +6717,10 @@ elements.mondayReadinessButton.addEventListener("click", () => {
   withBusy(elements.mondayReadinessButton, "Monday readiness", async () => {
     setSelfTestState("Monday readiness running", "Scoring runtime, memory, embeddings, App Connect, and recall.", "pending");
     const payload = await requestJson("/api/monday-readiness", {
-      params: {
+      method: "POST",
+      body: {
         context_id: state.context,
-        include_apps: "true",
+        include_apps: true,
       },
     });
     renderMondayReadiness(payload);
@@ -6671,8 +6733,9 @@ elements.mondayReadinessButton.addEventListener("click", () => {
 
 elements.profileButton.addEventListener("click", async () => {
   await withBusy(elements.profileButton, "Resource profile", async () => {
-    const profile = await requestJson("/api/profile", {
-      params: { benchmark_quick_prune: "true" },
+    const profile = await requestJson("/api/profile-benchmark", {
+      method: "POST",
+      body: {},
     });
     state.snapshot.profile = profile;
     renderSnapshot(state.snapshot);

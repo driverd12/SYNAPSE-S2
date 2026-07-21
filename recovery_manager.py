@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -27,19 +28,50 @@ from capture_daemon import (
     GLOBAL_CAPTURE_LOCK,
     resolve_capture_root,
 )
+from core_request_journal import (
+    JOURNAL_APPLICATION_ID,
+    JOURNAL_BINDING_SCHEMA,
+    JOURNAL_SCHEMA_IDENTITY,
+    JOURNAL_SCHEMA_VERSION,
+)
 from memory_store import (
     BACKUP_DIGEST_RE,
+    BACKUP_CRITICAL_TABLES,
+    BACKUP_SCHEMA_COMPATIBILITY_REGISTRY,
     CAPTURE_PROTOCOL_VERSION,
     DurableMemoryStore,
+    LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
+    RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA,
+    SQLITE_USER_VERSION,
     _json_dumps,
     capture_request_fingerprint,
 )
 from redaction import redact_capture_text, reject_sensitive_identifier, strip_untrusted_raw_digest_text
 
 
-RECOVERY_BUNDLE_SCHEMA = "synapse-s2.recovery-bundle.v1"
+RECOVERY_BUNDLE_SCHEMA = "synapse-s2.recovery-bundle.v2"
+LEGACY_RECOVERY_BUNDLE_SCHEMA = "synapse-s2.recovery-bundle.v1"
+REQUEST_JOURNAL_RESTORE_BINDING_SCHEMA = (
+    "synapse-s2.request-journal-restore-binding.v1"
+)
+REQUEST_JOURNAL_SCHEMA_SHA256 = (
+    "1325dcfa3887dc64b6de58f23d03be8393e246fcea8a72c606fcb05cc74f8e3b"
+)
+REQUEST_JOURNAL_ID_RE = re.compile(r"\Ajournal-[0-9a-f]{24}\Z")
+STORE_IDENTITY_RE = re.compile(r"\Astore-[0-9a-f]{24}\Z")
+REQUEST_JOURNAL_IDENTIFIER_RE = re.compile(
+    r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z"
+)
 CAPTURE_ARCHIVE_MANIFEST_SCHEMA = "synapse-s2.capture-archive.v1"
-RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v1"
+RUNTIME_STATE_BINDING_SCHEMA = "synapse-s2.runtime-state-binding.v1"
+RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA = (
+    "synapse-s2.runtime-authority-binding.v1"
+)
+RUNTIME_STATE_AUTHORITY_LOCK_RE = re.compile(
+    r"\Alockfs-v1-[0-9a-f]{1,32}-[0-9a-f]{1,32}\Z"
+)
+RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v2"
+LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v1"
 RECOVERY_RETENTION_PLAN_SCHEMA = "synapse-s2.recovery-retention-plan.v1"
 RECOVERY_RETIREMENT_RECEIPT_SCHEMA = "synapse-s2.recovery-retirement.v1"
 RECOVERY_PUBLICATION_RECEIPT_SCHEMA = "synapse-s2.recovery-publication.v1"
@@ -138,10 +170,22 @@ class VerifiedRecoveryManager:
         store: DurableMemoryStore,
         *,
         capture_root: str | os.PathLike[str] | None = None,
+        runtime_state_path: str | os.PathLike[str] | None = None,
         allow_noncanonical_capture_root: bool = False,
     ) -> None:
         self.store = store
         self.capture_root = resolve_capture_root(capture_root)
+        configured_runtime_state = (
+            runtime_state_path
+            if runtime_state_path is not None
+            else os.getenv("SYNAPSE_S2_STATE_PATH")
+            or (self.store.db_path.parent / "runtime_state.json")
+        )
+        reject_sensitive_identifier(
+            configured_runtime_state,
+            field="runtime state path",
+        )
+        self.runtime_state_path = Path(configured_runtime_state).expanduser().absolute()
         self.allow_noncanonical_capture_root = bool(allow_noncanonical_capture_root)
         self.daemon = CaptureInboxDaemon(root=self.capture_root)
         self._repository_thread_lock = threading.RLock()
@@ -190,6 +234,48 @@ class VerifiedRecoveryManager:
                 self.store._release_file_lock(descriptor)
         finally:
             self._repository_thread_lock.release()
+
+    @contextmanager
+    def _existing_private_file_lock(
+        self,
+        path: Path,
+        *,
+        mode: int,
+    ) -> Iterable[None]:
+        """Acquire an already-established lock without creating or chmodding it."""
+
+        observed = os.lstat(path)
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        acquired = False
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or int(opened.st_nlink) != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or self.store._regular_file_identity(observed)
+                != self.store._regular_file_identity(opened)
+            ):
+                raise PermissionError("attestation lock is not private")
+            fcntl.flock(descriptor, mode)
+            acquired = True
+            visible = os.lstat(path)
+            held = os.fstat(descriptor)
+            if (
+                self.store._regular_file_identity(visible)
+                != self.store._regular_file_identity(opened)
+                or self.store._regular_file_identity(held)
+                != self.store._regular_file_identity(opened)
+            ):
+                raise RuntimeError("attestation lock identity changed")
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def _publication_journal_root(self) -> Path:
         root = self.store.db_path.parent / "backups" / "publication-journals"
@@ -255,8 +341,8 @@ class VerifiedRecoveryManager:
                 relative_directory.is_absolute()
                 or ".." in relative_directory.parts
                 or not isinstance(artifact_names, list)
-                or len(artifact_names) != 4
-                or len(set(artifact_names)) != 4
+                or len(artifact_names) not in {4, 5, 6, 7}
+                or len(set(artifact_names)) != len(artifact_names)
                 or any(
                     not isinstance(name, str)
                     or not name
@@ -293,7 +379,7 @@ class VerifiedRecoveryManager:
                         "bundle_receipt_digest": str(
                             bundle_receipt["receipt_digest"]
                         ),
-                        "artifact_count": 4,
+                        "artifact_count": len(artifact_names),
                         "verified": True,
                         "created_at": time.time(),
                     }
@@ -396,6 +482,57 @@ class VerifiedRecoveryManager:
         return database_path.with_name(database_path.name + ".bundle.receipt.json")
 
     @staticmethod
+    def _request_journal_artifact_path(database_path: Path) -> Path:
+        return database_path.with_name(database_path.name + ".requests.sqlite3")
+
+    @staticmethod
+    def _request_journal_binding_receipt_path(database_path: Path) -> Path:
+        return database_path.with_name(
+            database_path.name + ".requests.binding.receipt.json"
+        )
+
+    @staticmethod
+    def _runtime_state_artifact_path(database_path: Path) -> Path:
+        return database_path.with_name(database_path.name + ".runtime-state.json")
+
+    def _store_identity(self) -> str:
+        with closing(self.store._connect_read_only()) as conn:
+            marker = self.store._core_authority_marker(conn)
+            self.store._validate_core_authority_version_pair(conn, marker)
+        if marker is not None:
+            return str(marker["store_identity"])
+        return self.store.store_identity_for_path(self.store.db_path)
+
+    def _live_store_governance(self) -> dict[str, Any]:
+        with closing(self.store._connect_read_only()) as conn:
+            marker = self.store._core_authority_marker(conn)
+            self.store._validate_core_authority_version_pair(conn, marker)
+            user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if marker is None:
+            if user_version != 5:
+                raise RuntimeError(
+                    "journal-less recovery is supported only for a pre-governed v5 store"
+                )
+            return {
+                "governance_mode": "pre-governed-v5",
+                "store_generation": "legacy-v5",
+                "authority_epoch_number": None,
+                "store_identity": self.store.store_identity_for_path(
+                    self.store.db_path
+                ),
+                "request_journal_id": None,
+            }
+        if user_version != SQLITE_USER_VERSION:
+            raise RuntimeError("governed recovery requires an authoritative v6 store")
+        return {
+            "governance_mode": "authoritative-v6",
+            "store_generation": f"epoch-{int(marker['epoch'])}",
+            "authority_epoch_number": int(marker["epoch"]),
+            "store_identity": str(marker["store_identity"]),
+            "request_journal_id": str(marker["request_journal_id"]),
+        }
+
+    @staticmethod
     def _bounded_capture_limits() -> tuple[int, int, int]:
         max_files = int(os.getenv("SYNAPSE_S2_RECOVERY_MAX_CAPTURE_FILES", "100000"))
         max_total_bytes = int(
@@ -454,6 +591,1717 @@ class VerifiedRecoveryManager:
         if len(data) != int(opened.st_size):
             raise RuntimeError("capture recovery input size changed while reading")
         return data, opened
+
+    @staticmethod
+    def _journal_column_signature(conn: sqlite3.Connection) -> tuple[tuple[Any, ...], ...]:
+        return tuple(
+            (
+                str(row[1]),
+                str(row[2]).upper(),
+                int(row[3]),
+                row[4],
+                int(row[5]),
+                int(row[6]),
+            )
+            for row in conn.execute("PRAGMA table_xinfo(request_journal)").fetchall()
+        )
+
+    def _inspect_request_journal_snapshot(
+        self,
+        path: Path,
+        *,
+        maximum_authority_epoch: int,
+    ) -> dict[str, Any]:
+        if maximum_authority_epoch <= 0:
+            raise ValueError("request-journal binding requires a governed store epoch")
+        uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            quick_check = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
+            integrity_check = [
+                str(row[0]) for row in conn.execute("PRAGMA integrity_check")
+            ]
+            application_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
+            user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            schema = self.store._sqlite_schema_fingerprint(conn)
+            logical_snapshot = self.store._canonical_logical_snapshot_digest(
+                conn
+            )
+            expected_columns = (
+                ("caller", "TEXT", 1, None, 1, 0),
+                ("request_id", "TEXT", 1, None, 2, 0),
+                ("operation", "TEXT", 1, None, 0, 0),
+                ("request_fingerprint", "TEXT", 1, None, 0, 0),
+                ("authority_epoch", "TEXT", 1, None, 0, 0),
+                ("state", "TEXT", 1, None, 0, 0),
+                ("result_kind", "TEXT", 0, None, 0, 0),
+                ("safe_error_code", "TEXT", 0, None, 0, 0),
+                ("accepted_at_unix_ms", "INTEGER", 1, None, 0, 0),
+                ("finished_at_unix_ms", "INTEGER", 0, None, 0, 0),
+            )
+            objects = {
+                (str(row[0]), str(row[1]))
+                for row in conn.execute(
+                    "SELECT type, name FROM sqlite_schema "
+                    "WHERE name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            if (
+                quick_check != ["ok"]
+                or integrity_check != ["ok"]
+                or application_id != JOURNAL_APPLICATION_ID
+                or user_version != JOURNAL_SCHEMA_VERSION
+                or str(schema["sha256"]) != REQUEST_JOURNAL_SCHEMA_SHA256
+                or self._journal_column_signature(conn) != expected_columns
+                or objects
+                != {
+                    ("table", "request_journal"),
+                    ("index", "request_journal_terminal_age"),
+                    ("table", "request_journal_metadata"),
+                }
+            ):
+                raise RuntimeError("request journal failed its exact recovery contract")
+            metadata_columns = tuple(
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(request_journal_metadata)"
+                ).fetchall()
+            )
+            metadata = {
+                str(row[0]): str(row[1])
+                for row in conn.execute(
+                    "SELECT key, value FROM request_journal_metadata ORDER BY key"
+                ).fetchall()
+            }
+            if (
+                metadata_columns != ("key", "value")
+                or set(metadata)
+                != {"binding_schema", "journal_id", "store_identity"}
+                or metadata["binding_schema"] != JOURNAL_BINDING_SCHEMA
+                or REQUEST_JOURNAL_ID_RE.fullmatch(metadata["journal_id"]) is None
+                or STORE_IDENTITY_RE.fullmatch(metadata["store_identity"]) is None
+            ):
+                raise RuntimeError(
+                    "request journal has an invalid immutable store binding"
+                )
+            state_counts = {
+                "accepted": 0,
+                "completed": 0,
+                "failed": 0,
+                "ambiguous": 0,
+            }
+            current_epoch_row_count = 0
+            maximum_observed_epoch = 0
+            maximum_rows = int(
+                os.getenv("SYNAPSE_S2_RECOVERY_MAX_JOURNAL_ROWS", "1000000")
+            )
+            row_count = int(
+                conn.execute("SELECT COUNT(*) FROM request_journal").fetchone()[0]
+            )
+            if maximum_rows <= 0 or row_count > maximum_rows:
+                raise RuntimeError("request journal exceeds the recovery row limit")
+            result_kinds = {
+                "null",
+                "boolean",
+                "integer",
+                "number",
+                "string",
+                "array",
+                "object",
+            }
+            terminal_errors = {
+                "authentication_failed",
+                "deadline_exceeded",
+                "operation_failed",
+                "operation_unavailable",
+                "protocol_violation",
+                "request_conflict",
+                "service_unavailable",
+            }
+            cursor = conn.execute(
+                "SELECT caller, request_id, operation, request_fingerprint, "
+                "authority_epoch, state, result_kind, safe_error_code, "
+                "accepted_at_unix_ms, finished_at_unix_ms FROM request_journal"
+            )
+            streamed_row_count = 0
+            while True:
+                batch = cursor.fetchmany(512)
+                if not batch:
+                    break
+                streamed_row_count += len(batch)
+                if streamed_row_count > row_count:
+                    raise RuntimeError("request journal changed during bounded inspection")
+                for row in batch:
+                    caller = str(row["caller"])
+                    request_id = str(row["request_id"])
+                    operation = str(row["operation"])
+                    fingerprint = str(row["request_fingerprint"])
+                    authority_epoch = str(row["authority_epoch"])
+                    state = str(row["state"])
+                    result_kind = row["result_kind"]
+                    safe_error_code = row["safe_error_code"]
+                    accepted_at = row["accepted_at_unix_ms"]
+                    finished_at = row["finished_at_unix_ms"]
+                    epoch_match = re.fullmatch(
+                        r"epoch-([1-9][0-9]*)", authority_epoch
+                    )
+                    if (
+                        any(
+                            REQUEST_JOURNAL_IDENTIFIER_RE.fullmatch(value) is None
+                            for value in (caller, request_id, operation)
+                        )
+                        or BACKUP_DIGEST_RE.fullmatch(fingerprint) is None
+                        or epoch_match is None
+                        or state not in state_counts
+                        or type(accepted_at) is not int
+                        or int(accepted_at) <= 0
+                    ):
+                        raise RuntimeError(
+                            "request journal contains an invalid durable row"
+                        )
+                    for field, value in (
+                        ("request caller", caller),
+                        ("request id", request_id),
+                        ("request operation", operation),
+                    ):
+                        reject_sensitive_identifier(value, field=field)
+                    epoch_number = int(epoch_match.group(1))
+                    if epoch_number > maximum_authority_epoch:
+                        raise RuntimeError(
+                            "request journal belongs to a newer store authority generation"
+                        )
+                    maximum_observed_epoch = max(
+                        maximum_observed_epoch, epoch_number
+                    )
+                    if epoch_number == maximum_authority_epoch:
+                        current_epoch_row_count += 1
+                    if state == "accepted":
+                        valid_state = (
+                            result_kind is None
+                            and safe_error_code is None
+                            and finished_at is None
+                        )
+                    elif state == "completed":
+                        valid_state = (
+                            result_kind in result_kinds
+                            and safe_error_code is None
+                            and type(finished_at) is int
+                            and int(finished_at) >= int(accepted_at)
+                        )
+                    elif state == "ambiguous":
+                        valid_state = (
+                            result_kind is None
+                            and safe_error_code == "outcome_unknown"
+                            and type(finished_at) is int
+                            and int(finished_at) >= int(accepted_at)
+                        )
+                    else:
+                        valid_state = (
+                            result_kind is None
+                            and safe_error_code in terminal_errors
+                            and type(finished_at) is int
+                            and int(finished_at) >= int(accepted_at)
+                        )
+                    if not valid_state:
+                        raise RuntimeError(
+                            "request journal row state is inconsistent"
+                        )
+                    state_counts[state] += 1
+            if streamed_row_count != row_count:
+                raise RuntimeError("request journal changed during bounded inspection")
+        return {
+            "application_id": application_id,
+            "schema_version": user_version,
+            "schema_identity": JOURNAL_SCHEMA_IDENTITY,
+            "schema_sha256": str(schema["sha256"]),
+            "logical_snapshot_schema": str(logical_snapshot["schema"]),
+            "logical_snapshot_sha256": str(logical_snapshot["sha256"]),
+            "logical_snapshot_table_count": int(logical_snapshot["table_count"]),
+            "logical_snapshot_column_count": int(logical_snapshot["column_count"]),
+            "logical_snapshot_row_count": int(logical_snapshot["row_count"]),
+            "logical_snapshot_value_bytes": int(logical_snapshot["value_bytes"]),
+            "row_count": row_count,
+            "state_counts": state_counts,
+            "current_authority_epoch_row_count": current_epoch_row_count,
+            "maximum_observed_authority_epoch": maximum_observed_epoch,
+            "journal_id": metadata["journal_id"],
+            "store_identity": metadata["store_identity"],
+            "quick_check": quick_check,
+            "integrity_check": integrity_check,
+            "verified": True,
+        }
+
+    def recompute_request_journal_logical_digest(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        maximum_authority_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        """Recompute the live journal's exact logical digest without mutation.
+
+        Unlike recovery-artifact verification, this opens SQLite without
+        ``immutable=1`` so committed WAL pages participate in one explicit
+        read transaction.  The generic logical digest scanner supplies the
+        deterministic ordering, byte/row bounds, and schema identity.
+        """
+
+        source = (
+            self.store.db_path.parent / "core" / "requests.sqlite3"
+            if path is None
+            else Path(path).expanduser().absolute()
+        )
+        reject_sensitive_identifier(source, field="request journal path")
+        observed = os.lstat(source)
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) & 0o077
+            or int(observed.st_nlink) != 1
+        ):
+            raise PermissionError("live request journal is not private")
+        uri = source.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("BEGIN")
+            try:
+                application_id = int(
+                    conn.execute("PRAGMA application_id").fetchone()[0]
+                )
+                user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                schema = self.store._sqlite_schema_fingerprint(conn)
+                if (
+                    application_id != JOURNAL_APPLICATION_ID
+                    or user_version != JOURNAL_SCHEMA_VERSION
+                    or str(schema["sha256"]) != REQUEST_JOURNAL_SCHEMA_SHA256
+                ):
+                    raise RuntimeError(
+                        "live request journal failed its exact schema contract"
+                    )
+                maximum_rows = int(
+                    os.getenv("SYNAPSE_S2_RECOVERY_MAX_JOURNAL_ROWS", "1000000")
+                )
+                row_count = int(
+                    conn.execute("SELECT COUNT(*) FROM request_journal").fetchone()[0]
+                )
+                if maximum_rows <= 0 or row_count > maximum_rows:
+                    raise RuntimeError("request journal exceeds the recovery row limit")
+                maximum_observed_epoch = 0
+                for epoch_row in conn.execute(
+                    "SELECT authority_epoch FROM request_journal "
+                    "GROUP BY authority_epoch"
+                ):
+                    match = re.fullmatch(
+                        r"epoch-([1-9][0-9]*)", str(epoch_row[0])
+                    )
+                    if match is None:
+                        raise RuntimeError(
+                            "live request journal contains an invalid authority epoch"
+                        )
+                    maximum_observed_epoch = max(
+                        maximum_observed_epoch,
+                        int(match.group(1)),
+                    )
+                if (
+                    maximum_authority_epoch is not None
+                    and maximum_observed_epoch > int(maximum_authority_epoch)
+                ):
+                    raise RuntimeError(
+                        "live request journal belongs to a newer authority generation"
+                    )
+                state_counts = {
+                    "accepted": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "ambiguous": 0,
+                }
+                for state_row in conn.execute(
+                    "SELECT state, COUNT(*) FROM request_journal GROUP BY state"
+                ):
+                    state = str(state_row[0])
+                    if state not in state_counts:
+                        raise RuntimeError(
+                            "live request journal contains an invalid state"
+                        )
+                    state_counts[state] = int(state_row[1])
+                metadata = {
+                    str(row[0]): str(row[1])
+                    for row in conn.execute(
+                        "SELECT key, value FROM request_journal_metadata ORDER BY key"
+                    ).fetchall()
+                }
+                if (
+                    set(metadata)
+                    != {"binding_schema", "journal_id", "store_identity"}
+                    or metadata["binding_schema"] != JOURNAL_BINDING_SCHEMA
+                    or REQUEST_JOURNAL_ID_RE.fullmatch(metadata["journal_id"])
+                    is None
+                    or STORE_IDENTITY_RE.fullmatch(metadata["store_identity"])
+                    is None
+                ):
+                    raise RuntimeError(
+                        "live request journal has an invalid immutable binding"
+                    )
+                logical_snapshot = self.store._canonical_logical_snapshot_digest(
+                    conn
+                )
+            finally:
+                conn.execute("ROLLBACK")
+        visible = os.lstat(source)
+        if (
+            int(visible.st_dev),
+            int(visible.st_ino),
+        ) != (
+            int(observed.st_dev),
+            int(observed.st_ino),
+        ):
+            raise RuntimeError("live request journal identity changed during attestation")
+        return {
+            "path": str(source),
+            "application_id": application_id,
+            "schema_version": user_version,
+            "schema_identity": JOURNAL_SCHEMA_IDENTITY,
+            "schema_sha256": str(schema["sha256"]),
+            "logical_snapshot_schema": str(logical_snapshot["schema"]),
+            "logical_snapshot_sha256": str(logical_snapshot["sha256"]),
+            "logical_snapshot_table_count": int(logical_snapshot["table_count"]),
+            "logical_snapshot_column_count": int(logical_snapshot["column_count"]),
+            "logical_snapshot_row_count": int(logical_snapshot["row_count"]),
+            "logical_snapshot_value_bytes": int(logical_snapshot["value_bytes"]),
+            "row_count": row_count,
+            "state_counts": state_counts,
+            "maximum_observed_authority_epoch": maximum_observed_epoch,
+            "journal_id": metadata["journal_id"],
+            "store_identity": metadata["store_identity"],
+            "verified": True,
+        }
+
+    def _snapshot_request_journal(
+        self,
+        destination: Path,
+        *,
+        maximum_authority_epoch: int,
+    ) -> dict[str, Any]:
+        source = self.store.db_path.parent / "core" / "requests.sqlite3"
+        source_parent = source.parent
+        parent_metadata = os.lstat(source_parent)
+        source_metadata = os.lstat(source)
+        maximum_bytes = int(
+            os.getenv(
+                "SYNAPSE_S2_RECOVERY_MAX_JOURNAL_BYTES",
+                str(512 * 1024**2),
+            )
+        )
+        if maximum_bytes <= 0 or int(source_metadata.st_size) > maximum_bytes:
+            raise RuntimeError("authoritative request journal exceeds its recovery limit")
+        if (
+            stat.S_ISLNK(parent_metadata.st_mode)
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+            or stat.S_ISLNK(source_metadata.st_mode)
+            or not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_uid != os.getuid()
+            or source_metadata.st_nlink != 1
+            or stat.S_IMODE(source_metadata.st_mode) != 0o600
+        ):
+            raise PermissionError("authoritative request journal is not private")
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{source}{suffix}")
+            try:
+                observed = os.lstat(sidecar)
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.getuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != 0o600
+            ):
+                raise PermissionError("authoritative request-journal sidecar is unsafe")
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError("request-journal recovery artifact already exists")
+        temporary = self.store._unique_private_temp_path(
+            destination.parent,
+            prefix=f".{destination.name}.",
+        )
+        published = False
+        try:
+            source_uri = source.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(source_uri, uri=True)) as journal_source:
+                journal_source.execute("PRAGMA query_only = ON")
+                with closing(sqlite3.connect(temporary)) as journal_destination:
+                    journal_source.backup(journal_destination)
+                    journal_destination.commit()
+            source_after = os.lstat(source)
+            if self.store._regular_file_identity(source_metadata) != self.store._regular_file_identity(
+                source_after
+            ):
+                raise RuntimeError("request journal changed identity during snapshot")
+            self.store._fsync_file(temporary)
+            inspection = self._inspect_request_journal_snapshot(
+                temporary,
+                maximum_authority_epoch=maximum_authority_epoch,
+            )
+            digest, size_bytes, _ = self.store._hash_stable_regular_file(temporary)
+            if int(size_bytes) > maximum_bytes:
+                raise RuntimeError("request-journal snapshot exceeds its recovery limit")
+            os.link(temporary, destination, follow_symlinks=False)
+            published = True
+            os.chmod(destination, 0o600, follow_symlinks=False)
+            self.store._fsync_file(destination)
+            final_digest, final_size, final_metadata = self.store._hash_stable_regular_file(
+                destination
+            )
+            if (
+                not secrets.compare_digest(digest, final_digest)
+                or int(size_bytes) != int(final_size)
+                or int(final_metadata.st_nlink) != 2
+            ):
+                raise RuntimeError("request-journal publication changed after verification")
+            temporary.unlink()
+            self.store._fsync_directory(destination.parent)
+            return {
+                **inspection,
+                "sha256": final_digest,
+                "size_bytes": final_size,
+                "artifact_path": str(destination),
+            }
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            if published:
+                destination.unlink(missing_ok=True)
+            self.store._fsync_directory(destination.parent)
+            raise
+
+    def _verify_request_journal_artifact(
+        self,
+        path: Path,
+        *,
+        expected_sha256: str,
+        maximum_authority_epoch: int,
+    ) -> dict[str, Any]:
+        if BACKUP_DIGEST_RE.fullmatch(expected_sha256) is None:
+            raise ValueError("request-journal digest is invalid")
+        maximum_bytes = int(
+            os.getenv(
+                "SYNAPSE_S2_RECOVERY_MAX_JOURNAL_BYTES",
+                str(512 * 1024**2),
+            )
+        )
+        if maximum_bytes <= 0 or int(os.lstat(path).st_size) > maximum_bytes:
+            raise RuntimeError("request-journal artifact exceeds its recovery limit")
+        staging_dir = self.store._backup_verification_staging_dir()
+        temporary = self.store._unique_private_temp_path(
+            staging_dir,
+            prefix=f".{path.name}.journal-verify.",
+        )
+        try:
+            copied = self.store._copy_stable_regular_file(path, temporary)
+            if not secrets.compare_digest(str(copied["sha256"]), expected_sha256):
+                raise RuntimeError("request-journal artifact digest verification failed")
+            inspection = self._inspect_request_journal_snapshot(
+                temporary,
+                maximum_authority_epoch=maximum_authority_epoch,
+            )
+            return {
+                **inspection,
+                "sha256": str(copied["sha256"]),
+                "size_bytes": int(copied["size_bytes"]),
+                "artifact_path": str(path),
+            }
+        finally:
+            temporary.unlink(missing_ok=True)
+            self.store._fsync_directory(staging_dir)
+
+    @contextmanager
+    def _runtime_state_lock(self, *, read_only: bool = False) -> Iterable[None]:
+        lock_path = self.runtime_state_path.with_name(
+            f".{self.runtime_state_path.name}.lock"
+        )
+        if read_only:
+            observed = os.lstat(lock_path)
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(lock_path, flags)
+            opened = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or int(opened.st_nlink) != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or self.store._regular_file_identity(observed)
+                != self.store._regular_file_identity(opened)
+            ):
+                os.close(descriptor)
+                raise PermissionError("runtime-state lock is not private")
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            visible = os.lstat(lock_path)
+            if self.store._regular_file_identity(visible) != self.store._regular_file_identity(opened):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+                raise RuntimeError("runtime-state lock identity changed")
+        else:
+            descriptor = self.store._acquire_file_lock(
+                lock_path,
+                mode=fcntl.LOCK_EX,
+                timeout_seconds=30.0,
+            )
+        try:
+            yield
+        finally:
+            self.store._release_file_lock(descriptor)
+
+    def recompute_live_runtime_state_binding(
+        self,
+        *,
+        required: bool | None = None,
+    ) -> dict[str, Any]:
+        """Read-only canonical runtime-state evidence under its existing lock."""
+
+        runtime_required = (
+            self._live_store_governance()["governance_mode"] == "authoritative-v6"
+            if required is None
+            else bool(required)
+        )
+        with self._runtime_state_lock(read_only=True):
+            if not self.runtime_state_path.exists():
+                if runtime_required:
+                    raise RuntimeError("required runtime state is absent")
+                return {
+                    "required": False,
+                    "present": False,
+                    "artifact_sha256": None,
+                    "canonical_sha256": None,
+                    "state_schema_version": None,
+                    "size_bytes": 0,
+                    "verified": True,
+                }
+            data, metadata = self._read_private_regular(
+                self.runtime_state_path,
+                max_bytes=int(
+                    os.getenv(
+                        "SYNAPSE_S2_RECOVERY_MAX_RUNTIME_STATE_BYTES",
+                        str(8 * 1024**2),
+                    )
+                ),
+            )
+            if (
+                metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or int(metadata.st_nlink) != 1
+            ):
+                raise PermissionError("runtime state is not private")
+            inspection = self._inspect_runtime_state_bytes(data)
+            return {
+                "required": runtime_required,
+                "present": True,
+                "artifact_sha256": hashlib.sha256(data).hexdigest(),
+                "canonical_sha256": str(inspection["canonical_sha256"]),
+                "state_schema_version": int(inspection["state_schema_version"]),
+                "size_bytes": len(data),
+                "global_enabled": bool(inspection["global_enabled"]),
+                "context_override_count": int(
+                    inspection["context_override_count"]
+                ),
+                "cortex_session_count": int(inspection["cortex_session_count"]),
+                "verified": True,
+            }
+
+    def _inspect_runtime_state_bytes(self, data: bytes) -> dict[str, Any]:
+        maximum_bytes = int(
+            os.getenv("SYNAPSE_S2_RECOVERY_MAX_RUNTIME_STATE_BYTES", str(8 * 1024**2))
+        )
+        if maximum_bytes <= 0 or not data or len(data) > maximum_bytes:
+            raise RuntimeError("runtime state exceeds its recovery limit")
+        self._assert_secret_safe_text(data)
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("runtime state artifact is invalid JSON") from exc
+        base_keys = {
+            "version",
+            "global_enabled",
+            "context_overrides",
+            "cortex_sessions",
+            "runtime_state_repair",
+            "memory_db_path",
+            "updated_at",
+        }
+        state_version = payload.get("version") if isinstance(payload, dict) else None
+        expected_keys = (
+            base_keys
+            if state_version == 2
+            else base_keys | {"authority_binding"}
+        )
+        authority_binding = (
+            payload.get("authority_binding") if isinstance(payload, dict) else None
+        )
+        authority_binding_valid = state_version == 2 or (
+            state_version == 3
+            and isinstance(authority_binding, dict)
+            and set(authority_binding)
+            == {
+                "schema",
+                "marker_sha256",
+                "authority_epoch_number",
+                "lock_generation_id",
+            }
+            and authority_binding.get("schema")
+            == RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA
+            and BACKUP_DIGEST_RE.fullmatch(
+                str(authority_binding.get("marker_sha256") or "")
+            )
+            is not None
+            and type(authority_binding.get("authority_epoch_number")) is int
+            and int(authority_binding["authority_epoch_number"]) > 0
+            and RUNTIME_STATE_AUTHORITY_LOCK_RE.fullmatch(
+                str(authority_binding.get("lock_generation_id") or "")
+            )
+            is not None
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected_keys
+            or state_version not in {2, 3}
+            or not authority_binding_valid
+            or type(payload.get("global_enabled")) is not bool
+            or not isinstance(payload.get("context_overrides"), dict)
+            or any(
+                not isinstance(key, str) or type(value) is not bool
+                for key, value in payload["context_overrides"].items()
+            )
+            or not isinstance(payload.get("cortex_sessions"), dict)
+            or not isinstance(payload.get("runtime_state_repair"), dict)
+            or not isinstance(payload.get("memory_db_path"), str)
+            or not isinstance(payload.get("updated_at"), (int, float))
+            or isinstance(payload.get("updated_at"), bool)
+            or not math.isfinite(float(payload["updated_at"]))
+        ):
+            raise ValueError("runtime state artifact contract is unsupported")
+        canonical_sha256 = hashlib.sha256(
+            _json_dumps(payload).encode("utf-8")
+        ).hexdigest()
+        return {
+            "binding_schema": RUNTIME_STATE_BINDING_SCHEMA,
+            "state_schema_version": int(state_version),
+            "canonical_sha256": canonical_sha256,
+            "context_override_count": len(payload["context_overrides"]),
+            "cortex_session_count": len(payload["cortex_sessions"]),
+            "global_enabled": bool(payload["global_enabled"]),
+        }
+
+    def _snapshot_runtime_state(self, destination: Path) -> dict[str, Any]:
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError("runtime-state recovery artifact already exists")
+        source = self.runtime_state_path
+        parent = os.lstat(source.parent)
+        if (
+            stat.S_ISLNK(parent.st_mode)
+            or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid()
+            or stat.S_IMODE(parent.st_mode) & 0o077
+        ):
+            raise PermissionError("runtime state parent is not private")
+        with self._runtime_state_lock():
+            data, metadata = self._read_private_regular(
+                source,
+                max_bytes=int(
+                    os.getenv(
+                        "SYNAPSE_S2_RECOVERY_MAX_RUNTIME_STATE_BYTES",
+                        str(8 * 1024**2),
+                    )
+                ),
+            )
+            if (
+                metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or int(metadata.st_nlink) != 1
+            ):
+                raise PermissionError("runtime state is not private")
+            inspection = self._inspect_runtime_state_bytes(data)
+            temporary = self.store._unique_private_temp_path(
+                destination.parent,
+                prefix=f".{destination.name}.",
+            )
+            published = False
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY
+                    | os.O_TRUNC
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    offset = 0
+                    while offset < len(data):
+                        offset += os.write(descriptor, data[offset:])
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                digest = hashlib.sha256(data).hexdigest()
+                os.link(temporary, destination, follow_symlinks=False)
+                published = True
+                os.chmod(destination, 0o600, follow_symlinks=False)
+                self.store._fsync_file(destination)
+                final_digest, final_size, final_metadata = (
+                    self.store._hash_stable_regular_file(destination)
+                )
+                if (
+                    not secrets.compare_digest(digest, final_digest)
+                    or int(final_size) != len(data)
+                    or int(final_metadata.st_nlink) != 2
+                ):
+                    raise RuntimeError(
+                        "runtime-state publication changed after verification"
+                    )
+                temporary.unlink()
+                self.store._fsync_directory(destination.parent)
+                return {
+                    **inspection,
+                    "sha256": final_digest,
+                    "size_bytes": final_size,
+                    "artifact_path": str(destination),
+                }
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                if published:
+                    destination.unlink(missing_ok=True)
+                self.store._fsync_directory(destination.parent)
+                raise
+
+    def _verify_runtime_state_artifact(
+        self,
+        path: Path,
+        *,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        data, metadata = self._read_private_regular(
+            path,
+            max_bytes=int(
+                os.getenv(
+                    "SYNAPSE_S2_RECOVERY_MAX_RUNTIME_STATE_BYTES",
+                    str(8 * 1024**2),
+                )
+            ),
+        )
+        if (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or int(metadata.st_nlink) != 1
+        ):
+            raise PermissionError("runtime-state recovery artifact is not private")
+        digest = hashlib.sha256(data).hexdigest()
+        if not secrets.compare_digest(digest, expected_sha256):
+            raise RuntimeError("runtime-state recovery artifact digest mismatch")
+        return {
+            **self._inspect_runtime_state_bytes(data),
+            "sha256": digest,
+            "size_bytes": len(data),
+            "artifact_path": str(path),
+            "verified": True,
+        }
+
+    def _restore_runtime_state_artifact(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_source_sha256: str,
+        restored_memory_path: Path,
+    ) -> dict[str, Any]:
+        source_data, _source_metadata = self._read_private_regular(
+            source,
+            max_bytes=int(
+                os.getenv(
+                    "SYNAPSE_S2_RECOVERY_MAX_RUNTIME_STATE_BYTES",
+                    str(8 * 1024**2),
+                )
+            ),
+        )
+        source_sha256 = hashlib.sha256(source_data).hexdigest()
+        if not secrets.compare_digest(source_sha256, expected_source_sha256):
+            raise RuntimeError("runtime state changed before isolated restore")
+        source_inspection = self._inspect_runtime_state_bytes(source_data)
+        payload = json.loads(source_data.decode("utf-8"))
+        payload["memory_db_path"] = str(restored_memory_path)
+        if target.exists() or target.is_symlink():
+            raise FileExistsError("restored runtime state target already exists")
+        self.store._write_private_json_exclusive(target, payload)
+        try:
+            restored_data, restored_metadata = self._read_private_regular(
+                target,
+                max_bytes=int(
+                    os.getenv(
+                        "SYNAPSE_S2_RECOVERY_MAX_RUNTIME_STATE_BYTES",
+                        str(8 * 1024**2),
+                    )
+                ),
+            )
+            if (
+                restored_metadata.st_uid != os.getuid()
+                or stat.S_IMODE(restored_metadata.st_mode) != 0o600
+                or int(restored_metadata.st_nlink) != 1
+            ):
+                raise PermissionError("restored runtime state is not private")
+            restored_inspection = self._inspect_runtime_state_bytes(restored_data)
+            restored_payload = json.loads(restored_data.decode("utf-8"))
+            if restored_payload.get("memory_db_path") != str(restored_memory_path):
+                raise RuntimeError(
+                    "restored runtime state does not identify the restored database"
+                )
+            return {
+                **restored_inspection,
+                "path": str(target),
+                "sha256": hashlib.sha256(restored_data).hexdigest(),
+                "size_bytes": len(restored_data),
+                "memory_db_path": str(restored_memory_path),
+                "source_sha256": source_sha256,
+                "source_canonical_sha256": str(
+                    source_inspection["canonical_sha256"]
+                ),
+                "verified": True,
+            }
+        except BaseException:
+            target.unlink(missing_ok=True)
+            self.store._fsync_directory(target.parent)
+            raise
+
+    def _assert_memory_snapshot_fence(
+        self,
+        *,
+        expected_logical_snapshot_sha256: str,
+        expected_store_generation: str,
+    ) -> None:
+        """Prove no memory mutation crossed the journal snapshot interval."""
+
+        staging_dir = self.store._backup_verification_staging_dir()
+        temporary = self.store._unique_private_temp_path(
+            staging_dir,
+            prefix=".request-journal-memory-fence.",
+        )
+        try:
+            with closing(self.store._connect_read_only()) as source:
+                with closing(sqlite3.connect(temporary)) as destination:
+                    source.backup(destination)
+                    destination.commit()
+            self.store._fsync_file(temporary)
+            inspection = self.store._inspect_backup_snapshot(temporary)
+            if (
+                not secrets.compare_digest(
+                    str(inspection["logical_snapshot"]["sha256"]),
+                    expected_logical_snapshot_sha256,
+                )
+                or str(inspection["authority_binding"]["store_generation"])
+                != expected_store_generation
+            ):
+                raise RuntimeError(
+                    "memory store changed while its request journal was being snapshotted"
+                )
+        finally:
+            temporary.unlink(missing_ok=True)
+            self.store._fsync_directory(staging_dir)
+
+    def _restore_private_artifact(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        if target.exists() or target.is_symlink():
+            raise FileExistsError("recovery artifact target already exists")
+        temporary = self.store._unique_private_temp_path(
+            target.parent,
+            prefix=f".{target.name}.restore.",
+        )
+        published = False
+        try:
+            copied = self.store._copy_stable_regular_file(source, temporary)
+            if not secrets.compare_digest(
+                str(copied["sha256"]), expected_sha256
+            ):
+                raise RuntimeError("recovery artifact changed before restore")
+            os.link(temporary, target, follow_symlinks=False)
+            published = True
+            os.chmod(target, 0o600, follow_symlinks=False)
+            self.store._fsync_file(target)
+            digest, size_bytes, metadata = self.store._hash_stable_regular_file(target)
+            if (
+                not secrets.compare_digest(digest, expected_sha256)
+                or int(metadata.st_nlink) != 2
+            ):
+                raise RuntimeError("restored recovery artifact changed after publication")
+            temporary.unlink()
+            self.store._fsync_directory(target.parent)
+            return {"path": str(target), "sha256": digest, "size_bytes": size_bytes}
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            if published:
+                target.unlink(missing_ok=True)
+            self.store._fsync_directory(target.parent)
+            raise
+
+    @staticmethod
+    def _request_journal_binding_expected_keys() -> set[str]:
+        return {
+            "schema",
+            "journal_artifact_name",
+            "journal_sha256",
+            "journal_size_bytes",
+            "journal_application_id",
+            "journal_schema_version",
+            "journal_schema_identity",
+            "journal_schema_sha256",
+            "journal_logical_snapshot_schema",
+            "journal_logical_snapshot_sha256",
+            "journal_logical_snapshot_table_count",
+            "journal_logical_snapshot_column_count",
+            "journal_logical_snapshot_row_count",
+            "journal_logical_snapshot_value_bytes",
+            "journal_row_count",
+            "journal_state_counts",
+            "journal_current_authority_epoch_row_count",
+            "journal_maximum_observed_authority_epoch",
+            "request_journal_id",
+            "database_artifact_name",
+            "database_sha256",
+            "database_receipt_digest",
+            "database_schema_contract_version",
+            "database_snapshot_revision",
+            "database_logical_snapshot_schema",
+            "database_logical_snapshot_sha256",
+            "store_identity",
+            "store_generation",
+            "authority_epoch_number",
+            "created_at",
+            "auth_algorithm",
+            "auth_key_id",
+            "signing_public_key",
+            "receipt_digest",
+            "receipt_signature",
+        }
+
+    def _read_request_journal_binding_receipt(
+        self,
+        path: Path,
+    ) -> tuple[dict[str, Any], bool]:
+        data, metadata = self._read_private_regular(path, max_bytes=1024 * 1024)
+        if (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or int(metadata.st_nlink) != 1
+        ):
+            raise PermissionError("request-journal binding receipt is not private")
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("request-journal binding receipt is invalid JSON") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA
+            or set(payload) != self._request_journal_binding_expected_keys()
+        ):
+            raise ValueError("request-journal binding receipt contract is unsupported")
+        digest_fields = (
+            "journal_sha256",
+            "journal_schema_sha256",
+            "journal_logical_snapshot_sha256",
+            "database_sha256",
+            "database_receipt_digest",
+            "database_snapshot_revision",
+            "database_logical_snapshot_sha256",
+            "receipt_digest",
+        )
+        if any(
+            BACKUP_DIGEST_RE.fullmatch(str(payload.get(field) or "")) is None
+            for field in digest_fields
+        ):
+            raise ValueError("request-journal binding receipt digest is invalid")
+        state_counts = payload.get("journal_state_counts")
+        if (
+            type(payload.get("journal_size_bytes")) is not int
+            or int(payload["journal_size_bytes"]) <= 0
+            or type(payload.get("journal_application_id")) is not int
+            or int(payload["journal_application_id"]) != JOURNAL_APPLICATION_ID
+            or type(payload.get("journal_schema_version")) is not int
+            or int(payload["journal_schema_version"]) != JOURNAL_SCHEMA_VERSION
+            or payload.get("journal_schema_identity") != JOURNAL_SCHEMA_IDENTITY
+            or REQUEST_JOURNAL_ID_RE.fullmatch(
+                str(payload.get("request_journal_id") or "")
+            )
+            is None
+            or payload.get("journal_logical_snapshot_schema")
+            != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+            or any(
+                type(payload.get(field)) is not int
+                or int(payload[field]) < 0
+                for field in (
+                    "journal_logical_snapshot_table_count",
+                    "journal_logical_snapshot_column_count",
+                    "journal_logical_snapshot_row_count",
+                    "journal_logical_snapshot_value_bytes",
+                )
+            )
+            or type(payload.get("journal_row_count")) is not int
+            or int(payload["journal_row_count"]) < 0
+            or type(payload.get("authority_epoch_number")) is not int
+            or int(payload["authority_epoch_number"]) <= 0
+            or type(payload.get("journal_current_authority_epoch_row_count")) is not int
+            or int(payload["journal_current_authority_epoch_row_count"]) < 0
+            or type(payload.get("journal_maximum_observed_authority_epoch")) is not int
+            or int(payload["journal_maximum_observed_authority_epoch"]) < 0
+            or payload.get("database_logical_snapshot_schema")
+            != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+            or not isinstance(state_counts, dict)
+            or set(state_counts) != {"accepted", "completed", "failed", "ambiguous"}
+            or any(type(value) is not int or value < 0 for value in state_counts.values())
+            or not isinstance(payload.get("created_at"), (int, float))
+            or not math.isfinite(float(payload["created_at"]))
+        ):
+            raise ValueError("request-journal binding receipt fields are invalid")
+        if not secrets.compare_digest(
+            str(payload["receipt_digest"]),
+            self.store._canonical_payload_digest(payload),
+        ):
+            raise ValueError("request-journal binding receipt digest validation failed")
+        return payload, self.store._verify_receipt_authenticator(payload)
+
+    @staticmethod
+    def _restore_binding_expected_keys() -> set[str]:
+        return {
+            "schema",
+            "memory_artifact_relative",
+            "memory_sha256",
+            "memory_size_bytes",
+            "memory_schema_contract_version",
+            "memory_schema_identity",
+            "memory_snapshot_revision",
+            "memory_logical_snapshot_schema",
+            "memory_logical_snapshot_sha256",
+            "memory_logical_snapshot_table_count",
+            "memory_logical_snapshot_column_count",
+            "memory_logical_snapshot_row_count",
+            "memory_logical_snapshot_value_bytes",
+            "request_journal_artifact_relative",
+            "request_journal_sha256",
+            "request_journal_size_bytes",
+            "request_journal_application_id",
+            "request_journal_schema_version",
+            "request_journal_schema_identity",
+            "request_journal_schema_sha256",
+            "request_journal_logical_snapshot_schema",
+            "request_journal_logical_snapshot_sha256",
+            "request_journal_logical_snapshot_table_count",
+            "request_journal_logical_snapshot_column_count",
+            "request_journal_logical_snapshot_row_count",
+            "request_journal_logical_snapshot_value_bytes",
+            "request_journal_row_count",
+            "request_journal_state_counts",
+            "request_journal_current_authority_epoch_row_count",
+            "request_journal_maximum_observed_authority_epoch",
+            "request_journal_id",
+            "runtime_state_artifact_relative",
+            "runtime_state_sha256",
+            "runtime_state_size_bytes",
+            "runtime_state_binding_schema",
+            "runtime_state_schema_version",
+            "runtime_state_canonical_sha256",
+            "runtime_state_memory_db_path",
+            "source_runtime_state_sha256",
+            "source_runtime_state_canonical_sha256",
+            "store_identity",
+            "store_generation",
+            "authority_epoch_number",
+            "source_request_journal_binding_receipt_digest",
+            "source_database_receipt_digest",
+            "source_bundle_receipt_digest",
+            "created_at",
+            "auth_algorithm",
+            "auth_key_id",
+            "signing_public_key",
+            "receipt_digest",
+            "receipt_signature",
+        }
+
+    def _read_restore_binding_receipt(
+        self,
+        path: Path,
+        *,
+        require_local_trust_anchor: bool = True,
+    ) -> dict[str, Any]:
+        data, metadata = self._read_private_regular(path, max_bytes=1024 * 1024)
+        if (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or int(metadata.st_nlink) != 1
+        ):
+            raise PermissionError("restored request-journal binding is not private")
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("restored request-journal binding is invalid JSON") from exc
+        digest_fields = (
+            "memory_sha256",
+            "memory_snapshot_revision",
+            "memory_logical_snapshot_sha256",
+            "request_journal_sha256",
+            "request_journal_schema_sha256",
+            "request_journal_logical_snapshot_sha256",
+            "runtime_state_sha256",
+            "runtime_state_canonical_sha256",
+            "source_runtime_state_sha256",
+            "source_runtime_state_canonical_sha256",
+            "source_request_journal_binding_receipt_digest",
+            "source_database_receipt_digest",
+            "source_bundle_receipt_digest",
+            "receipt_digest",
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != REQUEST_JOURNAL_RESTORE_BINDING_SCHEMA
+            or set(payload) != self._restore_binding_expected_keys()
+            or any(
+                BACKUP_DIGEST_RE.fullmatch(str(payload.get(field) or "")) is None
+                for field in digest_fields
+            )
+            or payload.get("memory_artifact_relative") != "memory.sqlite3"
+            or payload.get("request_journal_artifact_relative")
+            != "core/requests.sqlite3"
+            or payload.get("runtime_state_artifact_relative")
+            != "runtime_state.json"
+            or payload.get("memory_logical_snapshot_schema")
+            != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+            or payload.get("request_journal_logical_snapshot_schema")
+            != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+            or payload.get("request_journal_schema_identity")
+            != JOURNAL_SCHEMA_IDENTITY
+            or REQUEST_JOURNAL_ID_RE.fullmatch(
+                str(payload.get("request_journal_id") or "")
+            )
+            is None
+            or payload.get("runtime_state_binding_schema")
+            != RUNTIME_STATE_BINDING_SCHEMA
+            or payload.get("runtime_state_schema_version") not in {2, 3}
+            or not isinstance(payload.get("runtime_state_memory_db_path"), str)
+            or REQUEST_JOURNAL_IDENTIFIER_RE.fullmatch(
+                str(payload.get("store_identity") or "")
+            )
+            is None
+            or REQUEST_JOURNAL_IDENTIFIER_RE.fullmatch(
+                str(payload.get("store_generation") or "")
+            )
+            is None
+            or type(payload.get("authority_epoch_number")) is not int
+            or int(payload["authority_epoch_number"]) <= 0
+            or not isinstance(payload.get("created_at"), (int, float))
+            or isinstance(payload.get("created_at"), bool)
+            or not math.isfinite(float(payload["created_at"]))
+        ):
+            raise ValueError("restored request-journal binding contract is invalid")
+        integer_fields = (
+            "memory_size_bytes",
+            "memory_logical_snapshot_table_count",
+            "memory_logical_snapshot_column_count",
+            "memory_logical_snapshot_row_count",
+            "memory_logical_snapshot_value_bytes",
+            "request_journal_size_bytes",
+            "request_journal_application_id",
+            "request_journal_schema_version",
+            "request_journal_logical_snapshot_table_count",
+            "request_journal_logical_snapshot_column_count",
+            "request_journal_logical_snapshot_row_count",
+            "request_journal_logical_snapshot_value_bytes",
+            "request_journal_row_count",
+            "request_journal_current_authority_epoch_row_count",
+            "request_journal_maximum_observed_authority_epoch",
+            "runtime_state_size_bytes",
+        )
+        if any(
+            type(payload.get(field)) is not int
+            or int(payload[field]) < (1 if field in {"memory_size_bytes", "request_journal_size_bytes", "request_journal_schema_version", "runtime_state_size_bytes"} else 0)
+            for field in integer_fields
+        ):
+            raise ValueError("restored request-journal binding counters are invalid")
+        state_counts = payload.get("request_journal_state_counts")
+        if (
+            not isinstance(state_counts, dict)
+            or set(state_counts) != {"accepted", "completed", "failed", "ambiguous"}
+            or any(
+                type(value) is not int or value < 0
+                for value in state_counts.values()
+            )
+            or sum(int(value) for value in state_counts.values())
+            != int(payload["request_journal_row_count"])
+        ):
+            raise ValueError("restored request-journal binding state counts are invalid")
+        digest_verified = secrets.compare_digest(
+            str(payload["receipt_digest"]),
+            self.store._canonical_payload_digest(payload),
+        )
+        signer_locally_trusted = self.store._verify_receipt_authenticator(payload)
+        if (
+            not digest_verified
+            or (require_local_trust_anchor and not signer_locally_trusted)
+        ):
+            raise ValueError("restored request-journal binding signer is not trusted")
+        return payload
+
+    def _inspect_live_restored_memory_binding(self) -> dict[str, Any]:
+        """Inspect the active memory target through one WAL-aware read snapshot."""
+
+        observed = self.store._assert_private_database_identity()
+        with closing(self.store._connect_read_only()) as conn:
+            conn.row_factory = sqlite3.Row
+            data_version_before = int(
+                conn.execute("PRAGMA data_version").fetchone()[0]
+            )
+            conn.execute("BEGIN")
+            try:
+                logical_snapshot = self.store._canonical_logical_snapshot_digest(
+                    conn
+                )
+                marker = self.store._core_authority_marker(conn)
+                self.store._validate_core_authority_version_pair(conn, marker)
+                if marker is None:
+                    raise RuntimeError(
+                        "restored request-journal binding requires governed memory"
+                    )
+                schema = self.store._sqlite_schema_fingerprint(conn)
+                migrations = sorted(
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT key FROM store_migrations ORDER BY key"
+                    ).fetchall()
+                )
+                schema_contract = {
+                    "schema_sha256": str(schema["sha256"]),
+                    "table_count": int(schema["table_count"]),
+                    "index_count": int(schema["index_count"]),
+                    "migration_set_sha256": hashlib.sha256(
+                        _json_dumps(migrations).encode("utf-8")
+                    ).hexdigest(),
+                    "migration_count": len(migrations),
+                    "application_id": int(
+                        conn.execute("PRAGMA application_id").fetchone()[0]
+                    ),
+                    "user_version": int(
+                        conn.execute("PRAGMA user_version").fetchone()[0]
+                    ),
+                }
+                matching_contract_versions = sorted(
+                    version
+                    for version, registered in BACKUP_SCHEMA_COMPATIBILITY_REGISTRY.items()
+                    if all(
+                        schema_contract.get(key) == expected_value
+                        for key, expected_value in registered.items()
+                    )
+                )
+                if not matching_contract_versions:
+                    raise RuntimeError(
+                        "live restored memory failed its schema contract"
+                    )
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table'"
+                    ).fetchall()
+                }
+                critical_counts = {
+                    table_name: int(
+                        conn.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}"'
+                        ).fetchone()[0]
+                    )
+                    for table_name in sorted(BACKUP_CRITICAL_TABLES & tables)
+                }
+                semantic = self.store._semantic_index_audit(
+                    conn,
+                    context_id=None,
+                    sample_limit=1,
+                    include_integrity_checks=False,
+                )
+                highwaters = {
+                    "memory_event_id": int(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(event_id), 0) FROM memory_events"
+                        ).fetchone()[0]
+                    ),
+                    "context_event_id": int(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(event_id), 0) "
+                            "FROM agent_context_events"
+                        ).fetchone()[0]
+                    ),
+                    "capture_committed_at_micros": int(
+                        float(
+                            conn.execute(
+                                "SELECT COALESCE(MAX(committed_at), 0) "
+                                "FROM capture_operations"
+                            ).fetchone()[0]
+                        )
+                        * 1_000_000
+                    ),
+                }
+                revision_seed = {
+                    "schema_sha256": str(schema["sha256"]),
+                    "critical_counts": critical_counts,
+                    "highwaters": highwaters,
+                    "semantic_source_revision": str(
+                        semantic.get("source_revision") or ""
+                    ),
+                }
+            finally:
+                conn.execute("ROLLBACK")
+            data_version_after = int(
+                conn.execute("PRAGMA data_version").fetchone()[0]
+            )
+        visible = os.lstat(self.store.db_path)
+        if (
+            self.store._regular_file_identity(observed)
+            != self.store._regular_file_identity(visible)
+            or data_version_before != data_version_after
+        ):
+            raise RuntimeError(
+                "live restored memory changed during binding verification"
+            )
+        return {
+            "schema_contract_version": matching_contract_versions[-1],
+            "authority_binding": {
+                "governance_mode": "authoritative-v6",
+                "store_generation": f"epoch-{int(marker['epoch'])}",
+                "authority_epoch_number": int(marker["epoch"]),
+                "store_identity": str(marker["store_identity"]),
+                "request_journal_id": str(marker["request_journal_id"]),
+                "restored_target_binding_receipt_digest": marker.get(
+                    "restored_target_binding_receipt_digest"
+                ),
+                "schema_identity": (
+                    f"sqlite-{int(schema_contract['application_id']):x}-"
+                    f"v{int(schema_contract['user_version'])}"
+                ),
+            },
+            "snapshot_revision": hashlib.sha256(
+                _json_dumps(revision_seed).encode("utf-8")
+            ).hexdigest(),
+            "logical_snapshot": logical_snapshot,
+        }
+
+    def verify_restored_request_journal_binding(
+        self,
+        recovery_root: str | os.PathLike[str],
+        *,
+        expected_store_identity: str | None = None,
+        expected_store_generation: str | None = None,
+        expected_source_request_journal_binding_receipt_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """Strictly verify the exact restored memory/journal target pair."""
+
+        root = Path(recovery_root).expanduser().absolute()
+        root_metadata = os.lstat(root)
+        if (
+            stat.S_ISLNK(root_metadata.st_mode)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise PermissionError("recovery root is not private")
+        memory_path = root / "memory.sqlite3"
+        journal_path = root / "core" / "requests.sqlite3"
+        runtime_state_path = root / "runtime_state.json"
+        receipt_path = root / "core" / "requests.sqlite3.binding.receipt.json"
+        core_metadata = os.lstat(journal_path.parent)
+        if (
+            stat.S_ISLNK(core_metadata.st_mode)
+            or not stat.S_ISDIR(core_metadata.st_mode)
+            or core_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(core_metadata.st_mode) != 0o700
+        ):
+            raise PermissionError("restored core directory is not private")
+        payload = self._read_restore_binding_receipt(receipt_path)
+        if (
+            expected_store_identity is not None
+            and str(payload["store_identity"]) != str(expected_store_identity)
+        ):
+            raise RuntimeError("restored binding store identity does not match")
+        if (
+            expected_store_generation is not None
+            and str(payload["store_generation"]) != str(expected_store_generation)
+        ):
+            raise RuntimeError("restored binding store generation does not match")
+        if expected_source_request_journal_binding_receipt_digest is not None:
+            expected_source = str(
+                expected_source_request_journal_binding_receipt_digest
+            )
+            if (
+                BACKUP_DIGEST_RE.fullmatch(expected_source) is None
+                or not secrets.compare_digest(
+                    str(
+                        payload[
+                            "source_request_journal_binding_receipt_digest"
+                        ]
+                    ),
+                    expected_source,
+                )
+            ):
+                raise RuntimeError("restored binding source chain does not match")
+        memory_digest, memory_size, _memory_metadata = (
+            self.store._hash_stable_regular_file(memory_path)
+        )
+        live_memory_target = (
+            memory_path.expanduser().absolute()
+            == self.store.db_path.expanduser().absolute()
+        )
+        memory = (
+            self._inspect_live_restored_memory_binding()
+            if live_memory_target
+            else self.store._inspect_backup_snapshot(memory_path)
+        )
+        if live_memory_target:
+            post_digest, post_size, _post_metadata = (
+                self.store._hash_stable_regular_file(memory_path)
+            )
+            if (
+                not secrets.compare_digest(memory_digest, post_digest)
+                or int(memory_size) != int(post_size)
+            ):
+                raise RuntimeError(
+                    "live restored memory changed during binding verification"
+                )
+        journal = self._verify_request_journal_artifact(
+            journal_path,
+            expected_sha256=str(payload["request_journal_sha256"]),
+            maximum_authority_epoch=int(payload["authority_epoch_number"]),
+        )
+        runtime_state = self._verify_runtime_state_artifact(
+            runtime_state_path,
+            expected_sha256=str(payload["runtime_state_sha256"]),
+        )
+        runtime_data, _runtime_metadata = self._read_private_regular(
+            runtime_state_path,
+            max_bytes=int(
+                os.getenv(
+                    "SYNAPSE_S2_RECOVERY_MAX_RUNTIME_STATE_BYTES",
+                    str(8 * 1024**2),
+                )
+            ),
+        )
+        runtime_payload = json.loads(runtime_data.decode("utf-8"))
+        memory_binding = memory["authority_binding"]
+        mismatches = (
+            not secrets.compare_digest(memory_digest, str(payload["memory_sha256"])),
+            int(memory_size) != int(payload["memory_size_bytes"]),
+            str(memory["schema_contract_version"])
+            != str(payload["memory_schema_contract_version"]),
+            str(memory_binding["schema_identity"])
+            != str(payload["memory_schema_identity"]),
+            str(memory["snapshot_revision"])
+            != str(payload["memory_snapshot_revision"]),
+            str(memory["logical_snapshot"]["schema"])
+            != str(payload["memory_logical_snapshot_schema"]),
+            str(memory["logical_snapshot"]["sha256"])
+            != str(payload["memory_logical_snapshot_sha256"]),
+            int(memory["logical_snapshot"]["table_count"])
+            != int(payload["memory_logical_snapshot_table_count"]),
+            int(memory["logical_snapshot"]["column_count"])
+            != int(payload["memory_logical_snapshot_column_count"]),
+            int(memory["logical_snapshot"]["row_count"])
+            != int(payload["memory_logical_snapshot_row_count"]),
+            int(memory["logical_snapshot"]["value_bytes"])
+            != int(payload["memory_logical_snapshot_value_bytes"]),
+            str(memory_binding["store_generation"])
+            != str(payload["store_generation"]),
+            memory_binding["authority_epoch_number"]
+            != int(payload["authority_epoch_number"]),
+            str(memory_binding["store_identity"])
+            != str(payload["store_identity"]),
+            str(journal["store_identity"])
+            != str(memory_binding["store_identity"]),
+            str(journal["journal_id"])
+            != str(memory_binding["request_journal_id"]),
+            str(journal["journal_id"])
+            != str(payload["request_journal_id"]),
+            str(journal["schema_identity"])
+            != str(payload["request_journal_schema_identity"]),
+            int(journal["size_bytes"])
+            != int(payload["request_journal_size_bytes"]),
+            int(journal["application_id"])
+            != int(payload["request_journal_application_id"]),
+            int(journal["schema_version"])
+            != int(payload["request_journal_schema_version"]),
+            str(journal["schema_sha256"])
+            != str(payload["request_journal_schema_sha256"]),
+            str(journal["logical_snapshot_schema"])
+            != str(payload["request_journal_logical_snapshot_schema"]),
+            str(journal["logical_snapshot_sha256"])
+            != str(payload["request_journal_logical_snapshot_sha256"]),
+            int(journal["logical_snapshot_table_count"])
+            != int(payload["request_journal_logical_snapshot_table_count"]),
+            int(journal["logical_snapshot_column_count"])
+            != int(payload["request_journal_logical_snapshot_column_count"]),
+            int(journal["logical_snapshot_row_count"])
+            != int(payload["request_journal_logical_snapshot_row_count"]),
+            int(journal["logical_snapshot_value_bytes"])
+            != int(payload["request_journal_logical_snapshot_value_bytes"]),
+            int(journal["row_count"])
+            != int(payload["request_journal_row_count"]),
+            journal["state_counts"] != payload["request_journal_state_counts"],
+            int(journal["current_authority_epoch_row_count"])
+            != int(payload["request_journal_current_authority_epoch_row_count"]),
+            int(journal["maximum_observed_authority_epoch"])
+            != int(payload["request_journal_maximum_observed_authority_epoch"]),
+            int(runtime_state["size_bytes"])
+            != int(payload["runtime_state_size_bytes"]),
+            str(runtime_state["binding_schema"])
+            != str(payload["runtime_state_binding_schema"]),
+            int(runtime_state["state_schema_version"])
+            != int(payload["runtime_state_schema_version"]),
+            str(runtime_state["canonical_sha256"])
+            != str(payload["runtime_state_canonical_sha256"]),
+            str(runtime_payload.get("memory_db_path") or "")
+            != str(memory_path),
+            str(payload["runtime_state_memory_db_path"]) != str(memory_path),
+        )
+        if any(mismatches):
+            raise RuntimeError("restored request-journal binding does not match its targets")
+        return {
+            "schema": REQUEST_JOURNAL_RESTORE_BINDING_SCHEMA,
+            "recovery_root": str(root),
+            "memory_artifact_relative": "memory.sqlite3",
+            "memory_logical_snapshot_sha256": str(
+                memory["logical_snapshot"]["sha256"]
+            ),
+            "request_journal_artifact_relative": "core/requests.sqlite3",
+            "request_journal_logical_snapshot_sha256": str(
+                journal["logical_snapshot_sha256"]
+            ),
+            "runtime_state_artifact_relative": "runtime_state.json",
+            "runtime_state_canonical_sha256": str(
+                runtime_state["canonical_sha256"]
+            ),
+            "store_identity": str(payload["store_identity"]),
+            "store_generation": str(payload["store_generation"]),
+            "authority_epoch_number": int(payload["authority_epoch_number"]),
+            "request_journal_id": str(payload["request_journal_id"]),
+            "request_journal_schema_identity": str(
+                payload["request_journal_schema_identity"]
+            ),
+            "source_request_journal_binding_receipt_digest": str(
+                payload["source_request_journal_binding_receipt_digest"]
+            ),
+            "receipt_digest": str(payload["receipt_digest"]),
+            "verified": True,
+        }
+
+    def verify_adopted_restored_store_identity(
+        self,
+        recovery_root: str | os.PathLike[str],
+        *,
+        expected_store_identity: str,
+        expected_authority_epoch_number: int,
+    ) -> dict[str, Any]:
+        """Verify the persisted identity of an already-adopted restore.
+
+        This is the post-startup identity contract used by the installer.  It
+        intentionally derives the private journal identifier and immutable
+        restore receipt digest from the governed database rather than from a
+        path-derived identity that necessarily changes at an isolated target.
+        """
+
+        memory = self._inspect_live_restored_memory_binding()
+        binding = memory["authority_binding"]
+        receipt_digest = binding.get("restored_target_binding_receipt_digest")
+        if not isinstance(receipt_digest, str):
+            raise RuntimeError("memory store is not an adopted restored target")
+        verified = self.verify_adopted_restored_request_journal_lineage(
+            recovery_root,
+            expected_store_identity=expected_store_identity,
+            expected_request_journal_id=str(binding["request_journal_id"]),
+            expected_authority_epoch_number=expected_authority_epoch_number,
+            expected_restore_binding_receipt_digest=receipt_digest,
+        )
+        if (
+            verified["store_identity"] != str(expected_store_identity)
+            or int(verified["authority_epoch_number"])
+            != int(expected_authority_epoch_number)
+        ):
+            raise RuntimeError("adopted restored service identity does not match")
+        return verified
+
+    def verify_adopted_restored_request_journal_lineage(
+        self,
+        recovery_root: str | os.PathLike[str],
+        *,
+        expected_store_identity: str,
+        expected_request_journal_id: str,
+        expected_authority_epoch_number: int,
+        expected_restore_binding_receipt_digest: str,
+    ) -> dict[str, Any]:
+        """Verify immutable restore provenance after the live pair has evolved.
+
+        The exact restore receipt binds the source database, journal, and
+        runtime state at adoption time. After adoption, authority epochs,
+        memory, and journal rows legitimately change, so subsequent startups
+        verify the signed source receipt plus the durable marker lineage rather
+        than incorrectly demanding the original byte digests forever.
+        """
+
+        root = Path(recovery_root).expanduser().absolute()
+        root_metadata = os.lstat(root)
+        if (
+            stat.S_ISLNK(root_metadata.st_mode)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise PermissionError("recovery root is not private")
+        receipt_path = root / "core" / "requests.sqlite3.binding.receipt.json"
+        # Exact restore verification required the source recovery authority's
+        # local trust anchor before adoption.  Afterwards the target can have a
+        # different active recovery key, so continuity relies on the original
+        # receipt's valid signature plus the immutable receipt digest that the
+        # trusted cutover wrote into the durable v6 marker.
+        payload = self._read_restore_binding_receipt(
+            receipt_path,
+            require_local_trust_anchor=False,
+        )
+        if not secrets.compare_digest(
+            str(payload["receipt_digest"]),
+            str(expected_restore_binding_receipt_digest),
+        ):
+            raise RuntimeError("restored binding receipt lineage does not match")
+        memory = self._inspect_live_restored_memory_binding()
+        binding = memory["authority_binding"]
+        if (
+            str(payload["store_identity"]) != str(expected_store_identity)
+            or str(binding["store_identity"]) != str(expected_store_identity)
+            or str(binding["request_journal_id"])
+            != str(expected_request_journal_id)
+            or int(binding["authority_epoch_number"])
+            != int(expected_authority_epoch_number)
+            or int(binding["authority_epoch_number"])
+            <= int(payload["authority_epoch_number"])
+            or not secrets.compare_digest(
+                str(binding.get("restored_target_binding_receipt_digest") or ""),
+                str(expected_restore_binding_receipt_digest),
+            )
+        ):
+            raise RuntimeError("adopted restored binding lineage does not match")
+        return {
+            "schema": REQUEST_JOURNAL_RESTORE_BINDING_SCHEMA,
+            "store_identity": str(binding["store_identity"]),
+            "request_journal_id": str(binding["request_journal_id"]),
+            "authority_epoch_number": int(binding["authority_epoch_number"]),
+            "source_authority_epoch_number": int(payload["authority_epoch_number"]),
+            "receipt_digest": str(payload["receipt_digest"]),
+            "verified": True,
+        }
 
     @staticmethod
     def _assert_secret_safe_text(data: bytes) -> None:
@@ -686,9 +2534,17 @@ class VerifiedRecoveryManager:
         *,
         ledger_ids: set[str],
         database_binding: dict[str, Any],
+        initialize_transport: bool = True,
     ) -> dict[str, Any]:
         paths = self.daemon.paths()
-        self.daemon._ensure_transport_dirs(paths)
+        if initialize_transport:
+            self.daemon._ensure_transport_dirs(paths)
+        else:
+            missing, unsafe = self.daemon._observe_transport_dirs(paths)
+            if missing or unsafe:
+                raise RuntimeError(
+                    "live capture transport is not safe for read-only attestation"
+                )
         max_files, max_total_bytes, max_file_bytes = self._bounded_capture_limits()
         records: list[dict[str, Any]] = []
         total_bytes = 0
@@ -826,6 +2682,104 @@ class VerifiedRecoveryManager:
             _json_dumps(manifest_seed).encode("utf-8")
         ).hexdigest()
         return {**manifest_seed, "manifest_sha256": manifest_sha256}
+
+    def recompute_live_capture_manifest(
+        self,
+        *,
+        database_binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attest live capture bytes without creating or repairing any path."""
+
+        expected_binding_keys = {
+            "artifact_sha256",
+            "receipt_digest",
+            "auth_key_id",
+            "schema_contract_version",
+            "snapshot_revision",
+            "logical_snapshot_schema",
+            "logical_snapshot_sha256",
+            "capture_operation_count",
+            "capture_operation_highwater_micros",
+            "capture_root_provenance",
+            "capture_root_identity_digest",
+        }
+        binding = dict(database_binding) if isinstance(database_binding, dict) else {}
+        if (
+            set(binding) != expected_binding_keys
+            or binding.get("logical_snapshot_schema")
+            != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+            or any(
+                BACKUP_DIGEST_RE.fullmatch(str(binding.get(field) or "")) is None
+                for field in (
+                    "artifact_sha256",
+                    "receipt_digest",
+                    "auth_key_id",
+                    "snapshot_revision",
+                    "logical_snapshot_sha256",
+                    "capture_root_identity_digest",
+                )
+            )
+        ):
+            raise ValueError("capture attestation database binding is invalid")
+        paths = self.daemon.paths()
+        repository_lock = self.store.db_path.parent / "recovery-locks" / "repository.lock"
+        capture_lock = paths["lock_dir"] / GLOBAL_CAPTURE_LOCK
+        with self._repository_thread_lock:
+            with self._existing_private_file_lock(
+                repository_lock,
+                mode=fcntl.LOCK_SH,
+            ):
+                with self._existing_private_file_lock(
+                    capture_lock,
+                    mode=fcntl.LOCK_EX,
+                ):
+                    root_provenance = self._validate_capture_source_root()
+                    if (
+                        root_provenance["capture_root_provenance"]
+                        != binding["capture_root_provenance"]
+                        or root_provenance["capture_root_identity_digest"]
+                        != binding["capture_root_identity_digest"]
+                    ):
+                        raise RuntimeError(
+                            "live capture root does not match its signed database binding"
+                        )
+                    with closing(self.store._connect_read_only()) as conn:
+                        with self.store._transaction(conn):
+                            ledger_bindings = self._snapshot_capture_ledger_bindings(
+                                conn
+                            )
+                    capture_highwater_micros = int(
+                        max(
+                            (
+                                float(item["committed_at"])
+                                for item in ledger_bindings.values()
+                            ),
+                            default=0.0,
+                        )
+                        * 1_000_000
+                    )
+                    if (
+                        int(binding["capture_operation_count"])
+                        != len(ledger_bindings)
+                        or int(binding["capture_operation_highwater_micros"])
+                        != capture_highwater_micros
+                    ):
+                        raise RuntimeError(
+                            "live capture ledger is newer than its signed database binding"
+                        )
+                    manifest = self._capture_inventory(
+                        ledger_ids=set(ledger_bindings),
+                        database_binding=binding,
+                        initialize_transport=False,
+                    )
+        return {
+            "manifest_sha256": str(manifest["manifest_sha256"]),
+            "file_count": int(manifest["file_count"]),
+            "total_bytes": int(manifest["total_bytes"]),
+            "database_binding": dict(manifest["database_binding"]),
+            "reconciliation": dict(manifest["reconciliation"]),
+            "verified": True,
+        }
 
     @staticmethod
     def _public_capture_ledger_audit(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2606,7 +4560,7 @@ class VerifiedRecoveryManager:
             if not isinstance(records, list):
                 raise ValueError("capture archive file inventory is invalid")
             binding = manifest.get("database_binding")
-            expected_binding_keys = {
+            legacy_binding_keys = {
                 "artifact_sha256",
                 "receipt_digest",
                 "auth_key_id",
@@ -2617,13 +4571,30 @@ class VerifiedRecoveryManager:
                 "capture_root_provenance",
                 "capture_root_identity_digest",
             }
-            if not isinstance(binding, dict) or set(binding) != expected_binding_keys:
+            current_binding_keys = legacy_binding_keys | {
+                "logical_snapshot_schema",
+                "logical_snapshot_sha256",
+            }
+            if (
+                not isinstance(binding, dict)
+                or set(binding) not in (legacy_binding_keys, current_binding_keys)
+            ):
                 raise ValueError("capture archive database binding is invalid")
             if database_binding is not None and binding != database_binding:
                 raise RuntimeError("capture archive database binding mismatch")
             if (
                 not BACKUP_DIGEST_RE.fullmatch(str(binding["artifact_sha256"]))
                 or not BACKUP_DIGEST_RE.fullmatch(str(binding["receipt_digest"]))
+                or (
+                    set(binding) == current_binding_keys
+                    and (
+                        binding["logical_snapshot_schema"]
+                        != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+                        or not BACKUP_DIGEST_RE.fullmatch(
+                            str(binding["logical_snapshot_sha256"])
+                        )
+                    )
+                )
                 or not BACKUP_DIGEST_RE.fullmatch(str(binding["auth_key_id"]))
                 or not BACKUP_DIGEST_RE.fullmatch(
                     str(binding["capture_root_identity_digest"])
@@ -2841,7 +4812,7 @@ class VerifiedRecoveryManager:
         }
 
     @staticmethod
-    def _bundle_receipt_expected_keys() -> set[str]:
+    def _legacy_bundle_receipt_expected_keys() -> set[str]:
         return {
             "schema",
             "database_artifact_name",
@@ -2873,6 +4844,50 @@ class VerifiedRecoveryManager:
             "receipt_signature",
         }
 
+    @classmethod
+    def _bundle_receipt_expected_keys(cls) -> set[str]:
+        return cls._legacy_bundle_receipt_expected_keys() | {
+            "governance_mode",
+            "store_identity",
+            "store_generation",
+            "database_logical_snapshot_schema",
+            "database_logical_snapshot_sha256",
+            "database_logical_snapshot_table_count",
+            "database_logical_snapshot_column_count",
+            "database_logical_snapshot_row_count",
+            "database_logical_snapshot_value_bytes",
+            "runtime_state_required",
+            "runtime_state_artifact_name",
+            "runtime_state_sha256",
+            "runtime_state_size_bytes",
+            "runtime_state_binding_schema",
+            "runtime_state_schema_version",
+            "runtime_state_canonical_sha256",
+            "runtime_state_global_enabled",
+            "runtime_state_context_override_count",
+            "runtime_state_cortex_session_count",
+            "request_journal_required",
+            "request_journal_artifact_name",
+            "request_journal_binding_receipt_name",
+            "request_journal_sha256",
+            "request_journal_size_bytes",
+            "request_journal_binding_receipt_digest",
+            "request_journal_schema_version",
+            "request_journal_schema_identity",
+            "request_journal_schema_sha256",
+            "request_journal_logical_snapshot_schema",
+            "request_journal_logical_snapshot_sha256",
+            "request_journal_logical_snapshot_table_count",
+            "request_journal_logical_snapshot_column_count",
+            "request_journal_logical_snapshot_row_count",
+            "request_journal_logical_snapshot_value_bytes",
+            "request_journal_row_count",
+            "request_journal_current_authority_epoch_row_count",
+            "request_journal_maximum_observed_authority_epoch",
+            "request_journal_id",
+            "authority_epoch_number",
+        }
+
     def _read_bundle_receipt(self, path: Path) -> tuple[dict[str, Any], bool]:
         data, metadata = self._read_private_regular(path, max_bytes=1024 * 1024)
         if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
@@ -2881,11 +4896,17 @@ class VerifiedRecoveryManager:
             payload = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("recovery bundle receipt is invalid JSON") from exc
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema") != RECOVERY_BUNDLE_SCHEMA
-            or set(payload) != self._bundle_receipt_expected_keys()
-        ):
+        if not isinstance(payload, dict):
+            raise ValueError("recovery bundle receipt contract is unsupported")
+        schema_name = payload.get("schema")
+        expected_keys = (
+            self._bundle_receipt_expected_keys()
+            if schema_name == RECOVERY_BUNDLE_SCHEMA
+            else self._legacy_bundle_receipt_expected_keys()
+            if schema_name == LEGACY_RECOVERY_BUNDLE_SCHEMA
+            else set()
+        )
+        if not expected_keys or set(payload) != expected_keys:
             raise ValueError("recovery bundle receipt contract is unsupported")
         digest_fields = (
             "database_sha256",
@@ -2930,6 +4951,162 @@ class VerifiedRecoveryManager:
             or not math.isfinite(float(payload["created_at"]))
         ):
             raise ValueError("recovery bundle receipt field types are invalid")
+        if schema_name == RECOVERY_BUNDLE_SCHEMA:
+            governance_mode = payload.get("governance_mode")
+            journal_required = payload.get("request_journal_required")
+            if (
+                governance_mode not in {"pre-governed-v5", "authoritative-v6"}
+                or type(journal_required) is not bool
+                or not isinstance(payload.get("store_identity"), str)
+                or re.fullmatch(r"store-[0-9a-f]{24}", str(payload["store_identity"]))
+                is None
+                or not isinstance(payload.get("store_generation"), str)
+                or payload.get("database_logical_snapshot_schema")
+                != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+                or BACKUP_DIGEST_RE.fullmatch(
+                    str(payload.get("database_logical_snapshot_sha256") or "")
+                )
+                is None
+                or any(
+                    type(payload.get(field)) is not int
+                    or int(payload[field]) < 0
+                    for field in (
+                        "database_logical_snapshot_table_count",
+                        "database_logical_snapshot_column_count",
+                        "database_logical_snapshot_row_count",
+                        "database_logical_snapshot_value_bytes",
+                    )
+                )
+            ):
+                raise ValueError("recovery bundle governance binding is invalid")
+            journal_fields = (
+                "request_journal_artifact_name",
+                "request_journal_binding_receipt_name",
+                "request_journal_sha256",
+                "request_journal_size_bytes",
+                "request_journal_binding_receipt_digest",
+                "request_journal_schema_version",
+                "request_journal_schema_identity",
+                "request_journal_schema_sha256",
+                "request_journal_logical_snapshot_schema",
+                "request_journal_logical_snapshot_sha256",
+                "request_journal_logical_snapshot_table_count",
+                "request_journal_logical_snapshot_column_count",
+                "request_journal_logical_snapshot_row_count",
+                "request_journal_logical_snapshot_value_bytes",
+                "request_journal_row_count",
+                "request_journal_current_authority_epoch_row_count",
+                "request_journal_maximum_observed_authority_epoch",
+                "request_journal_id",
+                "authority_epoch_number",
+            )
+            runtime_fields = (
+                "runtime_state_artifact_name",
+                "runtime_state_sha256",
+                "runtime_state_size_bytes",
+                "runtime_state_binding_schema",
+                "runtime_state_schema_version",
+                "runtime_state_canonical_sha256",
+                "runtime_state_global_enabled",
+                "runtime_state_context_override_count",
+                "runtime_state_cortex_session_count",
+            )
+            runtime_required = payload.get("runtime_state_required")
+            if type(runtime_required) is not bool:
+                raise ValueError("recovery bundle runtime-state binding is invalid")
+            if runtime_required:
+                if (
+                    not isinstance(payload.get("runtime_state_artifact_name"), str)
+                    or BACKUP_DIGEST_RE.fullmatch(
+                        str(payload.get("runtime_state_sha256") or "")
+                    )
+                    is None
+                    or BACKUP_DIGEST_RE.fullmatch(
+                        str(payload.get("runtime_state_canonical_sha256") or "")
+                    )
+                    is None
+                    or payload.get("runtime_state_binding_schema")
+                    != RUNTIME_STATE_BINDING_SCHEMA
+                    or payload.get("runtime_state_schema_version") not in {2, 3}
+                    or type(payload.get("runtime_state_global_enabled")) is not bool
+                    or any(
+                        type(payload.get(field)) is not int
+                        or int(payload[field])
+                        < (1 if field == "runtime_state_size_bytes" else 0)
+                        for field in (
+                            "runtime_state_size_bytes",
+                            "runtime_state_context_override_count",
+                            "runtime_state_cortex_session_count",
+                        )
+                    )
+                ):
+                    raise ValueError("recovery bundle runtime-state binding is invalid")
+            elif any(payload.get(field) is not None for field in runtime_fields):
+                raise ValueError("absent runtime state must use a null binding")
+            if governance_mode == "pre-governed-v5":
+                if (
+                    journal_required
+                    or payload.get("store_generation") != "legacy-v5"
+                    or any(payload.get(field) is not None for field in journal_fields)
+                ):
+                    raise ValueError(
+                        "pre-governed recovery must not claim request-journal evidence"
+                    )
+            else:
+                digest_fields = (
+                    "request_journal_sha256",
+                    "request_journal_binding_receipt_digest",
+                    "request_journal_schema_sha256",
+                    "request_journal_logical_snapshot_sha256",
+                )
+                integer_fields = (
+                    "request_journal_size_bytes",
+                    "request_journal_schema_version",
+                    "request_journal_logical_snapshot_table_count",
+                    "request_journal_logical_snapshot_column_count",
+                    "request_journal_logical_snapshot_row_count",
+                    "request_journal_logical_snapshot_value_bytes",
+                    "request_journal_row_count",
+                    "request_journal_current_authority_epoch_row_count",
+                    "request_journal_maximum_observed_authority_epoch",
+                    "authority_epoch_number",
+                )
+                if (
+                    not journal_required
+                    or runtime_required is not True
+                    or re.fullmatch(
+                        r"epoch-[1-9][0-9]*", str(payload.get("store_generation") or "")
+                    )
+                    is None
+                    or any(
+                        BACKUP_DIGEST_RE.fullmatch(str(payload.get(field) or ""))
+                        is None
+                        for field in digest_fields
+                    )
+                    or any(
+                        type(payload.get(field)) is not int
+                        or int(payload[field]) < (1 if field in {"request_journal_size_bytes", "request_journal_schema_version", "authority_epoch_number"} else 0)
+                        for field in integer_fields
+                    )
+                    or any(
+                        not isinstance(payload.get(field), str)
+                        for field in (
+                            "request_journal_artifact_name",
+                            "request_journal_binding_receipt_name",
+                        )
+                    )
+                    or payload.get("request_journal_logical_snapshot_schema")
+                    != LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+                    or payload.get("request_journal_schema_identity")
+                    != JOURNAL_SCHEMA_IDENTITY
+                    or REQUEST_JOURNAL_ID_RE.fullmatch(
+                        str(payload.get("request_journal_id") or "")
+                    )
+                    is None
+                ):
+                    raise ValueError(
+                        "authoritative recovery request-journal binding is invalid"
+                    )
         digest = str(payload.get("receipt_digest") or "").lower()
         if (
             not BACKUP_DIGEST_RE.fullmatch(digest)
@@ -2959,13 +5136,27 @@ class VerifiedRecoveryManager:
         purpose: str = "operator",
         pinned: bool = False,
     ) -> dict[str, Any]:
-        root_provenance = self._validate_capture_source_root()
+        # Bundle creation is an explicitly mutating maintenance operation and
+        # may initialize a missing local capture transport.  Read-only live
+        # attestations use ``recompute_live_capture_manifest`` and never take
+        # this initialization path.
         paths = self.daemon.paths()
         self.daemon._ensure_transport_dirs(paths)
+        root_provenance = self._validate_capture_source_root()
+        live_governance = self._live_store_governance()
+        journal_required = (
+            live_governance["governance_mode"] == "authoritative-v6"
+        )
+        runtime_state_present = (
+            self.runtime_state_path.exists() or self.runtime_state_path.is_symlink()
+        )
         database_path: Path | None = None
         database_receipt_path: Path | None = None
         capture_archive_path: Path | None = None
         bundle_receipt_path: Path | None = None
+        request_journal_path: Path | None = None
+        request_journal_binding_receipt_path: Path | None = None
+        runtime_state_artifact_path: Path | None = None
         publication_id: str | None = None
         publication_completed_path: Path | None = None
         with self.daemon._exclusive_lock(
@@ -3044,12 +5235,35 @@ class VerifiedRecoveryManager:
                 database_receipt_path = self.store._backup_receipt_path(database_path)
                 capture_archive_path = self._capture_archive_path(database_path)
                 bundle_receipt_path = self._bundle_receipt_path(database_path)
-                artifact_paths = (
+                base_artifact_paths = (
                     database_path,
                     database_receipt_path,
                     capture_archive_path,
-                    bundle_receipt_path,
                 )
+                if journal_required or runtime_state_present:
+                    runtime_state_artifact_path = self._runtime_state_artifact_path(
+                        database_path
+                    )
+                if journal_required:
+                    request_journal_path = self._request_journal_artifact_path(
+                        database_path
+                    )
+                    request_journal_binding_receipt_path = (
+                        self._request_journal_binding_receipt_path(database_path)
+                    )
+                    artifact_paths = (
+                        *base_artifact_paths,
+                        request_journal_path,
+                        request_journal_binding_receipt_path,
+                        *((runtime_state_artifact_path,) if runtime_state_artifact_path else ()),
+                        bundle_receipt_path,
+                    )
+                else:
+                    artifact_paths = (
+                        *base_artifact_paths,
+                        *((runtime_state_artifact_path,) if runtime_state_artifact_path else ()),
+                        bundle_receipt_path,
+                    )
                 if any(candidate.exists() or candidate.is_symlink() for candidate in artifact_paths):
                     raise FileExistsError(
                         "recovery bundle artifact already exists; refusing overwrite"
@@ -3087,6 +5301,17 @@ class VerifiedRecoveryManager:
                     or Path(str(database["receipt_path"])) != database_receipt_path
                 ):
                     raise RuntimeError("recovery database publication path changed")
+                if (
+                    str(database.get("governance_mode"))
+                    != str(live_governance["governance_mode"])
+                    or str(database.get("store_generation"))
+                    != str(live_governance["store_generation"])
+                    or database.get("authority_epoch_number")
+                    != live_governance["authority_epoch_number"]
+                ):
+                    raise RuntimeError(
+                        "memory-store governance changed during recovery publication"
+                    )
                 database_receipt, _ = self.store._read_trusted_backup_receipt(
                     database_receipt_path,
                     artifact=database_path,
@@ -3115,10 +5340,188 @@ class VerifiedRecoveryManager:
                         database_receipt["schema_contract_version"]
                     ),
                     "snapshot_revision": str(database["snapshot_revision"]),
+                    "logical_snapshot_schema": str(
+                        database["logical_snapshot_schema"]
+                    ),
+                    "logical_snapshot_sha256": str(
+                        database["logical_snapshot_sha256"]
+                    ),
                     "capture_operation_count": len(ledger_ids),
                     "capture_operation_highwater_micros": capture_highwater_micros,
                     **root_provenance,
                 }
+                request_journal: dict[str, Any] | None = None
+                request_journal_binding_receipt: dict[str, Any] | None = None
+                runtime_state: dict[str, Any] | None = None
+                if journal_required:
+                    if (
+                        request_journal_path is None
+                        or request_journal_binding_receipt_path is None
+                        or runtime_state_artifact_path is None
+                        or type(live_governance["authority_epoch_number"]) is not int
+                    ):
+                        raise RuntimeError(
+                            "governed recovery request-journal paths are unavailable"
+                        )
+                    request_journal = self._snapshot_request_journal(
+                        request_journal_path,
+                        maximum_authority_epoch=int(
+                            live_governance["authority_epoch_number"]
+                        ),
+                    )
+                    if (
+                        str(request_journal["journal_id"])
+                        != str(live_governance["request_journal_id"])
+                        or str(request_journal["store_identity"])
+                        != str(live_governance["store_identity"])
+                    ):
+                        raise RuntimeError(
+                            "request journal does not match the durable store binding"
+                        )
+                    self._assert_memory_snapshot_fence(
+                        expected_logical_snapshot_sha256=str(
+                            database["logical_snapshot_sha256"]
+                        ),
+                        expected_store_generation=str(
+                            live_governance["store_generation"]
+                        ),
+                    )
+                    runtime_state = self._snapshot_runtime_state(
+                        runtime_state_artifact_path
+                    )
+                    live_journal = self.recompute_request_journal_logical_digest(
+                        maximum_authority_epoch=int(
+                            live_governance["authority_epoch_number"]
+                        )
+                    )
+                    if not secrets.compare_digest(
+                        str(live_journal["logical_snapshot_sha256"]),
+                        str(request_journal["logical_snapshot_sha256"]),
+                    ):
+                        raise RuntimeError(
+                            "request journal changed while runtime state was being snapshotted"
+                        )
+                    request_journal_binding_receipt = {
+                        "schema": RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA,
+                        "journal_artifact_name": request_journal_path.name,
+                        "journal_sha256": str(request_journal["sha256"]),
+                        "journal_size_bytes": int(request_journal["size_bytes"]),
+                        "journal_application_id": int(
+                            request_journal["application_id"]
+                        ),
+                        "journal_schema_version": int(
+                            request_journal["schema_version"]
+                        ),
+                        "journal_schema_identity": str(
+                            request_journal["schema_identity"]
+                        ),
+                        "journal_schema_sha256": str(
+                            request_journal["schema_sha256"]
+                        ),
+                        "journal_logical_snapshot_schema": str(
+                            request_journal["logical_snapshot_schema"]
+                        ),
+                        "journal_logical_snapshot_sha256": str(
+                            request_journal["logical_snapshot_sha256"]
+                        ),
+                        "journal_logical_snapshot_table_count": int(
+                            request_journal["logical_snapshot_table_count"]
+                        ),
+                        "journal_logical_snapshot_column_count": int(
+                            request_journal["logical_snapshot_column_count"]
+                        ),
+                        "journal_logical_snapshot_row_count": int(
+                            request_journal["logical_snapshot_row_count"]
+                        ),
+                        "journal_logical_snapshot_value_bytes": int(
+                            request_journal["logical_snapshot_value_bytes"]
+                        ),
+                        "journal_row_count": int(request_journal["row_count"]),
+                        "journal_state_counts": dict(
+                            request_journal["state_counts"]
+                        ),
+                        "journal_current_authority_epoch_row_count": int(
+                            request_journal[
+                                "current_authority_epoch_row_count"
+                            ]
+                        ),
+                        "journal_maximum_observed_authority_epoch": int(
+                            request_journal[
+                                "maximum_observed_authority_epoch"
+                            ]
+                        ),
+                        "request_journal_id": str(request_journal["journal_id"]),
+                        "database_artifact_name": database_path.name,
+                        "database_sha256": str(database["sha256"]),
+                        "database_receipt_digest": str(
+                            database_receipt["receipt_digest"]
+                        ),
+                        "database_schema_contract_version": str(
+                            database_receipt["schema_contract_version"]
+                        ),
+                        "database_snapshot_revision": str(
+                            database["snapshot_revision"]
+                        ),
+                        "database_logical_snapshot_schema": str(
+                            database["logical_snapshot_schema"]
+                        ),
+                        "database_logical_snapshot_sha256": str(
+                            database["logical_snapshot_sha256"]
+                        ),
+                        "store_identity": self._store_identity(),
+                        "store_generation": str(
+                            live_governance["store_generation"]
+                        ),
+                        "authority_epoch_number": int(
+                            live_governance["authority_epoch_number"]
+                        ),
+                        "created_at": time.time(),
+                    }
+                    self.store._authenticate_receipt(
+                        request_journal_binding_receipt
+                    )
+                    self.store._write_private_json_exclusive(
+                        request_journal_binding_receipt_path,
+                        request_journal_binding_receipt,
+                    )
+                elif runtime_state_artifact_path is not None:
+                    runtime_state = self._snapshot_runtime_state(
+                        runtime_state_artifact_path
+                    )
+                    self._assert_memory_snapshot_fence(
+                        expected_logical_snapshot_sha256=str(
+                            database["logical_snapshot_sha256"]
+                        ),
+                        expected_store_generation=str(
+                            live_governance["store_generation"]
+                        ),
+                    )
+                current_runtime_presence = (
+                    self.runtime_state_path.exists()
+                    or self.runtime_state_path.is_symlink()
+                )
+                if current_runtime_presence != runtime_state_present:
+                    raise RuntimeError(
+                        "runtime-state presence changed during recovery publication"
+                    )
+                if runtime_state is not None:
+                    live_runtime = self.recompute_live_runtime_state_binding(
+                        required=journal_required
+                    )
+                    if (
+                        not bool(live_runtime["present"])
+                        or not secrets.compare_digest(
+                            str(live_runtime["artifact_sha256"]),
+                            str(runtime_state["sha256"]),
+                        )
+                        or not secrets.compare_digest(
+                            str(live_runtime["canonical_sha256"]),
+                            str(runtime_state["canonical_sha256"]),
+                        )
+                    ):
+                        raise RuntimeError(
+                            "runtime state changed during recovery publication"
+                        )
                 manifest = self._capture_inventory(
                     ledger_ids=ledger_ids,
                     database_binding=database_binding,
@@ -3150,6 +5553,24 @@ class VerifiedRecoveryManager:
                     "database_sha256": str(database["sha256"]),
                     "database_size_bytes": int(database["size_bytes"]),
                     "database_snapshot_revision": str(database["snapshot_revision"]),
+                    "database_logical_snapshot_schema": str(
+                        database["logical_snapshot_schema"]
+                    ),
+                    "database_logical_snapshot_sha256": str(
+                        database["logical_snapshot_sha256"]
+                    ),
+                    "database_logical_snapshot_table_count": int(
+                        database["logical_snapshot_table_count"]
+                    ),
+                    "database_logical_snapshot_column_count": int(
+                        database["logical_snapshot_column_count"]
+                    ),
+                    "database_logical_snapshot_row_count": int(
+                        database["logical_snapshot_row_count"]
+                    ),
+                    "database_logical_snapshot_value_bytes": int(
+                        database["logical_snapshot_value_bytes"]
+                    ),
                     "database_receipt_digest": str(
                         database_receipt["receipt_digest"]
                     ),
@@ -3167,6 +5588,147 @@ class VerifiedRecoveryManager:
                     "capture_file_count": int(manifest["file_count"]),
                     "capture_total_bytes": int(manifest["total_bytes"]),
                     "capture_protocol_version": "capture.v2",
+                    "governance_mode": str(live_governance["governance_mode"]),
+                    "store_identity": self._store_identity(),
+                    "store_generation": str(live_governance["store_generation"]),
+                    "runtime_state_required": runtime_state is not None,
+                    "runtime_state_artifact_name": (
+                        runtime_state_artifact_path.name
+                        if runtime_state_artifact_path is not None
+                        else None
+                    ),
+                    "runtime_state_sha256": (
+                        str(runtime_state["sha256"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "runtime_state_size_bytes": (
+                        int(runtime_state["size_bytes"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "runtime_state_binding_schema": (
+                        str(runtime_state["binding_schema"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "runtime_state_schema_version": (
+                        int(runtime_state["state_schema_version"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "runtime_state_canonical_sha256": (
+                        str(runtime_state["canonical_sha256"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "runtime_state_global_enabled": (
+                        bool(runtime_state["global_enabled"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "runtime_state_context_override_count": (
+                        int(runtime_state["context_override_count"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "runtime_state_cortex_session_count": (
+                        int(runtime_state["cortex_session_count"])
+                        if runtime_state is not None
+                        else None
+                    ),
+                    "request_journal_required": journal_required,
+                    "request_journal_artifact_name": (
+                        request_journal_path.name if request_journal_path else None
+                    ),
+                    "request_journal_binding_receipt_name": (
+                        request_journal_binding_receipt_path.name
+                        if request_journal_binding_receipt_path
+                        else None
+                    ),
+                    "request_journal_sha256": (
+                        str(request_journal["sha256"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_size_bytes": (
+                        int(request_journal["size_bytes"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_binding_receipt_digest": (
+                        str(request_journal_binding_receipt["receipt_digest"])
+                        if request_journal_binding_receipt is not None
+                        else None
+                    ),
+                    "request_journal_schema_version": (
+                        int(request_journal["schema_version"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_schema_identity": (
+                        str(request_journal["schema_identity"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_schema_sha256": (
+                        str(request_journal["schema_sha256"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_logical_snapshot_schema": (
+                        str(request_journal["logical_snapshot_schema"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_logical_snapshot_sha256": (
+                        str(request_journal["logical_snapshot_sha256"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_logical_snapshot_table_count": (
+                        int(request_journal["logical_snapshot_table_count"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_logical_snapshot_column_count": (
+                        int(request_journal["logical_snapshot_column_count"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_logical_snapshot_row_count": (
+                        int(request_journal["logical_snapshot_row_count"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_logical_snapshot_value_bytes": (
+                        int(request_journal["logical_snapshot_value_bytes"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_row_count": (
+                        int(request_journal["row_count"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_current_authority_epoch_row_count": (
+                        int(request_journal["current_authority_epoch_row_count"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_maximum_observed_authority_epoch": (
+                        int(request_journal["maximum_observed_authority_epoch"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "request_journal_id": (
+                        str(request_journal["journal_id"])
+                        if request_journal is not None
+                        else None
+                    ),
+                    "authority_epoch_number": live_governance[
+                        "authority_epoch_number"
+                    ],
                     "purpose": str(database["purpose"]),
                     "pinned": bool(pinned),
                     "created_at": created_at,
@@ -3182,7 +5744,7 @@ class VerifiedRecoveryManager:
                         publication_prepared["receipt_digest"]
                     ),
                     "bundle_receipt_digest": str(receipt["receipt_digest"]),
-                    "artifact_count": 4,
+                    "artifact_count": len(artifact_paths),
                     "verified": True,
                     "created_at": time.time(),
                 }
@@ -3197,6 +5759,19 @@ class VerifiedRecoveryManager:
                     "bundle_schema": RECOVERY_BUNDLE_SCHEMA,
                     "bundle_receipt_path": str(bundle_receipt_path),
                     "capture_archive_path": str(capture_archive_path),
+                    "request_journal_path": (
+                        str(request_journal_path) if request_journal_path else None
+                    ),
+                    "request_journal_binding_receipt_path": (
+                        str(request_journal_binding_receipt_path)
+                        if request_journal_binding_receipt_path
+                        else None
+                    ),
+                    "runtime_state_artifact_path": (
+                        str(runtime_state_artifact_path)
+                        if runtime_state_artifact_path is not None
+                        else None
+                    ),
                     "capture_archive_sha256": str(capture["sha256"]),
                     "capture_manifest_sha256": str(manifest["manifest_sha256"]),
                     "capture_file_count": int(manifest["file_count"]),
@@ -3229,12 +5804,16 @@ class VerifiedRecoveryManager:
         *,
         expected_database_sha256: str | None = None,
         expected_capture_sha256: str | None = None,
+        expected_request_journal_sha256: str | None = None,
+        expected_runtime_state_sha256: str | None = None,
     ) -> dict[str, Any]:
         with self._repository_lock():
             return self._verify_bundle_locked(
                 receipt_path,
                 expected_database_sha256=expected_database_sha256,
                 expected_capture_sha256=expected_capture_sha256,
+                expected_request_journal_sha256=expected_request_journal_sha256,
+                expected_runtime_state_sha256=expected_runtime_state_sha256,
             )
 
     def _verify_bundle_locked(
@@ -3243,18 +5822,35 @@ class VerifiedRecoveryManager:
         *,
         expected_database_sha256: str | None = None,
         expected_capture_sha256: str | None = None,
+        expected_request_journal_sha256: str | None = None,
+        expected_runtime_state_sha256: str | None = None,
     ) -> dict[str, Any]:
         reject_sensitive_identifier(receipt_path, field="recovery_bundle_receipt")
         receipt_file = Path(receipt_path).expanduser().absolute()
         receipt, identity_trusted = self._read_bundle_receipt(receipt_file)
         supplied_db = str(expected_database_sha256 or "").strip().lower()
         supplied_capture = str(expected_capture_sha256 or "").strip().lower()
-        for supplied in (supplied_db, supplied_capture):
+        supplied_journal = str(expected_request_journal_sha256 or "").strip().lower()
+        supplied_runtime = str(expected_runtime_state_sha256 or "").strip().lower()
+        for supplied in (
+            supplied_db,
+            supplied_capture,
+            supplied_journal,
+            supplied_runtime,
+        ):
             if supplied and not BACKUP_DIGEST_RE.fullmatch(supplied):
                 raise ValueError("expected recovery digest must be lowercase SHA-256")
-        if not identity_trusted and not (supplied_db and supplied_capture):
+        journal_required = bool(receipt.get("request_journal_required"))
+        runtime_state_required = bool(receipt.get("runtime_state_required"))
+        required_reviewed_digests = bool(
+            supplied_db
+            and supplied_capture
+            and (supplied_journal if journal_required else True)
+            and (supplied_runtime if runtime_state_required else True)
+        )
+        if not identity_trusted and not required_reviewed_digests:
             raise ValueError(
-                "recovery signer is not trusted locally; provide both reviewed SHA-256 digests"
+                "recovery signer is not trusted locally; provide every reviewed artifact SHA-256"
             )
         database_path = receipt_file.parent / self.store._validate_backup_artifact_name(
             receipt["database_artifact_name"], field="database artifact name"
@@ -3273,6 +5869,22 @@ class VerifiedRecoveryManager:
             supplied_capture, capture_expected
         ):
             raise ValueError("reviewed capture digest does not match the bundle receipt")
+        if journal_required and supplied_journal and not secrets.compare_digest(
+            supplied_journal,
+            str(receipt["request_journal_sha256"]),
+        ):
+            raise ValueError(
+                "reviewed request-journal digest does not match the bundle receipt"
+            )
+        if supplied_runtime and not runtime_state_required:
+            raise ValueError("recovery bundle does not contain a runtime-state artifact")
+        if runtime_state_required and supplied_runtime and not secrets.compare_digest(
+            supplied_runtime,
+            str(receipt["runtime_state_sha256"]),
+        ):
+            raise ValueError(
+                "reviewed runtime-state digest does not match the bundle receipt"
+            )
         database = self.store.verify_backup(
             database_path,
             expected_sha256=database_expected if supplied_db else None,
@@ -3284,6 +5896,269 @@ class VerifiedRecoveryManager:
             database_receipt_path,
             artifact=database_path,
         )
+        bundle_schema = str(receipt["schema"])
+        governance_mode = str(database["governance_mode"])
+        store_generation = str(database["store_generation"])
+        authority_epoch_number = database["authority_epoch_number"]
+        request_journal: dict[str, Any] | None = None
+        request_journal_binding: dict[str, Any] | None = None
+        request_journal_binding_path: Path | None = None
+        runtime_state: dict[str, Any] | None = None
+        runtime_state_path: Path | None = None
+        if (
+            bundle_schema == RECOVERY_BUNDLE_SCHEMA
+            and bool(receipt.get("runtime_state_required"))
+        ):
+            runtime_state_path = receipt_file.parent / self.store._validate_backup_artifact_name(
+                receipt["runtime_state_artifact_name"],
+                field="runtime state artifact name",
+            )
+            runtime_state = self._verify_runtime_state_artifact(
+                runtime_state_path,
+                expected_sha256=str(receipt["runtime_state_sha256"]),
+            )
+            runtime_state_mismatches = (
+                int(receipt["runtime_state_size_bytes"])
+                != int(runtime_state["size_bytes"]),
+                str(receipt["runtime_state_binding_schema"])
+                != str(runtime_state["binding_schema"]),
+                int(receipt["runtime_state_schema_version"])
+                != int(runtime_state["state_schema_version"]),
+                str(receipt["runtime_state_canonical_sha256"])
+                != str(runtime_state["canonical_sha256"]),
+                bool(receipt["runtime_state_global_enabled"])
+                != bool(runtime_state["global_enabled"]),
+                int(receipt["runtime_state_context_override_count"])
+                != int(runtime_state["context_override_count"]),
+                int(receipt["runtime_state_cortex_session_count"])
+                != int(runtime_state["cortex_session_count"]),
+            )
+            if any(runtime_state_mismatches):
+                raise RuntimeError(
+                    "runtime state does not match its signed bundle binding"
+                )
+        if bundle_schema == LEGACY_RECOVERY_BUNDLE_SCHEMA:
+            if governance_mode != "pre-governed-v5":
+                raise RuntimeError(
+                    "legacy journal-less bundles are valid only for pre-governed v5"
+                )
+        else:
+            if (
+                str(receipt["governance_mode"]) != governance_mode
+                or str(receipt["store_generation"]) != store_generation
+                or receipt["authority_epoch_number"] != authority_epoch_number
+            ):
+                raise RuntimeError(
+                    "recovery bundle store generation does not match its database"
+                )
+            if governance_mode == "authoritative-v6":
+                if not journal_required or type(authority_epoch_number) is not int:
+                    raise RuntimeError(
+                        "governed v6 recovery is missing request-journal evidence"
+                    )
+                request_journal_path = receipt_file.parent / self.store._validate_backup_artifact_name(
+                    receipt["request_journal_artifact_name"],
+                    field="request journal artifact name",
+                )
+                request_journal_binding_path = receipt_file.parent / self.store._validate_backup_artifact_name(
+                    receipt["request_journal_binding_receipt_name"],
+                    field="request journal binding receipt name",
+                )
+                request_journal_binding, binding_identity_trusted = (
+                    self._read_request_journal_binding_receipt(
+                        request_journal_binding_path
+                    )
+                )
+                if identity_trusted and not binding_identity_trusted:
+                    raise RuntimeError(
+                        "request-journal binding signer is not trusted locally"
+                    )
+                request_journal = self._verify_request_journal_artifact(
+                    request_journal_path,
+                    expected_sha256=str(receipt["request_journal_sha256"]),
+                    maximum_authority_epoch=int(authority_epoch_number),
+                )
+                if (
+                    str(request_journal["store_identity"])
+                    != str(database["store_identity"])
+                    or str(request_journal["journal_id"])
+                    != str(database["request_journal_id"])
+                ):
+                    raise RuntimeError(
+                        "request journal does not match the restored database binding"
+                    )
+                binding_mismatches = (
+                    str(request_journal_binding["journal_artifact_name"])
+                    != request_journal_path.name,
+                    str(request_journal_binding["journal_sha256"])
+                    != str(request_journal["sha256"]),
+                    int(request_journal_binding["journal_size_bytes"])
+                    != int(request_journal["size_bytes"]),
+                    int(request_journal_binding["journal_application_id"])
+                    != int(request_journal["application_id"]),
+                    int(request_journal_binding["journal_schema_version"])
+                    != int(request_journal["schema_version"]),
+                    str(request_journal_binding["journal_schema_identity"])
+                    != str(request_journal["schema_identity"]),
+                    str(request_journal_binding["request_journal_id"])
+                    != str(request_journal["journal_id"]),
+                    str(request_journal_binding["journal_schema_sha256"])
+                    != str(request_journal["schema_sha256"]),
+                    str(
+                        request_journal_binding[
+                            "journal_logical_snapshot_schema"
+                        ]
+                    )
+                    != str(request_journal["logical_snapshot_schema"]),
+                    str(
+                        request_journal_binding[
+                            "journal_logical_snapshot_sha256"
+                        ]
+                    )
+                    != str(request_journal["logical_snapshot_sha256"]),
+                    int(
+                        request_journal_binding[
+                            "journal_logical_snapshot_table_count"
+                        ]
+                    )
+                    != int(request_journal["logical_snapshot_table_count"]),
+                    int(
+                        request_journal_binding[
+                            "journal_logical_snapshot_column_count"
+                        ]
+                    )
+                    != int(request_journal["logical_snapshot_column_count"]),
+                    int(
+                        request_journal_binding[
+                            "journal_logical_snapshot_row_count"
+                        ]
+                    )
+                    != int(request_journal["logical_snapshot_row_count"]),
+                    int(
+                        request_journal_binding[
+                            "journal_logical_snapshot_value_bytes"
+                        ]
+                    )
+                    != int(request_journal["logical_snapshot_value_bytes"]),
+                    int(request_journal_binding["journal_row_count"])
+                    != int(request_journal["row_count"]),
+                    request_journal_binding["journal_state_counts"]
+                    != request_journal["state_counts"],
+                    int(
+                        request_journal_binding[
+                            "journal_current_authority_epoch_row_count"
+                        ]
+                    )
+                    != int(request_journal["current_authority_epoch_row_count"]),
+                    int(
+                        request_journal_binding[
+                            "journal_maximum_observed_authority_epoch"
+                        ]
+                    )
+                    != int(request_journal["maximum_observed_authority_epoch"]),
+                    str(request_journal_binding["database_artifact_name"])
+                    != database_path.name,
+                    str(request_journal_binding["database_sha256"])
+                    != str(database["sha256"]),
+                    str(request_journal_binding["database_receipt_digest"])
+                    != str(database_receipt["receipt_digest"]),
+                    str(
+                        request_journal_binding[
+                            "database_schema_contract_version"
+                        ]
+                    )
+                    != str(database_receipt["schema_contract_version"]),
+                    str(request_journal_binding["database_snapshot_revision"])
+                    != str(database["snapshot_revision"]),
+                    str(
+                        request_journal_binding[
+                            "database_logical_snapshot_schema"
+                        ]
+                    )
+                    != str(database["logical_snapshot_schema"]),
+                    str(
+                        request_journal_binding[
+                            "database_logical_snapshot_sha256"
+                        ]
+                    )
+                    != str(database["logical_snapshot_sha256"]),
+                    str(request_journal_binding["store_identity"])
+                    != str(receipt["store_identity"]),
+                    str(request_journal_binding["store_generation"])
+                    != store_generation,
+                    int(request_journal_binding["authority_epoch_number"])
+                    != int(authority_epoch_number),
+                    str(request_journal_binding["auth_key_id"])
+                    != str(receipt["auth_key_id"]),
+                    str(request_journal_binding["auth_key_id"])
+                    != str(database_receipt["auth_key_id"]),
+                    str(request_journal_binding["receipt_digest"])
+                    != str(receipt["request_journal_binding_receipt_digest"]),
+                    int(receipt["request_journal_size_bytes"])
+                    != int(request_journal["size_bytes"]),
+                    int(receipt["request_journal_schema_version"])
+                    != int(request_journal["schema_version"]),
+                    str(receipt["request_journal_schema_identity"])
+                    != str(request_journal["schema_identity"]),
+                    str(receipt["request_journal_id"])
+                    != str(request_journal["journal_id"]),
+                    str(receipt["request_journal_schema_sha256"])
+                    != str(request_journal["schema_sha256"]),
+                    str(receipt["request_journal_logical_snapshot_schema"])
+                    != str(request_journal["logical_snapshot_schema"]),
+                    str(receipt["request_journal_logical_snapshot_sha256"])
+                    != str(request_journal["logical_snapshot_sha256"]),
+                    int(receipt["request_journal_logical_snapshot_table_count"])
+                    != int(request_journal["logical_snapshot_table_count"]),
+                    int(receipt["request_journal_logical_snapshot_column_count"])
+                    != int(request_journal["logical_snapshot_column_count"]),
+                    int(receipt["request_journal_logical_snapshot_row_count"])
+                    != int(request_journal["logical_snapshot_row_count"]),
+                    int(receipt["request_journal_logical_snapshot_value_bytes"])
+                    != int(request_journal["logical_snapshot_value_bytes"]),
+                    int(receipt["request_journal_row_count"])
+                    != int(request_journal["row_count"]),
+                    int(
+                        receipt[
+                            "request_journal_current_authority_epoch_row_count"
+                        ]
+                    )
+                    != int(request_journal["current_authority_epoch_row_count"]),
+                    int(
+                        receipt[
+                            "request_journal_maximum_observed_authority_epoch"
+                        ]
+                    )
+                    != int(request_journal["maximum_observed_authority_epoch"]),
+                )
+                if any(binding_mismatches):
+                    raise RuntimeError(
+                        "request journal does not match its memory-store binding"
+                    )
+                runtime_state_mismatches = (
+                    int(receipt["runtime_state_size_bytes"])
+                    != int(runtime_state["size_bytes"]),
+                    str(receipt["runtime_state_binding_schema"])
+                    != str(runtime_state["binding_schema"]),
+                    int(receipt["runtime_state_schema_version"])
+                    != int(runtime_state["state_schema_version"]),
+                    str(receipt["runtime_state_canonical_sha256"])
+                    != str(runtime_state["canonical_sha256"]),
+                    bool(receipt["runtime_state_global_enabled"])
+                    != bool(runtime_state["global_enabled"]),
+                    int(receipt["runtime_state_context_override_count"])
+                    != int(runtime_state["context_override_count"]),
+                    int(receipt["runtime_state_cortex_session_count"])
+                    != int(runtime_state["cortex_session_count"]),
+                )
+                if any(runtime_state_mismatches):
+                    raise RuntimeError(
+                        "runtime state does not match its signed bundle binding"
+                    )
+            elif journal_required:
+                raise RuntimeError(
+                    "pre-governed v5 recovery must not include a request journal"
+                )
         database_uri = database_path.resolve().as_uri() + "?mode=ro&immutable=1"
         with closing(sqlite3.connect(database_uri, uri=True)) as snapshot:
             ledger_bindings = self._snapshot_capture_ledger_bindings(snapshot)
@@ -3306,6 +6181,8 @@ class VerifiedRecoveryManager:
                 database_receipt["schema_contract_version"]
             ),
             "snapshot_revision": str(database["snapshot_revision"]),
+            "logical_snapshot_schema": str(database["logical_snapshot_schema"]),
+            "logical_snapshot_sha256": str(database["logical_snapshot_sha256"]),
             "capture_operation_count": len(ledger_ids),
             "capture_operation_highwater_micros": capture_highwater_micros,
             "capture_root_provenance": str(receipt["capture_root_provenance"]),
@@ -3313,24 +6190,71 @@ class VerifiedRecoveryManager:
                 receipt["capture_root_identity_digest"]
             ),
         }
+        archive_database_binding: dict[str, Any] | None = database_binding
+        if bundle_schema == LEGACY_RECOVERY_BUNDLE_SCHEMA:
+            # A v1 outer receipt may refer either to a genuinely old archive or
+            # to an archive produced just before a receipt-only downgrade test.
+            # Verify the signed archive first, then accept only the exact
+            # current binding or its historical projection.
+            archive_database_binding = None
         capture = self._verify_capture_archive(
             capture_path,
             expected_sha256=capture_expected,
             expected_manifest_sha256=str(receipt["capture_manifest_sha256"]),
             ledger_ids=ledger_ids,
             ledger_bindings=ledger_bindings,
-            database_binding=database_binding,
+            database_binding=archive_database_binding,
         )
+        if bundle_schema == LEGACY_RECOVERY_BUNDLE_SCHEMA:
+            legacy_database_binding = dict(database_binding)
+            legacy_database_binding.pop("logical_snapshot_schema")
+            legacy_database_binding.pop("logical_snapshot_sha256")
+            archived_database_binding = dict(
+                capture["manifest"]["database_binding"]
+            )
+            if archived_database_binding not in (
+                database_binding,
+                legacy_database_binding,
+            ):
+                raise RuntimeError("capture archive database binding mismatch")
         reconciliation = dict(capture["manifest"]["reconciliation"])
         capture_ledger_binding = dict(capture["capture_ledger_binding"])
-        cutover_ready = bool(capture_ledger_binding["verified"]) and not bool(
-            reconciliation["replay_required_file_count"]
+        cutover_ready = (
+            bool(capture_ledger_binding["verified"])
+            and not bool(reconciliation["replay_required_file_count"])
+            and (
+                governance_mode == "pre-governed-v5"
+                or (
+                    request_journal is not None
+                    and request_journal_binding is not None
+                    and runtime_state is not None
+                )
+            )
         )
         if (
             int(receipt["database_size_bytes"]) != int(database["size_bytes"])
             or int(receipt["capture_size_bytes"]) != int(capture["size_bytes"])
             or str(receipt["database_snapshot_revision"])
             != str(database["snapshot_revision"])
+            or (
+                bundle_schema == RECOVERY_BUNDLE_SCHEMA
+                and (
+                    str(receipt["database_logical_snapshot_schema"])
+                    != str(database["logical_snapshot_schema"])
+                    or not secrets.compare_digest(
+                        str(receipt["database_logical_snapshot_sha256"]),
+                        str(database["logical_snapshot_sha256"]),
+                    )
+                    or int(receipt["database_logical_snapshot_table_count"])
+                    != int(database["logical_snapshot_table_count"])
+                    or int(receipt["database_logical_snapshot_column_count"])
+                    != int(database["logical_snapshot_column_count"])
+                    or int(receipt["database_logical_snapshot_row_count"])
+                    != int(database["logical_snapshot_row_count"])
+                    or int(receipt["database_logical_snapshot_value_bytes"])
+                    != int(database["logical_snapshot_value_bytes"])
+                )
+            )
             or int(receipt["capture_file_count"]) != int(capture["file_count"])
             or int(receipt["capture_total_bytes"]) != int(capture["total_bytes"])
             or str(receipt["database_receipt_digest"])
@@ -3357,15 +6281,66 @@ class VerifiedRecoveryManager:
         return {
             "action": "verify-recovery-bundle",
             "bundle_receipt_path": str(receipt_file),
+            "bundle_receipt_digest": str(receipt["receipt_digest"]),
             "database": database,
             "capture": {
                 key: value for key, value in capture.items() if key != "manifest"
             },
+            "capture_manifest_sha256": str(capture["manifest_sha256"]),
+            "capture_database_binding": dict(
+                capture["manifest"]["database_binding"]
+            ),
             "reconciliation": reconciliation,
             "capture_ledger_binding": capture_ledger_binding,
+            "governance_mode": governance_mode,
+            "store_identity": (
+                str(receipt["store_identity"])
+                if bundle_schema == RECOVERY_BUNDLE_SCHEMA
+                else self._store_identity()
+            ),
+            "store_generation": store_generation,
+            "logical_snapshot_schema": str(database["logical_snapshot_schema"]),
+            "logical_snapshot_sha256": str(database["logical_snapshot_sha256"]),
+            "request_journal": request_journal,
+            "request_journal_binding": (
+                None
+                if request_journal_binding is None
+                else {
+                    "receipt_path": str(request_journal_binding_path),
+                    "receipt_digest": str(
+                        request_journal_binding["receipt_digest"]
+                    ),
+                    "store_identity": str(
+                        request_journal_binding["store_identity"]
+                    ),
+                    "store_generation": str(
+                        request_journal_binding["store_generation"]
+                    ),
+                    "request_journal_id": str(
+                        request_journal_binding["request_journal_id"]
+                    ),
+                    "journal_schema_identity": str(
+                        request_journal_binding["journal_schema_identity"]
+                    ),
+                    "verified": True,
+                }
+            ),
+            "runtime_state": (
+                None
+                if runtime_state is None
+                else {
+                    "artifact_path": str(runtime_state_path),
+                    "sha256": str(runtime_state["sha256"]),
+                    "canonical_sha256": str(runtime_state["canonical_sha256"]),
+                    "state_schema_version": int(
+                        runtime_state["state_schema_version"]
+                    ),
+                    "verified": True,
+                }
+            ),
             "cutover_ready": cutover_ready,
             "receipt_identity_trusted": identity_trusted,
-            "reviewed_digests_verified": bool(supplied_db and supplied_capture),
+            "reviewed_digests_verified": required_reviewed_digests,
             "verified": True,
             "verified_at": time.time(),
         }
@@ -3456,6 +6431,8 @@ class VerifiedRecoveryManager:
         *,
         expected_database_sha256: str | None = None,
         expected_capture_sha256: str | None = None,
+        expected_request_journal_sha256: str | None = None,
+        expected_runtime_state_sha256: str | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
         with self._repository_lock():
@@ -3464,6 +6441,8 @@ class VerifiedRecoveryManager:
                 output_root,
                 expected_database_sha256=expected_database_sha256,
                 expected_capture_sha256=expected_capture_sha256,
+                expected_request_journal_sha256=expected_request_journal_sha256,
+                expected_runtime_state_sha256=expected_runtime_state_sha256,
                 confirm=confirm,
             )
 
@@ -3474,6 +6453,8 @@ class VerifiedRecoveryManager:
         *,
         expected_database_sha256: str | None = None,
         expected_capture_sha256: str | None = None,
+        expected_request_journal_sha256: str | None = None,
+        expected_runtime_state_sha256: str | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
         if not confirm:
@@ -3486,16 +6467,55 @@ class VerifiedRecoveryManager:
             receipt_path,
             expected_database_sha256=expected_database_sha256,
             expected_capture_sha256=expected_capture_sha256,
+            expected_request_journal_sha256=expected_request_journal_sha256,
+            expected_runtime_state_sha256=expected_runtime_state_sha256,
         )
         receipt_file = Path(str(verified["bundle_receipt_path"]))
         receipt, _ = self._read_bundle_receipt(receipt_file)
+        if not secrets.compare_digest(
+            str(receipt["receipt_digest"]),
+            str(verified["bundle_receipt_digest"]),
+        ):
+            raise RuntimeError("recovery bundle receipt changed after verification")
         database_path = receipt_file.parent / str(receipt["database_artifact_name"])
         database_receipt = receipt_file.parent / str(receipt["database_receipt_name"])
         capture_path = receipt_file.parent / str(receipt["capture_artifact_name"])
+        request_journal_path: Path | None = None
+        request_journal_binding_source: Path | None = None
+        request_journal_binding_payload: dict[str, Any] | None = None
+        runtime_state_source: Path | None = None
+        if verified["governance_mode"] == "authoritative-v6":
+            request_journal_path = receipt_file.parent / str(
+                receipt["request_journal_artifact_name"]
+            )
+            request_journal_binding_source = receipt_file.parent / str(
+                receipt["request_journal_binding_receipt_name"]
+            )
+            request_journal_binding_payload, _binding_trusted = (
+                self._read_request_journal_binding_receipt(
+                    request_journal_binding_source
+                )
+            )
+            if not secrets.compare_digest(
+                str(request_journal_binding_payload["receipt_digest"]),
+                str(receipt["request_journal_binding_receipt_digest"]),
+            ):
+                raise RuntimeError(
+                    "request-journal binding changed after bundle verification"
+                )
+        if bool(receipt.get("runtime_state_required")):
+            runtime_state_source = receipt_file.parent / str(
+                receipt["runtime_state_artifact_name"]
+            )
         database_receipt_payload, _ = self.store._read_trusted_backup_receipt(
             database_receipt,
             artifact=database_path,
         )
+        if not secrets.compare_digest(
+            str(database_receipt_payload["receipt_digest"]),
+            str(receipt["database_receipt_digest"]),
+        ):
+            raise RuntimeError("database receipt changed after bundle verification")
         database_uri = database_path.resolve().as_uri() + "?mode=ro&immutable=1"
         with closing(sqlite3.connect(database_uri, uri=True)) as snapshot:
             ledger_bindings = self._snapshot_capture_ledger_bindings(snapshot)
@@ -3508,6 +6528,12 @@ class VerifiedRecoveryManager:
                 database_receipt_payload["schema_contract_version"]
             ),
             "snapshot_revision": str(receipt["database_snapshot_revision"]),
+            "logical_snapshot_schema": str(
+                verified["database"]["logical_snapshot_schema"]
+            ),
+            "logical_snapshot_sha256": str(
+                verified["database"]["logical_snapshot_sha256"]
+            ),
             "capture_operation_count": len(ledger_ids),
             "capture_operation_highwater_micros": int(
                 max(
@@ -3524,15 +6550,30 @@ class VerifiedRecoveryManager:
                 receipt["capture_root_identity_digest"]
             ),
         }
+        archive_database_binding: dict[str, Any] | None = database_binding
+        if receipt.get("schema") == LEGACY_RECOVERY_BUNDLE_SCHEMA:
+            archive_database_binding = None
         capture_verification = self._verify_capture_archive(
             capture_path,
             expected_sha256=str(receipt["capture_sha256"]),
             expected_manifest_sha256=str(receipt["capture_manifest_sha256"]),
             ledger_ids=ledger_ids,
             ledger_bindings=ledger_bindings,
-            database_binding=database_binding,
+            database_binding=archive_database_binding,
             retain_verified_snapshot=True,
         )
+        if receipt.get("schema") == LEGACY_RECOVERY_BUNDLE_SCHEMA:
+            legacy_database_binding = dict(database_binding)
+            legacy_database_binding.pop("logical_snapshot_schema")
+            legacy_database_binding.pop("logical_snapshot_sha256")
+            archived_database_binding = dict(
+                capture_verification["manifest"]["database_binding"]
+            )
+            if archived_database_binding not in (
+                database_binding,
+                legacy_database_binding,
+            ):
+                raise RuntimeError("capture archive database binding mismatch")
         verified_capture_snapshot = Path(
             str(capture_verification.pop("verified_snapshot_path"))
         )
@@ -3545,7 +6586,157 @@ class VerifiedRecoveryManager:
                 expected_sha256=str(receipt["database_sha256"]),
                 receipt_path=database_receipt,
                 confirm=True,
+                _paired_request_journal_binding=(
+                    request_journal_binding_payload
+                    if verified["governance_mode"] == "authoritative-v6"
+                    else None
+                ),
+                _paired_request_journal_expected_sha256=(
+                    expected_request_journal_sha256
+                    if verified["governance_mode"] == "authoritative-v6"
+                    else None
+                ),
             )
+            request_journal_restore: dict[str, Any] | None = None
+            request_journal_binding_restore: dict[str, Any] | None = None
+            request_journal_restore_binding: dict[str, Any] | None = None
+            runtime_state_restore: dict[str, Any] | None = None
+            if verified["governance_mode"] == "authoritative-v6":
+                if (
+                    request_journal_path is None
+                    or request_journal_binding_source is None
+                    or request_journal_binding_payload is None
+                    or runtime_state_source is None
+                    or type(receipt["authority_epoch_number"]) is not int
+                ):
+                    raise RuntimeError(
+                        "governed restore lost its request-journal binding"
+                    )
+                core_target = target_root / "core"
+                os.mkdir(core_target, mode=0o700)
+                request_journal_target = core_target / "requests.sqlite3"
+                request_journal_restore = self._restore_private_artifact(
+                    request_journal_path,
+                    request_journal_target,
+                    expected_sha256=str(receipt["request_journal_sha256"]),
+                )
+                restored_journal_verification = (
+                    self._verify_request_journal_artifact(
+                        request_journal_target,
+                        expected_sha256=str(receipt["request_journal_sha256"]),
+                        maximum_authority_epoch=int(
+                            receipt["authority_epoch_number"]
+                        ),
+                    )
+                )
+                if (
+                    int(restored_journal_verification["row_count"])
+                    != int(receipt["request_journal_row_count"])
+                    or str(restored_journal_verification["schema_sha256"])
+                    != str(receipt["request_journal_schema_sha256"])
+                    or not secrets.compare_digest(
+                        str(
+                            restored_journal_verification[
+                                "logical_snapshot_sha256"
+                            ]
+                        ),
+                        str(
+                            receipt[
+                                "request_journal_logical_snapshot_sha256"
+                            ]
+                        ),
+                    )
+                ):
+                    raise RuntimeError(
+                        "restored request journal does not match its signed binding"
+                    )
+                request_journal_binding_target = (
+                    core_target / "requests.sqlite3.binding.receipt.json"
+                )
+                runtime_state_target = target_root / "runtime_state.json"
+                runtime_state_restore = self._restore_runtime_state_artifact(
+                    runtime_state_source,
+                    runtime_state_target,
+                    expected_source_sha256=str(receipt["runtime_state_sha256"]),
+                    restored_memory_path=database_target,
+                )
+                restore_binding_payload = {
+                    "schema": REQUEST_JOURNAL_RESTORE_BINDING_SCHEMA,
+                    "memory_artifact_relative": "memory.sqlite3",
+                    "memory_sha256": str(database_restore["sha256"]),
+                    "memory_size_bytes": int(database_restore["size_bytes"]),
+                    "memory_schema_contract_version": str(verified["database"]["schema_contract_version"]),
+                    "memory_schema_identity": str(verified["database"]["schema_identity"]),
+                    "memory_snapshot_revision": str(database_restore["snapshot_revision"]),
+                    "memory_logical_snapshot_schema": str(database_restore["logical_snapshot_schema"]),
+                    "memory_logical_snapshot_sha256": str(database_restore["logical_snapshot_sha256"]),
+                    "memory_logical_snapshot_table_count": int(verified["database"]["logical_snapshot_table_count"]),
+                    "memory_logical_snapshot_column_count": int(verified["database"]["logical_snapshot_column_count"]),
+                    "memory_logical_snapshot_row_count": int(verified["database"]["logical_snapshot_row_count"]),
+                    "memory_logical_snapshot_value_bytes": int(verified["database"]["logical_snapshot_value_bytes"]),
+                    "request_journal_artifact_relative": "core/requests.sqlite3",
+                    "request_journal_sha256": str(request_journal_restore["sha256"]),
+                    "request_journal_size_bytes": int(request_journal_restore["size_bytes"]),
+                    "request_journal_application_id": int(restored_journal_verification["application_id"]),
+                    "request_journal_schema_version": int(restored_journal_verification["schema_version"]),
+                    "request_journal_schema_identity": str(restored_journal_verification["schema_identity"]),
+                    "request_journal_schema_sha256": str(restored_journal_verification["schema_sha256"]),
+                    "request_journal_logical_snapshot_schema": str(restored_journal_verification["logical_snapshot_schema"]),
+                    "request_journal_logical_snapshot_sha256": str(restored_journal_verification["logical_snapshot_sha256"]),
+                    "request_journal_logical_snapshot_table_count": int(restored_journal_verification["logical_snapshot_table_count"]),
+                    "request_journal_logical_snapshot_column_count": int(restored_journal_verification["logical_snapshot_column_count"]),
+                    "request_journal_logical_snapshot_row_count": int(restored_journal_verification["logical_snapshot_row_count"]),
+                    "request_journal_logical_snapshot_value_bytes": int(restored_journal_verification["logical_snapshot_value_bytes"]),
+                    "request_journal_row_count": int(restored_journal_verification["row_count"]),
+                    "request_journal_state_counts": dict(restored_journal_verification["state_counts"]),
+                    "request_journal_current_authority_epoch_row_count": int(restored_journal_verification["current_authority_epoch_row_count"]),
+                    "request_journal_maximum_observed_authority_epoch": int(restored_journal_verification["maximum_observed_authority_epoch"]),
+                    "request_journal_id": str(restored_journal_verification["journal_id"]),
+                    "runtime_state_artifact_relative": "runtime_state.json",
+                    "runtime_state_sha256": str(runtime_state_restore["sha256"]),
+                    "runtime_state_size_bytes": int(runtime_state_restore["size_bytes"]),
+                    "runtime_state_binding_schema": str(runtime_state_restore["binding_schema"]),
+                    "runtime_state_schema_version": int(runtime_state_restore["state_schema_version"]),
+                    "runtime_state_canonical_sha256": str(runtime_state_restore["canonical_sha256"]),
+                    "runtime_state_memory_db_path": str(database_target),
+                    "source_runtime_state_sha256": str(runtime_state_restore["source_sha256"]),
+                    "source_runtime_state_canonical_sha256": str(runtime_state_restore["source_canonical_sha256"]),
+                    "store_identity": str(verified["store_identity"]),
+                    "store_generation": str(verified["store_generation"]),
+                    "authority_epoch_number": int(receipt["authority_epoch_number"]),
+                    "source_request_journal_binding_receipt_digest": str(request_journal_binding_payload["receipt_digest"]),
+                    "source_database_receipt_digest": str(database_receipt_payload["receipt_digest"]),
+                    "source_bundle_receipt_digest": str(receipt["receipt_digest"]),
+                    "created_at": time.time(),
+                }
+                self.store._authenticate_receipt(restore_binding_payload)
+                self.store._write_private_json_exclusive(
+                    request_journal_binding_target,
+                    restore_binding_payload,
+                )
+                binding_digest, binding_size, _binding_metadata = self.store._hash_stable_regular_file(
+                    request_journal_binding_target
+                )
+                request_journal_binding_restore = {
+                    "path": str(request_journal_binding_target),
+                    "sha256": binding_digest,
+                    "size_bytes": binding_size,
+                }
+                request_journal_restore_binding = self.verify_restored_request_journal_binding(
+                    target_root,
+                    expected_store_identity=str(verified["store_identity"]),
+                    expected_store_generation=str(verified["store_generation"]),
+                    expected_source_request_journal_binding_receipt_digest=str(
+                        request_journal_binding_payload["receipt_digest"]
+                    ),
+                )
+            elif runtime_state_source is not None:
+                runtime_state_restore = self._restore_runtime_state_artifact(
+                    runtime_state_source,
+                    target_root / "runtime_state.json",
+                    expected_source_sha256=str(receipt["runtime_state_sha256"]),
+                    restored_memory_path=database_target,
+                )
             capture_target = target_root / "capture-root"
             self._extract_capture_archive(
                 verified_capture_snapshot,
@@ -3603,11 +6794,25 @@ class VerifiedRecoveryManager:
                 raise RuntimeError(
                     "paired recovery proof found capture transport without authoritative ledger rows"
                 )
+            proof_schema = (
+                RECOVERY_BUNDLE_RESTORE_SCHEMA
+                if receipt.get("schema") == RECOVERY_BUNDLE_SCHEMA
+                else LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA
+            )
             proof = {
-                "schema": RECOVERY_BUNDLE_RESTORE_SCHEMA,
+                "schema": proof_schema,
                 "bundle_receipt_name": receipt_file.name,
                 "database_sha256": str(database_restore["sha256"]),
+                "database_logical_snapshot_schema": str(
+                    database_restore["logical_snapshot_schema"]
+                ),
+                "database_logical_snapshot_sha256": str(
+                    database_restore["logical_snapshot_sha256"]
+                ),
                 "capture_sha256": str(capture_verification["sha256"]),
+                "capture_manifest_sha256": str(
+                    capture_verification["manifest_sha256"]
+                ),
                 "capture_file_count": int(capture_verification["file_count"]),
                 "ledger_capture_count": len(ledger_ids),
                 "transport_receipt_capture_count": len(receipt_ids),
@@ -3622,6 +6827,110 @@ class VerifiedRecoveryManager:
                     capture_verification["manifest"]["reconciliation"][
                         "replay_required_file_count"
                     ]
+                )
+                and (
+                    verified["governance_mode"] == "pre-governed-v5"
+                    or (
+                        request_journal_restore is not None
+                        and request_journal_binding_restore is not None
+                        and request_journal_restore_binding is not None
+                        and runtime_state_restore is not None
+                    )
+                ),
+                "governance_mode": str(verified["governance_mode"]),
+                "store_identity": str(verified["store_identity"]),
+                "store_generation": str(verified["store_generation"]),
+                "authority_epoch_number": verified["database"][
+                    "authority_epoch_number"
+                ],
+                "request_journal_id": (
+                    None
+                    if request_journal_restore is None
+                    else str(verified["request_journal"]["journal_id"])
+                ),
+                "request_journal_schema_identity": (
+                    None
+                    if request_journal_restore is None
+                    else str(verified["request_journal"]["schema_identity"])
+                ),
+                "request_journal_sha256": (
+                    None
+                    if request_journal_restore is None
+                    else str(request_journal_restore["sha256"])
+                ),
+                "request_journal_binding_receipt_digest": (
+                    None
+                    if request_journal_restore_binding is None
+                    else str(request_journal_restore_binding["receipt_digest"])
+                ),
+                "source_request_journal_binding_receipt_digest": (
+                    None
+                    if request_journal_binding_payload is None
+                    else str(request_journal_binding_payload["receipt_digest"])
+                ),
+                "request_journal_logical_snapshot_schema": (
+                    None
+                    if request_journal_restore is None
+                    else str(
+                        verified["request_journal"]["logical_snapshot_schema"]
+                    )
+                ),
+                "request_journal_logical_snapshot_sha256": (
+                    None
+                    if request_journal_restore is None
+                    else str(
+                        verified["request_journal"]["logical_snapshot_sha256"]
+                    )
+                ),
+                "request_journal_artifact_relative": (
+                    "core/requests.sqlite3"
+                    if request_journal_restore is not None
+                    else None
+                ),
+                "request_journal_binding_receipt_relative": (
+                    "core/requests.sqlite3.binding.receipt.json"
+                    if request_journal_binding_restore is not None
+                    else None
+                ),
+                "request_journal_binding_verified": bool(
+                    request_journal_restore is not None
+                    and request_journal_binding_restore is not None
+                    and request_journal_binding_payload is not None
+                    and request_journal_restore_binding is not None
+                ),
+                "runtime_state_required": bool(
+                    receipt.get("runtime_state_required")
+                ),
+                "runtime_state_present": runtime_state_restore is not None,
+                "runtime_state_artifact_relative": (
+                    "runtime_state.json"
+                    if runtime_state_restore is not None
+                    else None
+                ),
+                "runtime_state_sha256": (
+                    None
+                    if runtime_state_restore is None
+                    else str(runtime_state_restore["sha256"])
+                ),
+                "runtime_state_canonical_sha256": (
+                    None
+                    if runtime_state_restore is None
+                    else str(runtime_state_restore["canonical_sha256"])
+                ),
+                "runtime_state_memory_db_path": (
+                    None
+                    if runtime_state_restore is None
+                    else str(database_target)
+                ),
+                "source_runtime_state_sha256": (
+                    None
+                    if runtime_state_restore is None
+                    else str(runtime_state_restore["source_sha256"])
+                ),
+                "source_runtime_state_canonical_sha256": (
+                    None
+                    if runtime_state_restore is None
+                    else str(runtime_state_restore["source_canonical_sha256"])
                 ),
                 "mode": "isolated-recovery-proof",
                 "verified": True,
@@ -3637,6 +6946,44 @@ class VerifiedRecoveryManager:
                 "restore_root": str(target_root),
                 "database_restore": database_restore,
                 "capture_restore_path": str(capture_target),
+                "request_journal_restore_path": (
+                    None
+                    if request_journal_restore is None
+                    else str(request_journal_restore["path"])
+                ),
+                "request_journal_binding_receipt_path": (
+                    None
+                    if request_journal_binding_restore is None
+                    else str(request_journal_binding_restore["path"])
+                ),
+                "request_journal_binding": (
+                    None
+                    if request_journal_restore_binding is None
+                    else {
+                        "store_identity": str(request_journal_restore_binding["store_identity"]),
+                        "store_generation": str(request_journal_restore_binding["store_generation"]),
+                        "request_journal_id": str(
+                            request_journal_restore_binding["request_journal_id"]
+                        ),
+                        "request_journal_schema_identity": str(
+                            request_journal_restore_binding[
+                                "request_journal_schema_identity"
+                            ]
+                        ),
+                        "receipt_digest": str(request_journal_restore_binding["receipt_digest"]),
+                        "source_receipt_digest": str(
+                            request_journal_restore_binding[
+                                "source_request_journal_binding_receipt_digest"
+                            ]
+                        ),
+                        "verified": True,
+                    }
+                ),
+                "runtime_state_restore_path": (
+                    None
+                    if runtime_state_restore is None
+                    else str(runtime_state_restore["path"])
+                ),
                 "recovery_proof_path": str(proof_path),
                 "capture_file_count": int(capture_verification["file_count"]),
                 "missing_transport_ledger_count": 0,
@@ -3710,12 +7057,22 @@ class VerifiedRecoveryManager:
     ) -> dict[str, Any]:
         receipt, _identity_trusted = self._read_bundle_receipt(receipt_path)
         verified = self.verify_bundle(receipt_path)
-        artifact_names = (
+        artifact_names_list = [
             str(receipt["database_artifact_name"]),
             str(receipt["database_receipt_name"]),
             str(receipt["capture_artifact_name"]),
-            receipt_path.name,
-        )
+        ]
+        if bool(receipt.get("request_journal_required")):
+            artifact_names_list.extend(
+                (
+                    str(receipt["request_journal_artifact_name"]),
+                    str(receipt["request_journal_binding_receipt_name"]),
+                )
+            )
+        if bool(receipt.get("runtime_state_required")):
+            artifact_names_list.append(str(receipt["runtime_state_artifact_name"]))
+        artifact_names_list.append(receipt_path.name)
+        artifact_names = tuple(artifact_names_list)
         if len(set(artifact_names)) != len(artifact_names):
             raise RuntimeError("recovery bundle contains overlapping artifact names")
         artifacts: list[dict[str, Any]] = []
@@ -3817,6 +7174,11 @@ class VerifiedRecoveryManager:
                 candidate.name.endswith(".sqlite3")
                 or candidate.name.endswith(".sqlite3.receipt.json")
                 or candidate.name.endswith(".sqlite3.capture.tar.gz")
+                or candidate.name.endswith(".sqlite3.requests.sqlite3")
+                or candidate.name.endswith(
+                    ".sqlite3.requests.binding.receipt.json"
+                )
+                or candidate.name.endswith(".sqlite3.runtime-state.json")
                 or candidate.name.endswith(".sqlite3.bundle.receipt.json")
             )
         ]

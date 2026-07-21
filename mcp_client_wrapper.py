@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import signal
+from typing import Any
 
-from client_session_bridge import ClientSessionBridge
-import mcp_server
+from core_client_binding import apply_binding_environment
 
 
 class _BridgeShutdown:
-    def __init__(self, bridge: ClientSessionBridge) -> None:
+    def __init__(self, bridge: Any) -> None:
         self.bridge = bridge
         self.finished = False
 
@@ -44,6 +44,12 @@ def _restore_signal_handlers(previous: dict[int, signal.Handlers]) -> None:
 
 
 def main() -> None:
+    # Resolve the owner-only layout binding before importing any adapter that
+    # can construct a backend or choose a capture/export root.
+    apply_binding_environment()
+    from client_session_bridge import ClientSessionBridge
+    import mcp_server
+
     bridge = ClientSessionBridge.from_environment()
     shutdown = _BridgeShutdown(bridge)
     previous_handlers = _install_signal_handlers(shutdown)

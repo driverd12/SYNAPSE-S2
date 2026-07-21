@@ -106,6 +106,41 @@ class FailProcessedMoveOnceDaemon(CaptureInboxDaemon):
 
 
 class CaptureInboxDaemonTests(unittest.TestCase):
+    def test_capture_lock_rejects_wrong_mode_symlink_and_hardlink(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
+
+            wrong_mode = root / "wrong-mode.lock"
+            wrong_mode.write_text("preserve", encoding="utf-8")
+            wrong_mode.chmod(0o644)
+            wrong_mode_inode = wrong_mode.stat().st_ino
+            with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+                with daemon._exclusive_lock(wrong_mode, blocking=True):
+                    self.fail("unsafe lock must not be acquired")
+            self.assertEqual(wrong_mode.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(wrong_mode.stat().st_ino, wrong_mode_inode)
+
+            hardlink_target = root / "hardlink-target"
+            hardlink_target.write_text("preserve", encoding="utf-8")
+            hardlink_target.chmod(0o600)
+            hardlink = root / "hardlink.lock"
+            os.link(hardlink_target, hardlink)
+            with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+                with daemon._exclusive_lock(hardlink, blocking=True):
+                    self.fail("hard-linked lock must not be acquired")
+            self.assertEqual(hardlink_target.stat().st_nlink, 2)
+
+            symlink_target = root / "symlink-target"
+            symlink_target.write_text("preserve", encoding="utf-8")
+            symlink_target.chmod(0o600)
+            symlink = root / "symlink.lock"
+            symlink.symlink_to(symlink_target)
+            with self.assertRaises(OSError):
+                with daemon._exclusive_lock(symlink, blocking=True):
+                    self.fail("symlink lock must not be acquired")
+            self.assertEqual(symlink_target.read_text(encoding="utf-8"), "preserve")
+
     def test_capture_root_rejects_credential_shaped_path(self):
         with TemporaryDirectory() as tmp:
             marker = "SYNTHETIC_CAPTURE_ROOT_SECRET_42"
@@ -177,6 +212,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
             root = Path(tmp)
             inbox = root / "capture_inbox"
             inbox.mkdir(parents=True, exist_ok=True)
+            inbox.chmod(0o700)
             raw_payload = json.dumps(
                 {
                     "version": 2,
@@ -609,21 +645,29 @@ class CaptureInboxDaemonTests(unittest.TestCase):
             sentinel.write_text("outside sentinel", encoding="utf-8")
             os.symlink(outside, root / "capture_processed")
 
-            with self.assertRaises(ValueError):
-                CaptureInboxDaemon(root=root, backend=RecordingBackend()).status()
+            status = CaptureInboxDaemon(
+                root=root,
+                backend=RecordingBackend(),
+            ).status()
 
             self.assertEqual(
                 sentinel.read_text(encoding="utf-8"),
                 "outside sentinel",
             )
+            self.assertFalse(status["transport_ready"])
+            self.assertIn("processed_dir", status["unsafe_transport_directories"])
 
     def test_owned_transport_directory_non_directory_is_rejected(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "capture_inbox").write_text("not a directory", encoding="utf-8")
 
-            with self.assertRaises(ValueError):
-                CaptureInboxDaemon(root=root, backend=RecordingBackend()).status()
+            status = CaptureInboxDaemon(
+                root=root,
+                backend=RecordingBackend(),
+            ).status()
+            self.assertFalse(status["transport_ready"])
+            self.assertIn("inbox_dir", status["unsafe_transport_directories"])
 
     def test_stale_inbox_temps_are_quarantined_without_ingestion_or_content_evidence(self):
         with TemporaryDirectory() as tmp:
@@ -632,6 +676,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
             daemon = CaptureInboxDaemon(root=root, backend=backend)
             inbox = daemon.paths()["inbox_dir"]
             inbox.mkdir(parents=True, exist_ok=True)
+            inbox.chmod(0o700)
             stale_content = '{"text":"api_key=sk-stale-temp-secret-123456"'
             stale_path = inbox / "stale.json.tmp"
             stale_path.write_text(stale_content, encoding="utf-8")
@@ -1176,7 +1221,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
-            daemon.status()
+            daemon.prepare_transport()
             claim = daemon.paths()["processing_dir"] / ("s2claim_" + "c" * 32)
             claim.mkdir(mode=0o700)
             source = claim / "payload.json"
@@ -1213,7 +1258,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
-            daemon.status()
+            daemon.prepare_transport()
             claim = daemon.paths()["processing_dir"] / ("s2claim_" + "b" * 32)
             claim.mkdir(mode=0o700)
             source = claim / "payload.json"
@@ -1570,6 +1615,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
             daemon = CaptureInboxDaemon(root=root, backend=backend)
             processing = daemon.paths()["processing_dir"]
             processing.mkdir(parents=True, exist_ok=True)
+            processing.chmod(0o700)
             empty_claim = processing / (
                 "s2claim_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
             )
@@ -1823,7 +1869,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
-            daemon.status()
+            daemon.prepare_transport()
             evidence_path = root / "capture_errors" / "terminal.evidence.json"
             evidence_path.write_text(
                 json.dumps(
@@ -1866,7 +1912,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
-            daemon.status()
+            daemon.prepare_transport()
             error_dir = root / "capture_errors"
             legacy = error_dir / "legacy.error.json"
             legacy.write_text(
@@ -1916,7 +1962,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
-            daemon.status()
+            daemon.prepare_transport()
             error_dir = root / "capture_errors"
             unsafe = error_dir / "unsafe.json"
             unsafe.write_text(
@@ -1951,7 +1997,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
             root = Path(tmp)
             daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
             paths = daemon.paths()
-            daemon.status()
+            daemon.prepare_transport()
             unsafe = paths["error_dir"] / "unsafe.json"
             unsafe.write_text(
                 json.dumps(
@@ -2030,7 +2076,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
-            daemon.status()
+            daemon.prepare_transport()
             evidence = root / "capture_errors" / "terminal.evidence.json"
             evidence.write_text(
                 json.dumps(

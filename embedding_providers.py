@@ -25,6 +25,12 @@ TOKEN_RE = re.compile(r"[a-z0-9_.:/#-]+")
 DEFAULT_NEURAL_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
 DEFAULT_NEURAL_POOLING = "mean"
 DEFAULT_NEURAL_MAX_TOKENS = 512
+EMBEDDING_RUNTIME_CONFIG_SCHEMA = "synapse-s2.embedding-runtime-config.v1"
+IMMUTABLE_REVISION_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+MODEL_REPOSITORY_ID_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z"
+)
+MAX_PROVIDER_IDENTIFIER_CHARS = 1024
 
 CONCEPT_GROUPS: dict[str, set[str]] = {
     "local_compute": {
@@ -159,7 +165,22 @@ class MLXNeuralEmbeddingConfig:
     local_files_only: bool
 
 
+@dataclass(frozen=True)
+class EmbeddingProviderConfig:
+    """Closed, environment-independent embedding provider configuration.
+
+    Neural configurations deliberately require every runtime-affecting field,
+    including an immutable model revision.  Legacy callers can continue to use
+    ``resolve_embedding_provider(name)`` and the environment-backed constructor.
+    """
+
+    provider: str
+    neural: MLXNeuralEmbeddingConfig | None = None
+
+
 def resolve_embedding_provider(name: str | None = None) -> EmbeddingProvider:
+    if name is not None and not isinstance(name, str):
+        raise EmbeddingProviderError("embedding provider name must be a string")
     requested = (name or os.getenv("SYNAPSE_S2_EMBEDDING_PROVIDER") or "auto").strip()
     normalized = requested.lower()
     if normalized in {"", "auto", "default"}:
@@ -182,6 +203,57 @@ def resolve_embedding_provider(name: str | None = None) -> EmbeddingProvider:
         "unknown embedding provider; expected auto, semantic-hash, lexical-hash, "
         "mlx-neural[:model-id], or python:/path/to/module.py:function"
     )
+
+
+def resolve_embedding_provider_config(
+    config: EmbeddingProviderConfig,
+    *,
+    runtime_factory: Callable[[MLXNeuralEmbeddingConfig], Any] | None = None,
+) -> EmbeddingProvider:
+    """Resolve a provider without consulting process environment variables."""
+
+    if not isinstance(config, EmbeddingProviderConfig):
+        raise EmbeddingProviderError(
+            "explicit embedding configuration must be EmbeddingProviderConfig"
+        )
+    requested = _provider_selection(config.provider, field="embedding provider")
+    normalized = requested.lower()
+    if normalized in {"semantic", "semantic-hash", "semantic-hash-v1"}:
+        if config.neural is not None:
+            raise EmbeddingProviderError(
+                "non-neural embedding configuration must not include neural settings"
+            )
+        return SemanticHashEmbeddingProvider()
+    if normalized in {"lexical", "hash", "lexical-hash", "lexical-hash-v1"}:
+        if config.neural is not None:
+            raise EmbeddingProviderError(
+                "non-neural embedding configuration must not include neural settings"
+            )
+        return LexicalHashEmbeddingProvider()
+    if normalized.startswith("python:"):
+        if config.neural is not None:
+            raise EmbeddingProviderError(
+                "non-neural embedding configuration must not include neural settings"
+            )
+        return PythonCallableEmbeddingProvider(requested)
+    if normalized in {"neural", "mlx", "mlx-neural", "mlx-neural-v1"}:
+        if config.neural is None:
+            raise EmbeddingProviderError(
+                "explicit MLX neural configuration requires pinned neural settings"
+            )
+        return MLXNeuralEmbeddingProvider(
+            config=config.neural,
+            runtime_factory=runtime_factory,
+        )
+    if normalized in {"", "auto", "default"}:
+        raise EmbeddingProviderError(
+            "explicit embedding configuration must select a concrete provider"
+        )
+    if normalized.startswith(("neural:", "mlx-neural:")):
+        raise EmbeddingProviderError(
+            "explicit neural model_id must be supplied in neural settings"
+        )
+    raise EmbeddingProviderError("unknown explicit embedding provider")
 
 
 class LexicalHashEmbeddingProvider(EmbeddingProvider):
@@ -364,6 +436,7 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
         self,
         model_id: str | None = None,
         *,
+        config: MLXNeuralEmbeddingConfig | None = None,
         runtime_factory: Callable[[MLXNeuralEmbeddingConfig], Any] | None = None,
         pooling: str | None = None,
         max_tokens: int | None = None,
@@ -372,55 +445,101 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
         normalize: bool | None = None,
         local_files_only: bool | None = None,
     ) -> None:
-        raw_model_id = (
-            model_id
-            or os.getenv("SYNAPSE_S2_NEURAL_MODEL")
-            or DEFAULT_NEURAL_MODEL
-        ).strip()
-        if not raw_model_id:
-            raise EmbeddingProviderError("MLX neural provider requires a model id")
-        self.model_id = _provider_identifier(raw_model_id, field="MLX model_id")
-        self.pooling = _validate_pooling(
-            pooling or os.getenv("SYNAPSE_S2_NEURAL_POOLING") or DEFAULT_NEURAL_POOLING
+        direct_values = (
+            model_id,
+            pooling,
+            max_tokens,
+            cache_dir,
+            revision,
+            normalize,
+            local_files_only,
         )
-        self.max_tokens = _positive_int(
-            max_tokens
-            if max_tokens is not None
-            else os.getenv("SYNAPSE_S2_NEURAL_MAX_TOKENS"),
-            default=DEFAULT_NEURAL_MAX_TOKENS,
-            name="SYNAPSE_S2_NEURAL_MAX_TOKENS",
-        )
-        raw_cache_dir = (
-            cache_dir
-            if cache_dir is not None
-            else os.getenv("SYNAPSE_S2_NEURAL_CACHE_DIR")
-        )
-        if raw_cache_dir is None or not str(raw_cache_dir).strip():
-            self.cache_dir = None
+        if config is not None:
+            if any(value is not None for value in direct_values):
+                raise EmbeddingProviderError(
+                    "explicit neural config cannot be combined with direct neural settings"
+                )
+            resolved = _validate_explicit_neural_config(config)
+            self.configuration_source = "explicit"
         else:
-            safe_cache_dir = _provider_identifier(
-                str(raw_cache_dir),
-                field="MLX cache_dir",
+            raw_model_id = (
+                model_id
+                if model_id is not None
+                else os.getenv("SYNAPSE_S2_NEURAL_MODEL") or DEFAULT_NEURAL_MODEL
             )
-            self.cache_dir = _optional_path_str(safe_cache_dir)
-        raw_revision = (
-            revision
-            if revision is not None
-            else os.getenv("SYNAPSE_S2_NEURAL_REVISION")
-        )
-        self.revision = (
-            _provider_identifier(str(raw_revision), field="MLX revision")
-            if raw_revision is not None and str(raw_revision).strip()
-            else None
-        )
-        self.normalize = _env_bool(
-            "SYNAPSE_S2_NEURAL_NORMALIZE",
-            default=True if normalize is None else bool(normalize),
-        )
-        self.local_files_only = _env_bool(
-            "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY",
-            default=False if local_files_only is None else bool(local_files_only),
-        )
+            safe_model_id = _legacy_neural_identifier(
+                raw_model_id,
+                field="MLX model_id",
+            )
+            resolved_pooling = _validate_pooling(
+                pooling
+                if pooling is not None
+                else os.getenv("SYNAPSE_S2_NEURAL_POOLING")
+                or DEFAULT_NEURAL_POOLING
+            )
+            resolved_max_tokens = _positive_int(
+                max_tokens
+                if max_tokens is not None
+                else os.getenv("SYNAPSE_S2_NEURAL_MAX_TOKENS"),
+                default=DEFAULT_NEURAL_MAX_TOKENS,
+                name="SYNAPSE_S2_NEURAL_MAX_TOKENS",
+            )
+            raw_cache_dir = (
+                cache_dir
+                if cache_dir is not None
+                else os.getenv("SYNAPSE_S2_NEURAL_CACHE_DIR")
+            )
+            if raw_cache_dir is None or not str(raw_cache_dir).strip():
+                resolved_cache_dir = None
+            else:
+                safe_cache_dir = _legacy_neural_identifier(
+                    raw_cache_dir,
+                    field="MLX cache_dir",
+                )
+                resolved_cache_dir = _optional_path_str(safe_cache_dir)
+            raw_revision = (
+                revision
+                if revision is not None
+                else os.getenv("SYNAPSE_S2_NEURAL_REVISION")
+            )
+            resolved_revision = (
+                _legacy_neural_identifier(raw_revision, field="MLX revision")
+                if raw_revision is not None and str(raw_revision).strip()
+                else None
+            )
+            resolved_normalize = (
+                _strict_bool(normalize, name="normalize")
+                if normalize is not None
+                else _env_bool("SYNAPSE_S2_NEURAL_NORMALIZE", default=True)
+            )
+            resolved_local_files_only = (
+                _strict_bool(local_files_only, name="local_files_only")
+                if local_files_only is not None
+                else _env_bool(
+                    "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY",
+                    default=False,
+                )
+            )
+            resolved = MLXNeuralEmbeddingConfig(
+                model_id=safe_model_id,
+                cache_dir=resolved_cache_dir,
+                revision=resolved_revision,
+                pooling=resolved_pooling,
+                max_tokens=resolved_max_tokens,
+                normalize=resolved_normalize,
+                local_files_only=resolved_local_files_only,
+            )
+            self.configuration_source = "legacy"
+
+        self.runtime_config = resolved
+        self.model_id = resolved.model_id
+        self.pooling = resolved.pooling
+        self.max_tokens = resolved.max_tokens
+        self.cache_dir = resolved.cache_dir
+        self.revision = resolved.revision
+        self.normalize = resolved.normalize
+        self.local_files_only = resolved.local_files_only
+        self.configuration_sha256 = _runtime_config_sha256(resolved)
         self._runtime_factory = runtime_factory or MLXNeuralEmbeddingRuntime
         self._runtime = None
 
@@ -472,6 +591,8 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
                 "revision": self.revision or "",
                 "max_tokens": self.max_tokens,
                 "local_files_only": bool(self.local_files_only),
+                "configuration_source": self.configuration_source,
+                "configuration_sha256": self.configuration_sha256,
                 "projection": "signed-hash-projection-v1",
                 "runtime_source": runtime_source,
                 "cache_fallback_used": bool(
@@ -491,6 +612,9 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
 
     def info(self, *, dimensions: int) -> dict[str, Any]:
         dims = _validate_dimensions(dimensions)
+        runtime = self._runtime
+        loaded = runtime is not None
+        native_mlx = bool(loaded and getattr(runtime, "native_mlx", False))
         return {
             "provider": self.provider_id,
             "provider_type": "mlx-neural",
@@ -498,29 +622,25 @@ class MLXNeuralEmbeddingProvider(EmbeddingProvider):
             "dimensions": dims,
             "semantic": True,
             "local_only": True,
-            "native_mlx": True,
+            "native_mlx": native_mlx,
             "pooling": self.pooling,
             "max_tokens": self.max_tokens,
             "normalized": bool(self.normalize),
-            "loaded": self._runtime is not None,
+            "loaded": loaded,
+            "ready": bool(loaded and native_mlx),
             "cache_dir": self.cache_dir or "",
             "revision": self.revision or "",
+            "local_files_only": bool(self.local_files_only),
+            "configuration_source": self.configuration_source,
+            "configuration_sha256": self.configuration_sha256,
+            "runtime_config": _runtime_config_payload(self.runtime_config),
         }
 
     def _get_runtime(self):
         if self._runtime is not None:
             return self._runtime
-        config = MLXNeuralEmbeddingConfig(
-            model_id=self.model_id,
-            cache_dir=self.cache_dir,
-            revision=self.revision,
-            pooling=self.pooling,
-            max_tokens=self.max_tokens,
-            normalize=self.normalize,
-            local_files_only=self.local_files_only,
-        )
         try:
-            self._runtime = self._runtime_factory(config)
+            self._runtime = self._runtime_factory(self.runtime_config)
         except EmbeddingProviderError:
             raise
         except ImportError as exc:
@@ -568,7 +688,9 @@ class MLXNeuralEmbeddingRuntime:
 
     def _resolve_model_ref(self, config: MLXNeuralEmbeddingConfig) -> str:
         local_path = Path(config.model_id).expanduser()
-        if local_path.exists():
+        if local_path.exists() and (
+            local_path.is_absolute() or config.revision is None
+        ):
             self.source = str(local_path)
             return str(local_path)
         if not config.cache_dir:
@@ -596,7 +718,11 @@ class MLXNeuralEmbeddingRuntime:
                 ],
             )
         except Exception:
-            cached_snapshot = _latest_cached_snapshot(cache_root, config.model_id)
+            cached_snapshot = _latest_cached_snapshot(
+                cache_root,
+                config.model_id,
+                revision=config.revision,
+            )
             if cached_snapshot is None:
                 raise
             self.cache_fallback_used = True
@@ -612,8 +738,9 @@ class MLXNeuralEmbeddingRuntime:
         token_array = mx.array([tokens], dtype=mx.int32)
         hidden = self._hidden_states(token_array)
         pooled = self._pool(hidden, pooling=pooling)
-        denom = mx.sqrt(mx.sum(pooled * pooled))
-        pooled = pooled / mx.maximum(denom, mx.array(1e-12))
+        if self.config.normalize:
+            denom = mx.sqrt(mx.sum(pooled * pooled))
+            pooled = pooled / mx.maximum(denom, mx.array(1e-12))
         mx.eval(pooled)
         return [float(value) for value in pooled.tolist()]
 
@@ -659,7 +786,12 @@ def _tokens(text: str) -> list[str]:
     return tokens or ["empty"]
 
 
-def _latest_cached_snapshot(cache_root: Path, model_id: str) -> Path | None:
+def _latest_cached_snapshot(
+    cache_root: Path,
+    model_id: str,
+    *,
+    revision: str | None = None,
+) -> Path | None:
     snapshot_root = (
         cache_root
         / f"models--{str(model_id).strip().replace('/', '--')}"
@@ -668,6 +800,11 @@ def _latest_cached_snapshot(cache_root: Path, model_id: str) -> Path | None:
     if not snapshot_root.exists():
         return None
     candidates = [path for path in snapshot_root.iterdir() if path.is_dir()]
+    if revision:
+        normalized_revision = str(revision).strip().lower()
+        candidates = [
+            path for path in candidates if path.name.lower() == normalized_revision
+        ]
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
@@ -784,6 +921,8 @@ def _normalize_vector(vector: list[float]) -> list[float]:
 
 
 def _validate_pooling(pooling: str) -> str:
+    if not isinstance(pooling, str):
+        raise EmbeddingProviderError("neural pooling must be a string")
     normalized = str(pooling or DEFAULT_NEURAL_POOLING).strip().lower()
     if normalized in {"mean", "avg", "average"}:
         return "mean"
@@ -797,6 +936,8 @@ def _validate_pooling(pooling: str) -> str:
 def _positive_int(value: Any, *, default: int, name: str) -> int:
     if value is None or value == "":
         return int(default)
+    if isinstance(value, bool):
+        raise EmbeddingProviderError(f"{name} must be a positive integer")
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:
@@ -818,19 +959,136 @@ def _optional_path_str(value: str | os.PathLike[str] | None) -> str | None:
 def _provider_identifier(value: Any, *, field: str) -> str:
     """Reject credential-shaped provider provenance without echoing it."""
 
+    if not isinstance(value, str):
+        raise EmbeddingProviderError(f"{field} must be a string")
     try:
-        return reject_sensitive_identifier(value, field=field).strip()
+        safe = reject_sensitive_identifier(value, field=field).strip()
     except ValueError as exc:
         raise EmbeddingProviderError(
             f"{field} must not contain credential material"
         ) from exc
+    if not safe:
+        raise EmbeddingProviderError(f"{field} must not be empty")
+    if len(safe) > MAX_PROVIDER_IDENTIFIER_CHARS:
+        raise EmbeddingProviderError(f"{field} is too long")
+    if any(ord(character) < 32 or ord(character) == 127 for character in safe):
+        raise EmbeddingProviderError(f"{field} contains invalid control characters")
+    return safe
+
+
+def _provider_selection(value: Any, *, field: str) -> str:
+    safe = _provider_identifier(value, field=field)
+    if any(character.isspace() for character in safe):
+        raise EmbeddingProviderError(f"{field} must not contain whitespace")
+    return safe
+
+
+def _legacy_neural_identifier(value: Any, *, field: str) -> str:
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    return _provider_identifier(value, field=field)
+
+
+def _strict_bool(value: Any, *, name: str) -> bool:
+    if type(value) is not bool:
+        raise EmbeddingProviderError(f"{name} must be a boolean")
+    return value
+
+
+def _validate_explicit_neural_config(
+    config: MLXNeuralEmbeddingConfig,
+) -> MLXNeuralEmbeddingConfig:
+    if not isinstance(config, MLXNeuralEmbeddingConfig):
+        raise EmbeddingProviderError(
+            "neural settings must be MLXNeuralEmbeddingConfig"
+        )
+    model_id = _provider_identifier(config.model_id, field="MLX model_id")
+    if any(character.isspace() for character in model_id):
+        raise EmbeddingProviderError("MLX model_id must not contain whitespace")
+    if MODEL_REPOSITORY_ID_RE.fullmatch(model_id) is None:
+        raise EmbeddingProviderError(
+            "explicit MLX model_id must be a canonical repository identifier"
+        )
+
+    revision = _provider_identifier(config.revision, field="MLX revision").lower()
+    if IMMUTABLE_REVISION_RE.fullmatch(revision) is None:
+        raise EmbeddingProviderError(
+            "explicit MLX revision must be an immutable 40- or 64-character hex digest"
+        )
+
+    if config.cache_dir is None:
+        raise EmbeddingProviderError("explicit MLX cache_dir is required")
+    if not isinstance(config.cache_dir, (str, os.PathLike)):
+        raise EmbeddingProviderError("explicit MLX cache_dir must be a path")
+    safe_cache_dir = _provider_identifier(
+        os.fspath(config.cache_dir),
+        field="MLX cache_dir",
+    )
+    cache_path = Path(safe_cache_dir).expanduser()
+    if not cache_path.is_absolute():
+        raise EmbeddingProviderError("explicit MLX cache_dir must be absolute")
+    resolved_cache_path = cache_path.resolve(strict=False)
+    if resolved_cache_path == Path(resolved_cache_path.anchor):
+        raise EmbeddingProviderError("explicit MLX cache_dir must not be a filesystem root")
+
+    pooling = _validate_pooling(config.pooling)
+    if type(config.max_tokens) is not int:
+        raise EmbeddingProviderError("neural max_tokens must be a positive integer")
+    max_tokens = _positive_int(
+        config.max_tokens,
+        default=DEFAULT_NEURAL_MAX_TOKENS,
+        name="neural max_tokens",
+    )
+    normalize = _strict_bool(config.normalize, name="neural normalize")
+    local_files_only = _strict_bool(
+        config.local_files_only,
+        name="neural local_files_only",
+    )
+    return MLXNeuralEmbeddingConfig(
+        model_id=model_id,
+        cache_dir=str(resolved_cache_path),
+        revision=revision,
+        pooling=pooling,
+        max_tokens=max_tokens,
+        normalize=normalize,
+        local_files_only=local_files_only,
+    )
+
+
+def _runtime_config_payload(config: MLXNeuralEmbeddingConfig) -> dict[str, Any]:
+    return {
+        "schema": EMBEDDING_RUNTIME_CONFIG_SCHEMA,
+        "provider": "mlx-neural-v1",
+        "model_id": config.model_id,
+        "revision": config.revision or "",
+        "cache_dir": config.cache_dir or "",
+        "pooling": config.pooling,
+        "max_tokens": int(config.max_tokens),
+        "normalize": bool(config.normalize),
+        "local_files_only": bool(config.local_files_only),
+    }
+
+
+def _runtime_config_sha256(config: MLXNeuralEmbeddingConfig) -> str:
+    encoded = json.dumps(
+        _runtime_config_payload(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
         return bool(default)
-    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    raise EmbeddingProviderError(f"{name} must be a boolean")
 
 
 def _extract_array_output(output: Any):
