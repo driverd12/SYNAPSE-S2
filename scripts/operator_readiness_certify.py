@@ -3027,9 +3027,26 @@ class OperatorReadinessCertifier:
         metrics: dict[str, Any],
         duration_ms: float,
         artifact_paths: dict[str, str] | None = None,
+        preserve_crypto_fields: bool = False,
     ) -> CheckResult:
         parsed_path = self.artifact_dir / f"{safe_filename(check_id)}.parsed.json"
-        self._write_json(parsed_path, parsed)
+        if preserve_crypto_fields:
+            parsed_bytes = (
+                json.dumps(
+                    parsed,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_opaque_json_artifact(
+                parsed_path,
+                source_bytes=parsed_bytes,
+                expected_payload=parsed,
+            )
+        else:
+            self._write_json(parsed_path, parsed)
         paths = {"parsed": str(parsed_path), **(artifact_paths or {})}
         result = CheckResult(
             check_id=check_id,
@@ -3209,6 +3226,7 @@ class OperatorReadinessCertifier:
                 "guarded": True,
             },
             duration_ms=duration_ms,
+            preserve_crypto_fields=True,
         )
 
         restore = dict(evidence.get("restore") or {})
@@ -3261,10 +3279,6 @@ class OperatorReadinessCertifier:
                 )
             except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
                 proof_ready = False
-                try:
-                    durable_proof.unlink()
-                except FileNotFoundError:
-                    pass
             else:
                 extra_artifacts["recovery_proof"] = str(durable_proof)
         restore_ready = (
@@ -3736,6 +3750,21 @@ class OperatorReadinessCertifier:
         expected_payload: dict[str, Any],
     ) -> None:
         """Publish one verified signed receipt without altering its bytes."""
+
+        self._write_opaque_json_artifact(
+            path,
+            source_bytes=source_bytes,
+            expected_payload=expected_payload,
+        )
+
+    def _write_opaque_json_artifact(
+        self,
+        path: Path,
+        *,
+        source_bytes: bytes,
+        expected_payload: dict[str, Any],
+    ) -> None:
+        """Publish trusted private JSON without redacting binding fields."""
 
         candidate = Path(path)
         if (

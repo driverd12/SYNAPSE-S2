@@ -378,6 +378,9 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 "verified": True,
                 "cutover_ready": True,
                 "receipt_identity_trusted": True,
+                "capture_database_binding": {
+                    "auth_key_id": "unit-test-public-key-id",
+                },
                 "capture_ledger_binding": binding,
                 "reconciliation": reconciliation,
             },
@@ -2112,11 +2115,20 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 by_id["recovery_restore"].artifact_paths["recovery_proof"]
             )
             self.assertEqual(verify_path.parent, certifier.artifact_dir)
-            self.assertTrue(json.loads(verify_path.read_text())["verified"])
+            verified_artifact = json.loads(verify_path.read_text())
+            self.assertTrue(verified_artifact["verified"])
+            self.assertEqual(
+                verified_artifact["capture_database_binding"]["auth_key_id"],
+                "unit-test-public-key-id",
+            )
             self.assertEqual(restore_path.parent, certifier.artifact_dir)
             self.assertTrue(json.loads(restore_path.read_text())["verified"])
             self.assertEqual(restore_path.read_bytes(), proof_source.read_bytes())
             with zipfile.ZipFile(certifier.archive_path) as archive:
+                self.assertEqual(
+                    archive.read("artifacts/recovery_verify.parsed.json"),
+                    verify_path.read_bytes(),
+                )
                 self.assertEqual(
                     archive.read(
                         "artifacts/recovery_restore_proof.receipt.json"
@@ -2287,6 +2299,37 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             self.assertTrue(destination.is_symlink())
             self.assertEqual(protected.read_bytes(), b"protected-private-artifact")
 
+    def test_recovery_recording_never_deletes_preexisting_proof_artifact(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            certifier, _, _ = self._bound_certifier(root)
+            certifier.pack_dir.mkdir(parents=True, mode=0o700)
+            certifier.artifact_dir.mkdir(mode=0o700)
+            proof_source = root / "isolated-proof.json"
+            evidence = self._guarded_recovery_evidence(
+                recovery_proof_path=proof_source
+            )
+            destination = (
+                certifier.artifact_dir
+                / "recovery_restore_proof.receipt.json"
+            )
+            original = b"preexisting-private-proof-artifact"
+            destination.write_bytes(original)
+            destination.chmod(0o600)
+
+            certifier._record_guarded_recovery_evidence(
+                evidence,
+                duration_ms=1.0,
+            )
+
+            by_id = {result.check_id: result for result in certifier.results}
+            self.assertEqual(by_id["recovery_restore"].status, "blocked")
+            self.assertEqual(destination.read_bytes(), original)
+            self.assertNotIn(
+                "recovery_proof",
+                by_id["recovery_restore"].artifact_paths,
+            )
+
     def test_exact_copied_real_signed_proof_passes_preflight_signature(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -2337,10 +2380,27 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 source_bytes=source_bytes,
                 expected_payload=signed_payload,
             )
+            certifier._record_in_process_check(
+                "recovery_verify",
+                label="Recovery bundle verification",
+                status="ready",
+                detail="Synthetic exact verification copy.",
+                repair="",
+                parsed=verified,
+                metrics={"verified": True},
+                duration_ms=1.0,
+                preserve_crypto_fields=True,
+            )
+            verified_copy_path = (
+                certifier.artifact_dir / "recovery_verify.parsed.json"
+            )
+            verified_copy = json.loads(verified_copy_path.read_text())
 
             self.assertEqual(copied.read_bytes(), source_bytes)
+            self.assertEqual(verified_copy, verified)
+            self.assertNotEqual(json_safe(verified_copy), verified_copy)
             result = preflight.verify_recovery_binding(
-                parsed=verified,
+                parsed=verified_copy,
                 receipt_path=Path(bundle["bundle_receipt_path"]),
                 restore_proof=signed_payload,
                 restore_proof_path=copied,
