@@ -651,6 +651,75 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(map_payload["link_count"], 1)
         self.assertEqual(map_payload["default_recall_scope"], "local")
 
+    def test_cli_governed_namespace_proposal_review_and_audit(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            for context in ("alpha", "beta"):
+                remembered = self.run_cli(
+                    "remember-text",
+                    "--context",
+                    context,
+                    "--tag",
+                    f"{context}-memory",
+                    "--text",
+                    f"{context} shared governed bridge evidence",
+                    state_path=state_path,
+                    memory_path=memory_path,
+                )
+                self.assertEqual(remembered.returncode, 0, remembered.stdout)
+
+            proposed = self.run_cli(
+                "namespace-link-propose",
+                "--source-context",
+                "alpha",
+                "--target-context",
+                "beta",
+                "--reason",
+                "Reviewed overlap requires an explicit decision.",
+                "--governance-request-id",
+                "cli-governance-proposal",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            self.assertEqual(proposed.returncode, 0, proposed.stdout)
+            proposal = json.loads(proposed.stdout)["proposal"]
+
+            pending_map = self.run_cli(
+                "namespace-map",
+                "--context",
+                "alpha",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            self.assertEqual(json.loads(pending_map.stdout)["link_count"], 0)
+
+            reviewed = self.run_cli(
+                "namespace-link-review",
+                "--proposal-id",
+                proposal["proposal_id"],
+                "--decision",
+                "approve",
+                "--expected-revision",
+                proposal["revision"],
+                "--reason",
+                "The current evidence supports one-hop connected recall.",
+                "--governance-request-id",
+                "cli-governance-review",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            audit = self.run_cli(
+                "namespace-link-audit",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(reviewed.returncode, 0, reviewed.stdout)
+        self.assertEqual(json.loads(reviewed.stdout)["state"], "approved")
+        self.assertEqual(audit.returncode, 0, audit.stdout)
+        self.assertEqual(json.loads(audit.stdout)["status"], "ready")
+
     def test_cli_doctor_reports_runtime_fields(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

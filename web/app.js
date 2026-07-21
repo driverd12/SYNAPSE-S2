@@ -424,7 +424,7 @@ const state = {
   namespaceGalaxy: {
     status: "idle",
     view: "galaxy",
-    data: { nodes: [], links: [], suggestions: [], stats: {} },
+    data: { nodes: [], links: [], proposals: [], suggestions: [], stats: {} },
     detail: null,
     focusedDetail: null,
     detailContextId: "",
@@ -1269,7 +1269,7 @@ async function refreshNamespaceGalaxy() {
         );
       }
     } else {
-      renderNamespaceGalaxy({ nodes: [], links: [], suggestions: [], stats: {} });
+      renderNamespaceGalaxy({ nodes: [], links: [], proposals: [], suggestions: [], stats: {} });
       setNamespaceGalaxyState("error", "Namespace Galaxy unavailable", error.message || "The namespace map could not be loaded.");
     }
     logOperation("Namespace Galaxy refresh failed", error.message);
@@ -1817,7 +1817,10 @@ function normalizeNamespaceMap(payload = {}) {
         ?? rawLink?.evidence?.suggested_phase_delay_ticks,
       0,
     )));
-    const suppliedId = rawLink?.context_link_id ?? rawLink?.relationship_id ?? rawLink?.suggestion_id;
+    const suppliedId = rawLink?.context_link_id
+      ?? rawLink?.proposal_id
+      ?? rawLink?.relationship_id
+      ?? rawLink?.suggestion_id;
     return {
       kind,
       id: String(suppliedId || `${kind}:${sourceContextId}:${targetContextId}:${relationType}:${index}`),
@@ -1827,9 +1830,14 @@ function normalizeNamespaceMap(payload = {}) {
       weight,
       direction,
       suggestedPhaseDelayTicks,
-      enabled: kind === "suggestion" ? false : rawLink?.enabled !== false,
-      approved: kind === "suggestion" ? false : rawLink?.approved !== false,
-      evidence: namespaceEvidenceText(rawLink?.evidence ?? rawLink?.reason ?? rawLink?.provenance),
+      enabled: kind === "link" && rawLink?.enabled !== false,
+      approved: kind === "link" && rawLink?.approved !== false,
+      proposalId: String(rawLink?.proposal_id || ""),
+      revision: String(rawLink?.revision || ""),
+      governanceState: String(rawLink?.effective_state ?? rawLink?.state ?? ""),
+      evidence: namespaceEvidenceText(
+        rawLink?.evidence ?? rawLink?.proposal_reason ?? rawLink?.reason ?? rawLink?.provenance,
+      ),
       verifiedAt: rawLink?.verified_at ?? rawLink?.updated_at ?? null,
       raw: rawLink,
     };
@@ -1842,6 +1850,13 @@ function normalizeNamespaceMap(payload = {}) {
     .map((rawLink, index) => normalizeBridge(rawLink, "suggestion", index))
     .filter(Boolean)
     .sort((left, right) => right.weight - left.weight);
+  const proposals = (Array.isArray(payload.proposals) ? payload.proposals : [])
+    .map((rawLink, index) => normalizeBridge(rawLink, "proposal", index))
+    .filter((item) => item && item.governanceState === "pending")
+    .sort((left, right) => (
+      Number(right.raw?.updated_at || 0) - Number(left.raw?.updated_at || 0)
+      || right.weight - left.weight
+    ));
 
   // Links are meaningful only when both ends are actual stored contexts. Do not
   // manufacture planets for a stale link or a currently selected empty context.
@@ -1860,6 +1875,7 @@ function normalizeNamespaceMap(payload = {}) {
       || left.contextId.localeCompare(right.contextId, undefined, { sensitivity: "base" })
     )),
     links: storedLinks,
+    proposals: proposals.filter(hasStoredEndpoint),
     suggestions: suggestions.filter(hasStoredEndpoint),
     stats: payload.stats && typeof payload.stats === "object" ? payload.stats : {},
   };
@@ -1972,6 +1988,7 @@ function namespaceMapFallbackFromSnapshot() {
       entry_count: entryCount,
     })),
     links: [],
+    proposals: [],
     suggestions: [],
     stats: { fallback: true },
   });
@@ -2035,7 +2052,9 @@ function renderNamespaceGalaxy(data) {
 
   elements.namespaceGalaxyNodeCount.textContent = formatNumber(data.nodes.length);
   elements.namespaceGalaxyLinkCount.textContent = formatNumber(data.links.length);
-  elements.namespaceGalaxySuggestionCount.textContent = formatNumber(data.suggestions.length);
+  elements.namespaceGalaxySuggestionCount.textContent = formatNumber(
+    data.proposals.length + data.suggestions.length,
+  );
   if (galaxy.view === "namespace") {
     updateNamespaceGalaxyChrome();
     if (galaxy.detail) renderNamespaceDetailList();
@@ -2758,7 +2777,8 @@ function drawNamespaceGalaxy() {
     .sort((left, right) => left.depth - right.depth);
   const projectedById = new Map(projectedNodes.map((node) => [node.item.contextId, node]));
   const visibleSuggestions = visibleNamespaceSuggestions(data.suggestions);
-  const projectedLinks = [...data.links, ...visibleSuggestions]
+  const visibleProposals = visibleNamespaceProposals(data.proposals);
+  const projectedLinks = [...data.links, ...visibleProposals, ...visibleSuggestions]
     .map((link) => projectNamespaceBridge(link, projectedById))
     .filter(Boolean)
     .sort((left, right) => left.depth - right.depth);
@@ -2780,6 +2800,7 @@ function namespaceGalaxyPalette() {
     bridge: value("--galaxy-bridge", "#00e6c7"),
     bridgeDisabled: value("--galaxy-bridge-disabled", "#65786e"),
     suggestion: value("--galaxy-suggestion", "#b88cff"),
+    proposal: value("--galaxy-proposal", "#ffb454"),
     strong: value("--galaxy-strong", "#58dbc2"),
     associative: value("--galaxy-associative", "#955ae5"),
     node: value("--galaxy-node", "#1ca8a2"),
@@ -2864,6 +2885,22 @@ function visibleNamespaceSuggestions(suggestions) {
   return chosen;
 }
 
+function visibleNamespaceProposals(proposals) {
+  const activeContext = state.namespaceGalaxy.selection?.kind === "node"
+    ? state.namespaceGalaxy.selection.contextId
+    : state.context;
+  const pending = proposals.filter((proposal) => proposal.governanceState === "pending");
+  const related = pending.filter((proposal) => (
+    proposal.sourceContextId === activeContext || proposal.targetContextId === activeContext
+  ));
+  const chosen = (related.length ? related : pending).slice(0, 12);
+  const selected = state.namespaceGalaxy.selection;
+  if (selected?.kind === "proposal" && !chosen.some((item) => item.id === selected.id)) {
+    chosen.push(selected);
+  }
+  return chosen;
+}
+
 function namespaceGalaxyNeighborhood(data) {
   const focal = state.namespaceGalaxy.hover || state.namespaceGalaxy.selection;
   if (!focal) return null;
@@ -2882,6 +2919,10 @@ function namespaceGalaxyNeighborhood(data) {
     data.suggestions.forEach((suggestion) => {
       if (suggestion.sourceContextId === focal.contextId) contextIds.add(suggestion.targetContextId);
       if (suggestion.targetContextId === focal.contextId) contextIds.add(suggestion.sourceContextId);
+    });
+    data.proposals.forEach((proposal) => {
+      if (proposal.sourceContextId === focal.contextId) contextIds.add(proposal.targetContextId);
+      if (proposal.targetContextId === focal.contextId) contextIds.add(proposal.sourceContextId);
     });
   } else {
     contextIds.add(focal.sourceContextId);
@@ -2905,7 +2946,9 @@ function projectNamespaceBridge(link, projectedById) {
     depth: (source.depth + target.depth) / 2,
     lineWidth: link.kind === "link" && link.enabled && link.approved
       ? 0.85 + link.weight * 3.35
-      : 0.9,
+      : link.kind === "proposal"
+        ? 1.15 + link.weight * 0.8
+        : 0.9,
   };
 }
 
@@ -2929,11 +2972,14 @@ function drawNamespaceBridge(context, bridge, palette, neighborhood) {
   const hovered = state.namespaceGalaxy.hover?.id === item.id
     && state.namespaceGalaxy.hover?.kind === item.kind;
   const isSuggestion = item.kind === "suggestion";
-  const isApprovedEnabled = !isSuggestion && item.enabled && item.approved;
+  const isProposal = item.kind === "proposal";
+  const isApprovedEnabled = item.kind === "link" && item.enabled && item.approved;
   const local = namespaceBridgeIsLocal(item, neighborhood);
   context.save();
   context.strokeStyle = isSuggestion
     ? palette.suggestion
+    : isProposal
+      ? palette.proposal
     : isApprovedEnabled
       ? palette.bridge
       : palette.bridgeDisabled;
@@ -2942,6 +2988,8 @@ function drawNamespaceBridge(context, bridge, palette, neighborhood) {
     ? 0.94
     : isSuggestion
       ? local ? 0.28 : 0.13
+      : isProposal
+        ? local ? 0.5 : 0.2
       : isApprovedEnabled
         ? local ? 0.3 + item.weight * 0.56 : 0.12 + item.weight * 0.22
         : local ? 0.25 : 0.12;
@@ -2949,6 +2997,8 @@ function drawNamespaceBridge(context, bridge, palette, neighborhood) {
   context.setLineDash(
     isSuggestion
       ? [2 + Math.min(visualDelay, 4), 7 + Math.min(visualDelay * 1.5, 6)]
+      : isProposal
+        ? [9, 4, 2, 4]
       : isApprovedEnabled
         ? []
         : [8, 7],
@@ -3157,7 +3207,11 @@ function showNamespaceGalaxyTooltip(item, x, y) {
   if (item.kind === "node") {
     tooltip.innerHTML = `<strong>${escapeHtml(item.contextId)}</strong><span>${escapeHtml(formatNumber(item.entryCount))} memories · ${escapeHtml(formatNumber(item.visualMassScore * 100))}% relative size</span>`;
   } else {
-    const status = item.kind === "suggestion" ? "suggested" : item.enabled ? "approved" : "disabled";
+    const status = item.kind === "suggestion"
+      ? "suggested"
+      : item.kind === "proposal"
+        ? `proposal: ${item.governanceState || "pending"}`
+        : item.enabled ? "approved" : "disabled";
     tooltip.innerHTML = `<strong>${escapeHtml(item.sourceContextId)} → ${escapeHtml(item.targetContextId)}</strong><span>${escapeHtml(item.relationType)} · ${escapeHtml(formatNumber(item.weight, 2))} · ${escapeHtml(status)}</span>`;
   }
   const stage = elements.namespaceGalaxyCanvas.parentElement;
@@ -3185,6 +3239,7 @@ function findNamespaceGalaxyItem(kind, id) {
   if (!kind || !id) return null;
   if (kind === "node") return state.namespaceGalaxy.data.nodes.find((item) => item.id === id) || null;
   if (kind === "suggestion") return state.namespaceGalaxy.data.suggestions.find((item) => item.id === id) || null;
+  if (kind === "proposal") return state.namespaceGalaxy.data.proposals.find((item) => item.id === id) || null;
   return state.namespaceGalaxy.data.links.find((item) => item.id === id) || null;
 }
 
@@ -3239,10 +3294,17 @@ function renderNamespaceGalaxyInspector(item) {
   }
 
   const isSuggestion = item.kind === "suggestion";
-  title.textContent = isSuggestion ? "Suggested bridge" : "Approved bridge";
+  const isProposal = item.kind === "proposal";
+  title.textContent = isSuggestion
+    ? "Suggested bridge"
+    : isProposal
+      ? "Governed bridge proposal"
+      : "Approved bridge";
   body.textContent = isSuggestion
-    ? (item.evidence || "Evidence-only density-normalized similarity candidate. It is not active until an operator connects it.")
-    : (item.evidence || "This operator-approved bridge can participate in one-hop connected recall when enabled.");
+    ? (item.evidence || "Evidence-only density-normalized similarity candidate. It is not active until an operator proposes it.")
+    : isProposal
+      ? (item.evidence || "This reviewed proposal remains isolated until an explicit CAS approval.")
+      : (item.evidence || "This operator-approved bridge can participate in one-hop connected recall when enabled.");
   renderNamespaceGalaxyFacts([
     ["Source", item.sourceContextId],
     ["Target", item.targetContextId],
@@ -3255,13 +3317,34 @@ function renderNamespaceGalaxyInspector(item) {
         ? `${formatNumber(item.suggestedPhaseDelayTicks)} ticks (display only)`
         : "None",
     ],
-    ["Status", isSuggestion ? "Suggested only" : item.enabled ? "Approved and enabled" : "Approved but disabled"],
-    ["Visual encoding", isSuggestion ? "Does not affect node size" : "Width and opacity scale with weight"],
+    [
+      "Status",
+      isSuggestion
+        ? "Suggested only"
+        : isProposal
+          ? `Proposal ${item.governanceState || "pending"}; recall remains isolated`
+          : item.enabled ? "Approved and enabled" : "Approved but disabled",
+    ],
+    ["Proposal revision", isProposal ? item.revision : ""],
+    [
+      "Visual encoding",
+      isSuggestion
+        ? "Does not affect node size"
+        : isProposal
+          ? "Amber dashed bridge; never contributes to recall or node weighting"
+          : "Width and opacity scale with weight",
+    ],
     ["Verified", formatNamespaceUpdatedAt(item.verifiedAt)],
   ]);
   actions.innerHTML = [
     isSuggestion
-      ? '<button type="button" class="primary-button" data-galaxy-action="connect">Connect</button>'
+      ? '<button type="button" class="primary-button" data-galaxy-action="connect">Propose bridge</button>'
+      : "",
+    isProposal && item.governanceState === "pending"
+      ? '<button type="button" class="primary-button" data-galaxy-action="approve-proposal">Approve proposal</button>'
+      : "",
+    isProposal && item.governanceState === "pending"
+      ? '<button type="button" class="secondary-button" data-galaxy-action="reject-proposal">Reject proposal</button>'
       : "",
     `<button type="button" class="secondary-button" data-galaxy-action="load" data-galaxy-context="${escapeHtml(item.sourceContextId)}">Load source</button>`,
     `<button type="button" class="secondary-button" data-galaxy-action="load" data-galaxy-context="${escapeHtml(item.targetContextId)}">Load target</button>`,
@@ -3350,6 +3433,14 @@ function handleNamespaceGalaxyInspectorClick(event) {
   }
   if (button.dataset.galaxyAction === "connect") {
     void connectSelectedNamespaceSuggestion(button);
+    return;
+  }
+  if (button.dataset.galaxyAction === "approve-proposal") {
+    void reviewSelectedNamespaceProposal(button, "approve");
+    return;
+  }
+  if (button.dataset.galaxyAction === "reject-proposal") {
+    void reviewSelectedNamespaceProposal(button, "reject");
   }
 }
 
@@ -3357,15 +3448,43 @@ async function connectSelectedNamespaceSuggestion(button) {
   const suggestion = state.namespaceGalaxy.selection;
   if (!suggestion || suggestion.kind !== "suggestion") return null;
   try {
-    return await withBusy(button, "Connect namespace bridge", async () => {
-      const payload = await requestJson("/api/namespace-links", {
+    return await withBusy(button, "Propose namespace bridge", async () => {
+      const payload = await requestJson("/api/namespace-link-proposals", {
         method: "POST",
         body: {
           source_context_id: suggestion.sourceContextId,
           target_context_id: suggestion.targetContextId,
           relation_type: suggestion.relationType,
           weight: suggestion.weight,
-          confirm: true,
+          reason: "Dashboard operator submitted an evidence-backed namespace bridge for review.",
+        },
+      });
+      state.namespaceGalaxy.selection = null;
+      await refreshNamespaceGalaxy();
+      return payload;
+    }, { refresh: false });
+  } catch {
+    return null;
+  }
+}
+
+async function reviewSelectedNamespaceProposal(button, decision) {
+  const proposal = state.namespaceGalaxy.selection;
+  if (!proposal || proposal.kind !== "proposal" || proposal.governanceState !== "pending") {
+    return null;
+  }
+  const verb = decision === "approve" ? "Approve" : "Reject";
+  try {
+    return await withBusy(button, `${verb} namespace bridge`, async () => {
+      const payload = await requestJson("/api/namespace-link-reviews", {
+        method: "POST",
+        body: {
+          proposal_id: proposal.proposalId,
+          decision,
+          expected_revision: proposal.revision,
+          reason: decision === "approve"
+            ? "Dashboard operator reviewed the current evidence and explicitly approved one-hop connected recall."
+            : "Dashboard operator reviewed the current evidence and rejected this recall bridge.",
         },
       });
       state.namespaceGalaxy.selection = null;

@@ -28,6 +28,10 @@ from core_authority import (
     CoreAuthorityError,
     CoreAuthorityLease,
 )
+from bridge_governance import (
+    BridgeGovernanceError,
+    BridgeGovernanceIntegrityError,
+)
 from core_protocol import (
     CORE_CONFIG_VERSION,
     DEFAULT_MAX_FRAME_BYTES,
@@ -94,6 +98,7 @@ BACKEND_LANE_CLOSE_GRACE_SECONDS = 2.0
 CORE_STORE_SCHEMA_IDENTITY = "sqlite-53324442-v6"
 BUILD_SOURCE_MANIFEST = (
     "backend_router.py",
+    "bridge_governance.py",
     "capture_daemon.py",
     "core_authority.py",
     "core_client_binding.py",
@@ -490,11 +495,53 @@ _CONTRACT_LIST = (
     _contract(
         "approve_namespace_link",
         "source_context_id target_context_id relation_type weight evidence direction "
-        "approved_by enabled confirm",
+        "approved_by enabled reason link_expires_at governance_request_id confirm",
         "source_context_id target_context_id",
         mutation=True,
     ),
-    _contract("delete_namespace_link", "context_link_id confirm", "context_link_id", mutation=True),
+    _contract(
+        "propose_namespace_link",
+        "source_context_id target_context_id relation_type weight evidence direction "
+        "proposed_by reason proposal_expires_at link_expires_at governance_request_id",
+        "source_context_id target_context_id reason",
+        mutation=True,
+    ),
+    _contract(
+        "review_namespace_link",
+        "proposal_id decision expected_revision reviewed_by reason governance_request_id",
+        "proposal_id decision expected_revision reason",
+        mutation=True,
+    ),
+    _contract(
+        "disable_namespace_link",
+        "context_link_id expected_revision disabled_by reason governance_request_id confirm",
+        "context_link_id expected_revision reason confirm",
+        mutation=True,
+    ),
+    _contract(
+        "revoke_namespace_link",
+        "context_link_id expected_revision revoked_by reason governance_request_id confirm",
+        "context_link_id expected_revision reason confirm",
+        mutation=True,
+    ),
+    _contract("expire_namespace_links", mutation=True),
+    _contract(
+        "delete_namespace_link",
+        "context_link_id expected_revision revoked_by reason governance_request_id confirm",
+        "context_link_id expected_revision confirm",
+        mutation=True,
+    ),
+    _contract(
+        "list_namespace_link_proposals",
+        "context_id state limit",
+        retry_safe=True,
+    ),
+    _contract(
+        "list_namespace_link_history",
+        "proposal_id context_link_id limit",
+        retry_safe=True,
+    ),
+    _contract("audit_namespace_link_governance", retry_safe=True),
     _contract(
         "suggest_namespace_links",
         "context_id limit min_score include_linked max_visual_phase_delay_ticks",
@@ -618,6 +665,17 @@ DETERMINISTIC_DELIVERY_REJECTION_OPERATIONS = frozenset(
         "ack_context_events",
         "release_context_events",
         "dead_letter_context_delivery",
+    }
+)
+DETERMINISTIC_GOVERNANCE_REJECTION_OPERATIONS = frozenset(
+    {
+        "approve_namespace_link",
+        "propose_namespace_link",
+        "review_namespace_link",
+        "disable_namespace_link",
+        "revoke_namespace_link",
+        "delete_namespace_link",
+        "expire_namespace_links",
     }
 )
 
@@ -1044,10 +1102,55 @@ MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingPr
             direction=_LINK_DIRECTION,
             approved_by=_IDENTIFIER,
             enabled=_BOOL,
+            reason=_NONEMPTY_SHORT_STRING,
+            link_expires_at=_OPTIONAL_TIMESTAMP,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
             confirm=_TRUE,
         ),
+        "propose_namespace_link": _schema(
+            source_context_id=_NONEMPTY_IDENTIFIER,
+            target_context_id=_NONEMPTY_IDENTIFIER,
+            relation_type=_SHORT_STRING,
+            weight=_UNIT_INTERVAL,
+            evidence=_JSON_OBJECT,
+            direction=_LINK_DIRECTION,
+            proposed_by=_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            proposal_expires_at=_OPTIONAL_TIMESTAMP,
+            link_expires_at=_OPTIONAL_TIMESTAMP,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
+        ),
+        "review_namespace_link": _schema(
+            proposal_id=_NONEMPTY_IDENTIFIER,
+            decision=_SHORT_STRING,
+            expected_revision=_DIGEST,
+            reviewed_by=_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
+        ),
+        "disable_namespace_link": _schema(
+            context_link_id=_NONEMPTY_IDENTIFIER,
+            expected_revision=_DIGEST,
+            disabled_by=_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
+            confirm=_TRUE,
+        ),
+        "revoke_namespace_link": _schema(
+            context_link_id=_NONEMPTY_IDENTIFIER,
+            expected_revision=_DIGEST,
+            revoked_by=_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
+            confirm=_TRUE,
+        ),
+        "expire_namespace_links": _schema(),
         "delete_namespace_link": _schema(
             context_link_id=_NONEMPTY_IDENTIFIER,
+            expected_revision=_DIGEST,
+            revoked_by=_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
             confirm=_TRUE,
         ),
         "repair_semantic_indexes": _schema(
@@ -1347,6 +1450,8 @@ def _validate_mutation_arguments(
         "dead_letter_context_delivery",
         "prune_memory",
         "approve_namespace_link",
+        "disable_namespace_link",
+        "revoke_namespace_link",
         "delete_namespace_link",
         "repair_semantic_indexes",
         "repair_capture_ledger",
@@ -1385,14 +1490,61 @@ def _validate_mutation_arguments(
         elif target in {"context_event", "deployment", "context_deployment"}:
             if int(arguments.get("event_id") or 0) <= 0:
                 raise CoreProtocolError()
-    if operation == "approve_namespace_link":
+    if operation in {"approve_namespace_link", "propose_namespace_link"}:
         if arguments.get("source_context_id") == arguments.get("target_context_id"):
+            raise CoreProtocolError()
+    if operation == "approve_namespace_link" and arguments.get("enabled", True) is not True:
+        raise CoreProtocolError()
+    if operation == "review_namespace_link":
+        if str(arguments.get("decision") or "").strip().lower() not in {
+            "approve",
+            "reject",
+        }:
             raise CoreProtocolError()
     if operation in {"benchmark_resource_profile", "certify_runtime"}:
         minimum = arguments.get("target_min_mb")
         maximum = arguments.get("target_max_mb")
         if minimum is not None and maximum is not None and float(minimum) > float(maximum):
             raise CoreProtocolError()
+
+
+_GOVERNANCE_ACTOR_FIELDS: Mapping[str, str] = MappingProxyType(
+    {
+        "approve_namespace_link": "approved_by",
+        "propose_namespace_link": "proposed_by",
+        "review_namespace_link": "reviewed_by",
+        "disable_namespace_link": "disabled_by",
+        "revoke_namespace_link": "revoked_by",
+        "delete_namespace_link": "revoked_by",
+    }
+)
+
+
+def _bind_authenticated_governance_actor(
+    operation: str,
+    arguments: Mapping[str, Any],
+    *,
+    authenticated_principal: str,
+) -> dict[str, Any]:
+    """Bind bridge actors to OS-verified local ownership, never caller labels."""
+
+    field = _GOVERNANCE_ACTOR_FIELDS.get(operation)
+    if field is None:
+        return dict(arguments)
+    try:
+        clean_principal = reject_sensitive_identifier(
+            authenticated_principal,
+            field="authenticated_principal",
+        ).strip()
+    except ValueError as exc:
+        raise CoreProtocolError() from exc
+    if not clean_principal:
+        raise CoreProtocolError()
+    digest = hashlib.sha256(clean_principal.encode("utf-8")).hexdigest()[:24]
+    actor = f"core:local-owner:{digest}"
+    bound = dict(arguments)
+    bound[field] = actor
+    return bound
 
 
 _MUTATION_CONTRACT_NAMES = frozenset(
@@ -3384,7 +3536,10 @@ class AuthoritativeCoreService:
                     now_unix_ms=int(time.time() * 1000),
                 )
                 connection.settimeout(AUTHENTICATED_CONNECTION_TIMEOUT_SECONDS)
-                response = self._execute_request(request)
+                response = self._execute_request(
+                    request,
+                    authenticated_principal=f"local-uid:{observed_uid}",
+                )
             except CoreProtocolError as exc:
                 response = self._invalid_request_response(exc.code)
             except (CoreTransportError, OSError, TimeoutError):
@@ -3525,7 +3680,12 @@ class AuthoritativeCoreService:
             safe_error_code=None if error is None else error["code"],
         )
 
-    def _execute_request(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _execute_request(
+        self,
+        request: dict[str, Any],
+        *,
+        authenticated_principal: str | None = None,
+    ) -> dict[str, Any]:
         expected_config = request.get("expected_config_fingerprint")
         if expected_config is not None and not secrets.compare_digest(
             expected_config,
@@ -3574,11 +3734,24 @@ class AuthoritativeCoreService:
                 contract.name,
                 request["arguments"],
             )
+            authorized_arguments = _bind_authenticated_governance_actor(
+                contract.name,
+                authorized_arguments,
+                authenticated_principal=(
+                    authenticated_principal
+                    if authenticated_principal is not None
+                    else f"local-uid:{os.getuid()}"
+                ),
+            )
         except CorePathPolicyError:
             return self._response(
                 request,
                 error=safe_error("path_not_authorized"),
             )
+        except CoreProtocolError as exc:
+            for token in path_tokens:
+                token.close()
+            return self._response(request, error=safe_error(exc.code))
         if self._stop_event.is_set():
             for token in path_tokens:
                 token.close()
@@ -3731,6 +3904,40 @@ class AuthoritativeCoreService:
                     except (CoreRequestJournalError, OSError, sqlite3.Error):
                         LOGGER.error(
                             "path authorization failure could not be finalized"
+                        )
+                    return self._cache_mutation_response(request, response)
+                except BridgeGovernanceIntegrityError:
+                    LOGGER.error(
+                        "bridge governance integrity failure operation=%s",
+                        contract.name,
+                    )
+                    response = self._response(
+                        request,
+                        error=safe_error("service_unavailable"),
+                    )
+                    try:
+                        self._journal_finish(request, response)
+                    except (CoreRequestJournalError, OSError, sqlite3.Error):
+                        LOGGER.error(
+                            "governance integrity failure could not be finalized"
+                        )
+                    return self._cache_mutation_response(request, response)
+                except BridgeGovernanceError:
+                    if contract.name not in DETERMINISTIC_GOVERNANCE_REJECTION_OPERATIONS:
+                        response = self._response(
+                            request,
+                            error=safe_error("outcome_unknown"),
+                        )
+                    else:
+                        response = self._response(
+                            request,
+                            error=safe_error("invalid_request"),
+                        )
+                    try:
+                        self._journal_finish(request, response)
+                    except (CoreRequestJournalError, OSError, sqlite3.Error):
+                        LOGGER.error(
+                            "governance rejection could not be finalized"
                         )
                     return self._cache_mutation_response(request, response)
                 except ContextDeliveryRejected:

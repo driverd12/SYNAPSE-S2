@@ -470,8 +470,32 @@ class CoreClient:
     def approve_namespace_link(self, **arguments: Any) -> dict[str, Any]:
         return self.call("approve_namespace_link", arguments)
 
+    def propose_namespace_link(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("propose_namespace_link", arguments)
+
+    def review_namespace_link(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("review_namespace_link", arguments)
+
+    def disable_namespace_link(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("disable_namespace_link", arguments)
+
+    def revoke_namespace_link(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("revoke_namespace_link", arguments)
+
+    def expire_namespace_links(self) -> dict[str, Any]:
+        return self.call("expire_namespace_links")
+
     def delete_namespace_link(self, **arguments: Any) -> dict[str, Any]:
         return self.call("delete_namespace_link", arguments)
+
+    def list_namespace_link_proposals(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("list_namespace_link_proposals", arguments)
+
+    def list_namespace_link_history(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("list_namespace_link_history", arguments)
+
+    def audit_namespace_link_governance(self) -> dict[str, Any]:
+        return self.call("audit_namespace_link_governance")
 
     def suggest_namespace_links(self, **arguments: Any) -> dict[str, Any]:
         return self.call("suggest_namespace_links", arguments)

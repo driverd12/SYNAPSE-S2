@@ -28,6 +28,12 @@ from embedding_providers import (
     resolve_embedding_provider_config,
 )
 from event_segmenter import BayesianSurpriseEventSegmenter
+from bridge_governance import (
+    BridgeGovernance,
+    BridgeGovernanceInvalidTransition,
+    BridgeGovernanceNotFound,
+    BridgeGovernanceStaleRevision,
+)
 from core_authority import (
     CORE_AUTHORITY_LOCK_GENERATION_RE,
     CoreAuthorityError,
@@ -621,6 +627,17 @@ class SpikingAttentionBackend:
         self.memory_store = DurableMemoryStore(
             resolved_memory_path,
             authority_lease=authority_lease,
+        )
+        # Keep the lifecycle engine strict by default for direct callers while
+        # the single-user backend uses an explicit proposal/review workflow
+        # without pretending that two local process identifiers are two human
+        # approvers. The authoritative core binds every actor field to the
+        # OS-verified local-owner principal; all decisions require a fresh CAS
+        # revision, but this local deployment does not claim two-person review.
+        self.bridge_governance = BridgeGovernance(
+            self.memory_store,
+            require_distinct_reviewer=False,
+            allow_compatibility_approval=True,
         )
         self._core_preclaim_bootstrap = bool(
             authority_lease is not None
@@ -2326,7 +2343,7 @@ class SpikingAttentionBackend:
         context: str,
         recall_scope: str,
     ) -> dict[str, Any]:
-        raw_records = self.memory_store.resolve_recall_contexts(
+        raw_records = self.bridge_governance.resolve_recall_contexts(
             context_id=context,
             scope=recall_scope,
         )
@@ -2362,9 +2379,8 @@ class SpikingAttentionBackend:
         raw_links: list[dict[str, Any]] = []
         links_truncated = False
         if recall_scope == "connected":
-            raw_links = self.memory_store.list_context_links(
+            raw_links = self.bridge_governance.list_active_namespace_links(
                 context_id=context,
-                enabled_only=True,
                 limit=RETRIEVAL_V2_MAX_SCOPE_LINKS + 1,
             )
             raw_links = sorted(
@@ -3499,7 +3515,7 @@ class SpikingAttentionBackend:
         if not query_spikes:
             return []
         firing_values = firing_signature.tolist()
-        scope_records = self.memory_store.resolve_recall_contexts(
+        scope_records = self.bridge_governance.resolve_recall_contexts(
             context_id=context,
             scope=recall_scope,
         )
@@ -3742,7 +3758,7 @@ class SpikingAttentionBackend:
         scope_records = list(
             recall_contexts
             if recall_contexts is not None
-            else self.memory_store.resolve_recall_contexts(
+            else self.bridge_governance.resolve_recall_contexts(
                 context_id=context,
                 scope=recall_scope,
             )
@@ -3867,7 +3883,7 @@ class SpikingAttentionBackend:
         *,
         recall_scope: str = "local",
     ) -> list[str]:
-        scope_records = self.memory_store.resolve_recall_contexts(
+        scope_records = self.bridge_governance.resolve_recall_contexts(
             context_id=context,
             scope=recall_scope,
         )
@@ -4079,7 +4095,7 @@ class SpikingAttentionBackend:
         """Resolve the backend's bounded recall scope with provenance."""
         context = sanitize_context_id(context_id)
         scope = sanitize_recall_scope(recall_scope)
-        return self.memory_store.resolve_recall_contexts(
+        return self.bridge_governance.resolve_recall_contexts(
             context_id=context,
             scope=scope,
         )
@@ -4228,7 +4244,7 @@ class SpikingAttentionBackend:
         recall_scope: str,
         include_global: bool,
     ) -> dict[str, Any]:
-        records = self.memory_store.resolve_recall_contexts(
+        records = self.bridge_governance.resolve_recall_contexts(
             context_id=context,
             scope=recall_scope,
         )
@@ -4534,7 +4550,7 @@ class SpikingAttentionBackend:
         recall_scope: str,
     ) -> dict[str, Any]:
         bounded_limit = min(max(int(limit), 1), 10_000)
-        scope_records = self.memory_store.resolve_recall_contexts(
+        scope_records = self.bridge_governance.resolve_recall_contexts(
             context_id=context,
             scope=recall_scope,
         )
@@ -8918,11 +8934,18 @@ class SpikingAttentionBackend:
         direction: str = "bidirectional",
         approved_by: str = "operator",
         enabled: bool = True,
+        reason: str = "explicit operator approval",
+        link_expires_at: float | None = None,
+        governance_request_id: str | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
-        """Persist an operator-approved namespace link; never auto-approve."""
-        if not confirm:
+        """Compatibility approval that still records the full governed lifecycle."""
+        if confirm is not True:
             raise ValueError("confirm=true is required to approve a namespace link")
+        if enabled is not True:
+            raise ValueError(
+                "direct approval must be enabled; approve then explicitly disable it"
+            )
         source = sanitize_context_id(source_context_id)
         target = sanitize_context_id(target_context_id)
         if source == target:
@@ -8943,43 +8966,251 @@ class SpikingAttentionBackend:
             "automatic_cross_namespace_write": False,
             "connected_recall_only": True,
         }
-        link = self.memory_store.upsert_context_link(
+        governed = self.bridge_governance.approve_namespace_link_compat(
             source_context_id=source,
             target_context_id=target,
             relation_type=relation,
-            confidence=weight,
+            weight=weight,
             evidence=self._json_safe_metadata(approval_evidence),
             direction=direction,
             approved_by=sanitize_agent_id(approved_by),
-            enabled=enabled,
+            reason=reason,
+            link_expires_at=link_expires_at,
+            governance_request_id=governance_request_id,
+            confirm=confirm,
         )
+        link = self._decorate_namespace_link(dict(governed["link"]))
         self._surface_recall_cache.clear()
         self._mark_activity()
         return {
             "action": "approve-namespace-link",
-            "approved": True,
+            "approved": bool(governed.get("authorization_active")),
             "confirmed": True,
-            "link": self._decorate_namespace_link(link),
+            "link": link,
+            "proposal": governed["proposal"],
+            "governance_state": governed["state"],
+            "authorization_active": bool(governed.get("authorization_active")),
+            "idempotent_replay": bool(governed.get("idempotent_replay")),
+            "compatibility_mode": True,
             "automatic_cross_namespace_write": False,
             "memory_db_path": str(self.memory_store.db_path),
         }
+
+    def propose_namespace_link(
+        self,
+        *,
+        source_context_id: str,
+        target_context_id: str,
+        relation_type: str = "related",
+        weight: float = 1.0,
+        evidence: dict[str, Any] | None = None,
+        direction: str = "bidirectional",
+        proposed_by: str = "operator",
+        reason: str,
+        proposal_expires_at: float | None = None,
+        link_expires_at: float | None = None,
+        governance_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        source = sanitize_context_id(source_context_id)
+        target = sanitize_context_id(target_context_id)
+        if source == target:
+            raise ValueError("source and target namespaces must be distinct")
+        similarity = self.memory_store.context_similarity(
+            source_context_id=source,
+            target_context_id=target,
+            max_phase_delay_ticks=4,
+        )
+        supplied = evidence if isinstance(evidence, dict) else {}
+        safe_supplied, _redaction_count = redact_sensitive_value(supplied)
+        safe_supplied = safe_supplied if isinstance(safe_supplied, dict) else {}
+        basis_revision = self.memory_store.entries_revision(
+            context_ids=sorted({source, target})
+        )
+        result = self.bridge_governance.propose_namespace_link(
+            source_context_id=source,
+            target_context_id=target,
+            relation_type=sanitize_tag(relation_type or "related")
+            .lower()
+            .replace(" ", "_"),
+            weight=weight,
+            evidence=self._json_safe_metadata(
+                {
+                    **safe_supplied,
+                    **dict(similarity["evidence"]),
+                    "basis_entries_revision": basis_revision["revision"],
+                    "basis_context_ids": basis_revision["context_ids"],
+                    "proposal_source": "explicit-operator-request",
+                    "connected_recall_only": True,
+                    "automatic_cross_namespace_write": False,
+                }
+            ),
+            direction=direction,
+            proposed_by=sanitize_agent_id(proposed_by),
+            reason=reason,
+            proposal_expires_at=proposal_expires_at,
+            link_expires_at=link_expires_at,
+            governance_request_id=governance_request_id,
+        )
+        self._mark_activity()
+        return {**result, "memory_db_path": str(self.memory_store.db_path)}
+
+    def review_namespace_link(
+        self,
+        *,
+        proposal_id: str,
+        decision: str,
+        expected_revision: str,
+        reviewed_by: str = "operator",
+        reason: str,
+        governance_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        current_proposal = self.bridge_governance.get_namespace_link_proposal(
+            proposal_id=proposal_id
+        )
+        if str(decision or "").strip().lower() == "approve":
+            proposal_evidence = current_proposal.get("evidence")
+            proposal_evidence = (
+                proposal_evidence if isinstance(proposal_evidence, dict) else {}
+            )
+            basis_revision = str(
+                proposal_evidence.get("basis_entries_revision") or ""
+            )
+            if basis_revision:
+                observed_revision = self.memory_store.entries_revision(
+                    context_ids=sorted(
+                        {
+                            str(current_proposal["source_context_id"]),
+                            str(current_proposal["target_context_id"]),
+                        }
+                    )
+                )["revision"]
+                if observed_revision != basis_revision:
+                    raise BridgeGovernanceStaleRevision(
+                        "bridge proposal evidence is stale; create a new proposal"
+                    )
+        result = self.bridge_governance.review_namespace_link(
+            proposal_id=proposal_id,
+            decision=decision,
+            expected_revision=expected_revision,
+            reviewed_by=sanitize_agent_id(reviewed_by),
+            reason=reason,
+            governance_request_id=governance_request_id,
+        )
+        if isinstance(result.get("link"), dict):
+            result["link"] = self._decorate_namespace_link(dict(result["link"]))
+        self._surface_recall_cache.clear()
+        self._mark_activity()
+        return {**result, "memory_db_path": str(self.memory_store.db_path)}
+
+    def disable_namespace_link(
+        self,
+        *,
+        context_link_id: str,
+        expected_revision: str,
+        disabled_by: str = "operator",
+        reason: str,
+        governance_request_id: str | None = None,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        result = self.bridge_governance.disable_namespace_link(
+            context_link_id=context_link_id,
+            expected_revision=expected_revision,
+            disabled_by=sanitize_agent_id(disabled_by),
+            reason=reason,
+            governance_request_id=governance_request_id,
+            confirm=confirm,
+        )
+        if isinstance(result.get("link"), dict):
+            result["link"] = self._decorate_namespace_link(dict(result["link"]))
+        self._surface_recall_cache.clear()
+        self._mark_activity()
+        return {**result, "memory_db_path": str(self.memory_store.db_path)}
+
+    def revoke_namespace_link(
+        self,
+        *,
+        context_link_id: str,
+        expected_revision: str,
+        revoked_by: str = "operator",
+        reason: str,
+        governance_request_id: str | None = None,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        result = self.bridge_governance.revoke_namespace_link(
+            context_link_id=context_link_id,
+            expected_revision=expected_revision,
+            revoked_by=sanitize_agent_id(revoked_by),
+            reason=reason,
+            governance_request_id=governance_request_id,
+            confirm=confirm,
+        )
+        if isinstance(result.get("link"), dict):
+            result["link"] = self._decorate_namespace_link(dict(result["link"]))
+        self._surface_recall_cache.clear()
+        self._mark_activity()
+        return {**result, "memory_db_path": str(self.memory_store.db_path)}
+
+    def list_namespace_link_proposals(
+        self,
+        *,
+        context_id: str = "",
+        state: str = "",
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        return self.bridge_governance.list_namespace_link_proposals(
+            context_id=sanitize_context_id(context_id) if str(context_id).strip() else None,
+            state=state or None,
+            limit=limit,
+        )
+
+    def list_namespace_link_history(
+        self,
+        *,
+        proposal_id: str = "",
+        context_link_id: str = "",
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        return self.bridge_governance.list_namespace_link_history(
+            proposal_id=proposal_id or None,
+            context_link_id=context_link_id or None,
+            limit=limit,
+        )
+
+    def audit_namespace_link_governance(self) -> dict[str, Any]:
+        return self.bridge_governance.audit_integrity()
+
+    def expire_namespace_links(self) -> dict[str, Any]:
+        result = self.bridge_governance.expire_due()
+        if int(result.get("expired_count", 0)):
+            self._surface_recall_cache.clear()
+            self._mark_activity()
+        return result
 
     def delete_namespace_link(
         self,
         *,
         context_link_id: str,
-        confirm: bool = False,
+        expected_revision: str,
+        revoked_by: str = "operator",
+        reason: str = "legacy delete request converted to governed revocation",
+        governance_request_id: str | None = None,
+        confirm: bool,
     ) -> dict[str, Any]:
         if not confirm:
             raise ValueError("confirm=true is required to delete a namespace link")
-        result = self.memory_store.delete_context_link(
-            context_link_id=str(context_link_id or "").strip()
+        result = self.revoke_namespace_link(
+            context_link_id=context_link_id,
+            expected_revision=expected_revision,
+            revoked_by=revoked_by,
+            reason=reason,
+            governance_request_id=governance_request_id,
+            confirm=True,
         )
-        self._surface_recall_cache.clear()
-        self._mark_activity()
         return {
-            "action": "delete-namespace-link",
-            **result,
+            "action": "revoke-namespace-link",
+            "deleted": False,
+            "revoked": True,
+            "result": result,
             "automatic_cross_namespace_write": False,
             "memory_db_path": str(self.memory_store.db_path),
         }
@@ -9035,8 +9266,8 @@ class SpikingAttentionBackend:
         )
         bounded_limit = min(max(int(limit), 1), 10_000)
         raw_nodes = self.memory_store.list_context_summaries(limit=bounded_limit)
-        raw_links = self.memory_store.list_context_links(
-            limit=min(max(bounded_limit * 8, 1000), 10_000)
+        raw_links = self.bridge_governance.list_active_namespace_links(
+            limit=min(max(bounded_limit * 8, 1000), 2_000)
         )
         links = [self._decorate_namespace_link(link) for link in raw_links]
         adjacency: dict[str, set[str]] = {
@@ -9089,16 +9320,33 @@ class SpikingAttentionBackend:
             else {"suggestions": []}
         )
         suggestions = list(suggestions_payload.get("suggestions", []))
+        proposal_payload = self.bridge_governance.list_namespace_link_proposals(
+            limit=min(max(bounded_limit * 4, 500), 2_000)
+        )
+        proposals = list(proposal_payload.get("proposals", []))
         return {
             "action": "list-namespace-map",
             "scope": "all",
             "selected_context_id": selected_context,
             "node_count": len(nodes),
             "link_count": len(links),
+            "proposal_count": len(proposals),
             "suggestion_count": len(suggestions),
             "nodes": nodes,
             "links": links,
+            "proposals": proposals,
             "suggestions": suggestions,
+            "bridge_governance": {
+                "schema": "synapse-s2.bridge-governance-map.v1",
+                "mode": "proposal-review-cas",
+                "actor_assurance": "os-verified-local-owner-v1",
+                "review_separation": "two-step-single-local-owner",
+                "distinct_human_review_claimed": False,
+                "active_link_count": len(links),
+                "proposal_count": len(proposals),
+                "audit_available": True,
+                "automatic_cross_namespace_write": False,
+            },
             "recall_scopes": ["local", "connected", "all"],
             "default_recall_scope": "local",
             "connected_scope_hops": 1,
@@ -11523,6 +11771,9 @@ def approve_namespace_link(
     direction: str = "bidirectional",
     approved_by: str = "operator",
     enabled: bool = True,
+    reason: str = "explicit operator approval",
+    link_expires_at: float | None = None,
+    governance_request_id: str | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
     return get_backend().approve_namespace_link(
@@ -11534,17 +11785,60 @@ def approve_namespace_link(
         direction=direction,
         approved_by=approved_by,
         enabled=enabled,
+        reason=reason,
+        link_expires_at=link_expires_at,
+        governance_request_id=governance_request_id,
         confirm=confirm,
     )
+
+
+def propose_namespace_link(**arguments: Any) -> dict[str, Any]:
+    return get_backend().propose_namespace_link(**arguments)
+
+
+def review_namespace_link(**arguments: Any) -> dict[str, Any]:
+    return get_backend().review_namespace_link(**arguments)
+
+
+def disable_namespace_link(**arguments: Any) -> dict[str, Any]:
+    return get_backend().disable_namespace_link(**arguments)
+
+
+def revoke_namespace_link(**arguments: Any) -> dict[str, Any]:
+    return get_backend().revoke_namespace_link(**arguments)
+
+
+def list_namespace_link_proposals(**arguments: Any) -> dict[str, Any]:
+    return get_backend().list_namespace_link_proposals(**arguments)
+
+
+def list_namespace_link_history(**arguments: Any) -> dict[str, Any]:
+    return get_backend().list_namespace_link_history(**arguments)
+
+
+def audit_namespace_link_governance() -> dict[str, Any]:
+    return get_backend().audit_namespace_link_governance()
+
+
+def expire_namespace_links() -> dict[str, Any]:
+    return get_backend().expire_namespace_links()
 
 
 def delete_namespace_link(
     *,
     context_link_id: str,
+    expected_revision: str,
+    revoked_by: str = "operator",
+    reason: str = "legacy delete request converted to governed revocation",
+    governance_request_id: str | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
     return get_backend().delete_namespace_link(
         context_link_id=context_link_id,
+        expected_revision=expected_revision,
+        revoked_by=revoked_by,
+        reason=reason,
+        governance_request_id=governance_request_id,
         confirm=confirm,
     )
 

@@ -878,6 +878,62 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertTrue(linked_bridge["enabled"])
         self.assertEqual(linked_bridge["direction"], "bidirectional")
 
+    def test_namespace_proposal_api_keeps_recall_isolated_until_review(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime.backend.register_trace(
+                tag="governed-camera-memory",
+                embedding=runtime.backend.embed_text("governed camera overlap"),
+                context_id="camera-work",
+                source_text="governed camera overlap",
+            )
+            proposed_status, proposed = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/namespace-link-proposals",
+                    json.dumps(
+                        {
+                            "source_context_id": "demo",
+                            "target_context_id": "camera-work",
+                            "relation_type": "related",
+                            "weight": 0.82,
+                            "reason": "Dashboard proposal requires deliberate review.",
+                        }
+                    ).encode(),
+                )
+            )
+            pending_status, pending = self.decode(
+                runtime.handle("GET", "/api/namespace-map?context_id=demo")
+            )
+            proposal = proposed["proposal"]
+            reviewed_status, reviewed = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/namespace-link-reviews",
+                    json.dumps(
+                        {
+                            "proposal_id": proposal["proposal_id"],
+                            "decision": "approve",
+                            "expected_revision": proposal["revision"],
+                            "reason": "The current evidence supports connected recall.",
+                        }
+                    ).encode(),
+                )
+            )
+            audit_status, audit = self.decode(
+                runtime.handle("GET", "/api/namespace-link-governance")
+            )
+
+        self.assertEqual(proposed_status, 200)
+        self.assertEqual(proposed["state"], "pending")
+        self.assertEqual(pending_status, 200)
+        self.assertEqual(pending["link_count"], 0)
+        self.assertEqual(pending["proposal_count"], 1)
+        self.assertEqual(reviewed_status, 200)
+        self.assertEqual(reviewed["state"], "approved")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit["status"], "ready")
+
     def test_api_errors_hide_internal_details_by_default(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)

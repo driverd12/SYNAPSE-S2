@@ -77,6 +77,8 @@ _RETRIEVAL_MAX_CONTEXTS = 64
 _RETRIEVAL_SNAPSHOT_REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _RETRIEVAL_GENERATION_KEY_PREFIX = "retrieval_snapshot_generation.v1"
 _RETRIEVAL_GENERATION_MAX = 9_223_372_036_854_775_807
+NAMESPACE_CATALOG_SCHEMA = "synapse-s2.namespace-catalog.v1"
+NAMESPACE_CATALOG_METADATA_PREFIX = "namespace_catalog.v1:"
 
 
 BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v3"
@@ -7325,6 +7327,74 @@ class DurableMemoryStore:
         ).encode("utf-8")
         return "s2cl_" + hashlib.sha256(key).hexdigest()[:32]
 
+    def _record_namespace_catalog_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        context_id: str,
+        observed_at: float | None = None,
+    ) -> None:
+        """Remember a namespace independently of its remaining memory rows.
+
+        The catalog deliberately uses the versioned ``store_metadata``
+        extension point rather than changing the certified v6 SQLite schema.
+        It is therefore included in logical snapshots and verified recovery
+        bundles without weakening the exact schema contract.  Callers invoke
+        this helper inside the same transaction that first observes durable
+        namespace activity.
+        """
+
+        clean_context = reject_sensitive_identifier(
+            context_id,
+            field="context_id",
+        )
+        if not self._context_event_context_id_is_valid(clean_context):
+            raise ValueError(
+                "context_id must be stripped, nonempty, and at most 128 characters"
+            )
+        timestamp = time.time() if observed_at is None else float(observed_at)
+        if not math.isfinite(timestamp) or timestamp <= 0.0:
+            raise ValueError("namespace observation time must be a finite timestamp")
+        key = f"{NAMESPACE_CATALOG_METADATA_PREFIX}{clean_context}"
+        row = conn.execute(
+            "SELECT value_json FROM store_metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        created_at = timestamp
+        last_seen_at = timestamp
+        if row is not None:
+            existing = _decode_json(str(row["value_json"]), {})
+            if isinstance(existing, dict):
+                try:
+                    candidate = float(existing.get("created_at", timestamp))
+                except (TypeError, ValueError, OverflowError):
+                    candidate = timestamp
+                if math.isfinite(candidate) and candidate > 0.0:
+                    created_at = min(candidate, timestamp)
+                try:
+                    prior_last_seen = float(existing.get("last_seen_at", timestamp))
+                except (TypeError, ValueError, OverflowError):
+                    prior_last_seen = timestamp
+                if math.isfinite(prior_last_seen) and prior_last_seen > 0.0:
+                    last_seen_at = max(prior_last_seen, timestamp)
+        payload = {
+            "schema": NAMESPACE_CATALOG_SCHEMA,
+            "context_id": clean_context,
+            "state": "active",
+            "created_at": created_at,
+            "last_seen_at": last_seen_at,
+        }
+        conn.execute(
+            """
+            INSERT INTO store_metadata (key, value_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (key, _json_dumps(payload), last_seen_at),
+        )
+
     @staticmethod
     def _validate_capture_id(capture_id: Any) -> str:
         if type(capture_id) is not str or CAPTURE_ID_RE.fullmatch(capture_id) is None:
@@ -7965,6 +8035,11 @@ class DurableMemoryStore:
         registered_at: float,
     ) -> dict[str, Any]:
         updated_at = time.time()
+        self._record_namespace_catalog_conn(
+            conn,
+            context_id=context_id,
+            observed_at=updated_at,
+        )
         conn.execute(
             """
             INSERT INTO memory_entries (
@@ -9495,7 +9570,37 @@ class DurableMemoryStore:
                     """,
                     tuple(params),
                 ).fetchall()
-            return [self._row_to_context_link(row) for row in rows]
+            links = [self._row_to_context_link(row) for row in rows]
+            if enabled_only:
+                # Governed link expiry is an authorization boundary, not a
+                # maintenance schedule.  Enforce it on every recall read even
+                # if the asynchronous expiry sweep has not yet materialized
+                # ``enabled = 0``. Legacy approved links remain compatible
+                # until explicitly adopted into the governance ledger.
+                observed_at = time.time()
+                effective: list[dict[str, Any]] = []
+                for link in links:
+                    evidence = link.get("evidence")
+                    governance = (
+                        evidence.get("governance")
+                        if isinstance(evidence, dict)
+                        else None
+                    )
+                    if isinstance(governance, dict):
+                        if governance.get("state") != "approved":
+                            continue
+                        expires_at = governance.get("link_expires_at")
+                        if expires_at is not None:
+                            try:
+                                if observed_at >= float(expires_at):
+                                    continue
+                            except (TypeError, ValueError, OverflowError):
+                                # Malformed policy data can never broaden
+                                # connected recall.
+                                continue
+                    effective.append(link)
+                links = effective
+            return links
         except Exception:
             LOGGER.exception("failed to list context links")
             raise
@@ -9531,11 +9636,20 @@ class DurableMemoryStore:
             with closing(self._connect()) as conn:
                 rows = conn.execute(
                     """
-                    WITH contexts AS (
+                    WITH namespace_catalog AS (
+                        SELECT
+                            substr(key, length(?) + 1) AS context_id,
+                            updated_at AS last_catalog_at
+                        FROM store_metadata
+                        WHERE substr(key, 1, length(?)) = ?
+                          AND length(key) > length(?)
+                    ),
+                    contexts AS (
                         SELECT context_id FROM memory_entries
                         UNION SELECT context_id FROM agent_context_events
                         UNION SELECT source_context_id FROM context_relationships
                         UNION SELECT target_context_id FROM context_relationships
+                        UNION SELECT context_id FROM namespace_catalog
                     ),
                     entry_stats AS (
                         SELECT
@@ -9595,9 +9709,11 @@ class DurableMemoryStore:
                         MAX(
                             COALESCE(entry_stats.last_entry_at, 0.0),
                             COALESCE(event_stats.last_event_at, 0.0),
-                            COALESCE(link_stats.last_link_at, 0.0)
+                            COALESCE(link_stats.last_link_at, 0.0),
+                            COALESCE(namespace_catalog.last_catalog_at, 0.0)
                         ) AS last_activity_at
                     FROM contexts
+                    LEFT JOIN namespace_catalog USING (context_id)
                     LEFT JOIN entry_stats USING (context_id)
                     LEFT JOIN relationship_stats USING (context_id)
                     LEFT JOIN spike_stats USING (context_id)
@@ -9607,7 +9723,13 @@ class DurableMemoryStore:
                     ORDER BY entry_count DESC, last_activity_at DESC, contexts.context_id
                     LIMIT ?
                     """,
-                    (bounded_limit,),
+                    (
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        bounded_limit,
+                    ),
                 ).fetchall()
             return [
                 {
@@ -10382,6 +10504,11 @@ class DurableMemoryStore:
         targets: list[str],
         created_at: float,
     ) -> dict[str, Any]:
+        self._record_namespace_catalog_conn(
+            conn,
+            context_id=context_id,
+            observed_at=created_at,
+        )
         cursor = conn.execute(
             """
             INSERT INTO agent_context_events (
@@ -12755,11 +12882,32 @@ class DurableMemoryStore:
                 event_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
                 context_rows = conn.execute(
                     """
-                    SELECT context_id, COUNT(*) AS count
-                    FROM memory_entries
-                    GROUP BY context_id
-                    ORDER BY context_id
-                    """
+                    WITH catalog AS (
+                        SELECT substr(key, length(?) + 1) AS context_id
+                        FROM store_metadata
+                        WHERE substr(key, 1, length(?)) = ?
+                          AND length(key) > length(?)
+                    ),
+                    contexts AS (
+                        SELECT context_id FROM memory_entries
+                        UNION SELECT context_id FROM catalog
+                    ),
+                    counts AS (
+                        SELECT context_id, COUNT(*) AS count
+                        FROM memory_entries
+                        GROUP BY context_id
+                    )
+                    SELECT contexts.context_id, COALESCE(counts.count, 0) AS count
+                    FROM contexts
+                    LEFT JOIN counts USING (context_id)
+                    ORDER BY contexts.context_id
+                    """,
+                    (
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                    ),
                 ).fetchall()
                 if owns_transaction:
                     conn.commit()

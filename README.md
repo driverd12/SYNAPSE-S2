@@ -165,6 +165,9 @@ sanitized acceptance artifact is
 `738cfce`; it records Recall@k 1.0, MRR 1.0, nDCG@k 0.99951846, zero namespace
 leakage, deterministic output, and unchanged measured read state. This remains
 a fixed synthetic regression gate, not a live-corpus relevance or latency SLO.
+The proposal/review/CAS lifecycle, actor binding, expiry and revocation rules,
+audit non-repair semantics, namespace catalog, and safe operator procedure for
+connected recall are in `docs/BRIDGE_GOVERNANCE.md`.
 The sanitized Phase 6 acceptance artifact is
 `docs/evidence/phase6-token-contract-acceptance.json`: it passed all 11
 correctness gates against a verified isolated recovery restore, with an
@@ -625,6 +628,11 @@ The MCP server exposes these tools:
 | `list_spiking_app_connections` | List App Connect attachments. |
 | `capture_spiking_app_snapshot` | Capture a confirmed redacted local app Accessibility snapshot into memory. |
 | `list_spiking_memory_graph` | List compact memory nodes and relationship edges with endpoint resolution, provenance, completeness, and omission metadata. |
+| `list_spiking_namespace_map` | List the bounded namespace catalog, active governed links, pending proposals, and read-only bridge suggestions for the Neural Galaxy. |
+| `propose_spiking_namespace_link` | Create an isolated pending bridge proposal with evidence and expiry; it does not expand recall. |
+| `reject_spiking_namespace_link` | CAS-reject the exact pending proposal revision; the MCP surface cannot approve a bridge or expand recall. |
+| `list_spiking_namespace_link_history` | Inspect bounded append-only bridge-governance history by proposal or durable link id. |
+| `audit_spiking_namespace_link_governance` | Read-only integrity audit across governance projections, receipts, and durable link rows. |
 | `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Atomically acknowledge exact receipt ids after their deployments were consumed. |
@@ -724,6 +732,9 @@ Recall always declares one of three scopes:
 Retrieval v2 fuses the durable spike-overlap index, durable surface/facet index, and an optional bounded set of same-context graph neighbors with versioned weights, then applies bounded MMR/Jaccard diversity selection. Every result carries stable memory identity, source provenance, scope provenance, and—when it crossed a namespace boundary—the exact approved one-hop link that authorized it. Scores are deterministic ranking signals, not confidence estimates, truth probabilities, or biological firing rates. The response reports candidate, scope, term, and result truncation independently; ranked retrieval itself is one bounded snapshot read and does not advertise a continuation cursor.
 
 The full validation contract, cursor behavior, benchmark method, and non-claims are documented in [`docs/RETRIEVAL_V2_VALIDATION.md`](docs/RETRIEVAL_V2_VALIDATION.md).
+The production bridge lifecycle, authenticated actor semantics, supported
+surfaces, audit behavior, and containment runbook are documented in
+[`docs/BRIDGE_GOVERNANCE.md`](docs/BRIDGE_GOVERNANCE.md).
 
 Connected recall is a bounded read operation. Similarity and density-normalized suggestion scores never copy or write durable memories into another namespace, and links require explicit confirmation. Phase-delay values are presentation metadata used only for bridge styling and inspection in the galaxy, not a claim that the SQLite memory store runs a validated biological synchronization model.
 

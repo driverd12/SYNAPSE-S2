@@ -798,8 +798,90 @@ def command_namespace_link(args: argparse.Namespace) -> dict[str, Any]:
         direction=args.direction,
         approved_by=args.approved_by,
         enabled=not bool(args.disabled),
+        reason=args.reason,
+        link_expires_at=args.link_expires_at,
+        governance_request_id=args.governance_request_id,
         confirm=bool(args.confirm),
     )
+
+
+def command_namespace_link_propose(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.propose_namespace_link(
+        source_context_id=args.source_context,
+        target_context_id=args.target_context,
+        relation_type=args.relation_type,
+        weight=args.weight,
+        evidence=parse_metadata(args.evidence),
+        direction=args.direction,
+        proposed_by=args.proposed_by,
+        reason=args.reason,
+        proposal_expires_at=args.proposal_expires_at,
+        link_expires_at=args.link_expires_at,
+        governance_request_id=args.governance_request_id,
+    )
+
+
+def command_namespace_link_review(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.review_namespace_link(
+        proposal_id=args.proposal_id,
+        decision=args.decision,
+        expected_revision=args.expected_revision,
+        reviewed_by=args.reviewed_by,
+        reason=args.reason,
+        governance_request_id=args.governance_request_id,
+    )
+
+
+def command_namespace_link_disable(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.disable_namespace_link(
+        context_link_id=args.context_link_id,
+        expected_revision=args.expected_revision,
+        disabled_by=args.actor,
+        reason=args.reason,
+        governance_request_id=args.governance_request_id,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_namespace_link_revoke(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.revoke_namespace_link(
+        context_link_id=args.context_link_id,
+        expected_revision=args.expected_revision,
+        revoked_by=args.actor,
+        reason=args.reason,
+        governance_request_id=args.governance_request_id,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_namespace_link_proposals(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_namespace_link_proposals(
+        context_id=args.context,
+        state=args.state,
+        limit=args.limit,
+    )
+
+
+def command_namespace_link_history(args: argparse.Namespace) -> dict[str, Any]:
+    backend = build_backend(args)
+    return backend.list_namespace_link_history(
+        proposal_id=args.proposal_id,
+        context_link_id=args.context_link_id,
+        limit=args.limit,
+    )
+
+
+def command_namespace_link_audit(args: argparse.Namespace) -> dict[str, Any]:
+    return build_backend(args).audit_namespace_link_governance()
+
+
+def command_namespace_link_expire(args: argparse.Namespace) -> dict[str, Any]:
+    return build_backend(args).expire_namespace_links()
 
 
 def _publish_cli_deployment(
@@ -1997,8 +2079,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     namespace_link.add_argument("--approved-by", default="operator")
     namespace_link.add_argument("--disabled", action="store_true")
+    namespace_link.add_argument("--reason", default="explicit operator approval")
+    namespace_link.add_argument("--link-expires-at", type=float)
+    namespace_link.add_argument("--governance-request-id")
     namespace_link.add_argument("--confirm", action="store_true")
     namespace_link.set_defaults(func=command_namespace_link)
+
+    namespace_link_propose = subparsers.add_parser("namespace-link-propose")
+    namespace_link_propose.add_argument("--source-context", required=True)
+    namespace_link_propose.add_argument("--target-context", required=True)
+    namespace_link_propose.add_argument("--relation-type", default="related")
+    namespace_link_propose.add_argument("--weight", type=float, default=1.0)
+    namespace_link_propose.add_argument("--evidence", default=None)
+    namespace_link_propose.add_argument(
+        "--direction", choices=("bidirectional", "directed"), default="bidirectional"
+    )
+    namespace_link_propose.add_argument("--proposed-by", default="operator")
+    namespace_link_propose.add_argument("--reason", required=True)
+    namespace_link_propose.add_argument("--proposal-expires-at", type=float)
+    namespace_link_propose.add_argument("--link-expires-at", type=float)
+    namespace_link_propose.add_argument("--governance-request-id")
+    namespace_link_propose.set_defaults(func=command_namespace_link_propose)
+
+    namespace_link_review = subparsers.add_parser("namespace-link-review")
+    namespace_link_review.add_argument("--proposal-id", required=True)
+    namespace_link_review.add_argument(
+        "--decision", choices=("approve", "reject"), required=True
+    )
+    namespace_link_review.add_argument("--expected-revision", required=True)
+    namespace_link_review.add_argument("--reviewed-by", default="operator")
+    namespace_link_review.add_argument("--reason", required=True)
+    namespace_link_review.add_argument("--governance-request-id")
+    namespace_link_review.set_defaults(func=command_namespace_link_review)
+
+    for command_name, command_func in (
+        ("namespace-link-disable", command_namespace_link_disable),
+        ("namespace-link-revoke", command_namespace_link_revoke),
+    ):
+        link_action_parser = subparsers.add_parser(command_name)
+        link_action_parser.add_argument("--context-link-id", required=True)
+        link_action_parser.add_argument("--expected-revision", required=True)
+        link_action_parser.add_argument("--actor", default="operator")
+        link_action_parser.add_argument("--reason", required=True)
+        link_action_parser.add_argument("--governance-request-id")
+        link_action_parser.add_argument("--confirm", action="store_true")
+        link_action_parser.set_defaults(func=command_func)
+
+    namespace_link_proposals = subparsers.add_parser("namespace-link-proposals")
+    namespace_link_proposals.add_argument("--context", default="")
+    namespace_link_proposals.add_argument("--state", default="")
+    namespace_link_proposals.add_argument("--limit", type=int, default=500)
+    namespace_link_proposals.set_defaults(func=command_namespace_link_proposals)
+
+    namespace_link_history = subparsers.add_parser("namespace-link-history")
+    namespace_link_history.add_argument("--proposal-id", default="")
+    namespace_link_history.add_argument("--context-link-id", default="")
+    namespace_link_history.add_argument("--limit", type=int, default=500)
+    namespace_link_history.set_defaults(func=command_namespace_link_history)
+
+    namespace_link_audit = subparsers.add_parser("namespace-link-audit")
+    namespace_link_audit.set_defaults(func=command_namespace_link_audit)
+
+    namespace_link_expire = subparsers.add_parser("namespace-link-expire")
+    namespace_link_expire.set_defaults(func=command_namespace_link_expire)
 
     pull_context = subparsers.add_parser("pull-context")
     add_context(pull_context)

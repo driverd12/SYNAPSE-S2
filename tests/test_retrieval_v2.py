@@ -255,33 +255,41 @@ class RetrievalV2Tests(unittest.TestCase):
                 text=f"Shared namespace retrieval signal for {context}.",
                 label=f"{context.title()} memory",
             )
-        alpha_beta = backend.memory_store.upsert_context_link(
+        alpha_beta_approval = backend.approve_namespace_link(
             source_context_id="alpha",
             target_context_id="beta",
             relation_type="camera-control",
             direction="directed",
-            confidence=0.91,
+            weight=0.91,
             approved_by="unit-test",
-            enabled=True,
+            confirm=True,
         )
-        backend.memory_store.upsert_context_link(
+        backend.approve_namespace_link(
             source_context_id="beta",
             target_context_id="gamma",
             relation_type="two-hop-only",
             direction="bidirectional",
-            confidence=0.8,
+            weight=0.8,
             approved_by="unit-test",
-            enabled=True,
+            confirm=True,
         )
-        backend.memory_store.upsert_context_link(
+        disabled_approval = backend.approve_namespace_link(
             source_context_id="alpha",
             target_context_id="delta",
             relation_type="disabled-link",
             direction="bidirectional",
-            confidence=1.0,
+            weight=1.0,
             approved_by="unit-test",
-            enabled=False,
+            confirm=True,
         )
+        backend.disable_namespace_link(
+            context_link_id=disabled_approval["link"]["context_link_id"],
+            expected_revision=disabled_approval["proposal"]["revision"],
+            disabled_by="unit-test",
+            reason="disabled fixture must remain outside connected recall",
+            confirm=True,
+        )
+        alpha_beta = alpha_beta_approval["link"]
 
         local = backend.retrieve_text_v2(
             prompt,

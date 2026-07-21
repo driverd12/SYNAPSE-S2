@@ -1273,7 +1273,7 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("demo_with_spaces", result)
         self.assertNotIn("..", result)
 
-    def test_namespace_map_requires_confirmation_before_linking(self):
+    def test_namespace_map_compatibility_helper_requires_confirmation_before_linking(self):
         for context, tag, vector in (
             ("alpha", "alpha-memory", [1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
             ("beta", "beta-memory", [1.0, 0.0, 0.8, 0.0, 0.0, 0.0]),
@@ -1310,6 +1310,68 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(namespace_map["node_count"], 2)
         self.assertEqual(namespace_map["link_count"], 1)
         self.assertEqual(namespace_map["connected_scope_hops"], 1)
+
+    def test_namespace_proposal_mcp_isolated_then_cas_rejected(self):
+        for context in ("alpha", "beta"):
+            mcp_server.remember_spiking_context(
+                tag=f"{context}-governed-memory",
+                context_id=context,
+                prompt_embedding=[1.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                text=f"{context} governed bridge evidence",
+            )
+        proposed = json.loads(
+            mcp_server.propose_spiking_namespace_link(
+                source_context_id="alpha",
+                target_context_id="beta",
+                reason="MCP operator requested deliberate bridge review.",
+                governance_request_id="mcp-proposal",
+            )
+        )
+        pending_map = json.loads(
+            mcp_server.list_spiking_namespace_map(context_id="alpha")
+        )
+        proposal = proposed["proposal"]
+        reviewed = json.loads(
+            mcp_server.reject_spiking_namespace_link(
+                proposal_id=proposal["proposal_id"],
+                expected_revision=proposal["revision"],
+                reason="MCP caller rejected the proposal without gaining recall.",
+                governance_request_id="mcp-review",
+            )
+        )
+        audit = json.loads(mcp_server.audit_spiking_namespace_link_governance())
+        history = json.loads(
+            mcp_server.list_spiking_namespace_link_history(
+                proposal_id=proposal["proposal_id"],
+            )
+        )
+        final_map = json.loads(
+            mcp_server.list_spiking_namespace_map(context_id="alpha")
+        )
+
+        self.assertEqual(proposed["state"], "pending")
+        self.assertEqual(pending_map["link_count"], 0)
+        self.assertEqual(reviewed["state"], "rejected")
+        self.assertEqual(final_map["link_count"], 0)
+        self.assertGreaterEqual(history["event_count"], 2)
+        self.assertEqual(audit["status"], "ready")
+
+    def test_mcp_bridge_tools_cannot_grant_their_own_recall(self):
+        async def inspect_tools():
+            return {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
+
+        tools = asyncio.run(inspect_tools())
+        self.assertNotIn("approve_spiking_namespace_link", tools)
+        self.assertNotIn("review_spiking_namespace_link", tools)
+        self.assertIn("propose_spiking_namespace_link", tools)
+        self.assertIn("reject_spiking_namespace_link", tools)
+        self.assertIn("list_spiking_namespace_link_history", tools)
+        self.assertIn("audit_spiking_namespace_link_governance", tools)
+        self.assertFalse(tools["propose_spiking_namespace_link"].annotations.readOnlyHint)
+        self.assertFalse(tools["reject_spiking_namespace_link"].annotations.readOnlyHint)
+        self.assertTrue(
+            tools["list_spiking_namespace_link_history"].annotations.readOnlyHint
+        )
 
     def test_sleep_consolidation_returns_status_string(self):
         result = mcp_server.trigger_sleep_consolidation()

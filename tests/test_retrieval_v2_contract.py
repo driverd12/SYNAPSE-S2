@@ -45,14 +45,14 @@ class RetrievalV2ContractTests(unittest.TestCase):
                     "source": "retrieval-contract-test",
                 },
             )
-        self.backend.memory_store.upsert_context_link(
+        self.backend.approve_namespace_link(
             source_context_id="alpha",
             target_context_id="beta",
             relation_type="camera-control",
             direction="directed",
-            confidence=0.9,
+            weight=0.9,
             approved_by="unit-test",
-            enabled=True,
+            confirm=True,
         )
         payload = self.backend.retrieve_text_v2(
             prompt,

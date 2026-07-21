@@ -591,6 +591,42 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             )["connected_to_selected"]
         )
 
+    def test_compat_approval_replay_after_revoke_reports_inactive(self):
+        backend = SpikingAttentionBackend(
+            dimension=8,
+            num_neurons=16,
+            default_top_k=2,
+            recall_count=5,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        approved = backend.approve_namespace_link(
+            source_context_id="alpha",
+            target_context_id="beta",
+            relation_type="related",
+            confirm=True,
+        )
+        revoked = backend.revoke_namespace_link(
+            context_link_id=approved["link"]["context_link_id"],
+            expected_revision=approved["proposal"]["revision"],
+            revoked_by="operator",
+            reason="The compatibility bridge is retired.",
+            confirm=True,
+        )
+        replay = backend.approve_namespace_link(
+            source_context_id="alpha",
+            target_context_id="beta",
+            relation_type="related",
+            confirm=True,
+        )
+
+        self.assertEqual(revoked["state"], "revoked")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["governance_state"], "revoked")
+        self.assertFalse(replay["approved"])
+        self.assertFalse(replay["authorization_active"])
+        self.assertFalse(replay["link"]["enabled"])
+
     def test_query_recall_scope_is_local_then_approved_one_hop_then_all(self):
         backend = SpikingAttentionBackend(
             dimension=8,

@@ -115,14 +115,14 @@ class RetrievalPaginationIntegrationTests(unittest.TestCase):
             ),
         ]
         self._entry("excluded", context_id="unrelated")
-        self.backend.memory_store.upsert_context_link(
+        self.backend.approve_namespace_link(
             source_context_id="alpha",
             target_context_id="beta",
             relation_type="approved-connected",
             direction="directed",
-            confidence=0.9,
+            weight=0.9,
             approved_by="integration-test",
-            enabled=True,
+            confirm=True,
         )
         self._force_timestamp_ties()
         return entries

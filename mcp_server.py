@@ -1292,14 +1292,6 @@ def list_spiking_namespace_map(
         return json.dumps({"error": _public_error("namespace map failed", exc)}, sort_keys=True)
 
 
-@mcp.tool(
-    annotations={
-        "title": "Approve SYNAPSE-S2 Namespace Link",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-    }
-)
 def approve_spiking_namespace_link(
     source_context_id: str,
     target_context_id: str,
@@ -1310,7 +1302,7 @@ def approve_spiking_namespace_link(
     approved_by: str = "operator",
     confirm: bool = False,
 ) -> str:
-    """Persist one typed link after explicit confirmation; never copies memories."""
+    """Compatibility helper; intentionally not registered as an MCP tool."""
     source = "unknown"
     target = "unknown"
     try:
@@ -1334,6 +1326,185 @@ def approve_spiking_namespace_link(
     except Exception as exc:
         LOGGER.exception("namespace link approval failed for %s -> %s", source, target)
         return json.dumps({"error": _public_error("namespace link approval failed", exc)}, sort_keys=True)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Propose SYNAPSE-S2 Namespace Link",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
+)
+def propose_spiking_namespace_link(
+    source_context_id: str,
+    target_context_id: str,
+    reason: str,
+    relation_type: str = "related",
+    weight: float = 1.0,
+    evidence: dict[str, Any] | None = None,
+    direction: str = "bidirectional",
+    proposed_by: str = "operator",
+    proposal_expires_at: float | None = None,
+    link_expires_at: float | None = None,
+    governance_request_id: str | None = None,
+) -> str:
+    """Create a pending bridge proposal; pending proposals never expand recall."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.propose_namespace_link(
+            source_context_id=_sanitize_context_id(source_context_id),
+            target_context_id=_sanitize_context_id(target_context_id),
+            relation_type=relation_type,
+            weight=float(weight),
+            evidence=evidence or {},
+            direction=direction,
+            proposed_by=_sanitize_agent_id(proposed_by),
+            reason=reason,
+            proposal_expires_at=proposal_expires_at,
+            link_expires_at=link_expires_at,
+            governance_request_id=governance_request_id,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        return json.dumps(
+            {"error": _public_error("invalid namespace link proposal", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("namespace link proposal failed")
+        return json.dumps(
+            {"error": _public_error("namespace link proposal failed", exc)},
+            sort_keys=True,
+        )
+
+
+def review_spiking_namespace_link(
+    proposal_id: str,
+    decision: str,
+    expected_revision: str,
+    reason: str,
+    reviewed_by: str = "operator",
+    governance_request_id: str | None = None,
+) -> str:
+    """Operator compatibility helper; intentionally not an MCP tool."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.review_namespace_link(
+            proposal_id=proposal_id,
+            decision=decision,
+            expected_revision=expected_revision,
+            reviewed_by=_sanitize_agent_id(reviewed_by),
+            reason=reason,
+            governance_request_id=governance_request_id,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        return json.dumps(
+            {"error": _public_error("invalid namespace link review", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("namespace link review failed")
+        return json.dumps(
+            {"error": _public_error("namespace link review failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Reject SYNAPSE-S2 Namespace Link Proposal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
+)
+def reject_spiking_namespace_link(
+    proposal_id: str,
+    expected_revision: str,
+    reason: str,
+    rejected_by: str = "operator",
+    governance_request_id: str | None = None,
+) -> str:
+    """CAS-reject one pending proposal; this tool can never grant recall."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.review_namespace_link(
+            proposal_id=proposal_id,
+            decision="reject",
+            expected_revision=expected_revision,
+            reviewed_by=_sanitize_agent_id(rejected_by),
+            reason=reason,
+            governance_request_id=governance_request_id,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        return json.dumps(
+            {"error": _public_error("invalid namespace link rejection", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("namespace link rejection failed")
+        return json.dumps(
+            {"error": _public_error("namespace link rejection failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "List SYNAPSE-S2 Namespace Link History",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
+)
+def list_spiking_namespace_link_history(
+    proposal_id: str = "",
+    context_link_id: str = "",
+    limit: int = 100,
+) -> str:
+    """Inspect bounded governance history without changing bridge state."""
+    try:
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.list_namespace_link_history(
+            proposal_id=proposal_id,
+            context_link_id=context_link_id,
+            limit=_validate_limit(limit),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except ValueError as exc:
+        return json.dumps(
+            {"error": _public_error("invalid namespace link history request", exc)},
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("namespace link history failed")
+        return json.dumps(
+            {"error": _public_error("namespace link history failed", exc)},
+            sort_keys=True,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Audit SYNAPSE-S2 Namespace Link Governance",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
+)
+def audit_spiking_namespace_link_governance() -> str:
+    try:
+        _, mlx_backend = _load_backend()
+        return json.dumps(mlx_backend.audit_namespace_link_governance(), sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("namespace link governance audit failed")
+        return json.dumps(
+            {"error": _public_error("namespace link governance audit failed", exc)},
+            sort_keys=True,
+        )
 
 
 @mcp.tool()

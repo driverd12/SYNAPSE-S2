@@ -464,6 +464,21 @@ class DashboardRuntime:
                     min_suggestion_score=min_suggestion_score,
                 )
             )
+        if method == "GET" and path == "/api/namespace-link-proposals":
+            context = str(params.get("context_id", [""])[0] or "").strip()
+            state = str(params.get("state", [""])[0] or "").strip().lower()
+            limit = self._int_param(params, "limit", 500, minimum=1, maximum=2_000)
+            return self._json_response(
+                self.backend.list_namespace_link_proposals(
+                    context_id=context,
+                    state=state,
+                    limit=limit,
+                )
+            )
+        if method == "GET" and path == "/api/namespace-link-governance":
+            return self._json_response(
+                self.backend.audit_namespace_link_governance()
+            )
         if method == "GET" and path == "/api/namespace-detail":
             context = self._context_from_params(params)
             level = str(params.get("level", ["cortex"])[0] or "cortex").strip().lower()
@@ -933,6 +948,66 @@ class DashboardRuntime:
                     "query_id": retrieval.get("retrieval_id")
                     or self._query_id(context=context),
                 }
+            )
+        if method == "POST" and path == "/api/namespace-link-proposals":
+            payload = self._parse_json_body(body)
+            evidence = payload.get("evidence", {})
+            if evidence is None:
+                evidence = {}
+            if not isinstance(evidence, dict):
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "evidence must be an object")
+            try:
+                weight = float(payload.get("weight", 1.0))
+            except (TypeError, ValueError) as exc:
+                raise DashboardError(HTTPStatus.BAD_REQUEST, "weight must be a number") from exc
+            return self._json_response(
+                self.backend.propose_namespace_link(
+                    source_context_id=self._text_payload(
+                        payload, "source_context_id", max_bytes=256
+                    ),
+                    target_context_id=self._text_payload(
+                        payload, "target_context_id", max_bytes=256
+                    ),
+                    relation_type=str(payload.get("relation_type", "related") or "related"),
+                    weight=weight,
+                    evidence=evidence,
+                    direction=str(payload.get("direction", "bidirectional") or "bidirectional"),
+                    proposed_by=str(payload.get("proposed_by", "dashboard-operator") or "dashboard-operator"),
+                    reason=self._text_payload(payload, "reason", max_bytes=4_096),
+                    proposal_expires_at=payload.get("proposal_expires_at"),
+                    link_expires_at=payload.get("link_expires_at"),
+                    governance_request_id=payload.get("governance_request_id"),
+                )
+            )
+        if method == "POST" and path == "/api/namespace-link-reviews":
+            payload = self._parse_json_body(body)
+            return self._json_response(
+                self.backend.review_namespace_link(
+                    proposal_id=self._text_payload(payload, "proposal_id", max_bytes=256),
+                    decision=self._text_payload(payload, "decision", max_bytes=32),
+                    expected_revision=self._text_payload(
+                        payload, "expected_revision", max_bytes=128
+                    ),
+                    reviewed_by=str(payload.get("reviewed_by", "dashboard-operator") or "dashboard-operator"),
+                    reason=self._text_payload(payload, "reason", max_bytes=4_096),
+                    governance_request_id=payload.get("governance_request_id"),
+                )
+            )
+        if method == "POST" and path == "/api/namespace-link-revocations":
+            payload = self._parse_json_body(body)
+            return self._json_response(
+                self.backend.revoke_namespace_link(
+                    context_link_id=self._text_payload(
+                        payload, "context_link_id", max_bytes=256
+                    ),
+                    expected_revision=self._text_payload(
+                        payload, "expected_revision", max_bytes=128
+                    ),
+                    revoked_by=str(payload.get("revoked_by", "dashboard-operator") or "dashboard-operator"),
+                    reason=self._text_payload(payload, "reason", max_bytes=4_096),
+                    governance_request_id=payload.get("governance_request_id"),
+                    confirm=self._required_bool(payload, "confirm"),
+                )
             )
         if method == "POST" and path == "/api/namespace-links":
             payload = self._parse_json_body(body)

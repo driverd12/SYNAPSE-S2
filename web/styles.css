@@ -35,6 +35,7 @@
   --galaxy-bridge: #31cdb6;
   --galaxy-bridge-disabled: #7c8b84;
   --galaxy-suggestion: #b88cff;
+  --galaxy-proposal: #d98b20;
   --galaxy-node: #149c98;
   --galaxy-node-highlight: #a5fff0;
   --galaxy-node-shadow: #063b3c;
@@ -92,6 +93,7 @@
   --galaxy-bridge: #00e6c7;
   --galaxy-bridge-disabled: #65786e;
   --galaxy-suggestion: #b88cff;
+  --galaxy-proposal: #ffb454;
   --galaxy-node: #1ca8a2;
   --galaxy-node-highlight: #8affdf;
   --galaxy-node-shadow: #07383a;
@@ -2686,6 +2688,11 @@ textarea {
 .namespace-key-suggested {
   border-color: var(--purple);
   border-style: dotted;
+}
+
+.namespace-key-proposal {
+  border-color: var(--galaxy-proposal);
+  border-style: dashed;
 }
 
 .namespace-galaxy-encoding-note {

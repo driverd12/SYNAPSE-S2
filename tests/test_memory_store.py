@@ -747,6 +747,36 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(stats["context_link_count"], 2)
         self.assertEqual(alpha["context_id"], "alpha")
 
+    def test_namespace_catalog_survives_last_memory_prune(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            entry = store.upsert_entry(
+                tag="only-memory",
+                context_id="durable-empty-namespace",
+                source_text="This namespace remains navigable after pruning.",
+                metadata={},
+                embedding_dimensions=8,
+                spike_indices=[1, 2],
+                neuron_indices=[1],
+            )
+
+            store.delete_entry(
+                context_id="durable-empty-namespace",
+                memory_id=entry["memory_id"],
+            )
+            summaries = store.list_context_summaries()
+            stats = store.stats()
+
+            catalogued = next(
+                item
+                for item in summaries
+                if item["context_id"] == "durable-empty-namespace"
+            )
+            self.assertEqual(catalogued["entry_count"], 0)
+            self.assertGreater(catalogued["last_activity_at"], 0.0)
+            self.assertEqual(stats["contexts"]["durable-empty-namespace"], 0)
+
     def test_context_bus_events_are_persisted_listed_and_exported(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "synapse-memory.sqlite3"

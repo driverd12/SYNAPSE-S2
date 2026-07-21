@@ -1901,6 +1901,125 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=5.0)
 
+    def test_core_binds_bridge_actor_and_keeps_pending_recall_isolated(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            service = AuthoritativeCoreService(config)
+            failures: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    service.serve_forever()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not config.socket_path.exists():
+                if failures:
+                    break
+                time.sleep(0.02)
+            try:
+                self.assertEqual(failures, [])
+                client = CoreClient(
+                    socket_path=config.socket_path,
+                    caller="claimed-alice",
+                    default_timeout_seconds=3.0,
+                )
+                reviewer_client = CoreClient(
+                    socket_path=config.socket_path,
+                    caller="claimed-bob",
+                    default_timeout_seconds=3.0,
+                )
+                for context in ("alpha", "beta"):
+                    client.register_text_trace(
+                        tag=f"{context}-bridge-memory",
+                        text=f"{context} governed bridge evidence",
+                        context_id=context,
+                    )
+                proposed = client.propose_namespace_link(
+                    source_context_id="alpha",
+                    target_context_id="beta",
+                    proposed_by="forged-proposer",
+                    reason="The bridge requires an explicit current review.",
+                    governance_request_id="core-bridge-proposal",
+                )
+                proposal = proposed["proposal"]
+                pending_scope = client.resolve_recall_contexts(
+                    context_id="alpha", recall_scope="connected"
+                )
+                reviewed = reviewer_client.review_namespace_link(
+                    proposal_id=proposal["proposal_id"],
+                    decision="approve",
+                    expected_revision=proposal["revision"],
+                    reviewed_by="forged-reviewer",
+                    reason="The authenticated client approved current evidence.",
+                    governance_request_id="core-bridge-review",
+                )
+                active_scope = client.resolve_recall_contexts(
+                    context_id="alpha", recall_scope="connected"
+                )
+
+                self.assertTrue(
+                    proposal["proposed_by"].startswith("core:local-owner:")
+                )
+                self.assertNotEqual(proposal["proposed_by"], "forged-proposer")
+                self.assertEqual(
+                    [row["context_id"] for row in pending_scope],
+                    ["alpha", "global"],
+                )
+                self.assertTrue(
+                    reviewed["proposal"]["reviewed_by"].startswith(
+                        "core:local-owner:"
+                    )
+                )
+                self.assertEqual(
+                    reviewed["proposal"]["reviewed_by"],
+                    proposal["proposed_by"],
+                )
+                self.assertNotEqual(
+                    reviewed["proposal"]["reviewed_by"], "forged-reviewer"
+                )
+                self.assertEqual(
+                    [row["context_id"] for row in active_scope],
+                    ["alpha", "beta", "global"],
+                )
+                self.assertEqual(client.audit_namespace_link_governance()["status"], "ready")
+
+                link = reviewed["link"]
+                with closing(sqlite3.connect(config.memory_path)) as connection:
+                    connection.execute(
+                        "UPDATE context_relationships SET source_context_id = ? "
+                        "WHERE context_link_id = ?",
+                        ("tampered", link["context_link_id"]),
+                    )
+                    connection.commit()
+                request_id = "req-core-bridge-integrity-failure"
+                with self.assertRaises(CoreRemoteError) as raised:
+                    client.call(
+                        "disable_namespace_link",
+                        {
+                            "context_link_id": link["context_link_id"],
+                            "expected_revision": reviewed["proposal"]["revision"],
+                            "disabled_by": "forged-disabler",
+                            "reason": "The core must classify projection tamper safely.",
+                            "governance_request_id": "core-bridge-integrity-failure",
+                            "confirm": True,
+                        },
+                        request_id=request_id,
+                    )
+                self.assertEqual(raised.exception.code, "service_unavailable")
+                status = client.request_status(
+                    caller=client.delivery_instance_id,
+                    request_id=request_id,
+                )
+                self.assertEqual(status["state"], "failed")
+                self.assertEqual(status["safe_error_code"], "service_unavailable")
+            finally:
+                service.close()
+                thread.join(timeout=5.0)
+
     def test_retrieval_v2_is_structured_and_never_admitted_to_mutation_journal(
         self,
     ) -> None:
