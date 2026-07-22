@@ -24,6 +24,7 @@ import fcntl
 
 from capture_daemon import (
     CAPTURE_ID_RE,
+    CLAIM_DIR_RE,
     CaptureInboxDaemon,
     GLOBAL_CAPTURE_LOCK,
     resolve_capture_root,
@@ -2950,17 +2951,37 @@ class VerifiedRecoveryManager:
     def _canonical_pending_capture_state(
         manifest: dict[str, Any],
     ) -> dict[str, Any]:
-        """Summarize whether replay debt is exactly canonical v2 inbox work."""
+        """Summarize canonical v2 work queued in inbox or a durable claim."""
 
         records = manifest.get("files")
         if not isinstance(records, list):
             raise ValueError("capture manifest file inventory is missing")
-        inbox_records = [
+        queued_records = [
             record
             for record in records
             if isinstance(record, dict)
-            and Path(str(record.get("relative_path") or "")).parts
-            and Path(str(record["relative_path"])).parts[0] == "capture_inbox"
+            and (
+                (
+                    len(
+                        Path(str(record.get("relative_path") or "")).parts
+                    )
+                    == 2
+                    and Path(str(record["relative_path"])).parts[0]
+                    == "capture_inbox"
+                )
+                or (
+                    len(
+                        Path(str(record.get("relative_path") or "")).parts
+                    )
+                    == 3
+                    and Path(str(record["relative_path"])).parts[0]
+                    == "capture_processing"
+                    and CLAIM_DIR_RE.fullmatch(
+                        Path(str(record["relative_path"])).parts[1]
+                    )
+                    is not None
+                )
+            )
         ]
         replay_records = [
             record
@@ -2969,23 +2990,47 @@ class VerifiedRecoveryManager:
             and record.get("replay_disposition")
             in {"replay-required", "mixed-replay-required"}
         ]
-        canonical = (
-            len(inbox_records) == len(replay_records)
-            and all(record in inbox_records for record in replay_records)
-            and all(
+        receipt_capture_ids = {
+            capture_id
+            for record in records
+            if isinstance(record, dict)
+            and record.get("category") == "capture-receipt"
+            for capture_id in record.get("capture_ids") or []
+        }
+
+        def canonical_queued_record(record: dict[str, Any]) -> bool:
+            parts = Path(str(record.get("relative_path") or "")).parts
+            disposition = record.get("replay_disposition")
+            return bool(
                 record.get("category") == "v2-capture-payload"
-                and record.get("replay_disposition") == "replay-required"
+                and disposition in {"replay-required", "dedupe-on-replay"}
                 and isinstance(record.get("capture_ids"), list)
                 and len(record["capture_ids"]) == 1
-                for record in inbox_records
+                and (
+                    (parts[0] == "capture_inbox" and disposition == "replay-required")
+                    or parts[0] == "capture_processing"
+                )
             )
+
+        queued_capture_ids = {
+            str(record["capture_ids"][0])
+            for record in queued_records
+            if isinstance(record.get("capture_ids"), list)
+            and len(record["capture_ids"]) == 1
+        }
+        queued_receipt_count = len(queued_capture_ids & receipt_capture_ids)
+        canonical = (
+            all(record in queued_records for record in replay_records)
+            and all(canonical_queued_record(record) for record in queued_records)
+            and queued_receipt_count == 0
         )
         return {
-            "pending_file_count": len(inbox_records),
+            "pending_file_count": len(queued_records),
             "replay_required_file_count": len(replay_records),
             "replay_required_capture_count": sum(
                 len(record.get("capture_ids") or []) for record in replay_records
             ),
+            "receipt_backed_file_count": queued_receipt_count,
             "canonical_v2": canonical,
         }
 
@@ -4613,12 +4658,12 @@ class VerifiedRecoveryManager:
         for record_index, record in enumerate(records):
             raw_version = record.get("version", 1)
             if isinstance(raw_version, bool):
-                raise ValueError("processed capture payload version is invalid")
+                raise ValueError("ledger-backed capture payload version is invalid")
             try:
                 version = int(raw_version)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    "processed capture payload version is invalid"
+                    "ledger-backed capture payload version is invalid"
                 ) from exc
             if version != 2:
                 continue
@@ -4630,7 +4675,7 @@ class VerifiedRecoveryManager:
             expected = ledger_bindings.get(capture_id)
             if expected is None:
                 raise RuntimeError(
-                    "processed capture payload has no authoritative ledger binding"
+                    "capture payload has no authoritative ledger binding"
                 )
             compared_fields = (
                 "capture_id",
@@ -4650,7 +4695,7 @@ class VerifiedRecoveryManager:
             ]
             if mismatch_fields:
                 raise RuntimeError(
-                    "processed capture request does not match its authoritative "
+                    "capture request does not match its authoritative "
                     f"ledger binding (fields={mismatch_fields!r})"
                 )
             seeds.append(
@@ -4701,51 +4746,69 @@ class VerifiedRecoveryManager:
         processed_root: Path,
         *,
         ledger_bindings: dict[str, dict[str, Any]],
+        processing_root: Path | None = None,
     ) -> dict[str, Any]:
-        if not processed_root.exists() and not processed_root.is_symlink():
+        roots = [(processed_root, True)]
+        if processing_root is not None:
+            roots.append((processing_root, False))
+        if not any(root.exists() or root.is_symlink() for root, _ in roots):
             return self._capture_ledger_binding_proof([])
-        if processed_root.is_symlink() or not processed_root.is_dir():
-            raise ValueError(
-                "restored capture processed archive is not a real directory"
-            )
         max_files, max_total_bytes, max_file_bytes = self._bounded_capture_limits()
         scanned_files = 0
         scanned_bytes = 0
         seeds: list[dict[str, Any]] = []
-        for current_root, dir_names, file_names in os.walk(
-            processed_root,
-            followlinks=False,
-        ):
-            current = Path(current_root)
-            for dir_name in list(dir_names):
-                metadata = os.lstat(current / dir_name)
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(
-                    metadata.st_mode
-                ):
-                    raise ValueError(
-                        "restored capture processed archive contains an unsafe directory"
-                    )
-            for file_name in sorted(file_names):
-                path = current / file_name
-                data, _metadata = self._read_private_regular(
-                    path,
-                    max_bytes=max_file_bytes,
+        for scan_root, require_ledger in roots:
+            if not scan_root.exists() and not scan_root.is_symlink():
+                continue
+            if scan_root.is_symlink() or not scan_root.is_dir():
+                raise ValueError(
+                    "restored ledger-backed capture root is not a real directory"
                 )
-                self._assert_secret_safe_text(data)
-                scanned_files += 1
-                scanned_bytes += len(data)
-                if scanned_files > max_files or scanned_bytes > max_total_bytes:
-                    raise RuntimeError(
-                        "restored capture binding verification exceeded its bounds"
+            for current_root, dir_names, file_names in os.walk(
+                scan_root,
+                followlinks=False,
+            ):
+                current = Path(current_root)
+                for dir_name in list(dir_names):
+                    metadata = os.lstat(current / dir_name)
+                    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(
+                        metadata.st_mode
+                    ):
+                        raise ValueError(
+                            "restored capture archive contains an unsafe directory"
+                        )
+                for file_name in sorted(file_names):
+                    if file_name == ".lock":
+                        continue
+                    path = current / file_name
+                    data, _metadata = self._read_private_regular(
+                        path,
+                        max_bytes=max_file_bytes,
                     )
-                seeds.extend(
-                    self._processed_v2_binding_seeds(
-                        path=path,
-                        data=data,
-                        member_sha256=hashlib.sha256(data).hexdigest(),
-                        ledger_bindings=ledger_bindings,
-                    )
-                )
+                    self._assert_secret_safe_text(data)
+                    scanned_files += 1
+                    scanned_bytes += len(data)
+                    if scanned_files > max_files or scanned_bytes > max_total_bytes:
+                        raise RuntimeError(
+                            "restored capture binding verification exceeded its bounds"
+                        )
+                    records = self._decode_capture_records(path, data)
+                    capture_ids = {
+                        str(record.get("capture_id") or "")
+                        for record in (records or [])
+                        if int(record.get("version", 1)) == 2
+                    }
+                    if require_ledger or (
+                        capture_ids and capture_ids.issubset(ledger_bindings)
+                    ):
+                        seeds.extend(
+                            self._processed_v2_binding_seeds(
+                                path=path,
+                                data=data,
+                                member_sha256=hashlib.sha256(data).hexdigest(),
+                                ledger_bindings=ledger_bindings,
+                            )
+                        )
         return self._capture_ledger_binding_proof(seeds)
 
     def _verify_capture_archive(
@@ -5011,9 +5074,13 @@ class VerifiedRecoveryManager:
                     data=data,
                     ledger_ids=effective_ledger_ids,
                 )
-                if (
-                    ledger_bindings is not None
-                    and directory_key == "processed_dir"
+                if ledger_bindings is not None and (
+                    directory_key == "processed_dir"
+                    or (
+                        directory_key == "processing_dir"
+                        and classification.get("replay_disposition")
+                        == "dedupe-on-replay"
+                    )
                 ):
                     binding_seeds.extend(
                         self._processed_v2_binding_seeds(
@@ -5443,7 +5510,6 @@ class VerifiedRecoveryManager:
             status = self.daemon.status()
             blocking_count_fields = (
                 "inbox_temp_file_count",
-                "processing_file_count",
                 "processing_empty_claim_count",
                 "processing_malformed_claim_count",
                 "error_file_count",
@@ -5457,18 +5523,29 @@ class VerifiedRecoveryManager:
                 for field in blocking_count_fields
             }
             pending_file_count = status.get("pending_file_count")
+            processing_file_count = status.get("processing_file_count")
+            queued_file_count = (
+                pending_file_count + processing_file_count
+                if type(pending_file_count) is int
+                and type(processing_file_count) is int
+                else None
+            )
             if (
                 status.get("transport_ready") is not True
                 or status.get("missing_transport_directories")
                 or status.get("unsafe_transport_directories")
                 or type(pending_file_count) is not int
+                or type(processing_file_count) is not int
                 or pending_file_count < 0
-                or pending_file_count > maximum_pending_files
+                or processing_file_count < 0
+                or queued_file_count is None
+                or queued_file_count > maximum_pending_files
                 or any(blocking_counts.values())
             ):
                 raise RuntimeError(
                     "capture transport is not quiescent for guarded recovery "
                     f"(pending_file_count={pending_file_count!r}, "
+                    f"processing_file_count={processing_file_count!r}, "
                     f"maximum_pending_files={maximum_pending_files!r}, "
                     f"blocking_counts={blocking_counts!r})"
                 )
@@ -5491,8 +5568,12 @@ class VerifiedRecoveryManager:
             reconciliation = dict(inventory["reconciliation"])
             pending_state = self._canonical_pending_capture_state(inventory)
             expected_reconciliation = {
-                "replay_required_capture_count": pending_file_count,
-                "replay_required_file_count": pending_file_count,
+                "replay_required_capture_count": pending_state[
+                    "replay_required_capture_count"
+                ],
+                "replay_required_file_count": pending_state[
+                    "replay_required_file_count"
+                ],
                 "identifierless_replay_file_count": 0,
                 "unclassified_file_count": 0,
                 "missing_authoritative_ledger_count": 0,
@@ -5505,9 +5586,16 @@ class VerifiedRecoveryManager:
                 actual_reconciliation != expected_reconciliation
                 or pending_state
                 != {
-                    "pending_file_count": pending_file_count,
-                    "replay_required_file_count": pending_file_count,
-                    "replay_required_capture_count": pending_file_count,
+                    "pending_file_count": queued_file_count,
+                    "replay_required_file_count": reconciliation.get(
+                        "replay_required_file_count"
+                    ),
+                    "replay_required_capture_count": reconciliation.get(
+                        "replay_required_capture_count"
+                    ),
+                    "receipt_backed_file_count": pending_state.get(
+                        "receipt_backed_file_count"
+                    ),
                     "canonical_v2": True,
                 }
             ):
@@ -5532,10 +5620,18 @@ class VerifiedRecoveryManager:
                 ),
                 "transport_revision": transport_revision,
                 "transport_ready": True,
-                "pending_file_count": pending_file_count,
-                "processing_file_count": blocking_counts[
-                    "processing_file_count"
-                ],
+                "pending_file_count": queued_file_count,
+                "inbox_file_count": pending_file_count,
+                "processing_file_count": processing_file_count,
+                "replay_required_file_count": int(
+                    pending_state["replay_required_file_count"]
+                ),
+                "replay_required_capture_count": int(
+                    pending_state["replay_required_capture_count"]
+                ),
+                "receipt_backed_file_count": int(
+                    pending_state["receipt_backed_file_count"]
+                ),
                 "unresolved_error_count": 0,
                 "unsafe_error_artifact_count": 0,
                 "error_resolution_pending_count": 0,
@@ -5635,6 +5731,7 @@ class VerifiedRecoveryManager:
         verification: dict[str, Any],
         maximum_pending_files: int = 0,
         expected_pending_file_count: int = 0,
+        expected_replay_required_file_count: int = 0,
     ) -> dict[str, Any]:
         """Prove live memory, journal, runtime, capture, and ledger did not drift."""
 
@@ -5642,7 +5739,22 @@ class VerifiedRecoveryManager:
             if verification.get("verified") is not True:
                 raise RuntimeError("guarded recovery bundle verification is incomplete")
             expected_cutover_ready = expected_pending_file_count == 0
-            if verification.get("cutover_ready") is not expected_cutover_ready:
+            expected_pending_state = {
+                "pending_file_count": expected_pending_file_count,
+                "replay_required_file_count": (
+                    expected_replay_required_file_count
+                ),
+                "replay_required_capture_count": (
+                    expected_replay_required_file_count
+                ),
+                "receipt_backed_file_count": 0,
+                "canonical_v2": True,
+            }
+            if (
+                verification.get("cutover_ready") is not expected_cutover_ready
+                or verification.get("capture_pending_state")
+                != expected_pending_state
+            ):
                 raise RuntimeError(
                     "guarded recovery bundle readiness does not match its "
                     "admitted capture state"
@@ -5650,7 +5762,9 @@ class VerifiedRecoveryManager:
             self._require_expected_replay_debt(
                 verification,
                 stage="verified bundle",
-                expected_pending_file_count=expected_pending_file_count,
+                expected_pending_file_count=(
+                    expected_replay_required_file_count
+                ),
             )
             self._assert_memory_snapshot_fence(
                 expected_logical_snapshot_sha256=str(
@@ -5709,7 +5823,10 @@ class VerifiedRecoveryManager:
                 maximum_pending_files=maximum_pending_files,
             )
             if (
-                not secrets.compare_digest(
+                after.get("pending_file_count") != expected_pending_file_count
+                or after.get("replay_required_file_count")
+                != expected_replay_required_file_count
+                or not secrets.compare_digest(
                     str(after["transport_revision"]),
                     str(before["transport_revision"]),
                 )
@@ -5784,6 +5901,9 @@ class VerifiedRecoveryManager:
                     maximum_pending_files=replacement_pending_limit,
                 )
                 admitted_pending_file_count = int(before["pending_file_count"])
+                admitted_replay_required_file_count = int(
+                    before["replay_required_file_count"]
+                )
                 if (
                     replacement_pending_limit
                     and admitted_pending_file_count != replacement_pending_limit
@@ -5832,17 +5952,23 @@ class VerifiedRecoveryManager:
                 self._require_expected_replay_debt(
                     bundle,
                     stage="created bundle",
-                    expected_pending_file_count=admitted_pending_file_count,
+                    expected_pending_file_count=(
+                        admitted_replay_required_file_count
+                    ),
                 )
                 self._require_expected_replay_debt(
                     restore,
                     stage="isolated restore",
-                    expected_pending_file_count=admitted_pending_file_count,
+                    expected_pending_file_count=(
+                        admitted_replay_required_file_count
+                    ),
                 )
                 expected_cutover_ready = admitted_pending_file_count == 0
                 if (
                     restore.get("verified") is not True
                     or restore.get("cutover_ready") is not expected_cutover_ready
+                    or restore.get("capture_pending_state")
+                    != verification.get("capture_pending_state")
                 ):
                     raise RuntimeError("guarded isolated recovery proof is incomplete")
                 after = self._guarded_recovery_postflight_locked(
@@ -5851,6 +5977,9 @@ class VerifiedRecoveryManager:
                     verification=verification,
                     maximum_pending_files=replacement_pending_limit,
                     expected_pending_file_count=admitted_pending_file_count,
+                    expected_replay_required_file_count=(
+                        admitted_replay_required_file_count
+                    ),
                 )
                 evidence = {
                     "schema": GUARDED_RECOVERY_TRANSACTION_SCHEMA,
@@ -5866,10 +5995,19 @@ class VerifiedRecoveryManager:
                         "repository": "held-through-context-exit",
                         "capture_maintenance": "held-through-context-exit",
                     },
-                    "replay_required_capture_count": admitted_pending_file_count,
-                    "replay_required_file_count": admitted_pending_file_count,
+                    "replay_required_capture_count": (
+                        admitted_replay_required_file_count
+                    ),
+                    "replay_required_file_count": (
+                        admitted_replay_required_file_count
+                    ),
                     "pending_file_count": admitted_pending_file_count,
-                    "processing_file_count": 0,
+                    "processing_file_count": int(
+                        before["processing_file_count"]
+                    ),
+                    "receipt_backed_file_count": int(
+                        before["receipt_backed_file_count"]
+                    ),
                     "cutover_ready": expected_cutover_ready,
                     "replacement_stage_ready": (
                         purpose == "replacement-admission"
@@ -5886,6 +6024,9 @@ class VerifiedRecoveryManager:
                         verification=verification,
                         maximum_pending_files=replacement_pending_limit,
                         expected_pending_file_count=admitted_pending_file_count,
+                        expected_replay_required_file_count=(
+                            admitted_replay_required_file_count
+                        ),
                     )
 
                 publication = GuardedRecoveryPublication(
@@ -7034,9 +7175,13 @@ class VerifiedRecoveryManager:
                 raise RuntimeError("capture archive database binding mismatch")
         reconciliation = dict(capture["manifest"]["reconciliation"])
         capture_ledger_binding = dict(capture["capture_ledger_binding"])
+        pending_state = self._canonical_pending_capture_state(
+            capture["manifest"]
+        )
         cutover_ready = (
             bool(capture_ledger_binding["verified"])
             and not bool(reconciliation["replay_required_file_count"])
+            and pending_state.get("pending_file_count") == 0
             and (
                 governance_mode == "pre-governed-v5"
                 or (
@@ -7105,9 +7250,7 @@ class VerifiedRecoveryManager:
             "capture_database_binding": dict(
                 capture["manifest"]["database_binding"]
             ),
-            "capture_pending_state": self._canonical_pending_capture_state(
-                capture["manifest"]
-            ),
+            "capture_pending_state": pending_state,
             "reconciliation": reconciliation,
             "capture_ledger_binding": capture_ledger_binding,
             "governance_mode": governance_mode,
@@ -7575,6 +7718,7 @@ class VerifiedRecoveryManager:
                 self._verify_extracted_capture_ledger_bindings(
                     capture_target / "capture_processed",
                     ledger_bindings=restored_ledger_bindings,
+                    processing_root=capture_target / "capture_processing",
                 )
             )
             archive_binding_proof = dict(
@@ -7617,6 +7761,9 @@ class VerifiedRecoveryManager:
                 if receipt.get("schema") == RECOVERY_BUNDLE_SCHEMA
                 else LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA
             )
+            restored_pending_state = self._canonical_pending_capture_state(
+                capture_verification["manifest"]
+            )
             proof = {
                 "schema": proof_schema,
                 "bundle_receipt_name": receipt_file.name,
@@ -7637,10 +7784,12 @@ class VerifiedRecoveryManager:
                 "processed_capture_count": len(processed_ids),
                 "missing_transport_ledger_count": 0,
                 "capture_ledger_binding": restored_binding_proof,
+                "capture_pending_state": restored_pending_state,
                 "reconciliation": dict(
                     capture_verification["manifest"]["reconciliation"]
                 ),
                 "cutover_ready": bool(restored_binding_proof["verified"])
+                and restored_pending_state.get("pending_file_count") == 0
                 and not bool(
                     capture_verification["manifest"]["reconciliation"][
                         "replay_required_file_count"
@@ -7806,6 +7955,9 @@ class VerifiedRecoveryManager:
                 "capture_file_count": int(capture_verification["file_count"]),
                 "missing_transport_ledger_count": 0,
                 "capture_ledger_binding": restored_binding_proof,
+                "capture_pending_state": dict(
+                    proof["capture_pending_state"]
+                ),
                 "reconciliation": dict(
                     capture_verification["manifest"]["reconciliation"]
                 ),

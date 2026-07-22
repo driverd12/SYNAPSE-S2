@@ -2553,6 +2553,8 @@ class CaptureInboxDaemon:
                 claim_dir.is_symlink()
                 or not stat.S_ISDIR(claim_stat.st_mode)
                 or CLAIM_DIR_RE.fullmatch(claim_dir.name) is None
+                or claim_stat.st_uid != os.getuid()
+                or stat.S_IMODE(claim_stat.st_mode) != 0o700
             ):
                 continue
             payload_files = self._capture_files(claim_dir)
@@ -2573,7 +2575,10 @@ class CaptureInboxDaemon:
                 claim_dir.is_symlink()
                 or not stat.S_ISDIR(claim_stat.st_mode)
                 or CLAIM_DIR_RE.fullmatch(claim_dir.name) is None
+                or claim_stat.st_uid != os.getuid()
+                or stat.S_IMODE(claim_stat.st_mode) != 0o700
             ):
+                diagnostics["malformed"] += 1
                 continue
             state = self._claim_state(claim_dir)
             if state["missing"]:
@@ -2600,9 +2605,21 @@ class CaptureInboxDaemon:
             }
         for child in children:
             child_names.append(child.name)
-            if child.name in {".lock", LEGACY_TEXT_IDENTITY_FILE}:
+            try:
+                child_stat = child.lstat()
+            except FileNotFoundError:
                 continue
-            if child in payloads:
+            safe_private_file = bool(
+                stat.S_ISREG(child_stat.st_mode)
+                and not stat.S_ISLNK(child_stat.st_mode)
+                and child_stat.st_uid == os.getuid()
+                and child_stat.st_nlink == 1
+                and stat.S_IMODE(child_stat.st_mode) == 0o600
+            )
+            if child.name in {".lock", LEGACY_TEXT_IDENTITY_FILE}:
+                if safe_private_file:
+                    continue
+            elif child in payloads and safe_private_file:
                 continue
             unknown_names.append(child.name)
         identity_allowed = bool(

@@ -468,9 +468,9 @@ else:
             "transport_ready": True,
             "missing_transport_directories": [],
             "unsafe_transport_directories": [],
-            "pending_file_count": 3,
+            "pending_file_count": 2,
             "inbox_temp_file_count": 0,
-            "processing_file_count": 0,
+            "processing_file_count": 1,
             "processing_empty_claim_count": 0,
             "processing_malformed_claim_count": 0,
             "error_file_count": 0,
@@ -486,6 +486,7 @@ else:
         post_capture_status = {
             **capture,
             "pending_file_count": 0,
+            "processing_file_count": 0,
             "processed_file_count": 20,
             "receipt_count": 20,
         }
@@ -494,8 +495,9 @@ else:
             "cutover_ready": False,
             "replacement_stage_ready": True,
             "pending_file_count": 3,
-            "replay_required_file_count": 3,
-            "replay_required_capture_count": 3,
+            "replay_required_file_count": 2,
+            "replay_required_capture_count": 2,
+            "receipt_backed_file_count": 0,
             "bundle": {"bundle_receipt_path": str(self.base / "bundle.json")},
             "restore": {"recovery_proof_path": str(self.base / "proof.json")},
         }
@@ -618,6 +620,16 @@ else:
             ].expected_pending_file_count,
             3,
         )
+        self.assertEqual(
+            publisher.call_args.kwargs[
+                "request"
+            ].expected_replay_required_file_count,
+            2,
+        )
+        self.assertEqual(
+            publisher.call_args.kwargs["request"].ttl_seconds,
+            installer.replacement_admission_ttl_seconds(2),
+        )
         manager.guarded_recovery_transaction.assert_called_once_with(
             mock.ANY,
             purpose="replacement-admission",
@@ -698,12 +710,58 @@ else:
             ):
                 installer.replacement_certification_seconds_remaining(None)
 
+    def test_replacement_activation_uses_bounded_dynamic_ticket_budget(self) -> None:
+        self.assertEqual(
+            installer.replacement_admission_ttl_seconds(150),
+            900.0,
+        )
+        self.assertEqual(
+            installer.replacement_admission_ttl_seconds(600),
+            installer.REPLACEMENT_ADMISSION_MAX_TTL_SECONDS,
+        )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "signed admission bound",
+        ):
+            installer.replacement_admission_ttl_seconds(601)
+
+        now = 1_000_000.0
+        required = (
+            (2 * 600)
+            + installer.REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS
+        )
+        with mock.patch.object(installer.time, "time", return_value=now):
+            self.assertEqual(
+                installer.replacement_activation_seconds_remaining(
+                    {
+                        "expires_at_unix_ms": int(
+                            (now + required + 7) * 1000
+                        )
+                    },
+                    wait_seconds=600,
+                ),
+                int(required + 7),
+            )
+            with self.assertRaisesRegex(
+                installer.CoreInstallerError,
+                "too little signed time remaining for activation",
+            ):
+                installer.replacement_activation_seconds_remaining(
+                    {
+                        "expires_at_unix_ms": int(
+                            (now + required - 1) * 1000
+                        )
+                    },
+                    wait_seconds=600,
+                )
+
     def test_replacement_capture_transport_admits_only_one_clean_pending_batch(
         self,
     ) -> None:
         clean = {
             "transport_ready": True,
             "pending_file_count": 23,
+            "processing_file_count": 0,
             **{
                 field: 0
                 for field in installer.CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS
@@ -724,15 +782,24 @@ else:
                 clean,
                 maximum_pending_files=0,
             )
-        ambiguous = dict(clean)
-        ambiguous["pending_file_count"] = 0
-        ambiguous["processing_file_count"] = 1
+        claimed = dict(clean)
+        claimed["pending_file_count"] = 0
+        claimed["processing_file_count"] = 1
+        self.assertEqual(
+            installer.validate_replacement_capture_transport(
+                claimed,
+                maximum_pending_files=50,
+            ),
+            1,
+        )
+        malformed = dict(claimed)
+        malformed["processing_malformed_claim_count"] = 1
         with self.assertRaisesRegex(
             installer.CoreInstallerError,
             "bounded, unambiguous",
         ):
             installer.validate_replacement_capture_transport(
-                ambiguous,
+                malformed,
                 maximum_pending_files=50,
             )
 

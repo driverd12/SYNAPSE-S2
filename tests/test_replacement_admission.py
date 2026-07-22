@@ -347,6 +347,42 @@ class ReplacementAdmissionTests(unittest.TestCase):
         finally:
             store.close()
 
+        store = DurableMemoryStore.open_existing_for_audit(self.memory_db)
+        try:
+            longest = {
+                **content,
+                "expires_at_unix_ms": now
+                + int(preflight.REPLACEMENT_ADMISSION_MAX_TTL_SECONDS * 1000),
+            }
+            signed_longest = self._signed(longest)
+            self.assertEqual(
+                preflight._validate_replacement_admission(
+                    signed_longest,
+                    store=store,
+                    now_unix_ms=now,
+                ),
+                signed_longest["receipt_digest"],
+            )
+            with self.assertRaisesRegex(
+                preflight.CutoverPreflightError,
+                "values",
+            ):
+                preflight._validate_replacement_admission(
+                    self._signed(
+                        {
+                            **longest,
+                            "expires_at_unix_ms": longest[
+                                "expires_at_unix_ms"
+                            ]
+                            + 1,
+                        }
+                    ),
+                    store=store,
+                    now_unix_ms=now,
+                )
+        finally:
+            store.close()
+
         inspection = self._inspection()
         inspection["next_epoch"] = 9
         with self.assertRaisesRegex(
@@ -675,10 +711,56 @@ class ReplacementAdmissionTests(unittest.TestCase):
         )
         first = AuthoritativeCoreService(config)
         first.start()
-        first.close()
         daemon = CaptureInboxDaemon(root=state_root)
         transport_paths = daemon.paths()
         daemon._ensure_transport_dirs(transport_paths)
+        cleanup_capture_id = "s2cap_90909090909090909090909090909090"
+        cleanup_drop = write_capture_drop(
+            root=state_root,
+            context_id="replacement-pending-test",
+            source_tag="replacement-cleanup-boundary",
+            speaker="codex",
+            text=(
+                "A crash after the ledger commit must resume transport cleanup "
+                "without writing the capture twice."
+            ),
+            capture_id=cleanup_capture_id,
+        )
+        initial_deadline = time.monotonic() + 5.0
+        while time.monotonic() < initial_deadline:
+            initial_status = daemon.status()
+            if (
+                initial_status["pending_file_count"] == 0
+                and initial_status["processing_file_count"] == 0
+                and initial_status["processed_file_count"] == 1
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("initial core did not commit the cleanup fixture")
+        first.close()
+        self.assertFalse(cleanup_drop.exists())
+        cleanup_receipt = (
+            transport_paths["receipt_dir"] / f"{cleanup_capture_id}.json"
+        )
+        self.assertTrue(cleanup_receipt.exists())
+        cleanup_receipt_bytes = cleanup_receipt.read_bytes()
+        cleanup_receipt.unlink()
+        processed_payloads = daemon._capture_files(
+            transport_paths["processed_dir"]
+        )
+        self.assertEqual(len(processed_payloads), 1)
+        cleanup_requeue = (
+            transport_paths["inbox_dir"] / "cleanup-after-ledger.json"
+        )
+        os.replace(processed_payloads[0], cleanup_requeue)
+        cleanup_claim = daemon._claim_inbox_file(
+            inbox_path=cleanup_requeue,
+            inbox_dir=transport_paths["inbox_dir"],
+            processing_dir=transport_paths["processing_dir"],
+        )
+        self.assertIsNotNone(cleanup_claim)
+        cleanup_claim_dir, cleanup_claim_path = cleanup_claim
         maintenance_lock = (
             transport_paths["lock_dir"] / ".capture-maintenance.lock"
         )
@@ -696,6 +778,13 @@ class ReplacementAdmissionTests(unittest.TestCase):
             ),
             capture_id=pending_capture_id,
         )
+        claimed = daemon._claim_inbox_file(
+            inbox_path=pending_drop,
+            inbox_dir=transport_paths["inbox_dir"],
+            processing_dir=transport_paths["processing_dir"],
+        )
+        self.assertIsNotNone(claimed)
+        pending_claim_dir, pending_claim_path = claimed
         candidate_build_id = "source-" + "d" * 24
         admission_path = state_root / "core" / preflight.REPLACEMENT_ADMISSION_NAME
         restore_root = state_root / "replacement-restore"
@@ -717,6 +806,40 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 capture_root=state_root,
                 runtime_state_path=config.state_path,
             )
+            cleanup_receipt.write_bytes(cleanup_receipt_bytes)
+            cleanup_receipt.chmod(0o600)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unsupported replay work",
+            ):
+                with manager.guarded_recovery_transaction(
+                    state_root / "receipt-backed-restore",
+                    purpose="replacement-admission",
+                    replacement_pending_limit=2,
+                ):
+                    self.fail("receipt-backed queued work reached admission")
+            cleanup_receipt.unlink()
+
+            cleanup_original = cleanup_claim_path.read_bytes()
+            cleanup_payload = json.loads(cleanup_original.decode("utf-8"))
+            cleanup_payload["source_tag"] = "mismatched-cleanup-binding"
+            cleanup_claim_path.write_text(
+                json.dumps(cleanup_payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            cleanup_claim_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "authoritative ledger binding",
+            ):
+                with manager.guarded_recovery_transaction(
+                    state_root / "mismatched-binding-restore",
+                    purpose="replacement-admission",
+                    replacement_pending_limit=2,
+                ):
+                    self.fail("mismatched cleanup claim reached admission")
+            cleanup_claim_path.write_bytes(cleanup_original)
+            cleanup_claim_path.chmod(0o600)
             strict_bundle = state_root / "strict-pending.sqlite3"
             strict_restore = state_root / "strict-pending-restore"
             with self.assertRaisesRegex(
@@ -735,7 +858,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 restore_root,
                 purpose="replacement-admission",
                 pinned=True,
-                replacement_pending_limit=1,
+                replacement_pending_limit=2,
             ) as publication:
                 self.assertFalse(publication.evidence["cutover_ready"])
                 self.assertTrue(
@@ -743,7 +866,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     publication.evidence["pending_file_count"],
-                    1,
+                    2,
                 )
                 expected_debt = {
                     "replay_required_capture_count": 1,
@@ -765,9 +888,10 @@ class ReplacementAdmissionTests(unittest.TestCase):
                         "capture_pending_state"
                     ],
                     {
-                        "pending_file_count": 1,
+                        "pending_file_count": 2,
                         "replay_required_file_count": 1,
                         "replay_required_capture_count": 1,
+                        "receipt_backed_file_count": 0,
                         "canonical_v2": True,
                     },
                 )
@@ -778,7 +902,8 @@ class ReplacementAdmissionTests(unittest.TestCase):
                             path=admission_path,
                             build_id=candidate_build_id,
                             config_fingerprint=config.fingerprint,
-                            expected_pending_file_count=1,
+                            expected_pending_file_count=2,
+                            expected_replay_required_file_count=1,
                         ),
                         root=ROOT,
                         memory_db=config.memory_path,
@@ -855,30 +980,39 @@ class ReplacementAdmissionTests(unittest.TestCase):
             if successor is not None:
                 successor.close()
         self.assertTrue(published["verified"])
-        self.assertEqual(published["recovery_pending_file_count"], 1)
+        self.assertEqual(published["recovery_pending_file_count"], 2)
         self.assertEqual(published["recovery_replay_required_file_count"], 1)
         self.assertEqual(published["recovery_replay_required_capture_count"], 1)
         self.assertFalse(pending_drop.exists())
+        self.assertFalse(pending_claim_path.exists())
+        self.assertFalse(pending_claim_dir.exists())
+        self.assertFalse(cleanup_claim_path.exists())
+        self.assertFalse(cleanup_claim_dir.exists())
         self.assertEqual(drained_status["pending_file_count"], 0)
         self.assertEqual(drained_status["processing_file_count"], 0)
-        self.assertEqual(drained_status["processed_file_count"], 1)
-        self.assertEqual(drained_status["receipt_count"], 1)
+        self.assertEqual(drained_status["processed_file_count"], 2)
+        self.assertEqual(drained_status["receipt_count"], 2)
         self.assertEqual(drained_status["error_file_count"], 0)
         self.assertEqual(drained_status["unresolved_error_count"], 0)
         self.assertEqual(drained_status["unsafe_error_artifact_count"], 0)
         self.assertTrue(health["capture"]["ready"])
         self.assertGreaterEqual(health["capture"]["iteration_count"], 1)
-        self.assertEqual(health["capture"]["processed_count"], 1)
+        self.assertEqual(health["capture"]["processed_count"], 2)
         self.assertEqual(health["capture"]["error_count"], 0)
         audit_store = DurableMemoryStore.open_existing_for_audit(
             config.memory_path
         )
         try:
             captured = audit_store.get_capture_operation(pending_capture_id)
+            cleanup_captured = audit_store.get_capture_operation(
+                cleanup_capture_id
+            )
         finally:
             audit_store.close()
         self.assertIsNotNone(captured)
         self.assertEqual(captured["capture_id"], pending_capture_id)
+        self.assertIsNotNone(cleanup_captured)
+        self.assertEqual(cleanup_captured["capture_id"], cleanup_capture_id)
         with closing(sqlite3.connect(config.memory_path)) as connection:
             capture_rows = connection.execute(
                 "SELECT COUNT(*), COUNT(DISTINCT deployment_event_id), "

@@ -58,6 +58,8 @@ from core_service import (  # noqa: E402
 )
 from scripts.core_cutover_preflight import (  # noqa: E402
     CUTOVER_ATTESTATION_NAME,
+    REPLACEMENT_ADMISSION_DEFAULT_TTL_SECONDS,
+    REPLACEMENT_ADMISSION_MAX_TTL_SECONDS,
     CutoverAttestationRequest,
     CutoverPreflightError,
     ReplacementAdmissionRequest,
@@ -79,9 +81,9 @@ DEFAULT_PRODUCTION_NEURAL_MODEL = (
 DEFAULT_PRODUCTION_NEURAL_REVISION = "6c3ae70858513f1a78e9cdca3cae330d9075cd2a"
 DEFAULT_PRODUCTION_MLX_DEVICE = "gpu"
 REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS = 300.0
+REPLACEMENT_ACTIVATION_HEADROOM_SECONDS = 300.0
 CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS = (
     "inbox_temp_file_count",
-    "processing_file_count",
     "processing_empty_claim_count",
     "processing_malformed_claim_count",
     "error_file_count",
@@ -1213,12 +1215,60 @@ def replacement_certification_seconds_remaining(
     return remaining_milliseconds // 1000
 
 
+def replacement_admission_ttl_seconds(wait_seconds: float) -> float:
+    """Budget both activation waits, certification reserve, and publication work."""
+
+    if (
+        not isinstance(wait_seconds, (int, float))
+        or isinstance(wait_seconds, bool)
+        or not math.isfinite(float(wait_seconds))
+        or float(wait_seconds) <= 0.0
+    ):
+        raise CoreInstallerError("replacement activation wait is invalid")
+    ttl_seconds = max(
+        REPLACEMENT_ADMISSION_DEFAULT_TTL_SECONDS,
+        (2.0 * float(wait_seconds))
+        + REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS
+        + REPLACEMENT_ACTIVATION_HEADROOM_SECONDS,
+    )
+    if ttl_seconds > REPLACEMENT_ADMISSION_MAX_TTL_SECONDS:
+        raise CoreInstallerError(
+            "replacement activation cannot fit inside the signed admission bound"
+        )
+    return ttl_seconds
+
+
+def replacement_activation_seconds_remaining(
+    admission: Mapping[str, Any] | None,
+    *,
+    wait_seconds: float,
+) -> int:
+    """Fail before launch unless both bounded waits and certification still fit."""
+
+    replacement_admission_ttl_seconds(wait_seconds)
+    expires_at = (
+        None if not isinstance(admission, Mapping) else admission.get("expires_at_unix_ms")
+    )
+    if type(expires_at) is not int:
+        raise CoreInstallerError("replacement admission expiry is invalid")
+    remaining_milliseconds = int(expires_at) - int(time.time() * 1000)
+    required_seconds = (
+        (2.0 * float(wait_seconds))
+        + REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS
+    )
+    if remaining_milliseconds < int(required_seconds * 1000):
+        raise CoreInstallerError(
+            "replacement admission has too little signed time remaining for activation"
+        )
+    return remaining_milliseconds // 1000
+
+
 def validate_replacement_capture_transport(
     status: Mapping[str, Any] | None,
     *,
     maximum_pending_files: int,
 ) -> int:
-    """Admit bounded durable inbox debt, but no ambiguous transport state."""
+    """Admit bounded canonical queued debt, but no ambiguous transport state."""
 
     if type(maximum_pending_files) is not int or maximum_pending_files < 0:
         raise CoreInstallerError("replacement capture pending bound is invalid")
@@ -1227,12 +1277,19 @@ def validate_replacement_capture_transport(
         if not isinstance(status, Mapping)
         else status.get("pending_file_count")
     )
+    processing = (
+        None
+        if not isinstance(status, Mapping)
+        else status.get("processing_file_count")
+    )
     if (
         not isinstance(status, Mapping)
         or status.get("transport_ready") is not True
         or type(pending) is not int
+        or type(processing) is not int
         or int(pending) < 0
-        or int(pending) > maximum_pending_files
+        or int(processing) < 0
+        or int(pending) + int(processing) > maximum_pending_files
         or any(
             type(status.get(field)) is not int or int(status[field]) != 0
             for field in CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS
@@ -1241,7 +1298,7 @@ def validate_replacement_capture_transport(
         raise CoreInstallerError(
             "replacement staging requires bounded, unambiguous capture transport"
         )
-    return int(pending)
+    return int(pending) + int(processing)
 
 
 def capture_transport_status(capture_root: Path) -> dict[str, Any]:
@@ -1267,6 +1324,7 @@ def wait_for_replacement_capture_drain(
     capture_root: Path,
     admitted_status: Mapping[str, Any],
     admitted_pending_file_count: int,
+    admitted_receipt_backed_file_count: int = 0,
     wait_seconds: float,
 ) -> dict[str, Any]:
     """Wait for only the admitted inbox set to become durable and archived."""
@@ -1274,6 +1332,9 @@ def wait_for_replacement_capture_drain(
     if (
         type(admitted_pending_file_count) is not int
         or admitted_pending_file_count < 0
+        or type(admitted_receipt_backed_file_count) is not int
+        or admitted_receipt_backed_file_count < 0
+        or admitted_receipt_backed_file_count > admitted_pending_file_count
         or not isinstance(admitted_status, Mapping)
         or type(admitted_status.get("processed_file_count")) is not int
         or type(admitted_status.get("receipt_count")) is not int
@@ -1288,7 +1349,9 @@ def wait_for_replacement_capture_drain(
         + admitted_pending_file_count
     )
     expected_receipts = (
-        int(admitted_status["receipt_count"]) + admitted_pending_file_count
+        int(admitted_status["receipt_count"])
+        + admitted_pending_file_count
+        - admitted_receipt_backed_file_count
     )
     deadline = time.monotonic() + float(wait_seconds)
     fatal_fields = tuple(
@@ -2607,10 +2670,14 @@ def stage_replacement(
                         evidence.get("replacement_stage_ready") is not True
                         or evidence.get("pending_file_count")
                         != admitted_pending_file_count
-                        or evidence.get("replay_required_file_count")
-                        != admitted_pending_file_count
+                        or type(evidence.get("replay_required_file_count"))
+                        is not int
                         or evidence.get("replay_required_capture_count")
-                        != admitted_pending_file_count
+                        != evidence.get("replay_required_file_count")
+                        or int(evidence["replay_required_file_count"]) < 0
+                        or int(evidence["replay_required_file_count"])
+                        > admitted_pending_file_count
+                        or evidence.get("receipt_backed_file_count") != 0
                     ):
                         raise CoreInstallerError(
                             "replacement recovery evidence changed its admitted "
@@ -2621,8 +2688,14 @@ def stage_replacement(
                             path=paths.core_root / "replacement-admission.json",
                             build_id=candidate_build_id,
                             config_fingerprint=config.fingerprint,
+                            ttl_seconds=replacement_admission_ttl_seconds(
+                                wait_seconds
+                            ),
                             expected_pending_file_count=(
                                 admitted_pending_file_count
+                            ),
+                            expected_replay_required_file_count=int(
+                                evidence["replay_required_file_count"]
                             ),
                         ),
                         root=paths.root,
@@ -2679,6 +2752,10 @@ def stage_replacement(
             kind="replacement staging LaunchAgent plist",
             require_mode=0o600,
         )
+        replacement_activation_seconds_remaining(
+            admission,
+            wait_seconds=wait_seconds,
+        )
         activated = False
         certification_seconds_remaining: int | None = None
         try:
@@ -2697,6 +2774,9 @@ def stage_replacement(
                 capture_root=paths.capture_root,
                 admitted_status=capture,
                 admitted_pending_file_count=admitted_pending_file_count,
+                admitted_receipt_backed_file_count=int(
+                    guarded_evidence.get("receipt_backed_file_count") or 0
+                ),
                 wait_seconds=wait_seconds,
             )
             certification_seconds_remaining = (

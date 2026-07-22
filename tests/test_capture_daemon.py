@@ -1661,18 +1661,19 @@ class CaptureInboxDaemonTests(unittest.TestCase):
             empty_claim = processing / (
                 "s2claim_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
             )
-            empty_claim.mkdir()
+            empty_claim.mkdir(mode=0o700)
             old_time = time.time() - 120
             os.utime(empty_claim, (old_time, old_time))
             malformed_claim = processing / (
                 "s2claim_ffffffffffffffffffffffffffffffff"
             )
-            malformed_claim.mkdir()
+            malformed_claim.mkdir(mode=0o700)
             for index in (1, 2):
                 (malformed_claim / f"payload-{index}.json").write_text(
                     json.dumps({"version": 1, "text": f"payload {index}"}),
                     encoding="utf-8",
                 )
+                (malformed_claim / f"payload-{index}.json").chmod(0o600)
             before = daemon.status()
 
             result = daemon.process_once()
@@ -1685,6 +1686,27 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         self.assertEqual(len(backend.effects), 0)
         self.assertEqual(after["processing_empty_claim_count"], 0)
         self.assertEqual(after["processing_malformed_claim_count"], 0)
+
+    def test_processing_diagnostics_fail_closed_on_rogue_entries(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
+            daemon.prepare_transport()
+            processing = daemon.paths()["processing_dir"]
+            rogue_file = processing / "not-a-claim"
+            rogue_file.write_text("not a claim", encoding="utf-8")
+            rogue_file.chmod(0o600)
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            os.symlink(outside, processing / ("s2claim_" + "a" * 32))
+            unsafe_claim = processing / ("s2claim_" + "b" * 32)
+            unsafe_claim.mkdir(mode=0o755)
+
+            status = daemon.status()
+
+        self.assertEqual(status["processing_file_count"], 0)
+        self.assertEqual(status["processing_empty_claim_count"], 0)
+        self.assertEqual(status["processing_malformed_claim_count"], 3)
 
     def test_process_once_ingests_inbox_payloads_and_moves_file(self):
         with TemporaryDirectory() as tmp:

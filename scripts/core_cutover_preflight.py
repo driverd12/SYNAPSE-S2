@@ -105,7 +105,8 @@ REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA = (
 )
 REPLACEMENT_ADMISSION_NAME = "replacement-admission.json"
 REPLACEMENT_ADMISSION_MAX_BYTES = 64 * 1024
-REPLACEMENT_ADMISSION_MAX_TTL_SECONDS = 600.0
+REPLACEMENT_ADMISSION_DEFAULT_TTL_SECONDS = 600.0
+REPLACEMENT_ADMISSION_MAX_TTL_SECONDS = 1_800.0
 REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS = 120.0
 REPLACEMENT_ADMISSION_MAX_PENDING_FILES = 1_000
 REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX = "replacement-certification:"
@@ -420,8 +421,9 @@ class ReplacementAdmissionRequest:
     path: Path
     build_id: str
     config_fingerprint: str
-    ttl_seconds: float = REPLACEMENT_ADMISSION_MAX_TTL_SECONDS
+    ttl_seconds: float = REPLACEMENT_ADMISSION_DEFAULT_TTL_SECONDS
     expected_pending_file_count: int = 0
+    expected_replay_required_file_count: int | None = None
 
 
 def _normal_absolute(path: str | os.PathLike[str], *, name: str) -> Path:
@@ -1185,12 +1187,21 @@ def _replacement_capture_debt(
     reconciliation: Any,
     *,
     expected_pending_file_count: int,
+    expected_replay_required_file_count: int | None = None,
     name: str,
 ) -> dict[str, int]:
+    expected_replay_count = (
+        expected_pending_file_count
+        if expected_replay_required_file_count is None
+        else expected_replay_required_file_count
+    )
     if (
         type(expected_pending_file_count) is not int
         or expected_pending_file_count < 0
         or expected_pending_file_count > REPLACEMENT_ADMISSION_MAX_PENDING_FILES
+        or type(expected_replay_count) is not int
+        or expected_replay_count < 0
+        or expected_replay_count > expected_pending_file_count
     ):
         raise CutoverPreflightError(
             "replacement pending capture count is invalid"
@@ -1204,8 +1215,8 @@ def _replacement_capture_debt(
         raise CutoverPreflightError(f"{name} values are invalid")
     expected = {
         "missing_authoritative_ledger_count": 0,
-        "replay_required_capture_count": expected_pending_file_count,
-        "replay_required_file_count": expected_pending_file_count,
+        "replay_required_capture_count": expected_replay_count,
+        "replay_required_file_count": expected_replay_count,
         "identifierless_replay_file_count": 0,
         "unclassified_file_count": 0,
     }
@@ -1233,6 +1244,7 @@ def _replacement_recovery_binding(
     maximum_evidence_age_seconds: float,
     guarded_recovery_locks_held: bool = False,
     expected_pending_file_count: int = 0,
+    expected_replay_required_file_count: int | None = None,
 ) -> tuple[dict[str, Any], float]:
     maximum_age = _maximum_evidence_age(maximum_evidence_age_seconds)
     if (
@@ -1310,27 +1322,38 @@ def _replacement_recovery_binding(
                     now=observed_now,
                     maximum_age_seconds=maximum_age,
                 )
+                expected_replay_count = (
+                    expected_pending_file_count
+                    if expected_replay_required_file_count is None
+                    else expected_replay_required_file_count
+                )
                 expected_cutover_ready = expected_pending_file_count == 0
                 debt = _replacement_capture_debt(
                     parsed.get("reconciliation"),
                     expected_pending_file_count=expected_pending_file_count,
+                    expected_replay_required_file_count=(
+                        expected_replay_count
+                    ),
                     name="replacement recovery reconciliation",
                 )
                 _replacement_capture_debt(
                     restore_proof.get("reconciliation"),
                     expected_pending_file_count=expected_pending_file_count,
+                    expected_replay_required_file_count=(
+                        expected_replay_count
+                    ),
                     name="replacement isolated restore reconciliation",
                 )
                 expected_pending_state = {
                     "pending_file_count": expected_pending_file_count,
-                    "replay_required_file_count": expected_pending_file_count,
-                    "replay_required_capture_count": expected_pending_file_count,
+                    "replay_required_file_count": expected_replay_count,
+                    "replay_required_capture_count": expected_replay_count,
+                    "receipt_backed_file_count": 0,
                     "canonical_v2": True,
                 }
                 capture_status = manager.daemon.status()
                 zero_status_fields = (
                     "inbox_temp_file_count",
-                    "processing_file_count",
                     "processing_empty_claim_count",
                     "processing_malformed_claim_count",
                     "error_file_count",
@@ -1352,6 +1375,8 @@ def _replacement_recovery_binding(
                     or parsed.get("capture_pending_state")
                     != expected_pending_state
                     or restore_proof.get("verified") is not True
+                    or restore_proof.get("capture_pending_state")
+                    != expected_pending_state
                     or restore_proof.get("cutover_ready")
                     is not expected_cutover_ready
                     or restore_proof.get("missing_transport_ledger_count") != 0
@@ -1362,7 +1387,10 @@ def _replacement_recovery_binding(
                     or capture_status.get("transport_ready") is not True
                     or capture_status.get("missing_transport_directories")
                     or capture_status.get("unsafe_transport_directories")
-                    or capture_status.get("pending_file_count")
+                    or type(capture_status.get("pending_file_count")) is not int
+                    or type(capture_status.get("processing_file_count")) is not int
+                    or int(capture_status["pending_file_count"])
+                    + int(capture_status["processing_file_count"])
                     != expected_pending_file_count
                     or any(
                         type(capture_status.get(field)) is not int
@@ -1606,11 +1634,12 @@ def _validate_replacement_admission(
         or int(payload["recovery_pending_file_count"])
         > REPLACEMENT_ADMISSION_MAX_PENDING_FILES
         or type(payload.get("recovery_replay_required_file_count")) is not int
-        or payload.get("recovery_replay_required_file_count")
-        != payload.get("recovery_pending_file_count")
+        or int(payload["recovery_replay_required_file_count"]) < 0
+        or int(payload["recovery_replay_required_file_count"])
+        > int(payload["recovery_pending_file_count"])
         or type(payload.get("recovery_replay_required_capture_count")) is not int
         or payload.get("recovery_replay_required_capture_count")
-        != payload.get("recovery_pending_file_count")
+        != payload.get("recovery_replay_required_file_count")
         or payload.get("runtime_state_required") is not True
         or payload.get("runtime_state_present") is not True
         or _SHA256.fullmatch(
@@ -2182,6 +2211,15 @@ def publish_replacement_admission(
         or request.expected_pending_file_count < 0
         or request.expected_pending_file_count
         > REPLACEMENT_ADMISSION_MAX_PENDING_FILES
+        or type(request.expected_replay_required_file_count) not in {int, type(None)}
+        or (
+            request.expected_replay_required_file_count is not None
+            and (
+                request.expected_replay_required_file_count < 0
+                or request.expected_replay_required_file_count
+                > request.expected_pending_file_count
+            )
+        )
     ):
         raise CutoverPreflightError(
             "replacement pending capture count is invalid"
@@ -2214,6 +2252,9 @@ def publish_replacement_admission(
         maximum_evidence_age_seconds=maximum_evidence_age_seconds,
         guarded_recovery_locks_held=True,
         expected_pending_file_count=request.expected_pending_file_count,
+        expected_replay_required_file_count=(
+            request.expected_replay_required_file_count
+        ),
     )
     delivery = _replacement_delivery_binding(
         memory_db=memory_db,
@@ -2417,6 +2458,9 @@ def verify_replacement_admission_for_core(
         restore_proof_path=restore_proof_path,
         maximum_evidence_age_seconds=maximum_evidence_age_seconds,
         expected_pending_file_count=int(payload["recovery_pending_file_count"]),
+        expected_replay_required_file_count=int(
+            payload["recovery_replay_required_file_count"]
+        ),
     )
     delivery = _replacement_delivery_binding(
         memory_db=memory_db,

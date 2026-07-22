@@ -3316,14 +3316,15 @@ class AuthoritativeCoreService:
                 verification.get("recovery_replay_required_file_count")
             )
             is not int
-            or verification.get("recovery_replay_required_file_count")
-            != verification.get("recovery_pending_file_count")
+            or int(verification["recovery_replay_required_file_count"]) < 0
+            or int(verification["recovery_replay_required_file_count"])
+            > int(verification["recovery_pending_file_count"])
             or type(
                 verification.get("recovery_replay_required_capture_count")
             )
             is not int
             or verification.get("recovery_replay_required_capture_count")
-            != verification.get("recovery_pending_file_count")
+            != verification.get("recovery_replay_required_file_count")
             or verification.get("runtime_state_required") is not True
             or verification.get("runtime_state_present") is not True
             or verification.get("request_journal_id")
