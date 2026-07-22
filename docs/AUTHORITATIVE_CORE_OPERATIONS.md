@@ -245,7 +245,8 @@ changing permissions on an existing caller-owned directory.
    ```bash
    scripts/install_core_agent.sh publish-binding
    scripts/install_local_launcher.sh
-   .venv/bin/python scripts/install_client_configs.py
+   .venv/bin/python scripts/install_client_configs.py \
+     --codex-disabled-for-certification
    ```
 
    This first atomically writes and rereads the canonical owner-only
@@ -284,6 +285,32 @@ changing permissions on an existing caller-owned directory.
    prior core LaunchAgents. Review exact PIDs and labels; never use `pkill`,
    `killall`, or a broad command match.
 
+   Keep the reviewed Codex MCP definition present but set to `enabled=false`
+   for the entire certification window. This bounded activation profile
+   preserves the exact command, environment, and binding contract while
+   preventing an already-running Codex host from respawning a wrapper during
+   the long recovery proof. Publish it transactionally and prove it is
+   idempotent before process inventory:
+
+   ```bash
+   .venv/bin/python scripts/install_client_configs.py \
+     --codex-disabled-for-certification
+   .venv/bin/python scripts/install_client_configs.py \
+     --codex-disabled-for-certification \
+     --dry-run
+   ```
+
+   The dry-run must report schema `synapse-s2.client-config-plan.v1`, profile
+   `certification-quiescence`, `codex_mcp_enabled: false`, all four expected
+   clients, `publication_recovery_required: false`, no pending change, and
+   `restart_required: false`. Its repository, launcher, binding path and digest,
+   configuration fingerprint, embedding-space identity, and authority mode
+   must match the reviewed candidate exactly. Continue to close and disable
+   every other persistent client or exact respawner independently; the Codex
+   profile is not a blanket quiescence bypass. A surviving config-publication
+   journal blocks dry-run certification until a real non-dry-run invocation
+   safely completes or rolls back that transaction.
+
    Run a separate read-only inventory before certification:
 
    ```bash
@@ -307,7 +334,8 @@ changing permissions on an existing caller-owned directory.
      --json \
      --context default \
      --agent-id codex-desktop \
-     --expect-embedding-provider mlx-neural
+     --expect-embedding-provider mlx-neural \
+     --codex-disabled-for-certification
    ```
 
    The certifier loads the digest-bound candidate through the same installer
@@ -334,6 +362,12 @@ changing permissions on an existing caller-owned directory.
    non-ready rows, and the manifest binds the exact versioned quiescence policy
    digest. Probe children receive only a minimal allowlisted environment, not
    ambient GitHub, OpenAI, Hugging Face, Python, or DYLD credentials/settings.
+   Its Retrieval v2 proof writes one fresh, run-derived alphabetic marker, uses
+   the exact write text as the local-scope query with graph-neighbor expansion
+   disabled, and accepts only one returned item carrying the exact memory ID,
+   tag, and marker together. This keeps historical certification traces from
+   crowding or accidentally satisfying the proof without weakening the normal
+   production ranker.
    Those transient Phase-A processes do not authorize reopening an external
    persistent wrapper. Treat the returned manifest as immediately perishable
    and proceed directly to the next two commands.
@@ -369,7 +403,8 @@ changing permissions on an existing caller-owned directory.
      --context default \
      --agent-id codex-desktop \
      --expect-embedding-provider mlx-neural \
-     --handoff-running-core
+     --handoff-running-core \
+     --codex-disabled-for-certification
    ```
 
    `stage-replacement` accepts only a build-only successor with unchanged
@@ -500,7 +535,12 @@ changing permissions on an existing caller-owned directory.
    prove that the label is absent. The gate also acquires the existing
    owner-only authority lock exclusively and nonblocking for the full database
    and recovery comparison. Process output is limited to PID and a fixed
-   category; command text is never returned.
+   category; command text is never returned. After the potentially long
+   recovery comparison, it revalidates the exact disabled client profile and
+   repeats process plus LaunchAgent inventory immediately before attestation or
+   a ready result. A wrapper or respawner that appears during verification
+   therefore invalidates the cutover instead of slipping through the earlier
+   snapshot.
 5. Install only with that explicit evidence manifest:
 
    ```bash
@@ -544,6 +584,23 @@ binding. The activation result and later `status` calls must report
 failed activation unloads and disables the new core and does not publish an
 active binding. Reinstalling an already healthy exact build repairs the active
 binding idempotently.
+
+After `install` and a fresh `status` both report stable authenticated health,
+`production_ready: true`, embedded capture readiness, and
+`client_binding.ready: true`, restore the normal Codex activation profile and
+prove the publication is already converged:
+
+```bash
+scripts/install_core_agent.sh status
+.venv/bin/python scripts/install_client_configs.py --codex-enabled
+.venv/bin/python scripts/install_client_configs.py --codex-enabled --dry-run
+```
+
+The final dry-run must report profile `operational`,
+`codex_mcp_enabled: true`, no pending changes, and
+`restart_required: false`. Never restore the client before production health
+and binding publication: a newly spawned wrapper would invalidate a still-live
+certification or preflight window.
 
 If activation fails only after schema v6 has been durably claimed, the original
 v5 evidence pack describes bytes that no longer exist and must never be reused.

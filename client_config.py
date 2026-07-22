@@ -42,6 +42,7 @@ DEFAULT_RESPONSE_MODE = "compact"
 DEFAULT_MAX_RESPONSE_BYTES = "12288"
 MAX_CLIENT_CONFIG_BYTES = 4 * 1024 * 1024
 PUBLICATION_SCHEMA = "synapse-s2.client-config-publication.v1"
+CLIENT_CONFIG_PLAN_SCHEMA = "synapse-s2.client-config-plan.v1"
 
 
 def _canonical_config_path(path: Path, *, field: str) -> Path:
@@ -149,7 +150,10 @@ def install_client_configs(
     launcher_path: Path = DEFAULT_LAUNCHER,
     dry_run: bool = False,
     core_binding_path: Path | None = None,
+    codex_enabled: bool = True,
 ) -> dict[str, Any]:
+    if type(codex_enabled) is not bool:
+        raise TypeError("codex_enabled must be a boolean")
     repo = _canonical_config_path(repo_root, field="repo_root")
     home_path = _canonical_config_path(home, field="home")
     launcher = _canonical_config_path(launcher_path, field="launcher_path")
@@ -173,9 +177,15 @@ def install_client_configs(
     if binding is not None and binding.repo_root != repo:
         raise OSError("core binding belongs to a different repository")
     result: dict[str, Any] = {
+        "schema": CLIENT_CONFIG_PLAN_SCHEMA,
         "server_name": SERVER_NAME,
         "repo_root": str(repo),
         "launcher_path": str(launcher),
+        "codex_mcp_enabled": bool(codex_enabled),
+        "activation_profile": (
+            "operational" if codex_enabled else "certification-quiescence"
+        ),
+        "publication_recovery_required": False,
         "restart_required": False,
         "core_binding": (
             None
@@ -204,6 +214,10 @@ def install_client_configs(
     codex_path = home_path / ".codex" / "config.toml"
     journal_path = repo / ".synapse_s2" / "client-config-publication.journal.json"
     allowed_targets = {project_path, desktop_path, claude_code_path, codex_path}
+    if dry_run and (journal_path.exists() or journal_path.is_symlink()):
+        raise RuntimeError(
+            "client config publication recovery is required before dry-run"
+        )
     if not dry_run:
         _recover_pending_publication(
             journal_path,
@@ -251,6 +265,7 @@ def install_client_configs(
     next_codex = merge_codex_config_text(
         _read_text(codex_path),
         server=codex_server,
+        enabled=codex_enabled,
     )
     json_plans = (
         ("project_mcp", project_path, project_payload),
@@ -364,7 +379,12 @@ def _plan_text_update(
     )
 
 
-def merge_codex_config_text(text: str, *, server: dict[str, Any]) -> str:
+def merge_codex_config_text(
+    text: str,
+    *,
+    server: dict[str, Any],
+    enabled: bool = True,
+) -> str:
     cleaned = _remove_toml_sections(
         text,
         {
@@ -373,17 +393,21 @@ def merge_codex_config_text(text: str, *, server: dict[str, Any]) -> str:
         },
     ).rstrip()
     separator = "\n\n" if cleaned else ""
-    return cleaned + separator + _codex_server_block(server)
+    return cleaned + separator + _codex_server_block(server, enabled=enabled)
 
 
-def _codex_server_block(server: dict[str, Any]) -> str:
+def _codex_server_block(
+    server: dict[str, Any],
+    *,
+    enabled: bool = True,
+) -> str:
     lines = [
         "[mcp_servers.synapse-s2]",
         f"command = {_toml_string(server['command'])}",
         "args = []",
         "startup_timeout_sec = 15",
         "tool_timeout_sec = 30",
-        "enabled = true",
+        f"enabled = {'true' if enabled else 'false'}",
         "",
         "[mcp_servers.synapse-s2.env]",
     ]
@@ -1217,6 +1241,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Owner-only core binding; auto-discovered from ~/.config/synapse-s2 when present.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    activation = parser.add_mutually_exclusive_group()
+    activation.add_argument(
+        "--codex-enabled",
+        dest="codex_enabled",
+        action="store_true",
+        help="publish the Codex SYNAPSE-S2 definition enabled for normal operation",
+    )
+    activation.add_argument(
+        "--codex-disabled-for-certification",
+        dest="codex_enabled",
+        action="store_false",
+        help=(
+            "publish the exact Codex SYNAPSE-S2 definition with enabled=false "
+            "so a live Codex host cannot respawn it during exclusive recovery proof"
+        ),
+    )
+    parser.set_defaults(codex_enabled=True)
     return parser
 
 
@@ -1228,6 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
         launcher_path=args.launcher,
         dry_run=args.dry_run,
         core_binding_path=args.core_binding,
+        codex_enabled=args.codex_enabled,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0

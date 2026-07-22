@@ -2992,6 +2992,383 @@ class CoreCutoverPreflightTests(unittest.TestCase):
         return checks, {str(check["check_id"]): check for check in checks}
 
     @staticmethod
+    def _disabled_codex_client_plan() -> dict:
+        binding = {
+            "path": str(ROOT / ".config" / "synapse-s2" / "core-binding.json"),
+            "digest": "a" * 64,
+            "authority_mode": "authoritative-core-v6",
+            "config_path": str(ROOT / ".synapse_s2" / "core" / "service.json"),
+            "config_digest": "b" * 64,
+            "config_fingerprint": "c" * 64,
+            "embedding_space_identity": "mlx-neural-unit-test-space",
+        }
+        return {
+            "schema": preflight.CLIENT_CONFIG_PLAN_SCHEMA,
+            "repo_root": str(ROOT),
+            "launcher_path": str(ROOT / ".venv" / "bin" / "synapse-s2-mcp"),
+            "publication_recovery_required": False,
+            "core_binding": binding,
+            "codex_mcp_enabled": False,
+            "activation_profile": "certification-quiescence",
+            "restart_required": False,
+            "clients": {
+                client: {"changed": False, "would_change": False}
+                for client in (
+                    "project_mcp",
+                    "claude_desktop",
+                    "claude_code",
+                    "codex",
+                )
+            },
+        }
+
+    @staticmethod
+    def _disabled_codex_manifest(plan: dict) -> dict:
+        binding = plan["core_binding"]
+        metrics = {
+            "client_count": 4,
+            "pending_changes": [],
+            "codex_mcp_enabled": False,
+            "activation_profile": "certification-quiescence",
+            "repo_root": plan["repo_root"],
+            "launcher_path": plan["launcher_path"],
+            "publication_recovery_required": False,
+            "core_binding": binding,
+        }
+        client_check = {
+            "check_id": "client_config",
+            "required": True,
+            "status": "ready",
+            "metrics": metrics,
+            "artifact_paths": {},
+        }
+        return {
+            "codex_disabled_for_certification": True,
+            "launcher": plan["launcher_path"],
+            "core_config_contract": {
+                "config_fingerprint": binding["config_fingerprint"]
+            },
+            "authority_route": {
+                "source": "core-binding",
+                "mode": binding["authority_mode"],
+                "binding_path": binding["path"],
+                "binding_digest": binding["digest"],
+                "binding_config_digest": binding["config_digest"],
+                "binding_config_fingerprint": binding["config_fingerprint"],
+                "binding_embedding_space_identity": (
+                    binding["embedding_space_identity"]
+                ),
+                "binding_authority_mode": binding["authority_mode"],
+            },
+            "proofs": {"client_config": client_check},
+        }
+
+    def test_codex_certification_quiescence_accepts_matching_evidence(self) -> None:
+        plan = self._disabled_codex_client_plan()
+        metrics = {
+            "client_count": 4,
+            "pending_changes": [],
+            "codex_mcp_enabled": False,
+            "activation_profile": "certification-quiescence",
+            "repo_root": plan["repo_root"],
+            "launcher_path": plan["launcher_path"],
+            "publication_recovery_required": False,
+            "core_binding": plan["core_binding"],
+        }
+        by_id = {"client_config": {"metrics": metrics}}
+        binding = plan["core_binding"]
+        manifest = {
+            "codex_disabled_for_certification": True,
+            "launcher": plan["launcher_path"],
+            "core_config_contract": {
+                "config_fingerprint": binding["config_fingerprint"]
+            },
+            "authority_route": {
+                "source": "core-binding",
+                "mode": binding["authority_mode"],
+                "binding_path": binding["path"],
+                "binding_digest": binding["digest"],
+                "binding_config_digest": binding["config_digest"],
+                "binding_config_fingerprint": binding["config_fingerprint"],
+                "binding_embedding_space_identity": (
+                    binding["embedding_space_identity"]
+                ),
+                "binding_authority_mode": binding["authority_mode"],
+            },
+        }
+
+        self.assertTrue(
+            preflight._codex_certification_quiescence_requested(
+                manifest,
+                by_id=by_id,
+                root=ROOT,
+            )
+        )
+        self.assertFalse(
+            preflight._codex_certification_quiescence_requested(
+                {},
+                by_id=by_id,
+                root=ROOT,
+            )
+        )
+
+    def test_codex_certification_quiescence_evidence_mismatches_fail_closed(
+        self,
+    ) -> None:
+        plan = self._disabled_codex_client_plan()
+        manifest = self._disabled_codex_manifest(plan)
+        valid_metrics = manifest["proofs"]["client_config"]["metrics"]
+        invalid_metrics = {
+            "missing_metrics": None,
+            "wrong_client_count": {**valid_metrics, "client_count": 3},
+            "pending_change": {**valid_metrics, "pending_changes": ["codex"]},
+            "codex_enabled": {**valid_metrics, "codex_mcp_enabled": True},
+            "wrong_profile": {**valid_metrics, "activation_profile": "operational"},
+        }
+        for case, metrics in invalid_metrics.items():
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(
+                    preflight.CutoverPreflightError,
+                    "does not bind the disabled Codex certification profile",
+                ):
+                    preflight._codex_certification_quiescence_requested(
+                        manifest,
+                        by_id={"client_config": {"metrics": metrics}},
+                        root=ROOT,
+                    )
+
+        with self.assertRaisesRegex(
+            preflight.CutoverPreflightError,
+            "evidence flag is invalid",
+        ):
+            preflight._codex_certification_quiescence_requested(
+                {"codex_disabled_for_certification": 1},
+                by_id={"client_config": {"metrics": valid_metrics}},
+                root=ROOT,
+            )
+
+    def test_live_codex_certification_quiescence_requires_exact_dry_run_plan(
+        self,
+    ) -> None:
+        launcher = ROOT / ".venv" / "bin" / "synapse-s2-mcp"
+        plan = self._disabled_codex_client_plan()
+        manifest = self._disabled_codex_manifest(plan)
+        with tempfile.TemporaryDirectory(
+            prefix="synapse-client-config-preflight-"
+        ) as temporary:
+            home = Path(temporary).resolve()
+            with mock.patch.object(
+                preflight,
+                "install_client_configs",
+                return_value=self._disabled_codex_client_plan(),
+            ) as install_configs:
+                result = preflight._validate_live_codex_certification_quiescence(
+                    manifest,
+                    root=ROOT,
+                    home=home,
+                )
+
+        self.assertEqual(
+            result,
+            {
+                "verified": True,
+                "schema": preflight.CLIENT_CONFIG_PLAN_SCHEMA,
+                "activation_profile": "certification-quiescence",
+                "codex_mcp_enabled": False,
+                "client_count": 4,
+                "binding_digest": plan["core_binding"]["digest"],
+            },
+        )
+        install_configs.assert_called_once_with(
+            home=home,
+            repo_root=ROOT,
+            launcher_path=launcher,
+            dry_run=True,
+            core_binding_path=Path(plan["core_binding"]["path"]),
+            codex_enabled=False,
+        )
+
+    def test_live_codex_certification_quiescence_pending_changes_fail_closed(
+        self,
+    ) -> None:
+        base_plan = self._disabled_codex_client_plan()
+        manifest = self._disabled_codex_manifest(base_plan)
+        cases = {
+            "restart_required": lambda plan: plan.update(restart_required=True),
+            "publication_recovery": lambda plan: plan.update(
+                publication_recovery_required=True
+            ),
+            "would_change": lambda plan: plan["clients"]["codex"].update(
+                would_change=True
+            ),
+            "changed": lambda plan: plan["clients"]["project_mcp"].update(
+                changed=True
+            ),
+            "unexpected_client": lambda plan: plan["clients"].update(
+                {"unknown": {"changed": False, "would_change": False}}
+            ),
+            "binding_drift": lambda plan: plan["core_binding"].update(
+                digest="d" * 64
+            ),
+        }
+        for case, mutate in cases.items():
+            with self.subTest(case=case):
+                plan = self._disabled_codex_client_plan()
+                mutate(plan)
+                with mock.patch.object(
+                    preflight,
+                    "install_client_configs",
+                    return_value=plan,
+                ):
+                    with self.assertRaisesRegex(
+                        preflight.CutoverPreflightError,
+                        "no longer match the disabled Codex certification profile",
+                    ):
+                        preflight._validate_live_codex_certification_quiescence(
+                            manifest,
+                            root=ROOT,
+                            home=ROOT,
+                        )
+
+    def test_run_preflight_rechecks_clients_and_quiescence_before_ready(self) -> None:
+        authority_lock = mock.MagicMock()
+        parsed = {"codex_disabled_for_certification": True}
+        recovery_proof = {"governance_mode": "pre-governed-v5"}
+        with (
+            mock.patch.object(
+                preflight,
+                "collect_process_inventory",
+                side_effect=[[], []],
+            ) as process_inventory,
+            mock.patch.object(
+                preflight,
+                "collect_launchagent_inventory",
+                side_effect=[{}, {}],
+            ),
+            mock.patch.object(
+                preflight,
+                "launchagent_quiescence_blockers",
+                return_value=[],
+            ),
+            mock.patch.object(
+                preflight,
+                "exclusive_authority_lock",
+                return_value=authority_lock,
+            ),
+            mock.patch.object(
+                preflight,
+                "inspect_database_contract",
+                return_value={"user_version": 5},
+            ),
+            mock.patch.object(
+                preflight,
+                "validate_evidence_contract",
+                return_value=(
+                    parsed,
+                    ROOT / "receipt.json",
+                    recovery_proof,
+                    ROOT / "restore.json",
+                ),
+            ),
+            mock.patch.object(
+                preflight,
+                "verify_recovery_binding",
+                return_value={"verified": True},
+            ),
+            mock.patch.object(
+                preflight,
+                "_validate_live_codex_certification_quiescence",
+                return_value={"verified": True},
+            ) as client_quiescence,
+        ):
+            result = preflight.run_preflight(
+                root=ROOT,
+                memory_db=ROOT / ".synapse_s2" / "memory.sqlite3",
+                capture_root=ROOT / ".synapse_s2",
+                evidence_manifest=ROOT / "evidence.json",
+                maximum_evidence_age_seconds=7200,
+                require_quiescent=True,
+                inventory_only=False,
+                launchctl_bin="/bin/launchctl",
+                ps_bin="/bin/ps",
+            )
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(process_inventory.call_count, 2)
+        self.assertEqual(client_quiescence.call_count, 2)
+        self.assertEqual(result["final_quiescence"]["process_findings"], [])
+
+    def test_run_preflight_rejects_writer_appearing_during_verification(self) -> None:
+        authority_lock = mock.MagicMock()
+        with (
+            mock.patch.object(
+                preflight,
+                "collect_process_inventory",
+                side_effect=[[], [preflight.ProcessFinding(4321, "mcp-client")]],
+            ),
+            mock.patch.object(
+                preflight,
+                "collect_launchagent_inventory",
+                side_effect=[{}, {}],
+            ),
+            mock.patch.object(
+                preflight,
+                "launchagent_quiescence_blockers",
+                return_value=[],
+            ),
+            mock.patch.object(
+                preflight,
+                "exclusive_authority_lock",
+                return_value=authority_lock,
+            ),
+            mock.patch.object(
+                preflight,
+                "inspect_database_contract",
+                return_value={"user_version": 5},
+            ),
+            mock.patch.object(
+                preflight,
+                "validate_evidence_contract",
+                return_value=(
+                    {},
+                    ROOT / "receipt.json",
+                    {"governance_mode": "pre-governed-v5"},
+                    ROOT / "restore.json",
+                ),
+            ),
+            mock.patch.object(
+                preflight,
+                "verify_recovery_binding",
+                return_value={"verified": True},
+            ),
+            mock.patch.object(
+                preflight,
+                "publish_cutover_attestation",
+            ) as publish_attestation,
+            self.assertRaisesRegex(
+                preflight.CutoverPreflightError,
+                "appeared during final cutover verification",
+            ),
+        ):
+            preflight.run_preflight(
+                root=ROOT,
+                memory_db=ROOT / ".synapse_s2" / "memory.sqlite3",
+                capture_root=ROOT / ".synapse_s2",
+                evidence_manifest=ROOT / "evidence.json",
+                maximum_evidence_age_seconds=7200,
+                require_quiescent=True,
+                inventory_only=False,
+                launchctl_bin="/bin/launchctl",
+                ps_bin="/bin/ps",
+                attestation_request=preflight.CutoverAttestationRequest(
+                    path=ROOT / "cutover-attestation.json",
+                    build_id="source-" + "a" * 24,
+                    config_fingerprint="c" * 64,
+                ),
+            )
+        publish_attestation.assert_not_called()
+
+    @staticmethod
     def _write_cutover_evidence_pack(
         *,
         root: Path,

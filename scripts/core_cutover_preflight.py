@@ -51,6 +51,10 @@ from core_authority import (  # noqa: E402
     CORE_AUTHORITY_SCHEMA_VERSION,
 )
 from core_protocol import contains_secret_shape  # noqa: E402
+from client_config import (  # noqa: E402
+    CLIENT_CONFIG_PLAN_SCHEMA,
+    install_client_configs,
+)
 from capture_daemon import GLOBAL_CAPTURE_LOCK  # noqa: E402
 from core_request_journal import (  # noqa: E402
     JOURNAL_BINDING_SCHEMA,
@@ -2946,6 +2950,151 @@ def _validate_operator_readiness_proof_contract(
     return by_id
 
 
+def _codex_certification_quiescence_requested(
+    manifest: Mapping[str, Any],
+    *,
+    by_id: Mapping[str, Mapping[str, Any]],
+    root: Path,
+) -> bool:
+    requested = manifest.get("codex_disabled_for_certification", False)
+    if type(requested) is not bool:
+        raise CutoverPreflightError(
+            "Codex certification quiescence evidence flag is invalid"
+        )
+    if not requested:
+        return False
+    metrics = by_id["client_config"].get("metrics")
+    authority_route = manifest.get("authority_route")
+    core_config_contract = manifest.get("core_config_contract")
+    binding = metrics.get("core_binding") if isinstance(metrics, dict) else None
+    expected_binding_fields = {
+        "path",
+        "digest",
+        "authority_mode",
+        "config_path",
+        "config_digest",
+        "config_fingerprint",
+        "embedding_space_identity",
+    }
+    if (
+        not isinstance(metrics, dict)
+        or metrics.get("client_count") != 4
+        or metrics.get("pending_changes") != []
+        or metrics.get("codex_mcp_enabled") is not False
+        or metrics.get("activation_profile") != "certification-quiescence"
+        or metrics.get("repo_root") != str(root)
+        or metrics.get("launcher_path") != manifest.get("launcher")
+        or metrics.get("publication_recovery_required") is not False
+        or not isinstance(binding, dict)
+        or set(binding) != expected_binding_fields
+        or not isinstance(authority_route, dict)
+        or authority_route.get("source") != "core-binding"
+        or authority_route.get("binding_path") != binding.get("path")
+        or authority_route.get("binding_digest") != binding.get("digest")
+        or authority_route.get("binding_config_digest")
+        != binding.get("config_digest")
+        or authority_route.get("binding_config_fingerprint")
+        != binding.get("config_fingerprint")
+        or authority_route.get("binding_embedding_space_identity")
+        != binding.get("embedding_space_identity")
+        or authority_route.get("binding_authority_mode")
+        != binding.get("authority_mode")
+        or authority_route.get("mode") != binding.get("authority_mode")
+        or not isinstance(core_config_contract, dict)
+        or core_config_contract.get("config_fingerprint")
+        != binding.get("config_fingerprint")
+        or _SHA256.fullmatch(str(binding.get("digest") or "")) is None
+        or _SHA256.fullmatch(str(binding.get("config_digest") or "")) is None
+    ):
+        raise CutoverPreflightError(
+            "client-config proof does not bind the disabled Codex certification profile"
+        )
+    try:
+        binding_path = _normal_absolute(
+            str(binding["path"]),
+            name="evidence-bound client binding",
+        )
+        launcher = _normal_absolute(
+            str(metrics["launcher_path"]),
+            name="evidence-bound client launcher",
+        )
+    except CutoverPreflightError:
+        raise
+    if str(binding_path) != binding["path"] or str(launcher) != metrics["launcher_path"]:
+        raise CutoverPreflightError(
+            "client-config proof paths are not canonical"
+        )
+    return True
+
+
+def _validate_live_codex_certification_quiescence(
+    manifest: Mapping[str, Any],
+    *,
+    root: Path,
+    home: Path | None = None,
+) -> dict[str, Any]:
+    launcher = _normal_absolute(
+        str(manifest.get("launcher") or ""),
+        name="readiness launcher",
+    )
+    proofs = manifest.get("proofs")
+    client_proof = proofs.get("client_config") if isinstance(proofs, dict) else None
+    metrics = client_proof.get("metrics") if isinstance(client_proof, dict) else None
+    authority_route = manifest.get("authority_route")
+    if not isinstance(metrics, dict) or not isinstance(authority_route, dict):
+        raise CutoverPreflightError(
+            "client-config certification evidence is unavailable"
+        )
+    binding_path = _normal_absolute(
+        str(authority_route.get("binding_path") or ""),
+        name="evidence-bound client binding",
+    )
+    plan = install_client_configs(
+        home=(Path.home() if home is None else home),
+        repo_root=root,
+        launcher_path=launcher,
+        dry_run=True,
+        core_binding_path=binding_path,
+        codex_enabled=False,
+    )
+    clients = plan.get("clients")
+    expected_clients = {
+        "project_mcp",
+        "claude_desktop",
+        "claude_code",
+        "codex",
+    }
+    if (
+        plan.get("schema") != CLIENT_CONFIG_PLAN_SCHEMA
+        or plan.get("repo_root") != str(root)
+        or plan.get("launcher_path") != str(launcher)
+        or plan.get("publication_recovery_required") is not False
+        or plan.get("core_binding") != metrics.get("core_binding")
+        or plan.get("codex_mcp_enabled") is not False
+        or plan.get("activation_profile") != "certification-quiescence"
+        or plan.get("restart_required") is not False
+        or not isinstance(clients, dict)
+        or set(clients) != expected_clients
+        or any(
+            not isinstance(payload, dict)
+            or payload.get("would_change") is not False
+            or payload.get("changed") is not False
+            for payload in clients.values()
+        )
+    ):
+        raise CutoverPreflightError(
+            "live client configs no longer match the disabled Codex certification profile"
+        )
+    return {
+        "verified": True,
+        "schema": CLIENT_CONFIG_PLAN_SCHEMA,
+        "activation_profile": "certification-quiescence",
+        "codex_mcp_enabled": False,
+        "client_count": len(clients),
+        "binding_digest": str(plan["core_binding"]["digest"]),
+    }
+
+
 def _validate_runtime_build_identity_proof(
     check: Mapping[str, Any],
     *,
@@ -3235,6 +3384,11 @@ def validate_evidence_contract(
             "operator-readiness quiescence policy binding is invalid"
         )
     by_id = _validate_operator_readiness_proof_contract(manifest)
+    _codex_certification_quiescence_requested(
+        manifest,
+        by_id=by_id,
+        root=root,
+    )
     authority_route = manifest.get("authority_route")
     if (
         not isinstance(authority_route, dict)
@@ -4216,6 +4370,13 @@ def run_preflight(
                 else attestation_request.config_fingerprint
             ),
         )
+        if parsed.get("codex_disabled_for_certification") is True:
+            result["codex_certification_quiescence"] = (
+                _validate_live_codex_certification_quiescence(
+                    parsed,
+                    root=root,
+                )
+            )
         expected_governance = (
             "authoritative-v6"
             if database["user_version"] == 6
@@ -4238,6 +4399,41 @@ def run_preflight(
                 else False
             ),
         )
+        if parsed.get("codex_disabled_for_certification") is True:
+            result["codex_certification_quiescence_final"] = (
+                _validate_live_codex_certification_quiescence(
+                    parsed,
+                    root=root,
+                )
+            )
+        final_processes = collect_process_inventory(ps_bin=ps_bin)
+        final_launch_agents = collect_launchagent_inventory(
+            launchctl_bin=launchctl_bin,
+            labels=labels,
+        )
+        final_quiescence_loaded = [
+            category
+            for category, snapshot in final_launch_agents.items()
+            if snapshot.get("loaded") is True
+        ]
+        final_quiescence_blockers = launchagent_quiescence_blockers(
+            final_launch_agents
+        )
+        result["final_quiescence"] = {
+            "process_findings": [item.to_wire() for item in final_processes],
+            "process_findings_truncated": (
+                len(final_processes) >= MAX_PROCESS_FINDINGS
+            ),
+            "launch_agents": final_launch_agents,
+            "loaded_categories": final_quiescence_loaded,
+            "policy_blockers": final_quiescence_blockers,
+        }
+        if require_quiescent and (
+            final_processes or final_quiescence_blockers
+        ):
+            raise CutoverPreflightError(
+                "local writers or respawners appeared during final cutover verification"
+            )
         if attestation_request is not None:
             result["cutover_attestation"] = publish_cutover_attestation(
                 request=attestation_request,

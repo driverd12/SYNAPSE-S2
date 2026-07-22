@@ -486,6 +486,99 @@ command = "node"
         self.assertNotIn("/old/synapse-s2-mcp", merged)
         self.assertNotIn("old-agent", merged)
 
+    def test_codex_certification_profile_keeps_definition_but_disables_respawn(self):
+        with TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "SYNAPSE-S2"
+            launcher = Path(tmp) / "bin" / "synapse-s2-mcp"
+            server = client_config.build_server_definition(
+                repo_root=repo_root,
+                launcher_path=launcher,
+                client_agent_id="codex-desktop",
+            )
+            merged = client_config.merge_codex_config_text(
+                'model = "gpt-5.5"\n',
+                server=server,
+                enabled=False,
+            )
+
+        server_block = merged.split("[mcp_servers.synapse-s2.env]", 1)[0]
+        self.assertIn("[mcp_servers.synapse-s2]", server_block)
+        self.assertIn(str(launcher), server_block)
+        self.assertIn("enabled = false", server_block)
+        self.assertNotIn("enabled = true", server_block)
+
+    def test_install_reports_codex_certification_activation_profile(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            repo_root = Path(tmp) / "SYNAPSE-S2"
+            launcher = home / ".local" / "bin" / "synapse-s2-mcp"
+
+            result = client_config.install_client_configs(
+                home=home,
+                repo_root=repo_root,
+                launcher_path=launcher,
+                dry_run=True,
+                codex_enabled=False,
+            )
+
+        self.assertFalse(result["codex_mcp_enabled"])
+        self.assertEqual(
+            result["activation_profile"],
+            "certification-quiescence",
+        )
+        self.assertTrue(result["clients"]["codex"]["would_change"])
+
+    def test_certification_profile_publication_is_idempotent_and_restorable(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            repo_root = root / "SYNAPSE-S2"
+            home.mkdir(mode=0o700)
+            repo_root.mkdir(mode=0o700)
+            launcher = home / ".local" / "bin" / "synapse-s2-mcp"
+
+            first = client_config.install_client_configs(
+                home=home,
+                repo_root=repo_root,
+                launcher_path=launcher,
+                codex_enabled=False,
+            )
+            second = client_config.install_client_configs(
+                home=home,
+                repo_root=repo_root,
+                launcher_path=launcher,
+                codex_enabled=False,
+            )
+            restored = client_config.install_client_configs(
+                home=home,
+                repo_root=repo_root,
+                launcher_path=launcher,
+                codex_enabled=True,
+            )
+            codex = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+
+        self.assertTrue(first["clients"]["codex"]["changed"])
+        self.assertFalse(second["restart_required"])
+        self.assertFalse(second["clients"]["codex"]["would_change"])
+        self.assertTrue(restored["clients"]["codex"]["changed"])
+        self.assertTrue(restored["codex_mcp_enabled"])
+        self.assertEqual(restored["activation_profile"], "operational")
+        self.assertEqual(codex.count("[mcp_servers.synapse-s2]"), 1)
+        self.assertIn("enabled = true", codex)
+        self.assertNotIn("enabled = false", codex)
+
+    def test_install_rejects_non_boolean_codex_activation_before_io(self):
+        with TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            TypeError,
+            "codex_enabled must be a boolean",
+        ):
+            client_config.install_client_configs(
+                home=Path(tmp) / "missing-home",
+                repo_root=Path(tmp) / "missing-repo",
+                launcher_path=Path(tmp) / "missing-launcher",
+                codex_enabled=1,
+            )
+
     def test_install_refuses_to_overwrite_malformed_existing_json(self):
         with TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -643,6 +736,61 @@ command = "node"
             self.assertIn("synapse-s2", project["mcpServers"])
             self.assertTrue(result["clients"]["project_mcp"]["changed"])
             self.assertFalse(journal.exists())
+            self.assertTrue(backup.exists())
+
+    def test_dry_run_fails_closed_when_publication_recovery_is_pending(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "home"
+            repo = root / "repo"
+            home.mkdir(mode=0o700)
+            repo.mkdir(mode=0o700)
+            target = repo / ".mcp.json"
+            target.write_text('{"prior":"project"}\n', encoding="utf-8")
+            target.chmod(0o600)
+            original = target.read_bytes()
+            desired = b'{"desired":"disabled-profile"}\n'
+            backup = client_config._create_exclusive_private_backup(target)
+            temporary = client_config._stage_private_payload(target, desired)
+            journal = (
+                repo
+                / ".synapse_s2"
+                / "client-config-publication.journal.json"
+            )
+            client_config._write_publication_journal(
+                journal,
+                {
+                    "schema": client_config.PUBLICATION_SCHEMA,
+                    "state": "prepared",
+                    "entries": [
+                        {
+                            "client": "project_mcp",
+                            "target": str(target),
+                            "original_exists": True,
+                            "original_sha256": hashlib.sha256(original).hexdigest(),
+                            "desired_sha256": hashlib.sha256(desired).hexdigest(),
+                            "backup_path": str(backup),
+                            "temp_path": str(temporary),
+                        }
+                    ],
+                },
+            )
+            os.replace(temporary, target)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "publication recovery is required before dry-run",
+            ):
+                client_config.install_client_configs(
+                    home=home,
+                    repo_root=repo,
+                    launcher_path=home / ".local" / "bin" / "synapse-s2-mcp",
+                    dry_run=True,
+                    codex_enabled=False,
+                )
+
+            self.assertEqual(target.read_bytes(), desired)
+            self.assertTrue(journal.exists())
             self.assertTrue(backup.exists())
 
     def test_hardlinked_client_config_and_lock_are_rejected(self):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from redaction import (
     safe_public_error,
     strip_untrusted_raw_digest_fields,
 )
+from client_config import CLIENT_CONFIG_PLAN_SCHEMA
 from backend_router import database_requires_core
 from core_authority import CoreAuthorityLease
 from core_service import _manifest_build_id
@@ -166,6 +168,17 @@ def validate_run_id(value: Any) -> str:
             "readiness run_id must be one safe basename component"
         )
     return raw
+
+
+def readiness_recall_marker(run_id: str) -> str:
+    """Return one non-secret, token-stable marker unique to a readiness run."""
+
+    safe_run_id = validate_run_id(run_id)
+    digest = hashlib.sha256(safe_run_id.encode("utf-8")).hexdigest()[:24]
+    alphabetic_digest = digest.translate(
+        str.maketrans("0123456789abcdef", "abcdefghijklmnop")
+    )
+    return f"synapseproof{alphabetic_digest}"
 
 
 def validate_evidence_path(value: Any, *, field: str) -> Path:
@@ -1296,6 +1309,7 @@ class OperatorReadinessCertifier:
             args.run_id
             or f"operator-readiness-{time.strftime('%Y%m%d-%H%M%S')}"
         )
+        self.recall_marker = readiness_recall_marker(self.run_id)
         self.output_root = validate_evidence_path(
             args.output_dir,
             field="readiness output_dir",
@@ -1327,6 +1341,9 @@ class OperatorReadinessCertifier:
         )
         self.args.repair_delivery_publication_after_handoff = bool(
             getattr(args, "repair_delivery_publication_after_handoff", False)
+        )
+        self.args.codex_disabled_for_certification = bool(
+            getattr(args, "codex_disabled_for_certification", False)
         )
         if (
             self.args.repair_delivery_publication_after_handoff
@@ -1363,6 +1380,13 @@ class OperatorReadinessCertifier:
             if self.core_binding_path is not None
             else None
         )
+        if (
+            self.args.codex_disabled_for_certification
+            and self.core_binding is None
+        ):
+            raise ValueError(
+                "Codex certification quiescence requires a reviewed core binding"
+            )
         if self.core_binding is None:
             self.candidate_config = build_candidate_core_config(self.core_paths)
         else:
@@ -1694,6 +1718,9 @@ class OperatorReadinessCertifier:
             "delivery_publication_repair_requested": bool(
                 self.args.repair_delivery_publication_after_handoff
             ),
+            "codex_disabled_for_certification": bool(
+                self.args.codex_disabled_for_certification
+            ),
             "embedding_provider": config.embedding_provider_name,
             "topology": {
                 "dimension": config.dimension,
@@ -1715,6 +1742,31 @@ class OperatorReadinessCertifier:
                 "candidate_config_fingerprint": config.fingerprint,
                 "binding_digest": (
                     self.core_binding.digest
+                    if self.core_binding is not None
+                    else None
+                ),
+                "binding_path": (
+                    str(self.core_binding_path)
+                    if self.core_binding_path is not None
+                    else None
+                ),
+                "binding_config_digest": (
+                    self.core_binding.config_digest
+                    if self.core_binding is not None
+                    else None
+                ),
+                "binding_config_fingerprint": (
+                    self.core_binding.config_fingerprint
+                    if self.core_binding is not None
+                    else None
+                ),
+                "binding_embedding_space_identity": (
+                    self.core_binding.embedding_space_identity
+                    if self.core_binding is not None
+                    else None
+                ),
+                "binding_authority_mode": (
+                    self.core_binding.authority_mode
                     if self.core_binding is not None
                     else None
                 ),
@@ -2008,6 +2060,29 @@ class OperatorReadinessCertifier:
         )
 
     def _check_client_config(self) -> None:
+        expected_codex_enabled = not self.args.codex_disabled_for_certification
+        expected_clients = {
+            "project_mcp",
+            "claude_desktop",
+            "claude_code",
+            "codex",
+        }
+        expected_core_binding = (
+            None
+            if self.core_binding is None
+            else {
+                "path": str(self.core_binding_path),
+                "digest": self.core_binding.digest,
+                "authority_mode": self.core_binding.authority_mode,
+                "config_path": str(self.core_binding.config_path),
+                "config_digest": self.core_binding.config_digest,
+                "config_fingerprint": self.core_binding.config_fingerprint,
+                "embedding_space_identity": (
+                    self.core_binding.embedding_space_identity
+                ),
+            }
+        )
+
         def evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0 or not isinstance(parsed, dict):
                 return (
@@ -2016,8 +2091,53 @@ class OperatorReadinessCertifier:
                     "Run scripts/install_client_configs.py and inspect unreadable config files.",
                     {},
                 )
-            clients = dict(parsed.get("clients") or {})
-            restart_required = bool(parsed.get("restart_required"))
+            clients = parsed.get("clients")
+            if (
+                parsed.get("schema") != CLIENT_CONFIG_PLAN_SCHEMA
+                or parsed.get("repo_root") != str(ROOT)
+                or parsed.get("launcher_path") != str(self.launcher)
+                or parsed.get("publication_recovery_required") is not False
+                or parsed.get("core_binding") != expected_core_binding
+                or type(parsed.get("restart_required")) is not bool
+                or parsed.get("restart_required") is not False
+                or not isinstance(clients, dict)
+                or set(clients) != expected_clients
+                or any(
+                    not isinstance(payload, dict)
+                    or type(payload.get("would_change")) is not bool
+                    or type(payload.get("changed")) is not bool
+                    for payload in clients.values()
+                )
+            ):
+                return (
+                    "blocked",
+                    "Client config dry-run returned an incomplete or malformed plan contract.",
+                    "Run the reviewed client-config installer and inspect every target result.",
+                    {},
+                )
+            restart_required = parsed["restart_required"]
+            observed_codex_enabled = parsed.get("codex_mcp_enabled")
+            observed_profile = str(parsed.get("activation_profile") or "")
+            expected_profile = (
+                "operational"
+                if expected_codex_enabled
+                else "certification-quiescence"
+            )
+            if (
+                observed_codex_enabled is not expected_codex_enabled
+                or observed_profile != expected_profile
+            ):
+                return (
+                    "blocked",
+                    "Client config dry-run returned the wrong Codex activation profile.",
+                    "Re-run the reviewed client-config installer with the matching certification mode.",
+                    {
+                        "expected_codex_mcp_enabled": expected_codex_enabled,
+                        "observed_codex_mcp_enabled": observed_codex_enabled,
+                        "expected_activation_profile": expected_profile,
+                        "observed_activation_profile": observed_profile,
+                    },
+                )
             changed = [
                 name
                 for name, payload in clients.items()
@@ -2025,20 +2145,39 @@ class OperatorReadinessCertifier:
             ]
             status = "degraded" if restart_required or changed else "ready"
             repair = "Run scripts/install_client_configs.py, then restart affected clients." if changed else ""
+            activation_detail = (
+                "Codex enabled for operation"
+                if expected_codex_enabled
+                else "Codex definition present but disabled for exclusive certification"
+            )
             return (
                 status,
-                f"{len(clients)} client config targets checked; pending changes: {', '.join(changed) or 'none'}.",
+                f"{len(clients)} client config targets checked; {activation_detail}; "
+                f"pending changes: {', '.join(changed) or 'none'}.",
                 repair,
-                {"client_count": len(clients), "pending_changes": changed},
+                {
+                    "client_count": len(clients),
+                    "pending_changes": changed,
+                    "codex_mcp_enabled": observed_codex_enabled,
+                    "activation_profile": observed_profile,
+                    "repo_root": str(parsed["repo_root"]),
+                    "launcher_path": str(parsed["launcher_path"]),
+                    "publication_recovery_required": False,
+                    "core_binding": parsed["core_binding"],
+                },
             )
 
         command = [
             self.python,
             str(ROOT / "scripts" / "install_client_configs.py"),
             "--dry-run",
+            "--launcher",
+            str(self.launcher),
         ]
         if self.core_binding_path is not None:
             command.extend(["--core-binding", str(self.core_binding_path)])
+        if self.args.codex_disabled_for_certification:
+            command.append("--codex-disabled-for-certification")
         self._run_command(
             "client_config",
             label="Client config dry-run",
@@ -2536,11 +2675,7 @@ class OperatorReadinessCertifier:
     def _check_memory_write(self) -> dict[str, Any]:
         tag = safe_filename(f"{self.run_id}-memory-write")
         git_head = self.metadata.get("git", {}).get("head", "")
-        text = (
-            f"Readiness certification {self.run_id}: real memory write proof for SYNAPSE-S2 "
-            f"context {self.context} on commit {git_head}. This is an operator evidence trace, "
-            "not a sample dataset or demo seed."
-        )
+        text = f"SYNAPSE readiness retrieval proof marker {self.recall_marker}"
 
         def evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0 or not isinstance(parsed, dict):
@@ -2566,6 +2701,7 @@ class OperatorReadinessCertifier:
                     "memory_id": memory_id,
                     "tag": parsed.get("tag"),
                     "spike_count": parsed.get("spike_count"),
+                    "recall_marker": self.recall_marker,
                 },
             )
 
@@ -2587,6 +2723,7 @@ class OperatorReadinessCertifier:
                         "run_id": self.run_id,
                         "git_head": git_head,
                         "operator_evidence": True,
+                        "readiness_recall_marker": self.recall_marker,
                     },
                     sort_keys=True,
                 ),
@@ -2595,15 +2732,25 @@ class OperatorReadinessCertifier:
             timeout=90,
             evaluator=evaluate,
         )
-        return result.parsed if isinstance(result.parsed, dict) else {"tag": tag, "text": text}
+        memory = (
+            dict(result.parsed)
+            if isinstance(result.parsed, dict)
+            else {"tag": tag, "text": text}
+        )
+        memory["readiness_recall_marker"] = self.recall_marker
+        memory["readiness_recall_query"] = text
+        return memory
 
     def _check_recall(self, memory: dict[str, Any]) -> None:
-        expected = [
-            str(memory.get("memory_id") or ""),
-            str(memory.get("tag") or ""),
-            self.run_id,
-        ]
-        query = f"readiness certification {self.run_id} real memory write proof"
+        expected_memory_id = str(memory.get("memory_id") or "")
+        expected_tag = str(memory.get("tag") or "")
+        expected_marker = str(
+            memory.get("readiness_recall_marker") or self.recall_marker
+        )
+        query = str(
+            memory.get("readiness_recall_query")
+            or f"SYNAPSE readiness retrieval proof marker {expected_marker}"
+        )
 
         def evaluate(returncode: int, parsed: Any, stdout: str, stderr: str):
             if returncode != 0 or not isinstance(parsed, dict):
@@ -2642,32 +2789,50 @@ class OperatorReadinessCertifier:
                     "Inspect retrieve-v2, its authoritative core route, and token contract projection.",
                     {},
                 )
-            evidence_fields: list[str] = []
-            for item in items:
+            matched_item: dict[str, Any] | None = None
+            matched_rank: int | None = None
+            for rank, item in enumerate(items, start=1):
                 if not isinstance(item, dict):
                     continue
-                evidence_fields.extend(
+                evidence_fields = [
                     str(item.get(field) or "")
                     for field in ("memory_id", "tag", "label", "summary", "excerpt")
+                ]
+                identity_match = (
+                    bool(expected_memory_id)
+                    and str(item.get("memory_id") or "") == expected_memory_id
+                    and bool(expected_tag)
+                    and str(item.get("tag") or "") == expected_tag
                 )
-            matched = [
-                value
-                for value in expected
-                if value and any(value in field for field in evidence_fields)
-            ]
-            if not matched:
+                marker_match = (
+                    bool(expected_marker)
+                    and any(expected_marker in field for field in evidence_fields)
+                )
+                if identity_match and marker_match:
+                    matched_item = item
+                    matched_rank = rank
+                    break
+            if matched_item is None:
                 return (
                     "blocked",
-                    "Recall returned but did not include the readiness memory id, tag, or run id.",
+                    "Recall did not return the exact readiness write with its unique marker.",
                     "Inspect retrieve-v2 output, scope provenance, and memory index consistency.",
-                    {"expected": [item for item in expected if item]},
+                    {
+                        "expected_memory_id": expected_memory_id,
+                        "expected_tag": expected_tag,
+                        "expected_recall_marker": expected_marker,
+                    },
                 )
             return (
                 "ready",
-                f"Retrieval v2 returned the readiness write using {', '.join(matched[:2])}.",
+                "Retrieval v2 returned the exact readiness write and unique marker "
+                f"at rank {matched_rank}.",
                 "",
                 {
-                    "matched_evidence": matched,
+                    "matched_memory_id": str(matched_item.get("memory_id") or ""),
+                    "matched_tag": str(matched_item.get("tag") or ""),
+                    "matched_recall_marker": expected_marker,
+                    "matched_rank": matched_rank,
                     "result_count": len(items),
                     "ranker_id": ranker.get("id"),
                     "ranker_version": ranker.get("version"),
@@ -2687,6 +2852,7 @@ class OperatorReadinessCertifier:
                 query,
                 "--scope",
                 "local",
+                "--no-include-graph-neighbors",
                 "--result-limit",
                 "8",
                 "--candidate-limit",
@@ -4454,6 +4620,8 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         command.append("--handoff-running-core")
     if manifest.get("delivery_publication_repair_requested") is True:
         command.append("--repair-delivery-publication-after-handoff")
+    if manifest.get("codex_disabled_for_certification") is True:
+        command.append("--codex-disabled-for-certification")
     lines = [
         "# Operator Readiness Runbook",
         "",
@@ -4467,7 +4635,7 @@ def render_runbook_markdown(manifest: dict[str, Any]) -> str:
         "",
         "Required proof gates:",
         "",
-        "- Client configs dry-run without pending changes.",
+        "- Client configs dry-run without pending changes; when requested, the exact Codex definition remains present with `enabled=false` until production publication completes.",
         "- FastMCP connects to the installed local launcher and lists SYNAPSE-S2 tools.",
         "- The installed launcher returns the compact MCP contract within the separate 12,288-byte structured and 4,096-byte safety-channel ceilings.",
         "- The exact candidate core configuration is embedded in the manifest and its provider produces a non-empty local vector; `mlx-neural` must match every pinned model setting and report native MLX.",
@@ -4525,6 +4693,14 @@ def build_parser() -> argparse.ArgumentParser:
             "after the explicit exact-core handoff, delegate only the exact "
             "revision-bound target-highwater and receipt-derived cursor repair "
             "to the locked installer maintenance lane"
+        ),
+    )
+    parser.add_argument(
+        "--codex-disabled-for-certification",
+        action="store_true",
+        help=(
+            "require the exact Codex SYNAPSE-S2 definition to remain configured "
+            "with enabled=false during the exclusive handoff and recovery proof"
         ),
     )
     parser.add_argument(

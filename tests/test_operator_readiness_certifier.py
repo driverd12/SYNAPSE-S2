@@ -17,6 +17,7 @@ from core_client_binding import (
     binding_for_config,
     write_core_client_binding,
 )
+from client_config import CLIENT_CONFIG_PLAN_SCHEMA
 from core_authority import CoreAuthorityLease
 from core_service import CoreConfig, write_core_config
 from capture_daemon import CaptureInboxDaemon
@@ -43,6 +44,7 @@ from scripts.operator_readiness_certify import (
     json_safe,
     mcp_compact_contract_probe_status,
     read_private_regular_bytes,
+    readiness_recall_marker,
     render_runbook_markdown,
     render_summary_markdown,
     runtime_status_from_mcp_envelope,
@@ -650,6 +652,101 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             str(binding_path),
         )
 
+    def test_client_config_probe_requires_exact_disabled_codex_profile(self):
+        with TemporaryDirectory() as tmp:
+            certifier, binding, _ = self._bound_certifier(
+                Path(tmp),
+                authority_mode="authoritative-core-v6",
+                handoff_running_core=True,
+                codex_disabled_for_certification=True,
+            )
+            with mock.patch.object(certifier, "_run_command") as run_command:
+                certifier._check_client_config()
+
+        call = run_command.call_args
+        self.assertIn("--codex-disabled-for-certification", call.kwargs["command"])
+        self.assertEqual(
+            call.kwargs["command"][
+                call.kwargs["command"].index("--launcher") + 1
+            ],
+            str(certifier.launcher),
+        )
+        evaluator = call.kwargs["evaluator"]
+        parsed = {
+            "schema": CLIENT_CONFIG_PLAN_SCHEMA,
+            "codex_mcp_enabled": False,
+            "activation_profile": "certification-quiescence",
+            "repo_root": str(Path(__file__).resolve().parents[1]),
+            "launcher_path": str(certifier.launcher),
+            "publication_recovery_required": False,
+            "core_binding": {
+                "path": str(certifier.core_binding_path),
+                "digest": binding.digest,
+                "authority_mode": binding.authority_mode,
+                "config_path": str(binding.config_path),
+                "config_digest": binding.config_digest,
+                "config_fingerprint": binding.config_fingerprint,
+                "embedding_space_identity": binding.embedding_space_identity,
+            },
+            "restart_required": False,
+            "clients": {
+                name: {"would_change": False, "changed": False}
+                for name in ("project_mcp", "claude_desktop", "claude_code", "codex")
+            },
+        }
+        ready = evaluator(0, parsed, "", "")
+        wrong = evaluator(
+            0,
+            {**parsed, "codex_mcp_enabled": True, "activation_profile": "operational"},
+            "",
+            "",
+        )
+        drifted_binding = copy.deepcopy(parsed)
+        drifted_binding["core_binding"]["digest"] = "0" * 64
+        drifted = evaluator(0, drifted_binding, "", "")
+        self.assertEqual(ready[0], "ready")
+        self.assertFalse(ready[3]["codex_mcp_enabled"])
+        self.assertEqual(ready[3]["core_binding"]["digest"], binding.digest)
+        self.assertEqual(wrong[0], "blocked")
+        self.assertEqual(drifted[0], "blocked")
+
+    def test_codex_certification_profile_supports_bound_first_cutover(self):
+        with TemporaryDirectory() as tmp:
+            certifier, binding, _ = self._bound_certifier(
+                Path(tmp),
+                authority_mode="candidate-local-v5",
+                codex_disabled_for_certification=True,
+                handoff_running_core=False,
+            )
+
+        self.assertTrue(certifier.args.codex_disabled_for_certification)
+        self.assertFalse(certifier.args.handoff_running_core)
+        self.assertEqual(certifier.core_binding.digest, binding.digest)
+
+    def test_codex_certification_profile_requires_reviewed_binding(self):
+        with TemporaryDirectory() as tmp, mock.patch(
+            "scripts.operator_readiness_certify.default_binding_path",
+            return_value=Path(tmp) / "missing-core-binding.json",
+        ), self.assertRaisesRegex(
+            ValueError,
+            "requires a reviewed core binding",
+        ):
+            OperatorReadinessCertifier(
+                self._args(
+                    Path(tmp),
+                    codex_disabled_for_certification=True,
+                )
+            )
+
+    def test_readiness_recall_marker_is_deterministic_unique_and_alphabetic(self):
+        first = readiness_recall_marker("operator-readiness-unit-test")
+        repeated = readiness_recall_marker("operator-readiness-unit-test")
+        different = readiness_recall_marker("operator-readiness-unit-test-2")
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, different)
+        self.assertRegex(first, r"^synapseproof[a-p]{24}$")
+
     def test_parser_defaults_follow_candidate_config_without_parallel_defaults(self):
         with TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=True):
             args = build_parser().parse_args(
@@ -1188,6 +1285,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             memory = {
                 "memory_id": "s2mem_readiness_fixture",
                 "tag": "operator-readiness-unit-test-memory-write",
+                "readiness_recall_marker": certifier.recall_marker,
             }
             with mock.patch.object(certifier, "_run_command") as run_command:
                 certifier._check_recall(memory)
@@ -1197,6 +1295,11 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         evaluator = call.kwargs["evaluator"]
         self.assertIn("retrieve-v2", command)
         self.assertNotIn("query-text", command)
+        self.assertIn("--no-include-graph-neighbors", command)
+        self.assertEqual(
+            command[command.index("--prompt") + 1],
+            f"SYNAPSE readiness retrieval proof marker {certifier.recall_marker}",
+        )
         self.assertEqual(command[command.index("--scope") + 1], "local")
         self.assertEqual(command[command.index("--response-mode") + 1], "compact")
 
@@ -1220,7 +1323,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     {
                         "memory_id": memory["memory_id"],
                         "tag": memory["tag"],
-                        "label": "readiness proof",
+                        "label": f"readiness proof {certifier.recall_marker}",
                         "summary": "operator-readiness-unit-test",
                         "excerpt": "bounded evidence",
                     }
@@ -1239,8 +1342,41 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         blocked = evaluator(0, invalid, "", "")
 
         self.assertEqual(ready[0], "ready")
-        self.assertIn(memory["memory_id"], ready[3]["matched_evidence"])
+        self.assertEqual(memory["memory_id"], ready[3]["matched_memory_id"])
+        self.assertEqual(certifier.recall_marker, ready[3]["matched_recall_marker"])
         self.assertEqual(blocked[0], "blocked")
+
+        crowded = copy.deepcopy(valid)
+        crowded["data"]["items"] = [
+            {
+                "memory_id": "s2mem_historical_fixture",
+                "tag": "operator-readiness-old-memory-write",
+                "label": "readiness proof",
+                "summary": "generic historical certification trace",
+                "excerpt": "real memory write proof",
+            }
+        ]
+        missing_exact_write = evaluator(0, crowded, "", "")
+        self.assertEqual(missing_exact_write[0], "blocked")
+        self.assertEqual(
+            missing_exact_write[3]["expected_recall_marker"],
+            certifier.recall_marker,
+        )
+
+        split_evidence = copy.deepcopy(valid)
+        split_evidence["data"]["items"] = [
+            {
+                "memory_id": memory["memory_id"],
+                "tag": memory["tag"],
+                "label": "exact identity without marker",
+            },
+            {
+                "memory_id": "s2mem_wrong_identity",
+                "tag": "wrong-tag",
+                "label": certifier.recall_marker,
+            },
+        ]
+        self.assertEqual(evaluator(0, split_evidence, "", "")[0], "blocked")
 
     def test_installed_launcher_status_attests_bound_config_and_embedding_identity(self):
         with TemporaryDirectory() as tmp:
