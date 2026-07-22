@@ -31,6 +31,7 @@ from core_client import (
     CoreOutcomeUnknown,
     CoreRemoteError,
     CoreUnavailable,
+    _CorePreconnectUnavailable,
     outcome_unknown_projection,
 )
 from core_protocol import (
@@ -1815,6 +1816,54 @@ class CoreClientMutationTransportTests(unittest.TestCase):
             client = self.private_client(Path(temporary))
             with self.assertRaises(CoreUnavailable):
                 client.set_enabled(True)
+
+    def test_mutation_preconnect_failure_retries_same_request_once(self) -> None:
+        with TemporaryDirectory() as temporary:
+            client = self.private_client(Path(temporary))
+            observed_request_ids: list[str] = []
+
+            def fail_then_respond(
+                request: dict[str, object],
+                *,
+                timeout_seconds: float,
+            ) -> dict[str, object]:
+                _ = timeout_seconds
+                observed_request_ids.append(str(request["request_id"]))
+                if len(observed_request_ids) == 1:
+                    raise _CorePreconnectUnavailable()
+                return {
+                    "protocol_version": "synapse-core.v1",
+                    "request_id": request["request_id"],
+                    "caller": request["caller"],
+                    "operation": request["operation"],
+                    "request_fingerprint": request["request_fingerprint"],
+                    "operation_sequence": 1,
+                    "server_time_unix_ms": int(time.time() * 1000),
+                    "identity": {
+                        "authority_id": "core-test",
+                        "neural_epoch": "epoch-1",
+                        "config_fingerprint": "a" * 64,
+                        "build_id": "build-test",
+                        "store_identity": "store-test",
+                        "schema_identity": "sqlite-test-v6",
+                    },
+                    "ok": True,
+                    "result": {"effective_enabled": True},
+                    "error": None,
+                }
+
+            client._exchange = fail_then_respond  # type: ignore[method-assign]
+            result = client.call(
+                "set_enabled",
+                {"enabled": True},
+                request_id="req-preconnect-retry",
+            )
+
+        self.assertTrue(result["effective_enabled"])
+        self.assertEqual(
+            observed_request_ids,
+            ["req-preconnect-retry", "req-preconnect-retry"],
+        )
 
     def test_mutation_disconnect_after_send_is_outcome_unknown(self) -> None:
         with TemporaryDirectory() as temporary:

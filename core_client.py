@@ -44,6 +44,10 @@ class CoreUnavailable(RuntimeError):
         self.code = "service_unavailable"
 
 
+class _CorePreconnectUnavailable(CoreUnavailable):
+    """Internal proof that no request bytes could have reached the core."""
+
+
 class CoreOutcomeUnknown(RuntimeError):
     """A mutation may have reached the core; automatic replay is forbidden."""
 
@@ -264,7 +268,13 @@ class CoreClient:
             authentication_key=authentication_key,
             expected_config_fingerprint=self.expected_config_fingerprint,
         )
-        attempts = 2 if operation in SAFE_READ_OPERATIONS else 1
+        # Every request receives one retry only after the explicit internal
+        # proof that the Unix-socket connection was never established.
+        # ``_exchange`` converts every post-connect send/receive uncertainty
+        # into ``CoreOutcomeUnknown``. Reusing the same signed request and
+        # request id here therefore closes transient launchd/backlog races
+        # without weakening the no-replay mutation contract.
+        attempts = 2
         last_error: BaseException | None = None
         for _attempt in range(attempts):
             remaining = (deadline_unix_ms / 1000.0) - time.time()
@@ -273,6 +283,9 @@ class CoreClient:
             try:
                 response = self._exchange(request, timeout_seconds=remaining)
                 validated = validate_response(response, expected_request=request)
+            except _CorePreconnectUnavailable as exc:
+                last_error = exc
+                continue
             except CoreOutcomeUnknown as exc:
                 last_error = exc
                 if contract.mutation:
@@ -289,6 +302,8 @@ class CoreClient:
                 continue
             except (CoreTransportError, CoreUnavailable, OSError, TimeoutError) as exc:
                 last_error = exc
+                if contract.mutation:
+                    raise CoreUnavailable() from exc
                 continue
             identity = dict(validated["identity"])
             if (
@@ -327,7 +342,10 @@ class CoreClient:
         *,
         timeout_seconds: float,
     ) -> Any:
-        validate_private_socket(self.socket_path)
+        try:
+            validate_private_socket(self.socket_path)
+        except CoreTransportError as exc:
+            raise _CorePreconnectUnavailable() from exc
         try:
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.settimeout(max(0.01, timeout_seconds))
@@ -337,7 +355,7 @@ class CoreClient:
                 connection.close()
             except (NameError, OSError):
                 pass
-            raise CoreUnavailable() from exc
+            raise _CorePreconnectUnavailable() from exc
         try:
             send_frame(
                 connection,
