@@ -2538,7 +2538,157 @@ def context_delivery_integrity(
                 lease.close()
 
 
+def replacement_capture_freeze_ttl_seconds(wait_seconds: float) -> float:
+    """Keep producers out of the signed inbox across proof and activation."""
+
+    if (
+        not isinstance(wait_seconds, (int, float))
+        or isinstance(wait_seconds, bool)
+        or not math.isfinite(float(wait_seconds))
+        or float(wait_seconds) <= 0.0
+    ):
+        raise CoreInstallerError("replacement activation wait is invalid")
+    return min(
+        7_200.0,
+        max(
+            3_600.0,
+            (3.0 * float(wait_seconds)) + 1_800.0,
+        ),
+    )
+
+
 def stage_replacement(
+    *,
+    paths: InstallPaths,
+    label: str,
+    launchctl: LaunchCtl,
+    wait_seconds: float,
+    maximum_evidence_age_seconds: float,
+    confirm: bool,
+    expected_revision: str | None,
+) -> dict[str, Any]:
+    """Freeze late producers around the exact signed replacement lane."""
+
+    if confirm is not True:
+        raise CoreInstallerError("replacement staging requires --confirm")
+    reviewed_revision = str(expected_revision or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", reviewed_revision) is None:
+        raise CoreInstallerError(
+            "replacement staging requires one exact reviewed delivery revision"
+        )
+    initial_service = launchctl.snapshot()
+    initial_disabled = launchctl.disabled()
+    if (
+        initial_service.get("loaded")
+        or initial_service.get("running")
+        or not initial_disabled
+    ):
+        raise CoreInstallerError(
+            "replacement staging requires the exact core LaunchAgent to be "
+            "disabled and unloaded"
+        )
+
+    from capture_daemon import (
+        begin_capture_replacement_freeze,
+        release_capture_replacement_freeze,
+    )
+
+    freeze = begin_capture_replacement_freeze(
+        root=paths.capture_root,
+        ttl_seconds=replacement_capture_freeze_ttl_seconds(wait_seconds),
+    )
+    freeze_released = False
+    try:
+        result = _stage_replacement_frozen(
+            paths=paths,
+            label=label,
+            launchctl=launchctl,
+            wait_seconds=wait_seconds,
+            maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+            confirm=confirm,
+            expected_revision=expected_revision,
+        )
+        thaw = release_capture_replacement_freeze(
+            root=paths.capture_root,
+            freeze_id=str(freeze["freeze_id"]),
+            require_main_queue_empty=True,
+        )
+        freeze_released = True
+        late_file_count = int(thaw["deferred_file_count"])
+        updated = {
+            **result,
+            "recovered_preexisting_deferred_file_count": int(
+                freeze.get("recovered_deferred_count") or 0
+            ),
+            "drained_late_arrival_file_count": late_file_count,
+        }
+        if late_file_count:
+            baseline = thaw.get("baseline_status")
+            if not isinstance(baseline, Mapping):
+                raise CoreInstallerError(
+                    "replacement late-arrival baseline is invalid"
+                )
+            config = load_core_config(paths.config)
+            wait_for_replacement_capture_drain(
+                capture_root=paths.capture_root,
+                admitted_status=baseline,
+                admitted_pending_file_count=late_file_count,
+                admitted_receipt_backed_file_count=0,
+                wait_seconds=wait_seconds,
+            )
+            health = wait_for_health(
+                launchctl=launchctl,
+                config=config,
+                prior_pid=None,
+                wait_seconds=min(
+                    wait_seconds,
+                    REPLACEMENT_ACTIVATION_HEADROOM_SECONDS,
+                ),
+                expected_deployment_mode="replacement-certification",
+                require_capture_ready=True,
+            )
+            admission = result.get("admission")
+            certification_seconds_remaining = (
+                replacement_certification_seconds_remaining(
+                    admission if isinstance(admission, Mapping) else None
+                )
+            )
+            updated.update(health)
+            updated["certification_seconds_remaining"] = (
+                certification_seconds_remaining
+            )
+            updated["drained_pending_file_count"] = int(
+                result.get("drained_pending_file_count") or 0
+            ) + late_file_count
+        return updated
+    except BaseException as exc:
+        if not freeze_released:
+            try:
+                release_capture_replacement_freeze(
+                    root=paths.capture_root,
+                    freeze_id=str(freeze["freeze_id"]),
+                    require_main_queue_empty=False,
+                )
+                freeze_released = True
+            except Exception as release_error:
+                raise CoreInstallerError(
+                    "replacement capture freeze could not be safely released"
+                ) from release_error
+        snapshot = launchctl.snapshot()
+        if snapshot.get("loaded") or snapshot.get("running"):
+            cleanup_errors = verified_exact_label_cleanup(
+                launchctl=launchctl,
+                wait_seconds=wait_seconds,
+            )
+            if cleanup_errors:
+                raise CoreInstallerError(
+                    "replacement late-arrival handling failed and exact-label "
+                    "cleanup could not be verified"
+                ) from exc
+        raise
+
+
+def _stage_replacement_frozen(
     *,
     paths: InstallPaths,
     label: str,

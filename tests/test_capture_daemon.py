@@ -12,9 +12,12 @@ from unittest.mock import patch
 import capture_daemon
 from capture_daemon import (
     CAPTURE_ID_RE,
+    CAPTURE_DEFERRED_DIR_NAME,
     STALE_INBOX_TEMP_SECONDS,
     CaptureInboxDaemon,
+    begin_capture_replacement_freeze,
     redact_capture_text,
+    release_capture_replacement_freeze,
     write_capture_drop,
 )
 from mlx_backend import SpikingAttentionBackend
@@ -295,6 +298,102 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         self.assertEqual(backend.batch_entry_count, 1)
         self.assertEqual(backend.batch_exit_count, 1)
         self.assertEqual(backend.batch_observations, [True, True])
+
+    def test_replacement_freeze_defers_and_recovers_late_capture(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            freeze = begin_capture_replacement_freeze(
+                root=root,
+                ttl_seconds=600,
+            )
+            deferred_path = write_capture_drop(
+                root=root,
+                context_id="freeze-test",
+                source_tag="late-boundary",
+                speaker="codex",
+                text="A boundary arriving during signed recovery is durable.",
+                capture_id="s2cap_" + ("9" * 32),
+            )
+            self.assertEqual(
+                deferred_path.parent.resolve(),
+                (root / CAPTURE_DEFERRED_DIR_NAME).resolve(),
+            )
+            self.assertEqual(
+                list((root / "capture_inbox").iterdir()),
+                [],
+            )
+
+            thaw = release_capture_replacement_freeze(
+                root=root,
+                freeze_id=str(freeze["freeze_id"]),
+                require_main_queue_empty=True,
+            )
+            restored = root / "capture_inbox" / deferred_path.name
+            restored_exists = restored.is_file()
+            deferred_exists = deferred_path.exists()
+
+        self.assertTrue(thaw["released"])
+        self.assertEqual(thaw["deferred_file_count"], 1)
+        self.assertTrue(restored_exists)
+        self.assertFalse(deferred_exists)
+
+    def test_replacement_freeze_rejects_unsafe_deferred_payload(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            freeze = begin_capture_replacement_freeze(
+                root=root,
+                ttl_seconds=600,
+            )
+            unsafe = root / CAPTURE_DEFERRED_DIR_NAME / "unsafe.json"
+            unsafe.write_text("{}", encoding="utf-8")
+            unsafe.chmod(0o644)
+
+            with self.assertRaisesRegex(ValueError, "payload is unsafe"):
+                release_capture_replacement_freeze(
+                    root=root,
+                    freeze_id=str(freeze["freeze_id"]),
+                    require_main_queue_empty=True,
+                )
+
+    def test_expired_replacement_freeze_recovers_deferred_before_write(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            begin_capture_replacement_freeze(
+                root=root,
+                ttl_seconds=0.01,
+            )
+            deferred_path = write_capture_drop(
+                root=root,
+                context_id="freeze-test",
+                source_tag="late-boundary",
+                speaker="codex",
+                text="This record is initially deferred.",
+                capture_id="s2cap_" + ("7" * 32),
+            )
+            time.sleep(0.02)
+            current_path = write_capture_drop(
+                root=root,
+                context_id="freeze-test",
+                source_tag="post-expiry",
+                speaker="codex",
+                text="This record triggers safe deferred recovery.",
+                capture_id="s2cap_" + ("8" * 32),
+            )
+
+            inbox_names = sorted(
+                path.name for path in (root / "capture_inbox").iterdir()
+            )
+            freeze_path = (
+                root
+                / "capture_locks"
+                / capture_daemon.CAPTURE_REPLACEMENT_FREEZE_NAME
+            )
+
+        self.assertEqual(
+            inbox_names,
+            sorted((deferred_path.name, current_path.name)),
+        )
+        self.assertFalse(freeze_path.exists())
 
     def test_status_and_preflight_do_not_construct_mlx_backend(self):
         with TemporaryDirectory() as tmp:

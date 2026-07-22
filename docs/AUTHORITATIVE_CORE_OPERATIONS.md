@@ -400,16 +400,28 @@ changing permissions on an existing caller-owned directory.
    Staging permits at most one configured capture batch across the inbox and
    well-formed processing claims only when every temporary, malformed-claim,
    error, and reconciliation class is zero; that exact queued set is included
-   in the signed recovery bundle. The provisional core must drain the batch through
-   its governed exactly-once worker, and staging verifies a completely zero-debt
-   transport after stabilized health. The bounded drain permits only the
-   admitted files to move through a canonical processing claim and requires the
-   processed-archive and receipt totals to rise by that exact count. A partial
-   batch, malformed drop, error, unexpected new file, or remaining pending file
-   triggers the same verified exact-label cleanup and blocks certification.
+   in the signed recovery bundle. Before taking that recovery point, the
+   installer publishes an owner-only, time-bounded capture freeze under the
+   same global capture lock used by every producer. Session-boundary records
+   that arrive during proof or activation are atomically written to a private
+   deferred spool instead of changing the signed queue. The provisional core
+   must drain the admitted batch through its governed exactly-once worker, and
+   staging verifies a completely zero-debt main transport after stabilized
+   health. The bounded drain permits only the admitted files to move through a
+   canonical processing claim and requires the processed-archive and receipt
+   totals to rise by that exact count. The installer then atomically thaws the
+   deferred spool into the empty inbox and drains those late arrivals before
+   returning staged health. A partial batch, malformed drop, error, unexpected
+   file in the signed main queue, or remaining pending file triggers the same
+   verified exact-label cleanup and blocks certification.
    A queued capture that already has a matching transport receipt is also
    rejected before launch: its drain accounting is ambiguous until a governed
    reconciliation contract can prove the receipt, payload, and ledger together.
+   An interrupted freeze also fails recoverably: its bounded lease expires,
+   and the next producer moves every validated deferred payload back into the
+   normal inbox under the global lock before accepting the new drop. Unsafe
+   deferred files or directories fail closed and require operator repair; they
+   are never silently skipped or deleted.
    Candidate activation first proves the authority, socket, journal, and backend
    while allowing the admitted capture worker to report `ready: false` only
    during its first in-flight iteration. The installer then uses the separate

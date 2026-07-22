@@ -664,6 +664,108 @@ else:
         launch_log = (self.base / "launchctl.log").read_text(encoding="utf-8")
         self.assertIn(str(staged_plist), launch_log)
 
+    def test_stage_replacement_drains_capture_deferred_during_signed_proof(
+        self,
+    ) -> None:
+        environment = {
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+            "SYNAPSE_S2_TRANSCRIPT_POLL": "false",
+            "MLX_DEVICE": "cpu",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = installer.build_config(self.paths)
+        installer.write_core_config(self.paths.config, config)
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
+        admission = {
+            "receipt_digest": "e" * 64,
+            "expires_at_unix_ms": int(time.time() * 1000) + 600_000,
+        }
+        staged = {
+            "action": "stage-replacement",
+            "status": "staged-healthy",
+            "provisional": True,
+            "persistent": False,
+            "drained_pending_file_count": 3,
+            "certification_seconds_remaining": 500,
+            "admission": admission,
+        }
+        baseline = {
+            "processed_file_count": 10,
+            "receipt_count": 10,
+        }
+        with mock.patch(
+            "capture_daemon.begin_capture_replacement_freeze",
+            return_value={
+                "freeze_id": "s2freeze_" + ("a" * 32),
+                "recovered_deferred_count": 0,
+            },
+        ) as begin, mock.patch(
+            "capture_daemon.release_capture_replacement_freeze",
+            return_value={
+                "released": True,
+                "deferred_file_count": 1,
+                "baseline_status": baseline,
+            },
+        ) as release, mock.patch.object(
+            installer,
+            "_stage_replacement_frozen",
+            return_value=staged,
+        ), mock.patch.object(
+            installer,
+            "wait_for_replacement_capture_drain",
+        ) as drain, mock.patch.object(
+            installer,
+            "wait_for_health",
+            return_value={
+                **self._health(),
+                "deployment_mode": "replacement-certification",
+                "pid": 4242,
+            },
+        ) as health:
+            result = installer.stage_replacement(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2,
+                maximum_evidence_age_seconds=7200,
+                confirm=True,
+                expected_revision="a" * 64,
+            )
+
+        begin.assert_called_once_with(
+            root=self.paths.capture_root,
+            ttl_seconds=installer.replacement_capture_freeze_ttl_seconds(2),
+        )
+        release.assert_called_once_with(
+            root=self.paths.capture_root,
+            freeze_id="s2freeze_" + ("a" * 32),
+            require_main_queue_empty=True,
+        )
+        drain.assert_called_once_with(
+            capture_root=self.paths.capture_root,
+            admitted_status=baseline,
+            admitted_pending_file_count=1,
+            admitted_receipt_backed_file_count=0,
+            wait_seconds=2,
+        )
+        health.assert_called_once_with(
+            launchctl=mock.ANY,
+            config=config,
+            prior_pid=None,
+            wait_seconds=2,
+            expected_deployment_mode="replacement-certification",
+            require_capture_ready=True,
+        )
+        self.assertEqual(result["drained_pending_file_count"], 4)
+        self.assertEqual(result["drained_late_arrival_file_count"], 1)
+
     def test_stage_replacement_refuses_unreviewed_or_enabled_service(self) -> None:
         with self.assertRaisesRegex(installer.CoreInstallerError, "--confirm"):
             installer.stage_replacement(

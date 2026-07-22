@@ -59,6 +59,11 @@ ATOMIC_INBOX_TEMP_RE = re.compile(
 LEGACY_TEXT_IDENTITY_FILE = ".capture-identity.json"
 PROCESSED_ARCHIVE_SCRUB_SCHEMA = "capture-processed-scrub.v1"
 GLOBAL_CAPTURE_LOCK = ".capture-maintenance.lock"
+CAPTURE_REPLACEMENT_FREEZE_SCHEMA = "capture-replacement-freeze.v1"
+CAPTURE_REPLACEMENT_FREEZE_NAME = ".replacement-capture-freeze.json"
+CAPTURE_REPLACEMENT_FREEZE_ID_RE = re.compile(r"^s2freeze_[0-9a-f]{32}$")
+CAPTURE_REPLACEMENT_FREEZE_MAX_SECONDS = 7_200.0
+CAPTURE_DEFERRED_DIR_NAME = "capture_deferred"
 ERROR_RESOLUTION_SCHEMA = "capture-error-resolution.v1"
 ERROR_RESOLUTION_ARCHIVE_RE = re.compile(r"^resolved-[0-9a-f]{32}\.json$")
 ERROR_RESOLUTION_MANIFEST_RE = re.compile(r"^resolution-[0-9a-f]{32}\.json$")
@@ -490,6 +495,225 @@ def new_capture_id() -> str:
     return f"s2cap_{secrets.token_hex(16)}"
 
 
+def _read_capture_replacement_freeze(path: Path) -> dict[str, Any] | None:
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o600
+        or observed.st_size > 4_096
+    ):
+        raise ValueError("capture replacement freeze is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os,
+        "O_NOFOLLOW",
+        0,
+    )
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise ValueError("capture replacement freeze changed during read")
+        raw = os.read(descriptor, 4_097)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 4_096:
+        raise ValueError("capture replacement freeze exceeds its size limit")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("capture replacement freeze is malformed") from exc
+    expected_keys = {
+        "schema",
+        "freeze_id",
+        "created_at_unix_ms",
+        "expires_at_unix_ms",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload.get("schema") != CAPTURE_REPLACEMENT_FREEZE_SCHEMA
+        or CAPTURE_REPLACEMENT_FREEZE_ID_RE.fullmatch(
+            str(payload.get("freeze_id") or "")
+        )
+        is None
+        or type(payload.get("created_at_unix_ms")) is not int
+        or type(payload.get("expires_at_unix_ms")) is not int
+        or int(payload["created_at_unix_ms"]) <= 0
+        or int(payload["expires_at_unix_ms"])
+        <= int(payload["created_at_unix_ms"])
+        or int(payload["expires_at_unix_ms"])
+        - int(payload["created_at_unix_ms"])
+        > int(CAPTURE_REPLACEMENT_FREEZE_MAX_SECONDS * 1000)
+    ):
+        raise ValueError("capture replacement freeze contract is invalid")
+    return dict(payload)
+
+
+def _deferred_capture_files(deferred_dir: Path) -> list[Path]:
+    if not deferred_dir.exists() and not deferred_dir.is_symlink():
+        return []
+    observed_root = deferred_dir.lstat()
+    if (
+        stat.S_ISLNK(observed_root.st_mode)
+        or not stat.S_ISDIR(observed_root.st_mode)
+        or observed_root.st_uid != os.getuid()
+        or stat.S_IMODE(observed_root.st_mode) != 0o700
+    ):
+        raise ValueError("deferred capture directory is unsafe")
+    files: list[Path] = []
+    for path in deferred_dir.iterdir():
+        observed = path.lstat()
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or path.suffix.lower() not in CAPTURE_SUFFIXES
+            or observed.st_size > MAX_CAPTURE_BYTES
+        ):
+            raise ValueError("deferred capture payload is unsafe")
+        files.append(path)
+    return sorted(files, key=lambda value: value.name)
+
+
+def _move_deferred_captures_locked(
+    *,
+    deferred_dir: Path,
+    inbox_dir: Path,
+) -> int:
+    moved = 0
+    for source in _deferred_capture_files(deferred_dir):
+        destination = inbox_dir / source.name
+        if destination.exists() or destination.is_symlink():
+            raise ValueError("deferred capture destination already exists")
+        os.replace(source, destination)
+        moved += 1
+    if moved:
+        _fsync_directory(deferred_dir)
+        _fsync_directory(inbox_dir)
+    return moved
+
+
+def begin_capture_replacement_freeze(
+    *,
+    root: str | os.PathLike[str] | None,
+    ttl_seconds: float,
+) -> dict[str, Any]:
+    if (
+        not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not math.isfinite(float(ttl_seconds))
+        or float(ttl_seconds) <= 0.0
+        or float(ttl_seconds) > CAPTURE_REPLACEMENT_FREEZE_MAX_SECONDS
+    ):
+        raise ValueError("capture replacement freeze TTL is invalid")
+    capture_root = resolve_capture_root(root)
+    daemon = CaptureInboxDaemon(root=capture_root)
+    daemon.prepare_transport()
+    paths = daemon.paths()
+    inbox_dir = paths["inbox_dir"]
+    deferred_dir = capture_root / CAPTURE_DEFERRED_DIR_NAME
+    lock_dir = paths["lock_dir"]
+    _ensure_private_dir(deferred_dir, tighten_existing=True)
+    freeze_path = lock_dir / CAPTURE_REPLACEMENT_FREEZE_NAME
+    with daemon._exclusive_lock(
+        lock_dir / GLOBAL_CAPTURE_LOCK,
+        blocking=True,
+    ) as acquired:
+        if not acquired:
+            raise RuntimeError("capture maintenance lock is unavailable")
+        existing = _read_capture_replacement_freeze(freeze_path)
+        now_unix_ms = int(time.time() * 1000)
+        if (
+            existing is not None
+            and int(existing["expires_at_unix_ms"]) > now_unix_ms
+        ):
+            raise RuntimeError("capture replacement freeze is already active")
+        if existing is not None:
+            freeze_path.unlink()
+            _fsync_directory(lock_dir)
+        recovered_deferred_count = _move_deferred_captures_locked(
+            deferred_dir=deferred_dir,
+            inbox_dir=inbox_dir,
+        )
+        freeze = {
+            "schema": CAPTURE_REPLACEMENT_FREEZE_SCHEMA,
+            "freeze_id": f"s2freeze_{secrets.token_hex(16)}",
+            "created_at_unix_ms": now_unix_ms,
+            "expires_at_unix_ms": now_unix_ms
+            + int(float(ttl_seconds) * 1000),
+        }
+        _atomic_write_private_text(
+            freeze_path,
+            json.dumps(freeze, indent=2, sort_keys=True) + "\n",
+        )
+    return {
+        **freeze,
+        "path": str(freeze_path),
+        "recovered_deferred_count": recovered_deferred_count,
+    }
+
+
+def release_capture_replacement_freeze(
+    *,
+    root: str | os.PathLike[str] | None,
+    freeze_id: str,
+    require_main_queue_empty: bool,
+) -> dict[str, Any]:
+    if CAPTURE_REPLACEMENT_FREEZE_ID_RE.fullmatch(str(freeze_id or "")) is None:
+        raise ValueError("capture replacement freeze identity is invalid")
+    capture_root = resolve_capture_root(root)
+    inbox_dir = capture_root / "capture_inbox"
+    deferred_dir = capture_root / CAPTURE_DEFERRED_DIR_NAME
+    lock_dir = capture_root / "capture_locks"
+    freeze_path = lock_dir / CAPTURE_REPLACEMENT_FREEZE_NAME
+    daemon = CaptureInboxDaemon(root=capture_root)
+    with daemon._exclusive_lock(
+        lock_dir / GLOBAL_CAPTURE_LOCK,
+        blocking=True,
+    ) as acquired:
+        if not acquired:
+            raise RuntimeError("capture maintenance lock is unavailable")
+        freeze = _read_capture_replacement_freeze(freeze_path)
+        if freeze is None or not secrets.compare_digest(
+            str(freeze["freeze_id"]),
+            str(freeze_id),
+        ):
+            raise RuntimeError("capture replacement freeze identity changed")
+        status = daemon.status()
+        if require_main_queue_empty and (
+            status.get("transport_ready") is not True
+            or status.get("pending_file_count") != 0
+            or status.get("processing_file_count") != 0
+        ):
+            raise RuntimeError(
+                "capture replacement freeze cannot thaw into a nonempty queue"
+            )
+        moved = _move_deferred_captures_locked(
+            deferred_dir=deferred_dir,
+            inbox_dir=inbox_dir,
+        )
+        freeze_path.unlink()
+        _fsync_directory(lock_dir)
+    return {
+        "freeze_id": freeze_id,
+        "released": True,
+        "deferred_file_count": moved,
+        "baseline_status": status,
+    }
+
+
 def write_capture_drop(
     *,
     root: str | os.PathLike[str] | None = None,
@@ -539,7 +763,6 @@ def write_capture_drop(
         f"{time.strftime('%Y%m%d-%H%M%S')}-{tag[:80]}-"
         f"{canonical_capture_id}-{secrets.token_hex(6)}.json"
     )
-    output_path = inbox_dir / filename
     lock_dir = capture_root / "capture_locks"
     _ensure_private_dir(lock_dir, tighten_existing=True)
     # Recovery bundles take the same exclusive gate as the daemon.  Producers
@@ -552,6 +775,26 @@ def write_capture_drop(
     ) as acquired:
         if not acquired:
             raise RuntimeError("capture maintenance lock is unavailable")
+        freeze_path = lock_dir / CAPTURE_REPLACEMENT_FREEZE_NAME
+        freeze = _read_capture_replacement_freeze(freeze_path)
+        if (
+            freeze is not None
+            and int(freeze["expires_at_unix_ms"]) <= int(time.time() * 1000)
+        ):
+            deferred_dir = capture_root / CAPTURE_DEFERRED_DIR_NAME
+            _ensure_private_dir(deferred_dir, tighten_existing=True)
+            _move_deferred_captures_locked(
+                deferred_dir=deferred_dir,
+                inbox_dir=inbox_dir,
+            )
+            freeze_path.unlink()
+            _fsync_directory(lock_dir)
+            freeze = None
+        destination_dir = inbox_dir
+        if freeze is not None:
+            destination_dir = capture_root / CAPTURE_DEFERRED_DIR_NAME
+            _ensure_private_dir(destination_dir, tighten_existing=True)
+        output_path = destination_dir / filename
         _atomic_write_private_text(
             output_path,
             json.dumps(payload, indent=2, sort_keys=True),
