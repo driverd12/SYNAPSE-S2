@@ -2693,15 +2693,57 @@ class OperatorReadinessCertifier:
                     "Inspect register_text_trace persistence and memory_store writes.",
                     {},
                 )
+            deployment = parsed.get("agent_deployment")
+            if not isinstance(deployment, dict):
+                return (
+                    "blocked",
+                    "remember-text returned no context-delivery receipt.",
+                    "Inspect the compound CLI publication boundary before relying on memory writes.",
+                    {"memory_id": memory_id},
+                )
+            deployment_published = deployment.get("published") is True
+            deployment_state = str(deployment.get("state") or "")
+            deployment_unresolved = bool(
+                deployment_state == "outcome_unknown"
+                and deployment.get("replay_safe") is False
+                and isinstance(deployment.get("reconciliation"), dict)
+                and deployment["reconciliation"].get("code")
+                == "outcome_unknown"
+            )
+            if not deployment_published and not deployment_unresolved:
+                return (
+                    "blocked",
+                    "remember-text returned an invalid context-delivery state.",
+                    "Repair the CLI deployment receipt contract and rerun a completely new evidence pack.",
+                    {
+                        "memory_id": memory_id,
+                        "deployment_state": deployment_state or "missing",
+                    },
+                )
+            deployment_detail = (
+                " Context delivery was recovered or published."
+                if deployment_published
+                else " The primary memory commit is retained while the non-replayable notification remains explicitly unresolved; delivery integrity is independently gated after handoff."
+            )
             return (
                 "ready",
-                f"Wrote trace {parsed.get('tag')} as {memory_id}.",
+                f"Wrote trace {parsed.get('tag')} as {memory_id}.{deployment_detail}",
                 "",
                 {
                     "memory_id": memory_id,
                     "tag": parsed.get("tag"),
                     "spike_count": parsed.get("spike_count"),
                     "recall_marker": self.recall_marker,
+                    "deployment_published": deployment_published,
+                    "deployment_state": (
+                        deployment_state
+                        or ("published" if deployment_published else "unknown")
+                    ),
+                    "deployment_reconciled": bool(
+                        deployment.get("reconciled_after_outcome_unknown")
+                    ),
+                    "deployment_replay_safe": deployment.get("replay_safe")
+                    is True,
                 },
             )
 

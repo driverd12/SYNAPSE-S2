@@ -304,6 +304,136 @@ class SynapseCliTests(unittest.TestCase):
             request_id="req-cli-status",
         )
 
+    def test_remember_text_preserves_primary_commit_when_deployment_is_unknown(self):
+        import synapse_cli
+
+        backend = mock.Mock()
+        backend.register_text_trace.return_value = {
+            "tag": "readiness-memory",
+            "context_id": "default",
+            "memory_id": "s2_" + ("1" * 32),
+            "spike_count": 8,
+            "neuron_count": 8,
+            "persisted": True,
+        }
+        backend.publish_context_event.side_effect = CoreOutcomeUnknown(
+            caller="compound-cli",
+            request_id="req-compound-publish",
+            operation="publish_context_event",
+        )
+        backend.request_status.return_value = {
+            "known": False,
+            "state": "not_found",
+            "operation": None,
+            "safe_error_code": None,
+            "replay_safe": False,
+            "retention_expiry_possible": True,
+        }
+        backend.list_context_events.return_value = {"events": []}
+        args = mock.Mock(
+            context="default",
+            tag="readiness-memory",
+            text="A durable memory whose notification response was lost.",
+            metadata=None,
+        )
+
+        with (
+            mock.patch.object(synapse_cli, "build_backend", return_value=backend),
+            mock.patch.object(
+                synapse_cli.secrets,
+                "token_hex",
+                return_value="a" * 32,
+            ),
+        ):
+            payload = synapse_cli.command_remember_text(args)
+
+        self.assertEqual(payload["memory_id"], "s2_" + ("1" * 32))
+        self.assertTrue(payload["persisted"])
+        deployment = payload["agent_deployment"]
+        self.assertIsNone(deployment["published"])
+        self.assertEqual(deployment["state"], "outcome_unknown")
+        self.assertFalse(deployment["replay_safe"])
+        self.assertEqual(deployment["cli_deployment_id"], "s2dep_" + ("a" * 32))
+        self.assertEqual(
+            deployment["reconciliation"]["request_id"],
+            "req-compound-publish",
+        )
+        backend.publish_context_event.assert_called_once()
+        self.assertEqual(
+            backend.publish_context_event.call_args.kwargs["payload"][
+                "cli_deployment_id"
+            ],
+            "s2dep_" + ("a" * 32),
+        )
+
+    def test_remember_text_recovers_exact_deployment_without_replay(self):
+        import synapse_cli
+
+        deployment_id = "s2dep_" + ("b" * 32)
+        backend = mock.Mock()
+        backend.register_text_trace.return_value = {
+            "tag": "recovered-memory",
+            "context_id": "default",
+            "memory_id": "s2_" + ("2" * 32),
+            "spike_count": 6,
+            "neuron_count": 6,
+            "persisted": True,
+        }
+        backend.publish_context_event.side_effect = CoreOutcomeUnknown(
+            caller="compound-cli",
+            request_id="req-compound-recovered",
+            operation="publish_context_event",
+        )
+        backend.request_status.return_value = {
+            "known": True,
+            "state": "completed",
+            "operation": "publish_context_event",
+            "safe_error_code": None,
+            "replay_safe": False,
+            "retention_expiry_possible": False,
+        }
+        backend.list_context_events.return_value = {
+            "events": [
+                {
+                    "event_id": 42,
+                    "context_id": "default",
+                    "source_surface": "cli",
+                    "event_type": "remember-trace",
+                    "published": True,
+                    "payload": {"cli_deployment_id": deployment_id},
+                }
+            ]
+        }
+        args = mock.Mock(
+            context="default",
+            tag="recovered-memory",
+            text="A durable memory with a recoverable publication receipt.",
+            metadata=None,
+        )
+
+        with (
+            mock.patch.object(synapse_cli, "build_backend", return_value=backend),
+            mock.patch.object(
+                synapse_cli.secrets,
+                "token_hex",
+                return_value="b" * 32,
+            ),
+        ):
+            payload = synapse_cli.command_remember_text(args)
+
+        deployment = payload["agent_deployment"]
+        self.assertEqual(deployment["event_id"], 42)
+        self.assertTrue(deployment["published"])
+        self.assertTrue(deployment["reconciled_after_outcome_unknown"])
+        self.assertFalse(deployment["replay_safe"])
+        backend.publish_context_event.assert_called_once()
+        backend.list_context_events.assert_called_once_with(
+            context_id="default",
+            since_event_id=0,
+            order="desc",
+            limit=64,
+        )
+
     def test_cli_startup_import_error_is_sanitized(self):
         import synapse_cli
 

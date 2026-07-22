@@ -3035,6 +3035,74 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         self.assertEqual(metrics["quality_status"], "blocked")
         self.assertFalse(metrics["writes_memory"])
 
+    def test_memory_write_retains_primary_commit_when_notification_is_unknown(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(Path(tmp))
+            payload = {
+                "tag": "operator-readiness-memory-write",
+                "memory_id": "s2_" + ("3" * 32),
+                "spike_count": 7,
+                "persisted": True,
+                "agent_deployment": {
+                    "published": None,
+                    "state": "outcome_unknown",
+                    "replay_safe": False,
+                    "reconciliation": {
+                        "code": "outcome_unknown",
+                        "caller": "certifier-cli",
+                        "request_id": "req-certifier-publish",
+                        "operation": "publish_context_event",
+                        "replay_safe": False,
+                    },
+                },
+            }
+
+            def run_command(
+                check_id,
+                *,
+                label,
+                command,
+                required,
+                timeout,
+                evaluator,
+                env=None,
+            ):
+                del timeout, env
+                status, detail, repair, metrics = evaluator(
+                    0,
+                    payload,
+                    json.dumps(payload),
+                    "",
+                )
+                result = CheckResult(
+                    check_id=check_id,
+                    label=label,
+                    status=status,
+                    required=required,
+                    detail=detail,
+                    repair=repair,
+                    command=command,
+                    returncode=0,
+                    parsed=payload,
+                    metrics=metrics,
+                )
+                certifier.results.append(result)
+                return result
+
+            with mock.patch.object(
+                certifier,
+                "_run_command",
+                side_effect=run_command,
+            ):
+                memory = certifier._check_memory_write()
+
+        result = certifier.results[-1]
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(memory["memory_id"], payload["memory_id"])
+        self.assertFalse(result.metrics["deployment_published"])
+        self.assertEqual(result.metrics["deployment_state"], "outcome_unknown")
+        self.assertIn("explicitly unresolved", result.detail)
+
     def test_app_preview_status_blocks_silent_or_mutating_preview(self):
         status, detail, _, _ = app_preview_status(
             {

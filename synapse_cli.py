@@ -893,13 +893,146 @@ def _publish_cli_deployment(
     summary: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    return backend.publish_context_event(
-        context_id=context_id,
-        source_surface="cli",
-        event_type=event_type,
-        summary=summary,
-        payload=payload,
+    # ``remember-*`` and ``ingest-text`` are intentionally compound CLI
+    # conveniences: their primary durable write completes before this context
+    # delivery notification is published.  Losing the second RPC response must
+    # never erase the already-proven primary receipt from the CLI response, and
+    # the non-replayable mutation must never be retried blindly.
+    deployment_id = f"s2dep_{secrets.token_hex(16)}"
+    deployment_payload = {
+        **payload,
+        "cli_deployment_id": deployment_id,
+    }
+    try:
+        deployment = backend.publish_context_event(
+            context_id=context_id,
+            source_surface="cli",
+            event_type=event_type,
+            summary=summary,
+            payload=deployment_payload,
+        )
+    except CoreOutcomeUnknown as exc:
+        return _reconcile_cli_deployment_outcome(
+            backend,
+            context_id=context_id,
+            event_type=event_type,
+            deployment_id=deployment_id,
+            error=exc,
+        )
+    deployment["cli_deployment_id"] = deployment_id
+    deployment["reconciled_after_outcome_unknown"] = False
+    return deployment
+
+
+def _reconcile_cli_deployment_outcome(
+    backend: mlx_backend.SpikingAttentionBackend,
+    *,
+    context_id: str,
+    event_type: str,
+    deployment_id: str,
+    error: CoreOutcomeUnknown,
+) -> dict[str, Any]:
+    """Reconcile one lost compound-operation response without mutation replay.
+
+    The unique public deployment id is written inside the event payload.  A
+    bounded read can therefore recover the exact event receipt when the server
+    committed before the transport failed.  If no receipt is visible, return a
+    content-free unresolved handle while allowing the caller to retain its
+    already-committed primary result.
+    """
+
+    reconciliation = outcome_unknown_projection(error)
+    request_status: dict[str, Any] | None = None
+    request_status_fn = getattr(backend, "request_status", None)
+    if callable(request_status_fn):
+        try:
+            observed = request_status_fn(
+                caller=error.caller,
+                request_id=error.request_id,
+            )
+            if isinstance(observed, dict):
+                request_status = {
+                    "known": observed.get("known") is True,
+                    "state": str(observed.get("state") or "not_found"),
+                    "operation": (
+                        str(observed["operation"])
+                        if observed.get("operation") is not None
+                        else None
+                    ),
+                    "safe_error_code": (
+                        str(observed["safe_error_code"])
+                        if observed.get("safe_error_code") is not None
+                        else None
+                    ),
+                    "replay_safe": False,
+                    "retention_expiry_possible": bool(
+                        observed.get("retention_expiry_possible", False)
+                    ),
+                }
+        except Exception:
+            # Reconciliation is best-effort and read-only.  The fixed original
+            # handle remains sufficient for an operator to inspect later.
+            request_status = None
+
+    list_events = getattr(backend, "list_context_events", None)
+    if callable(list_events):
+        try:
+            listed = list_events(
+                context_id=context_id,
+                since_event_id=0,
+                order="desc",
+                limit=64,
+            )
+            events = listed.get("events", []) if isinstance(listed, dict) else []
+            for raw_event in events if isinstance(events, list) else []:
+                if not isinstance(raw_event, dict):
+                    continue
+                event_payload = raw_event.get("payload")
+                if not isinstance(event_payload, dict):
+                    continue
+                if not (
+                    raw_event.get("context_id") == context_id
+                    and raw_event.get("source_surface") == "cli"
+                    and raw_event.get("event_type") == event_type
+                    and event_payload.get("cli_deployment_id") == deployment_id
+                ):
+                    continue
+                recovered = dict(raw_event)
+                recovered.update(
+                    {
+                        "cli_deployment_id": deployment_id,
+                        "reconciled_after_outcome_unknown": True,
+                        "replay_safe": False,
+                        "reconciliation": reconciliation,
+                    }
+                )
+                if request_status is not None:
+                    recovered["request_status"] = request_status
+                return recovered
+        except Exception:
+            pass
+
+    completed = bool(
+        request_status is not None
+        and request_status.get("known") is True
+        and request_status.get("state") == "completed"
     )
+    unresolved = {
+        "protocol_version": "context-delivery.v2",
+        "context_id": context_id,
+        "source_surface": "cli",
+        "event_type": event_type,
+        "delivery_mode": "leased-at-least-once",
+        "published": True if completed else None,
+        "state": "completed_without_receipt" if completed else "outcome_unknown",
+        "cli_deployment_id": deployment_id,
+        "reconciled_after_outcome_unknown": False,
+        "replay_safe": False,
+        "reconciliation": reconciliation,
+    }
+    if request_status is not None:
+        unresolved["request_status"] = request_status
+    return unresolved
 
 
 def command_pull_context(args: argparse.Namespace) -> dict[str, Any]:
