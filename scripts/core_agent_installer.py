@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -78,6 +79,19 @@ DEFAULT_PRODUCTION_NEURAL_MODEL = (
 DEFAULT_PRODUCTION_NEURAL_REVISION = "6c3ae70858513f1a78e9cdca3cae330d9075cd2a"
 DEFAULT_PRODUCTION_MLX_DEVICE = "gpu"
 REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS = 300.0
+CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS = (
+    "inbox_temp_file_count",
+    "processing_file_count",
+    "processing_empty_claim_count",
+    "processing_malformed_claim_count",
+    "error_file_count",
+    "unresolved_error_count",
+    "terminal_error_evidence_count",
+    "historical_error_evidence_count",
+    "unsafe_error_artifact_count",
+    "error_resolution_pending_count",
+    "error_resolution_failed_count",
+)
 LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 LAYOUT_MANIFEST_SCHEMA = "synapse-s2.noncanonical-core-layout.v1"
 EXPECTED_SCHEMA_IDENTITY = "sqlite-53324442-v6"
@@ -1197,6 +1211,132 @@ def replacement_certification_seconds_remaining(
             "replacement candidate has too little signed time remaining for certification"
         )
     return remaining_milliseconds // 1000
+
+
+def validate_replacement_capture_transport(
+    status: Mapping[str, Any] | None,
+    *,
+    maximum_pending_files: int,
+) -> int:
+    """Admit bounded durable inbox debt, but no ambiguous transport state."""
+
+    if type(maximum_pending_files) is not int or maximum_pending_files < 0:
+        raise CoreInstallerError("replacement capture pending bound is invalid")
+    pending = (
+        None
+        if not isinstance(status, Mapping)
+        else status.get("pending_file_count")
+    )
+    if (
+        not isinstance(status, Mapping)
+        or status.get("transport_ready") is not True
+        or type(pending) is not int
+        or int(pending) < 0
+        or int(pending) > maximum_pending_files
+        or any(
+            type(status.get(field)) is not int or int(status[field]) != 0
+            for field in CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS
+        )
+    ):
+        raise CoreInstallerError(
+            "replacement staging requires bounded, unambiguous capture transport"
+        )
+    return int(pending)
+
+
+def capture_transport_status(capture_root: Path) -> dict[str, Any]:
+    """Take one capture-transport snapshot behind the producer/daemon gate."""
+
+    from capture_daemon import CaptureInboxDaemon, GLOBAL_CAPTURE_LOCK
+
+    daemon = CaptureInboxDaemon(root=capture_root)
+    paths = daemon.paths()
+    with daemon._exclusive_lock(
+        paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
+        blocking=True,
+    ) as acquired:
+        if not acquired:
+            raise CoreInstallerError(
+                "capture maintenance lock is unavailable during replacement drain"
+            )
+        return dict(daemon.status())
+
+
+def wait_for_replacement_capture_drain(
+    *,
+    capture_root: Path,
+    admitted_status: Mapping[str, Any],
+    admitted_pending_file_count: int,
+    wait_seconds: float,
+) -> dict[str, Any]:
+    """Wait for only the admitted inbox set to become durable and archived."""
+
+    if (
+        type(admitted_pending_file_count) is not int
+        or admitted_pending_file_count < 0
+        or not isinstance(admitted_status, Mapping)
+        or type(admitted_status.get("processed_file_count")) is not int
+        or type(admitted_status.get("receipt_count")) is not int
+        or not isinstance(wait_seconds, (int, float))
+        or isinstance(wait_seconds, bool)
+        or not math.isfinite(float(wait_seconds))
+        or float(wait_seconds) <= 0
+    ):
+        raise CoreInstallerError("replacement capture drain request is invalid")
+    expected_processed = (
+        int(admitted_status["processed_file_count"])
+        + admitted_pending_file_count
+    )
+    expected_receipts = (
+        int(admitted_status["receipt_count"]) + admitted_pending_file_count
+    )
+    deadline = time.monotonic() + float(wait_seconds)
+    fatal_fields = tuple(
+        field
+        for field in CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS
+        if field != "processing_file_count"
+    )
+    while True:
+        status = capture_transport_status(capture_root)
+        pending = status.get("pending_file_count")
+        processing = status.get("processing_file_count")
+        if (
+            status.get("transport_ready") is not True
+            or status.get("missing_transport_directories")
+            or status.get("unsafe_transport_directories")
+            or type(pending) is not int
+            or type(processing) is not int
+            or pending < 0
+            or processing < 0
+            or pending + processing > admitted_pending_file_count
+            or any(
+                type(status.get(field)) is not int
+                or int(status[field]) != 0
+                for field in fatal_fields
+            )
+        ):
+            raise CoreInstallerError(
+                "replacement capture drain entered an ambiguous or failed state"
+            )
+        if pending == 0 and processing == 0:
+            validate_replacement_capture_transport(
+                status,
+                maximum_pending_files=0,
+            )
+            if (
+                status.get("processed_file_count") != expected_processed
+                or status.get("receipt_count") != expected_receipts
+            ):
+                raise CoreInstallerError(
+                    "replacement capture drain did not produce exact durable "
+                    "archive and receipt counts"
+                )
+            return dict(status)
+        if time.monotonic() >= deadline:
+            raise CoreInstallerError(
+                "replacement capture drain did not complete before its deadline"
+            )
+        time.sleep(0.1)
 
 
 def verified_exact_label_cleanup(
@@ -2430,35 +2570,16 @@ def stage_replacement(
                 runtime_state_path=paths.state,
             )
             capture = manager.daemon.status()
-            capture_zero_fields = (
-                "pending_file_count",
-                "processing_file_count",
-                "processing_empty_claim_count",
-                "processing_malformed_claim_count",
-                "error_file_count",
-                "unresolved_error_count",
-                "terminal_error_evidence_count",
-                "historical_error_evidence_count",
-                "unsafe_error_artifact_count",
-                "error_resolution_pending_count",
-                "error_resolution_failed_count",
+            admitted_pending_file_count = validate_replacement_capture_transport(
+                capture,
+                maximum_pending_files=config.capture_max_files,
             )
-            if (
-                capture.get("transport_ready") is not True
-                or any(
-                    type(capture.get(field)) is not int
-                    or int(capture[field]) != 0
-                    for field in capture_zero_fields
-                )
-            ):
-                raise CoreInstallerError(
-                    "replacement staging requires a clean capture transport"
-                )
             restore_root = Path(temporary) / "isolated-restore"
             with manager.guarded_recovery_transaction(
                 restore_root,
                 purpose="replacement-admission",
                 pinned=True,
+                replacement_pending_limit=admitted_pending_file_count,
             ) as publication:
 
                 def publish(
@@ -2482,11 +2603,27 @@ def stage_replacement(
                         raise CoreInstallerError(
                             "replacement recovery evidence is incomplete"
                         )
+                    if (
+                        evidence.get("replacement_stage_ready") is not True
+                        or evidence.get("pending_file_count")
+                        != admitted_pending_file_count
+                        or evidence.get("replay_required_file_count")
+                        != admitted_pending_file_count
+                        or evidence.get("replay_required_capture_count")
+                        != admitted_pending_file_count
+                    ):
+                        raise CoreInstallerError(
+                            "replacement recovery evidence changed its admitted "
+                            "capture set"
+                        )
                     return publish_replacement_admission(
                         request=ReplacementAdmissionRequest(
                             path=paths.core_root / "replacement-admission.json",
                             build_id=candidate_build_id,
                             config_fingerprint=config.fingerprint,
+                            expected_pending_file_count=(
+                                admitted_pending_file_count
+                            ),
                         ),
                         root=paths.root,
                         memory_db=paths.memory_db,
@@ -2556,6 +2693,12 @@ def stage_replacement(
                 wait_seconds=wait_seconds,
                 expected_deployment_mode="replacement-certification",
             )
+            wait_for_replacement_capture_drain(
+                capture_root=paths.capture_root,
+                admitted_status=capture,
+                admitted_pending_file_count=admitted_pending_file_count,
+                wait_seconds=wait_seconds,
+            )
             certification_seconds_remaining = (
                 replacement_certification_seconds_remaining(admission)
             )
@@ -2589,6 +2732,7 @@ def stage_replacement(
             status="staged-healthy",
             provisional=True,
             persistent=False,
+            drained_pending_file_count=admitted_pending_file_count,
             certification_seconds_remaining=certification_seconds_remaining,
             staged_plist=str(staged_plist),
             admission={

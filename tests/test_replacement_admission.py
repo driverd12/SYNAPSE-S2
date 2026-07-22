@@ -23,7 +23,7 @@ from memory_store import (  # noqa: E402
     SQLITE_USER_VERSION,
     DurableMemoryStore,
 )
-from capture_daemon import CaptureInboxDaemon  # noqa: E402
+from capture_daemon import CaptureInboxDaemon, write_capture_drop  # noqa: E402
 from core_authority import CoreAuthorityLease  # noqa: E402
 from core_request_journal import (  # noqa: E402
     JOURNAL_BINDING_SCHEMA,
@@ -156,6 +156,9 @@ class ReplacementAdmissionTests(unittest.TestCase):
             "database_logical_snapshot_schema": LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
             "database_logical_snapshot_sha256": "8" * 64,
             "capture_manifest_sha256": "b" * 64,
+            "recovery_pending_file_count": 0,
+            "recovery_replay_required_file_count": 0,
+            "recovery_replay_required_capture_count": 0,
             "runtime_state_required": True,
             "runtime_state_present": True,
             "runtime_state_canonical_sha256": "c" * 64,
@@ -252,6 +255,63 @@ class ReplacementAdmissionTests(unittest.TestCase):
             content["candidate_config_fingerprint"],
             content["predecessor_config_fingerprint"],
         )
+
+    def test_contract_binds_exact_pending_capture_counts(self) -> None:
+        now = int(time.time() * 1000)
+        positive = self._content(now=now)
+        positive.update(
+            {
+                "recovery_pending_file_count": 1,
+                "recovery_replay_required_file_count": 1,
+                "recovery_replay_required_capture_count": 1,
+            }
+        )
+        store = DurableMemoryStore.open_existing_for_audit(self.memory_db)
+        try:
+            payload = self._signed(positive)
+            self.assertEqual(
+                preflight._validate_replacement_admission(
+                    payload,
+                    store=store,
+                    expected_content=positive,
+                    expected_auth_key_id=self.auth_key_id,
+                    now_unix_ms=now,
+                ),
+                payload["receipt_digest"],
+            )
+            invalid_bindings = (
+                {"recovery_pending_file_count": True},
+                {"recovery_pending_file_count": -1},
+                {
+                    "recovery_pending_file_count": (
+                        preflight.REPLACEMENT_ADMISSION_MAX_PENDING_FILES + 1
+                    ),
+                    "recovery_replay_required_file_count": (
+                        preflight.REPLACEMENT_ADMISSION_MAX_PENDING_FILES + 1
+                    ),
+                    "recovery_replay_required_capture_count": (
+                        preflight.REPLACEMENT_ADMISSION_MAX_PENDING_FILES + 1
+                    ),
+                },
+                {"recovery_replay_required_file_count": 0},
+                {"recovery_replay_required_capture_count": 0},
+            )
+            for override in invalid_bindings:
+                with self.subTest(override=override):
+                    invalid = {**positive, **override}
+                    signed = self._signed(invalid)
+                    with self.assertRaisesRegex(
+                        preflight.CutoverPreflightError,
+                        "values are invalid",
+                    ):
+                        preflight._validate_replacement_admission(
+                            signed,
+                            store=store,
+                            expected_auth_key_id=self.auth_key_id,
+                            now_unix_ms=now,
+                        )
+        finally:
+            store.close()
 
     def test_contract_rejects_expiry_tampering_and_predecessor_drift(self) -> None:
         now = int(time.time() * 1000)
@@ -527,6 +587,73 @@ class ReplacementAdmissionTests(unittest.TestCase):
                     delivery_audit=delivery,
                 )
 
+    def test_replacement_recovery_rejects_mixed_v1_v2_capture_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="replacement-mixed-") as tmp:
+            root = Path(tmp).resolve()
+            root.chmod(0o700)
+            memory_db = root / "memory.sqlite3"
+            seed_store = DurableMemoryStore(memory_db)
+            seed_store.close()
+            authority = CoreAuthorityLease.acquire_core(
+                memory_db,
+                timeout_seconds=0.0,
+                instance_id="replacement-mixed-test",
+            )
+            store = DurableMemoryStore.open_existing_for_core_maintenance(
+                memory_db,
+                authority_lease=authority,
+            )
+            try:
+                manager = VerifiedRecoveryManager(store, capture_root=root)
+                paths = manager.daemon.paths()
+                manager.daemon._ensure_transport_dirs(paths)
+                drop = write_capture_drop(
+                    root=root,
+                    context_id="replacement-mixed-test",
+                    source_tag="replacement-session-boundary",
+                    speaker="codex",
+                    text=(
+                        "A canonical v2 record must never conceal legacy replay work."
+                    ),
+                    capture_id="s2cap_92929292929292929292929292929292",
+                )
+                v2_record = json.loads(drop.read_text(encoding="utf-8"))
+                drop.write_text(
+                    json.dumps(
+                        [
+                            v2_record,
+                            {
+                                "version": 1,
+                                "text": (
+                                    "Identifierless legacy work cannot share a v2 file."
+                                ),
+                                "context_id": "replacement-mixed-test",
+                                "source_tag": "legacy-replay",
+                            },
+                        ],
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                drop.chmod(0o600)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "cannot mix v1 and v2",
+                ):
+                    with manager.guarded_recovery_transaction(
+                        root / "replacement-mixed-restore",
+                        purpose="replacement-admission",
+                        replacement_pending_limit=1,
+                    ):
+                        self.fail(
+                            "mixed capture versions reached replacement admission"
+                        )
+            finally:
+                store.close()
+                authority.close()
+
     def test_real_guarded_v6_recovery_publishes_and_reverifies(self) -> None:
         # Keep the Unix socket below macOS's short sockaddr_un limit even when
         # the main fixture receives a descriptive randomized prefix.
@@ -544,6 +671,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
             default_top_k=4,
             recall_count=2,
             authority_timeout_seconds=0.0,
+            capture_poll_seconds=0.25,
         )
         first = AuthoritativeCoreService(config)
         first.start()
@@ -556,6 +684,18 @@ class ReplacementAdmissionTests(unittest.TestCase):
         )
         maintenance_lock.write_bytes(b"")
         maintenance_lock.chmod(0o600)
+        pending_capture_id = "s2cap_91919191919191919191919191919191"
+        pending_drop = write_capture_drop(
+            root=state_root,
+            context_id="replacement-pending-test",
+            source_tag="replacement-session-boundary",
+            speaker="codex",
+            text=(
+                "The replacement core must drain this signed pending capture "
+                "exactly once after it claims provisional authority."
+            ),
+            capture_id=pending_capture_id,
+        )
         candidate_build_id = "source-" + "d" * 24
         admission_path = state_root / "core" / preflight.REPLACEMENT_ADMISSION_NAME
         restore_root = state_root / "replacement-restore"
@@ -577,11 +717,60 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 capture_root=state_root,
                 runtime_state_path=config.state_path,
             )
+            strict_bundle = state_root / "strict-pending.sqlite3"
+            strict_restore = state_root / "strict-pending-restore"
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "capture transport is not quiescent",
+            ):
+                with manager.guarded_recovery_transaction(
+                    strict_restore,
+                    path=strict_bundle,
+                    purpose="operator-certification",
+                ):
+                    self.fail("ordinary guarded recovery admitted pending work")
+            self.assertFalse(strict_bundle.exists())
+            self.assertFalse(strict_restore.exists())
             with manager.guarded_recovery_transaction(
                 restore_root,
-                purpose="replacement-admission-test",
+                purpose="replacement-admission",
                 pinned=True,
+                replacement_pending_limit=1,
             ) as publication:
+                self.assertFalse(publication.evidence["cutover_ready"])
+                self.assertTrue(
+                    publication.evidence["replacement_stage_ready"]
+                )
+                self.assertEqual(
+                    publication.evidence["pending_file_count"],
+                    1,
+                )
+                expected_debt = {
+                    "replay_required_capture_count": 1,
+                    "replay_required_file_count": 1,
+                    "identifierless_replay_file_count": 0,
+                    "unclassified_file_count": 0,
+                    "missing_authoritative_ledger_count": 0,
+                }
+                for evidence_key in ("bundle", "verification", "restore"):
+                    observed = publication.evidence[evidence_key][
+                        "reconciliation"
+                    ]
+                    self.assertEqual(
+                        {key: observed[key] for key in expected_debt},
+                        expected_debt,
+                    )
+                self.assertEqual(
+                    publication.evidence["verification"][
+                        "capture_pending_state"
+                    ],
+                    {
+                        "pending_file_count": 1,
+                        "replay_required_file_count": 1,
+                        "replay_required_capture_count": 1,
+                        "canonical_v2": True,
+                    },
+                )
 
                 def publish(evidence: dict) -> dict:
                     return preflight.publish_replacement_admission(
@@ -589,6 +778,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
                             path=admission_path,
                             build_id=candidate_build_id,
                             config_fingerprint=config.fingerprint,
+                            expected_pending_file_count=1,
                         ),
                         root=ROOT,
                         memory_db=config.memory_path,
@@ -642,6 +832,17 @@ class ReplacementAdmissionTests(unittest.TestCase):
             ):
                 successor = AuthoritativeCoreService(config)
                 successor.start()
+                drain_deadline = time.monotonic() + 5.0
+                while time.monotonic() < drain_deadline:
+                    drained_status = CaptureInboxDaemon(root=state_root).status()
+                    if (
+                        drained_status["pending_file_count"] == 0
+                        and drained_status["processing_file_count"] == 0
+                    ):
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("provisional core did not drain admitted capture")
                 health = successor._health_result()
                 with closing(sqlite3.connect(config.memory_path)) as connection:
                     successor_marker = json.loads(
@@ -654,6 +855,38 @@ class ReplacementAdmissionTests(unittest.TestCase):
             if successor is not None:
                 successor.close()
         self.assertTrue(published["verified"])
+        self.assertEqual(published["recovery_pending_file_count"], 1)
+        self.assertEqual(published["recovery_replay_required_file_count"], 1)
+        self.assertEqual(published["recovery_replay_required_capture_count"], 1)
+        self.assertFalse(pending_drop.exists())
+        self.assertEqual(drained_status["pending_file_count"], 0)
+        self.assertEqual(drained_status["processing_file_count"], 0)
+        self.assertEqual(drained_status["processed_file_count"], 1)
+        self.assertEqual(drained_status["receipt_count"], 1)
+        self.assertEqual(drained_status["error_file_count"], 0)
+        self.assertEqual(drained_status["unresolved_error_count"], 0)
+        self.assertEqual(drained_status["unsafe_error_artifact_count"], 0)
+        self.assertTrue(health["capture"]["ready"])
+        self.assertGreaterEqual(health["capture"]["iteration_count"], 1)
+        self.assertEqual(health["capture"]["processed_count"], 1)
+        self.assertEqual(health["capture"]["error_count"], 0)
+        audit_store = DurableMemoryStore.open_existing_for_audit(
+            config.memory_path
+        )
+        try:
+            captured = audit_store.get_capture_operation(pending_capture_id)
+        finally:
+            audit_store.close()
+        self.assertIsNotNone(captured)
+        self.assertEqual(captured["capture_id"], pending_capture_id)
+        with closing(sqlite3.connect(config.memory_path)) as connection:
+            capture_rows = connection.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT deployment_event_id), "
+                "SUM(CASE WHEN deployment_event_id IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM capture_operations WHERE capture_id = ?",
+                (pending_capture_id,),
+            ).fetchone()
+        self.assertEqual(capture_rows, (1, 1, 1))
         self.assertTrue(health["ready"])
         self.assertEqual(
             health["deployment_mode"],

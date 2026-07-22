@@ -466,7 +466,10 @@ else:
         }
         capture = {
             "transport_ready": True,
-            "pending_file_count": 0,
+            "missing_transport_directories": [],
+            "unsafe_transport_directories": [],
+            "pending_file_count": 3,
+            "inbox_temp_file_count": 0,
             "processing_file_count": 0,
             "processing_empty_claim_count": 0,
             "processing_malformed_claim_count": 0,
@@ -477,10 +480,22 @@ else:
             "unsafe_error_artifact_count": 0,
             "error_resolution_pending_count": 0,
             "error_resolution_failed_count": 0,
+            "processed_file_count": 17,
+            "receipt_count": 17,
+        }
+        post_capture_status = {
+            **capture,
+            "pending_file_count": 0,
+            "processed_file_count": 20,
+            "receipt_count": 20,
         }
         guarded = {
             "verified": True,
-            "cutover_ready": True,
+            "cutover_ready": False,
+            "replacement_stage_ready": True,
+            "pending_file_count": 3,
+            "replay_required_file_count": 3,
+            "replay_required_capture_count": 3,
             "bundle": {"bundle_receipt_path": str(self.base / "bundle.json")},
             "restore": {"recovery_proof_path": str(self.base / "proof.json")},
         }
@@ -564,7 +579,11 @@ else:
                 "pid": 4242,
                 "deployment_mode": "replacement-certification",
             },
-        ) as health:
+        ) as health, mock.patch.object(
+            installer,
+            "capture_transport_status",
+            return_value=post_capture_status,
+        ) as post_capture:
             result = installer.stage_replacement(
                 paths=self.paths,
                 label="aero.boom.synapse-s2.core.test",
@@ -578,6 +597,7 @@ else:
         self.assertEqual(result["status"], "staged-healthy")
         self.assertTrue(result["provisional"])
         self.assertFalse(result["persistent"])
+        self.assertEqual(result["drained_pending_file_count"], 3)
         self.assertFalse(self.paths.plist.exists())
         staged_plist = Path(result["staged_plist"])
         payload = plistlib.loads(staged_plist.read_bytes())
@@ -592,6 +612,19 @@ else:
             installer.default_binding_path(self.home).exists()
         )
         publisher.assert_called_once()
+        self.assertEqual(
+            publisher.call_args.kwargs[
+                "request"
+            ].expected_pending_file_count,
+            3,
+        )
+        manager.guarded_recovery_transaction.assert_called_once_with(
+            mock.ANY,
+            purpose="replacement-admission",
+            pinned=True,
+            replacement_pending_limit=3,
+        )
+        post_capture.assert_called_once_with(self.paths.capture_root)
         health.assert_called_once_with(
             launchctl=mock.ANY,
             config=config,
@@ -664,6 +697,111 @@ else:
                 "expiry is invalid",
             ):
                 installer.replacement_certification_seconds_remaining(None)
+
+    def test_replacement_capture_transport_admits_only_one_clean_pending_batch(
+        self,
+    ) -> None:
+        clean = {
+            "transport_ready": True,
+            "pending_file_count": 23,
+            **{
+                field: 0
+                for field in installer.CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS
+            },
+        }
+        self.assertEqual(
+            installer.validate_replacement_capture_transport(
+                clean,
+                maximum_pending_files=50,
+            ),
+            23,
+        )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "bounded, unambiguous",
+        ):
+            installer.validate_replacement_capture_transport(
+                clean,
+                maximum_pending_files=0,
+            )
+        ambiguous = dict(clean)
+        ambiguous["pending_file_count"] = 0
+        ambiguous["processing_file_count"] = 1
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "bounded, unambiguous",
+        ):
+            installer.validate_replacement_capture_transport(
+                ambiguous,
+                maximum_pending_files=50,
+            )
+
+        admitted = {
+            **clean,
+            "processed_file_count": 10,
+            "receipt_count": 10,
+        }
+        in_flight = {
+            **admitted,
+            "pending_file_count": 2,
+            "processing_file_count": 1,
+        }
+        drained = {
+            **admitted,
+            "pending_file_count": 0,
+            "processed_file_count": 13,
+            "receipt_count": 13,
+        }
+        with mock.patch.object(
+            installer,
+            "capture_transport_status",
+            side_effect=(in_flight, drained),
+        ), mock.patch.object(installer.time, "sleep"):
+            self.assertEqual(
+                installer.wait_for_replacement_capture_drain(
+                    capture_root=self.paths.capture_root,
+                    admitted_status=admitted,
+                    admitted_pending_file_count=3,
+                    wait_seconds=2,
+                ),
+                drained,
+            )
+
+    def test_capture_transport_status_holds_global_gate_while_scanning(self) -> None:
+        daemon = mock.Mock()
+        daemon.paths.return_value = {"lock_dir": self.data / "capture_locks"}
+
+        class Gate:
+            held = False
+
+            def __enter__(self):
+                self.held = True
+                return True
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.held = False
+                return False
+
+        gate = Gate()
+        daemon._exclusive_lock.return_value = gate
+
+        def status() -> dict[str, object]:
+            self.assertTrue(gate.held)
+            return {"transport_ready": True, "pending_file_count": 0}
+
+        daemon.status.side_effect = status
+        with mock.patch(
+            "capture_daemon.CaptureInboxDaemon",
+            return_value=daemon,
+        ):
+            observed = installer.capture_transport_status(self.data)
+
+        self.assertTrue(observed["transport_ready"])
+        self.assertFalse(gate.held)
+        daemon._exclusive_lock.assert_called_once_with(
+            self.data / "capture_locks" / ".capture-maintenance.lock",
+            blocking=True,
+        )
 
     def test_exact_label_cleanup_requires_both_launchd_readbacks(self) -> None:
         cases = (

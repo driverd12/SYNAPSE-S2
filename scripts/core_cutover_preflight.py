@@ -99,14 +99,15 @@ CUTOVER_ATTESTATION_NAME = "cutover-attestation.json"
 CUTOVER_ATTESTATION_MAX_BYTES = 64 * 1024
 CUTOVER_ATTESTATION_MAX_TTL_SECONDS = 600.0
 CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS = 120.0
-REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v1"
+REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v2"
 REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA = (
-    "synapse-s2.replacement-admission-verification.v1"
+    "synapse-s2.replacement-admission-verification.v2"
 )
 REPLACEMENT_ADMISSION_NAME = "replacement-admission.json"
 REPLACEMENT_ADMISSION_MAX_BYTES = 64 * 1024
 REPLACEMENT_ADMISSION_MAX_TTL_SECONDS = 600.0
 REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS = 120.0
+REPLACEMENT_ADMISSION_MAX_PENDING_FILES = 1_000
 REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX = "replacement-certification:"
 MAXIMUM_EVIDENCE_AGE_SECONDS = 86_400.0
 MAXIMUM_UNIX_TIMESTAMP_SECONDS = 253_402_300_799.0
@@ -168,6 +169,9 @@ _REPLACEMENT_ADMISSION_CONTENT_KEYS = {
     "database_logical_snapshot_schema",
     "database_logical_snapshot_sha256",
     "capture_manifest_sha256",
+    "recovery_pending_file_count",
+    "recovery_replay_required_file_count",
+    "recovery_replay_required_capture_count",
     "runtime_state_required",
     "runtime_state_present",
     "runtime_state_canonical_sha256",
@@ -417,6 +421,7 @@ class ReplacementAdmissionRequest:
     build_id: str
     config_fingerprint: str
     ttl_seconds: float = REPLACEMENT_ADMISSION_MAX_TTL_SECONDS
+    expected_pending_file_count: int = 0
 
 
 def _normal_absolute(path: str | os.PathLike[str], *, name: str) -> Path:
@@ -1176,6 +1181,49 @@ def _validate_replacement_inspection(
     }
 
 
+def _replacement_capture_debt(
+    reconciliation: Any,
+    *,
+    expected_pending_file_count: int,
+    name: str,
+) -> dict[str, int]:
+    if (
+        type(expected_pending_file_count) is not int
+        or expected_pending_file_count < 0
+        or expected_pending_file_count > REPLACEMENT_ADMISSION_MAX_PENDING_FILES
+    ):
+        raise CutoverPreflightError(
+            "replacement pending capture count is invalid"
+        )
+    if not isinstance(reconciliation, Mapping):
+        raise CutoverPreflightError(f"{name} is missing")
+    observed = {
+        field: reconciliation.get(field) for field in REPLAY_DEBT_COUNTERS
+    }
+    if any(type(value) is not int or value < 0 for value in observed.values()):
+        raise CutoverPreflightError(f"{name} values are invalid")
+    expected = {
+        "missing_authoritative_ledger_count": 0,
+        "replay_required_capture_count": expected_pending_file_count,
+        "replay_required_file_count": expected_pending_file_count,
+        "identifierless_replay_file_count": 0,
+        "unclassified_file_count": 0,
+    }
+    if observed != expected:
+        raise CutoverPreflightError(
+            f"{name} does not match the admitted pending capture set"
+        )
+    return {
+        "recovery_pending_file_count": expected_pending_file_count,
+        "recovery_replay_required_file_count": int(
+            observed["replay_required_file_count"]
+        ),
+        "recovery_replay_required_capture_count": int(
+            observed["replay_required_capture_count"]
+        ),
+    }
+
+
 def _replacement_recovery_binding(
     *,
     memory_db: Path,
@@ -1184,11 +1232,17 @@ def _replacement_recovery_binding(
     restore_proof_path: Path,
     maximum_evidence_age_seconds: float,
     guarded_recovery_locks_held: bool = False,
+    expected_pending_file_count: int = 0,
 ) -> tuple[dict[str, Any], float]:
     maximum_age = _maximum_evidence_age(maximum_evidence_age_seconds)
-    if type(guarded_recovery_locks_held) is not bool:
+    if (
+        type(guarded_recovery_locks_held) is not bool
+        or type(expected_pending_file_count) is not int
+        or expected_pending_file_count < 0
+        or expected_pending_file_count > REPLACEMENT_ADMISSION_MAX_PENDING_FILES
+    ):
         raise CutoverPreflightError(
-            "replacement guarded-recovery lock ownership is invalid"
+            "replacement guarded-recovery request is invalid"
         )
     for path, name in (
         (memory_db, "live memory database"),
@@ -1203,10 +1257,15 @@ def _replacement_recovery_binding(
         repository_lock_path = (
             memory_db.parent / "recovery-locks" / "repository.lock"
         )
+        capture_lock_path = manager.daemon.paths()["lock_dir"] / GLOBAL_CAPTURE_LOCK
         if not guarded_recovery_locks_held:
             _assert_no_symlink_components(
                 repository_lock_path,
                 name="recovery repository lock",
+            )
+            _assert_no_symlink_components(
+                capture_lock_path,
+                name="capture maintenance lock",
             )
         lock_scope = (
             nullcontext()
@@ -1222,49 +1281,112 @@ def _replacement_recovery_binding(
         # the publisher already owns GuardedRecoveryPublication's exclusive
         # lock, while core startup takes this existing lock shared.
         with lock_scope:
-            parsed = manager._verify_bundle_locked(receipt_path)
-            receipt, identity_trusted = manager._read_bundle_receipt(receipt_path)
-            restore_proof = _read_json(
-                restore_proof_path,
-                name="isolated restore proof",
-            )
-            observed_now = _current_unix_timestamp_seconds()
-            receipt_created = _freshness_age_seconds(
-                receipt.get("created_at"),
-                name="replacement recovery bundle creation time",
-                now=observed_now,
-                maximum_age_seconds=maximum_age,
-            )
-            restore_created = _freshness_age_seconds(
-                restore_proof.get("created_at"),
-                name="replacement isolated restore time",
-                now=observed_now,
-                maximum_age_seconds=maximum_age,
-            )
-            if (
-                identity_trusted is not True
-                or parsed.get("receipt_identity_trusted") is not True
-                or parsed.get("verified") is not True
-                or parsed.get("cutover_ready") is not True
-                or parsed.get("bundle_receipt_path") != str(receipt_path)
-            ):
-                raise CutoverPreflightError(
-                    "replacement requires trusted cutover-ready recovery evidence"
+            capture_scope = (
+                nullcontext()
+                if guarded_recovery_locks_held
+                else manager._existing_private_file_lock(
+                    capture_lock_path,
+                    mode=fcntl.LOCK_EX,
+                    timeout_seconds=30.0,
                 )
-            recovery = verify_recovery_binding(
-                parsed=parsed,
-                receipt_path=receipt_path,
-                restore_proof=restore_proof,
-                restore_proof_path=restore_proof_path,
-                memory_db=memory_db,
-                capture_root=capture_root,
-                restored_target=False,
-                repository_lock_held=True,
-                capture_maintenance_lock_held=(
-                    guarded_recovery_locks_held
-                ),
             )
-            return recovery, min(receipt_created, restore_created) + maximum_age
+            with capture_scope:
+                parsed = manager._verify_bundle_locked(receipt_path)
+                receipt, identity_trusted = manager._read_bundle_receipt(receipt_path)
+                restore_proof = _read_json(
+                    restore_proof_path,
+                    name="isolated restore proof",
+                )
+                observed_now = _current_unix_timestamp_seconds()
+                receipt_created = _freshness_age_seconds(
+                    receipt.get("created_at"),
+                    name="replacement recovery bundle creation time",
+                    now=observed_now,
+                    maximum_age_seconds=maximum_age,
+                )
+                restore_created = _freshness_age_seconds(
+                    restore_proof.get("created_at"),
+                    name="replacement isolated restore time",
+                    now=observed_now,
+                    maximum_age_seconds=maximum_age,
+                )
+                expected_cutover_ready = expected_pending_file_count == 0
+                debt = _replacement_capture_debt(
+                    parsed.get("reconciliation"),
+                    expected_pending_file_count=expected_pending_file_count,
+                    name="replacement recovery reconciliation",
+                )
+                _replacement_capture_debt(
+                    restore_proof.get("reconciliation"),
+                    expected_pending_file_count=expected_pending_file_count,
+                    name="replacement isolated restore reconciliation",
+                )
+                expected_pending_state = {
+                    "pending_file_count": expected_pending_file_count,
+                    "replay_required_file_count": expected_pending_file_count,
+                    "replay_required_capture_count": expected_pending_file_count,
+                    "canonical_v2": True,
+                }
+                capture_status = manager.daemon.status()
+                zero_status_fields = (
+                    "inbox_temp_file_count",
+                    "processing_file_count",
+                    "processing_empty_claim_count",
+                    "processing_malformed_claim_count",
+                    "error_file_count",
+                    "unresolved_error_count",
+                    "terminal_error_evidence_count",
+                    "historical_error_evidence_count",
+                    "unsafe_error_artifact_count",
+                    "error_resolution_pending_count",
+                    "error_resolution_failed_count",
+                )
+                capture_binding = parsed.get("capture_ledger_binding")
+                restore_binding = restore_proof.get("capture_ledger_binding")
+                if (
+                    identity_trusted is not True
+                    or parsed.get("receipt_identity_trusted") is not True
+                    or parsed.get("verified") is not True
+                    or parsed.get("cutover_ready") is not expected_cutover_ready
+                    or parsed.get("bundle_receipt_path") != str(receipt_path)
+                    or parsed.get("capture_pending_state")
+                    != expected_pending_state
+                    or restore_proof.get("verified") is not True
+                    or restore_proof.get("cutover_ready")
+                    is not expected_cutover_ready
+                    or restore_proof.get("missing_transport_ledger_count") != 0
+                    or not isinstance(capture_binding, Mapping)
+                    or capture_binding.get("verified") is not True
+                    or not isinstance(restore_binding, Mapping)
+                    or restore_binding.get("verified") is not True
+                    or capture_status.get("transport_ready") is not True
+                    or capture_status.get("missing_transport_directories")
+                    or capture_status.get("unsafe_transport_directories")
+                    or capture_status.get("pending_file_count")
+                    != expected_pending_file_count
+                    or any(
+                        type(capture_status.get(field)) is not int
+                        or int(capture_status[field]) != 0
+                        for field in zero_status_fields
+                    )
+                ):
+                    raise CutoverPreflightError(
+                        "replacement recovery evidence does not match its exact "
+                        "admitted capture state"
+                    )
+                recovery = verify_recovery_binding(
+                    parsed=parsed,
+                    receipt_path=receipt_path,
+                    restore_proof=restore_proof,
+                    restore_proof_path=restore_proof_path,
+                    memory_db=memory_db,
+                    capture_root=capture_root,
+                    restored_target=False,
+                    repository_lock_held=True,
+                    capture_maintenance_lock_held=True,
+                )
+                recovery.update(debt)
+                return recovery, min(receipt_created, restore_created) + maximum_age
     except CutoverPreflightError:
         raise
     except Exception as exc:
@@ -1338,6 +1460,15 @@ def _replacement_admission_content(
             "database_logical_snapshot_sha256"
         ),
         "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
+        "recovery_pending_file_count": recovery.get(
+            "recovery_pending_file_count"
+        ),
+        "recovery_replay_required_file_count": recovery.get(
+            "recovery_replay_required_file_count"
+        ),
+        "recovery_replay_required_capture_count": recovery.get(
+            "recovery_replay_required_capture_count"
+        ),
         "runtime_state_required": recovery.get("runtime_state_required"),
         "runtime_state_present": recovery.get("runtime_state_present"),
         "runtime_state_canonical_sha256": recovery.get(
@@ -1470,6 +1601,16 @@ def _validate_replacement_admission(
             str(payload.get("capture_manifest_sha256") or "")
         )
         is None
+        or type(payload.get("recovery_pending_file_count")) is not int
+        or int(payload["recovery_pending_file_count"]) < 0
+        or int(payload["recovery_pending_file_count"])
+        > REPLACEMENT_ADMISSION_MAX_PENDING_FILES
+        or type(payload.get("recovery_replay_required_file_count")) is not int
+        or payload.get("recovery_replay_required_file_count")
+        != payload.get("recovery_pending_file_count")
+        or type(payload.get("recovery_replay_required_capture_count")) is not int
+        or payload.get("recovery_replay_required_capture_count")
+        != payload.get("recovery_pending_file_count")
         or payload.get("runtime_state_required") is not True
         or payload.get("runtime_state_present") is not True
         or _SHA256.fullmatch(
@@ -2037,6 +2178,15 @@ def publish_replacement_admission(
         maximum=REPLACEMENT_ADMISSION_MAX_TTL_SECONDS,
     )
     if (
+        type(request.expected_pending_file_count) is not int
+        or request.expected_pending_file_count < 0
+        or request.expected_pending_file_count
+        > REPLACEMENT_ADMISSION_MAX_PENDING_FILES
+    ):
+        raise CutoverPreflightError(
+            "replacement pending capture count is invalid"
+        )
+    if (
         _BUILD_ID.fullmatch(request.build_id) is None
         or _SHA256.fullmatch(request.config_fingerprint) is None
     ):
@@ -2063,6 +2213,7 @@ def publish_replacement_admission(
         restore_proof_path=recovery_restore_proof,
         maximum_evidence_age_seconds=maximum_evidence_age_seconds,
         guarded_recovery_locks_held=True,
+        expected_pending_file_count=request.expected_pending_file_count,
     )
     delivery = _replacement_delivery_binding(
         memory_db=memory_db,
@@ -2170,6 +2321,15 @@ def publish_replacement_admission(
             "delivery_audit_revision": expected_content[
                 "delivery_audit_revision"
             ],
+            "recovery_pending_file_count": expected_content[
+                "recovery_pending_file_count"
+            ],
+            "recovery_replay_required_file_count": expected_content[
+                "recovery_replay_required_file_count"
+            ],
+            "recovery_replay_required_capture_count": expected_content[
+                "recovery_replay_required_capture_count"
+            ],
             "verified": True,
         }
     except CutoverPreflightError:
@@ -2256,6 +2416,7 @@ def verify_replacement_admission_for_core(
         receipt_path=receipt_path,
         restore_proof_path=restore_proof_path,
         maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+        expected_pending_file_count=int(payload["recovery_pending_file_count"]),
     )
     delivery = _replacement_delivery_binding(
         memory_db=memory_db,
@@ -2301,6 +2462,9 @@ def verify_replacement_admission_for_core(
         "database_logical_snapshot_schema",
         "database_logical_snapshot_sha256",
         "capture_manifest_sha256",
+        "recovery_pending_file_count",
+        "recovery_replay_required_file_count",
+        "recovery_replay_required_capture_count",
         "runtime_state_required",
         "runtime_state_present",
         "runtime_state_canonical_sha256",

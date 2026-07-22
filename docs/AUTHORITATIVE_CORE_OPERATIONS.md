@@ -393,6 +393,18 @@ changing permissions on an existing caller-owned directory.
    candidate self-fences at admission expiry; never fall back to the predecessor
    build or continue promotion from that state.
 
+   Final wrapper shutdown may leave a bounded set of durable session-boundary
+   drops after every old writer is already disabled. Staging permits at most one
+   configured capture batch of pending files only when processing and every
+   error/reconciliation class are zero; that exact inbox is included in the
+   signed recovery bundle. The provisional core must drain the batch through
+   its governed exactly-once worker, and staging verifies a completely zero-debt
+   transport after stabilized health. The bounded drain permits only the
+   admitted files to move through a canonical processing claim and requires the
+   processed-archive and receipt totals to rise by that exact count. A partial
+   batch, malformed drop, error, unexpected new file, or remaining pending file
+   triggers the same verified exact-label cleanup and blocks certification.
+
    The existing authoritative client binding is deliberately retained so the
    certifier can exercise the staged service. It also means another already
    configured same-user MCP client could connect during this window. Close all
