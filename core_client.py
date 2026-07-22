@@ -27,6 +27,9 @@ from core_protocol import (
 from core_service import CORE_OPERATION_CONTRACTS, SAFE_READ_OPERATIONS
 
 
+SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS = 120.0
+
+
 class CoreUnavailable(RuntimeError):
     """The authoritative service could not be reached or authenticated."""
 
@@ -524,10 +527,18 @@ class CoreClient:
         return self.call("list_memory_graph", arguments)
 
     def audit_semantic_indexes(self, **arguments: Any) -> dict[str, Any]:
-        return self.call("audit_semantic_indexes", arguments)
+        return self.call(
+            "audit_semantic_indexes",
+            arguments,
+            timeout_seconds=SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
+        )
 
     def repair_semantic_indexes(self, **arguments: Any) -> dict[str, Any]:
-        return self.call("repair_semantic_indexes", arguments)
+        return self.call(
+            "repair_semantic_indexes",
+            arguments,
+            timeout_seconds=SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
+        )
 
     def resolve_recall_contexts(self, **arguments: Any) -> list[dict[str, Any]]:
         return self.call("resolve_recall_contexts", arguments)

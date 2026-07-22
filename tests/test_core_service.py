@@ -25,7 +25,13 @@ from core_request_journal import (
     CoreRequestJournalError,
     repair_empty_preclaim_journal_residue,
 )
-from core_client import CoreClient, CoreOutcomeUnknown, CoreRemoteError, CoreUnavailable
+from core_client import (
+    SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
+    CoreClient,
+    CoreOutcomeUnknown,
+    CoreRemoteError,
+    CoreUnavailable,
+)
 from core_protocol import (
     PROTOCOL_VERSION,
     build_request,
@@ -45,6 +51,7 @@ from core_service import (
     REPLICATION_MAINTENANCE_LANE_SECONDS,
     REPLICATION_OPERATIONS,
     SAFE_READ_OPERATIONS,
+    SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS,
     SERVICE_CONTROL_OPERATIONS,
     AuthoritativeCoreService,
     CoreConfig,
@@ -1415,6 +1422,38 @@ class CoreServiceTests(unittest.TestCase):
             )
             self.assertFalse(reconciliation["known"])
             self.assertEqual(reconciliation["state"], "not_found")
+        finally:
+            service._release_backend_lane()
+
+    def test_semantic_index_lane_has_a_bounded_long_operation_budget(self) -> None:
+        service = self.harness.service
+        for operation in (
+            "audit_semantic_indexes",
+            "repair_semantic_indexes",
+        ):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    service._backend_lane_timeout_floor(operation),
+                    SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS,
+                )
+        self.assertEqual(SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS, 120.0)
+        started = time.monotonic() - 31.0
+        acquired = service._acquire_backend_lane(
+            owner="semantic-index-maintenance",
+            timeout=0.0,
+            deadline_monotonic=(
+                started + SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS
+            ),
+        )
+        self.assertTrue(acquired)
+        try:
+            with service._backend_lane_state_lock:
+                service._backend_lane_started_monotonic = started
+            health = service._health_result()
+            self.assertTrue(health["ready"])
+            self.assertEqual(health["operational_state"], "maintenance")
+            self.assertTrue(health["backend_lane"]["maintenance"])
+            self.assertIsNone(health["backend_lane"]["blocker"])
         finally:
             service._release_backend_lane()
 
@@ -3882,6 +3921,48 @@ class CoreClientRetryTests(unittest.TestCase):
             with self.assertRaises(CoreUnavailable):
                 client.set_enabled(True)
             self.assertEqual(mutation_attempts, 1)
+
+    def test_semantic_index_operations_use_the_long_bounded_timeout(self) -> None:
+        with TemporaryDirectory() as temporary:
+            client = self.client(Path(temporary))
+            with mock.patch.object(
+                client,
+                "call",
+                return_value={"status": "ready"},
+            ) as call:
+                audit = client.audit_semantic_indexes(
+                    context_id=None,
+                    sample_limit=5,
+                )
+                repair = client.repair_semantic_indexes(
+                    context_id=None,
+                    confirm=True,
+                    expected_revision="a" * 64,
+                    sample_limit=5,
+                )
+        self.assertEqual(audit, {"status": "ready"})
+        self.assertEqual(repair, {"status": "ready"})
+        self.assertEqual(SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS, 120.0)
+        self.assertEqual(
+            call.call_args_list,
+            [
+                mock.call(
+                    "audit_semantic_indexes",
+                    {"context_id": None, "sample_limit": 5},
+                    timeout_seconds=SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    "repair_semantic_indexes",
+                    {
+                        "context_id": None,
+                        "confirm": True,
+                        "expected_revision": "a" * 64,
+                        "sample_limit": 5,
+                    },
+                    timeout_seconds=SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
+                ),
+            ],
+        )
 
     def test_retrieval_v2_contract_matches_backend_and_client_forwarding(self) -> None:
         contract = CORE_OPERATION_CONTRACTS["retrieve_text_v2"]

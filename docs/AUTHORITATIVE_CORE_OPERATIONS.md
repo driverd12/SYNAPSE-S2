@@ -433,6 +433,13 @@ changing permissions on an existing caller-owned directory.
    the installer deadline remains enforceable while the worker owns the capture
    maintenance lock.
 
+   Semantic-index audit and repair are likewise explicit bounded maintenance
+   lanes rather than ordinary 30-second RPCs. Both the authoritative client
+   and service allow up to 120 seconds for these full-store operations, so a
+   healthy audit that outlives a short caller timeout cannot be misclassified
+   as a stalled writer and poison the core. Health remains authenticated and
+   reports maintenance while either lane is active.
+
    The existing authoritative client binding is deliberately retained so the
    certifier can exercise the staged service. It also means another already
    configured same-user MCP client could connect during this window. Close all

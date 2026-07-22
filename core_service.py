@@ -99,6 +99,7 @@ AUTHORITATIVE_DEPLOYMENT_MODE = "authoritative"
 BACKEND_LANE_CAPTURE_TIMEOUT_SECONDS = 60.0
 BACKEND_LANE_CAPTURE_FILE_SECONDS = 5.0
 BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
+SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS = 120.0
 # The protocol accepts deadlines no farther than 300 seconds into the future.
 # Replication remains synchronous, so any transport timeout is reconciled by
 # request_status rather than implying a longer hidden server-side contract.
@@ -719,6 +720,12 @@ LONG_REPLICATION_OPERATIONS = frozenset(
     {
         "replication_create_checkpoint",
         "replication_stage_checkpoint",
+    }
+)
+LONG_SEMANTIC_INDEX_OPERATIONS = frozenset(
+    {
+        "audit_semantic_indexes",
+        "repair_semantic_indexes",
     }
 )
 DETERMINISTIC_DELIVERY_REJECTION_OPERATIONS = frozenset(
@@ -2713,6 +2720,8 @@ class AuthoritativeCoreService:
     def _backend_lane_timeout_floor(self, operation: str) -> float:
         if operation in LONG_REPLICATION_OPERATIONS:
             return REPLICATION_MAINTENANCE_LANE_SECONDS
+        if operation in LONG_SEMANTIC_INDEX_OPERATIONS:
+            return SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS
         return BACKEND_LANE_RPC_TIMEOUT_SECONDS
 
     def _release_backend_lane(self) -> None:
@@ -2737,7 +2746,10 @@ class AuthoritativeCoreService:
         if stale:
             self._fence_service("backend_lane_stalled")
             poisoned = "backend_lane_stalled"
-        maintenance = owner == "replication-maintenance"
+        maintenance = owner in {
+            "replication-maintenance",
+            "semantic-index-maintenance",
+        }
         return {
             "ready": not stale and poisoned is None,
             "active": owner is not None,
@@ -4480,7 +4492,11 @@ class AuthoritativeCoreService:
             owner=(
                 "replication-maintenance"
                 if contract.name in LONG_REPLICATION_OPERATIONS
-                else "rpc"
+                else (
+                    "semantic-index-maintenance"
+                    if contract.name in LONG_SEMANTIC_INDEX_OPERATIONS
+                    else "rpc"
+                )
             ),
             timeout=remaining,
             deadline_monotonic=(
