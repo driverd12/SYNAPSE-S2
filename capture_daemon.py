@@ -2255,20 +2255,28 @@ class CaptureInboxDaemon:
         deferred_file_count = 0
         idempotent_capture_count = 0
 
-        for claim_dir, path in claims:
-            outcome = self._process_claim(
-                claim_dir=claim_dir,
-                path=path,
-                paths=paths,
-            )
-            if outcome is None:
-                deferred_file_count += 1
-                continue
-            captures.extend(outcome["captures"])
-            errors.extend(outcome["errors"])
-            processed_file_count += int(outcome["processed_file_count"])
-            error_file_count += int(outcome["error_file_count"])
-            idempotent_capture_count += int(outcome["idempotent_capture_count"])
+        batch_context = contextlib.nullcontext()
+        if claims:
+            capture_batch = getattr(self.backend, "capture_batch", None)
+            if callable(capture_batch):
+                batch_context = capture_batch()
+        with batch_context:
+            for claim_dir, path in claims:
+                outcome = self._process_claim(
+                    claim_dir=claim_dir,
+                    path=path,
+                    paths=paths,
+                )
+                if outcome is None:
+                    deferred_file_count += 1
+                    continue
+                captures.extend(outcome["captures"])
+                errors.extend(outcome["errors"])
+                processed_file_count += int(outcome["processed_file_count"])
+                error_file_count += int(outcome["error_file_count"])
+                idempotent_capture_count += int(
+                    outcome["idempotent_capture_count"]
+                )
 
         captured_event_count = sum(int(item.get("event_count") or 0) for item in captures)
         captured_relationship_count = sum(

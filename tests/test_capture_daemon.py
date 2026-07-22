@@ -67,6 +67,29 @@ class RecordingBackend:
             return result
 
 
+class BatchRecordingBackend(RecordingBackend):
+    def __init__(self):
+        super().__init__()
+        self.batch_entry_count = 0
+        self.batch_exit_count = 0
+        self.in_batch = False
+        self.batch_observations: list[bool] = []
+
+    @contextmanager
+    def capture_batch(self):
+        self.batch_entry_count += 1
+        self.in_batch = True
+        try:
+            yield
+        finally:
+            self.in_batch = False
+            self.batch_exit_count += 1
+
+    def capture_conversation(self, **kwargs):
+        self.batch_observations.append(self.in_batch)
+        return super().capture_conversation(**kwargs)
+
+
 class FailOnceForCaptureBackend(RecordingBackend):
     def __init__(self, capture_id: str):
         super().__init__()
@@ -248,6 +271,30 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         self.assertEqual(backend.calls[0]["capture_id"], capture_id)
         self.assertEqual(backend.calls[0]["metadata"]["capture_id"], capture_id)
         self.assertNotIn("input_sha256", backend.calls[0]["metadata"])
+
+    def test_process_once_uses_one_backend_refresh_batch_for_all_claims(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend = BatchRecordingBackend()
+            for index in range(2):
+                write_capture_drop(
+                    root=root,
+                    context_id="batch-test",
+                    source_tag="batch-refresh",
+                    speaker="codex",
+                    text=f"Capture batch event {index}.",
+                    capture_id=f"s2cap_{index + 1:032x}",
+                )
+
+            result = CaptureInboxDaemon(
+                root=root,
+                backend=backend,
+            ).process_once(max_files=2)
+
+        self.assertEqual(result["processed_file_count"], 2)
+        self.assertEqual(backend.batch_entry_count, 1)
+        self.assertEqual(backend.batch_exit_count, 1)
+        self.assertEqual(backend.batch_observations, [True, True])
 
     def test_status_and_preflight_do_not_construct_mlx_backend(self):
         with TemporaryDirectory() as tmp:

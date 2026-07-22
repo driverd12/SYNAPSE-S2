@@ -636,13 +636,30 @@ else:
             pinned=True,
             replacement_pending_limit=3,
         )
-        post_capture.assert_called_once_with(self.paths.capture_root)
-        health.assert_called_once_with(
-            launchctl=mock.ANY,
-            config=config,
-            prior_pid=None,
-            wait_seconds=2,
-            expected_deployment_mode="replacement-certification",
+        post_capture.assert_called_once_with(
+            self.paths.capture_root,
+            blocking=False,
+        )
+        self.assertEqual(
+            health.call_args_list,
+            [
+                mock.call(
+                    launchctl=mock.ANY,
+                    config=config,
+                    prior_pid=None,
+                    wait_seconds=2,
+                    expected_deployment_mode="replacement-certification",
+                    require_capture_ready=False,
+                ),
+                mock.call(
+                    launchctl=mock.ANY,
+                    config=config,
+                    prior_pid=None,
+                    wait_seconds=2,
+                    expected_deployment_mode="replacement-certification",
+                    require_capture_ready=True,
+                ),
+            ],
         )
         launch_log = (self.base / "launchctl.log").read_text(encoding="utf-8")
         self.assertIn(str(staged_plist), launch_log)
@@ -2347,7 +2364,13 @@ else:
             "ready": True,
             "protocol_version": installer.PROTOCOL_VERSION,
             "deployment_mode": "authoritative",
-            "capture": {"enabled": True, "ready": True, "iteration_count": 1},
+            "capture": {
+                "enabled": True,
+                "ready": True,
+                "iteration_count": 1,
+                "error_count": 0,
+                "last_error_code": None,
+            },
         }
         type(client).authority_identity = mock.PropertyMock(return_value=identity)
         with mock.patch("core_client.CoreClient", return_value=client), mock.patch.object(
@@ -2368,6 +2391,33 @@ else:
                     config,
                     expected_deployment_mode="replacement-certification",
                 )["ready"]
+            )
+            client.health.return_value["capture"].update(
+                {
+                    "ready": False,
+                    "iteration_count": 0,
+                }
+            )
+            with self.assertRaisesRegex(
+                installer.CoreInstallerError,
+                "not ready",
+            ):
+                installer.probe_health(
+                    config,
+                    expected_deployment_mode="replacement-certification",
+                )
+            relaxed = installer.probe_health(
+                config,
+                expected_deployment_mode="replacement-certification",
+                require_capture_ready=False,
+            )
+            self.assertTrue(relaxed["ready"])
+            self.assertFalse(relaxed["capture_ready"])
+            client.health.return_value["capture"].update(
+                {
+                    "ready": True,
+                    "iteration_count": 1,
+                }
             )
             client.health.return_value["deployment_mode"] = "authoritative"
             identity["schema_identity"] = "sqlite-test-v6"
@@ -2409,7 +2459,13 @@ else:
             "ready": True,
             "protocol_version": installer.PROTOCOL_VERSION,
             "deployment_mode": "authoritative",
-            "capture": {"enabled": True, "ready": True, "iteration_count": 2},
+            "capture": {
+                "enabled": True,
+                "ready": True,
+                "iteration_count": 2,
+                "error_count": 0,
+                "last_error_code": None,
+            },
         }
         type(client).authority_identity = mock.PropertyMock(return_value=identity)
         verified = {

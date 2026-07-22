@@ -1073,6 +1073,7 @@ def probe_health(
     *,
     restored_target: bool = False,
     expected_deployment_mode: str = "authoritative",
+    require_capture_ready: bool = True,
 ) -> dict[str, Any]:
     from core_client import CoreClient
 
@@ -1095,6 +1096,12 @@ def probe_health(
     ):
         raise CoreInstallerError("authoritative-core identity is incomplete")
     capture = result.get("capture") if isinstance(result, dict) else None
+    capture_ready = bool(
+        isinstance(capture, dict)
+        and capture.get("ready") is True
+        and type(capture.get("iteration_count")) is int
+        and int(capture["iteration_count"]) >= 1
+    )
     if (
         not isinstance(result, dict)
         or result.get("ready") is not True
@@ -1102,8 +1109,13 @@ def probe_health(
         or result.get("deployment_mode") != expected_deployment_mode
         or not isinstance(capture, dict)
         or capture.get("enabled") is not True
-        or capture.get("ready") is not True
-        or int(capture.get("iteration_count", 0)) < 1
+        or type(capture.get("ready")) is not bool
+        or type(capture.get("iteration_count")) is not int
+        or int(capture["iteration_count"]) < 0
+        or type(capture.get("error_count")) is not int
+        or int(capture["error_count"]) < 0
+        or (not capture_ready and capture.get("last_error_code") is not None)
+        or (require_capture_ready and not capture_ready)
     ):
         raise CoreInstallerError("authoritative-core or embedded capture is not ready")
     expected = {
@@ -1144,7 +1156,7 @@ def probe_health(
     _private_token(config.socket_path.with_name(config.socket_path.name + ".token"))
     return {
         "ready": True,
-        "capture_ready": True,
+        "capture_ready": capture_ready,
         "authority_id": identity["authority_id"],
         "neural_epoch": identity["neural_epoch"],
         "build_id": identity["build_id"],
@@ -1163,6 +1175,7 @@ def wait_for_health(
     wait_seconds: float,
     restored_target: bool = False,
     expected_deployment_mode: str = "authoritative",
+    require_capture_ready: bool = True,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + wait_seconds
     last_pid = None
@@ -1176,6 +1189,7 @@ def wait_for_health(
                     config,
                     restored_target=restored_target,
                     expected_deployment_mode=expected_deployment_mode,
+                    require_capture_ready=require_capture_ready,
                 )
             except Exception:
                 health = None
@@ -1301,7 +1315,11 @@ def validate_replacement_capture_transport(
     return int(pending) + int(processing)
 
 
-def capture_transport_status(capture_root: Path) -> dict[str, Any]:
+def capture_transport_status(
+    capture_root: Path,
+    *,
+    blocking: bool = True,
+) -> dict[str, Any] | None:
     """Take one capture-transport snapshot behind the producer/daemon gate."""
 
     from capture_daemon import CaptureInboxDaemon, GLOBAL_CAPTURE_LOCK
@@ -1310,9 +1328,11 @@ def capture_transport_status(capture_root: Path) -> dict[str, Any]:
     paths = daemon.paths()
     with daemon._exclusive_lock(
         paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
-        blocking=True,
+        blocking=blocking,
     ) as acquired:
         if not acquired:
+            if not blocking:
+                return None
             raise CoreInstallerError(
                 "capture maintenance lock is unavailable during replacement drain"
             )
@@ -1360,7 +1380,14 @@ def wait_for_replacement_capture_drain(
         if field != "processing_file_count"
     )
     while True:
-        status = capture_transport_status(capture_root)
+        status = capture_transport_status(capture_root, blocking=False)
+        if status is None:
+            if time.monotonic() >= deadline:
+                raise CoreInstallerError(
+                    "replacement capture drain did not complete before its deadline"
+                )
+            time.sleep(0.1)
+            continue
         pending = status.get("pending_file_count")
         processing = status.get("processing_file_count")
         if (
@@ -2769,6 +2796,7 @@ def stage_replacement(
                 prior_pid=None,
                 wait_seconds=wait_seconds,
                 expected_deployment_mode="replacement-certification",
+                require_capture_ready=False,
             )
             wait_for_replacement_capture_drain(
                 capture_root=paths.capture_root,
@@ -2778,6 +2806,17 @@ def stage_replacement(
                     guarded_evidence.get("receipt_backed_file_count") or 0
                 ),
                 wait_seconds=wait_seconds,
+            )
+            health = wait_for_health(
+                launchctl=launchctl,
+                config=config,
+                prior_pid=None,
+                wait_seconds=min(
+                    wait_seconds,
+                    REPLACEMENT_ACTIVATION_HEADROOM_SECONDS,
+                ),
+                expected_deployment_mode="replacement-certification",
+                require_capture_ready=True,
             )
             certification_seconds_remaining = (
                 replacement_certification_seconds_remaining(admission)

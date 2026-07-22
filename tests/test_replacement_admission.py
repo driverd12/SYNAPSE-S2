@@ -960,15 +960,18 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 drain_deadline = time.monotonic() + 5.0
                 while time.monotonic() < drain_deadline:
                     drained_status = CaptureInboxDaemon(root=state_root).status()
+                    health = successor._health_result()
                     if (
                         drained_status["pending_file_count"] == 0
                         and drained_status["processing_file_count"] == 0
+                        and health["capture"]["ready"] is True
                     ):
                         break
                     time.sleep(0.05)
                 else:
-                    self.fail("provisional core did not drain admitted capture")
-                health = successor._health_result()
+                    self.fail(
+                        "provisional core did not drain and refresh admitted capture"
+                    )
                 with closing(sqlite3.connect(config.memory_path)) as connection:
                     successor_marker = json.loads(
                         connection.execute(

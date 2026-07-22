@@ -3242,6 +3242,44 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             )
         )
 
+    def test_capture_batch_coalesces_runtime_refreshes(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+            embedding_provider_name="semantic-hash",
+        )
+        refreshes: list[str] = []
+        backend._surface_recall_cache["stale"] = {"value": True}
+
+        with patch.object(
+            backend,
+            "_refresh_registered_traces",
+            side_effect=lambda: refreshes.append("traces"),
+        ), patch.object(
+            backend,
+            "_persist_runtime_state",
+            side_effect=lambda: refreshes.append("runtime"),
+        ), patch.object(
+            backend,
+            "_mark_activity",
+            side_effect=lambda: refreshes.append("activity"),
+        ):
+            with backend.capture_batch():
+                backend._refresh_after_capture(committed_new_operation=False)
+                with backend.capture_batch():
+                    backend._refresh_after_capture(
+                        committed_new_operation=True
+                    )
+                self.assertEqual(refreshes, [])
+                self.assertIn("stale", backend._surface_recall_cache)
+
+        self.assertEqual(refreshes, ["traces", "runtime", "activity"])
+        self.assertEqual(backend._surface_recall_cache, {})
+
     def test_replay_capture_operation_avoids_reobserving_dynamic_input(self):
         backend = SpikingAttentionBackend(
             dimension=32,

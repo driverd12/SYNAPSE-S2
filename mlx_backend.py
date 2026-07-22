@@ -654,6 +654,7 @@ class SpikingAttentionBackend:
         self.cortex_sessions: dict[str, dict[str, Any]] = {}
         self.registered_traces: list[dict[str, Any]] = []
         self._surface_recall_cache: dict[str, dict[str, Any]] = {}
+        self._capture_refresh_state = threading.local()
         self._retrieval_cursor_codec: RetrievalCursorCodec | None = None
         self._retrieval_cursor_lock = threading.Lock()
 
@@ -7844,7 +7845,48 @@ class SpikingAttentionBackend:
         self._refresh_after_capture(committed_new_operation=False)
         return response
 
+    @contextmanager
+    def capture_batch(self) -> Iterable[None]:
+        """Coalesce repairable runtime refreshes across one durable batch."""
+
+        state = self._capture_refresh_state
+        depth = int(getattr(state, "depth", 0))
+        state.depth = depth + 1
+        try:
+            yield
+        finally:
+            current_depth = int(getattr(state, "depth", 0))
+            if current_depth <= 0:
+                raise RuntimeError("capture refresh batch depth is invalid")
+            state.depth = current_depth - 1
+            if state.depth == 0:
+                refresh_requested = bool(
+                    getattr(state, "refresh_requested", False)
+                )
+                committed_new_operation = bool(
+                    getattr(state, "committed_new_operation", False)
+                )
+                state.refresh_requested = False
+                state.committed_new_operation = False
+                if refresh_requested:
+                    self._apply_capture_refresh(
+                        committed_new_operation=committed_new_operation
+                    )
+
     def _refresh_after_capture(self, *, committed_new_operation: bool) -> None:
+        state = self._capture_refresh_state
+        if int(getattr(state, "depth", 0)) > 0:
+            state.refresh_requested = True
+            state.committed_new_operation = bool(
+                getattr(state, "committed_new_operation", False)
+                or committed_new_operation
+            )
+            return
+        self._apply_capture_refresh(
+            committed_new_operation=committed_new_operation
+        )
+
+    def _apply_capture_refresh(self, *, committed_new_operation: bool) -> None:
         refreshes = [
             self._refresh_registered_traces,
             self._surface_recall_cache.clear,

@@ -410,6 +410,16 @@ changing permissions on an existing caller-owned directory.
    A queued capture that already has a matching transport receipt is also
    rejected before launch: its drain accounting is ambiguous until a governed
    reconciliation contract can prove the receipt, payload, and ledger together.
+   Candidate activation first proves the authority, socket, journal, and backend
+   while allowing the admitted capture worker to report `ready: false` only
+   during its first in-flight iteration. The installer then uses the separate
+   bounded drain window and requires a second stabilized health proof with the
+   capture worker fully ready. One daemon iteration coalesces repairable MLX
+   trace/cache/runtime refreshes across the admitted files, so a durable batch
+   pays that refresh cost once without weakening per-capture SQLite atomicity,
+   receipts, or archive moves. Drain observation uses nonblocking lock probes so
+   the installer deadline remains enforceable while the worker owns the capture
+   maintenance lock.
 
    The existing authoritative client binding is deliberately retained so the
    certifier can exercise the staged service. It also means another already
