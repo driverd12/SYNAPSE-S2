@@ -24,10 +24,16 @@ from core_protocol import (
     validate_reconciliation_projection,
     validate_response,
 )
-from core_service import CORE_OPERATION_CONTRACTS, SAFE_READ_OPERATIONS
+from core_service import (
+    CORE_OPERATION_CONTRACTS,
+    LONG_NEURAL_OPERATIONS,
+    NEURAL_OPERATION_LANE_SECONDS,
+    SAFE_READ_OPERATIONS,
+)
 
 
 SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS = 120.0
+NEURAL_OPERATION_TIMEOUT_SECONDS = NEURAL_OPERATION_LANE_SECONDS
 
 
 class CoreUnavailable(RuntimeError):
@@ -245,6 +251,8 @@ class CoreClient:
             if timeout_seconds is None
             else timeout_seconds
         )
+        if operation in LONG_NEURAL_OPERATIONS:
+            timeout = max(timeout, NEURAL_OPERATION_TIMEOUT_SECONDS)
         authentication_key = _read_authentication_key(self.authentication_path)
         deadline_unix_ms = int((time.time() + timeout) * 1000)
         request = build_request(

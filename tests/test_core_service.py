@@ -13,7 +13,7 @@ import stat
 import threading
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -26,6 +26,7 @@ from core_request_journal import (
     repair_empty_preclaim_journal_residue,
 )
 from core_client import (
+    NEURAL_OPERATION_TIMEOUT_SECONDS,
     SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
     CoreClient,
     CoreOutcomeUnknown,
@@ -45,6 +46,8 @@ from core_service import (
     CORE_OPERATION_CONTRACTS,
     LOGGER,
     MAX_ACTIVE_CONNECTIONS,
+    LONG_NEURAL_OPERATIONS,
+    NEURAL_OPERATION_LANE_SECONDS,
     REPLACEMENT_ADMISSION_ENV,
     REPLACEMENT_CERTIFICATION_MODE,
     REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX,
@@ -1456,6 +1459,83 @@ class CoreServiceTests(unittest.TestCase):
             self.assertIsNone(health["backend_lane"]["blocker"])
         finally:
             service._release_backend_lane()
+
+    def test_neural_operation_lane_has_a_bounded_long_operation_budget(self) -> None:
+        service = self.harness.service
+        expected_operations = {
+            "embed_text_payload",
+            "benchmark_embedding_provider",
+            "register_text_trace",
+            "register_trace",
+            "query_text",
+            "retrieve_text_v2",
+            "query",
+            "enter_spiking_cortex",
+            "cortex_tick",
+            "commit_cortical_trace",
+            "create_goal",
+            "update_goal",
+            "hydrate_agent_context",
+            "ingest_text_events",
+            "capture_conversation",
+            "benchmark_resource_profile",
+            "certify_runtime",
+            "run_quick_pruning",
+            "run_idle_maintenance",
+            "run_deep_sleep_consolidation",
+        }
+        self.assertEqual(LONG_NEURAL_OPERATIONS, expected_operations)
+        self.assertEqual(NEURAL_OPERATION_LANE_SECONDS, 120.0)
+        for operation in expected_operations:
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    service._backend_lane_timeout_floor(operation),
+                    NEURAL_OPERATION_LANE_SECONDS,
+                )
+        self.assertEqual(service._backend_lane_timeout_floor("status"), 30.0)
+
+        started = time.monotonic() - 31.0
+        acquired = service._acquire_backend_lane(
+            owner="rpc",
+            timeout=0.0,
+            deadline_monotonic=started + NEURAL_OPERATION_LANE_SECONDS,
+        )
+        self.assertTrue(acquired)
+        try:
+            with service._backend_lane_state_lock:
+                service._backend_lane_started_monotonic = started
+            health = service._health_result()
+            self.assertTrue(health["ready"])
+            self.assertEqual(health["operational_state"], "ready")
+            self.assertTrue(health["backend_lane"]["active"])
+            self.assertFalse(health["backend_lane"]["maintenance"])
+            self.assertFalse(
+                health["backend_lane"]["accepting_ordinary_operations"]
+            )
+            self.assertIsNone(health["backend_lane"]["blocker"])
+        finally:
+            service._release_backend_lane()
+
+    def test_backend_handlers_enter_the_backend_execution_context(self) -> None:
+        entered = 0
+        exited = 0
+
+        @contextmanager
+        def execution_context():
+            nonlocal entered, exited
+            entered += 1
+            try:
+                yield
+            finally:
+                exited += 1
+
+        self.harness.backend.execution_context = execution_context  # type: ignore[attr-defined]
+
+        result = self.harness.client().status()
+
+        self.assertEqual(result["runtime"], "ready")
+        self.assertEqual(entered, 1)
+        self.assertEqual(exited, 1)
 
     def test_hanging_backend_close_is_bounded_and_retains_all_references(self) -> None:
         entered = threading.Event()
@@ -3963,6 +4043,55 @@ class CoreClientRetryTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_neural_operations_apply_client_timeout_floor(self) -> None:
+        with TemporaryDirectory() as temporary:
+            client = self.client(Path(temporary))
+            observations: list[tuple[str, float, float]] = []
+
+            def exchange(
+                request: dict[str, Any],
+                *,
+                timeout_seconds: float,
+            ) -> Any:
+                deadline_seconds = (
+                    float(request["deadline_unix_ms"]) / 1000.0
+                ) - time.time()
+                observations.append(
+                    (request["operation"], timeout_seconds, deadline_seconds)
+                )
+                return self.response(request, {"status": "ready"})
+
+            client._exchange = exchange  # type: ignore[method-assign]
+            client.retrieve_text_v2("bounded neural read")
+            client.register_text_trace(
+                tag="bounded-neural-write",
+                text="A bounded neural mutation must not become ambiguous early.",
+            )
+            client.status()
+            client.call(
+                "retrieve_text_v2",
+                {"prompt": "caller requested a longer valid deadline"},
+                timeout_seconds=180.0,
+            )
+
+        self.assertEqual(
+            NEURAL_OPERATION_TIMEOUT_SECONDS,
+            NEURAL_OPERATION_LANE_SECONDS,
+        )
+        self.assertEqual(NEURAL_OPERATION_TIMEOUT_SECONDS, 120.0)
+        by_operation = observations[:3]
+        for operation, socket_timeout, deadline_seconds in by_operation[:2]:
+            with self.subTest(operation=operation):
+                self.assertGreaterEqual(socket_timeout, 119.0)
+                self.assertLessEqual(socket_timeout, 120.0)
+                self.assertGreaterEqual(deadline_seconds, 119.0)
+                self.assertLessEqual(deadline_seconds, 120.0)
+        self.assertEqual(by_operation[2][0], "status")
+        self.assertGreaterEqual(by_operation[2][1], 1.0)
+        self.assertLessEqual(by_operation[2][1], 2.0)
+        self.assertGreaterEqual(observations[3][1], 179.0)
+        self.assertLessEqual(observations[3][1], 180.0)
 
     def test_retrieval_v2_contract_matches_backend_and_client_forwarding(self) -> None:
         contract = CORE_OPERATION_CONTRACTS["retrieve_text_v2"]

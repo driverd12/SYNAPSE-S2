@@ -578,6 +578,12 @@ class SpikingAttentionBackend:
         self.W_lateral_decay_multiplier = 1.0
         self.control_plane_only = bool(control_plane_only)
         self._mx = native_mx
+        self._execution_stream = (
+            native_mx.new_thread_local_stream(native_mx.default_device())
+            if hasattr(native_mx, "new_thread_local_stream")
+            and hasattr(native_mx, "default_device")
+            else None
+        )
         self._lif_step = (
             None
             if self.control_plane_only
@@ -1635,6 +1641,17 @@ class SpikingAttentionBackend:
             except Exception as exc:  # pragma: no cover - compile varies by host
                 LOGGER.warning("mx.compile unavailable for LIF step: %s", exc)
         return lif_step
+
+    @contextmanager
+    def execution_context(self) -> Iterable[None]:
+        """Bind MLX's per-thread stream before a core worker touches arrays."""
+
+        execution_stream = getattr(self, "_execution_stream", None)
+        if execution_stream is None or not hasattr(self._mx, "stream"):
+            yield
+            return
+        with self._mx.stream(execution_stream):
+            yield
 
     def _build_mlxsnn_lif_layer(self) -> Any | None:
         if mlxsnn is None:

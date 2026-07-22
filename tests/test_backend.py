@@ -42,6 +42,34 @@ class SpikingAttentionBackendTests(unittest.TestCase):
                 )
         require_mx.assert_not_called()
 
+    def test_execution_context_binds_the_thread_local_mlx_stream(self):
+        entered: list[object] = []
+        exited: list[object] = []
+        stream_token = object()
+
+        class Scope:
+            def __enter__(self):
+                entered.append(stream_token)
+
+            def __exit__(self, exc_type, exc, traceback):
+                exited.append(stream_token)
+
+        class StreamAPI:
+            def stream(self, selected_stream):
+                self.asserted_stream = selected_stream
+                return Scope()
+
+        backend = object.__new__(SpikingAttentionBackend)
+        backend._mx = StreamAPI()
+        backend._execution_stream = stream_token
+
+        with backend.execution_context():
+            self.assertEqual(entered, [stream_token])
+            self.assertEqual(exited, [])
+
+        self.assertIs(backend._mx.asserted_stream, stream_token)
+        self.assertEqual(exited, [stream_token])
+
     def test_oversized_embedding_is_rejected_before_materialization_or_resize(self):
         class OversizedEmbeddingProbe:
             shape = (10_000,)

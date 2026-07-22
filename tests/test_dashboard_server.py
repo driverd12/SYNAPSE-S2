@@ -668,6 +668,106 @@ class DashboardRuntimeTests(unittest.TestCase):
             request_id="req-dashboard-status",
         )
 
+    def test_memory_hygiene_uses_stable_bounded_memory_pages(self):
+        backend = mock.Mock()
+        total_entries = 300
+
+        def page(**arguments):
+            cursor = str(arguments.get("cursor") or "")
+            offset = int(cursor.removeprefix("cursor-") or 0)
+            returned = min(50, total_entries - offset)
+            entries = [
+                {
+                    "memory_id": f"memory-{index}",
+                    "tag": f"trace-{index}",
+                    "context_id": "demo",
+                    "source_text": f"Low confidence trace {index}",
+                    "metadata": {"confidence": 0.4},
+                    "created_at": float(index),
+                    "updated_at": float(index),
+                }
+                for index in range(offset, offset + returned)
+            ]
+            next_offset = offset + returned
+            has_more = next_offset < total_entries
+            return {
+                "entries": entries,
+                "_retrieval_page": {
+                    "surface": "memory-list",
+                    "response_mode": "compact",
+                    "snapshot_revision": "stable-revision",
+                    "total": {"entries": total_entries},
+                    "returned": {"entries": returned},
+                    "has_more": has_more,
+                    "next_cursor": f"cursor-{next_offset}" if has_more else None,
+                },
+            }
+
+        backend.list_memory.side_effect = page
+        runtime = DashboardRuntime(backend)
+
+        hygiene = runtime.memory_hygiene(context_id="demo", limit=8)
+
+        self.assertEqual(hygiene["assessment_scope"], "recent-bounded-scan")
+        self.assertEqual(hygiene["scanned_entry_count"], 250)
+        self.assertEqual(hygiene["total_entry_count"], 300)
+        self.assertFalse(hygiene["scan_complete"])
+        self.assertEqual(hygiene["scan_limit"], 250)
+        self.assertEqual(hygiene["backlog_count"], 250)
+        self.assertEqual(len(hygiene["review_items"]), 8)
+        self.assertEqual(backend.list_memory.call_count, 5)
+        for call in backend.list_memory.call_args_list:
+            self.assertEqual(call.kwargs["limit"], 50)
+            self.assertEqual(call.kwargs["response_mode"], "compact")
+            self.assertTrue(call.kwargs["include_global"])
+            self.assertFalse(call.kwargs["include_vectors"])
+            self.assertEqual(call.kwargs["recall_scope"], "local")
+        backend.list_memory_graph.assert_not_called()
+
+    def test_memory_hygiene_rejects_nonadvancing_pages(self):
+        backend = mock.Mock()
+        backend.list_memory.side_effect = [
+            {
+                "entries": [
+                    {
+                        "memory_id": "memory-1",
+                        "tag": "trace-1",
+                        "source_text": "First trace",
+                        "metadata": {},
+                    }
+                ],
+                "_retrieval_page": {
+                    "surface": "memory-list",
+                    "response_mode": "compact",
+                    "snapshot_revision": "stable-revision",
+                    "total": {"entries": 2},
+                    "returned": {"entries": 1},
+                    "has_more": True,
+                    "next_cursor": "same-cursor",
+                },
+            },
+            {
+                "entries": [],
+                "_retrieval_page": {
+                    "surface": "memory-list",
+                    "response_mode": "compact",
+                    "snapshot_revision": "stable-revision",
+                    "total": {"entries": 2},
+                    "returned": {"entries": 0},
+                    "has_more": True,
+                    "next_cursor": "same-cursor",
+                },
+            },
+        ]
+        runtime = DashboardRuntime(backend)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "memory hygiene pagination did not complete",
+        ):
+            runtime.memory_hygiene(context_id="demo")
+        self.assertEqual(backend.list_memory.call_count, 2)
+
     def test_toggle_and_query_use_real_backend_state(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)

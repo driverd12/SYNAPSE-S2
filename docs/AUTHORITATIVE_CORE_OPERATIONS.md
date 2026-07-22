@@ -440,6 +440,25 @@ changing permissions on an existing caller-owned directory.
    as a stalled writer and poison the core. Health remains authenticated and
    reports maintenance while either lane is active.
 
+   Native neural operations use a separate 120-second bounded floor on both
+   the authoritative client and serialized backend lane. This covers embedding,
+   Retrieval v2, SNN query, trace registration, conversation/event capture,
+   Cortex recall and trace commits, goal writes, certification benchmarks, and
+   consolidation. A caller cannot shorten that floor and turn a healthy native
+   mutation into an avoidable `outcome_unknown`; longer valid deadlines remain
+   valid up to the protocol maximum. Ordinary status and graph control-plane
+   reads retain the 30-second lane fence. Every core RPC and capture worker also
+   enters the backend's MLX thread-local stream context before array execution,
+   so serialized work remains valid even though accepted requests run on
+   different OS threads.
+
+   Start Work and Context Health share one Memory Hygiene result. Hygiene reads
+   `memory-list` compact cursor pages of at most 50 entries, holds one snapshot
+   revision across the bounded scan, rejects repeated or malformed cursors, and
+   never serializes unrelated graph endpoints or relationship bodies. The
+   response states the exact total, scanned count, 250-entry scan ceiling, and
+   whether that bounded assessment covered the whole namespace.
+
    The existing authoritative client binding is deliberately retained so the
    certifier can exercise the staged service. It also means another already
    configured same-user MCP client could connect during this window. Close all

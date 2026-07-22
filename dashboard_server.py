@@ -50,6 +50,7 @@ from redaction import (  # noqa: E402
     strip_untrusted_raw_digest_fields,
 )
 from transcript_capture import TranscriptCaptureManager  # noqa: E402
+from token_contracts import COMPACT_SOURCE_LIMITS  # noqa: E402
 
 
 LOGGER = logging.getLogger("synapse_s2.dashboard")
@@ -1881,7 +1882,12 @@ class DashboardRuntime:
             "generated_at": time.time(),
         }
 
-    def context_health(self, *, context_id: str) -> dict[str, Any]:
+    def context_health(
+        self,
+        *,
+        context_id: str,
+        hygiene: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         context = mlx_backend.sanitize_context_id(context_id)
         started = time.perf_counter()
         factors: list[dict[str, Any]] = []
@@ -1930,7 +1936,8 @@ class DashboardRuntime:
                 points_lost=loss,
             )
 
-        hygiene = self.memory_hygiene(context_id=context, limit=25)
+        if hygiene is None:
+            hygiene = self.memory_hygiene(context_id=context, limit=25)
         hygiene_loss = min(22, int(hygiene.get("backlog_count") or 0) * 4)
         memory_quality_score = max(0, 100 - hygiene_loss)
         add_factor(
@@ -2010,10 +2017,113 @@ class DashboardRuntime:
             "generated_at": time.time(),
         }
 
+    def _memory_hygiene_entries(
+        self,
+        *,
+        context_id: str,
+        scan_limit: int = 250,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Read a stable, bounded entry sample without serializing graph edges."""
+
+        bounded_scan_limit = max(1, min(int(scan_limit), 1_000))
+        page_limit = int(COMPACT_SOURCE_LIMITS["memory-list"])
+        entries: list[dict[str, Any]] = []
+        seen_memory_ids: set[str] = set()
+        seen_cursors: set[str] = set()
+        cursor = ""
+        expected_total: int | None = None
+        expected_revision: str | None = None
+
+        while len(entries) < bounded_scan_limit:
+            page_payload = self.backend.list_memory(
+                context_id=context_id,
+                limit=min(page_limit, bounded_scan_limit - len(entries)),
+                include_global=True,
+                include_vectors=False,
+                recall_scope="local",
+                cursor=cursor,
+                response_mode="compact",
+            )
+            page = page_payload.get("_retrieval_page")
+            total = page.get("total") if isinstance(page, dict) else None
+            returned = page.get("returned") if isinstance(page, dict) else None
+            total_entries = total.get("entries") if isinstance(total, dict) else None
+            returned_entries = (
+                returned.get("entries") if isinstance(returned, dict) else None
+            )
+            has_more = page.get("has_more") if isinstance(page, dict) else None
+            next_cursor = page.get("next_cursor") if isinstance(page, dict) else None
+            revision = page.get("snapshot_revision") if isinstance(page, dict) else None
+            if (
+                not isinstance(page, dict)
+                or page.get("surface") != "memory-list"
+                or page.get("response_mode") != "compact"
+                or type(total_entries) is not int
+                or total_entries < 0
+                or type(returned_entries) is not int
+                or returned_entries < 0
+                or type(has_more) is not bool
+                or not isinstance(revision, str)
+                or not revision
+                or (
+                    has_more
+                    and (not isinstance(next_cursor, str) or not next_cursor)
+                )
+                or (not has_more and next_cursor is not None)
+            ):
+                raise RuntimeError("memory hygiene pagination metadata is invalid")
+
+            if expected_total is None:
+                expected_total = total_entries
+                expected_revision = revision
+            elif total_entries != expected_total or revision != expected_revision:
+                raise RuntimeError("memory hygiene snapshot changed during pagination")
+
+            raw_entries = page_payload.get("entries")
+            if not isinstance(raw_entries, list) or len(raw_entries) != returned_entries:
+                raise RuntimeError("memory hygiene page count is inconsistent")
+            page_ids: list[str] = []
+            for entry in raw_entries:
+                if not isinstance(entry, dict):
+                    raise RuntimeError("memory hygiene entry is invalid")
+                memory_id = str(entry.get("memory_id") or "")
+                if not memory_id:
+                    raise RuntimeError("memory hygiene entry identity is invalid")
+                page_ids.append(memory_id)
+            if len(page_ids) != len(set(page_ids)) or seen_memory_ids.intersection(
+                page_ids
+            ):
+                raise RuntimeError("memory hygiene entries did not advance")
+            seen_memory_ids.update(page_ids)
+            entries.extend(raw_entries)
+
+            target_count = min(expected_total, bounded_scan_limit)
+            if len(entries) == target_count:
+                break
+            if (
+                len(entries) > target_count
+                or not has_more
+                or returned_entries == 0
+                or next_cursor in seen_cursors
+            ):
+                raise RuntimeError("memory hygiene pagination did not complete")
+            assert isinstance(next_cursor, str)
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        assert expected_total is not None
+        return entries, {
+            "assessment_scope": "recent-bounded-scan",
+            "scanned_entry_count": len(entries),
+            "total_entry_count": expected_total,
+            "scan_complete": len(entries) == expected_total,
+            "scan_limit": bounded_scan_limit,
+            "snapshot_revision": expected_revision,
+        }
+
     def memory_hygiene(self, *, context_id: str, limit: int = 25) -> dict[str, Any]:
         context = mlx_backend.sanitize_context_id(context_id)
-        graph = self.backend.list_memory_graph(context_id=context, limit=250)
-        entries = list(graph.get("entries") or [])
+        entries, scan = self._memory_hygiene_entries(context_id=context)
         duplicate_seen: dict[str, str] = {}
         review_items: list[dict[str, Any]] = []
         queue_summary: dict[str, int] = {}
@@ -2041,6 +2151,7 @@ class DashboardRuntime:
             "context_id": context,
             "status": status,
             "backlog_count": backlog_count,
+            **scan,
             "review_items": bounded_items,
             "queue_summary": dict(sorted(queue_summary.items())),
             "memory_quality_score": max(0, 100 - min(60, backlog_count * 5)),
@@ -2367,8 +2478,12 @@ class DashboardRuntime:
         context = mlx_backend.sanitize_context_id(context_id)
         agent = mlx_backend.sanitize_agent_id(agent_id or "dashboard-ui").casefold()
         started = time.perf_counter()
-        health = self.context_health(context_id=context)
-        hygiene = self.memory_hygiene(context_id=context, limit=8)
+        hygiene = self.memory_hygiene(context_id=context, limit=25)
+        health = self.context_health(context_id=context, hygiene=hygiene)
+        hygiene = {
+            **hygiene,
+            "review_items": list(hygiene.get("review_items") or [])[:8],
+        }
         hydrate = self.backend.hydrate_agent_context(
             context_id=context,
             agent_id=agent,

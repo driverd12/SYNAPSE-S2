@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -99,6 +100,7 @@ AUTHORITATIVE_DEPLOYMENT_MODE = "authoritative"
 BACKEND_LANE_CAPTURE_TIMEOUT_SECONDS = 60.0
 BACKEND_LANE_CAPTURE_FILE_SECONDS = 5.0
 BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
+NEURAL_OPERATION_LANE_SECONDS = 120.0
 SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS = 120.0
 # The protocol accepts deadlines no farther than 300 seconds into the future.
 # Replication remains synchronous, so any transport timeout is reconciled by
@@ -726,6 +728,30 @@ LONG_SEMANTIC_INDEX_OPERATIONS = frozenset(
     {
         "audit_semantic_indexes",
         "repair_semantic_indexes",
+    }
+)
+LONG_NEURAL_OPERATIONS = frozenset(
+    {
+        "embed_text_payload",
+        "benchmark_embedding_provider",
+        "register_text_trace",
+        "register_trace",
+        "query_text",
+        "retrieve_text_v2",
+        "query",
+        "enter_spiking_cortex",
+        "cortex_tick",
+        "commit_cortical_trace",
+        "create_goal",
+        "update_goal",
+        "hydrate_agent_context",
+        "ingest_text_events",
+        "capture_conversation",
+        "benchmark_resource_profile",
+        "certify_runtime",
+        "run_quick_pruning",
+        "run_idle_maintenance",
+        "run_deep_sleep_consolidation",
     }
 )
 DETERMINISTIC_DELIVERY_REJECTION_OPERATIONS = frozenset(
@@ -2717,11 +2743,23 @@ class AuthoritativeCoreService:
             self._backend_lane_deadline_monotonic = deadline_monotonic
         return True
 
+    @contextmanager
+    def _backend_execution_context(self) -> Any:
+        backend = self._backend
+        execution_context = getattr(backend, "execution_context", None)
+        if not callable(execution_context):
+            yield
+            return
+        with execution_context():
+            yield
+
     def _backend_lane_timeout_floor(self, operation: str) -> float:
         if operation in LONG_REPLICATION_OPERATIONS:
             return REPLICATION_MAINTENANCE_LANE_SECONDS
         if operation in LONG_SEMANTIC_INDEX_OPERATIONS:
             return SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS
+        if operation in LONG_NEURAL_OPERATIONS:
+            return NEURAL_OPERATION_LANE_SECONDS
         return BACKEND_LANE_RPC_TIMEOUT_SECONDS
 
     def _release_backend_lane(self) -> None:
@@ -4124,17 +4162,18 @@ class AuthoritativeCoreService:
                 self._assert_live_authority()
                 if self._stop_event.is_set():
                     break
-                result = self._capture_worker.process_once(
-                    max_files=self.config.capture_max_files
-                )
-                if self.config.poll_transcript_sources:
-                    from capture_daemon import _poll_transcript_sources
-
-                    _poll_transcript_sources(
-                        root=self.config.capture_root,
-                        backend=self._backend,
-                        max_bytes=self.config.max_transcript_bytes,
+                with self._backend_execution_context():
+                    result = self._capture_worker.process_once(
+                        max_files=self.config.capture_max_files
                     )
+                    if self.config.poll_transcript_sources:
+                        from capture_daemon import _poll_transcript_sources
+
+                        _poll_transcript_sources(
+                            root=self.config.capture_root,
+                            backend=self._backend,
+                            max_bytes=self.config.max_transcript_bytes,
+                        )
                 self._assert_live_authority()
                 processed = int(result.get("processed_file_count", 0))
                 errors = int(result.get("error_file_count", 0))
@@ -4587,7 +4626,8 @@ class AuthoritativeCoreService:
                     for token in path_tokens:
                         token.assert_stable()
                     self._assert_live_authority()
-                    result = self._handlers[contract.name](**authorized_arguments)
+                    with self._backend_execution_context():
+                        result = self._handlers[contract.name](**authorized_arguments)
                     self._assert_live_authority()
                     response = self._response(request, result=result)
                     self._bounded_response_bytes(response)
@@ -4702,7 +4742,8 @@ class AuthoritativeCoreService:
                     for token in path_tokens:
                         token.assert_stable()
                     self._assert_live_authority()
-                    result = self._handlers[contract.name](**authorized_arguments)
+                    with self._backend_execution_context():
+                        result = self._handlers[contract.name](**authorized_arguments)
                     self._assert_live_authority()
                     response = self._response(request, result=result)
                     # Prove the complete envelope fits before publishing it.
