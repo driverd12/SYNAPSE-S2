@@ -1660,6 +1660,27 @@ class OperatorReadinessCertifier:
         self.artifact_dir.mkdir(mode=0o700)
         self.metadata = self._run_metadata()
         self._write_json(self.artifact_dir / "run_metadata.json", self.metadata)
+        if self._source_checkout_dirty():
+            self._record_manual(
+                "source_checkout_clean",
+                label="Source checkout clean",
+                status="blocked",
+                required=False,
+                detail=(
+                    "Operator-readiness certification requires a clean source "
+                    "checkout before producing cutover evidence."
+                ),
+                repair=(
+                    "Commit or explicitly preserve local changes, rerun the "
+                    "client-config installer, and restart certification from a "
+                    "clean git status."
+                ),
+                metrics={
+                    "git": self.metadata.get("git", {}),
+                    "checked_before_live_probes": True,
+                },
+            )
+            return self._finalize()
 
         runtime_build = self._check_runtime_build_identity()
         if runtime_build.status != "ready":
@@ -1894,6 +1915,14 @@ class OperatorReadinessCertifier:
             "branch": git("branch", "--show-current"),
             "status_short": git("status", "--short"),
         }
+
+    def _source_checkout_dirty(self) -> bool:
+        git = self.metadata.get("git")
+        if not isinstance(git, dict):
+            return True
+        return not str(git.get("head") or "").strip() or bool(
+            str(git.get("status_short") or "").strip()
+        )
 
     def _base_env(self) -> dict[str, str]:
         # Probes execute a broad dependency surface (FastMCP, Python, MLX).

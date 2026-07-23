@@ -4,7 +4,6 @@
       "args": [],
       "command": "/Users/dan.driver/.local/bin/synapse-s2-mcp",
       "env": {
-        "PYTHONPATH": "/Users/dan.driver/Documents/Playground/SYNAPSE-S2",
         "SYNAPSE_S2_CLIENT_AGENT_ID": "project-mcp",
         "SYNAPSE_S2_CLIENT_CORTEX": "1",
         "SYNAPSE_S2_CLIENT_CORTEX_MODE": "strict",

@@ -28,6 +28,12 @@ For a reviewed noncanonical layout, pass the same
 `--noncanonical-layout-manifest` to `publish-binding`, this certifier, and the
 eventual install.
 
+`scripts/install_client_configs.py` intentionally keeps persisted client JSON
+free of `PYTHONPATH`. The installed launcher resolves its own real checkout
+root and prepends that path at runtime. This keeps tracked project-scoped
+`.mcp.json` host-path-neutral, including reviewed noncanonical layouts, while
+still routing each Mac to its local repository.
+
 ## Run
 
 ```bash
@@ -53,6 +59,10 @@ The command writes:
 - `.synapse_s2/evidence_packs/<run-id>.zip`
 
 Exit code `0` means every required proof returned `ready`. Any `degraded` or `blocked` required proof returns a non-zero exit code and must be treated as not ready until rerun cleanly.
+
+The certifier checks the source checkout before live probes. A non-empty
+`git status --short` produces a blocked diagnostic pack immediately; it must not
+be treated as operator-ready or used for cutover.
 
 ## What It Proves
 

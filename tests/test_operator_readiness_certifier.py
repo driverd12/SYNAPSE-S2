@@ -1258,7 +1258,15 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 required=True,
                 detail="Synthetic runtime build mismatch.",
             )
-            certifier._run_metadata = mock.Mock(return_value={})
+            certifier._run_metadata = mock.Mock(
+                return_value={
+                    "git": {
+                        "head": "709330378b0902841cb15a0b82971eea4fe3969e",
+                        "branch": "main",
+                        "status_short": "",
+                    }
+                }
+            )
             certifier._write_json = mock.Mock()
             certifier._check_runtime_build_identity = mock.Mock(
                 return_value=blocked
@@ -1276,6 +1284,40 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             certifier._check_runtime_build_identity.assert_called_once_with()
             certifier._check_mcp_connect.assert_not_called()
             certifier._check_memory_write.assert_not_called()
+            certifier._guarded_recovery_and_finalize.assert_not_called()
+            certifier._finalize.assert_called_once_with()
+
+    def test_run_stops_before_expensive_probes_on_dirty_source_checkout(self):
+        with TemporaryDirectory() as tmp:
+            certifier, _, _ = self._bound_certifier(
+                Path(tmp),
+                authority_mode="authoritative-core-v6",
+            )
+            certifier._run_metadata = mock.Mock(
+                return_value={
+                    "git": {
+                        "head": "709330378b0902841cb15a0b82971eea4fe3969e",
+                        "branch": "main",
+                        "status_short": "M .mcp.json",
+                    }
+                }
+            )
+            certifier._write_json = mock.Mock()
+            certifier._check_runtime_build_identity = mock.Mock()
+            certifier._check_mcp_connect = mock.Mock()
+            certifier._guarded_recovery_and_finalize = mock.Mock()
+            certifier._finalize = mock.Mock(
+                return_value={"overall_status": "blocked"}
+            )
+
+            result = certifier.run()
+
+            self.assertEqual(result["overall_status"], "blocked")
+            self.assertEqual(certifier.results[0].check_id, "source_checkout_clean")
+            self.assertEqual(certifier.results[0].status, "blocked")
+            self.assertFalse(certifier.results[0].required)
+            certifier._check_runtime_build_identity.assert_not_called()
+            certifier._check_mcp_connect.assert_not_called()
             certifier._guarded_recovery_and_finalize.assert_not_called()
             certifier._finalize.assert_called_once_with()
 
@@ -2142,6 +2184,11 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     "run_id": certifier.run_id,
                     "context_id": certifier.context,
                     "agent_id": certifier.agent_id,
+                    "git": {
+                        "head": "709330378b0902841cb15a0b82971eea4fe3969e",
+                        "branch": "main",
+                        "status_short": "",
+                    },
                 }
             )
             certifier._write_json = mock.Mock()

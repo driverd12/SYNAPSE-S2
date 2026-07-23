@@ -126,7 +126,12 @@ def build_server_definition(
         "command": str(launcher),
         "args": [],
         "env": {
-            "PYTHONPATH": str(repo),
+            # The local launcher is the authority for the checkout path: it
+            # cd's into its install-time repository and prepends that path to
+            # PYTHONPATH before starting mcp_client_wrapper.py. Keeping
+            # PYTHONPATH out of persisted client JSON prevents tracked
+            # project-scoped .mcp.json from becoming host-path-specific while
+            # still resolving the real repository on each Mac.
             **route_env,
             "SYNAPSE_S2_DEFAULT_RESPONSE_MODE": DEFAULT_RESPONSE_MODE,
             "SYNAPSE_S2_MAX_RESPONSE_BYTES": DEFAULT_MAX_RESPONSE_BYTES,

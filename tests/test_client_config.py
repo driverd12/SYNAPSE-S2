@@ -248,7 +248,7 @@ class ClientConfigTests(unittest.TestCase):
 
         self.assertEqual(server["type"], "stdio")
         self.assertEqual(server["command"], str(launcher.resolve()))
-        self.assertEqual(server["env"]["PYTHONPATH"], str(resolved_repo))
+        self.assertNotIn("PYTHONPATH", server["env"])
         self.assertNotIn(BINDING_ENV, server["env"])
         self.assertNotIn("SYNAPSE_S2_CORE_SOCKET", server["env"])
         self.assertEqual(server["env"]["MLX_DEVICE"], "gpu")
@@ -295,6 +295,7 @@ class ClientConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(server["env"][BINDING_ENV], str(binding_path))
+        self.assertNotIn("PYTHONPATH", server["env"])
         self.assertFalse(DIRECT_ROUTE_ENV & set(server["env"]))
 
     def test_server_definition_rejects_binding_without_its_reviewed_path(self):
@@ -383,6 +384,7 @@ class ClientConfigTests(unittest.TestCase):
         )
         self.assertIn("[mcp_servers.synapse-s2]", codex_text)
         self.assertIn(str(launcher), codex_text)
+        self.assertNotIn("PYTHONPATH", codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_SESSION_BRIDGE = "1"', codex_text)
         self.assertIn('SYNAPSE_S2_CLIENT_CORTEX = "1"', codex_text)
@@ -444,8 +446,10 @@ class ClientConfigTests(unittest.TestCase):
         )
         for definition in definitions:
             self.assertEqual(definition["env"][BINDING_ENV], str(binding_path))
+            self.assertNotIn("PYTHONPATH", definition["env"])
             self.assertFalse(DIRECT_ROUTE_ENV & set(definition["env"]))
         self.assertIn(f'{BINDING_ENV} = "{binding_path}"', codex)
+        self.assertNotIn("PYTHONPATH", codex)
         self.assertFalse(DIRECT_ROUTE_ENV & set(key for key in DIRECT_ROUTE_ENV if key in codex))
         self.assertEqual(result["core_binding"]["digest"], binding.digest)
         self.assertEqual(result["core_binding"]["authority_mode"], "candidate-local-v5")
@@ -477,6 +481,7 @@ command = "node"
         self.assertIn('model = "gpt-5.5"', merged)
         self.assertIn("[mcp_servers.other]", merged)
         self.assertIn(str(launcher), merged)
+        self.assertNotIn("PYTHONPATH", merged)
         self.assertIn('SYNAPSE_S2_CLIENT_AGENT_ID = "codex-desktop"', merged)
         self.assertNotIn("SYNAPSE_S2_CORE_SOCKET", merged)
         self.assertNotIn(BINDING_ENV, merged)
