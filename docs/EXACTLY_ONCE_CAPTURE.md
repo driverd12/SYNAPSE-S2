@@ -165,6 +165,27 @@ content-free manifest records the operation identity and counts without storing
 filenames, raw content, or digests. Preserved artifacts are never replayed; any
 future review must be a separate evidence-handling action.
 
+If unsafe artifacts are discovered after they have already been moved into
+`capture_error_archive`, use the separate archive lane rather than fabricating a
+new active error root or manually moving files:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-unsafe-archive-preflight \
+  --capture-root '<reviewed-capture-root>' \
+  --reason '<operator-reviewed archive quarantine reason>'
+.venv/bin/python synapse_cli.py --json capture-unsafe-archive-quarantine \
+  --capture-root '<reviewed-capture-root>' \
+  --preflight-token '<preflight_token>' \
+  --reason '<same operator-reviewed archive quarantine reason>' \
+  --confirm
+```
+
+The archive lane recursively classifies resolved historical evidence without
+returning filenames, raw content, or content digests. It revalidates the exact
+device/inode/size/revision selection under the global capture lock, moves only
+the reviewed unsafe archive files into private non-replayable quarantine, and
+leaves the SQLite database and primary memory IDs unchanged.
+
 Stale `capture_inbox/*.tmp` files are reconciled through the normal confirmed
 inbox processor. It uses inode/revision-bound staged discard evidence and does
 not ingest temporary payloads:

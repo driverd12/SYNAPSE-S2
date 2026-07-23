@@ -2036,6 +2036,52 @@ class SynapseCliTests(unittest.TestCase):
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
         self.assertEqual(json.loads(resolved.stdout)["resolved_count"], 1)
 
+    def test_cli_capture_unsafe_archive_quarantine(self):
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            memory_path = Path(tmp) / "memory.sqlite3"
+            capture_root = Path(tmp) / "capture-root"
+            daemon = CaptureInboxDaemon(root=capture_root)
+            daemon.prepare_transport()
+            archive_dir = capture_root / "capture_error_archive" / "historical"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            unsafe = archive_dir / "unsafe-resolved.json"
+            unsafe.write_text(
+                json.dumps({"api_key": "SYNTHETIC_ONLY_ARCHIVE_SECRET"}),
+                encoding="utf-8",
+            )
+            unsafe.chmod(0o600)
+            reason = "reviewed archived capture evidence"
+            preflight = self.run_cli(
+                "capture-unsafe-archive-preflight",
+                "--capture-root",
+                str(capture_root),
+                "--reason",
+                reason,
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+            token = json.loads(preflight.stdout)["preflight_token"]
+            quarantined = self.run_cli(
+                "capture-unsafe-archive-quarantine",
+                "--capture-root",
+                str(capture_root),
+                "--preflight-token",
+                token,
+                "--reason",
+                reason,
+                "--confirm",
+                state_path=state_path,
+                memory_path=memory_path,
+            )
+
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        self.assertEqual(json.loads(preflight.stdout)["selected_count"], 1)
+        self.assertEqual(quarantined.returncode, 0, quarantined.stderr)
+        payload = json.loads(quarantined.stdout)
+        self.assertEqual(payload["quarantined_count"], 1)
+        self.assertEqual(payload["remaining_unsafe_archived_error_count"], 0)
+
     def test_cli_capture_session_replays_supplied_capture_id(self):
         with TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

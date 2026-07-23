@@ -832,6 +832,52 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             self.assertIn(capture_id, receipt_text)
             self.assertIn(capture_id, processed_text)
 
+    def test_unsafe_resolved_archive_quarantine_unblocks_paired_bundle(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, db_path = self._seed_store(root)
+            daemon = CaptureInboxDaemon(root=root)
+            paths = daemon.paths()
+            archive_dir = paths["error_archive_dir"] / "historical" / "nested"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            unsafe = archive_dir / "resolved-unsafe-evidence.json"
+            unsafe.write_text(
+                json.dumps({"api_key": "SYNTHETIC_ONLY_ARCHIVE_SECRET"}),
+                encoding="utf-8",
+            )
+            unsafe.chmod(0o600)
+            manager = VerifiedRecoveryManager(store, capture_root=root)
+            before_database = db_path.read_bytes()
+
+            with self.assertRaisesRegex(RuntimeError, "secret hygiene"):
+                manager.create_bundle(
+                    root / "blocked-by-archive.sqlite3",
+                    purpose="unit-test",
+                    pinned=True,
+                )
+
+            preflight = daemon.unsafe_archived_error_quarantine_preflight(
+                reason="unit-test archive quarantine"
+            )
+            quarantine = daemon.quarantine_unsafe_archived_error_artifacts(
+                preflight_token=preflight["preflight_token"],
+                reason="unit-test archive quarantine",
+                confirm=True,
+            )
+            bundle = manager.create_bundle(
+                root / "unblocked.sqlite3",
+                purpose="unit-test",
+                pinned=True,
+            )
+            verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+
+            self.assertEqual(db_path.read_bytes(), before_database)
+            self.assertEqual(preflight["selected_count"], 1)
+            self.assertEqual(quarantine["quarantined_count"], 1)
+            self.assertEqual(quarantine["remaining_unsafe_archived_error_count"], 0)
+            self.assertTrue(bundle["bundle_verified"])
+            self.assertTrue(verified["verified"])
+
     def test_dans_mbp_legacy_v5_schema_contract_paired_bundle_and_preclaim(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

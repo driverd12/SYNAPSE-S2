@@ -681,6 +681,28 @@ def command_capture_unsafe_quarantine(args: argparse.Namespace) -> dict[str, Any
     )
 
 
+def command_capture_unsafe_archive_preflight(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return _capture_daemon_from_args(
+        args,
+        require_backend=False,
+    ).unsafe_archived_error_quarantine_preflight(reason=args.reason)
+
+
+def command_capture_unsafe_archive_quarantine(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return _capture_daemon_from_args(
+        args,
+        require_backend=False,
+    ).quarantine_unsafe_archived_error_artifacts(
+        preflight_token=args.preflight_token,
+        reason=args.reason,
+        confirm=bool(args.confirm),
+    )
+
+
 def _transcript_manager_from_args(args: argparse.Namespace) -> TranscriptCaptureManager:
     return TranscriptCaptureManager(root=args.capture_root, backend=build_backend(args))
 
@@ -2256,6 +2278,29 @@ def build_parser() -> argparse.ArgumentParser:
     capture_unsafe_quarantine.add_argument("--reason", required=True)
     capture_unsafe_quarantine.add_argument("--confirm", action="store_true")
     capture_unsafe_quarantine.set_defaults(func=command_capture_unsafe_quarantine)
+
+    capture_unsafe_archive_preflight = subparsers.add_parser(
+        "capture-unsafe-archive-preflight"
+    )
+    capture_unsafe_archive_preflight.add_argument("--capture-root", default=None)
+    capture_unsafe_archive_preflight.add_argument("--reason", required=True)
+    capture_unsafe_archive_preflight.set_defaults(
+        func=command_capture_unsafe_archive_preflight
+    )
+
+    capture_unsafe_archive_quarantine = subparsers.add_parser(
+        "capture-unsafe-archive-quarantine"
+    )
+    capture_unsafe_archive_quarantine.add_argument("--capture-root", default=None)
+    capture_unsafe_archive_quarantine.add_argument(
+        "--preflight-token",
+        required=True,
+    )
+    capture_unsafe_archive_quarantine.add_argument("--reason", required=True)
+    capture_unsafe_archive_quarantine.add_argument("--confirm", action="store_true")
+    capture_unsafe_archive_quarantine.set_defaults(
+        func=command_capture_unsafe_archive_quarantine
+    )
 
     transcript_source_add = subparsers.add_parser("transcript-source-add")
     add_context(transcript_source_add)

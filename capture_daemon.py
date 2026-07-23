@@ -1324,6 +1324,159 @@ class CaptureInboxDaemon:
                 "replay_permitted": False,
             }
 
+    def unsafe_archived_error_quarantine_preflight(
+        self,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Describe a content-free quarantine for unsafe resolved archives."""
+
+        paths = self.paths()
+        self._ensure_transport_dirs(paths)
+        clean_reason, _ = redact_capture_text(" ".join(str(reason or "").split()))
+        if not clean_reason:
+            raise ValueError("a non-empty archive quarantine reason is required")
+        diagnostics = self._archived_error_artifact_diagnostics(paths)
+        return self._unsafe_error_quarantine_preflight_payload(
+            diagnostics=diagnostics,
+            reason=clean_reason,
+            action="capture-unsafe-archive-quarantine-preflight",
+            artifact_prefix="unsafe-capture-error-archive",
+        )
+
+    def quarantine_unsafe_archived_error_artifacts(
+        self,
+        *,
+        preflight_token: str,
+        reason: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Move unsafe resolved error archives into private quarantine.
+
+        This lane is intentionally separate from active ``capture_errors``:
+        already-resolved archives are recovery evidence, not replay input. The
+        operation returns no filenames, content, or content digests.
+        """
+
+        if not confirm:
+            raise ValueError(
+                "confirm=true is required to quarantine unsafe archived errors"
+            )
+        clean_reason, _ = redact_capture_text(" ".join(str(reason or "").split()))
+        if not clean_reason:
+            raise ValueError("a non-empty archive quarantine reason is required")
+        token = reject_sensitive_identifier(
+            preflight_token,
+            field="unsafe archived error quarantine preflight token",
+        ).strip()
+        if re.fullmatch(r"[0-9a-f]{64}", token) is None:
+            raise ValueError("invalid unsafe archived error quarantine preflight token")
+
+        paths = self.paths()
+        self._ensure_transport_dirs(paths)
+        with self._exclusive_lock(
+            paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
+            blocking=True,
+        ) as acquired:
+            if not acquired:
+                raise RuntimeError("capture maintenance lock is unavailable")
+            diagnostics = self._archived_error_artifact_diagnostics(paths)
+            preflight = self._unsafe_error_quarantine_preflight_payload(
+                diagnostics=diagnostics,
+                reason=clean_reason,
+                action="capture-unsafe-archive-quarantine-preflight",
+                artifact_prefix="unsafe-capture-error-archive",
+            )
+            if not secrets.compare_digest(token, preflight["preflight_token"]):
+                raise ValueError(
+                    "unsafe archived error set changed after preflight; review and retry"
+                )
+            selected = [
+                record
+                for record in diagnostics["records"]
+                if record["category"] == "unsafe"
+            ]
+            if not selected:
+                return {
+                    "action": "capture-unsafe-archive-quarantine",
+                    "status": "ready",
+                    "quarantined_count": 0,
+                    "quarantine_id": "",
+                    "reason": clean_reason,
+                }
+            quarantine_id = secrets.token_hex(16)
+            manifest_path = paths["error_quarantine_dir"] / (
+                f"unsafe-quarantine-{quarantine_id}.json"
+            )
+            items: list[dict[str, Any]] = []
+            for record in selected:
+                items.append(
+                    {
+                        "item_id": secrets.token_hex(16),
+                        "source_identity": record["token"],
+                        "source_lane": "capture_error_archive",
+                        "classification": "unsafe-resolved-capture-error-artifact",
+                        "archive_name": f"unsafe-{secrets.token_hex(16)}.artifact",
+                        "expected": self._error_resolution_expected_stat(
+                            record["stat"]
+                        ),
+                        "moved": False,
+                    }
+                )
+            manifest: dict[str, Any] = {
+                "schema": UNSAFE_ERROR_QUARANTINE_SCHEMA,
+                "quarantine_id": quarantine_id,
+                "state": "prepared",
+                "reason": clean_reason,
+                "source_lane": "capture_error_archive",
+                "confirmation_recorded": True,
+                "source_filenames_stored": False,
+                "content_returned": False,
+                "content_digest_recorded": False,
+                "raw_content_stored_in_manifest": False,
+                "replay_permitted": False,
+                "preflight_fence": token,
+                "created_at": time.time(),
+                "items": items,
+            }
+            self._write_unsafe_error_quarantine_manifest(manifest_path, manifest)
+            records_by_token = {str(record["token"]): record for record in selected}
+            for item in items:
+                record = records_by_token.get(str(item["source_identity"]))
+                if record is None:
+                    raise RuntimeError(
+                        "unsafe archived error source disappeared during quarantine"
+                    )
+                self._move_unsafe_archived_error_quarantine_item(
+                    paths=paths,
+                    record=record,
+                    item=item,
+                )
+                item["moved"] = True
+                item["quarantined_at"] = time.time()
+                self._write_unsafe_error_quarantine_manifest(
+                    manifest_path,
+                    manifest,
+                )
+            manifest["state"] = "complete"
+            manifest["completed_at"] = time.time()
+            self._write_unsafe_error_quarantine_manifest(manifest_path, manifest)
+            after = self._archived_error_artifact_diagnostics(paths)
+            return {
+                "action": "capture-unsafe-archive-quarantine",
+                "status": "ready",
+                "quarantined_count": len(items),
+                "quarantine_id": quarantine_id,
+                "reason": clean_reason,
+                "remaining_unsafe_archived_error_count": int(
+                    after["unsafe_error_count"]
+                ),
+                "content_returned": False,
+                "content_digests_returned": False,
+                "source_filenames_returned": False,
+                "replay_permitted": False,
+            }
+
     def _error_artifact_diagnostics(
         self,
         paths: dict[str, Path],
@@ -1424,6 +1577,126 @@ class CaptureInboxDaemon:
             "unresolved_error_count": historical_count + unsafe_count,
         }
 
+    def _archived_error_artifact_diagnostics(
+        self,
+        paths: dict[str, Path],
+    ) -> dict[str, Any]:
+        archive_dir = paths["error_archive_dir"]
+        records: list[dict[str, Any]] = []
+        unsafe_count = 0
+        try:
+            root_stat = archive_dir.lstat()
+        except FileNotFoundError:
+            return {
+                "records": [],
+                "terminal_evidence_count": 0,
+                "historical_evidence_count": 0,
+                "unsafe_error_count": 0,
+                "unresolved_error_count": 0,
+            }
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError("capture error archive is not a real directory")
+        for current_root, dir_names, file_names in os.walk(
+            archive_dir,
+            followlinks=False,
+        ):
+            current = Path(current_root)
+            for dir_name in list(dir_names):
+                directory_stat = (current / dir_name).lstat()
+                if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(
+                    directory_stat.st_mode
+                ):
+                    raise ValueError(
+                        "capture error archive contains an unsafe directory"
+                    )
+            directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            directory_flags |= getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            directory_fd = os.open(current, directory_flags)
+            try:
+                for file_name in sorted(file_names):
+                    path = current / file_name
+                    try:
+                        path_stat = path.lstat()
+                    except FileNotFoundError:
+                        continue
+                    category = "unsafe"
+                    parsed: dict[str, Any] | None = None
+                    if (
+                        stat.S_ISREG(path_stat.st_mode)
+                        and not stat.S_ISLNK(path_stat.st_mode)
+                        and path.suffix.lower() == ".json"
+                        and not path.name.startswith(".")
+                        and int(path_stat.st_size) <= MAX_CAPTURE_BYTES
+                    ):
+                        try:
+                            raw, opened_stat = _read_regular_file_at(
+                                directory_fd,
+                                file_name,
+                                max_bytes=MAX_CAPTURE_BYTES,
+                            )
+                            candidate = json.loads(raw.decode("utf-8"))
+                            redacted, redactions = redact_sensitive_value(candidate)
+                            (
+                                sanitized,
+                                digest_removals,
+                            ) = strip_untrusted_raw_digest_fields(redacted)
+                            if (
+                                isinstance(candidate, dict)
+                                and candidate == sanitized
+                                and not redactions
+                                and not digest_removals
+                                and candidate.get("raw_payload_retained") is not True
+                            ):
+                                parsed = candidate
+                                path_stat = opened_stat
+                                if (
+                                    candidate.get("artifact_type")
+                                    in RECOVERABLE_DISCARD_ARTIFACT_TYPES
+                                    and candidate.get("raw_payload_retained") is False
+                                    and str(candidate.get("disposition") or "")
+                                    in TERMINAL_ERROR_DISPOSITIONS
+                                ):
+                                    category = "terminal"
+                                else:
+                                    category = "historical"
+                        except (
+                            OSError,
+                            UnicodeError,
+                            ValueError,
+                            TypeError,
+                            json.JSONDecodeError,
+                        ):
+                            category = "unsafe"
+                    token = self._preflight_transport_token(
+                        path=path,
+                        stat_result=path_stat,
+                    )
+                    if category == "unsafe":
+                        unsafe_count += 1
+                    records.append(
+                        {
+                            "path": path,
+                            "stat": path_stat,
+                            "token": token,
+                            "category": category,
+                            "classified": parsed is not None,
+                        }
+                    )
+            finally:
+                os.close(directory_fd)
+        terminal_count = sum(1 for item in records if item["category"] == "terminal")
+        historical_count = sum(
+            1 for item in records if item["category"] == "historical"
+        )
+        return {
+            "records": records,
+            "terminal_evidence_count": terminal_count,
+            "historical_evidence_count": historical_count,
+            "unsafe_error_count": unsafe_count,
+            "unresolved_error_count": unsafe_count,
+        }
+
     def _error_resolution_preflight_payload(
         self,
         *,
@@ -1473,6 +1746,8 @@ class CaptureInboxDaemon:
         *,
         diagnostics: dict[str, Any],
         reason: str,
+        action: str = "capture-unsafe-error-quarantine-preflight",
+        artifact_prefix: str = "unsafe-capture-error",
     ) -> dict[str, Any]:
         unsafe_records = [
             record for record in diagnostics["records"] if record["category"] == "unsafe"
@@ -1488,7 +1763,7 @@ class CaptureInboxDaemon:
             json.dumps(token_payload, sort_keys=True, separators=(",", ":"))
         )
         return {
-            "action": "capture-unsafe-error-quarantine-preflight",
+            "action": action,
             "preflight_token": preflight_token,
             "unsafe_error_count": len(selected_tokens),
             "selected_count": len(selected_tokens),
@@ -1496,7 +1771,7 @@ class CaptureInboxDaemon:
             "ready_to_quarantine": bool(selected_tokens),
             "artifacts": [
                 {
-                    "artifact": f"unsafe-capture-error-{str(record['token'])[:16]}",
+                    "artifact": f"{artifact_prefix}-{str(record['token'])[:16]}",
                     "transport_token": str(record["token"]),
                     "classification": "unsafe-capture-error-artifact",
                     "bytes": int(record["stat"].st_size),
@@ -1558,6 +1833,38 @@ class CaptureInboxDaemon:
         except PermissionError:
             LOGGER.warning("could not chmod unsafe capture error quarantine archive")
         _fsync_directory(paths["error_dir"])
+        _fsync_directory(paths["error_quarantine_dir"])
+
+    def _move_unsafe_archived_error_quarantine_item(
+        self,
+        *,
+        paths: dict[str, Path],
+        record: dict[str, Any],
+        item: dict[str, Any],
+    ) -> None:
+        source = record["path"]
+        try:
+            source.relative_to(paths["error_archive_dir"])
+        except ValueError as exc:
+            raise ValueError("unsafe archived error source is outside archive") from exc
+        source_stat = source.lstat()
+        if _stat_identity(source_stat) != _stat_identity(record["stat"]):
+            raise ValueError(
+                "unsafe archived error artifact changed during quarantine"
+            )
+        archive_name = str(item["archive_name"])
+        if UNSAFE_ERROR_QUARANTINE_ARCHIVE_RE.fullmatch(archive_name) is None:
+            raise ValueError("invalid unsafe archived error archive identity")
+        destination = paths["error_quarantine_dir"] / archive_name
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError("unsafe archived error quarantine target exists")
+        os.replace(source, destination)
+        try:
+            destination.chmod(0o600)
+        except PermissionError:
+            LOGGER.warning("could not chmod unsafe archived error quarantine archive")
+        _fsync_directory(source.parent)
+        _fsync_directory(paths["error_archive_dir"])
         _fsync_directory(paths["error_quarantine_dir"])
 
     @staticmethod
