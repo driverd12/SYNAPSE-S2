@@ -132,6 +132,47 @@ previously failed suffix can commit. Never assign new IDs to records listed as
 committed merely to bypass a conflict. Legacy pre-v2 error files remain manual
 review items and are never auto-requeued.
 
+## Guarded legacy error recovery
+
+A legacy v5 transport can contain capture-error JSON artifacts that are not safe
+to inspect through normal logs or replay paths. Treat these artifacts as
+evidence, not as capture input. First run a content-free preflight against the
+offline or reviewed capture root:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-unsafe-preflight \
+  --capture-root '<reviewed-capture-root>' \
+  --reason '<operator-reviewed recovery reason>'
+```
+
+The preflight returns only bounded classification metadata, pseudo IDs, counts,
+revision tokens, byte sizes, and modification times. It deliberately returns no
+raw content, source filenames, or content digests, and it never permits blind
+replay. If the reviewed plan is still current, quarantine the exact revision:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-unsafe-quarantine \
+  --capture-root '<reviewed-capture-root>' \
+  --preflight-token '<preflight_token>' \
+  --reason '<operator-reviewed recovery reason>' \
+  --confirm
+```
+
+The quarantine operation rechecks the complete artifact set under the global
+capture lock, fails if the preflight token is stale, and moves only the exact
+inode/revision-bound unsafe artifacts into a private quarantine directory. The
+content-free manifest records the operation identity and counts without storing
+filenames, raw content, or digests. Preserved artifacts are never replayed; any
+future review must be a separate evidence-handling action.
+
+Stale `capture_inbox/*.tmp` files are reconciled through the normal confirmed
+inbox processor. It uses inode/revision-bound staged discard evidence and does
+not ingest temporary payloads:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
+```
+
 ## Governed historical ledger reconciliation
 
 A bounded hot-runtime cutover can leave a narrow legacy state: the old daemon
@@ -149,6 +190,36 @@ Run the read-only audit first:
 On the authoritative-core lane, the service injects the capture root from the
 reviewed binding; public calls must not pass `--capture-root`. That option is
 retained only for an explicitly offline local-v5 maintenance audit.
+
+If the only blocker is a legacy v5 database missing the capture-ledger schema,
+the local maintenance lane may be reviewed with explicit schema adoption:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root '<reviewed-capture-root>' \
+  --adopt-legacy-ledger-schema
+```
+
+This read-only audit is allowed only for the narrow missing-schema signature and
+binds that exact signature into the `audit_revision`. The confirmed repair may
+then install just the missing ledger/maintenance schema and populate
+`capture_operations` rows only from durable processed-file, database graph, and
+conversation-deployment evidence:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root '<reviewed-capture-root>' \
+  --repair --confirm \
+  --adopt-legacy-ledger-schema \
+  --expected-revision '<audit_revision>'
+.venv/bin/python synapse_cli.py --json capture-ledger-integrity \
+  --capture-root '<reviewed-capture-root>'
+```
+
+Schema adoption never recreates memories, relationships, deployments, capture
+receipts, or context acknowledgements. It writes only the missing ledger schema,
+evidence-derived compact ledger rows, and one content-free maintenance receipt
+after the normal verified safety backup.
 
 The audit binds processed payload identity, the normalized redacted request,
 namespace entries, relationship identities and endpoints, the unique durable

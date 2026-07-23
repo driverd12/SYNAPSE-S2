@@ -663,6 +663,24 @@ def command_capture_error_resolve(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def command_capture_unsafe_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    return _capture_daemon_from_args(
+        args,
+        require_backend=False,
+    ).unsafe_error_quarantine_preflight(reason=args.reason)
+
+
+def command_capture_unsafe_quarantine(args: argparse.Namespace) -> dict[str, Any]:
+    return _capture_daemon_from_args(
+        args,
+        require_backend=False,
+    ).quarantine_unsafe_error_artifacts(
+        preflight_token=args.preflight_token,
+        reason=args.reason,
+        confirm=bool(args.confirm),
+    )
+
+
 def _transcript_manager_from_args(args: argparse.Namespace) -> TranscriptCaptureManager:
     return TranscriptCaptureManager(root=args.capture_root, backend=build_backend(args))
 
@@ -1563,8 +1581,15 @@ def command_capture_ledger_integrity(args: argparse.Namespace) -> dict[str, Any]
             raise ValueError(
                 "capture root overrides are unavailable on the authoritative core lane"
             )
+        adopt_legacy_ledger_schema = bool(
+            getattr(args, "adopt_legacy_ledger_schema", False)
+        )
         if args.repair:
             if isinstance(backend, CoreClient):
+                if adopt_legacy_ledger_schema:
+                    raise ValueError(
+                        "legacy ledger schema adoption is only available on the local maintenance lane"
+                    )
                 return backend.repair_capture_ledger(
                     confirm=bool(args.confirm),
                     expected_revision=args.expected_revision,
@@ -1575,12 +1600,18 @@ def command_capture_ledger_integrity(args: argparse.Namespace) -> dict[str, Any]
                 confirm=bool(args.confirm),
                 expected_revision=args.expected_revision,
                 sample_limit=args.sample_limit,
+                adopt_legacy_ledger_schema=adopt_legacy_ledger_schema,
             )
         if isinstance(backend, CoreClient):
+            if adopt_legacy_ledger_schema:
+                raise ValueError(
+                    "legacy ledger schema adoption is only available on the local maintenance lane"
+                )
             return backend.audit_capture_ledger(sample_limit=args.sample_limit)
         return backend.audit_capture_ledger(
             capture_root=args.capture_root,
             sample_limit=args.sample_limit,
+            adopt_legacy_ledger_schema=adopt_legacy_ledger_schema,
         )
     finally:
         close = getattr(backend, "close", None)
@@ -2210,6 +2241,22 @@ def build_parser() -> argparse.ArgumentParser:
     capture_error_resolve.add_argument("--confirm", action="store_true")
     capture_error_resolve.set_defaults(func=command_capture_error_resolve)
 
+    capture_unsafe_preflight = subparsers.add_parser(
+        "capture-unsafe-preflight"
+    )
+    capture_unsafe_preflight.add_argument("--capture-root", default=None)
+    capture_unsafe_preflight.add_argument("--reason", required=True)
+    capture_unsafe_preflight.set_defaults(func=command_capture_unsafe_preflight)
+
+    capture_unsafe_quarantine = subparsers.add_parser(
+        "capture-unsafe-quarantine"
+    )
+    capture_unsafe_quarantine.add_argument("--capture-root", default=None)
+    capture_unsafe_quarantine.add_argument("--preflight-token", required=True)
+    capture_unsafe_quarantine.add_argument("--reason", required=True)
+    capture_unsafe_quarantine.add_argument("--confirm", action="store_true")
+    capture_unsafe_quarantine.set_defaults(func=command_capture_unsafe_quarantine)
+
     transcript_source_add = subparsers.add_parser("transcript-source-add")
     add_context(transcript_source_add)
     transcript_source_add.add_argument("--source-id", required=True)
@@ -2687,6 +2734,14 @@ def build_parser() -> argparse.ArgumentParser:
     capture_ledger.add_argument("--repair", action="store_true")
     capture_ledger.add_argument("--confirm", action="store_true")
     capture_ledger.add_argument("--expected-revision", default=None)
+    capture_ledger.add_argument(
+        "--adopt-legacy-ledger-schema",
+        action="store_true",
+        help=(
+            "Allow explicit local-v5 adoption of missing capture ledger tables "
+            "before reviewed reconciliation; never available through core RPC."
+        ),
+    )
     capture_ledger.set_defaults(func=command_capture_ledger_integrity)
 
     backup_recovery = subparsers.add_parser(

@@ -249,6 +249,76 @@ class CaptureLedgerReconciliationTests(unittest.TestCase):
         self.assertEqual(retried["state"], "already-completed")
         self.assertEqual(maintenance_count, 1)
 
+    def test_legacy_v5_missing_capture_operations_schema_is_adopted_then_reconciled(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._seed_legacy_gap(root)
+            with closing(sqlite3.connect(root / "memory.sqlite3")) as conn:
+                conn.executescript(
+                    """
+                    DROP INDEX IF EXISTS ix_capture_operations_context_committed;
+                    DROP INDEX IF EXISTS ux_capture_operations_deployment_event;
+                    DROP TABLE capture_operations;
+                    DROP INDEX IF EXISTS ix_store_maintenance_receipts_type_created;
+                    DROP TABLE store_maintenance_receipts;
+                    """
+                )
+                conn.commit()
+
+            strict_manager = VerifiedRecoveryManager(
+                fixture["backend"].memory_store,
+                capture_root=root,
+            )
+            with self.assertRaisesRegex(RuntimeError, "schema is invalid"):
+                strict_manager.audit_capture_ledger()
+
+            audit = fixture["manager"].audit_capture_ledger(
+                adopt_legacy_ledger_schema=True
+            )
+            repaired = fixture["manager"].repair_capture_ledger(
+                confirm=True,
+                expected_revision=audit["audit_revision"],
+                adopt_legacy_ledger_schema=True,
+            )
+            row = self._ledger_row(root, fixture["capture_id"])
+            with closing(sqlite3.connect(root / "memory.sqlite3")) as conn:
+                maintenance_payload = json.loads(
+                    conn.execute(
+                        """
+                        SELECT payload_json FROM store_maintenance_receipts
+                        WHERE operation_type = 'capture-ledger-reconciliation'
+                        """
+                    ).fetchone()[0]
+                )
+                graph_counts = {
+                    "entries": conn.execute(
+                        "SELECT COUNT(*) FROM memory_entries"
+                    ).fetchone()[0],
+                    "relationships": conn.execute(
+                        "SELECT COUNT(*) FROM memory_relationships"
+                    ).fetchone()[0],
+                    "deployments": conn.execute(
+                        "SELECT COUNT(*) FROM agent_context_events"
+                    ).fetchone()[0],
+                }
+
+        self.assertEqual(audit["status"], "degraded")
+        self.assertTrue(audit["schema_adoption_required"])
+        self.assertEqual(
+            audit["schema_adoption_errors"],
+            [
+                "capture_operations:missing-table",
+                "ix_store_maintenance_receipts_type_created:index-signature",
+                "store_maintenance_receipts:missing-table",
+            ],
+        )
+        self.assertEqual(repaired["state"], "completed")
+        self.assertTrue(repaired["verification_passed"])
+        self.assertIsNotNone(row)
+        self.assertEqual(graph_counts, fixture["graph_counts"])
+        self.assertTrue(maintenance_payload["legacy_schema_adopted"])
+        self.assertFalse(maintenance_payload["transport_receipts_synthesized"])
+
     def test_concurrent_managers_serialize_repair_audit_and_retry(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

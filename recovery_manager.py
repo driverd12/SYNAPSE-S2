@@ -41,6 +41,7 @@ from memory_store import (
     BACKUP_CRITICAL_TABLES,
     BACKUP_SCHEMA_COMPATIBILITY_REGISTRY,
     CAPTURE_PROTOCOL_VERSION,
+    SCHEMA_SQL,
     DurableMemoryStore,
     LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
     RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA,
@@ -3222,6 +3223,59 @@ class VerifiedRecoveryManager:
             )
 
     @staticmethod
+    def _legacy_capture_ledger_schema_adoption_allowed(
+        errors: list[str],
+    ) -> bool:
+        allowed = {
+            "capture_operations:missing-table",
+            "store_maintenance_receipts:missing-table",
+            "ix_store_maintenance_receipts_type_created:index-signature",
+        }
+        return bool(errors) and set(errors).issubset(allowed)
+
+    @staticmethod
+    def _legacy_capture_ledger_schema_statements() -> tuple[str, ...]:
+        wanted_prefixes = (
+            "CREATE TABLE IF NOT EXISTS capture_operations",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_capture_operations_deployment_event",
+            "CREATE INDEX IF NOT EXISTS ix_capture_operations_context_committed",
+            "CREATE TABLE IF NOT EXISTS store_maintenance_receipts",
+            "CREATE INDEX IF NOT EXISTS ix_store_maintenance_receipts_type_created",
+        )
+        statements: list[str] = []
+        pending = ""
+        for line in SCHEMA_SQL.splitlines(keepends=True):
+            pending += line
+            if sqlite3.complete_statement(pending):
+                statement = pending.strip()
+                pending = ""
+                if any(statement.startswith(prefix) for prefix in wanted_prefixes):
+                    statements.append(statement)
+        if len(statements) != len(wanted_prefixes):
+            raise RuntimeError("legacy capture ledger schema subset is incomplete")
+        return tuple(statements)
+
+    def _install_legacy_capture_ledger_schema(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        expected_errors: list[str],
+    ) -> list[str]:
+        if not self._legacy_capture_ledger_schema_adoption_allowed(expected_errors):
+            raise RuntimeError(
+                "legacy capture ledger schema adoption is not allowed for this schema state"
+            )
+        for statement in self._legacy_capture_ledger_schema_statements():
+            conn.execute(statement)
+        after_errors = self._capture_ledger_schema_errors(conn)
+        if after_errors:
+            raise RuntimeError(
+                "legacy capture ledger schema adoption failed "
+                f"(errors={after_errors[:8]!r})"
+            )
+        return list(expected_errors)
+
+    @staticmethod
     def _exact_json_digest(value: Any) -> str:
         try:
             canonical = json.dumps(
@@ -3724,9 +3778,23 @@ class VerifiedRecoveryManager:
         conn: sqlite3.Connection,
         *,
         sample_limit: int,
+        adopt_legacy_ledger_schema: bool = False,
     ) -> dict[str, Any]:
         root_provenance = self._validate_capture_source_root()
-        self._require_capture_ledger_schema(conn)
+        schema_errors = self._capture_ledger_schema_errors(conn)
+        schema_adoption_required = False
+        if schema_errors:
+            if not (
+                adopt_legacy_ledger_schema
+                and self._legacy_capture_ledger_schema_adoption_allowed(
+                    schema_errors
+                )
+            ):
+                raise RuntimeError(
+                    "capture ledger reconciliation schema is invalid "
+                    f"(errors={schema_errors[:8]!r})"
+                )
+            schema_adoption_required = True
         paths = self.daemon.paths()
         self.daemon._ensure_transport_dirs(paths)
         processed_dir = paths["processed_dir"]
@@ -3735,16 +3803,19 @@ class VerifiedRecoveryManager:
             root_metadata.st_mode
         ):
             raise ValueError("capture processed archive is not a real directory")
-        ledger_operations = {
-            str(row["capture_id"]): row
-            for row in conn.execute(
-                """
-                SELECT capture_id, request_fingerprint, context_id,
-                       source_tag, speaker
-                FROM capture_operations
-                """
-            ).fetchall()
-        }
+        if schema_adoption_required:
+            ledger_operations = {}
+        else:
+            ledger_operations = {
+                str(row["capture_id"]): row
+                for row in conn.execute(
+                    """
+                    SELECT capture_id, request_fingerprint, context_id,
+                           source_tag, speaker
+                    FROM capture_operations
+                    """
+                ).fetchall()
+            }
         ledger_ids = set(ledger_operations)
         max_files, max_total_bytes, max_file_bytes = self._bounded_capture_limits()
         scanned_file_count = 0
@@ -3983,6 +4054,8 @@ class VerifiedRecoveryManager:
             {
                 "schema": CAPTURE_LEDGER_RECONCILIATION_SCHEMA,
                 "capture_root_provenance": root_provenance,
+                "schema_adoption_required": schema_adoption_required,
+                "schema_adoption_errors": schema_errors,
                 "findings": revision_seed,
                 "ledger_backed_evidence": sorted(
                     ledger_backed_evidence,
@@ -4035,6 +4108,8 @@ class VerifiedRecoveryManager:
                 len(locations) for locations in seen_v2_locations.values()
             ),
             "ledger_capture_count": len(ledger_ids),
+            "schema_adoption_required": schema_adoption_required,
+            "schema_adoption_errors": schema_errors,
             "missing_authoritative_ledger_count": len(missing_capture_ids),
             "ledger_binding_mismatch_count": len(ledger_mismatches),
             "repairable_capture_count": len(candidates),
@@ -4050,7 +4125,12 @@ class VerifiedRecoveryManager:
             "_candidates": candidates,
         }
 
-    def audit_capture_ledger(self, *, sample_limit: int = 20) -> dict[str, Any]:
+    def audit_capture_ledger(
+        self,
+        *,
+        sample_limit: int = 20,
+        adopt_legacy_ledger_schema: bool = False,
+    ) -> dict[str, Any]:
         bounded_sample_limit = min(max(int(sample_limit), 1), 1000)
         root_provenance = self._validate_capture_source_root()
         paths = self.daemon.paths()
@@ -4070,6 +4150,7 @@ class VerifiedRecoveryManager:
                     audit = self._capture_ledger_audit_locked(
                         conn,
                         sample_limit=bounded_sample_limit,
+                        adopt_legacy_ledger_schema=adopt_legacy_ledger_schema,
                     )
         return self._public_capture_ledger_audit(audit)
 
@@ -4200,6 +4281,7 @@ class VerifiedRecoveryManager:
         confirm: bool = False,
         expected_revision: str | None = None,
         sample_limit: int = 20,
+        adopt_legacy_ledger_schema: bool = False,
         fault_hook: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         if confirm is not True:
@@ -4253,6 +4335,7 @@ class VerifiedRecoveryManager:
                             before = self._capture_ledger_audit_locked(
                                 conn,
                                 sample_limit=bounded_sample_limit,
+                                adopt_legacy_ledger_schema=adopt_legacy_ledger_schema,
                             )
                         data_version_after = int(
                             conn.execute("PRAGMA data_version").fetchone()[0]
@@ -4345,12 +4428,27 @@ class VerifiedRecoveryManager:
                             current = self._capture_ledger_audit_locked(
                                 conn,
                                 sample_limit=bounded_sample_limit,
+                                adopt_legacy_ledger_schema=adopt_legacy_ledger_schema,
                             )
                             if current["audit_revision"] != expected:
                                 raise RuntimeError(
                                     "capture ledger evidence changed after planning"
                                 )
                             candidates = list(current["_candidates"])
+                            adopted_schema_errors: list[str] = []
+                            if current["schema_adoption_required"]:
+                                if not adopt_legacy_ledger_schema:
+                                    raise RuntimeError(
+                                        "legacy capture ledger schema adoption was not authorized"
+                                    )
+                                adopted_schema_errors = (
+                                    self._install_legacy_capture_ledger_schema(
+                                        conn,
+                                        expected_errors=list(
+                                            current["schema_adoption_errors"]
+                                        ),
+                                    )
+                                )
                             repaired_capture_ids: list[str] = []
                             evidence_revisions: list[str] = []
                             for index, candidate in enumerate(candidates):
@@ -4447,6 +4545,7 @@ class VerifiedRecoveryManager:
                             after = self._capture_ledger_audit_locked(
                                 conn,
                                 sample_limit=bounded_sample_limit,
+                                adopt_legacy_ledger_schema=False,
                             )
                             if after["status"] != "ready":
                                 raise RuntimeError(
@@ -4459,6 +4558,8 @@ class VerifiedRecoveryManager:
                             receipt_payload = {
                                 "schema": CAPTURE_LEDGER_RECONCILIATION_SCHEMA,
                                 "content_free": True,
+                                "legacy_schema_adopted": bool(adopted_schema_errors),
+                                "legacy_schema_errors_repaired": adopted_schema_errors,
                                 "capture_ids": sorted(repaired_capture_ids),
                                 "capture_id_sha256": target_digest,
                                 "repaired_capture_count": len(
@@ -4505,6 +4606,7 @@ class VerifiedRecoveryManager:
                             verified_after = self._capture_ledger_audit_locked(
                                 conn,
                                 sample_limit=bounded_sample_limit,
+                                adopt_legacy_ledger_schema=False,
                             )
                         if verified_after["status"] != "ready":
                             raise RuntimeError(

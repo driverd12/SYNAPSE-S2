@@ -111,9 +111,11 @@ class LocalMaintenanceBackend:
         *,
         capture_root: str | os.PathLike[str] | None = None,
         sample_limit: int = 20,
+        adopt_legacy_ledger_schema: bool = False,
     ) -> dict[str, Any]:
         return self._recovery_manager(capture_root).audit_capture_ledger(
-            sample_limit=sample_limit
+            sample_limit=sample_limit,
+            adopt_legacy_ledger_schema=adopt_legacy_ledger_schema,
         )
 
     def repair_capture_ledger(
@@ -123,11 +125,13 @@ class LocalMaintenanceBackend:
         confirm: bool = False,
         expected_revision: str | None = None,
         sample_limit: int = 20,
+        adopt_legacy_ledger_schema: bool = False,
     ) -> dict[str, Any]:
         return self._recovery_manager(capture_root).repair_capture_ledger(
             confirm=confirm,
             expected_revision=expected_revision,
             sample_limit=sample_limit,
+            adopt_legacy_ledger_schema=adopt_legacy_ledger_schema,
         )
 
 

@@ -1167,6 +1167,49 @@ class CaptureInboxDaemonTests(unittest.TestCase):
         self.assertIn('"content_inspected": false', evidence_text)
         self.assertIn('"raw_payload_retained": false', evidence_text)
 
+    def test_unsafe_capture_errors_are_quarantined_without_content_exposure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daemon = CaptureInboxDaemon(root=root, backend=RecordingBackend())
+            error_dir = daemon.paths()["error_dir"]
+            error_dir.mkdir(parents=True, exist_ok=True)
+            marker = "SYNTHETIC_ONLY_SECRET_VALUE_99"
+            for index in range(3):
+                unsafe = error_dir / f"capture-error-{index}.json"
+                unsafe.write_text(
+                    json.dumps({"api_key": marker, "index": index}),
+                    encoding="utf-8",
+                )
+                unsafe.chmod(0o600)
+
+            preflight = daemon.unsafe_error_quarantine_preflight(
+                reason="Dans-MBP guarded legacy recovery"
+            )
+            result = daemon.quarantine_unsafe_error_artifacts(
+                preflight_token=preflight["preflight_token"],
+                reason="Dans-MBP guarded legacy recovery",
+                confirm=True,
+            )
+            status = daemon.status()
+            quarantine_dir = root / "capture_error_quarantine"
+            quarantined_artifact_count = len(
+                list(quarantine_dir.glob("unsafe-*.artifact"))
+            )
+            manifest_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in quarantine_dir.glob("unsafe-quarantine-*.json")
+            )
+
+        self.assertEqual(preflight["unsafe_error_count"], 3)
+        self.assertFalse(preflight["content_returned"])
+        self.assertFalse(preflight["content_digests_returned"])
+        self.assertEqual(result["quarantined_count"], 3)
+        self.assertEqual(status["unsafe_error_artifact_count"], 0)
+        self.assertEqual(status["unsafe_error_quarantine_count"], 3)
+        self.assertEqual(quarantined_artifact_count, 3)
+        self.assertNotIn(marker, manifest_text)
+        self.assertIn('"replay_permitted": false', manifest_text)
+
     def test_legacy_discard_evidence_scrub_removes_string_digest_oracles(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
