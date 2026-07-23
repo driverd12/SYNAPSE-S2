@@ -55,6 +55,11 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class VerifiedBackupRecoveryTests(unittest.TestCase):
+    DANS_MBP_LEGACY_V5_SCHEMA_VERSION = "s2-schema-v5-dans-mbp-20260723"
+    DANS_MBP_LEGACY_V5_SCHEMA_SHA256 = (
+        "338c97e56aaab242f0d23143288d2825d3e12c22389612d7fda97cde90b225f8"
+    )
+
     @staticmethod
     def _seed_store(root: Path, *, large: bool = False) -> tuple[DurableMemoryStore, Path]:
         db_path = root / "synapse-memory.sqlite3"
@@ -76,6 +81,29 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
     @staticmethod
     def _backup(store: DurableMemoryStore, root: Path, name: str = "verified.sqlite3"):
         return store.backup(root / name, purpose="unit-test", pinned=False)
+
+    @classmethod
+    def _dans_mbp_legacy_schema_fingerprint_patch(cls):
+        original = DurableMemoryStore._sqlite_schema_fingerprint
+
+        def alternate_v5_fingerprint(conn: sqlite3.Connection) -> dict:
+            schema = dict(original(conn))
+            user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if (
+                user_version == 5
+                and schema.get("sha256")
+                == BACKUP_SCHEMA_COMPATIBILITY_REGISTRY["s2-schema-v5"][
+                    "schema_sha256"
+                ]
+            ):
+                schema["sha256"] = cls.DANS_MBP_LEGACY_V5_SCHEMA_SHA256
+            return schema
+
+        return mock.patch.object(
+            DurableMemoryStore,
+            "_sqlite_schema_fingerprint",
+            staticmethod(alternate_v5_fingerprint),
+        )
 
     @staticmethod
     def _capture_backed_bundle(root: Path) -> tuple[
@@ -803,6 +831,84 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             )
             self.assertIn(capture_id, receipt_text)
             self.assertIn(capture_id, processed_text)
+
+    def test_dans_mbp_legacy_v5_schema_contract_paired_bundle_and_preclaim(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, db_path = self._seed_store(root)
+            CaptureInboxDaemon(root=root).status()
+            manager = VerifiedRecoveryManager(store, capture_root=root)
+            before_bytes = db_path.read_bytes()
+
+            with self._dans_mbp_legacy_schema_fingerprint_patch():
+                bundle = manager.create_bundle(
+                    root / "dans-mbp-legacy-v5.sqlite3",
+                    purpose="dans-mbp-schema-compatibility-test",
+                    pinned=True,
+                )
+                verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+                restored = manager.restore_bundle_isolated(
+                    bundle["bundle_receipt_path"],
+                    root / "dans-mbp-isolated-restore",
+                    confirm=True,
+                )
+
+                self.assertEqual(db_path.read_bytes(), before_bytes)
+                self.assertTrue(bundle["bundle_verified"])
+                self.assertEqual(
+                    bundle["schema_sha256"],
+                    self.DANS_MBP_LEGACY_V5_SCHEMA_SHA256,
+                )
+                self.assertEqual(
+                    bundle["schema_contract_version"],
+                    self.DANS_MBP_LEGACY_V5_SCHEMA_VERSION,
+                )
+                self.assertTrue(verified["verified"])
+                self.assertEqual(
+                    verified["database"]["schema_contract_version"],
+                    self.DANS_MBP_LEGACY_V5_SCHEMA_VERSION,
+                )
+                self.assertTrue(restored["verified"])
+
+                restored_db = Path(restored["restore_root"]) / "memory.sqlite3"
+                authority = CoreAuthorityLease.acquire_core(
+                    restored_db,
+                    timeout_seconds=0.0,
+                    instance_id="dans-mbp-schema-compatibility-test",
+                )
+                try:
+                    restored_store = DurableMemoryStore(
+                        restored_db,
+                        authority_lease=authority,
+                    )
+                    inspection = restored_store.inspect_core_authority_preclaim()
+                    preclaim = inspection["logical_snapshot"]
+                    self.assertEqual(
+                        inspection["schema_identity"],
+                        "sqlite-53324442-v5",
+                    )
+                    restored_store.claim_core_authority(
+                        instance_id=authority.instance_id,
+                        config_fingerprint="d" * 64,
+                        build_id="dans-mbp-schema-compatibility-test",
+                        protocol_version="synapse-core.v1",
+                        expected_store_identity=str(inspection["store_identity"]),
+                        request_journal_id="journal-" + ("d" * 24),
+                        request_journal_binding_schema=JOURNAL_BINDING_SCHEMA,
+                        request_journal_schema_version=3,
+                        expected_preclaim_logical_snapshot_sha256=str(
+                            preclaim["sha256"]
+                        ),
+                        expected_previous_epoch=0,
+                        expected_next_epoch=1,
+                        root_generation_id="generation-" + ("d" * 24),
+                        embedding_space_identity="d" * 64,
+                        attestation_receipt_digest="d" * 64,
+                        attestation_expires_at_unix_ms=int(time.time() * 1000)
+                        + 60_000,
+                    )
+                finally:
+                    authority.close()
 
     def test_guarded_recovery_transaction_holds_capture_lock_through_yield(self):
         with TemporaryDirectory() as tmp:

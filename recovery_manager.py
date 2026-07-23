@@ -47,6 +47,7 @@ from memory_store import (
     RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA,
     SQLITE_USER_VERSION,
     _json_dumps,
+    _matching_backup_schema_contract_versions,
     capture_request_fingerprint,
 )
 from redaction import redact_capture_text, reject_sensitive_identifier, strip_untrusted_raw_digest_text
@@ -2155,13 +2156,8 @@ class VerifiedRecoveryManager:
                         conn.execute("PRAGMA user_version").fetchone()[0]
                     ),
                 }
-                matching_contract_versions = sorted(
-                    version
-                    for version, registered in BACKUP_SCHEMA_COMPATIBILITY_REGISTRY.items()
-                    if all(
-                        schema_contract.get(key) == expected_value
-                        for key, expected_value in registered.items()
-                    )
+                matching_contract_versions = _matching_backup_schema_contract_versions(
+                    schema_contract
                 )
                 if not matching_contract_versions:
                     raise RuntimeError(

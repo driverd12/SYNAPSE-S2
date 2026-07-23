@@ -133,6 +133,15 @@ BACKUP_SCHEMA_COMPATIBILITY_REGISTRY: dict[str, dict[str, Any]] = {
         "application_id": SQLITE_APPLICATION_ID,
         "user_version": 5,
     },
+    "s2-schema-v5-dans-mbp-20260723": {
+        "schema_sha256": "338c97e56aaab242f0d23143288d2825d3e12c22389612d7fda97cde90b225f8",
+        "table_count": 19,
+        "index_count": 28,
+        "migration_set_sha256": "ff16d292fa470cd97a9a6cb2e88dd2f801824ce6c3ee640d7546e08b3191c228",
+        "migration_count": 12,
+        "application_id": SQLITE_APPLICATION_ID,
+        "user_version": 5,
+    },
     BACKUP_SCHEMA_CONTRACT_VERSION: {
         "schema_sha256": "861746736fae070d4ccd2765cedb0d049892385158846b1ea8272aa890c59685",
         "table_count": 19,
@@ -144,6 +153,19 @@ BACKUP_SCHEMA_COMPATIBILITY_REGISTRY: dict[str, dict[str, Any]] = {
     },
 }
 _CANONICAL_BACKUP_CONTRACT: dict[str, Any] | None = None
+
+
+def _matching_backup_schema_contract_versions(
+    schema_contract: dict[str, Any],
+) -> list[str]:
+    return sorted(
+        version
+        for version, registered in BACKUP_SCHEMA_COMPATIBILITY_REGISTRY.items()
+        if all(
+            schema_contract.get(key) == expected_value
+            for key, expected_value in registered.items()
+        )
+    )
 BACKUP_CRITICAL_TABLES = frozenset(
     {
         "memory_entries",
@@ -2835,9 +2857,6 @@ class DurableMemoryStore:
         *,
         user_version: int,
     ) -> None:
-        expected = BACKUP_SCHEMA_COMPATIBILITY_REGISTRY[
-            self._schema_contract_key(user_version)
-        ]
         schema = self._sqlite_schema_fingerprint(conn)
         migrations = sorted(
             str(row[0])
@@ -2848,13 +2867,16 @@ class DurableMemoryStore:
         migration_digest = hashlib.sha256(
             _json_dumps(migrations).encode("utf-8")
         ).hexdigest()
-        if (
-            str(schema["sha256"]) != str(expected["schema_sha256"])
-            or int(schema["table_count"]) != int(expected["table_count"])
-            or int(schema["index_count"]) != int(expected["index_count"])
-            or migration_digest != str(expected["migration_set_sha256"])
-            or len(migrations) != int(expected["migration_count"])
-        ):
+        schema_contract = {
+            "schema_sha256": str(schema["sha256"]),
+            "table_count": int(schema["table_count"]),
+            "index_count": int(schema["index_count"]),
+            "migration_set_sha256": migration_digest,
+            "migration_count": len(migrations),
+            "application_id": int(conn.execute("PRAGMA application_id").fetchone()[0]),
+            "user_version": int(user_version),
+        }
+        if not _matching_backup_schema_contract_versions(schema_contract):
             raise CoreAuthorityError(
                 "memory database schema or migration contract is not authoritative"
             )
@@ -17242,13 +17264,8 @@ class DurableMemoryStore:
                     ),
                 }
             canonical_contract = self._canonical_backup_contract()
-            matching_contract_versions = sorted(
-                version
-                for version, registered in BACKUP_SCHEMA_COMPATIBILITY_REGISTRY.items()
-                if all(
-                    schema_contract.get(key) == expected_value
-                    for key, expected_value in registered.items()
-                )
+            matching_contract_versions = _matching_backup_schema_contract_versions(
+                schema_contract
             )
             schema_contract_error_count = 0 if matching_contract_versions else sum(
                 1

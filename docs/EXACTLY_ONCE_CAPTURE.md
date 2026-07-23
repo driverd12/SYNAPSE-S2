@@ -221,6 +221,18 @@ receipts, or context acknowledgements. It writes only the missing ledger schema,
 evidence-derived compact ledger rows, and one content-free maintenance receipt
 after the normal verified safety backup.
 
+Some recovered v5 databases may be structurally identical to the registered v5
+schema while preserving older whitespace in `sqlite_schema.sql`. Because paired
+recovery intentionally fingerprints stored DDL exactly, these stores must be
+handled by a reviewed compatibility-registry entry rather than by ad hoc SQL
+rewrites. The Dans-MBP July 23, 2026 legacy recovery is registered as
+`s2-schema-v5-dans-mbp-20260723` for schema SHA-256
+`338c97e56aaab242f0d23143288d2825d3e12c22389612d7fda97cde90b225f8`, with the
+same v5 application ID, user version, table/index counts, migration set, and
+migration count as the canonical v5 contract. This permits backup, verification,
+isolated restore proof, and authoritative preclaim without mutating the source
+database schema.
+
 The audit binds processed payload identity, the normalized redacted request,
 namespace entries, relationship identities and endpoints, the unique durable
 deployment, deployment target records, and existing ledger-backed fingerprints.

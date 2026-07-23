@@ -28,13 +28,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memory_store import (  # noqa: E402
-    BACKUP_SCHEMA_COMPATIBILITY_REGISTRY,
     DurableMemoryStore,
+    _matching_backup_schema_contract_versions,
 )
 from core_authority import CoreAuthorityError, CoreAuthorityLease  # noqa: E402
 
 
-V5_CONTRACT_NAME = "s2-schema-v5"
 TORN_USER_VERSION = 6
 REPAIRED_USER_VERSION = 5
 AUTHORITY_METADATA_KEY = "core_authority"
@@ -174,17 +173,21 @@ def _open_database(path: Path, *, writable: bool) -> sqlite3.Connection:
 
 
 def _assert_v5_contract(snapshot: dict[str, Any]) -> None:
-    expected = BACKUP_SCHEMA_COMPATIBILITY_REGISTRY[V5_CONTRACT_NAME]
-    for key in (
-        "application_id",
-        "schema_sha256",
-        "table_count",
-        "index_count",
-        "migration_count",
-        "migration_set_sha256",
-    ):
-        if snapshot[key] != expected[key]:
-            raise TornAdoptionRepairError("database does not match the registered v5 contract")
+    schema_contract = {
+        key: snapshot[key]
+        for key in (
+            "application_id",
+            "user_version",
+            "schema_sha256",
+            "table_count",
+            "index_count",
+            "migration_count",
+            "migration_set_sha256",
+        )
+    }
+    schema_contract["user_version"] = REPAIRED_USER_VERSION
+    if not _matching_backup_schema_contract_versions(schema_contract):
+        raise TornAdoptionRepairError("database does not match a registered v5 contract")
     if snapshot["missing_critical_table_count"] != 0:
         raise TornAdoptionRepairError("database is missing a critical table")
     if snapshot["authority_marker_present"] or snapshot["authority_migration_present"]:
