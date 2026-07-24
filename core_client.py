@@ -30,6 +30,11 @@ from core_service import (
     NEURAL_OPERATION_LANE_SECONDS,
     SAFE_READ_OPERATIONS,
 )
+from core_runtime_paths import (
+    CoreRuntimePathError,
+    canonical_core_socket_path,
+    validate_core_socket_path,
+)
 
 
 SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS = 120.0
@@ -156,9 +161,18 @@ class CoreClient:
         expected_config_fingerprint: str | None = None,
     ) -> None:
         configured_socket = socket_path or os.getenv("SYNAPSE_S2_CORE_SOCKET")
+        default_socket = configured_socket is None
         if configured_socket is None:
-            configured_socket = Path.cwd() / ".synapse_s2" / "core" / "service.sock"
-        self.socket_path = Path(configured_socket).expanduser()
+            try:
+                configured_socket = canonical_core_socket_path(
+                    Path.cwd() / ".synapse_s2"
+                )
+            except CoreRuntimePathError as exc:
+                raise CoreUnavailable() from exc
+        try:
+            self.socket_path = validate_core_socket_path(configured_socket)
+        except CoreRuntimePathError as exc:
+            raise CoreUnavailable() from exc
         if not self.socket_path.is_absolute() or ".." in self.socket_path.parts:
             raise CoreUnavailable()
         self.authentication_path = _token_path(self.socket_path)
@@ -177,10 +191,26 @@ class CoreClient:
                 raise CoreUnavailable()
         self.expected_config_fingerprint = configured_fingerprint
         configured_state = state_path or os.getenv("SYNAPSE_S2_STATE_PATH")
+        if (
+            configured_state is None
+            and not default_socket
+            and (
+                self.socket_path.name != "service.sock"
+                or self.socket_path.parent.name != "core"
+            )
+        ):
+            # A split transport deliberately has no durable state adjacent to
+            # its socket. Require the reviewed binding/router (or an explicit
+            # state path) instead of silently inspecting the transport tree.
+            raise CoreUnavailable()
         self.state_path = (
             Path(configured_state).expanduser()
             if configured_state is not None
-            else self.socket_path.parent.parent / "runtime_state.json"
+            else (
+                Path.cwd() / ".synapse_s2" / "runtime_state.json"
+                if default_socket
+                else self.socket_path.parent.parent / "runtime_state.json"
+            )
         )
         configured_replication_inbox = replication_inbox_root or os.getenv(
             "SYNAPSE_S2_REPLICATION_INBOX_ROOT"

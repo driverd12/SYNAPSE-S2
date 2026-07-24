@@ -110,8 +110,8 @@ admission cannot stop the daemon before Python starts:
 | Service configuration | `.synapse_s2/core/service.json` | `0600` |
 | Authority lease | `.synapse_s2/core/authority.lock` | `0600` |
 | Root-generation sentinel | `.synapse_s2/core/store-generation.json` | `0600` |
-| Unix socket | `.synapse_s2/core/service.sock` | `0600` |
-| Authentication sidecar | `.synapse_s2/core/service.sock.token` | `0600` |
+| Unix socket | `.synapse_s2/core/service.sock` when it fits Darwin's socket bound; otherwise `~/.config/synapse-s2/run/<data-root-digest>/service.sock` | `0600` |
+| Authentication sidecar | Beside the selected Unix socket as `service.sock.token` | `0600` |
 | Mutation request journal | `.synapse_s2/core/requests.sqlite3` | `0600` |
 | Request-journal lock | `.synapse_s2/core/requests.sqlite3.lock` | `0600` |
 | Cutover attestation | `.synapse_s2/core/cutover-attestation.json` | `0600` |
@@ -120,6 +120,11 @@ admission cannot stop the daemon before Python starts:
 | Durable memory | `.synapse_s2/memory.sqlite3` | `0600` |
 | Capture transport root | `.synapse_s2/` | `0700` |
 | Core runtime directory | `.synapse_s2/core/` | `0700` |
+
+Only the socket and authentication sidecar may use the short transport
+directory. The authority lease, generation sentinel, journal, repair receipts,
+cutover attestation, runtime state, database, backups, and captures remain in
+their durable repository-relative layout.
 
 The installer refuses symlinks, non-regular config/log/token/database targets,
 foreign owners, hard-linked private files, and non-private modes. Publication
@@ -326,6 +331,30 @@ changing permissions on an existing caller-owned directory.
    Do not reopen a persistent MCP client or legacy worker after this gate, and
    treat any automatically relaunched client as an invalidation that requires
    another inbox drain and a completely new evidence run.
+
+   If an earlier first-adoption start failed while the database remained exact
+   unclaimed v5 and left `core/requests.sqlite3`, do not rerun installation or
+   use `recover-existing`. With the exact core LaunchAgent positively disabled
+   and unloaded, reconcile that residue before producing any new recovery or
+   readiness evidence:
+
+   ```bash
+   scripts/install_core_agent.sh repair-preclaim-residue --confirm
+   ```
+
+   This guarded lane accepts only the exact supported pre-governed v5 store and
+   a verified zero-row preclaim journal. Under the exclusive authority lease it
+   preserves the journal and lock as authenticated private archives, publishes
+   a complete repair receipt, revalidates all prior repair evidence, and proves
+   the full logical database snapshot is unchanged. A nonempty journal,
+   malformed or unexpected sidecar, active/loaded core, v6 marker, schema
+   mismatch, authority contention, or changed prior archive fails without
+   replay or cleanup. Review the content-free result, require
+   `status: complete`, `request_row_count: 0`, and the same logical snapshot
+   digest, then start again with a fresh paired bundle and the complete
+   certification sequence below. The command does not make older evidence
+   reusable.
+
 3. Produce a fresh, clean-HEAD operator-readiness evidence pack through the
    binding-backed launcher only after the preceding zero-writer proof:
 
@@ -556,9 +585,13 @@ changing permissions on an existing caller-owned directory.
    runtime-state presence and canonical digest, and (for v6) the exact request-
    journal logical digest and source binding receipt. It also binds the signed
    recovery-bundle and isolated-restore receipt digests. The receipt is valid
-   for at most ten minutes and publication requires at least two minutes of
-   remaining evidence validity; expired, future-dated, near-expiry, partially
-   populated, or signer-mismatched receipts fail closed.
+   for at most ten minutes and publication requires at least 180 seconds of
+   remaining evidence validity, covering the bounded full-store preclaim digest,
+   commit margin, and launch scheduling headroom. Before replacing an older
+   canonical attestation, the
+   installer preserves its exact bytes in a private digest-named archive with a
+   signed inode- and digest-bound receipt. Expired, future-dated, near-expiry,
+   partially populated, or signer-mismatched receipts fail closed.
 
    When the production data root is itself a promoted authoritative-v6
    recovery target, add `--restored-target`. That explicit closed flag requires

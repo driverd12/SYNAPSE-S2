@@ -21,6 +21,7 @@ from core_client_binding import (
     default_binding_path,
     write_core_client_binding,
 )
+from core_runtime_paths import canonical_core_socket_path
 from core_service import CoreConfig, write_core_config
 from scripts.core_agent_installer import build_config, resolve_paths
 from scripts.operator_readiness_certify import OperatorReadinessCertifier
@@ -56,7 +57,7 @@ def _write_reviewed_binding(
     data_root.chmod(0o700)
     core.chmod(0o700)
     config = CoreConfig(
-        socket_path=data_root / "core" / "service.sock",
+        socket_path=canonical_core_socket_path(data_root),
         state_path=data_root / "runtime_state.json",
         memory_path=data_root / "memory.sqlite3",
         capture_root=data_root,

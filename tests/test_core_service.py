@@ -25,6 +25,13 @@ from core_request_journal import (
     CoreRequestJournalError,
     repair_empty_preclaim_journal_residue,
 )
+from core_runtime_paths import (
+    CoreRuntimePathError,
+    MAX_UNIX_SOCKET_PATH_BYTES,
+    canonical_core_socket_path,
+    durable_core_root,
+    supported_core_socket_path,
+)
 from core_client import (
     NEURAL_OPERATION_TIMEOUT_SECONDS,
     SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
@@ -44,6 +51,7 @@ from core_protocol import (
 from core_service import (
     BUILD_SOURCE_MANIFEST,
     CORE_OPERATION_CONTRACTS,
+    CORE_STARTUP_FAILURE_SCHEMA,
     LOGGER,
     MAX_ACTIVE_CONNECTIONS,
     LONG_NEURAL_OPERATIONS,
@@ -1875,6 +1883,55 @@ class CoreServiceTests(unittest.TestCase):
         replacement.close()
         original_path.unlink()
 
+    def test_startup_failure_log_is_stage_bounded_and_content_free(self) -> None:
+        secret = "sk-startup-diagnostic-canary-123456789"
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            root.mkdir(mode=0o700)
+            config = CoreConfig(
+                socket_path=root / "core" / "service.sock",
+                state_path=root / "runtime_state.json",
+                memory_path=root / "memory.sqlite3",
+                dimension=8,
+                num_neurons=8,
+                default_top_k=4,
+                authority_timeout_seconds=0.0,
+            )
+            failing = AuthoritativeCoreService(config)
+            self.addCleanup(failing.close)
+            with mock.patch.object(
+                failing,
+                "_bind_listener",
+                side_effect=OSError(secret),
+            ), self.assertLogs(LOGGER, level="ERROR") as captured:
+                with self.assertRaises(OSError):
+                    failing.start()
+            payload = json.loads(
+                captured.records[-1].getMessage().split(" ", 4)[-1]
+            )
+            self.assertEqual(payload["schema"], CORE_STARTUP_FAILURE_SCHEMA)
+            self.assertEqual(payload["stage"], "listener_bind")
+            self.assertEqual(payload["failure_class"], "transport_unavailable")
+            self.assertEqual(payload["safe_code"], "service_unavailable")
+            self.assertEqual(payload["store_state"], "unclaimed_v5")
+            self.assertEqual(payload["journal_state"], "opened")
+            rendered = canonical_json_bytes(payload).decode("utf-8")
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn(str(config.memory_path), rendered)
+            self.assertEqual(
+                frozenset(payload),
+                frozenset(
+                    {
+                        "schema",
+                        "stage",
+                        "failure_class",
+                        "safe_code",
+                        "store_state",
+                        "journal_state",
+                    }
+                ),
+            )
+
     def test_shutdown_drains_handler_before_releasing_authority(self) -> None:
         client_result: list[Any] = []
 
@@ -2085,6 +2142,71 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
             finally:
                 service.close()
                 thread.join(timeout=5.0)
+
+    def test_long_data_path_uses_short_transport_and_durable_core_evidence(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="s2-long-", dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            data_root = root / ("reviewed-production-checkout-" + ("x" * 120))
+            data_root.mkdir(mode=0o700)
+            socket_path = canonical_core_socket_path(
+                data_root,
+                home=root / "home",
+            )
+            socket_path.parent.mkdir(mode=0o700, parents=True)
+            socket_path.parent.chmod(0o700)
+            config = CoreConfig(
+                socket_path=socket_path,
+                state_path=data_root / "runtime_state.json",
+                memory_path=data_root / "memory.sqlite3",
+                dimension=8,
+                num_neurons=8,
+                default_top_k=4,
+                recall_count=2,
+                authority_timeout_seconds=0.0,
+            )
+            self.assertGreater(
+                len(
+                    os.fsencode(
+                        str(data_root / "core" / "service.sock")
+                    )
+                ),
+                MAX_UNIX_SOCKET_PATH_BYTES,
+            )
+            self.assertLessEqual(
+                len(os.fsencode(str(socket_path))),
+                MAX_UNIX_SOCKET_PATH_BYTES,
+            )
+
+            service = AuthoritativeCoreService(config)
+            service.start()
+            try:
+                durable_root = durable_core_root(config.memory_path)
+                self.assertTrue(socket_path.is_socket())
+                self.assertTrue(
+                    (socket_path.with_suffix(".sock.token")).is_file()
+                )
+                self.assertTrue(
+                    (durable_root / "requests.sqlite3").is_file()
+                )
+                self.assertTrue(
+                    (durable_root / "store-generation.json").is_file()
+                )
+                self.assertFalse(
+                    (socket_path.parent / "requests.sqlite3").exists()
+                )
+                with closing(sqlite3.connect(config.memory_path)) as connection:
+                    self.assertEqual(
+                        int(
+                            connection.execute(
+                                "PRAGMA user_version"
+                            ).fetchone()[0]
+                        ),
+                        6,
+                    )
+            finally:
+                service.close()
 
     def test_replication_fingerprint_mismatch_is_rejected_before_journal(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -2468,8 +2590,26 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 restarted.close()
 
     def test_first_cutover_retry_archives_only_empty_preclaim_journal(self) -> None:
-        with TemporaryDirectory() as temporary:
-            config = self.config(Path(temporary))
+        with TemporaryDirectory(prefix="s2-retry-", dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            data_root = root / ("reviewed-checkout-" + ("y" * 120))
+            data_root.mkdir(mode=0o700)
+            socket_path = canonical_core_socket_path(
+                data_root,
+                home=root / "home",
+            )
+            socket_path.parent.mkdir(mode=0o700, parents=True)
+            socket_path.parent.chmod(0o700)
+            config = CoreConfig(
+                socket_path=socket_path,
+                state_path=data_root / "runtime_state.json",
+                memory_path=data_root / "memory.sqlite3",
+                dimension=8,
+                num_neurons=8,
+                default_top_k=4,
+                recall_count=2,
+                authority_timeout_seconds=0.0,
+            )
             first = AuthoritativeCoreService(config)
             with mock.patch.object(
                 first,
@@ -2478,8 +2618,12 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
             ):
                 with self.assertRaises(CoreServiceError):
                     first.start()
-            journal_path = config.socket_path.parent / "requests.sqlite3"
+            journal_root = durable_core_root(config.memory_path)
+            journal_path = journal_root / "requests.sqlite3"
             self.assertTrue(journal_path.is_file())
+            self.assertFalse(
+                (config.socket_path.parent / "requests.sqlite3").exists()
+            )
             with closing(sqlite3.connect(config.memory_path)) as connection:
                 self.assertEqual(
                     int(connection.execute("PRAGMA user_version").fetchone()[0]),
@@ -2496,7 +2640,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
             def verify_after_repair(*, inspection):
                 self.assertFalse(journal_path.exists())
                 receipts = tuple(
-                    config.socket_path.parent.glob(
+                    journal_root.glob(
                         "requests.sqlite3.preclaim-repair-*.json"
                     )
                 )
@@ -2508,7 +2652,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 self.assertEqual(inspection["governance_mode"], "pre-governed-v5")
                 return {
                     "receipt_digest": "a" * 64,
-                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
                 }
 
             with mock.patch.object(
@@ -2519,7 +2663,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 restarted.start()
             try:
                 receipts = tuple(
-                    config.socket_path.parent.glob(
+                    journal_root.glob(
                         "requests.sqlite3.preclaim-repair-*.json"
                     )
                 )
@@ -2538,6 +2682,41 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 self.assertEqual(marker["epoch"], 1)
             finally:
                 restarted.close()
+
+    def test_near_expiry_cutover_attestation_fails_before_journal_creation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            bootstrap = DurableMemoryStore(config.memory_path)
+            bootstrap.close()
+            service = AuthoritativeCoreService(config)
+            with mock.patch.object(
+                service,
+                "_verify_required_cutover_attestation",
+                return_value={
+                    "receipt_digest": "a" * 64,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                },
+            ), self.assertRaises(CoreServiceError):
+                service.start()
+            self.assertFalse(
+                (
+                    durable_core_root(config.memory_path)
+                    / "requests.sqlite3"
+                ).exists()
+            )
+            with closing(sqlite3.connect(config.memory_path)) as connection:
+                self.assertEqual(
+                    int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                    5,
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM store_metadata WHERE key = ?",
+                        ("core_authority",),
+                    ).fetchone()
+                )
 
     def test_first_cutover_retry_refuses_nonempty_preclaim_journal(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -2922,7 +3101,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
             adopted = AuthoritativeCoreService(target_config)
             attestation = {
                 "receipt_digest": "a" * 64,
-                "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
                 "restored_target_binding_receipt_digest": receipt[
                     "receipt_digest"
                 ],
@@ -3141,7 +3320,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 "_verify_required_cutover_attestation",
                 return_value={
                     "receipt_digest": "a" * 64,
-                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
                 },
             ):
                 with self.assertRaises(CoreServiceError):
@@ -3261,7 +3440,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                     connection.commit()
                 return {
                     "receipt_digest": "a" * 64,
-                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
                 }
 
             with mock.patch.object(
@@ -3379,7 +3558,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
             admission_path.chmod(0o600)
             predecessor_lock = str(predecessor["lock_generation_id"])
             successor_build = "source-" + ("d" * 24)
-            expires_at = int(time.time() * 1000) + 60_000
+            expires_at = int(time.time() * 1000) + 300_000
             admission = {
                 "receipt_digest": "a" * 64,
                 "expires_at_unix_ms": expires_at,
@@ -3478,7 +3657,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 resumed_admission = {
                     **admission,
                     "receipt_digest": "b" * 64,
-                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
                 }
                 resumed = AuthoritativeCoreService(config)
                 with mock.patch.dict(
@@ -3531,7 +3710,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
 
                 final_attestation = {
                     "receipt_digest": "f" * 64,
-                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
                     "restored_target_binding_receipt_digest": None,
                 }
                 restarted = AuthoritativeCoreService(config)
@@ -3659,7 +3838,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 "_verify_required_cutover_attestation",
                 return_value={
                     "receipt_digest": "a" * 64,
-                    "expires_at_unix_ms": int(time.time() * 1000) + 60_000,
+                    "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
                 },
             ) as verifier:
                 with self.assertRaises(CoreServiceError):
@@ -3700,6 +3879,74 @@ class CoreConfigTests(unittest.TestCase):
             os.chmod(path, 0o600)
             with self.assertRaises(CoreServiceError):
                 load_core_config(path)
+
+    def test_overlong_legacy_socket_is_rejected_before_journal_creation(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="s2-path-", dir="/tmp") as temporary:
+            root = Path(temporary).resolve() / ("x" * 140)
+            config = CoreConfig(
+                socket_path=root / "core" / "service.sock",
+                state_path=root / "runtime_state.json",
+                memory_path=root / "memory.sqlite3",
+                dimension=8,
+                num_neurons=8,
+                default_top_k=4,
+            )
+            self.assertGreater(
+                len(os.fsencode(str(config.socket_path))),
+                MAX_UNIX_SOCKET_PATH_BYTES,
+            )
+            with self.assertRaisesRegex(CoreServiceError, "invalid_config"):
+                AuthoritativeCoreService(config)
+            self.assertFalse(
+                (root / "core" / "requests.sqlite3").exists()
+            )
+
+    def test_split_socket_rejects_matching_suffix_under_unsafe_home(self) -> None:
+        with TemporaryDirectory(prefix="s2p-", dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            owner_home = root / "owner"
+            owner_home.mkdir(mode=0o700)
+            os.chmod(owner_home, 0o700)
+            data = root / ("d" * 140)
+            memory = data / "memory.sqlite3"
+            canonical = canonical_core_socket_path(data, home=owner_home)
+            unsafe_home = root / "unsafe"
+            unsafe_home.mkdir(mode=0o777)
+            os.chmod(unsafe_home, 0o777)
+            forged = (
+                unsafe_home
+                / ".config"
+                / "synapse-s2"
+                / "run"
+                / canonical.parent.name
+                / "service.sock"
+            )
+            with self.assertRaises(CoreRuntimePathError):
+                supported_core_socket_path(
+                    forged,
+                    memory_path=memory,
+                )
+
+    def test_explicit_split_socket_requires_durable_state_path(self) -> None:
+        with TemporaryDirectory(prefix="s2c-", dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            owner_home = root / "owner"
+            owner_home.mkdir(mode=0o700)
+            os.chmod(owner_home, 0o700)
+            data = root / ("d" * 140)
+            socket_path = canonical_core_socket_path(data, home=owner_home)
+            with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(
+                CoreUnavailable
+            ):
+                CoreClient(socket_path=socket_path)
+            client = CoreClient(
+                socket_path=socket_path,
+                state_path=data / "runtime_state.json",
+            )
+            self.assertEqual(client.socket_path, socket_path)
+            self.assertEqual(client.state_path, data / "runtime_state.json")
 
     def test_runtime_never_chmods_an_existing_configured_directory(self) -> None:
         with TemporaryDirectory() as temporary:

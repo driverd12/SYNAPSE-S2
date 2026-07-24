@@ -19,6 +19,7 @@ from core_client_binding import (
     default_binding_path,
     write_core_client_binding,
 )
+from core_runtime_paths import canonical_core_socket_path
 from core_service import CoreConfig, write_core_config
 from scripts import operator_readiness_certify as readiness
 
@@ -33,7 +34,7 @@ def _write_test_core_config(data_root: Path) -> CoreConfig:
     data_root.chmod(0o700)
     core.chmod(0o700)
     config = CoreConfig(
-        socket_path=core / "service.sock",
+        socket_path=canonical_core_socket_path(data_root),
         state_path=data_root / "runtime_state.json",
         memory_path=data_root / "memory.sqlite3",
         capture_root=data_root,

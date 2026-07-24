@@ -63,6 +63,12 @@ from core_request_journal import (
     CoreRequestJournalError,
     repair_empty_preclaim_journal_residue,
 )
+from core_runtime_paths import (
+    CoreRuntimePathError,
+    durable_core_root,
+    supported_core_socket_path,
+    validate_core_socket_path,
+)
 from memory_store import ContextDeliveryRejected, LOGICAL_SNAPSHOT_DIGEST_SCHEMA
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
@@ -93,10 +99,36 @@ STORE_GENERATION_SCHEMA = "synapse-s2.root-generation.v1"
 STORE_GENERATION_ID_RE = re.compile(r"generation-[0-9a-f]{24}")
 CUTOVER_MINIMUM_REMAINING_SECONDS = 30.0
 CUTOVER_COMMIT_SAFETY_MARGIN_MS = 1_000
+# First adoption recomputes the complete logical store under BEGIN IMMEDIATE
+# with a 120-second default ceiling. Refuse a nearly-expired attestation before
+# opening a request journal so an expiry cannot manufacture fresh residue.
+CUTOVER_PRECLAIM_MINIMUM_REMAINING_SECONDS = 150.0
 REPLACEMENT_ADMISSION_ENV = "SYNAPSE_S2_REPLACEMENT_ADMISSION"
 REPLACEMENT_CERTIFICATION_MODE = "replacement-certification"
 REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX = "replacement-certification:"
 AUTHORITATIVE_DEPLOYMENT_MODE = "authoritative"
+CORE_STARTUP_FAILURE_SCHEMA = "synapse-s2.core-startup-failure.v1"
+CORE_STARTUP_FAILURE_CLASSES = MappingProxyType(
+    {
+        "initial_validation": "configuration_rejected",
+        "durable_preflight": "durable_state_rejected",
+        "authority_lock": "authority_lock_unavailable",
+        "transport_auth": "transport_auth_unavailable",
+        "backend_init": "backend_unavailable",
+        "preclaim_inspection": "preclaim_state_rejected",
+        "preclaim_journal_repair": "preclaim_journal_rejected",
+        "cutover_attestation": "cutover_attestation_rejected",
+        "request_journal_open": "request_journal_rejected",
+        "request_journal_binding": "request_journal_binding_rejected",
+        "capture_worker_prepare": "capture_worker_unavailable",
+        "listener_bind": "transport_unavailable",
+        "capture_thread_start": "capture_worker_unavailable",
+        "durable_authority_claim": "authority_claim_rejected",
+        "runtime_publication": "runtime_publication_rejected",
+        "replication_init": "replication_unavailable",
+        "path_policy_init": "path_policy_unavailable",
+    }
+)
 BACKEND_LANE_CAPTURE_TIMEOUT_SECONDS = 60.0
 BACKEND_LANE_CAPTURE_FILE_SECONDS = 5.0
 BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
@@ -118,6 +150,7 @@ BUILD_SOURCE_MANIFEST = (
     "core_path_policy.py",
     "core_protocol.py",
     "core_request_journal.py",
+    "core_runtime_paths.py",
     "core_service.py",
     "embedding_providers.py",
     "event_segmenter.py",
@@ -1821,10 +1854,14 @@ def config_from_wire(value: Any) -> CoreConfig:
     assert socket_path is not None
     assert state_path is not None
     assert memory_path is not None
-    if (
-        socket_path != memory_path.parent / "core" / "service.sock"
-        or state_path != memory_path.parent / "runtime_state.json"
-    ):
+    try:
+        socket_path = supported_core_socket_path(
+            socket_path,
+            memory_path=memory_path,
+        )
+    except CoreRuntimePathError as exc:
+        raise CoreServiceError("invalid_config") from exc
+    if state_path != memory_path.parent / "runtime_state.json":
         raise CoreServiceError("invalid_config")
     return CoreConfig(
         socket_path=socket_path,
@@ -1939,6 +1976,22 @@ def load_core_config(path: str | os.PathLike[str]) -> CoreConfig:
 def _ensure_private_directory(path: Path) -> None:
     if not path.is_absolute() or ".." in path.parts:
         raise CoreServiceError()
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            component_stat = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise CoreServiceError("invalid_config") from exc
+        if stat.S_ISLNK(component_stat.st_mode):
+            # macOS exposes /var as a platform-owned compatibility symlink.
+            if current == Path("/var") and os.readlink(current) == "private/var":
+                continue
+            raise CoreServiceError("invalid_config")
+        if current != path and not stat.S_ISDIR(component_stat.st_mode):
+            raise CoreServiceError("invalid_config")
     created = False
     try:
         observed = path.lstat()
@@ -2622,6 +2675,9 @@ class AuthoritativeCoreService:
         self._shutdown_teardown_thread: threading.Thread | None = None
         self._shutdown_teardown_complete = threading.Event()
         self._shutdown_teardown_succeeded = False
+        self._startup_stage = "initial_validation"
+        self._startup_store_state = "unknown"
+        self._startup_journal_state = "absent"
         self._identity: dict[str, str] = {
             "authority_id": f"core-{uuid.uuid4().hex}",
             "neural_epoch": f"epoch-{uuid.uuid4().hex}",
@@ -3172,7 +3228,6 @@ class AuthoritativeCoreService:
             or inspection.get("governance_mode") != "authoritative-v6"
             or inspection.get("schema_identity") != CORE_STORE_SCHEMA_IDENTITY
             or inspection.get("new_empty_bootstrap") is not False
-            or self.config.socket_path != data_root / "core" / "service.sock"
             or self.config.state_path != data_root / "runtime_state.json"
             or self.config.capture_root != data_root
             or (
@@ -3508,7 +3563,7 @@ class AuthoritativeCoreService:
                 runtime_state_path=self.config.state_path,
             )
             live = manager.recompute_request_journal_logical_digest(
-                self.config.socket_path.parent / "requests.sqlite3",
+                durable_core_root(self.config.memory_path) / "requests.sqlite3",
                 maximum_authority_epoch=maximum_epoch,
             )
         except Exception as exc:
@@ -3528,7 +3583,25 @@ class AuthoritativeCoreService:
 
     def start(self) -> None:
         with self._start_lock:
-            self._start_once()
+            try:
+                self._start_once()
+            except BaseException:
+                failure = {
+                    "schema": CORE_STARTUP_FAILURE_SCHEMA,
+                    "stage": self._startup_stage,
+                    "failure_class": CORE_STARTUP_FAILURE_CLASSES.get(
+                        self._startup_stage,
+                        "internal_unclassified",
+                    ),
+                    "safe_code": "service_unavailable",
+                    "store_state": self._startup_store_state,
+                    "journal_state": self._startup_journal_state,
+                }
+                LOGGER.error(
+                    "authoritative core startup failed %s",
+                    canonical_json_bytes(failure).decode("utf-8"),
+                )
+                raise
 
     def _assert_database_bootstrap_is_not_silent_data_loss(self) -> None:
         """Permit a new store only when no durable deployment evidence remains."""
@@ -3537,7 +3610,7 @@ class AuthoritativeCoreService:
         if memory_path.exists() or memory_path.is_symlink():
             return
         data_root = memory_path.parent
-        core_root = self.config.socket_path.parent
+        core_root = durable_core_root(memory_path)
         direct_evidence = (
             self.config.state_path,
             core_root / "store-generation.json",
@@ -3589,6 +3662,7 @@ class AuthoritativeCoreService:
             return
         if self._stop_event.is_set():
             raise CoreServiceError("service_unavailable")
+        self._startup_stage = "durable_preflight"
         replacement_admission_requested = self._replacement_admission_requested()
         if replacement_admission_requested:
             # Persist the provisional state in the existing durable authority
@@ -3600,6 +3674,7 @@ class AuthoritativeCoreService:
             )
         self._assert_database_bootstrap_is_not_silent_data_loss()
         _ensure_private_directory(self.config.socket_path.parent)
+        self._startup_stage = "authority_lock"
         authority = CoreAuthorityLease.acquire_core(
             self.config.memory_path,
             timeout_seconds=self.config.authority_timeout_seconds,
@@ -3610,12 +3685,14 @@ class AuthoritativeCoreService:
             # Token and generation publication are serialized by the exact
             # authority lease.  This avoids concurrent first-start publishers
             # and makes narrowly safe crash cleanup possible.
+            self._startup_stage = "transport_auth"
             self._authentication_key = _load_or_create_authentication_key(
                 _token_path(self.config.socket_path)
             )
             data_root = self.config.memory_path.parent
             self._root_generation_id = _load_or_create_store_generation(
-                self.config.socket_path.parent / "store-generation.json",
+                durable_core_root(self.config.memory_path)
+                / "store-generation.json",
                 store_identity=_store_identity(self.config.memory_path),
             )
             for managed_root in (
@@ -3628,6 +3705,7 @@ class AuthoritativeCoreService:
                 _ensure_private_directory(self.config.capture_root)
             # Full backend construction precedes the durable service claim. An
             # OOM or native-init failure therefore cannot publish readiness.
+            self._startup_stage = "backend_init"
             self._backend = self._backend_factory(authority)
             self._handlers = dict(self._operation_handlers_factory(self._backend))
             store = getattr(self._backend, "memory_store", None)
@@ -3653,14 +3731,22 @@ class AuthoritativeCoreService:
             attestation_required = False
             journal_must_exist = False
             expected_journal_id: str | None = None
+            self._startup_stage = "preclaim_inspection"
             inspection = inspect_method()
             if not isinstance(inspection, Mapping):
                 raise CoreServiceError("service_unavailable")
             marker = inspection.get("marker")
+            self._startup_store_state = (
+                "authoritative_v6"
+                if isinstance(marker, dict)
+                else "unclaimed_v5"
+            )
             if not isinstance(marker, dict):
                 try:
+                    self._startup_stage = "preclaim_journal_repair"
                     repair_empty_preclaim_journal_residue(
-                        self.config.socket_path.parent / "requests.sqlite3",
+                        durable_core_root(self.config.memory_path)
+                        / "requests.sqlite3",
                         expected_store_identity=str(inspection["store_identity"]),
                         memory_db_path=self.config.memory_path,
                         authority_lease=authority,
@@ -3793,6 +3879,7 @@ class AuthoritativeCoreService:
                 or self._replacement_certification_pending(marker)
             )
             if replacement_admission_requested:
+                self._startup_stage = "cutover_attestation"
                 self._assert_build_only_replacement_candidate(
                     inspection=inspection,
                     marker=marker,
@@ -3833,11 +3920,25 @@ class AuthoritativeCoreService:
                     time.monotonic() + remaining_seconds
                 )
             elif attestation_required:
+                self._startup_stage = "cutover_attestation"
                 attestation = self._verify_required_cutover_attestation(
                     inspection=inspection
                 )
+            if (
+                not replacement_admission_requested
+                and not isinstance(marker, dict)
+                and attestation is not None
+                and (
+                    int(attestation["expires_at_unix_ms"])
+                    - int(time.time() * 1000)
+                )
+                <= int(CUTOVER_PRECLAIM_MINIMUM_REMAINING_SECONDS * 1000)
+            ):
+                raise CoreServiceError("service_unavailable")
+            self._startup_stage = "request_journal_open"
             self._request_journal = CoreRequestJournal(
-                self.config.socket_path.parent / "requests.sqlite3",
+                durable_core_root(self.config.memory_path)
+                / "requests.sqlite3",
                 authority_epoch=self._identity["neural_epoch"],
                 require_existing=journal_must_exist,
                 prune_on_open=False,
@@ -3845,6 +3946,8 @@ class AuthoritativeCoreService:
                 store_identity=self._identity["store_identity"],
                 expected_journal_id=expected_journal_id,
             )
+            self._startup_journal_state = "opened"
+            self._startup_stage = "request_journal_binding"
             journal_binding = self._request_journal.binding()
             if (
                 inspection is not None
@@ -3859,13 +3962,17 @@ class AuthoritativeCoreService:
                 inspection=inspection,
                 journal_binding=journal_binding,
             )
+            self._startup_stage = "capture_worker_prepare"
             self._prepare_capture_worker_if_enabled()
+            self._startup_stage = "listener_bind"
             self._listener = self._bind_listener()
             # Every fallible readiness action must complete before the durable
             # v6 claim. The capture thread is started but parked behind an
             # activation event, so thread creation is proven without allowing
             # it to mutate the v5 store before adoption commits.
+            self._startup_stage = "capture_thread_start"
             self._start_prepared_capture_worker()
+            self._startup_stage = "durable_authority_claim"
             self._claim_durable_authority(
                 inspection=inspection,
                 journal_binding=journal_binding,
@@ -3878,6 +3985,7 @@ class AuthoritativeCoreService:
             )
             if not callable(publish_runtime_binding):
                 raise CoreServiceError("service_unavailable")
+            self._startup_stage = "runtime_publication"
             try:
                 publish_runtime_binding()
             except Exception as exc:
@@ -3908,6 +4016,7 @@ class AuthoritativeCoreService:
             # both completed. A failed preclaim startup therefore cannot leave
             # behind false replication deployment evidence.
             if requested_replication:
+                self._startup_stage = "replication_init"
                 try:
                     from recovery_manager import VerifiedRecoveryManager
                     from replication_manager import ReplicationManager
@@ -3933,6 +4042,7 @@ class AuthoritativeCoreService:
                     raise CoreServiceError("service_unavailable") from exc
             _ensure_private_directory(data_root / "replication")
             _ensure_private_directory(data_root / "replication" / "inbox")
+            self._startup_stage = "path_policy_init"
             self._path_policy = CorePathPolicy(
                 export_root=data_root / "exports",
                 backup_root=data_root / "backups",
@@ -3946,6 +4056,7 @@ class AuthoritativeCoreService:
                 raise CoreServiceError("operation_unavailable")
             self._capture_activation_event.set()
             self._started_event.set()
+            self._startup_stage = "ready"
         except BaseException:
             self.close()
             raise
@@ -4074,7 +4185,10 @@ class AuthoritativeCoreService:
             raise
 
     def _bind_listener(self) -> socket.socket:
-        socket_path = self.config.socket_path
+        try:
+            socket_path = validate_core_socket_path(self.config.socket_path)
+        except CoreRuntimePathError as exc:
+            raise CoreServiceError("service_unavailable") from exc
         try:
             observed = socket_path.lstat()
         except FileNotFoundError:
@@ -5071,6 +5185,7 @@ def _main(argv: list[str] | None = None) -> int:
         from core_client import CoreClient, CoreRemoteError, CoreUnavailable
 
         expected_config_fingerprint: str | None = None
+        reviewed_config: CoreConfig | None = None
         if args.config:
             reviewed_config = load_core_config(args.config)
             socket_path = reviewed_config.socket_path
@@ -5082,6 +5197,11 @@ def _main(argv: list[str] | None = None) -> int:
         try:
             client = CoreClient(
                 socket_path=socket_path,
+                state_path=(
+                    None
+                    if reviewed_config is None
+                    else reviewed_config.state_path
+                ),
                 expected_config_fingerprint=expected_config_fingerprint,
             )
             result = client.health(timeout_seconds=args.timeout)

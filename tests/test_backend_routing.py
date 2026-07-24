@@ -363,7 +363,7 @@ class BackendRoutingTests(unittest.TestCase):
             self.assertIsInstance(backend, CoreClient)
             self.assertEqual(
                 backend.socket_path,
-                root / "core" / "service.sock",
+                backend_router.canonical_core_socket(database),
             )
             self.assertEqual(backend.expected_config_fingerprint, "a" * 64)
 
@@ -611,7 +611,9 @@ class BackendRoutingTests(unittest.TestCase):
             core.mkdir(parents=True, mode=0o700)
             data_root.chmod(0o700)
             config = CoreConfig(
-                socket_path=data_root / "core" / "service.sock",
+                socket_path=backend_router.canonical_core_socket(
+                    data_root / "memory.sqlite3"
+                ),
                 state_path=data_root / "runtime_state.json",
                 memory_path=data_root / "memory.sqlite3",
                 capture_root=data_root,

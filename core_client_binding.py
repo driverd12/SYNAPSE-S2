@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from core_runtime_paths import (
+    CoreRuntimePathError,
+    supported_core_socket_path,
+)
+
 
 BINDING_SCHEMA = "synapse-s2.core-client-binding.v3"
 BINDING_ENV = "SYNAPSE_S2_CORE_BINDING"
@@ -212,7 +217,6 @@ def validate_core_client_binding(value: Any) -> CoreClientBinding:
     core = data / "core"
     expected = {
         "config_path": core / "service.json",
-        "socket_path": core / "service.sock",
         "state_path": data / "runtime_state.json",
         "memory_path": data / "memory.sqlite3",
         "capture_root": data,
@@ -222,6 +226,15 @@ def validate_core_client_binding(value: Any) -> CoreClientBinding:
         "replication_inbox_root": data / "replication" / "inbox",
     }
     if any(paths[field] != path for field, path in expected.items()):
+        _deny()
+    try:
+        socket_path = supported_core_socket_path(
+            paths["socket_path"],
+            memory_path=paths["memory_path"],
+        )
+    except CoreRuntimePathError:
+        _deny()
+    if socket_path != paths["socket_path"]:
         _deny()
     canonical_data = paths["repo_root"] / ".synapse_s2"
     if (layout == "canonical") != (data == canonical_data):
@@ -259,7 +272,7 @@ def binding_for_config(
         "schema": BINDING_SCHEMA,
         "repo_root": str(Path(repo_root).absolute()),
         "data_root": str(Path(data_root).absolute()),
-        "config_path": str(Path(config.socket_path).parent / "service.json"),
+        "config_path": str(Path(data_root) / "core" / "service.json"),
         "socket_path": str(config.socket_path),
         "state_path": str(config.state_path),
         "memory_path": str(config.memory_path),

@@ -29,7 +29,10 @@ from capture_daemon import CaptureInboxDaemon, write_capture_drop
 from core_authority import CoreAuthorityError, CoreAuthorityLease
 from core_protocol import canonical_json_bytes
 from core_request_journal import CoreRequestJournal
-from core_service import AuthoritativeCoreService
+from core_service import (
+    CUTOVER_PRECLAIM_MINIMUM_REMAINING_SECONDS,
+    AuthoritativeCoreService,
+)
 from operator_readiness_contract import (
     OPERATOR_READINESS_REQUIRED_PROOF_IDS,
     quiescence_policy_contract,
@@ -40,7 +43,10 @@ from operator_readiness_contract import (
 
 class CoreAgentInstallerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="synapse-core-installer-")
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="s2i-",
+            dir="/tmp",
+        )
         # macOS exposes /var as a symlink to /private/var.  Production path
         # validation is deliberately no-follow, so fixtures use the canonical
         # physical TemporaryDirectory path.
@@ -57,7 +63,10 @@ class CoreAgentInstallerTests(unittest.TestCase):
             data_root=self.data,
             core_root=self.core,
             config=self.core / "service.json",
-            socket=self.core / "service.sock",
+            socket=installer.canonical_core_socket_path(
+                self.data,
+                home=self.home,
+            ),
             state=self.data / "runtime_state.json",
             memory_db=self.memory_db,
             capture_root=self.capture,
@@ -221,6 +230,7 @@ else:
             config = installer.build_config(self.paths)
         installer.write_core_config(self.paths.config, config)
         token_path = self.paths.socket.with_name(self.paths.socket.name + ".token")
+        installer.ensure_private_directory(token_path.parent)
         token_path.write_bytes(b"a" * 64)
         token_path.chmod(0o600)
         root_generation_id = "generation-" + ("d" * 24)
@@ -1252,8 +1262,8 @@ else:
         preflight_mock.assert_not_called()
 
     def test_failed_activation_boots_out_and_preserves_all_state(self) -> None:
-        token = self.core / "service.sock.token"
-        self.core.mkdir(mode=0o700)
+        token = self.paths.socket.with_suffix(".sock.token")
+        token.parent.mkdir(mode=0o700, parents=True)
         token.write_text("test-token-placeholder", encoding="utf-8")
         token.chmod(0o600)
         capture_marker = self.data / "capture_inbox" / "pending.json"
@@ -1891,7 +1901,10 @@ else:
                 data_root=self.data,
                 core_root=self.core,
                 config=self.core / "service.json",
-                socket=self.core / "service.sock",
+                socket=installer.canonical_core_socket_path(
+                    self.data,
+                    home=self.home,
+                ),
                 state=self.data / "runtime_state.json",
                 memory_db=self.memory_db,
                 capture_root=self.capture,
@@ -2249,8 +2262,9 @@ else:
         for path, content in (
             (self.paths.config, "config"),
             (self.paths.log, "log"),
-            (self.core / "service.sock.token", "token"),
+            (self.paths.socket.with_suffix(".sock.token"), "token"),
         ):
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
             path.chmod(0o600)
         (self.base / "launchctl-loaded").write_text("loaded", encoding="utf-8")
@@ -2262,7 +2276,10 @@ else:
         self.assertTrue(self.memory_db.exists())
         self.assertEqual(self.paths.config.read_text(encoding="utf-8"), "config")
         self.assertEqual(self.paths.log.read_text(encoding="utf-8"), "log")
-        self.assertEqual((self.core / "service.sock.token").read_text(), "token")
+        self.assertEqual(
+            self.paths.socket.with_suffix(".sock.token").read_text(),
+            "token",
+        )
 
     def test_status_does_not_create_install_paths(self) -> None:
         result = installer.status(paths=self.paths, launchctl=self._launchctl())
@@ -2368,8 +2385,14 @@ else:
                 label="aero.boom.synapse-s2.core.test",
                 noncanonical_layout_manifest=manifest,
             )
-        self.assertEqual(paths.socket, self.data / "core" / "service.sock")
-        self.assertEqual(paths.socket.parent.parent, paths.data_root)
+        self.assertEqual(
+            paths.socket,
+            installer.canonical_core_socket_path(self.data, home=self.home),
+        )
+        self.assertLessEqual(
+            len(os.fsencode(str(paths.socket))),
+            103,
+        )
         self.assertEqual(paths.state, self.data / "runtime_state.json")
         self.assertEqual(
             paths.log,
@@ -2432,7 +2455,10 @@ else:
                 "data_root": linked,
                 "core_root": linked / "core",
                 "config": linked / "core" / "service.json",
-                "socket": linked / "core" / "service.sock",
+                "socket": installer.canonical_core_socket_path(
+                    linked,
+                    home=self.home,
+                ),
                 "state": linked / "runtime_state.json",
                 "memory_db": linked / "memory.sqlite3",
                 "capture_root": linked,
@@ -2615,6 +2641,10 @@ else:
     def test_preflight_repairs_empty_journal_only_after_exact_v5_inspection(
         self,
     ) -> None:
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
         self.memory_db.unlink()
         bootstrap = DurableMemoryStore(self.memory_db)
         bootstrap.close()
@@ -2678,7 +2708,226 @@ else:
             "complete",
         )
 
+    def test_explicit_preclaim_repair_preserves_exact_dans_style_history(
+        self,
+    ) -> None:
+        """Two prior repairs plus the third residue remain evidence-complete."""
+
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
+        self.memory_db.unlink()
+        bootstrap = DurableMemoryStore(self.memory_db)
+        bootstrap.upsert_entry(
+            tag="dans-style-repair",
+            context_id="default",
+            source_text="Synthetic guarded preclaim recovery fixture.",
+            metadata={"fixture": True},
+            embedding_dimensions=8,
+            spike_indices=[1],
+            neuron_indices=[2],
+            registered_at=100.0,
+        )
+        bootstrap.close()
+
+        def primary_ids() -> dict[str, tuple[object, ...]]:
+            with closing(sqlite3.connect(self.memory_db)) as connection:
+                return {
+                    table: tuple(
+                        row[0]
+                        for row in connection.execute(
+                            f"SELECT {column} FROM {table} ORDER BY {column}"
+                        ).fetchall()
+                    )
+                    for table, column in (
+                        ("memory_entries", "memory_id"),
+                        ("memory_events", "event_id"),
+                        ("memory_relationships", "relationship_id"),
+                        ("agent_context_events", "event_id"),
+                        ("capture_operations", "capture_id"),
+                        ("context_relationships", "context_link_id"),
+                    )
+                }
+
+        def create_empty_residue() -> None:
+            journal = CoreRequestJournal(
+                self.core / "requests.sqlite3",
+                authority_epoch="epoch-1",
+                prune_on_open=False,
+                store_identity=installer._store_identity(self.memory_db),
+            )
+            journal.close()
+
+        for _ in range(2):
+            create_empty_residue()
+            repaired = installer.repair_preclaim_residue(
+                paths=self.paths,
+                launchctl=self._launchctl(),
+                confirm=True,
+            )
+            self.assertTrue(repaired["repaired"])
+            self.assertEqual(repaired["request_row_count"], 0)
+
+        historical_paths = sorted(
+            (
+                *self.core.glob("requests.sqlite3.preclaim-repair-*.json"),
+                *self.core.glob(".*.preclaim-*.archive"),
+            ),
+            key=lambda path: path.name,
+        )
+        self.assertGreaterEqual(len(historical_paths), 4)
+        historical = {
+            path.name: (
+                path.read_bytes(),
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+            )
+            for path in historical_paths
+        }
+        prior_attestation = self.core / preflight.CUTOVER_ATTESTATION_NAME
+        prior_attestation.write_bytes(b"preserve-prior-cutover-evidence\n")
+        prior_attestation.chmod(0o600)
+        attestation_before = (
+            prior_attestation.read_bytes(),
+            prior_attestation.lstat().st_dev,
+            prior_attestation.lstat().st_ino,
+        )
+        create_empty_residue()
+        inspection_lease = CoreAuthorityLease.acquire_core(
+            self.memory_db,
+            timeout_seconds=0.0,
+            instance_id="dans-style-before-inspection",
+        )
+        store = DurableMemoryStore.open_existing_for_core_maintenance(
+            self.memory_db,
+            authority_lease=inspection_lease,
+        )
+        try:
+            logical_before = store.inspect_core_authority_preclaim_immutable()
+        finally:
+            store.close()
+            inspection_lease.close()
+        ids_before = primary_ids()
+
+        result = installer.repair_preclaim_residue(
+            paths=self.paths,
+            launchctl=self._launchctl(),
+            confirm=True,
+        )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["repaired"])
+        self.assertEqual(result["request_row_count"], 0)
+        self.assertFalse((self.core / "requests.sqlite3").exists())
+        self.assertFalse((self.core / "requests.sqlite3.lock").exists())
+        self.assertEqual(primary_ids(), ids_before)
+        reinspection_lease = CoreAuthorityLease.acquire_core(
+            self.memory_db,
+            timeout_seconds=0.0,
+            instance_id="dans-style-after-inspection",
+        )
+        reinspected = DurableMemoryStore.open_existing_for_core_maintenance(
+            self.memory_db,
+            authority_lease=reinspection_lease,
+        )
+        try:
+            self.assertEqual(
+                reinspected.inspect_core_authority_preclaim_immutable(),
+                logical_before,
+            )
+        finally:
+            reinspected.close()
+            reinspection_lease.close()
+        self.assertEqual(
+            (
+                prior_attestation.read_bytes(),
+                prior_attestation.lstat().st_dev,
+                prior_attestation.lstat().st_ino,
+            ),
+            attestation_before,
+        )
+        for name, expected in historical.items():
+            path = self.core / name
+            self.assertEqual(
+                (path.read_bytes(), path.lstat().st_dev, path.lstat().st_ino),
+                expected,
+            )
+        self.assertEqual(
+            len(tuple(self.core.glob("requests.sqlite3.preclaim-repair-*.json"))),
+            3,
+        )
+
+    def test_explicit_preclaim_repair_requires_confirmation_and_quiescence(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "requires --confirm",
+        ):
+            installer.repair_preclaim_residue(
+                paths=self.paths,
+                launchctl=self._launchctl(),
+                confirm=False,
+            )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "disabled and unloaded",
+        ):
+            installer.repair_preclaim_residue(
+                paths=self.paths,
+                launchctl=self._launchctl(),
+                confirm=True,
+            )
+
+    def test_install_preflight_leaves_authoritative_v6_journal_unchanged(
+        self,
+    ) -> None:
+        config = self._prepare_recoverable_v6()
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
+        journal_path = self.core / "requests.sqlite3"
+        journal_before = (
+            journal_path.read_bytes(),
+            journal_path.lstat().st_dev,
+            journal_path.lstat().st_ino,
+        )
+        with mock.patch.object(
+            installer,
+            "run_preflight",
+            return_value={"ready": True},
+        ) as delegated:
+            result = installer._preflight(
+                paths=self.paths,
+                evidence_manifest=self.base / "unused-evidence.json",
+                maximum_evidence_age_seconds=60.0,
+                launchctl_bin=str(self.launchctl_path),
+                ps_bin="/bin/ps",
+                label="aero.boom.synapse-s2.core.test",
+                config=config,
+            )
+
+        self.assertEqual(result, {"ready": True})
+        delegated.assert_called_once()
+        self.assertEqual(
+            (
+                journal_path.read_bytes(),
+                journal_path.lstat().st_dev,
+                journal_path.lstat().st_ino,
+            ),
+            journal_before,
+        )
+        self.assertFalse(
+            tuple(self.core.glob("requests.sqlite3.preclaim-repair-*.json"))
+        )
+
     def test_preflight_malformed_memory_schema_never_archives_journal(self) -> None:
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
         self.memory_db.unlink()
         bootstrap = DurableMemoryStore(self.memory_db)
         bootstrap.close()
@@ -2739,6 +2988,10 @@ else:
         self.assertFalse(tuple(self.core.glob(".*.preclaim-*.archive")))
 
     def test_preflight_active_core_contention_preserves_empty_residue(self) -> None:
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
         self.memory_db.unlink()
         bootstrap = DurableMemoryStore(self.memory_db)
         bootstrap.close()
@@ -2789,6 +3042,10 @@ else:
         self.assertFalse(tuple(self.core.glob(".*.preclaim-*.archive")))
 
     def test_preflight_journal_recovery_never_bootstraps_missing_memory(self) -> None:
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
         self.memory_db.unlink()
         self.core.mkdir(parents=True, mode=0o700)
         journal_path = self.core / "requests.sqlite3"
@@ -2829,6 +3086,10 @@ else:
         )
 
     def test_preflight_normalizes_filesystem_repair_failure(self) -> None:
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
         self.memory_db.unlink()
         bootstrap = DurableMemoryStore(self.memory_db)
         bootstrap.close()
@@ -2880,6 +3141,10 @@ else:
     def test_preflight_validates_completed_repair_without_canonical_journal(
         self,
     ) -> None:
+        (self.base / "launchctl-disabled").write_text(
+            "disabled",
+            encoding="utf-8",
+        )
         self.memory_db.unlink()
         bootstrap = DurableMemoryStore(self.memory_db)
         bootstrap.close()
@@ -2942,10 +3207,13 @@ else:
 class CoreCutoverPreflightTests(unittest.TestCase):
     @staticmethod
     def _core_config(root: Path, *, memory_path: Path | None = None) -> installer.CoreConfig:
+        selected_memory = memory_path or (root / "memory.sqlite3")
         return installer.CoreConfig(
-            socket_path=root / "core" / "service.sock",
+            socket_path=installer.canonical_core_socket_path(
+                selected_memory.parent
+            ),
             state_path=root / "runtime_state.json",
-            memory_path=memory_path or (root / "memory.sqlite3"),
+            memory_path=selected_memory,
             capture_root=root,
             dimension=8,
             num_neurons=16,
@@ -3460,6 +3728,10 @@ class CoreCutoverPreflightTests(unittest.TestCase):
         return manifest, proof_path
 
     def test_cutover_attestation_contract_uses_real_build_id_and_wall_clock(self) -> None:
+        self.assertGreater(
+            preflight.CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS,
+            CUTOVER_PRECLAIM_MINIMUM_REMAINING_SECONDS,
+        )
         with tempfile.TemporaryDirectory(
             prefix="synapse-cutover-attestation-contract-"
         ) as temporary:
@@ -3651,6 +3923,34 @@ class CoreCutoverPreflightTests(unittest.TestCase):
             self.assertEqual(result["path"], str(path))
             self.assertRegex(result["receipt_digest"], r"^[0-9a-f]{64}$")
             self.assertRegex(result["artifact_sha256"], r"^[0-9a-f]{64}$")
+            first_bytes = path.read_bytes()
+            first_identity = path.lstat()
+            with mock.patch.object(
+                preflight,
+                "_git_snapshot",
+                return_value=("1" * 40, ""),
+            ):
+                replacement = preflight.publish_cutover_attestation(
+                    request=request,
+                    root=ROOT,
+                    memory_db=db,
+                    evidence_manifest=evidence,
+                    maximum_evidence_age_seconds=7200,
+                    recovery=recovery,
+                )
+            preserved = replacement["superseded_attestation"]
+            self.assertTrue(preserved["preserved"])
+            archive = core / preserved["archive_name"]
+            receipt_path = core / preserved["receipt_name"]
+            self.assertEqual(archive.read_bytes(), first_bytes)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "complete")
+            self.assertEqual(receipt["source_inode"], first_identity.st_ino)
+            self.assertEqual(
+                receipt["artifact_sha256"],
+                hashlib.sha256(first_bytes).hexdigest(),
+            )
+            self.assertNotEqual(path.lstat().st_ino, first_identity.st_ino)
 
     def test_core_startup_verifier_refuses_stale_and_v5_state_drift(self) -> None:
         with tempfile.TemporaryDirectory(

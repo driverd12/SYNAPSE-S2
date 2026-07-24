@@ -151,6 +151,20 @@ BACKUP_SCHEMA_COMPATIBILITY_REGISTRY: dict[str, dict[str, Any]] = {
         "application_id": SQLITE_APPLICATION_ID,
         "user_version": SQLITE_USER_VERSION,
     },
+    # The reviewed Dans-MBP legacy database differs from the canonical DDL
+    # only in stored SQLite whitespace for three schema objects. Authority
+    # adoption adds the v6 migration/marker and changes user_version, but does
+    # not rewrite sqlite_schema text. Register that exact continuing shape
+    # instead of normalizing or rebuilding any table.
+    "s2-schema-v6-dans-mbp-20260724": {
+        "schema_sha256": "338c97e56aaab242f0d23143288d2825d3e12c22389612d7fda97cde90b225f8",
+        "table_count": 19,
+        "index_count": 28,
+        "migration_set_sha256": "ae7a7d3cd572233c5090f1bb6bb0ce209dd19925e5b03a3f86a00f6e2bc5f995",
+        "migration_count": 13,
+        "application_id": SQLITE_APPLICATION_ID,
+        "user_version": SQLITE_USER_VERSION,
+    },
 }
 _CANONICAL_BACKUP_CONTRACT: dict[str, Any] | None = None
 

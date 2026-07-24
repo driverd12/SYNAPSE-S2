@@ -100,9 +100,15 @@ _BUILD_ID = re.compile(r"^source-[0-9a-f]{24}$")
 CUTOVER_ATTESTATION_SCHEMA = "synapse-s2.core-cutover-attestation.v1"
 CUTOVER_VERIFICATION_SCHEMA = "synapse-s2.core-cutover-verification.v1"
 CUTOVER_ATTESTATION_NAME = "cutover-attestation.json"
+CUTOVER_ATTESTATION_PRESERVATION_SCHEMA = (
+    "synapse-s2.core-cutover-attestation-preservation.v1"
+)
 CUTOVER_ATTESTATION_MAX_BYTES = 64 * 1024
 CUTOVER_ATTESTATION_MAX_TTL_SECONDS = 600.0
-CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS = 120.0
+# Leave explicit publication/launchd scheduling headroom above the service's
+# 150-second preclaim floor; an attestation produced at the exact consumer
+# boundary would already be ineligible by the time the service reads it.
+CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS = 180.0
 REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v2"
 REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA = (
     "synapse-s2.replacement-admission-verification.v2"
@@ -684,6 +690,216 @@ def _atomic_private_json_replace(
         except FileNotFoundError:
             pass
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_private_bytes(
+    path: Path,
+    *,
+    name: str,
+    maximum_bytes: int,
+) -> tuple[bytes, os.stat_result]:
+    before = _safe_regular(
+        path,
+        name=name,
+        max_bytes=maximum_bytes,
+    )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise CutoverPreflightError(f"{name} exceeds its size limit")
+        finished = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    visible = path.lstat()
+
+    def identity(item: os.stat_result) -> tuple[int, ...]:
+        return (
+            int(item.st_dev),
+            int(item.st_ino),
+            int(item.st_size),
+            int(item.st_mtime_ns),
+            int(item.st_ctime_ns),
+            int(item.st_uid),
+            int(item.st_nlink),
+            stat.S_IMODE(item.st_mode),
+        )
+
+    if (
+        len({identity(item) for item in (before, opened, finished, visible)})
+        != 1
+        or total != int(before.st_size)
+    ):
+        raise CutoverPreflightError(f"{name} changed while being read")
+    return b"".join(chunks), before
+
+
+def _publish_private_archive_once(
+    path: Path,
+    payload: bytes,
+    *,
+    name: str,
+) -> None:
+    """Publish one exact immutable private archive, idempotently."""
+
+    if path.exists() or path.is_symlink():
+        observed, _metadata = _stable_private_bytes(
+            path,
+            name=name,
+            maximum_bytes=CUTOVER_ATTESTATION_MAX_BYTES,
+        )
+        if not secrets.compare_digest(observed, payload):
+            raise CutoverPreflightError(f"{name} conflicts with prior evidence")
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temporary = Path(temporary_name)
+    temporary_unlinked = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"{name} write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        # The archive must be single-linked before the stable private-file
+        # validator opens it.  The temporary hard-link is only a publication
+        # primitive and is never part of the durable evidence contract.
+        temporary.unlink()
+        temporary_unlinked = True
+        _fsync_directory(path.parent)
+        observed, _metadata = _stable_private_bytes(
+            path,
+            name=name,
+            maximum_bytes=CUTOVER_ATTESTATION_MAX_BYTES,
+        )
+        if not secrets.compare_digest(observed, payload):
+            raise CutoverPreflightError(f"{name} publication changed")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not temporary_unlinked:
+            temporary.unlink(missing_ok=True)
+
+
+def _preserve_superseded_cutover_attestation(
+    path: Path,
+    *,
+    store: DurableMemoryStore,
+) -> dict[str, Any] | None:
+    """Preserve the exact prior ticket before replacing the canonical path."""
+
+    if not (path.exists() or path.is_symlink()):
+        return None
+    raw, observed = _stable_private_bytes(
+        path,
+        name="existing cutover attestation",
+        maximum_bytes=CUTOVER_ATTESTATION_MAX_BYTES,
+    )
+    artifact_sha256 = hashlib.sha256(raw).hexdigest()
+    preservation_seed = {
+        "artifact_sha256": artifact_sha256,
+        "source_device": int(observed.st_dev),
+        "source_inode": int(observed.st_ino),
+        "source_size_bytes": int(observed.st_size),
+        "source_mtime_ns": int(observed.st_mtime_ns),
+    }
+    preservation_id = hashlib.sha256(
+        json.dumps(
+            preservation_seed,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    archive_name = (
+        f"cutover-attestation.superseded-{artifact_sha256}.archive"
+    )
+    archive_path = path.parent / archive_name
+    receipt_name = (
+        f"cutover-attestation.preservation-{preservation_id}.json"
+    )
+    receipt_path = path.parent / receipt_name
+    _publish_private_archive_once(
+        archive_path,
+        raw,
+        name="superseded cutover attestation archive",
+    )
+    receipt_base: dict[str, Any] = {
+        "schema": CUTOVER_ATTESTATION_PRESERVATION_SCHEMA,
+        "status": "complete",
+        "preservation_id": preservation_id,
+        "source_name": path.name,
+        "archive_name": archive_name,
+        **preservation_seed,
+        "created_at_unix_ms": max(1, int(observed.st_mtime_ns // 1_000_000)),
+    }
+    if receipt_path.exists() or receipt_path.is_symlink():
+        receipt = _read_json(
+            receipt_path,
+            name="cutover attestation preservation receipt",
+        )
+        unsigned = {
+            key: value
+            for key, value in receipt.items()
+            if key
+            not in {
+                "auth_algorithm",
+                "auth_key_id",
+                "signing_public_key",
+                "receipt_digest",
+                "receipt_signature",
+            }
+        }
+        if (
+            unsigned != receipt_base
+            or not store._verify_receipt_authenticator(receipt)
+            or not secrets.compare_digest(
+                str(receipt.get("receipt_digest") or ""),
+                store._canonical_payload_digest(receipt),
+            )
+        ):
+            raise CutoverPreflightError(
+                "cutover attestation preservation receipt is invalid"
+            )
+    else:
+        receipt = dict(receipt_base)
+        store._authenticate_receipt(receipt)
+        _atomic_private_json_replace(
+            receipt_path,
+            receipt,
+            name="cutover attestation preservation receipt",
+        )
+    return {
+        "preserved": True,
+        "preservation_id": preservation_id,
+        "archive_name": archive_name,
+        "receipt_name": receipt_name,
+        "receipt_digest": receipt.get("receipt_digest"),
+    }
 
 
 def _validate_cutover_attestation(
@@ -1926,6 +2142,10 @@ def publish_cutover_attestation(
             now_unix_ms=created_at_unix_ms,
             minimum_remaining_seconds=CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS,
         )
+        superseded = _preserve_superseded_cutover_attestation(
+            request.path,
+            store=store,
+        )
         artifact_sha256 = _atomic_private_json_replace(
             request.path,
             attestation,
@@ -1955,6 +2175,7 @@ def publish_cutover_attestation(
             "receipt_digest": receipt_digest,
             "artifact_sha256": artifact_sha256,
             "expires_at_unix_ms": expires_at_unix_ms,
+            "superseded_attestation": superseded,
             "verified": True,
         }
     except CutoverPreflightError:

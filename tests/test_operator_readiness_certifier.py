@@ -19,6 +19,7 @@ from core_client_binding import (
 )
 from client_config import CLIENT_CONFIG_PLAN_SCHEMA
 from core_authority import CoreAuthorityLease
+from core_runtime_paths import canonical_core_socket_path
 from core_service import CoreConfig, write_core_config
 from capture_daemon import CaptureInboxDaemon
 from memory_store import DurableMemoryStore
@@ -222,7 +223,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         core.mkdir(parents=True, mode=0o700)
         data.chmod(0o700)
         config = CoreConfig(
-            socket_path=core / "service.sock",
+            socket_path=canonical_core_socket_path(data),
             state_path=data / "runtime_state.json",
             memory_path=data / "memory.sqlite3",
             capture_root=data,

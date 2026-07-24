@@ -56,6 +56,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 class VerifiedBackupRecoveryTests(unittest.TestCase):
     DANS_MBP_LEGACY_V5_SCHEMA_VERSION = "s2-schema-v5-dans-mbp-20260723"
+    DANS_MBP_LEGACY_V6_SCHEMA_VERSION = "s2-schema-v6-dans-mbp-20260724"
     DANS_MBP_LEGACY_V5_SCHEMA_SHA256 = (
         "338c97e56aaab242f0d23143288d2825d3e12c22389612d7fda97cde90b225f8"
     )
@@ -90,7 +91,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             schema = dict(original(conn))
             user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if (
-                user_version == 5
+                user_version in {5, 6}
                 and schema.get("sha256")
                 == BACKUP_SCHEMA_COMPATIBILITY_REGISTRY["s2-schema-v5"][
                     "schema_sha256"
@@ -885,6 +886,9 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             CaptureInboxDaemon(root=root).status()
             manager = VerifiedRecoveryManager(store, capture_root=root)
             before_bytes = db_path.read_bytes()
+            # Compute the code-owned canonical v6 contract before the fixture
+            # substitutes Dans' reviewed, whitespace-only stored-DDL hash.
+            store._canonical_backup_contract()
 
             with self._dans_mbp_legacy_schema_fingerprint_patch():
                 bundle = manager.create_bundle(
@@ -933,7 +937,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                         inspection["schema_identity"],
                         "sqlite-53324442-v5",
                     )
-                    restored_store.claim_core_authority(
+                    marker = restored_store.claim_core_authority(
                         instance_id=authority.instance_id,
                         config_fingerprint="d" * 64,
                         build_id="dans-mbp-schema-compatibility-test",
@@ -952,6 +956,22 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                         attestation_receipt_digest="d" * 64,
                         attestation_expires_at_unix_ms=int(time.time() * 1000)
                         + 60_000,
+                    )
+                    self.assertEqual(marker["epoch"], 1)
+                    contract = restored_store._inspect_backup_snapshot(
+                        restored_db
+                    )
+                    self.assertEqual(
+                        contract["authority_binding"]["schema_identity"],
+                        "sqlite-53324442-v6",
+                    )
+                    self.assertEqual(
+                        contract["schema_contract_version"],
+                        self.DANS_MBP_LEGACY_V6_SCHEMA_VERSION,
+                    )
+                    self.assertEqual(
+                        contract["schema"]["sha256"],
+                        self.DANS_MBP_LEGACY_V5_SCHEMA_SHA256,
                     )
                 finally:
                     authority.close()

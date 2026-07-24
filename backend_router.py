@@ -19,6 +19,11 @@ from core_authority import (
 )
 from core_client_binding import apply_binding_environment
 from core_request_journal import JOURNAL_BINDING_SCHEMA, JOURNAL_SCHEMA_VERSION
+from core_runtime_paths import (
+    CoreRuntimePathError,
+    canonical_core_socket_path,
+    supported_core_socket_path,
+)
 
 
 CORE_SOCKET_ENV = "SYNAPSE_S2_CORE_SOCKET"
@@ -74,6 +79,7 @@ class BackendRoute:
     mode: str
     socket_path: Path | None
     memory_path: Path | None
+    state_path: Path | None
     source: str
     config_fingerprint: str | None = None
 
@@ -161,7 +167,12 @@ def _default_memory_path(
 
 def canonical_core_socket(memory_path: str | os.PathLike[str]) -> Path:
     memory = _absolute_path(memory_path, field="memory database path")
-    return memory.parent / "core" / "service.sock"
+    try:
+        return canonical_core_socket_path(memory.parent)
+    except CoreRuntimePathError as exc:
+        raise BackendRoutingError(
+            "authoritative core transport path is unavailable"
+        ) from exc
 
 
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -481,8 +492,14 @@ def resolve_backend_route(
         configured_socket = os.environ.get(CORE_SOCKET_ENV)
         if not configured_socket:
             raise BackendRoutingError("authoritative core socket is empty")
-    memory = _default_memory_path(memory_path=memory_path, state_path=state_path)
-    explicitly_configured_memory = bool(memory_path or os.getenv(MEMORY_DB_ENV))
+    memory = (
+        binding.memory_path
+        if binding is not None
+        else _default_memory_path(memory_path=memory_path, state_path=state_path)
+    )
+    explicitly_configured_memory = binding is not None or bool(
+        memory_path or os.getenv(MEMORY_DB_ENV)
+    )
     # A configured socket is the complete installed-client authority pointer.
     # Do not probe an unrelated cwd database unless the caller also supplied a
     # database constraint that must be checked for agreement.
@@ -510,6 +527,7 @@ def resolve_backend_route(
             mode="service",
             socket_path=canonical_core_socket(memory),
             memory_path=memory,
+            state_path=memory.parent / "runtime_state.json",
             source="durable-marker",
             config_fingerprint=inspection.config_fingerprint,
         )
@@ -518,10 +536,23 @@ def resolve_backend_route(
             mode="local",
             socket_path=None,
             memory_path=memory,
+            state_path=memory.parent / "runtime_state.json",
             source="local-v5",
             config_fingerprint=None,
         )
     socket = _absolute_path(configured_socket, field="authoritative core socket")
+    if (
+        binding is None
+        and not explicitly_configured_memory
+        and (
+            socket.name != "service.sock"
+            or socket.parent.name != "core"
+        )
+    ):
+        raise BackendRoutingError(
+            "split authoritative transport requires a reviewed binding "
+            "or explicit memory database"
+        )
     if inspection is None and binding_inspection is None:
         # A raw configured Unix socket still has one canonical adjacent store.
         # Inspect it read-only so an already governed deployment pins the exact
@@ -534,15 +565,31 @@ def resolve_backend_route(
             raise BackendRoutingError(
                 "memory database configuration conflicts with authoritative core mode"
             )
-        derived_socket = canonical_core_socket(memory)
-        if socket != derived_socket:
+        try:
+            supported_socket = supported_core_socket_path(
+                socket,
+                memory_path=memory,
+            )
+        except CoreRuntimePathError as exc:
+            raise BackendRoutingError(
+                "memory database and authoritative core socket do not match"
+            ) from exc
+        if binding is not None and supported_socket != binding.socket_path:
             raise BackendRoutingError(
                 "memory database and authoritative core socket do not match"
             )
     configured_state = state_path or os.getenv(STATE_PATH_ENV)
+    derived_state = (
+        binding.state_path
+        if binding is not None
+        else (
+            memory.parent / "runtime_state.json"
+            if explicitly_configured_memory
+            else socket.parent.parent / "runtime_state.json"
+        )
+    )
     if configured_state:
         state = _absolute_path(configured_state, field="runtime state path")
-        derived_state = socket.parent.parent / "runtime_state.json"
         if state != derived_state:
             raise BackendRoutingError(
                 "runtime state path and authoritative core socket do not match"
@@ -551,6 +598,7 @@ def resolve_backend_route(
         mode="service",
         socket_path=socket,
         memory_path=memory if explicitly_configured_memory else None,
+        state_path=derived_state,
         source="configured-socket",
         config_fingerprint=(
             inspection.config_fingerprint
@@ -611,11 +659,7 @@ def core_client_if_required(
 
     return CoreClient(
         socket_path=route.socket_path,
-        state_path=(
-            None
-            if route.socket_path is None
-            else route.socket_path.parent.parent / "runtime_state.json"
-        ),
+        state_path=route.state_path,
         caller=caller,
         expected_config_fingerprint=route.config_fingerprint,
     )

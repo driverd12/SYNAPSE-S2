@@ -26,6 +26,7 @@ from core_client_binding import (
     binding_for_config,
     write_core_client_binding,
 )
+from core_runtime_paths import canonical_core_socket_path
 from core_service import CORE_OPERATION_CONTRACTS
 from core_service import CoreConfig, write_core_config
 from dashboard_server import (
@@ -56,7 +57,7 @@ class DashboardRuntimeTests(unittest.TestCase):
             core.mkdir(parents=True, mode=0o700)
             data_root.chmod(0o700)
             config = CoreConfig(
-                socket_path=data_root / "core" / "service.sock",
+                socket_path=canonical_core_socket_path(data_root),
                 state_path=data_root / "runtime_state.json",
                 memory_path=data_root / "memory.sqlite3",
                 capture_root=data_root,

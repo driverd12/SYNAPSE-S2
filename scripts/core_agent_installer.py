@@ -37,6 +37,11 @@ from core_request_journal import (  # noqa: E402
     CoreRequestJournalError,
     repair_empty_preclaim_journal_residue,
 )
+from core_runtime_paths import (  # noqa: E402
+    CoreRuntimePathError,
+    canonical_core_socket_path,
+    validate_core_socket_path,
+)
 from core_client_binding import (  # noqa: E402
     binding_for_config,
     default_binding_path,
@@ -133,7 +138,10 @@ def _canonical_layout(data_root: Path, *, home: Path) -> dict[str, Path]:
         "data_root": data_root,
         "core_root": core_root,
         "config": core_root / "service.json",
-        "socket": core_root / "service.sock",
+        # Keep the AF_UNIX endpoint short even when the reviewed repository is
+        # nested below a long macOS Documents path. Durable generation,
+        # journal, repair, and attestation evidence remains under core_root.
+        "socket": canonical_core_socket_path(data_root, home=home),
         "state": data_root / "runtime_state.json",
         "memory_db": data_root / "memory.sqlite3",
         "capture_root": data_root,
@@ -217,13 +225,14 @@ def resolve_paths(
     home = _env_path("HOME", Path.home())
     data_root = _env_path("SYNAPSE_S2_CORE_DATA_ROOT", ROOT / ".synapse_s2")
     core_root = _env_path("SYNAPSE_S2_CORE_RUNTIME_ROOT", data_root / "core")
+    canonical_socket = canonical_core_socket_path(data_root, home=home)
     values = InstallPaths(
         home=home,
         root=ROOT,
         data_root=data_root,
         core_root=core_root,
         config=_env_path("SYNAPSE_S2_CORE_CONFIG", core_root / "service.json"),
-        socket=_env_path("SYNAPSE_S2_CORE_SOCKET", core_root / "service.sock"),
+        socket=_env_path("SYNAPSE_S2_CORE_SOCKET", canonical_socket),
         state=_env_path("SYNAPSE_S2_CORE_STATE", data_root / "runtime_state.json"),
         memory_db=_env_path("SYNAPSE_S2_MEMORY_DB", data_root / "memory.sqlite3"),
         capture_root=_env_path("SYNAPSE_S2_CAPTURE_ROOT", data_root),
@@ -273,10 +282,15 @@ def resolve_paths(
             raise CoreInstallerError(
                 "noncanonical layout does not match its reviewed manifest"
             )
-    if values.socket.parent != values.core_root or values.socket.parent.parent != values.data_root:
+    try:
+        validate_core_socket_path(values.socket)
+    except CoreRuntimePathError as exc:
         raise CoreInstallerError(
-            "core socket must be data_root/core/service.sock so every adapter "
-            "resolves one authority"
+            "core socket path exceeds the safe transport bound"
+        ) from exc
+    if values.socket != canonical_socket:
+        raise CoreInstallerError(
+            "core socket must use the canonical private transport path"
         )
     if values.state.parent != values.data_root:
         raise CoreInstallerError(
@@ -1077,7 +1091,11 @@ def probe_health(
 ) -> dict[str, Any]:
     from core_client import CoreClient
 
-    client = CoreClient(socket_path=config.socket_path)
+    client = CoreClient(
+        socket_path=config.socket_path,
+        state_path=config.state_path,
+        expected_config_fingerprint=config.fingerprint,
+    )
     result = client.health(timeout_seconds=2.0)
     identity = client.authority_identity
     if not isinstance(identity, dict):
@@ -2192,6 +2210,115 @@ def _existing_install_is_current(
     return {**health, "pid": snapshot.get("pid")}
 
 
+def repair_preclaim_residue(
+    *,
+    paths: InstallPaths,
+    launchctl: LaunchCtl,
+    confirm: bool,
+    _allow_authoritative_v6_noop: bool = False,
+) -> dict[str, Any]:
+    """Guardedly archive one exact empty v5 preclaim journal.
+
+    This explicit lane exists so a failed first-adoption journal can be
+    reconciled before a fresh paired bundle and operator certification are
+    created. It never starts a service, replays a request, or changes the
+    memory database.
+    """
+
+    if confirm is not True:
+        raise CoreInstallerError("preclaim residue repair requires --confirm")
+    snapshot = launchctl.snapshot()
+    if (
+        snapshot.get("loaded")
+        or snapshot.get("running")
+        or not launchctl.disabled()
+    ):
+        raise CoreInstallerError(
+            "preclaim residue repair requires the exact core LaunchAgent "
+            "to be disabled and unloaded"
+        )
+    _assert_owner_controlled(
+        paths.core_root,
+        kind="core directory",
+        require_mode=0o700,
+    )
+    _assert_owner_controlled(
+        paths.memory_db,
+        kind="live memory database",
+        require_mode=0o600,
+    )
+    lease = CoreAuthorityLease.acquire_core(
+        paths.memory_db,
+        timeout_seconds=0.0,
+        instance_id="core-installer-preclaim-repair",
+    )
+    store = None
+    try:
+        from memory_store import DurableMemoryStore
+
+        store = DurableMemoryStore(
+            paths.memory_db,
+            authority_lease=lease,
+        )
+        inspection = store.inspect_core_authority_preclaim()
+        governance_mode = inspection.get("governance_mode")
+        if (
+            governance_mode == "authoritative-v6"
+            and _allow_authoritative_v6_noop
+        ):
+            return _safe_result(
+                "repair-preclaim-residue",
+                status="not-applicable-authoritative-v6",
+                repaired=False,
+                request_row_count=0,
+                logical_snapshot_sha256=(
+                    dict(inspection.get("logical_snapshot") or {}).get(
+                        "sha256"
+                    )
+                ),
+            )
+        if governance_mode != "pre-governed-v5":
+            raise CoreInstallerError(
+                "preclaim residue repair requires an exact unclaimed v5 store"
+            )
+        logical_before = dict(inspection.get("logical_snapshot") or {})
+        result = repair_empty_preclaim_journal_residue(
+            paths.core_root / "requests.sqlite3",
+            expected_store_identity=str(inspection["store_identity"]),
+            memory_db_path=paths.memory_db,
+            authority_lease=lease,
+        )
+        reinspected = store.inspect_core_authority_preclaim()
+        if dict(reinspected) != dict(inspection):
+            raise CoreAuthorityError(
+                "memory store changed during preclaim journal repair"
+            )
+        if result is None:
+            return _safe_result(
+                "repair-preclaim-residue",
+                status="no-residue",
+                repaired=False,
+                request_row_count=0,
+                logical_snapshot_sha256=logical_before.get("sha256"),
+            )
+        return _safe_result(
+            "repair-preclaim-residue",
+            status="complete",
+            repaired=True,
+            repair_id=result.get("repair_id"),
+            receipt_name=(
+                "requests.sqlite3.preclaim-repair-"
+                f"{result.get('repair_id')}.json"
+            ),
+            request_row_count=int(result.get("request_row_count") or 0),
+            logical_snapshot_sha256=logical_before.get("sha256"),
+        )
+    finally:
+        if store is not None:
+            store.close()
+        lease.close()
+
+
 def _preflight(
     *,
     paths: InstallPaths,
@@ -2208,58 +2335,17 @@ def _preflight(
         # request journal behind while SQLite remains v5.  Repair only that
         # exact residue under the same authority lock used by the read-only
         # proof.  v6 lineage is never routed through this path.
-        journal_path = paths.core_root / "requests.sqlite3"
         if paths.core_root.exists() or paths.core_root.is_symlink():
-            # Recovery is never allowed to create/bootstrap the memory store.
-            # It may operate only beside an already-existing private database
-            # and private core root.  Invoke the helper even when no canonical
-            # journal remains so completed receipts, archives, interrupted
-            # temp publications, and verification scratch are authenticated
-            # exactly as they are on direct service startup.
-            _assert_owner_controlled(
-                paths.core_root,
-                kind="core directory",
-                require_mode=0o700,
+            repair_preclaim_residue(
+                paths=paths,
+                launchctl=LaunchCtl(
+                    launchctl_bin,
+                    uid=os.getuid(),
+                    label=label,
+                ),
+                confirm=True,
+                _allow_authoritative_v6_noop=True,
             )
-            _assert_owner_controlled(
-                paths.memory_db,
-                kind="live memory database",
-                require_mode=0o600,
-            )
-            lease = CoreAuthorityLease.acquire_core(
-                paths.memory_db,
-                timeout_seconds=0.0,
-                instance_id="core-installer-preclaim-repair",
-            )
-            store = None
-            try:
-                # Construct and inspect through the same exact v5/v6 schema
-                # contract used by the authoritative service.  A shallow
-                # PRAGMA/version probe must never authorize destructive
-                # request-journal recovery beside a malformed memory store.
-                from memory_store import DurableMemoryStore
-
-                store = DurableMemoryStore(
-                    paths.memory_db,
-                    authority_lease=lease,
-                )
-                inspection = store.inspect_core_authority_preclaim()
-                if inspection.get("governance_mode") == "pre-governed-v5":
-                    repair_empty_preclaim_journal_residue(
-                        journal_path,
-                        expected_store_identity=str(inspection["store_identity"]),
-                        memory_db_path=paths.memory_db,
-                        authority_lease=lease,
-                    )
-                    reinspected = store.inspect_core_authority_preclaim()
-                    if dict(reinspected) != dict(inspection):
-                        raise CoreAuthorityError(
-                            "memory store changed during preclaim journal repair"
-                        )
-            finally:
-                if store is not None:
-                    store.close()
-                lease.close()
         return run_preflight(
             root=paths.root,
             memory_db=paths.memory_db,
@@ -3143,6 +3229,7 @@ def build_parser() -> argparse.ArgumentParser:
             "install",
             "stage-replacement",
             "recover-existing",
+            "repair-preclaim-residue",
             "context-delivery-integrity",
             "publish-binding",
             "status",
@@ -3199,6 +3286,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if delivery_integrity_flags and args.action not in {
             "context-delivery-integrity",
             "stage-replacement",
+            "repair-preclaim-residue",
         }:
             raise CoreInstallerError(
                 "reviewed delivery flags are valid only for delivery integrity "
@@ -3207,6 +3295,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action == "stage-replacement" and args.repair:
             raise CoreInstallerError(
                 "replacement staging never repairs delivery publication"
+            )
+        if args.action == "repair-preclaim-residue" and (
+            args.repair
+            or args.expected_revision
+            or args.evidence_manifest
+            or args.force_restart
+            or args.restored_target
+        ):
+            raise CoreInstallerError(
+                "repair-preclaim-residue accepts only its explicit --confirm"
             )
         if args.action == "context-delivery-integrity" and (
             args.evidence_manifest or args.force_restart
@@ -3288,6 +3386,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         label=args.label,
                         launchctl=launchctl,
                         wait_seconds=args.wait_seconds,
+                    )
+                elif args.action == "repair-preclaim-residue":
+                    result = repair_preclaim_residue(
+                        paths=paths,
+                        launchctl=launchctl,
+                        confirm=bool(args.confirm),
                     )
                 elif args.action == "publish-binding":
                     from backend_router import database_requires_core
