@@ -151,12 +151,18 @@ temporary copies were not swept into backups or cloud sync before cleanup.
 
 ## Operational behavior
 
-Checkpoint creation and staging are exclusive maintenance operations. The core
-client and protocol both cap one synchronous request at 300 seconds; there is
-no hidden longer server claim and no asynchronous job contract. If the caller
-loses the response, the result is `outcome_unknown`: preserve its caller and
-request ID, use the normal `request-status` reconciliation path, and do not
-blindly submit a new logical operation:
+Checkpoint creation and staging are exclusive maintenance operations that
+create, hash, verify, and—for staging—restore a complete paired recovery point.
+They belong to the authenticated closed recovery allowlist and receive a
+bounded one-hour synchronous deadline. Ordinary operations, pairing, peer
+revocation, signed ACK recording, and bridge governance retain the five-minute
+protocol ceiling. Waiting to acquire the serialized maintenance lane is also
+capped at five minutes, so queued callers cannot consume the one-hour execution
+budget before admission. There is no unbounded or hidden server claim and no
+asynchronous job contract. If the caller loses the response, the result is
+`outcome_unknown`: preserve its caller and request ID, use the normal
+`request-status` reconciliation path, and do not blindly submit a new logical
+operation:
 
 ```bash
 .venv/bin/python synapse_cli.py --json request-status \
@@ -174,9 +180,11 @@ or reconcile first.
 
 Health and request-status remain available while the lane is active. Health
 reports `operational_state` as `maintenance`, marks the backend lane
-`degraded`, and sets
-`accepting_ordinary_operations: false`; ordinary memory RPCs may wait or time
-out until maintenance ends.
+`degraded`, sets `accepting_ordinary_operations: false`, identifies the fixed
+lane owner, and reports `deadline_remaining_ms`; ordinary memory RPCs may wait
+or time out until maintenance ends. The one-hour execution budget does not
+extend recovery-evidence freshness, retention-plan expiry, bridge proposal
+expiry, or cutover/admission tickets.
 
 ## Ledger witness operations and residual limits
 

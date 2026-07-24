@@ -402,6 +402,14 @@ For any other degraded result:
 8. create a new proposal rather than fabricating or rewriting governance
    history.
 
+The recovery operations in steps 4-6 run through the closed one-hour
+recovery-maintenance lane. That longer execution budget exists so a large
+paired snapshot and isolated proof can finish; it does not authorize, renew, or
+apply any bridge decision. Bridge proposal, audit-revision, confirmation, and
+expiry rules remain separate and unchanged. If recovery loses its response,
+reconcile the exact request before continuing and never use a bridge mutation
+as a retry mechanism.
+
 Invalid or tampered link structures are skipped by active-link resolution, so
 connected recall fails closed even while audit status is degraded. That safety
 property does not make a degraded store production-ready.

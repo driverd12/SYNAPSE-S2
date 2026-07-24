@@ -368,6 +368,18 @@ After the fresh audit is ready, create the complete recovery point:
   --pinned
 ```
 
+Paired backup, verification, isolated restore, capture-ledger recovery, signed
+retention, and replication checkpoint create/stage use a closed authenticated
+recovery-maintenance lane with a one-hour deadline. Ordinary memory and bridge
+operations retain the five-minute protocol ceiling. While this lane is active,
+authenticated health reports `operational_state: "maintenance"`,
+`accepting_ordinary_operations: false`, a fixed `backend_lane.owner`, and
+`deadline_remaining_ms`; let the operation finish. A lost mutation response is
+still `outcome_unknown`: preserve its caller/request ID, reconcile it with
+`request-status`, and never blind-retry. The longer execution budget does not
+extend recovery-evidence freshness, signed retention-plan expiry, bridge
+proposal expiry, or any cutover/admission ticket.
+
 On the authoritative lane, the service injects the capture root and retention
 directory from the reviewed binding. Public recovery calls therefore reject
 `--capture-root`, `--allow-noncanonical-capture-root`, and retention

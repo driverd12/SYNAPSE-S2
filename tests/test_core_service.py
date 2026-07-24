@@ -34,6 +34,7 @@ from core_runtime_paths import (
 )
 from core_client import (
     NEURAL_OPERATION_TIMEOUT_SECONDS,
+    RECOVERY_OPERATION_TIMEOUT_SECONDS,
     SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS,
     CoreClient,
     CoreOutcomeUnknown,
@@ -53,9 +54,12 @@ from core_service import (
     CORE_OPERATION_CONTRACTS,
     CORE_STARTUP_FAILURE_SCHEMA,
     LOGGER,
+    LONG_RECOVERY_OPERATIONS,
     MAX_ACTIVE_CONNECTIONS,
     LONG_NEURAL_OPERATIONS,
     NEURAL_OPERATION_LANE_SECONDS,
+    RECOVERY_MAINTENANCE_LANE_SECONDS,
+    RECOVERY_MAINTENANCE_QUEUE_SECONDS,
     REPLACEMENT_ADMISSION_ENV,
     REPLACEMENT_CERTIFICATION_MODE,
     REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX,
@@ -1404,8 +1408,9 @@ class CoreServiceTests(unittest.TestCase):
             "replication_create_checkpoint"
         )
         self.assertEqual(floor, REPLICATION_MAINTENANCE_LANE_SECONDS)
-        self.assertEqual(floor, 300.0)
-        started = time.monotonic() - 31.0
+        self.assertEqual(floor, RECOVERY_MAINTENANCE_LANE_SECONDS)
+        self.assertEqual(floor, 3_600.0)
+        started = time.monotonic() - 301.0
         acquired = service._acquire_backend_lane(
             owner="replication-maintenance",
             timeout=0.0,
@@ -1425,7 +1430,11 @@ class CoreServiceTests(unittest.TestCase):
             self.assertFalse(
                 health["backend_lane"]["accepting_ordinary_operations"]
             )
-            self.assertGreaterEqual(health["backend_lane"]["active_age_ms"], 30_000)
+            self.assertGreaterEqual(health["backend_lane"]["active_age_ms"], 300_000)
+            self.assertGreater(
+                health["backend_lane"]["deadline_remaining_ms"],
+                3_000_000,
+            )
             self.assertIsNone(health["backend_lane"]["blocker"])
             reconciliation = self.harness.client().request_status(
                 caller="replication-timeout-check",
@@ -1433,6 +1442,53 @@ class CoreServiceTests(unittest.TestCase):
             )
             self.assertFalse(reconciliation["known"])
             self.assertEqual(reconciliation["state"], "not_found")
+        finally:
+            service._release_backend_lane()
+
+    def test_every_closed_recovery_operation_uses_recovery_maintenance_health(self) -> None:
+        service = self.harness.service
+        self.assertEqual(RECOVERY_MAINTENANCE_LANE_SECONDS, 3_600.0)
+        self.assertEqual(RECOVERY_MAINTENANCE_QUEUE_SECONDS, 300.0)
+        for operation in sorted(LONG_RECOVERY_OPERATIONS):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    service._backend_lane_timeout_floor(operation),
+                    RECOVERY_MAINTENANCE_LANE_SECONDS,
+                )
+                self.assertEqual(
+                    service._backend_lane_acquire_timeout(
+                        operation,
+                        RECOVERY_MAINTENANCE_LANE_SECONDS,
+                    ),
+                    RECOVERY_MAINTENANCE_QUEUE_SECONDS,
+                )
+        self.assertEqual(
+            service._backend_lane_acquire_timeout(
+                "status",
+                RECOVERY_MAINTENANCE_LANE_SECONDS,
+            ),
+            RECOVERY_MAINTENANCE_LANE_SECONDS,
+        )
+        started = time.monotonic() - 301.0
+        acquired = service._acquire_backend_lane(
+            owner="recovery-maintenance",
+            timeout=0.0,
+            deadline_monotonic=started + RECOVERY_MAINTENANCE_LANE_SECONDS,
+        )
+        self.assertTrue(acquired)
+        try:
+            with service._backend_lane_state_lock:
+                service._backend_lane_started_monotonic = started
+            health = service._health_result()
+            self.assertTrue(health["ready"])
+            self.assertEqual(health["operational_state"], "maintenance")
+            self.assertTrue(health["backend_lane"]["active"])
+            self.assertTrue(health["backend_lane"]["maintenance"])
+            self.assertEqual(
+                health["backend_lane"]["owner"],
+                "recovery-maintenance",
+            )
+            self.assertIsNone(health["backend_lane"]["blocker"])
         finally:
             service._release_backend_lane()
 
@@ -4290,6 +4346,80 @@ class CoreClientRetryTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_recovery_operations_apply_the_closed_one_hour_timeout_floor(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = self.client(root)
+            observations: list[tuple[str, float, float]] = []
+
+            def exchange(
+                request: dict[str, Any],
+                *,
+                timeout_seconds: float,
+            ) -> Any:
+                deadline_seconds = (
+                    float(request["deadline_unix_ms"]) / 1000.0
+                ) - time.time()
+                observations.append(
+                    (request["operation"], timeout_seconds, deadline_seconds)
+                )
+                return self.response(request, {"status": "ready"})
+
+            client._exchange = exchange  # type: ignore[method-assign]
+            receipt = root / "bundle.receipt.json"
+            restore_root = root / "isolated-restore"
+            manifest = root / "checkpoint.manifest.json"
+            client.backup_recovery_bundle(purpose="operator", pinned=True)
+            client.audit_capture_ledger(sample_limit=10)
+            client.repair_capture_ledger(
+                confirm=True,
+                expected_revision="a" * 64,
+                sample_limit=10,
+            )
+            client.verify_recovery_bundle(receipt)
+            client.restore_recovery_bundle_isolated(
+                receipt,
+                restore_root,
+                confirm=True,
+            )
+            client.plan_recovery_retention(
+                keep_latest=3,
+                max_age_days=30.0,
+            )
+            client.apply_recovery_retention(
+                plan_token="b" * 64,
+                cutoff_created_at=1_900_000_000.0,
+                keep_latest=3,
+                max_age_days=30.0,
+                confirm=True,
+            )
+            client.restore_retired_recovery(
+                plan_token="b" * 64,
+                confirm=True,
+            )
+            client.replication_create_checkpoint("peer-123")
+            client.replication_stage_checkpoint(manifest)
+            with self.assertRaises(CoreUnavailable):
+                client.health(timeout_seconds=3_600.0)
+            with self.assertRaises(CoreUnavailable):
+                client.call(
+                    "backup_recovery_bundle",
+                    {"path": None, "purpose": "operator", "pinned": True},
+                    timeout_seconds=3_600.001,
+                )
+
+        self.assertEqual(RECOVERY_OPERATION_TIMEOUT_SECONDS, 3_600.0)
+        self.assertEqual(
+            {operation for operation, _timeout, _deadline in observations},
+            LONG_RECOVERY_OPERATIONS,
+        )
+        for operation, socket_timeout, deadline_seconds in observations:
+            with self.subTest(operation=operation):
+                self.assertGreaterEqual(socket_timeout, 3_599.0)
+                self.assertLessEqual(socket_timeout, 3_600.0)
+                self.assertGreaterEqual(deadline_seconds, 3_599.0)
+                self.assertLessEqual(deadline_seconds, 3_600.0)
 
     def test_neural_operations_apply_client_timeout_floor(self) -> None:
         with TemporaryDirectory() as temporary:

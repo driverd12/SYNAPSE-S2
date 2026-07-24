@@ -36,7 +36,10 @@ from bridge_governance import (
 from core_protocol import (
     CORE_CONFIG_VERSION,
     DEFAULT_MAX_FRAME_BYTES,
+    LONG_RECOVERY_OPERATIONS,
+    MAX_DEADLINE_HORIZON_MS,
     PROTOCOL_VERSION,
+    RECOVERY_MAX_DEADLINE_HORIZON_MS,
     CoreProtocolError,
     CoreTransportError,
     canonical_json_bytes,
@@ -134,10 +137,16 @@ BACKEND_LANE_CAPTURE_FILE_SECONDS = 5.0
 BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
 NEURAL_OPERATION_LANE_SECONDS = 120.0
 SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS = 120.0
-# The protocol accepts deadlines no farther than 300 seconds into the future.
-# Replication remains synchronous, so any transport timeout is reconciled by
-# request_status rather than implying a longer hidden server-side contract.
-REPLICATION_MAINTENANCE_LANE_SECONDS = 300.0
+# Ordinary protocol requests remain capped at 300 seconds.  The authenticated,
+# closed recovery allowlist receives one bounded hour because paired recovery
+# on a large local store legitimately performs stable copies, hashing, capture
+# reconciliation, and isolated restore proof.  It remains synchronous: a lost
+# response is still reconciled through request_status and never blind-replayed.
+RECOVERY_MAINTENANCE_LANE_SECONDS = (
+    RECOVERY_MAX_DEADLINE_HORIZON_MS / 1000.0
+)
+RECOVERY_MAINTENANCE_QUEUE_SECONDS = MAX_DEADLINE_HORIZON_MS / 1000.0
+REPLICATION_MAINTENANCE_LANE_SECONDS = RECOVERY_MAINTENANCE_LANE_SECONDS
 BACKEND_LANE_CLOSE_GRACE_SECONDS = 2.0
 CORE_STORE_SCHEMA_IDENTITY = "sqlite-53324442-v6"
 BUILD_SOURCE_MANIFEST = (
@@ -2810,13 +2819,27 @@ class AuthoritativeCoreService:
             yield
 
     def _backend_lane_timeout_floor(self, operation: str) -> float:
-        if operation in LONG_REPLICATION_OPERATIONS:
-            return REPLICATION_MAINTENANCE_LANE_SECONDS
+        if operation in LONG_RECOVERY_OPERATIONS:
+            return RECOVERY_MAINTENANCE_LANE_SECONDS
         if operation in LONG_SEMANTIC_INDEX_OPERATIONS:
             return SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS
         if operation in LONG_NEURAL_OPERATIONS:
             return NEURAL_OPERATION_LANE_SECONDS
         return BACKEND_LANE_RPC_TIMEOUT_SECONDS
+
+    @staticmethod
+    def _backend_lane_acquire_timeout(
+        operation: str,
+        remaining_seconds: float,
+    ) -> float:
+        """Keep the long recovery execution budget out of the worker queue."""
+
+        if operation in LONG_RECOVERY_OPERATIONS:
+            return min(
+                remaining_seconds,
+                RECOVERY_MAINTENANCE_QUEUE_SECONDS,
+            )
+        return remaining_seconds
 
     def _release_backend_lane(self) -> None:
         with self._backend_lane_state_lock:
@@ -2841,12 +2864,14 @@ class AuthoritativeCoreService:
             self._fence_service("backend_lane_stalled")
             poisoned = "backend_lane_stalled"
         maintenance = owner in {
+            "recovery-maintenance",
             "replication-maintenance",
             "semantic-index-maintenance",
         }
         return {
             "ready": not stale and poisoned is None,
             "active": owner is not None,
+            "owner": owner,
             "maintenance": maintenance,
             "degraded": maintenance or stale or poisoned is not None,
             "accepting_ordinary_operations": (
@@ -2856,6 +2881,11 @@ class AuthoritativeCoreService:
                 None
                 if owner is None or started is None
                 else max(0, int((now - started) * 1000))
+            ),
+            "deadline_remaining_ms": (
+                None
+                if owner is None or deadline is None
+                else max(0, int((deadline - now) * 1000))
             ),
             "blocker": poisoned,
         }
@@ -4641,17 +4671,25 @@ class AuthoritativeCoreService:
 
         remaining = (request["deadline_unix_ms"] / 1000.0) - time.time()
         lane_floor_seconds = self._backend_lane_timeout_floor(contract.name)
+        lane_acquire_timeout = self._backend_lane_acquire_timeout(
+            contract.name,
+            remaining,
+        )
         if remaining <= 0 or not self._acquire_backend_lane(
             owner=(
                 "replication-maintenance"
                 if contract.name in LONG_REPLICATION_OPERATIONS
                 else (
-                    "semantic-index-maintenance"
-                    if contract.name in LONG_SEMANTIC_INDEX_OPERATIONS
-                    else "rpc"
+                    "recovery-maintenance"
+                    if contract.name in LONG_RECOVERY_OPERATIONS
+                    else (
+                        "semantic-index-maintenance"
+                        if contract.name in LONG_SEMANTIC_INDEX_OPERATIONS
+                        else "rpc"
+                    )
                 )
             ),
-            timeout=remaining,
+            timeout=lane_acquire_timeout,
             deadline_monotonic=(
                 time.monotonic()
                 + max(remaining, lane_floor_seconds)

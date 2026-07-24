@@ -535,6 +535,18 @@ Create the recovery point only after that gate is ready:
   --pinned
 ```
 
+Recovery work is an explicit authenticated maintenance class. Paired backup,
+verification, isolated restore, capture-ledger recovery, signed retention, and
+replication checkpoint create/stage receive a bounded one-hour execution
+deadline; ordinary and bridge-governance RPCs remain capped at five minutes.
+During a healthy long run, health reports `operational_state: "maintenance"`,
+`accepting_ordinary_operations: false`, the fixed lane owner, and
+`deadline_remaining_ms`. Wait for completion. If the connection is lost,
+preserve the returned caller/request ID and use `request-status`; do not submit
+a new logical mutation until reconciliation proves how the first one ended.
+This execution allowance does not renew an evidence, retention-plan, bridge,
+admission, or cutover expiry.
+
 The authoritative core chooses the capture root and retention directory from
 its reviewed binding. Do not pass `--capture-root`,
 `--allow-noncanonical-capture-root`, or retention `--directory` on the core

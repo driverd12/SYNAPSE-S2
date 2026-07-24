@@ -11,7 +11,9 @@ from typing import Any, Mapping
 
 from core_protocol import (
     DEFAULT_MAX_FRAME_BYTES,
+    LONG_RECOVERY_OPERATIONS,
     MAX_DEADLINE_HORIZON_MS,
+    RECOVERY_MAX_DEADLINE_HORIZON_MS,
     CoreProtocolError,
     CoreTransportError,
     build_request,
@@ -39,6 +41,9 @@ from core_runtime_paths import (
 
 SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS = 120.0
 NEURAL_OPERATION_TIMEOUT_SECONDS = NEURAL_OPERATION_LANE_SECONDS
+RECOVERY_OPERATION_TIMEOUT_SECONDS = (
+    RECOVERY_MAX_DEADLINE_HORIZON_MS / 1000.0
+)
 
 
 class CoreUnavailable(RuntimeError):
@@ -251,12 +256,20 @@ class CoreClient:
         return cls()
 
     @staticmethod
-    def _timeout(value: float) -> float:
+    def _timeout(
+        value: float,
+        *,
+        operation: str | None = None,
+    ) -> float:
         try:
             timeout = float(value)
         except (TypeError, ValueError, OverflowError) as exc:
             raise CoreUnavailable() from exc
-        maximum = MAX_DEADLINE_HORIZON_MS / 1000.0
+        maximum = (
+            RECOVERY_MAX_DEADLINE_HORIZON_MS
+            if operation in LONG_RECOVERY_OPERATIONS
+            else MAX_DEADLINE_HORIZON_MS
+        ) / 1000.0
         if timeout <= 0.0 or timeout > maximum or timeout != timeout:
             raise CoreUnavailable()
         return timeout
@@ -283,8 +296,11 @@ class CoreClient:
         timeout = self._timeout(
             self.default_timeout_seconds
             if timeout_seconds is None
-            else timeout_seconds
+            else timeout_seconds,
+            operation=operation,
         )
+        if operation in LONG_RECOVERY_OPERATIONS:
+            timeout = max(timeout, RECOVERY_OPERATION_TIMEOUT_SECONDS)
         if operation in LONG_NEURAL_OPERATIONS:
             timeout = max(timeout, NEURAL_OPERATION_TIMEOUT_SECONDS)
         authentication_key = _read_authentication_key(self.authentication_path)
@@ -723,7 +739,7 @@ class CoreClient:
         self,
         peer_id: str,
         *,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = RECOVERY_OPERATION_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         return self.call(
             "replication_create_checkpoint",
@@ -735,7 +751,7 @@ class CoreClient:
         self,
         manifest_path: str | os.PathLike[str],
         *,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = RECOVERY_OPERATION_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         return self.call(
             "replication_stage_checkpoint",

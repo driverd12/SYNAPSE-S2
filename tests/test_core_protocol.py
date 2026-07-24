@@ -8,7 +8,10 @@ import unittest
 from unittest.mock import patch
 
 from core_protocol import (
+    LONG_RECOVERY_OPERATIONS,
+    MAX_DEADLINE_HORIZON_MS,
     PROTOCOL_VERSION,
+    RECOVERY_MAX_DEADLINE_HORIZON_MS,
     CoreProtocolError,
     CoreTransportError,
     build_request,
@@ -160,6 +163,94 @@ class CoreProtocolTests(unittest.TestCase):
                 authentication_key=self.key,
                 now_unix_ms=1_001,
             )
+
+    def test_only_closed_recovery_operations_receive_the_extended_deadline(self) -> None:
+        now_unix_ms = 1_900_000_000_000
+        self.assertEqual(MAX_DEADLINE_HORIZON_MS, 300_000)
+        self.assertEqual(RECOVERY_MAX_DEADLINE_HORIZON_MS, 3_600_000)
+        self.assertEqual(
+            LONG_RECOVERY_OPERATIONS,
+            frozenset(
+                {
+                    "backup_recovery_bundle",
+                    "audit_capture_ledger",
+                    "repair_capture_ledger",
+                    "verify_recovery_bundle",
+                    "restore_recovery_bundle_isolated",
+                    "plan_recovery_retention",
+                    "apply_recovery_retention",
+                    "restore_retired_recovery",
+                    "replication_create_checkpoint",
+                    "replication_stage_checkpoint",
+                }
+            ),
+        )
+
+        for operation in sorted(LONG_RECOVERY_OPERATIONS):
+            with self.subTest(operation=operation):
+                accepted = build_request(
+                    request_id=f"req-{operation}",
+                    caller="test-client",
+                    deadline_unix_ms=(
+                        now_unix_ms + RECOVERY_MAX_DEADLINE_HORIZON_MS
+                    ),
+                    operation=operation,
+                    arguments={},
+                    authentication_key=self.key,
+                )
+                self.assertEqual(
+                    validate_request(
+                        accepted,
+                        authentication_key=self.key,
+                        now_unix_ms=now_unix_ms,
+                    ),
+                    accepted,
+                )
+                too_long = build_request(
+                    request_id=f"req-too-long-{operation}",
+                    caller="test-client",
+                    deadline_unix_ms=(
+                        now_unix_ms + RECOVERY_MAX_DEADLINE_HORIZON_MS + 1
+                    ),
+                    operation=operation,
+                    arguments={},
+                    authentication_key=self.key,
+                )
+                with self.assertRaises(CoreProtocolError):
+                    validate_request(
+                        too_long,
+                        authentication_key=self.key,
+                        now_unix_ms=now_unix_ms,
+                    )
+
+        ordinary_operations = (
+            "health",
+            "request_status",
+            "replication_status",
+            "approve_namespace_link",
+            "replication_pair_peer",
+            "replication_revoke_peer",
+            "replication_record_acknowledgement",
+            "backup_recovery_bundle_extra",
+        )
+        for operation in ordinary_operations:
+            with self.subTest(ordinary_operation=operation):
+                ordinary = build_request(
+                    request_id=f"req-ordinary-too-long-{operation}",
+                    caller="test-client",
+                    deadline_unix_ms=(
+                        now_unix_ms + MAX_DEADLINE_HORIZON_MS + 1
+                    ),
+                    operation=operation,
+                    arguments={},
+                    authentication_key=self.key,
+                )
+                with self.assertRaises(CoreProtocolError):
+                    validate_request(
+                        ordinary,
+                        authentication_key=self.key,
+                        now_unix_ms=now_unix_ms,
+                    )
 
     def test_request_identifiers_reject_secret_shapes_without_reflection(self) -> None:
         canary = "sk-secret-identifier-12345678901234567890"

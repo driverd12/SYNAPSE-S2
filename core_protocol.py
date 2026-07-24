@@ -23,6 +23,21 @@ MAX_JSON_DEPTH = 16
 MAX_CONTAINER_ITEMS = 10_000
 MAX_STRING_BYTES = 262_144
 MAX_DEADLINE_HORIZON_MS = 300_000
+RECOVERY_MAX_DEADLINE_HORIZON_MS = 3_600_000
+LONG_RECOVERY_OPERATIONS = frozenset(
+    {
+        "backup_recovery_bundle",
+        "audit_capture_ledger",
+        "repair_capture_ledger",
+        "verify_recovery_bundle",
+        "restore_recovery_bundle_isolated",
+        "plan_recovery_retention",
+        "apply_recovery_retention",
+        "restore_retired_recovery",
+        "replication_create_checkpoint",
+        "replication_stage_checkpoint",
+    }
+)
 
 REQUEST_FIELDS = frozenset(
     {
@@ -482,7 +497,12 @@ def validate_request(
     if now_unix_ms is not None:
         if deadline < now_unix_ms:
             raise CoreProtocolError("deadline_exceeded")
-        if deadline - now_unix_ms > MAX_DEADLINE_HORIZON_MS:
+        maximum_horizon_ms = (
+            RECOVERY_MAX_DEADLINE_HORIZON_MS
+            if value["operation"] in LONG_RECOVERY_OPERATIONS
+            else MAX_DEADLINE_HORIZON_MS
+        )
+        if deadline - now_unix_ms > maximum_horizon_ms:
             raise CoreProtocolError()
     return value
 
