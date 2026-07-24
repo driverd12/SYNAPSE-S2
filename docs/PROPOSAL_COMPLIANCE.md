@@ -17,7 +17,7 @@ this matrix makes neither claim.
 
 | Proposal requirement | Status | Evidence |
 | :--- | :--- | :--- |
-| Apple Silicon local MCP server over JSON-RPC stdio | Implemented | `mcp_server.py`, `.mcp.json`, `/Users/dan.driver/.codex/config.toml` |
+| Apple Silicon local MCP server over JSON-RPC stdio | Implemented | `mcp_server.py`, generated `.mcp.json`, `$HOME/.codex/config.toml` |
 | FastMCP wrapper with stdout protected for JSON-RPC and logging routed to stderr | Implemented | `mcp_server.py` uses `logging.basicConfig(..., stream=sys.stderr, force=True)` and tests redirect stdout |
 | `query_spiking_attention(prompt_embedding, context_id)` tool | Implemented as deprecated stateful proposal compatibility | `mcp_server.py`, `tests/test_mcp_server.py`; new read-only recall uses `retrieve_spiking_memory_v2` |
 | `trigger_sleep_consolidation()` tool | Implemented | `mcp_server.py`, `tests/test_mcp_server.py` |
@@ -65,7 +65,7 @@ this matrix makes neither claim.
 | Transactional LaunchAgent installation | Implemented | Per-label locks, private/fsynced plists and logs, bounded launchd transitions, authoritative functional probes, and exact prior-definition/policy rollback in both installers |
 | Strict bounded loopback dashboard | Implemented | `dashboard_server.py` refuses non-loopback binds and limits the threaded adapter to eight active handlers/backlog 32, an absolute one-second pre-authentication header deadline, five-second post-header I/O, and bounded shutdown; API authorization uses the two-capability contract above |
 | Non-mutating readiness audit path | Implemented | `scripts/prep_tomorrow.sh --verify-only` runs tests, compile checks, status/profile/certification/preflight without installing agents, writing evidence, processing inboxes, launching MCP wrappers, dashboard smoke, maintenance, or backups |
-| Shared state across Codex/Claude/direct CLI surfaces | Implemented | `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, launcher, common `.synapse_s2/memory.sqlite3` |
+| Shared state across Codex/Claude/direct CLI surfaces | Implemented | generated `.mcp.json`, `$HOME/.codex/config.toml`, launcher, common `.synapse_s2/memory.sqlite3` |
 | Codex, Claude Desktop, and Claude Code client registration | Implemented | `client_config.py`, `scripts/install_client_configs.py`, `tests/test_client_config.py` |
 | Project-root state discovery through client environment | Implemented | `SYNAPSE_S2_*` envs, plus `CLAUDE_PROJECT_DIR` / `CODEX_PROJECT_DIR` fallback in `mlx_backend.py` |
 | Durable context-bus deployment to connected local agents | Implemented as leased at-least-once delivery with explicit receipt acknowledgement and governed retry quarantine | `pull_spiking_context_deployments`, atomic-batch `ack_spiking_context_deployments`, confirmed `dead_letter_spiking_context_delivery`, `list_spiking_context_cursors`, CLI `pull-context` / `ack-context` / `dead-letter-context`, canonical targets, bounded attempts, attempt receipts, ACK tombstones, and durable-disposition cursors |
@@ -130,7 +130,7 @@ this matrix makes neither claim.
 
 | Proposal language | Current implementation | Rationale |
 | :--- | :--- | :--- |
-| Raw `uv run mcp_server.py` in client config | Configs point to `/Users/dan.driver/.local/bin/synapse-s2-mcp` | The workspace path contains spaces and a colon. The launcher preserves the same synced `uv` environment while avoiding client command-splitting failures. |
+| Raw `uv run mcp_server.py` in client config | Configs point to `$HOME/.local/bin/synapse-s2-mcp` | A workspace path can contain spaces or punctuation. The launcher preserves the same synced `uv` environment while avoiding client command-splitting failures. |
 | Capture raw client text into local memory | Capture paths redact common secret/token/private-key shapes before pending inbox disk writes, SQLite persistence, graph/context-bus deployment, and API/MCP responses | Local memory is useful only if operators can trust it will not casually preserve sensitive operational material. Redaction is a guardrail, not permission to capture secrets. |
 | Any local HTTP dashboard bind or ambient browser cookie | Dashboard permits only loopback addresses and requires the port-specific cookie plus port-scoped header capability on every API call; POST additionally requires exact Host/Origin | The owner-only bootstrap and helper avoid bare URL launches, while the distinct header prevents another loopback port from reusing a host-scoped browser cookie. Remote access still requires a separately authenticated gateway. |
 | Destructive prune tool calls | CLI, MCP, and dashboard destructive graph and Cortex trace pruning are confirmation-gated | Operators need fast surgical cleanup while preventing accidental node, edge, temporal, associative, or governed-trace deletion. |

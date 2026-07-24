@@ -128,10 +128,12 @@ def build_server_definition(
         "env": {
             # The local launcher is the authority for the checkout path: it
             # cd's into its install-time repository and prepends that path to
-            # PYTHONPATH before starting mcp_client_wrapper.py. Keeping
-            # PYTHONPATH out of persisted client JSON prevents tracked
-            # project-scoped .mcp.json from becoming host-path-specific while
-            # still resolving the real repository on each Mac.
+            # PYTHONPATH before starting mcp_client_wrapper.py. The project
+            # .mcp.json is deliberately generated per host and ignored by Git;
+            # its absolute launcher and binding paths are certified through
+            # the installer dry-run instead of being committed as source.
+            # Keeping PYTHONPATH out of every persisted definition prevents a
+            # checkout path from becoming an executable import override.
             **route_env,
             "SYNAPSE_S2_DEFAULT_RESPONSE_MODE": DEFAULT_RESPONSE_MODE,
             "SYNAPSE_S2_MAX_RESPONSE_BYTES": DEFAULT_MAX_RESPONSE_BYTES,

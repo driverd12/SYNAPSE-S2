@@ -19,6 +19,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
+    def test_preflight_default_launcher_uses_current_home(self):
+        import synapse_cli
+
+        with mock.patch(
+            "synapse_cli.Path.home",
+            return_value=Path("/Users/alex.operator"),
+        ):
+            arguments = synapse_cli.build_parser().parse_args(["preflight"])
+
+        self.assertEqual(
+            arguments.launcher,
+            "/Users/alex.operator/.local/bin/synapse-s2-mcp",
+        )
+
     def test_replication_peer_add_uses_core_inbox_and_anti_tofu_digest(self):
         import synapse_cli
 

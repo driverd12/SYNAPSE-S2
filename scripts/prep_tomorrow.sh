@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LAUNCHER="/Users/dan.driver/.local/bin/synapse-s2-mcp"
+LAUNCHER="${HOME}/.local/bin/synapse-s2-mcp"
 CONTEXT="${SYNAPSE_S2_PREFLIGHT_CONTEXT:-default}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 VERIFY_ONLY="${SYNAPSE_S2_PREFLIGHT_VERIFY_ONLY:-0}"

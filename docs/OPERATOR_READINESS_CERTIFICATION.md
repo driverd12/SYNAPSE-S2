@@ -30,14 +30,16 @@ eventual install.
 
 `scripts/install_client_configs.py` intentionally keeps persisted client JSON
 free of `PYTHONPATH`. The installed launcher resolves its own real checkout
-root and prepends that path at runtime. This keeps tracked project-scoped
-`.mcp.json` host-path-neutral, including reviewed noncanonical layouts, while
-still routing each Mac to its local repository.
+root and prepends that path at runtime. Project-scoped `.mcp.json` is generated
+per host and ignored by Git; `.mcp.json.example` is the tracked path-free
+instruction document. The certifier requires the generated definition to be
+fully converged while the source checkout remains clean, including reviewed
+noncanonical layouts.
 
 ## Run
 
 ```bash
-cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
+cd "/absolute/path/to/SYNAPSE-S2"
 .venv/bin/python scripts/operator_readiness_certify.py \
   --context default \
   --agent-id codex-desktop \
@@ -69,7 +71,7 @@ be treated as operator-ready or used for cutover.
 | Required proof | What must be true |
 | :--- | :--- |
 | Candidate core contract | The manifest contains the complete validated candidate configuration and exact fingerprint produced by the same resolver/builder the installer uses. Every supplied `--expect-*` assertion matches it. |
-| Local launcher | `/Users/dan.driver/.local/bin/synapse-s2-mcp` exists and is executable. |
+| Local launcher | `$HOME/.local/bin/synapse-s2-mcp` exists and is executable. |
 | Client config | `scripts/install_client_configs.py --dry-run` has no pending changes and the installed definitions carry only the reviewed core-binding pointer. |
 | MCP connect | FastMCP lists SYNAPSE-S2 tools through the installed launcher; its status payload exactly matches the bound topology, maintenance intervals, MLX device, provider identity, configuration fingerprint, and embedding-space identity. |
 | MCP compact contract probe | An installed-launcher `list_spiking_memory` call returns exactly one authoritative `synapse-s2.token-contract.v1` compact `structuredContent` envelope at or below 12,288 bytes, with independently verified canonical byte accounting, exact authoritative totals, and authenticated-keyset snapshot/continuation metadata, plus exactly one `synapse-s2.mcp-safety-summary.v1` `TextContent` item at or below its separate 4,096-byte ceiling. The safety item must declare `structuredContent_required: true`. Outer JSON-RPC framing is excluded. |

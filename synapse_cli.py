@@ -2989,7 +2989,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--preview-limit", type=int, default=5)
     preflight.add_argument(
         "--launcher",
-        default="/Users/dan.driver/.local/bin/synapse-s2-mcp",
+        default=str(Path.home() / ".local" / "bin" / "synapse-s2-mcp"),
     )
     preflight.set_defaults(func=command_preflight)
 

@@ -1,0 +1,9 @@
+{
+  "_synapseS2": {
+    "generatedBy": "scripts/install_client_configs.py",
+    "hostSpecific": true,
+    "tracked": false,
+    "instruction": "Run the client-config installer; do not copy or hand-edit this example."
+  },
+  "mcpServers": {}
+}

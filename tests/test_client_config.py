@@ -1,6 +1,7 @@
 import json
 import os
 import hashlib
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +14,7 @@ from core_client_binding import (
     binding_for_config,
     write_core_client_binding,
 )
+from core_runtime_paths import canonical_core_socket_path
 from core_service import CoreConfig, write_core_config
 
 
@@ -44,7 +46,7 @@ class ClientConfigTests(unittest.TestCase):
         data.chmod(0o700)
         core.chmod(0o700)
         config = CoreConfig(
-            socket_path=core / "service.sock",
+            socket_path=canonical_core_socket_path(data, home=home),
             state_path=data / "runtime_state.json",
             memory_path=data / "memory.sqlite3",
             capture_root=data,
@@ -453,6 +455,108 @@ class ClientConfigTests(unittest.TestCase):
         self.assertFalse(DIRECT_ROUTE_ENV & set(key for key in DIRECT_ROUTE_ENV if key in codex))
         self.assertEqual(result["core_binding"]["digest"], binding.digest)
         self.assertEqual(result["core_binding"]["authority_mode"], "candidate-local-v5")
+
+    def test_generated_project_config_keeps_two_host_checkouts_clean(self):
+        source_root = Path(__file__).resolve().parents[1]
+        source_ignore = (source_root / ".gitignore").read_text(encoding="utf-8")
+        source_example = (source_root / ".mcp.json.example").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("\n/.mcp.json\n", f"\n{source_ignore}")
+        self.assertNotIn("/Users/", source_example)
+
+        # The production socket contract has Darwin's 103-byte sockaddr_un
+        # ceiling. Keep the synthetic homes short enough to exercise the real
+        # canonical transport path instead of failing on the test harness path.
+        with TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp).resolve()
+            usernames = ("alex.operator", "casey.engineer")
+            for username in usernames:
+                home = root / "Users" / username
+                repo = root / "worktrees" / username / "SYNAPSE-S2"
+                home.mkdir(mode=0o700, parents=True)
+                repo.mkdir(mode=0o700, parents=True)
+                (repo / ".gitignore").write_text(source_ignore, encoding="utf-8")
+                (repo / ".mcp.json.example").write_text(
+                    source_example,
+                    encoding="utf-8",
+                )
+                for command in (
+                    ["git", "init", "-q"],
+                    ["git", "config", "user.name", "SYNAPSE-S2 Test"],
+                    ["git", "config", "user.email", "synapse-tests.invalid"],
+                    ["git", "config", "commit.gpgsign", "false"],
+                    ["git", "add", ".gitignore", ".mcp.json.example"],
+                    ["git", "commit", "-qm", "host-neutral baseline"],
+                ):
+                    subprocess.run(
+                        command,
+                        cwd=repo,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+
+                launcher = home / ".local" / "bin" / "synapse-s2-mcp"
+                binding_path, _binding = self._write_binding(
+                    home=home,
+                    repo=repo,
+                )
+                installed = client_config.install_client_configs(
+                    home=home,
+                    repo_root=repo,
+                    launcher_path=launcher,
+                    codex_enabled=False,
+                )
+                project_path = repo / ".mcp.json"
+                project = json.loads(project_path.read_text(encoding="utf-8"))
+                definition = project["mcpServers"]["synapse-s2"]
+                self.assertEqual(definition["command"], str(launcher))
+                self.assertEqual(
+                    definition["env"][BINDING_ENV],
+                    str(binding_path),
+                )
+                self.assertFalse(DIRECT_ROUTE_ENV & set(definition["env"]))
+                project_text = project_path.read_text(encoding="utf-8")
+                self.assertNotIn("dan.driver", project_text)
+                for other_username in usernames:
+                    if other_username != username:
+                        self.assertNotIn(other_username, project_text)
+                self.assertTrue(installed["clients"]["project_mcp"]["changed"])
+
+                converged = client_config.install_client_configs(
+                    home=home,
+                    repo_root=repo,
+                    launcher_path=launcher,
+                    codex_enabled=False,
+                    dry_run=True,
+                )
+                self.assertFalse(
+                    converged["clients"]["project_mcp"]["would_change"]
+                )
+                self.assertFalse(converged["restart_required"])
+                ignored = subprocess.run(
+                    ["git", "check-ignore", "-q", "--", ".mcp.json"],
+                    cwd=repo,
+                    check=False,
+                )
+                self.assertEqual(ignored.returncode, 0)
+                tracked = subprocess.run(
+                    ["git", "ls-files", "--error-unmatch", ".mcp.json"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(tracked.returncode, 0)
+                status = subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(status.stdout, "")
 
     def test_codex_config_updates_existing_synapse_server_block(self):
         with TemporaryDirectory() as tmp:

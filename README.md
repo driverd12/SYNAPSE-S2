@@ -124,13 +124,13 @@ replacement keeps the existing authoritative binding—`publish-binding` is only
 for a pre-adoption v5 store. The full procedure and failure semantics are in
 `docs/AUTHORITATIVE_CORE_OPERATIONS.md`.
 
-The launcher installs `/Users/dan.driver/.local/bin/synapse-s2-mcp`. It exists because this checked-out workspace path contains spaces and a colon, which can break tools that split command strings or PATH entries. The launcher executes the synced virtual environment directly:
+The launcher installs `$HOME/.local/bin/synapse-s2-mcp`. It exists because a checked-out workspace path may contain spaces or punctuation that can break tools which split command strings or PATH entries. The launcher executes the synced virtual environment directly:
 
 ```bash
-/Users/dan.driver/.local/bin/synapse-s2-mcp
+"$HOME/.local/bin/synapse-s2-mcp"
 ```
 
-The launcher enters through `mcp_client_wrapper.py`, which hydrates recall and graph state at MCP process startup without claiming or acknowledging context-bus events that the host has not seen, enters a strict Cortex Governor session for that client, and drops a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the client disconnects. The same exit path also commits a typed `follow_up` cortical trace so the client lifecycle is visible in governed memory, not only the inbox. `scripts/install_client_configs.py` stamps distinct delivery identities for Codex, Claude Desktop, Claude Code, and the project `.mcp.json` manifest so one client cannot consume another client's exact-target deployments.
+The launcher enters through `mcp_client_wrapper.py`, which hydrates recall and graph state at MCP process startup without claiming or acknowledging context-bus events that the host has not seen, enters a strict Cortex Governor session for that client, and drops a sanitized session-boundary note into `.synapse_s2/capture_inbox` when the client disconnects. The same exit path also commits a typed `follow_up` cortical trace so the client lifecycle is visible in governed memory, not only the inbox. `scripts/install_client_configs.py` stamps distinct delivery identities for Codex, Claude Desktop, Claude Code, and the project `.mcp.json` manifest so one client cannot consume another client's exact-target deployments. Project `.mcp.json` is intentionally generated per host and ignored by Git; `.mcp.json.example` is the tracked, path-free instruction document. Certification proves the generated definition is converged through the installer dry-run instead of binding a source commit to one user's home directory.
 
 ### 2. Verify the Local Engine
 
@@ -314,7 +314,7 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 Expected Retrieval v2 output is a `synapse-s2.token-contract.v1` `memory-retrieval` envelope containing ranked registered traces such as `production-memory-contract` and linked event traces from `production-preflight-brief`. The read does not run the recurrent network, apply STDP or pruning, update runtime state, mark activity, or populate the legacy query cache. It fingerprints the redacted prompt without storing or returning the raw prompt.
 Event ingestion additionally creates segmented memories such as `production-preflight-brief-event-001` and relationship edges such as `temporal_next` and `semantic_overlap`. Event boundaries are driven by the configured local embedding provider's cosine-distance surprise when available, while retaining lexical surprise as an auditable fallback.
 
-Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `/Users/dan.driver/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, replication, or neural configuration. Authoritative exports, recovery paths, and the private replication inbox are published explicitly by the binding and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
+Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `$HOME/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, replication, or neural configuration. Authoritative exports, recovery paths, and the private replication inbox are published explicitly by the binding and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode`, `metadata.semantic_surprise_score`, and `metadata.lexical_surprise_score`, so operators can tell whether a boundary was cut by semantic embedding distance or by lexical fallback.
 SQLite maintains a durable sparse spike index and a durable surface-term index for prompt recall. The surface index is built from tags, display labels, display summaries, semantic facets, detail badges, keywords, and bounded source text, and existing memory databases are backfilled automatically on startup.
@@ -703,20 +703,20 @@ The MCP server exposes these tools:
 FastMCP smoke check:
 
 ```bash
-.venv/bin/fastmcp list --command /Users/dan.driver/.local/bin/synapse-s2-mcp --json --timeout 15
-.venv/bin/fastmcp call --command /Users/dan.driver/.local/bin/synapse-s2-mcp \
+.venv/bin/fastmcp list --command "$HOME/.local/bin/synapse-s2-mcp" --json --timeout 15
+.venv/bin/fastmcp call --command "$HOME/.local/bin/synapse-s2-mcp" \
   --target get_spiking_attention_status \
   --input-json '{"context_id":"default"}' \
   --json --timeout 15
 ```
 
-Project `.mcp.json`, `/Users/dan.driver/.codex/config.toml`, Claude Desktop, and Claude Code can be refreshed with:
+Project `.mcp.json`, `$HOME/.codex/config.toml`, Claude Desktop, and Claude Code can be refreshed with:
 
 ```bash
 scripts/install_client_configs.py
 ```
 
-The installer preserves existing client settings, writes timestamped backups before mutating existing JSON/TOML files, and points every bound client at `/Users/dan.driver/.local/bin/synapse-s2-mcp` with only the owner-only `SYNAPSE_S2_CORE_BINDING` route. It also assigns per-client `SYNAPSE_S2_CLIENT_AGENT_ID` values: `codex-desktop`, `claude-desktop`, `claude-code`, and `project-mcp`, and stamps `SYNAPSE_S2_CLIENT_CORTEX=1` with `SYNAPSE_S2_CLIENT_CORTEX_MODE=strict`. Restart Codex, Claude Desktop, and Claude Code after running it so each client reloads its MCP server registry and starts using the startup/Cortex/session-boundary bridge.
+The installer preserves existing client settings, writes timestamped backups before mutating existing JSON/TOML files, and points every bound client at `$HOME/.local/bin/synapse-s2-mcp` with only the owner-only `SYNAPSE_S2_CORE_BINDING` route. The generated project `.mcp.json` remains untracked and is still covered by the transactional publication journal plus the certification dry-run. The installer also assigns per-client `SYNAPSE_S2_CLIENT_AGENT_ID` values: `codex-desktop`, `claude-desktop`, `claude-code`, and `project-mcp`, and stamps `SYNAPSE_S2_CLIENT_CORTEX=1` with `SYNAPSE_S2_CLIENT_CORTEX_MODE=strict`. Restart Codex, Claude Desktop, and Claude Code after running it so each client reloads its MCP server registry and starts using the startup/Cortex/session-boundary bridge.
 
 ### 6. Maintenance Lifecycle
 
@@ -940,7 +940,7 @@ By executing directly inside Apple's Unified Memory Architecture via mlx-snn, SY
 To verify the transport layer, launch the interactive MCP Inspector interface with the launcher:
 
 ```
-npx @anthropic-ai/mcp-inspector /Users/dan.driver/.local/bin/synapse-s2-mcp
+npx @anthropic-ai/mcp-inspector "$HOME/.local/bin/synapse-s2-mcp"
 ```
 
 This verifies the stdio JSON-RPC endpoints and ensures structural tool definitions are fully accessible before registering the server to your primary client environments.

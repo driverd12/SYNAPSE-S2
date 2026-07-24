@@ -1,10 +1,12 @@
 # SYNAPSE-S2 Tomorrow Runbook
 
-This is the fast operator path for using SYNAPSE-S2 from this Mac tomorrow.
+This is the portable fast operator path for using an existing SYNAPSE-S2
+installation.
 
-Rollout status remains separate from repository capability: live production is
-still the untouched legacy-v5 service. None of the Phase 7 implementation,
-tests, or runbook text below claims deployment or publication to either remote.
+Rollout status remains separate from repository capability. Inspect the live
+core, database, capture transport, client binding, and remote refs before
+classifying any installation as legacy v5 or authoritative v6; this runbook
+does not make that live claim by itself.
 
 ## Monday operator-trust certification
 
@@ -13,7 +15,7 @@ trust SYNAPSE-S2 for real work right now?" For the first local-v5 cutover,
 publish the candidate binding described below before running it.
 
 ```bash
-cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
+cd "/absolute/path/to/SYNAPSE-S2"
 .venv/bin/python scripts/operator_readiness_certify.py \
   --context default \
   --agent-id codex-desktop \
@@ -102,7 +104,7 @@ scripts/install_core_agent.sh status
 The prep command is certification-only by default:
 
 ```bash
-cd "/Users/dan.driver/Documents/Playground/SYNAPSE-S2"
+cd "/absolute/path/to/SYNAPSE-S2"
 scripts/prep_tomorrow.sh --verify-only
 ```
 
@@ -181,7 +183,7 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | Check | Meaning | Fix |
 | :--- | :--- | :--- |
 | `dependencies_importable` | `mlx.core`, `mlxsnn`, `fastmcp`, or `mcp` is not importable. | Run `uv sync`. |
-| `launcher_executable` | `/Users/dan.driver/.local/bin/synapse-s2-mcp` is missing or not executable. | Run `scripts/install_local_launcher.sh`. |
+| `launcher_executable` | `$HOME/.local/bin/synapse-s2-mcp` is missing or not executable. | Run `scripts/install_local_launcher.sh`. |
 | `mcp_contract_probe` | The installed launcher did not return the exact compact schema/budget, independently verified canonical size, or the separate bounded safety summary. | Reinstall the launcher and client configs, restart the MCP client, then rerun certification. Inspect `docs/TOKEN_CONTRACTS.md` before changing a ceiling. |
 | `memory_minimum_met` | The selected context has fewer persisted memories than requested. | Capture a real trace with `synapse_cli.py --json remember-text --context default --tag <tag> --text <text>`. |
 | `relationship_minimum_met` | The selected context has too few persisted event relationships for the requested gate. | Run the event graph ingestion command below. |
@@ -685,7 +687,7 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
 Use the launcher directly:
 
 ```bash
-npx @anthropic-ai/mcp-inspector /Users/dan.driver/.local/bin/synapse-s2-mcp
+npx @anthropic-ai/mcp-inspector "$HOME/.local/bin/synapse-s2-mcp"
 ```
 
 Useful tool calls:
@@ -756,4 +758,4 @@ The matrix maps each proposal requirement to implementation evidence and separat
 | `.synapse_s2/backups/retired` | Reversible per-plan quarantine; no automatic purge or disk reclamation. |
 | `.synapse_s2/backups/retention-plans` | Signed expiring exact-inventory retention plans. |
 | `.synapse_s2/backups/retirement-journals` | Signed prepared/completed/recovered/restore receipts for crash recovery and idempotency. |
-| `/Users/dan.driver/.local/bin/synapse-s2-mcp` | Launcher used by Codex, FastMCP, and inspector tools. |
+| `$HOME/.local/bin/synapse-s2-mcp` | Launcher used by Codex, FastMCP, and inspector tools. |
