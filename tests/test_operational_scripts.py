@@ -1,6 +1,7 @@
 import json
 import os
 import plistlib
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -417,6 +418,9 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn("fsync_file_and_parent", script)
         self.assertIn("SYNAPSE_S2_INSTALL_STABILIZATION_SECONDS", script)
         self.assertIn("capture_functional_probe", script)
+        self.assertIn("env -u PYTHONPATH -u PYTHONHOME -u PYTHONSAFEPATH", script)
+        self.assertIn("sys.path.insert(0, str(repo_root))", script)
+        self.assertNotIn('PYTHONPATH="$ROOT', script)
         self.assertIn('launchctl bootout "gui/$UID_VALUE/$LABEL"', script)
         self.assertLess(
             script.index('plutil -lint "$PLIST_TEMP"'),
@@ -748,6 +752,8 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
         )
         self.assertIn("export SYNAPSE_S2_MEMORY_DB", script)
         self.assertIn("database_requires_core", script)
+        self.assertIn("unset PYTHONPATH", script)
+        self.assertNotIn("export PYTHONPATH", script)
         self.assertIn("unset MLX_DEVICE SYNAPSE_S2_DIMENSION", script)
         self.assertIn("unset SYNAPSE_S2_NEURAL_MODEL", script)
         self.assertIn("SYNAPSE_S2_STATE_PATH SYNAPSE_S2_TOP_K", script)
@@ -796,6 +802,76 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
             launcher_text = launcher.read_text(encoding="utf-8")
             self.assertIn("SYNAPSE_S2_DEFAULT_RESPONSE_MODE:=compact", launcher_text)
             self.assertIn("SYNAPSE_S2_MAX_RESPONSE_BYTES:=12288", launcher_text)
+            self.assertIn("unset PYTHONPATH", launcher_text)
+            self.assertNotIn("export PYTHONPATH", launcher_text)
+
+    def test_local_launcher_supports_colon_repo_and_drops_ambient_python_paths(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo:with-colon"
+            scripts = repo / "scripts"
+            runtime_bin = repo / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            runtime_bin.mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "install_local_launcher.sh", scripts)
+            (runtime_bin / "python").symlink_to(Path(sys.executable).resolve())
+            (repo / "sibling_module.py").write_text("VALUE = 'reviewed-repo'\n")
+            (repo / "mcp_client_wrapper.py").write_text(
+                "import json, os\n"
+                "from pathlib import Path\n"
+                "from sibling_module import VALUE\n"
+                "Path(os.environ['LAUNCHER_PROBE_OUTPUT']).write_text(json.dumps({\n"
+                "    'value': VALUE,\n"
+                "    'pythonpath': os.environ.get('PYTHONPATH'),\n"
+                "    'pythonhome': os.environ.get('PYTHONHOME'),\n"
+                "    'nousersite': os.environ.get('PYTHONNOUSERSITE'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            hostile = root / "hostile"
+            hostile.mkdir()
+            (hostile / "sibling_module.py").write_text("VALUE = 'hostile'\n")
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            install_environment = os.environ.copy()
+            install_environment["HOME"] = str(home)
+            installed = subprocess.run(
+                ["/bin/sh", str(scripts / "install_local_launcher.sh")],
+                cwd=root,
+                env=install_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            output = root / "launcher-probe.json"
+            launch_environment = install_environment | {
+                BINDING_ENV: str(root / "synthetic-binding.json"),
+                "LAUNCHER_PROBE_OUTPUT": str(output),
+                "PYTHONPATH": str(hostile),
+                "PYTHONHOME": str(root / "hostile-python-home"),
+                "PYTHONSAFEPATH": "1",
+            }
+            launched = subprocess.run(
+                [str(home / ".local" / "bin" / "synapse-s2-mcp")],
+                cwd=root,
+                env=launch_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(launched.returncode, 0, launched.stderr)
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {
+                    "value": "reviewed-repo",
+                    "pythonpath": None,
+                    "pythonhome": None,
+                    "nousersite": "1",
+                },
+            )
 
     def test_local_launcher_replace_failure_preserves_prior_launcher(self):
         with TemporaryDirectory() as tmp:

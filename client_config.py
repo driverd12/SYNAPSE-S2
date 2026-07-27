@@ -127,8 +127,8 @@ def build_server_definition(
         "args": [],
         "env": {
             # The local launcher is the authority for the checkout path: it
-            # cd's into its install-time repository and prepends that path to
-            # PYTHONPATH before starting mcp_client_wrapper.py. The project
+            # cd's into its install-time repository and executes
+            # mcp_client_wrapper.py by absolute path. The project
             # .mcp.json is deliberately generated per host and ignored by Git;
             # its absolute launcher and binding paths are certified through
             # the installer dry-run instead of being committed as source.

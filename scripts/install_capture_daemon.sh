@@ -167,14 +167,20 @@ service_pid() {
 }
 
 capture_functional_probe() {
-  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" \
-    - "$CAPTURE_ROOT" "$MEMORY_DB" >/dev/null 2>&1 <<'PY'
+  env -u PYTHONPATH -u PYTHONHOME -u PYTHONSAFEPATH PYTHONNOUSERSITE=1 \
+    "$PYTHON" -P \
+    - "$ROOT" "$CAPTURE_ROOT" "$MEMORY_DB" >/dev/null 2>&1 <<'PY'
 import os
 import signal
 import sqlite3
 import sys
 from pathlib import Path
 from urllib.parse import quote
+
+repo_root = Path(sys.argv[1]).expanduser().resolve()
+if not repo_root.is_dir():
+    raise SystemExit(1)
+sys.path.insert(0, str(repo_root))
 
 def fail_on_timeout(_signum, _frame):
     raise TimeoutError("capture health probe timed out")
@@ -183,8 +189,8 @@ signal.signal(signal.SIGALRM, fail_on_timeout)
 signal.alarm(5)
 from capture_daemon import CaptureInboxDaemon
 
-capture_root = Path(sys.argv[1]).expanduser().resolve()
-memory_db = Path(sys.argv[2]).expanduser().resolve()
+capture_root = Path(sys.argv[2]).expanduser().resolve()
+memory_db = Path(sys.argv[3]).expanduser().resolve()
 status = CaptureInboxDaemon(root=capture_root).status()
 if Path(str(status.get("root") or "")).resolve() != capture_root:
     raise SystemExit(1)

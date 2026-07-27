@@ -111,7 +111,10 @@ class DashboardRuntimeTests(unittest.TestCase):
                     BINDING_ENV: str(binding_path),
                     "EXPECTED_MEMORY": str(config.memory_path),
                     "ADAPTER_MARKER": str(marker),
-                    "PYTHONPATH": f"{fake_modules}:{ROOT}",
+                    # Keep the fake adapters first without serializing ROOT into
+                    # PYTHONPATH: a valid macOS repository path may itself
+                    # contain the POSIX path-list separator (":").
+                    "PYTHONPATH": str(fake_modules),
                 }
             )
             completed = subprocess.run(
@@ -119,7 +122,8 @@ class DashboardRuntimeTests(unittest.TestCase):
                     sys.executable,
                     "-c",
                     (
-                        "import runpy; "
+                        "import runpy, sys; "
+                        f"sys.path.append({str(ROOT)!r}); "
                         f"runpy.run_path({str(ROOT / 'dashboard_server.py')!r}, "
                         "run_name='dashboard_import_probe')"
                     ),

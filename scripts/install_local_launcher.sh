@@ -85,11 +85,12 @@ set -eu
 umask 077
 REPO_ROOT='${REPO_ROOT_SHELL}'
 cd "\$REPO_ROOT"
-if [ -n "\${PYTHONPATH:-}" ]; then
-  PYTHONPATH="\$REPO_ROOT:\$PYTHONPATH"
-else
-  PYTHONPATH="\$REPO_ROOT"
-fi
+# The wrapper is executed by absolute path, so Python places REPO_ROOT at
+# sys.path[0]. Do not serialize the checkout into PYTHONPATH: POSIX cannot
+# represent a path containing its ':' list separator, and inherited entries
+# would be an unnecessary import-override surface.
+unset PYTHONPATH PYTHONHOME PYTHONSAFEPATH
+PYTHONNOUSERSITE=1
 unset MLX_DEVICE SYNAPSE_S2_DIMENSION SYNAPSE_S2_EMBEDDING_PROVIDER
 unset SYNAPSE_S2_IDLE_DEEP_SLEEP_SECONDS SYNAPSE_S2_MEMORY_DB
 unset SYNAPSE_S2_NEURAL_CACHE_DIR SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY
@@ -157,7 +158,6 @@ fi
 : "\${SYNAPSE_S2_MAX_RESPONSE_BYTES:=12288}"
 : "\${SYNAPSE_S2_CLIENT_SESSION_BRIDGE:=1}"
 : "\${SYNAPSE_S2_CLIENT_STARTUP_RECALL_MODE:=surface}"
-export PYTHONPATH
 export MLX_DEVICE
 export SYNAPSE_S2_EMBEDDING_PROVIDER
 export SYNAPSE_S2_NEURAL_MODEL
@@ -177,6 +177,7 @@ export SYNAPSE_S2_DEFAULT_RESPONSE_MODE
 export SYNAPSE_S2_MAX_RESPONSE_BYTES
 export SYNAPSE_S2_CLIENT_SESSION_BRIDGE
 export SYNAPSE_S2_CLIENT_STARTUP_RECALL_MODE
+export PYTHONNOUSERSITE
 exec "\$REPO_ROOT/.venv/bin/python" "\$REPO_ROOT/mcp_client_wrapper.py"
 EOF
 /bin/sh -n "$LAUNCHER_TEMP"
