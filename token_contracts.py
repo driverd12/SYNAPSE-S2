@@ -198,7 +198,10 @@ def compact_agent_event_limit(*, requested_limit: int, max_output_bytes: int) ->
         max_output_bytes,
         default_bytes=DEFAULT_RESPONSE_BYTES["agent-hydration"],
     )
-    budget_bound = max(1, (budget - 2_048) // 768)
+    # Reserve the fixed delivery, Cortex, graph-summary, and namespace-safety
+    # capsules before leasing receipts. Every leased receipt must remain
+    # renderable even at the minimum 4 KiB contract.
+    budget_bound = max(1, (budget - 3_072) // 768)
     return min(requested, COMPACT_SOURCE_LIMITS["agent-events"], budget_bound)
 
 
@@ -853,6 +856,9 @@ def project_agent_hydration(
             "entries": graph_entries,
             "relationships": graph_relationships,
         },
+        "namespace_connectivity": _project_namespace_connectivity(
+            payload.get("namespace_connectivity")
+        ),
         "cortex": _project_cortex_summary(
             payload.get("cortex_state"),
             cortex_warnings=cortex_warnings,
@@ -904,6 +910,12 @@ def project_agent_hydration(
     for warning in agent_invariant_warnings:
         _ensure_warning(envelope, warning)
     shrinkers: list[Callable[[], bool]] = [
+        lambda: _shrink_namespace_connectivity_diagnostics(
+            data["namespace_connectivity"], envelope
+        ),
+        lambda: _shrink_namespace_connectivity_ids(
+            data["namespace_connectivity"], envelope
+        ),
         lambda: _drop_last(graph_relationships, envelope, "graph_relationships"),
         lambda: _drop_last(graph_entries, envelope, "graph_entries"),
         lambda: _drop_last(recall_items, envelope, "recall_items"),
@@ -1658,6 +1670,11 @@ def _refresh_dynamic_counts(envelope: dict[str, Any]) -> None:
     if operation == "agent-hydration":
         recall = data.get("recall") if isinstance(data.get("recall"), dict) else {}
         graph = data.get("graph") if isinstance(data.get("graph"), dict) else {}
+        connectivity = (
+            data.get("namespace_connectivity")
+            if isinstance(data.get("namespace_connectivity"), dict)
+            else {}
+        )
         recall["returned"] = (
             len(recall.get("items", [])) if isinstance(recall.get("items"), list) else 0
         )
@@ -1669,6 +1686,25 @@ def _refresh_dynamic_counts(envelope: dict[str, Any]) -> None:
             if isinstance(graph.get("relationships"), list)
             else 0
         )
+        for prefix in ("connected", "pending"):
+            ids = connectivity.get(f"{prefix}_context_ids")
+            returned = len(ids) if isinstance(ids, list) else 0
+            total = _safe_int(
+                connectivity.get(f"{prefix}_context_count_lower_bound")
+            )
+            upstream_truncated = bool(
+                connectivity.get(
+                    "bridge_records_truncated"
+                    if prefix == "connected"
+                    else "pending_proposal_records_truncated"
+                )
+            )
+            connectivity[f"{prefix}_context_ids_returned"] = returned
+            connectivity[f"{prefix}_context_ids_truncated"] = (
+                bool(connectivity.get(f"{prefix}_context_ids_truncated"))
+                or upstream_truncated
+                or total > returned
+            )
         graph_node_ids = {
             str(item.get("memory_id") or "")
             for item in graph.get("entries", [])
@@ -1792,6 +1828,57 @@ def _drop_noncritical_warning(envelope: dict[str, Any]) -> bool:
             _record_omission(envelope, "noncritical_warnings")
             return True
     return False
+
+
+def _shrink_namespace_connectivity_ids(
+    connectivity: dict[str, Any],
+    envelope: dict[str, Any],
+) -> bool:
+    """Yield compact byte budget to recall and graph evidence first."""
+
+    candidates = ("pending_context_ids", "connected_context_ids")
+    populated = [
+        field
+        for field in candidates
+        if isinstance(connectivity.get(field), list) and connectivity[field]
+    ]
+    if not populated:
+        return False
+    field = max(populated, key=lambda item: len(connectivity[item]))
+    connectivity[field].pop()
+    _record_omission(envelope, f"namespace_connectivity.{field}")
+    return True
+
+
+def _shrink_namespace_connectivity_diagnostics(
+    connectivity: dict[str, Any],
+    envelope: dict[str, Any],
+) -> bool:
+    """Keep routing and safety facts when the minimum hydration budget is tight.
+
+    The exact connected/pending namespace identities, lower bounds, truncation
+    flags, and the two fail-closed behavior flags remain present.  Aggregate
+    scan diagnostics are useful for larger envelopes but are not required to
+    safely consume and acknowledge a leased event.
+    """
+
+    optional_fields = (
+        "bridge_record_limit",
+        "active_bridge_records_returned",
+        "incident_bridge_records_returned",
+        "inbound_only_bridge_records_returned",
+        "pending_proposals_returned",
+        "suggestion_evaluation",
+    )
+    removed = 0
+    for field in optional_fields:
+        if field in connectivity:
+            connectivity.pop(field, None)
+            removed += 1
+    if not removed:
+        return False
+    _record_omission(envelope, "namespace_connectivity.diagnostics", removed)
+    return True
 
 
 def _shrink_deployment_text(deployments: list[dict[str, Any]], envelope: dict[str, Any]) -> bool:
@@ -2519,6 +2606,97 @@ def _project_graph_summary(value: Any) -> dict[str, Any]:
         "entry_count": _safe_int(value.get("entry_count")),
         "relationship_count": _safe_int(value.get("relationship_count")),
         "relationship_modes": projected_modes,
+    }
+
+
+def _project_namespace_connectivity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ResponseContractError("namespace_connectivity must be an object")
+
+    for field in ("automatic_cross_namespace_write", "multi_mac_live_sync"):
+        if value.get(field) is not False:
+            raise ResponseContractError(f"namespace_connectivity.{field} must be false")
+
+    def context_ids(
+        field: str,
+        *,
+        count_field: str,
+        truncated_field: str,
+    ) -> tuple[list[str], int, bool]:
+        raw = value.get(field)
+        if not isinstance(raw, list):
+            raw = []
+        projected: list[str] = []
+        for item in raw[:8]:
+            projected.append(
+                _atomic_identifier(item, field=field, max_chars=128)
+            )
+        if len(raw) > len(projected):
+            _record_projection_omission(field, len(raw) - len(projected))
+        total = max(_safe_int(value.get(count_field)), len(raw))
+        expected_truncated = total > len(projected)
+        producer_truncated = value.get(truncated_field)
+        if (
+            not isinstance(producer_truncated, bool)
+            or (expected_truncated and not producer_truncated)
+        ):
+            raise ResponseContractError(
+                f"namespace_connectivity.{truncated_field} does not match its count"
+            )
+        return projected, total, producer_truncated
+
+    connected_ids, connected_count, connected_truncated = context_ids(
+        "connected_context_ids",
+        count_field="connected_context_count_lower_bound",
+        truncated_field="connected_context_ids_truncated",
+    )
+    pending_ids, pending_count, pending_truncated = context_ids(
+        "pending_context_ids",
+        count_field="pending_context_count_lower_bound",
+        truncated_field="pending_context_ids_truncated",
+    )
+
+    return {
+        "scope": _clean_text(
+            value.get("scope") or "local-authoritative-store",
+            64,
+        ),
+        "local_namespace_count": _safe_int(value.get("local_namespace_count")),
+        "bridge_record_limit": _safe_int(value.get("bridge_record_limit")),
+        "active_bridge_records_returned": _safe_int(
+            value.get("active_bridge_records_returned")
+        ),
+        "incident_bridge_records_returned": _safe_int(
+            value.get("incident_bridge_records_returned")
+        ),
+        "inbound_only_bridge_records_returned": _safe_int(
+            value.get("inbound_only_bridge_records_returned")
+        ),
+        "bridge_records_truncated": _strict_boolean(
+            value.get("bridge_records_truncated"),
+            field="namespace_connectivity.bridge_records_truncated",
+        ),
+        "connected_context_count_lower_bound": connected_count,
+        "connected_context_ids_returned": len(connected_ids),
+        "connected_context_ids": connected_ids,
+        "connected_context_ids_truncated": connected_truncated,
+        "pending_proposals_returned": _safe_int(
+            value.get("pending_proposals_returned")
+        ),
+        "pending_proposal_records_truncated": _strict_boolean(
+            value.get("pending_proposal_records_truncated"),
+            field="namespace_connectivity.pending_proposal_records_truncated",
+        ),
+        "pending_context_count_lower_bound": pending_count,
+        "pending_context_ids_returned": len(pending_ids),
+        "pending_context_ids": pending_ids,
+        "pending_context_ids_truncated": pending_truncated,
+        "suggestion_evaluation": _clean_text(
+            value.get("suggestion_evaluation") or "on-demand-namespace-map",
+            64,
+        ),
+        "automatic_cross_namespace_write": False,
+        "multi_mac_live_sync": False,
     }
 
 
@@ -3525,6 +3703,17 @@ def _validate_surface_identities(surface: str, payload: dict[str, Any]) -> None:
         payload.get("context_id"), field="context_id", max_chars=128
     )
     if surface == "agent-hydration":
+        connectivity = payload.get("namespace_connectivity")
+        if not isinstance(connectivity, dict):
+            raise ResponseContractError("namespace_connectivity must be an object")
+        for field in (
+            "automatic_cross_namespace_write",
+            "multi_mac_live_sync",
+        ):
+            if connectivity.get(field) is not False:
+                raise ResponseContractError(
+                    f"namespace_connectivity.{field} must be false"
+                )
         protocol_version = _atomic_identifier(
             payload.get("protocol_version"),
             field="protocol_version",

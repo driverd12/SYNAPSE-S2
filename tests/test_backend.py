@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 import subprocess
 from contextlib import closing
+from typing import Any
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -69,6 +70,109 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertIs(backend._mx.asserted_stream, stream_token)
         self.assertEqual(exited, [stream_token])
+
+    def test_persistent_neural_state_crosses_constructor_worker_boundary(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            quick_pruning_interval_seconds=0.0,
+            state_path=self.state_path,
+        )
+        failures: list[BaseException] = []
+        result: dict[str, Any] = {}
+
+        def register_from_worker() -> None:
+            try:
+                with backend.execution_context():
+                    result.update(
+                        backend.register_text_trace(
+                            tag="worker-thread-trace",
+                            text="Worker-thread MLX state materialization proof.",
+                            context_id="thread-proof",
+                        )
+                    )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        with patch.object(mlx_backend.LOGGER, "warning") as warning:
+            worker = threading.Thread(target=register_from_worker)
+            worker.start()
+            worker.join(timeout=10.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(result.get("memory_id"))
+        self.assertIsNotNone(backend.memory_store.get_entry(result["memory_id"]))
+        self.assertFalse(
+            any(
+                "mx.eval failed" in str(call.args[0])
+                for call in warning.call_args_list
+                if call.args
+            )
+        )
+
+    def test_namespace_connectivity_excludes_inbound_directed_recall(self):
+        backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            quick_pruning_interval_seconds=0.0,
+            state_path=self.state_path,
+        )
+        backend.approve_namespace_link(
+            source_context_id="upstream",
+            target_context_id="downstream",
+            relation_type="related",
+            direction="directed",
+            approved_by="test-operator",
+            confirm=True,
+        )
+
+        connectivity = backend._agent_namespace_connectivity(context="downstream")
+
+        self.assertEqual(connectivity["active_bridge_records_returned"], 0)
+        self.assertEqual(connectivity["incident_bridge_records_returned"], 1)
+        self.assertEqual(
+            connectivity["inbound_only_bridge_records_returned"], 1
+        )
+        self.assertFalse(connectivity["bridge_records_truncated"])
+        self.assertEqual(connectivity["connected_context_ids"], [])
+
+    def test_namespace_connectivity_ignores_ungoverned_legacy_links(self):
+        backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            quick_pruning_interval_seconds=0.0,
+            state_path=self.state_path,
+        )
+        backend.memory_store.upsert_context_link(
+            source_context_id="legacy-a",
+            target_context_id="legacy-b",
+            relation_type="related",
+            approved_by="legacy-test",
+        )
+
+        connectivity = backend._agent_namespace_connectivity(context="legacy-a")
+        resolved = backend.resolve_recall_contexts(
+            context_id="legacy-a",
+            recall_scope="connected",
+        )
+
+        self.assertEqual(connectivity["active_bridge_records_returned"], 0)
+        self.assertEqual(connectivity["incident_bridge_records_returned"], 0)
+        self.assertEqual(connectivity["connected_context_ids"], [])
+        self.assertEqual(
+            [record["context_id"] for record in resolved],
+            ["legacy-a", "global"],
+        )
 
     def test_oversized_embedding_is_rejected_before_materialization_or_resize(self):
         class OversizedEmbeddingProbe:
@@ -553,6 +657,11 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             context_id="CASP-Control-Room",
             min_suggestion_score=0.01,
         )
+        lightweight_map = backend.list_namespace_map(
+            context_id="CASP-Control-Room",
+            include_suggestions=False,
+            include_density_metrics=False,
+        )
         with self.assertRaisesRegex(ValueError, "confirm=true"):
             backend.approve_namespace_link(
                 source_context_id="CASP-Control-Room",
@@ -574,6 +683,15 @@ class SpikingAttentionBackendTests(unittest.TestCase):
 
         self.assertGreaterEqual(suggestions["suggestion_count"], 1)
         self.assertTrue(suggestions["read_only"])
+        self.assertEqual(
+            suggestions["method"],
+            "density-normalized-dice-plus-containment-v2",
+        )
+        self.assertFalse(lightweight_map["density_metrics_included"])
+        self.assertEqual(lightweight_map["suggestions"], [])
+        self.assertTrue(
+            all("surface_term_count" not in node for node in lightweight_map["nodes"])
+        )
         self.assertEqual(map_before["link_count"], 0)
         self.assertEqual(map_before["node_count"], 3)
         self.assertEqual(map_after["link_count"], 1)
@@ -1809,6 +1927,30 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertIn("agent-brief-memory captured and published", first["briefing_markdown"])
         self.assertIn("agent-brief-memory", first["recall_result"])
         self.assertEqual(first["graph_summary"]["entry_count"], 1)
+        self.assertEqual(
+            first["namespace_connectivity"],
+            {
+                "scope": "local-authoritative-store",
+                "local_namespace_count": 1,
+                "bridge_record_limit": 100,
+                "active_bridge_records_returned": 0,
+                "incident_bridge_records_returned": 0,
+                "inbound_only_bridge_records_returned": 0,
+                "bridge_records_truncated": False,
+                "connected_context_count_lower_bound": 0,
+                "connected_context_ids": [],
+                "connected_context_ids_truncated": False,
+                "pending_proposals_returned": 0,
+                "pending_proposal_records_truncated": False,
+                "pending_context_count_lower_bound": 0,
+                "pending_context_ids": [],
+                "pending_context_ids_truncated": False,
+                "suggestion_evaluation": "on-demand-namespace-map",
+                "automatic_cross_namespace_write": False,
+                "multi_mac_live_sync": False,
+            },
+        )
+        self.assertIn("Internal memory relationships above are not namespace bridges", first["briefing_markdown"])
         self.assertEqual(second["new_event_count"], 0)
         self.assertEqual(second["since_event_id"], event["event_id"])
         self.assertFalse(second["ack_required"])
@@ -2712,6 +2854,39 @@ class SpikingAttentionBackendTests(unittest.TestCase):
                 truth_posture="test-validated",
                 text="This claim lacks a concrete validation artifact.",
                 evidence={"source": "unit-test"},
+            )
+
+        with self.assertRaisesRegex(ValueError, "concrete validation evidence"):
+            backend.commit_cortical_trace(
+                context_id="demo",
+                agent_id="codex",
+                session_id="validation-session",
+                trace_type="validation",
+                truth_posture="test-validated",
+                text="Secret-only output is not surviving validation evidence.",
+                evidence={"output": "sk-proj-" + ("A" * 64)},
+            )
+
+        with self.assertRaisesRegex(ValueError, "concrete validation evidence"):
+            backend.commit_cortical_trace(
+                context_id="demo",
+                agent_id="codex",
+                session_id="validation-session",
+                trace_type="validation",
+                truth_posture="test-validated",
+                text="A stripped raw digest is not validation evidence.",
+                evidence={"output": "raw_content_sha256: " + ("a" * 64)},
+            )
+
+        with self.assertRaisesRegex(ValueError, "concrete validation evidence"):
+            backend.commit_cortical_trace(
+                context_id="demo",
+                agent_id="codex",
+                session_id="validation-session",
+                trace_type="validation",
+                truth_posture="test-validated",
+                text="An unserializable placeholder is not validation evidence.",
+                evidence={"output": object()},
             )
 
         committed = backend.commit_cortical_trace(

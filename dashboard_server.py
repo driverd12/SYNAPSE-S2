@@ -266,7 +266,12 @@ class DashboardRuntime:
             self._semantic_audit_running = False
             self._semantic_audit_condition.notify_all()
 
-    def _semantic_audit_health(self, *, wait: bool) -> dict[str, Any]:
+    def _semantic_audit_health(
+        self,
+        *,
+        wait: bool,
+        start_if_missing: bool = True,
+    ) -> dict[str, Any]:
         if wait:
             run_refresh = False
             with self._semantic_audit_condition:
@@ -318,7 +323,7 @@ class DashboardRuntime:
                     }
                 )
                 return cached
-            if not self._semantic_audit_running:
+            if not self._semantic_audit_running and start_if_missing:
                 self._semantic_audit_running = True
                 worker = threading.Thread(
                     target=self._refresh_semantic_audit,
@@ -371,10 +376,11 @@ class DashboardRuntime:
             "status": "degraded",
             "checked_memory_count": 0,
             "mismatched_memory_count": 0,
-            "audit_revision": "pending",
+            "audit_revision": "pending" if pending else "not-run",
             "repairable": False,
             "audit_cached": False,
-            "audit_pending": True,
+            "audit_pending": pending,
+            "audit_not_run": not pending,
         }
 
     def handle(
@@ -432,6 +438,22 @@ class DashboardRuntime:
         if method == "GET" and path == "/api/status":
             context = self._context_from_params(params)
             return self._json_response(self.backend.status(context_id=context))
+        if method == "GET" and path == "/api/core-health":
+            backend = self.backend
+            if not isinstance(backend, CoreClient):
+                return self._json_response(
+                    {
+                        "ready": True,
+                        "operational_state": "in-process-test-runtime",
+                        "backend_lane": {
+                            "owner": None,
+                            "maintenance": False,
+                            "active_age_ms": 0,
+                            "deadline_remaining_ms": None,
+                        },
+                    }
+                )
+            return self._json_response(backend.health(timeout_seconds=2.0))
         if method == "GET" and path == "/api/profile":
             if self._bool_param(params, "benchmark_quick_prune", False):
                 raise DashboardError(
@@ -466,6 +488,11 @@ class DashboardRuntime:
                 maximum=500,
             )
             include_suggestions = self._bool_param(params, "include_suggestions", True)
+            include_density_metrics = self._bool_param(
+                params,
+                "include_density_metrics",
+                True,
+            )
             min_suggestion_score = self._float_param(
                 params,
                 "min_suggestion_score",
@@ -478,6 +505,7 @@ class DashboardRuntime:
                     context_id=context,
                     limit=limit,
                     include_suggestions=include_suggestions,
+                    include_density_metrics=include_density_metrics,
                     suggestion_limit=suggestion_limit,
                     min_suggestion_score=min_suggestion_score,
                 )
@@ -596,11 +624,17 @@ class DashboardRuntime:
             context = self._context_from_params(params)
             include_apps = self._bool_param(params, "include_apps", True)
             repair_plan = self._bool_param(params, "repair_plan", True)
+            deep_integrity_scan = self._bool_param(
+                params,
+                "deep_integrity_scan",
+                False,
+            )
             return self._json_response(
                 self.doctor_report(
                     context_id=context,
                     include_apps=include_apps,
                     repair_plan=repair_plan,
+                    run_semantic_audit=deep_integrity_scan,
                 )
             )
         if method == "GET" and path == "/api/start-work":
@@ -2238,10 +2272,12 @@ class DashboardRuntime:
         include_apps: bool = True,
         repair_plan: bool = True,
         wait_for_semantic_audit: bool = False,
+        run_semantic_audit: bool = False,
     ) -> dict[str, Any]:
         context = mlx_backend.sanitize_context_id(context_id)
         started = time.perf_counter()
         checks: list[dict[str, Any]] = []
+        semantic_audit: dict[str, Any] = {}
 
         def add_check(
             check_id: str,
@@ -2278,35 +2314,40 @@ class DashboardRuntime:
             detail=str(memory_path),
             repair="Set SYNAPSE_S2_MEMORY_DB to a writable local SQLite path.",
         )
-        try:
-            semantic_indexes = self._semantic_audit_health(
-                wait=wait_for_semantic_audit,
-            )
-            semantic_status = str(semantic_indexes.get("status") or "blocked")
-            add_check(
-                "semantic_indexes",
-                label="Semantic indexes",
-                status=semantic_status,
-                detail=(
-                    f"all namespaces: {semantic_indexes.get('checked_memory_count', 0)} checked, "
-                    f"{semantic_indexes.get('mismatched_memory_count', 0)} mismatched; "
-                    f"revision {semantic_indexes.get('audit_revision', 'unknown')}; "
-                    f"active namespace {context}; "
-                    f"pending {bool(semantic_indexes.get('audit_pending'))}"
-                ),
-                repair=(
-                    "Run memory-integrity, review its audit_revision, then run "
-                    "memory-integrity --repair --confirm --expected-revision <revision>."
-                ),
-            )
-        except Exception as exc:
-            add_check(
-                "semantic_indexes",
-                label="Semantic indexes",
-                status="blocked",
-                detail=safe_public_error(exc, fallback="readiness check failed"),
-                repair="Run memory-integrity from the project virtualenv and inspect SQLite.",
-            )
+        def add_semantic_index_check() -> None:
+            nonlocal semantic_audit
+            try:
+                semantic_indexes = self._semantic_audit_health(
+                    wait=wait_for_semantic_audit,
+                    start_if_missing=(run_semantic_audit or wait_for_semantic_audit),
+                )
+                semantic_audit = dict(semantic_indexes)
+                semantic_status = str(semantic_indexes.get("status") or "blocked")
+                add_check(
+                    "semantic_indexes",
+                    label="Semantic indexes",
+                    status=semantic_status,
+                    detail=(
+                        f"all namespaces: {semantic_indexes.get('checked_memory_count', 0)} checked, "
+                        f"{semantic_indexes.get('mismatched_memory_count', 0)} mismatched; "
+                        f"revision {semantic_indexes.get('audit_revision', 'unknown')}; "
+                        f"active namespace {context}; "
+                        f"pending {bool(semantic_indexes.get('audit_pending'))}"
+                    ),
+                    repair=(
+                        "Run Doctor with deep_integrity_scan=true or memory-integrity, "
+                        "review its audit_revision, then run memory-integrity --repair "
+                        "--confirm --expected-revision <revision>."
+                    ),
+                )
+            except Exception as exc:
+                add_check(
+                    "semantic_indexes",
+                    label="Semantic indexes",
+                    status="blocked",
+                    detail=safe_public_error(exc, fallback="readiness check failed"),
+                    repair="Run memory-integrity from the project virtualenv and inspect SQLite.",
+                )
         try:
             delivery_health = self.backend.context_delivery_health(context_id=None)
             add_check(
@@ -2420,6 +2461,12 @@ class DashboardRuntime:
                     repair="Grant macOS Automation/Accessibility permissions or use selected-text capture.",
                 )
 
+        # Start an explicitly requested deep audit only after all ordinary
+        # core checks have completed. The semantic audit owns the serialized
+        # maintenance lane; launching it earlier makes the supposedly quick
+        # Doctor wait behind its own background worker.
+        add_semantic_index_check()
+
         if any(check["status"] == "blocked" for check in checks):
             overall_status = "blocked"
         elif any(check["status"] == "degraded" for check in checks):
@@ -2438,6 +2485,7 @@ class DashboardRuntime:
             "context_id": context,
             "overall_status": overall_status,
             "checks": checks,
+            "semantic_audit": semantic_audit,
             "repair_plan": self._unique_strings(plan) if repair_plan else [],
             "environment": {
                 "MLX_DEVICE": os.getenv("MLX_DEVICE", ""),
@@ -4595,8 +4643,15 @@ class SynapseDashboardServer(ThreadingHTTPServer):
         path: str,
         raw_body: bytes,
     ) -> tuple[int, dict[str, str], bytes]:
-        # Network parsing and authentication may run concurrently, but MLX-backed
-        # runtime work remains serialized to preserve the existing device affinity.
+        parsed_path = urlparse(path).path
+        if method.upper() == "GET" and parsed_path == "/api/core-health":
+            # Core health bypasses the backend execution lane and performs no
+            # dashboard mutation. Keep it outside the runtime lock so an
+            # operator can see maintenance progress while a deep audit owns
+            # the serialized lane.
+            return self.runtime.handle(method, path, raw_body)
+        # Network parsing and authentication may run concurrently, but other
+        # MLX-backed runtime work remains serialized to preserve device affinity.
         with self._runtime_lock:
             return self.runtime.handle(method, path, raw_body)
 

@@ -10999,50 +10999,74 @@ class DurableMemoryStore:
             clauses.append("enabled = 1")
         where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
         bounded_limit = min(max(int(limit), 1), 10_000)
-        params.append(bounded_limit)
         try:
             with self._read_connection_scope(_conn) as conn:
-                rows = conn.execute(
-                    f"""
-                    SELECT *
-                    FROM context_relationships
-                    {where_sql}
-                    ORDER BY confidence DESC, updated_at DESC, context_link_id
-                    LIMIT ?
-                    """,
-                    tuple(params),
-                ).fetchall()
-            links = [self._row_to_context_link(row) for row in rows]
-            if enabled_only:
+                if not enabled_only:
+                    rows = conn.execute(
+                        f"""
+                        SELECT *
+                        FROM context_relationships
+                        {where_sql}
+                        ORDER BY confidence DESC, updated_at DESC, context_link_id
+                        LIMIT ?
+                        """,
+                        (*params, bounded_limit),
+                    ).fetchall()
+                    return [self._row_to_context_link(row) for row in rows]
+
                 # Governed link expiry is an authorization boundary, not a
                 # maintenance schedule.  Enforce it on every recall read even
                 # if the asynchronous expiry sweep has not yet materialized
                 # ``enabled = 0``. Legacy approved links remain compatible
-                # until explicitly adopted into the governance ledger.
+                # until explicitly adopted into the governance ledger. Read
+                # successive ordered pages before applying the caller limit;
+                # otherwise expired high-confidence rows can hide a later
+                # effective bridge and make the hydration capsule contradict
+                # actual connected recall.
                 observed_at = time.time()
                 effective: list[dict[str, Any]] = []
-                for link in links:
-                    evidence = link.get("evidence")
-                    governance = (
-                        evidence.get("governance")
-                        if isinstance(evidence, dict)
-                        else None
-                    )
-                    if isinstance(governance, dict):
-                        if governance.get("state") != "approved":
-                            continue
-                        expires_at = governance.get("link_expires_at")
-                        if expires_at is not None:
-                            try:
-                                if observed_at >= float(expires_at):
-                                    continue
-                            except (TypeError, ValueError, OverflowError):
-                                # Malformed policy data can never broaden
-                                # connected recall.
+                page_size = min(max(bounded_limit, 256), 2_000)
+                offset = 0
+                while len(effective) < bounded_limit:
+                    rows = conn.execute(
+                        f"""
+                        SELECT *
+                        FROM context_relationships
+                        {where_sql}
+                        ORDER BY confidence DESC, updated_at DESC, context_link_id
+                        LIMIT ? OFFSET ?
+                        """,
+                        (*params, page_size, offset),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    offset += len(rows)
+                    for row in rows:
+                        link = self._row_to_context_link(row)
+                        evidence = link.get("evidence")
+                        governance = (
+                            evidence.get("governance")
+                            if isinstance(evidence, dict)
+                            else None
+                        )
+                        if isinstance(governance, dict):
+                            if governance.get("state") != "approved":
                                 continue
-                    effective.append(link)
-                links = effective
-            return links
+                            expires_at = governance.get("link_expires_at")
+                            if expires_at is not None:
+                                try:
+                                    if observed_at >= float(expires_at):
+                                        continue
+                                except (TypeError, ValueError, OverflowError):
+                                    # Malformed policy data can never broaden
+                                    # connected recall.
+                                    continue
+                        effective.append(link)
+                        if len(effective) >= bounded_limit:
+                            break
+                    if len(rows) < page_size:
+                        break
+                return effective
         except Exception:
             LOGGER.exception("failed to list context links")
             raise
@@ -11191,6 +11215,147 @@ class DurableMemoryStore:
             LOGGER.exception("failed to list durable context summaries")
             raise
 
+    def count_contexts(self) -> int:
+        """Return the namespace count without aggregating derived indexes."""
+
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    """
+                    WITH namespace_catalog AS (
+                        SELECT substr(key, length(?) + 1) AS context_id
+                        FROM store_metadata
+                        WHERE substr(key, 1, length(?)) = ?
+                          AND length(key) > length(?)
+                    ),
+                    contexts AS (
+                        SELECT context_id FROM memory_entries
+                        UNION SELECT context_id FROM agent_context_events
+                        UNION SELECT source_context_id FROM context_relationships
+                        UNION SELECT target_context_id FROM context_relationships
+                        UNION SELECT context_id FROM namespace_catalog
+                    )
+                    SELECT COUNT(*) FROM contexts
+                    """,
+                    (
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                    ),
+                ).fetchone()
+            return int(row[0] if row is not None else 0)
+        except Exception:
+            LOGGER.exception("failed to count durable contexts")
+            raise
+
+    def list_context_summaries_lightweight(
+        self,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Return map summaries without scanning spike or surface-term indexes."""
+
+        bounded_limit = min(max(int(limit), 1), 10_000)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    WITH namespace_catalog AS (
+                        SELECT
+                            substr(key, length(?) + 1) AS context_id,
+                            updated_at AS last_catalog_at
+                        FROM store_metadata
+                        WHERE substr(key, 1, length(?)) = ?
+                          AND length(key) > length(?)
+                    ),
+                    contexts AS (
+                        SELECT context_id FROM memory_entries
+                        UNION SELECT context_id FROM agent_context_events
+                        UNION SELECT source_context_id FROM context_relationships
+                        UNION SELECT target_context_id FROM context_relationships
+                        UNION SELECT context_id FROM namespace_catalog
+                    ),
+                    entry_stats AS (
+                        SELECT context_id, COUNT(*) AS entry_count,
+                               MAX(updated_at) AS last_entry_at
+                        FROM memory_entries
+                        GROUP BY context_id
+                    ),
+                    relationship_stats AS (
+                        SELECT context_id, COUNT(*) AS relationship_count
+                        FROM memory_relationships
+                        GROUP BY context_id
+                    ),
+                    event_stats AS (
+                        SELECT context_id, COUNT(*) AS context_event_count,
+                               MAX(created_at) AS last_event_at
+                        FROM agent_context_events
+                        GROUP BY context_id
+                    ),
+                    link_events AS (
+                        SELECT source_context_id AS context_id, updated_at
+                        FROM context_relationships
+                        UNION ALL
+                        SELECT target_context_id AS context_id, updated_at
+                        FROM context_relationships
+                    ),
+                    link_stats AS (
+                        SELECT context_id, COUNT(*) AS context_link_count,
+                               MAX(updated_at) AS last_link_at
+                        FROM link_events
+                        GROUP BY context_id
+                    )
+                    SELECT
+                        contexts.context_id,
+                        COALESCE(entry_stats.entry_count, 0) AS entry_count,
+                        COALESCE(relationship_stats.relationship_count, 0)
+                            AS relationship_count,
+                        COALESCE(event_stats.context_event_count, 0)
+                            AS context_event_count,
+                        COALESCE(link_stats.context_link_count, 0)
+                            AS context_link_count,
+                        MAX(
+                            COALESCE(entry_stats.last_entry_at, 0.0),
+                            COALESCE(event_stats.last_event_at, 0.0),
+                            COALESCE(link_stats.last_link_at, 0.0),
+                            COALESCE(namespace_catalog.last_catalog_at, 0.0)
+                        ) AS last_activity_at
+                    FROM contexts
+                    LEFT JOIN namespace_catalog USING (context_id)
+                    LEFT JOIN entry_stats USING (context_id)
+                    LEFT JOIN relationship_stats USING (context_id)
+                    LEFT JOIN event_stats USING (context_id)
+                    LEFT JOIN link_stats USING (context_id)
+                    ORDER BY entry_count DESC, last_activity_at DESC,
+                             contexts.context_id
+                    LIMIT ?
+                    """,
+                    (
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        NAMESPACE_CATALOG_METADATA_PREFIX,
+                        bounded_limit,
+                    ),
+                ).fetchall()
+            return [
+                {
+                    "context_id": str(row["context_id"]),
+                    "entry_count": int(row["entry_count"]),
+                    "relationship_count": int(row["relationship_count"]),
+                    "context_event_count": int(row["context_event_count"]),
+                    "context_link_count": int(row["context_link_count"]),
+                    "last_activity_at": float(row["last_activity_at"]),
+                    "size": int(row["entry_count"]),
+                    "derived_density_metrics_included": False,
+                }
+                for row in rows
+            ]
+        except Exception:
+            LOGGER.exception("failed to list lightweight durable context summaries")
+            raise
+
     def resolve_recall_contexts(
         self,
         *,
@@ -11326,13 +11491,14 @@ class DurableMemoryStore:
                     profiles=profiles,
                     max_phase_delay_ticks=max_phase_delay_ticks,
                 )
-                if float(suggestion["dice_score"]) < float(min_score):
+                if float(suggestion["score"]) < float(min_score):
                     continue
                 suggestion["already_linked"] = already_linked
                 suggestions.append(suggestion)
         suggestions.sort(
             key=lambda item: (
-                float(item["dice_score"]),
+                float(item["score"]),
+                float(item["surface_containment"]),
                 int(item["surface_overlap_count"]),
                 int(item["spike_overlap_count"]),
                 str(item["source_context_id"]),
@@ -11421,29 +11587,81 @@ class DurableMemoryStore:
             if spike_denominator
             else 0.0
         )
+        surface_containment = (
+            len(shared_terms) / min(len(source_terms), len(target_terms))
+            if source_terms and target_terms
+            else 0.0
+        )
+        spike_containment = (
+            len(shared_spikes) / min(len(source_spikes), len(target_spikes))
+            if source_spikes and target_spikes
+            else 0.0
+        )
+        baseline_scores: list[tuple[float, float]] = []
+        if surface_denominator:
+            baseline_scores.append((surface_dice, 0.7))
+        if spike_denominator:
+            baseline_scores.append((spike_dice, 0.3))
+        baseline_weight = sum(weight for _score, weight in baseline_scores)
+        dice_score = (
+            sum(score * weight for score, weight in baseline_scores) / baseline_weight
+            if baseline_weight
+            else 0.0
+        )
+        # Symmetric Dice remains the density-normalized baseline.  It can
+        # nevertheless bury a genuinely focused namespace beside a very large
+        # one because the dense side dominates the denominator.  Apply a
+        # conservative asymmetric-containment lift only when at least two
+        # meaningful surface terms overlap. Spike containment may strengthen
+        # that corroborated signal but can never independently create it.
+        surface_relevance = (
+            max(surface_dice, (0.5 * surface_dice) + (0.5 * surface_containment))
+            if len(shared_terms) >= 2
+            else surface_dice
+        )
+        spike_relevance = (
+            max(spike_dice, (0.75 * spike_dice) + (0.25 * spike_containment))
+            if len(shared_terms) >= 2 and len(shared_spikes) >= 3
+            else spike_dice
+        )
         available_scores: list[tuple[float, float]] = []
         if surface_denominator:
-            available_scores.append((surface_dice, 0.7))
+            available_scores.append((surface_relevance, 0.7))
         if spike_denominator:
-            available_scores.append((spike_dice, 0.3))
+            available_scores.append((spike_relevance, 0.3))
         total_weight = sum(weight for _score, weight in available_scores)
-        dice_score = (
+        relevance_score = (
             sum(score * weight for score, weight in available_scores) / total_weight
             if total_weight
             else 0.0
         )
+        # Namespace-wide spike unions can saturate as a corpus grows. A dense
+        # namespace may then contain every spike in a small unrelated one.
+        # Require at least one shared semantic surface term before spike
+        # overlap can produce a suggestion score; retain the pure Dice value
+        # in evidence for inspection.
+        if not shared_terms:
+            relevance_score = 0.0
         bounded_max_delay = min(max(int(max_phase_delay_ticks), 0), 64)
         suggested_phase_delay_ticks = min(
             bounded_max_delay,
-            max(0, int(round(bounded_max_delay * (1.0 - dice_score)))),
+            max(0, int(round(bounded_max_delay * (1.0 - relevance_score)))),
         )
         pair = sorted((source_context_id, target_context_id))
-        suggestion_seed = f"{pair[0]}\x1f{pair[1]}\x1fdensity-dice-v1".encode("utf-8")
+        suggestion_seed = (
+            f"{pair[0]}\x1f{pair[1]}\x1fdensity-dice-containment-v2".encode("utf-8")
+        )
         evidence = {
-            "method": "density-normalized-dice-v1",
+            "method": "density-normalized-dice-plus-containment-v2",
             "surface_dice": round(surface_dice, 6),
             "spike_dice": round(spike_dice, 6),
             "dice_score": round(dice_score, 6),
+            "relevance_score": round(relevance_score, 6),
+            "surface_containment": round(surface_containment, 6),
+            "spike_containment": round(spike_containment, 6),
+            "containment_lift_applied": bool(
+                len(shared_terms) >= 2
+            ),
             "surface_overlap_count": len(shared_terms),
             "surface_source_count": len(source_terms),
             "surface_target_count": len(target_terms),
@@ -11461,12 +11679,15 @@ class DurableMemoryStore:
             "suggestion_id": "s2cs_" + hashlib.sha256(suggestion_seed).hexdigest()[:32],
             "source_context_id": source_context_id,
             "target_context_id": target_context_id,
-            "score": round(dice_score, 6),
-            "weight": round(dice_score, 6),
-            "confidence": round(dice_score, 6),
-            "dice_score": round(dice_score, 6),
+            "score": round(relevance_score, 6),
+            "weight": round(relevance_score, 6),
+            "confidence": round(relevance_score, 6),
+            "dice_score": evidence["dice_score"],
+            "relevance_score": round(relevance_score, 6),
             "surface_dice": round(surface_dice, 6),
             "spike_dice": round(spike_dice, 6),
+            "surface_containment": round(surface_containment, 6),
+            "spike_containment": round(spike_containment, 6),
             "surface_overlap_count": len(shared_terms),
             "spike_overlap_count": len(shared_spikes),
             "suggested_phase_delay_ticks": suggested_phase_delay_ticks,

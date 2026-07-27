@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from cortex_contract import (
+    canonicalize_validation_evidence,
+    has_concrete_validation_evidence,
+)
 from embedding_providers import (
     EmbeddingProvider,
     EmbeddingProviderConfig,
@@ -702,6 +706,20 @@ class SpikingAttentionBackend:
         else:
             self._load_runtime_state()
         if not self.control_plane_only:
+            # MLX arrays are lazy and retain the stream that created their
+            # unevaluated graph. The authoritative core constructs this state
+            # on its startup thread, then runs neural work on RPC worker
+            # threads. Materialize persistent state before that handoff so a
+            # worker never inherits a dependency on the constructor's
+            # thread-local default Stream(gpu, 0).
+            with self.execution_context():
+                native_mx.eval(
+                    self.W_syn,
+                    self.W_lateral,
+                    self.state["mem"],
+                    self.state["spk"],
+                    self.active_traces,
+                )
             self._refresh_registered_traces()
 
         if not self._mlxsnn_available:
@@ -5307,7 +5325,7 @@ class SpikingAttentionBackend:
         ).strip() or "direct-cortex-commit"
         clean_trace_type = self._normalize_cortex_trace_type(trace_type, clean_text)
         clean_truth_posture = self._normalize_truth_posture(truth_posture)
-        safe_evidence = self._json_safe_metadata(evidence or {})
+        safe_evidence = canonicalize_validation_evidence(evidence or {})
         if (
             clean_truth_posture == "test-validated"
             and not self._has_concrete_validation_evidence(safe_evidence)
@@ -6445,38 +6463,7 @@ class SpikingAttentionBackend:
         return round(min(max(score, 0.05), 0.99), 3)
 
     def _has_concrete_validation_evidence(self, evidence: dict[str, Any]) -> bool:
-        if not evidence:
-            return False
-        concrete_keys = {
-            "artifact",
-            "artifact_path",
-            "artifacts",
-            "check",
-            "checks",
-            "command",
-            "commands",
-            "commit",
-            "output",
-            "output_summary",
-            "proof",
-            "report",
-            "test_command",
-            "test_output",
-            "tests",
-            "validated_by",
-            "validation",
-            "verification",
-        }
-        for key, value in evidence.items():
-            normalized_key = str(key or "").strip().lower().replace("-", "_")
-            if normalized_key not in concrete_keys:
-                continue
-            if isinstance(value, (list, tuple, set, dict)):
-                if len(value) > 0:
-                    return True
-            elif str(value or "").strip():
-                return True
-        return False
+        return has_concrete_validation_evidence(evidence)
 
     def _summarize_cortex_memory(self, entry: dict[str, Any]) -> dict[str, Any]:
         metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
@@ -6842,6 +6829,7 @@ class SpikingAttentionBackend:
             "relationship_count": int(graph["relationship_count"]),
             "relationship_modes": graph["relationship_summary"],
         }
+        namespace_connectivity = self._agent_namespace_connectivity(context=context)
         cortex_state = self.get_cortex_state(
             context_id=context,
             agent_id=agent,
@@ -6884,6 +6872,7 @@ class SpikingAttentionBackend:
                 graph_summary=graph_summary,
                 graph_entries=graph_entries,
                 graph_relationships=graph_relationships,
+                namespace_connectivity=namespace_connectivity,
                 cortex_state=cortex_state,
             )
         except Exception:
@@ -6926,6 +6915,7 @@ class SpikingAttentionBackend:
         graph_summary: dict[str, Any],
         graph_entries: list[dict[str, Any]],
         graph_relationships: list[dict[str, Any]],
+        namespace_connectivity: dict[str, Any],
         cortex_state: dict[str, Any],
     ) -> dict[str, Any]:
         raw_events = deployments["events"]
@@ -7000,6 +6990,7 @@ class SpikingAttentionBackend:
             "graph_summary": graph_summary,
             "graph_entries": graph_entries,
             "graph_relationships": graph_relationships,
+            "namespace_connectivity": namespace_connectivity,
             "cortex_state": cortex_state,
             "delivery_mode": CONTEXT_BUS_DELIVERY_MODE,
             "protocol_version": CONTEXT_BUS_PROTOCOL_VERSION,
@@ -7007,6 +6998,79 @@ class SpikingAttentionBackend:
         }
         payload["briefing_markdown"] = self._render_agent_context_briefing(payload)
         return payload
+
+    def _agent_namespace_connectivity(self, *, context: str) -> dict[str, Any]:
+        record_limit = 100
+        links = self.bridge_governance.list_active_namespace_links(
+            context_id=context,
+            limit=record_limit + 1,
+        )
+        bridge_records_truncated = len(links) > record_limit
+        links = links[:record_limit]
+        reachable_links = [
+            link
+            for link in links
+            if str(link["source_context_id"]) == context
+            or str(link.get("direction") or "") == "bidirectional"
+        ]
+        connected_context_ids = sorted(
+            {
+                str(link["target_context_id"])
+                if str(link["source_context_id"]) == context
+                else str(link["source_context_id"])
+                for link in reachable_links
+            }
+        )
+        pending = self.bridge_governance.list_namespace_link_proposals(
+            context_id=context,
+            state="pending",
+            limit=record_limit + 1,
+        )
+        proposals = list(pending.get("proposals", []))
+        pending_proposal_records_truncated = len(proposals) > record_limit
+        proposals = proposals[:record_limit]
+        pending_context_ids = sorted(
+            {
+                str(proposal["target_context_id"])
+                if str(proposal["source_context_id"]) == context
+                else str(proposal["source_context_id"])
+                for proposal in proposals
+                if isinstance(proposal, dict)
+            }
+        )
+        connected_context_count = len(connected_context_ids)
+        pending_context_count = len(pending_context_ids)
+        context_id_limit = 8
+        return {
+            "scope": "local-authoritative-store",
+            "local_namespace_count": self.memory_store.count_contexts(),
+            "bridge_record_limit": record_limit,
+            "active_bridge_records_returned": len(reachable_links),
+            "incident_bridge_records_returned": len(links),
+            "inbound_only_bridge_records_returned": (
+                len(links) - len(reachable_links)
+            ),
+            "bridge_records_truncated": bridge_records_truncated,
+            "connected_context_count_lower_bound": connected_context_count,
+            "connected_context_ids": connected_context_ids[:context_id_limit],
+            "connected_context_ids_truncated": (
+                bridge_records_truncated
+                or connected_context_count > context_id_limit
+            ),
+            "pending_proposals_returned": len(proposals),
+            "pending_proposal_records_truncated": (
+                pending_proposal_records_truncated
+            ),
+            "pending_context_count_lower_bound": pending_context_count,
+            "pending_context_ids": pending_context_ids[:context_id_limit],
+            "pending_context_ids_truncated": (
+                pending_proposal_records_truncated
+                or pending_context_count > context_id_limit
+            ),
+            "suggestion_evaluation": "on-demand-namespace-map",
+            "automatic_cross_namespace_write": False,
+            "multi_mac_live_sync": False,
+        }
 
     @staticmethod
     def _normalize_agent_recall_mode(recall_mode: str) -> str:
@@ -7310,6 +7374,30 @@ class SpikingAttentionBackend:
             lines.append(
                 f"- {entry.get('tag', '')}: {self._compact_text(str(excerpt), 180)}"
             )
+        connectivity = payload.get("namespace_connectivity", {})
+        if connectivity:
+            connected = connectivity.get("connected_context_ids", [])
+            pending = connectivity.get("pending_context_ids", [])
+            lines.append("## Namespace Connectivity")
+            lines.append(
+                (
+                    "- Returned bridge records: "
+                    f"{connectivity.get('active_bridge_records_returned', 0)} active | "
+                    f"{connectivity.get('inbound_only_bridge_records_returned', 0)} inbound-only | "
+                    f"{connectivity.get('pending_proposals_returned', 0)} pending | "
+                    f"Scope: {connectivity.get('scope', 'local-authoritative-store')}"
+                )
+            )
+            if (
+                connectivity.get("bridge_records_truncated")
+                or connectivity.get("pending_proposal_records_truncated")
+            ):
+                lines.append("- Connectivity record scan is bounded; counts are lower bounds.")
+            if connected:
+                lines.append(f"- Connected namespaces: {', '.join(connected[:8])}")
+            if pending:
+                lines.append(f"- Pending namespaces: {', '.join(pending[:8])}")
+            lines.append("- Internal memory relationships above are not namespace bridges.")
         cortex_state = payload.get("cortex_state", {})
         if cortex_state:
             policy = cortex_state.get("policy", {})
@@ -9300,7 +9388,7 @@ class SpikingAttentionBackend:
             "selected_context_id": selected_context,
             "suggestion_count": len(suggestions),
             "suggestions": suggestions,
-            "method": "density-normalized-dice-v1",
+            "method": "density-normalized-dice-plus-containment-v2",
             "read_only": True,
             "requires_approval": True,
             "automatic_cross_namespace_write": False,
@@ -9313,6 +9401,7 @@ class SpikingAttentionBackend:
         context_id: str = "",
         limit: int = 500,
         include_suggestions: bool = True,
+        include_density_metrics: bool = True,
         suggestion_limit: int = 50,
         min_suggestion_score: float = 0.05,
         max_visual_phase_delay_ticks: int = 4,
@@ -9324,7 +9413,13 @@ class SpikingAttentionBackend:
             else ""
         )
         bounded_limit = min(max(int(limit), 1), 10_000)
-        raw_nodes = self.memory_store.list_context_summaries(limit=bounded_limit)
+        raw_nodes = (
+            self.memory_store.list_context_summaries(limit=bounded_limit)
+            if include_density_metrics
+            else self.memory_store.list_context_summaries_lightweight(
+                limit=bounded_limit
+            )
+        )
         raw_links = self.bridge_governance.list_active_namespace_links(
             limit=min(max(bounded_limit * 8, 1000), 2_000)
         )
@@ -9391,6 +9486,7 @@ class SpikingAttentionBackend:
             "link_count": len(links),
             "proposal_count": len(proposals),
             "suggestion_count": len(suggestions),
+            "density_metrics_included": bool(include_density_metrics),
             "nodes": nodes,
             "links": links,
             "proposals": proposals,
@@ -11924,6 +12020,7 @@ def list_namespace_map(
     context_id: str = "",
     limit: int = 500,
     include_suggestions: bool = True,
+    include_density_metrics: bool = True,
     suggestion_limit: int = 50,
     min_suggestion_score: float = 0.05,
     max_visual_phase_delay_ticks: int = 4,
@@ -11932,6 +12029,7 @@ def list_namespace_map(
         context_id=context_id,
         limit=limit,
         include_suggestions=include_suggestions,
+        include_density_metrics=include_density_metrics,
         suggestion_limit=suggestion_limit,
         min_suggestion_score=min_suggestion_score,
         max_visual_phase_delay_ticks=max_visual_phase_delay_ticks,

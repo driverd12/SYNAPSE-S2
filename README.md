@@ -468,10 +468,13 @@ invalidates, writes a target-digested maintenance receipt, and performs a full
 post-repair audit. If planning, backup, or commit fails, the transaction rolls
 back and the unused attempt backup is removed.
 
-Dashboard Doctor audits all namespaces, not only the active selector. The full
-scan refreshes in a background worker and Doctor returns a bounded pending or
-age-stamped cached state so the single-thread MLX request loop stays responsive;
-the CLI Doctor waits for a current authoritative audit.
+Dashboard Quick Doctor completes ordinary readiness checks without implicitly
+starting the global semantic-index scan. The separate Deep integrity scan
+button starts that all-namespace audit in a background worker; Quick Doctor then
+reports its bounded pending or age-stamped cached state. A lock-free health
+pulse keeps the header and last good Namespace Galaxy responsive while the
+governed maintenance lane is occupied. The CLI Doctor waits for a current
+authoritative audit.
 
 Connected MCP processes hydrate recall and graph state on startup, but deliberately leave context events unclaimed until an agent-facing pull or hydrate response can carry the receipt. To lease the current FIFO briefing manually:
 
@@ -784,7 +787,7 @@ The production bridge lifecycle, authenticated actor semantics, supported
 surfaces, audit behavior, and containment runbook are documented in
 [`docs/BRIDGE_GOVERNANCE.md`](docs/BRIDGE_GOVERNANCE.md).
 
-Connected recall is a bounded read operation. Similarity and density-normalized suggestion scores never copy or write durable memories into another namespace, and links require explicit confirmation. Phase-delay values are presentation metadata used only for bridge styling and inspection in the galaxy, not a claim that the SQLite memory store runs a validated biological synchronization model.
+Connected recall is a bounded read operation. Similarity suggestions combine density-normalized Dice with a conservative multi-overlap sparse-to-dense containment lift so a focused namespace is not drowned out by a much larger one. Suggestions never copy or write durable memories into another namespace, and links require explicit confirmation. Phase-delay values are presentation metadata used only for bridge styling and inspection in the galaxy, not a claim that the SQLite memory store runs a validated biological synchronization model.
 
 The supplied proposal cited S2-Net, Spike Dice Attention (SDA), and Spiking Graph Transformer Networks (SGTN) as May-July 2026 publications. Those citations were future-dated relative to the design evidence supplied to this repository and have not been independently verified as implementation evidence for SYNAPSE-S2. No S2-Net phase-delay engine, SDA spike-train attention operator, or SGTN training/inference model is implemented or validated here. The galaxy and bridge suggestions are operator-governed product features built from durable indexes, typed links, deterministic scoring, and explicit provenance—not a claim of experimentally established biological synchronization.
 

@@ -101,8 +101,12 @@ evidence; records both namespaces in the durable namespace catalog; and writes
 one `pending` projection plus one proposal event. It does **not** create a
 durable link or expand recall.
 
-The backend augments proposal evidence with current density-normalized
-similarity evidence and an entries-revision over both namespaces. Approval
+The backend augments proposal evidence with current density-normalized Dice
+and conservative sparse-to-dense containment evidence plus an entries-revision
+over both namespaces. Every scored suggestion requires semantic surface
+corroboration, and the containment lift requires multiple overlapping terms;
+spike containment cannot independently promote a dense namespace.
+Approval
 rechecks that entries-revision. If either namespace's memory corpus changed,
 the review is rejected as stale and the operator must create a new proposal
 from current evidence.
@@ -194,7 +198,8 @@ The map returns:
 - every bounded catalog/current-data namespace summary;
 - effective approved links only;
 - pending and historical proposal projections;
-- optional read-only, density-normalized suggestions;
+- optional read-only, density-normalized Dice plus sparse-to-dense containment
+  suggestions;
 - governance mode, counts, and the one-hop/no-auto-write declaration.
 
 Galaxy node size is derived from current entry volume. Suggestions and visual

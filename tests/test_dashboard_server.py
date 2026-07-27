@@ -196,6 +196,72 @@ class DashboardRuntimeTests(unittest.TestCase):
 
         self.assertEqual(runtime.peak, 1)
 
+    def test_core_health_bypasses_dashboard_runtime_lock(self):
+        class RuntimeProbe:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.active = 0
+                self.peak = 0
+                self.entered = threading.Event()
+
+            def handle(self, _method, _path, _body):
+                with self.lock:
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+                    if self.active == 1:
+                        self.entered.set()
+                time.sleep(0.05)
+                with self.lock:
+                    self.active -= 1
+                return 200, {}, b""
+
+        runtime = RuntimeProbe()
+        server = SynapseDashboardServer(("127.0.0.1", 0), runtime)
+        ordinary = threading.Thread(
+            target=server.handle_runtime_request,
+            args=("GET", "/api/status", b""),
+        )
+        health = threading.Thread(
+            target=server.handle_runtime_request,
+            args=("GET", "/api/core-health", b""),
+        )
+        try:
+            ordinary.start()
+            self.assertTrue(runtime.entered.wait(timeout=1.0))
+            health.start()
+            ordinary.join(timeout=2.0)
+            health.join(timeout=2.0)
+        finally:
+            server.server_close()
+
+        self.assertEqual(runtime.peak, 2)
+
+    def test_in_process_core_health_route_is_ready(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            status, payload = self.decode(runtime.handle("GET", "/api/core-health"))
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["operational_state"], "in-process-test-runtime")
+
+    def test_core_health_route_delegates_with_a_bounded_timeout(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            core = mock.create_autospec(CoreClient, instance=True)
+            core.health.return_value = {
+                "ready": True,
+                "operational_state": "maintenance",
+                "backend_lane": {"owner": "semantic-index-maintenance"},
+            }
+            runtime._backend = core
+
+            status, payload = self.decode(runtime.handle("GET", "/api/core-health"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["operational_state"], "maintenance")
+        core.health.assert_called_once_with(timeout_seconds=2.0)
+
     def test_doctor_global_audit_detects_corruption_outside_active_namespace(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -259,6 +325,7 @@ class DashboardRuntimeTests(unittest.TestCase):
                 first = runtime.doctor_report(
                     context_id="demo",
                     include_apps=False,
+                    run_semantic_audit=True,
                 )
                 self.assertTrue(started.wait(timeout=1.0))
                 first_semantic = next(
@@ -268,6 +335,7 @@ class DashboardRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(first_semantic["status"], "degraded")
                 self.assertIn("pending True", first_semantic["detail"])
+                self.assertTrue(first["semantic_audit"]["audit_pending"])
                 waiter = threading.Thread(
                     target=wait_for_current_audit,
                     daemon=True,
@@ -293,6 +361,61 @@ class DashboardRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(second_semantic["status"], "ready")
             self.assertIn("pending False", second_semantic["detail"])
+
+    def test_quick_doctor_does_not_launch_global_semantic_audit(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            with mock.patch.object(
+                runtime.backend,
+                "audit_semantic_indexes",
+                wraps=runtime.backend.audit_semantic_indexes,
+            ) as audit:
+                payload = runtime.doctor_report(
+                    context_id="demo",
+                    include_apps=False,
+                )
+
+            semantic = next(
+                check for check in payload["checks"] if check["id"] == "semantic_indexes"
+            )
+            audit.assert_not_called()
+            self.assertEqual(semantic["status"], "degraded")
+            self.assertIn("revision not-run", semantic["detail"])
+            self.assertLess(payload["elapsed_ms"], 1000.0)
+
+    def test_doctor_route_requires_explicit_deep_integrity_scan(self):
+        audit = {
+            "status": "ready",
+            "checked_memory_count": 4,
+            "mismatched_memory_count": 0,
+            "audit_revision": "audit-test",
+            "audit_pending": False,
+        }
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            with mock.patch.object(
+                runtime,
+                "_semantic_audit_health",
+                return_value=audit,
+            ) as semantic:
+                status, payload = self.decode(
+                    runtime.handle(
+                        "GET",
+                        "/api/doctor?context_id=demo&include_apps=false",
+                    )
+                )
+                self.assertEqual(status, 200)
+                self.assertFalse(semantic.call_args.kwargs["start_if_missing"])
+
+                status, deep_payload = self.decode(
+                    runtime.handle(
+                        "GET",
+                        "/api/doctor?context_id=demo&include_apps=false&deep_integrity_scan=true",
+                    )
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(semantic.call_args.kwargs["start_if_missing"])
+                self.assertEqual(deep_payload["semantic_audit"], audit)
 
     def test_dashboard_doctor_surfaces_ack_tombstone_count(self):
         with TemporaryDirectory() as tmp:
@@ -560,6 +683,7 @@ class DashboardRuntimeTests(unittest.TestCase):
             before_identity = runtime_state.lstat().st_ino
             routes = (
                 "/api/status?context_id=demo",
+                "/api/core-health",
                 "/api/profile",
                 "/api/graph?context_id=demo&limit=10",
                 "/api/namespace-map?context_id=demo&limit=10",
@@ -893,6 +1017,13 @@ class DashboardRuntimeTests(unittest.TestCase):
             map_status, map_payload = self.decode(
                 runtime.handle("GET", "/api/namespace-map?context_id=demo")
             )
+            lightweight_status, lightweight_payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/namespace-map?context_id=demo&include_suggestions=false"
+                    "&include_density_metrics=false",
+                )
+            )
             refused_status, refused_payload = self.decode(
                 runtime.handle(
                     "POST",
@@ -946,6 +1077,15 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(
             {node["context_id"] for node in map_payload["nodes"]},
             {"camera-work", "demo"},
+        )
+        self.assertEqual(lightweight_status, 200)
+        self.assertFalse(lightweight_payload["density_metrics_included"])
+        self.assertEqual(lightweight_payload["suggestions"], [])
+        self.assertTrue(
+            all(
+                "surface_term_count" not in node
+                for node in lightweight_payload["nodes"]
+            )
         )
         self.assertEqual(refused_status, 400)
         self.assertEqual(
@@ -1970,6 +2110,42 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("resetRecallResults({ contextId: nextContext })", app)
         self.assertIn("Context: ${queryContext} · Latency:", app)
         self.assertIn('status: "stale-context"', app)
+
+    def test_namespace_galaxy_reads_have_deadlines_and_visibility_aware_refresh(self):
+        root = Path(__file__).resolve().parents[1]
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("const READ_REQUEST_TIMEOUT_MS = 10000", app)
+        self.assertIn('const readOnly = normalizedMethod === "GET"', app)
+        self.assertIn("controller.abort()", app)
+        self.assertIn("last good data retained", app)
+        self.assertIn("backgroundRefreshPending", app)
+        self.assertIn("NAMESPACE_GALAXY_VISIBLE_REFRESH_MS", app)
+        self.assertIn('document.addEventListener("visibilitychange"', app)
+        self.assertIn('"Namespace Galaxy stale"', app)
+        self.assertIn('requestJson("/api/core-health", { timeoutMs: 3000 })', app)
+        self.assertIn('maintenance ? "MAINTENANCE" : ready ? "READY" : "OFFLINE"', app)
+        self.assertIn('elements.sidebarStatus.textContent = "OPERATIONAL"', app)
+        self.assertIn('hasLastGood ? "STALE" : "OFFLINE"', app)
+        self.assertIn("CORE_HEALTH_VISIBLE_REFRESH_MS", app)
+        self.assertIn("state.coreHealth.latest?.backend_lane?.accepting_ordinary_operations === false", app)
+        self.assertIn('"Namespace Galaxy waiting"', app)
+        self.assertIn('"deepDoctorReportButton"', app)
+        self.assertIn("deep_integrity_scan: String(deepIntegrityScan)", app)
+        self.assertIn('include_suggestions: background ? "false" : "true"', app)
+        self.assertIn('include_density_metrics: background ? "false" : "true"', app)
+        self.assertIn("galaxy.requestPending", app)
+        self.assertIn("DOCTOR_REQUEST_TIMEOUT_MS = 20000", app)
+        self.assertIn("timeoutMs: DOCTOR_REQUEST_TIMEOUT_MS", app)
+        self.assertIn("governedPairs", app)
+        self.assertIn("Deep integrity scan started", app)
+        self.assertIn('id="deepDoctorReportButton"', index)
+        mutation_start = app.index("async function requestJson")
+        mutation_end = app.index("function newCaptureId", mutation_start)
+        request_helper = app[mutation_start:mutation_end]
+        self.assertIn("readOnly &&", request_helper)
+        self.assertNotIn("controller = new window.AbortController()", request_helper)
 
     def test_namespace_galaxy_assets_explain_weighted_visual_mass(self):
         root = Path(__file__).resolve().parents[1]

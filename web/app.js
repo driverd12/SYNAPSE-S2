@@ -18,6 +18,12 @@ const NAMESPACE_DETAIL_NEURON_ZOOM = 1.42;
 const NAMESPACE_GALAXY_CONTEXT_PARAM = "galaxy_context";
 const NAMESPACE_GALAXY_CLUSTER_PARAM = "galaxy_cluster";
 const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
+const READ_REQUEST_TIMEOUT_MS = 10000;
+const DOCTOR_REQUEST_TIMEOUT_MS = 20000;
+const NAMESPACE_GALAXY_VISIBLE_REFRESH_MS = 30000;
+const NAMESPACE_GALAXY_HIDDEN_REFRESH_MS = 120000;
+const CORE_HEALTH_VISIBLE_REFRESH_MS = 5000;
+const CORE_HEALTH_HIDDEN_REFRESH_MS = 30000;
 
 function loadDashboardSessionCapability() {
   const rawFragment = window.location.hash.startsWith("#")
@@ -412,6 +418,12 @@ const state = {
     || new URLSearchParams(window.location.search).get("context_id")
   )?.trim() || DEFAULT_CONTEXT,
   snapshot: null,
+  coreHealth: {
+    refreshPending: false,
+    refreshTimer: null,
+    lastSuccessfulRefreshAt: 0,
+    latest: null,
+  },
   lastQueryPayload: null,
   recallRequestGeneration: 0,
   neuralInspector: false,
@@ -454,6 +466,10 @@ const state = {
     requestToken: 0,
     navigationToken: 0,
     pendingUrlRestore: Boolean(new URLSearchParams(window.location.search).get(NAMESPACE_GALAXY_CONTEXT_PARAM)),
+    backgroundRefreshPending: false,
+    requestPending: false,
+    backgroundRefreshTimer: null,
+    lastSuccessfulRefreshAt: 0,
     framePending: false,
     resizeObserver: null,
     reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false,
@@ -557,6 +573,7 @@ const elements = collectElements([
   "cortexWarnings",
   "cortexWorkingMemory",
   "doctorReportButton",
+  "deepDoctorReportButton",
   "doctorReportOutput",
   "captureForm",
   "captureInboxButton",
@@ -771,7 +788,11 @@ function apiUrl(path, params = {}) {
   return url;
 }
 
-async function requestJson(path, { method = "GET", params = {}, body = null } = {}) {
+async function requestJson(
+  path,
+  { method = "GET", params = {}, body = null, timeoutMs = READ_REQUEST_TIMEOUT_MS } = {},
+) {
+  const normalizedMethod = String(method || "GET").toUpperCase();
   const headers = {};
   if (dashboardSessionCapability) {
     headers[DASHBOARD_SESSION_HEADER_NAME] = dashboardSessionCapability;
@@ -779,12 +800,32 @@ async function requestJson(path, { method = "GET", params = {}, body = null } = 
   if (body) {
     headers["Content-Type"] = "application/json";
   }
-  const response = await fetch(apiUrl(path, params), {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const payload = await response.json();
+  const readOnly = normalizedMethod === "GET";
+  const controller = readOnly && typeof window.AbortController === "function"
+    ? new window.AbortController()
+    : null;
+  const boundedTimeoutMs = Math.max(1000, Number(timeoutMs) || READ_REQUEST_TIMEOUT_MS);
+  const timeout = controller
+    ? window.setTimeout(() => controller.abort(), boundedTimeoutMs)
+    : null;
+  let response;
+  let payload;
+  try {
+    response = await fetch(apiUrl(path, params), {
+      method: normalizedMethod,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller?.signal,
+    });
+    payload = await response.json();
+  } catch (error) {
+    if (readOnly && error?.name === "AbortError") {
+      throw new Error(`Read timed out after ${Math.round(boundedTimeoutMs / 1000)}s; last good data retained.`);
+    }
+    throw error;
+  } finally {
+    if (timeout !== null) window.clearTimeout(timeout);
+  }
   if (!response.ok) {
     const reconciliation = payload?.reconciliation;
     const handle = reconciliation && typeof reconciliation === "object"
@@ -800,6 +841,93 @@ async function requestJson(path, { method = "GET", params = {}, body = null } = 
     throw error;
   }
   return payload;
+}
+
+function renderCoreHealth(health) {
+  const operationalState = String(health?.operational_state || "unavailable").toLowerCase();
+  const lane = health?.backend_lane && typeof health.backend_lane === "object"
+    ? health.backend_lane
+    : {};
+  const maintenance = operationalState === "maintenance" || Boolean(lane.maintenance);
+  const ready = Boolean(health?.ready);
+  const label = maintenance ? "MAINTENANCE" : ready ? "READY" : "OFFLINE";
+  const owner = String(lane.owner || "").trim();
+  const ageSeconds = Number.isFinite(Number(lane.active_age_ms))
+    ? Math.max(0, Math.round(Number(lane.active_age_ms) / 1000))
+    : null;
+  const deadlineSeconds = Number.isFinite(Number(lane.deadline_remaining_ms))
+    ? Math.max(0, Math.round(Number(lane.deadline_remaining_ms) / 1000))
+    : null;
+  const blocker = String(lane.blocker || health?.authority?.blocker || "").trim();
+  const detail = owner
+    ? [
+        owner,
+        ageSeconds === null ? "" : `${ageSeconds}s elapsed`,
+        deadlineSeconds === null ? "" : `${deadlineSeconds}s remaining`,
+        blocker,
+      ].filter(Boolean).join(" · ")
+    : ready
+      ? "Authoritative core is accepting work"
+      : blocker || "Authoritative core is unavailable";
+
+  elements.headerRuntime.textContent = label;
+  elements.headerRuntime.title = detail;
+  if (maintenance) {
+    elements.sidebarStatus.textContent = "MAINTENANCE";
+  } else if (ready) {
+    elements.sidebarStatus.textContent = "OPERATIONAL";
+  } else if (!ready) {
+    elements.sidebarStatus.textContent = "OFFLINE";
+  }
+}
+
+async function refreshCoreHealth({ background = false } = {}) {
+  const coreHealth = state.coreHealth;
+  if (background && coreHealth.refreshPending) return null;
+  if (background) coreHealth.refreshPending = true;
+  try {
+    const health = await requestJson("/api/core-health", { timeoutMs: 3000 });
+    coreHealth.lastSuccessfulRefreshAt = Date.now();
+    coreHealth.latest = health;
+    renderCoreHealth(health);
+    return health;
+  } catch (error) {
+    const hasLastGood = Boolean(
+      coreHealth.latest && coreHealth.lastSuccessfulRefreshAt
+    );
+    const ageSeconds = hasLastGood
+      ? Math.max(
+          0,
+          Math.round((Date.now() - coreHealth.lastSuccessfulRefreshAt) / 1000),
+        )
+      : null;
+    elements.headerRuntime.textContent = hasLastGood ? "STALE" : "OFFLINE";
+    elements.sidebarStatus.textContent = hasLastGood ? "STALE" : "OFFLINE";
+    elements.headerRuntime.title = [
+      error.message || "Core health check failed",
+      ageSeconds === null ? "no live health response" : `last confirmed ${ageSeconds}s ago`,
+      "last dashboard data retained",
+    ].join("; ");
+    return null;
+  } finally {
+    if (background) coreHealth.refreshPending = false;
+  }
+}
+
+function scheduleCoreHealthRefresh({ immediate = false } = {}) {
+  const coreHealth = state.coreHealth;
+  if (coreHealth.refreshTimer !== null) {
+    window.clearTimeout(coreHealth.refreshTimer);
+  }
+  const hidden = document.visibilityState === "hidden";
+  const delay = immediate ? 0 : (
+    hidden ? CORE_HEALTH_HIDDEN_REFRESH_MS : CORE_HEALTH_VISIBLE_REFRESH_MS
+  );
+  coreHealth.refreshTimer = window.setTimeout(async () => {
+    coreHealth.refreshTimer = null;
+    await refreshCoreHealth({ background: true });
+    scheduleCoreHealthRefresh();
+  }, delay);
 }
 
 function newCaptureId() {
@@ -924,6 +1052,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   elements.uptimeLabel.textContent = formatDuration(system.uptime_seconds);
   elements.coreVersion.textContent = system.project_version ? `v${system.project_version}` : "local";
   elements.sidebarStatus.textContent = runtimeReady ? "OPERATIONAL" : "DISABLED";
+  if (state.coreHealth.latest) renderCoreHealth(state.coreHealth.latest);
   elements.memoryDbLabel.textContent = compactPath(status.memory_db_path || graph.memory_db_path || "pending");
 
   elements.engineState.textContent = status.mlx_available ? "ACTIVE" : "UNAVAILABLE";
@@ -1232,8 +1361,26 @@ function initializeNamespaceGalaxy() {
   updateNamespaceGalaxyChrome();
 }
 
-async function refreshNamespaceGalaxy() {
+async function refreshNamespaceGalaxy({ background = false } = {}) {
+  const galaxy = state.namespaceGalaxy;
+  if (background && (galaxy.backgroundRefreshPending || galaxy.requestPending)) {
+    return null;
+  }
+  if (
+    background
+    && state.coreHealth.latest
+    && state.coreHealth.latest?.backend_lane?.accepting_ordinary_operations === false
+  ) {
+    setNamespaceGalaxyState(
+      "warning",
+      "Namespace Galaxy waiting",
+      "The core is busy with a governed operation; the last good map remains visible.",
+    );
+    return null;
+  }
+  if (background) galaxy.backgroundRefreshPending = true;
   const requestToken = ++state.namespaceGalaxy.requestToken;
+  galaxy.requestPending = true;
   const contextId = state.context;
   const hasData = state.namespaceGalaxy.data.nodes.length > 0;
   if (!hasData) {
@@ -1241,11 +1388,46 @@ async function refreshNamespaceGalaxy() {
   }
   try {
     const payload = await requestJson("/api/namespace-map", {
-      params: { context_id: contextId, limit: 2000 },
+      params: {
+        context_id: contextId,
+        limit: 2000,
+        include_suggestions: background ? "false" : "true",
+        include_density_metrics: background ? "false" : "true",
+      },
+      timeoutMs: background ? 5000 : READ_REQUEST_TIMEOUT_MS,
     });
     if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
     const data = normalizeNamespaceMap(payload);
+    if (background) {
+      const priorNodes = new Map(
+        galaxy.data.nodes.map((node) => [node.contextId, node]),
+      );
+      data.nodes = data.nodes.map((node) => ({
+        ...node,
+        surfaceTermCount: node.surfaceTermCount
+          ?? priorNodes.get(node.contextId)?.surfaceTermCount
+          ?? null,
+      }));
+      data.nodes = applyNamespaceGalaxyMetrics(data.nodes, data.links);
+      const liveNodeIds = new Set(data.nodes.map((node) => node.contextId));
+      const governedPairs = new Set(
+        [...data.links, ...data.proposals].map((item) => (
+          [item.sourceContextId, item.targetContextId].sort().join("\u001f")
+        )),
+      );
+      data.suggestions = galaxy.data.suggestions.filter((item) => (
+        liveNodeIds.has(item.sourceContextId)
+        && liveNodeIds.has(item.targetContextId)
+        && !governedPairs.has(
+          [item.sourceContextId, item.targetContextId].sort().join("\u001f"),
+        )
+      ));
+      data.stats = { ...data.stats, suggestion_count: data.suggestions.length };
+    }
     renderNamespaceGalaxy(data);
+    galaxy.lastSuccessfulRefreshAt = Date.now();
+    elements.namespaceGalaxyCanvas.title = "Namespace map is current as of "
+      + new Date(galaxy.lastSuccessfulRefreshAt).toLocaleTimeString();
     if (data.nodes.length && state.namespaceGalaxy.view === "galaxy") {
       setNamespaceGalaxyState("ready", "Namespace Galaxy ready", "");
     } else if (state.namespaceGalaxy.view === "galaxy") {
@@ -1258,6 +1440,20 @@ async function refreshNamespaceGalaxy() {
     return data;
   } catch (error) {
     if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
+    if (background && galaxy.data.nodes.length) {
+      const ageSeconds = galaxy.lastSuccessfulRefreshAt
+        ? Math.max(0, Math.round((Date.now() - galaxy.lastSuccessfulRefreshAt) / 1000))
+        : null;
+      setNamespaceGalaxyState(
+        "warning",
+        "Namespace Galaxy stale",
+        ageSeconds === null
+          ? "Automatic refresh failed; the last good map remains visible."
+          : `Automatic refresh failed; showing the last good map from ${ageSeconds}s ago.`,
+      );
+      elements.namespaceGalaxyCanvas.title = error.message || "Automatic namespace refresh failed";
+      return null;
+    }
     const fallback = namespaceMapFallbackFromSnapshot();
     if (fallback.nodes.length) {
       renderNamespaceGalaxy(fallback);
@@ -1274,7 +1470,28 @@ async function refreshNamespaceGalaxy() {
     }
     logOperation("Namespace Galaxy refresh failed", error.message);
     return fallback;
+  } finally {
+    if (background) galaxy.backgroundRefreshPending = false;
+    if (requestToken === galaxy.requestToken) galaxy.requestPending = false;
   }
+}
+
+function scheduleNamespaceGalaxyRefresh({ immediate = false } = {}) {
+  const galaxy = state.namespaceGalaxy;
+  if (galaxy.backgroundRefreshTimer !== null) {
+    window.clearTimeout(galaxy.backgroundRefreshTimer);
+  }
+  const hidden = document.visibilityState === "hidden";
+  const delay = immediate ? 0 : (
+    hidden ? NAMESPACE_GALAXY_HIDDEN_REFRESH_MS : NAMESPACE_GALAXY_VISIBLE_REFRESH_MS
+  );
+  galaxy.backgroundRefreshTimer = window.setTimeout(async () => {
+    galaxy.backgroundRefreshTimer = null;
+    if (document.visibilityState !== "hidden") {
+      await refreshNamespaceGalaxy({ background: true });
+    }
+    scheduleNamespaceGalaxyRefresh();
+  }, delay);
 }
 
 async function enterNamespaceGalaxy(contextId, { pushHistory = false, clusterId = "" } = {}) {
@@ -4145,15 +4362,20 @@ function runContextHealth(button) {
   });
 }
 
-function runDoctorReport(button) {
-  return withBusy(button, "Doctor / Repair", async () => {
-    elements.doctorReportOutput.textContent = "Running Doctor...";
+function runDoctorReport(button, { deepIntegrityScan = false } = {}) {
+  const actionLabel = deepIntegrityScan ? "Deep integrity scan" : "Quick Doctor";
+  return withBusy(button, actionLabel, async () => {
+    elements.doctorReportOutput.textContent = deepIntegrityScan
+      ? "Starting governed deep integrity scan..."
+      : "Running quick Doctor...";
     const payload = await requestJson("/api/doctor", {
       params: {
         context_id: state.context,
         include_apps: "true",
         repair_plan: "true",
+        deep_integrity_scan: String(deepIntegrityScan),
       },
+      timeoutMs: DOCTOR_REQUEST_TIMEOUT_MS,
     });
     renderDoctorReport(payload);
     return payload;
@@ -4351,6 +4573,17 @@ function renderContextHealth(payload) {
 }
 
 function renderDoctorReport(payload) {
+  const semanticAudit = payload?.semantic_audit && typeof payload.semantic_audit === "object"
+    ? payload.semantic_audit
+    : {};
+  if (semanticAudit.audit_pending === true) {
+    elements.doctorReportOutput.innerHTML = `
+      <strong>Deep integrity scan started</strong>
+      <small>The global semantic audit is running in the governed maintenance lane.</small>
+      <p>Watch the runtime header move from MAINTENANCE to READY, then run Quick Doctor for the completed result.</p>
+    `;
+    return;
+  }
   const status = String(payload.overall_status || "degraded");
   const checks = payload.checks || [];
   const failures = checks.filter((check) => check.status !== "ready");
@@ -6828,6 +7061,9 @@ elements.contextHealthButton.addEventListener("click", () => {
 elements.doctorReportButton.addEventListener("click", () => {
   runDoctorReport(elements.doctorReportButton);
 });
+elements.deepDoctorReportButton.addEventListener("click", () => {
+  runDoctorReport(elements.deepDoctorReportButton, { deepIntegrityScan: true });
+});
 
 elements.memoryHygieneButton.addEventListener("click", () => {
   runMemoryHygiene(elements.memoryHygieneButton);
@@ -7251,9 +7487,18 @@ elements.appSelectionCaptureButton.addEventListener("click", () => {
   captureSelectedAppText(elements.appSelectionCaptureButton);
 });
 
+document.addEventListener("visibilitychange", () => {
+  scheduleNamespaceGalaxyRefresh({ immediate: document.visibilityState !== "hidden" });
+  scheduleCoreHealthRefresh({ immediate: document.visibilityState !== "hidden" });
+});
+
 refreshSnapshot()
   .catch((error) => {
     logOperation("Initial load failed", error.message);
+  })
+  .finally(() => {
+    scheduleNamespaceGalaxyRefresh();
+    scheduleCoreHealthRefresh({ immediate: true });
   });
 
 refreshAppConnect({ detect: false })

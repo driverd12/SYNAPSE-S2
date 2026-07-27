@@ -97,6 +97,7 @@ TEST_CONTRACTS = {
         "register_text_trace",
         "register_trace",
         "query",
+        "commit_cortical_trace",
         "repair_semantic_indexes",
         "list_memory",
         "embedding_provider_info",
@@ -195,6 +196,14 @@ class FakeBackend:
         try:
             self.mutation_count += 1
             return {"repaired": True, "arguments": arguments}
+        finally:
+            self._leave()
+
+    def commit_cortical_trace(self, **arguments: Any) -> dict[str, Any]:
+        self._enter()
+        try:
+            self.mutation_count += 1
+            return {"committed": True, "arguments": arguments}
         finally:
             self._leave()
 
@@ -347,6 +356,7 @@ class ServiceHarness:
                 "register_text_trace": backend.register_text_trace,
                 "register_trace": backend.register_trace,
                 "query": backend.query,
+                "commit_cortical_trace": backend.commit_cortical_trace,
                 "repair_semantic_indexes": backend.repair_semantic_indexes,
                 "list_memory": backend.list_memory,
                 "embedding_provider_info": backend.embedding_provider_info,
@@ -701,6 +711,66 @@ class CoreServiceTests(unittest.TestCase):
                 "repair_semantic_indexes",
                 {"confirm": False, "expected_revision": "a" * 64},
                 "req-invalid-mutation-confirmation",
+            ),
+            (
+                "commit_cortical_trace",
+                {
+                    "context_id": "demo",
+                    "agent_id": "codex",
+                    "session_id": "validation-session",
+                    "trace_type": "validation",
+                    "truth_posture": "test_validated",
+                    "text": "This claim lacks recognized validation evidence.",
+                    "evidence": {"source": "unit-test"},
+                    "confidence": 0.99,
+                },
+                "req-invalid-test-validated-evidence",
+            ),
+            (
+                "commit_cortical_trace",
+                {
+                    "context_id": "demo",
+                    "agent_id": "codex",
+                    "session_id": "validation-session",
+                    "trace_type": "validation",
+                    "truth_posture": "test-validated",
+                    "text": "Raw-content digest evidence is stripped before admission.",
+                    "evidence": {
+                        "output": {"raw_content_sha256": "a" * 64},
+                    },
+                    "confidence": 0.99,
+                },
+                "req-invalid-stripped-test-evidence",
+            ),
+            (
+                "commit_cortical_trace",
+                {
+                    "context_id": "demo",
+                    "agent_id": "codex",
+                    "session_id": "validation-session",
+                    "trace_type": "validation",
+                    "truth_posture": "test-validated",
+                    "text": "Secret-only output cannot become validation proof.",
+                    "evidence": {"output": "sk-proj-" + ("A" * 64)},
+                    "confidence": 0.99,
+                },
+                "req-invalid-redacted-test-evidence",
+            ),
+            (
+                "commit_cortical_trace",
+                {
+                    "context_id": "demo",
+                    "agent_id": "codex",
+                    "session_id": "validation-session",
+                    "trace_type": "validation",
+                    "truth_posture": "test-validated",
+                    "text": "A stripped raw digest is not validation proof.",
+                    "evidence": {
+                        "output": "raw_content_sha256: " + ("a" * 64)
+                    },
+                    "confidence": 0.99,
+                },
+                "req-invalid-removed-digest-test-evidence",
             ),
         )
         with mock.patch.object(

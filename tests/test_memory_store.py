@@ -627,7 +627,14 @@ class DurableMemoryStoreTests(unittest.TestCase):
                     6,
                 ),
             )
-            self.assertEqual(camera_suggestion["evidence"]["method"], "density-normalized-dice-v1")
+            self.assertEqual(
+                camera_suggestion["evidence"]["method"],
+                "density-normalized-dice-plus-containment-v2",
+            )
+            self.assertGreaterEqual(
+                camera_suggestion["relevance_score"],
+                camera_suggestion["dice_score"],
+            )
             self.assertEqual(camera_suggestion["delay_semantics"], "visualization-only")
             self.assertGreaterEqual(camera_suggestion["suggested_phase_delay_ticks"], 0)
             self.assertLessEqual(camera_suggestion["suggested_phase_delay_ticks"], 4)
@@ -640,6 +647,93 @@ class DurableMemoryStoreTests(unittest.TestCase):
                     """
                 ).fetchone()[0]
             self.assertEqual(table_exists, 1)
+
+    def test_context_link_suggestions_retain_sparse_to_dense_relevance(self):
+        with TemporaryDirectory() as tmp:
+            store = DurableMemoryStore(Path(tmp) / "synapse-memory.sqlite3")
+            shared = "casp rtp gopro camera stream discovery"
+            dense_terms = " ".join(f"casp_extra_{index:03d}" for index in range(220))
+            store.upsert_entry(
+                tag="ptzplz-bootstrap",
+                context_id="PTZPLZ",
+                source_text=shared,
+                metadata={},
+                embedding_dimensions=256,
+                spike_indices=[1, 2, 3, 4],
+                neuron_indices=[1, 2],
+            )
+            store.upsert_entry(
+                tag="casp-dense-operations",
+                context_id="CASP-Control-Room",
+                source_text=f"{shared} {dense_terms}",
+                metadata={},
+                embedding_dimensions=256,
+                spike_indices=list(range(1, 121)),
+                neuron_indices=[3, 4],
+            )
+            store.upsert_entry(
+                tag="unrelated-dense-operations",
+                context_id="Procurement",
+                source_text=f"camera {dense_terms.replace('casp_', 'procurement_')}",
+                metadata={},
+                embedding_dimensions=256,
+                spike_indices=list(range(120, 241)),
+                neuron_indices=[5, 6],
+            )
+
+            suggestions = store.suggest_context_links(
+                context_id="PTZPLZ",
+                min_score=0.05,
+                limit=10,
+            )
+            casp = next(
+                suggestion
+                for suggestion in suggestions
+                if "CASP-Control-Room"
+                in {
+                    suggestion["source_context_id"],
+                    suggestion["target_context_id"],
+                }
+            )
+
+            self.assertGreater(casp["surface_overlap_count"], 1)
+            self.assertTrue(casp["evidence"]["containment_lift_applied"])
+            self.assertGreater(casp["relevance_score"], casp["dice_score"])
+            self.assertGreaterEqual(casp["score"], 0.05)
+            self.assertFalse(
+                any(
+                    "Procurement"
+                    in {
+                        suggestion["source_context_id"],
+                        suggestion["target_context_id"],
+                    }
+                    for suggestion in suggestions
+                )
+            )
+            self.assertEqual(store.list_context_links(), [])
+
+    def test_spike_containment_requires_semantic_surface_corroboration(self):
+        with TemporaryDirectory() as tmp:
+            store = DurableMemoryStore(Path(tmp) / "synapse-memory.sqlite3")
+            similarity = store._build_context_similarity(
+                source_context_id="Sparse-Spikes",
+                target_context_id="Dense-Spikes",
+                profiles={
+                    "Sparse-Spikes": {
+                        "surface_terms": set(),
+                        "spike_indices": set(range(256)),
+                    },
+                    "Dense-Spikes": {
+                        "surface_terms": set(),
+                        "spike_indices": set(range(8192)),
+                    },
+                },
+                max_phase_delay_ticks=4,
+            )
+
+            self.assertGreater(similarity["dice_score"], 0.05)
+            self.assertEqual(similarity["score"], 0.0)
+            self.assertFalse(similarity["evidence"]["containment_lift_applied"])
 
     def test_approved_context_links_enable_only_one_hop_connected_recall(self):
         with TemporaryDirectory() as tmp:
@@ -766,6 +860,8 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 memory_id=entry["memory_id"],
             )
             summaries = store.list_context_summaries()
+            lightweight = store.list_context_summaries_lightweight()
+            context_count = store.count_contexts()
             stats = store.stats()
 
             catalogued = next(
@@ -776,6 +872,50 @@ class DurableMemoryStoreTests(unittest.TestCase):
             self.assertEqual(catalogued["entry_count"], 0)
             self.assertGreater(catalogued["last_activity_at"], 0.0)
             self.assertEqual(stats["contexts"]["durable-empty-namespace"], 0)
+            self.assertEqual(context_count, len(summaries))
+            self.assertEqual(
+                [item["context_id"] for item in lightweight],
+                [item["context_id"] for item in summaries],
+            )
+            self.assertNotIn("surface_term_count", lightweight[0])
+            self.assertFalse(lightweight[0]["derived_density_metrics_included"])
+
+    def test_enabled_link_limit_is_applied_after_expiry_filtering(self):
+        with TemporaryDirectory() as tmp:
+            store = DurableMemoryStore(Path(tmp) / "synapse-memory.sqlite3")
+            for index in range(260):
+                store.upsert_context_link(
+                    source_context_id="hub",
+                    target_context_id=f"expired-{index:03d}",
+                    relation_type="related",
+                    confidence=0.99,
+                    evidence={
+                        "governance": {
+                            "state": "approved",
+                            "link_expires_at": 1.0,
+                        }
+                    },
+                    approved_by="unit-test",
+                )
+            live = store.upsert_context_link(
+                source_context_id="hub",
+                target_context_id="zz-live",
+                relation_type="related",
+                confidence=0.1,
+                evidence={"source": "legacy-approved-link"},
+                approved_by="unit-test",
+            )
+
+            links = store.list_context_links(
+                context_id="hub",
+                enabled_only=True,
+                limit=1,
+            )
+
+        self.assertEqual(
+            [item["context_link_id"] for item in links],
+            [live["context_link_id"]],
+        )
 
     def test_context_bus_events_are_persisted_listed_and_exported(self):
         with TemporaryDirectory() as tmp:

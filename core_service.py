@@ -72,6 +72,10 @@ from core_runtime_paths import (
     supported_core_socket_path,
     validate_core_socket_path,
 )
+from cortex_contract import (
+    canonicalize_validation_evidence,
+    has_concrete_validation_evidence,
+)
 from memory_store import ContextDeliveryRejected, LOGICAL_SNAPSHOT_DIGEST_SCHEMA
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
@@ -606,7 +610,8 @@ _CONTRACT_LIST = (
     ),
     _contract(
         "list_namespace_map",
-        "context_id limit include_suggestions suggestion_limit min_suggestion_score "
+        "context_id limit include_suggestions include_density_metrics "
+        "suggestion_limit min_suggestion_score "
         "max_visual_phase_delay_ticks",
         retry_safe=True,
     ),
@@ -1640,6 +1645,21 @@ def _validate_mutation_arguments(
         if arguments.get("acknowledge") is True:
             raise CoreProtocolError()
         if arguments.get("claim_events", True) and arguments.get("since_event_id") is not None:
+            raise CoreProtocolError()
+    if operation == "commit_cortical_trace":
+        truth_posture = (
+            str(arguments.get("truth_posture") or "observed")
+            .strip()
+            .lower()
+            .replace("_", "-")
+        )
+        evidence = canonicalize_validation_evidence(arguments.get("evidence") or {})
+        if truth_posture == "test-validated" and not has_concrete_validation_evidence(
+            evidence
+        ):
+            # Reject deterministic no-effect evidence errors before request
+            # journal admission. Once a mutation is accepted, clients must
+            # treat a lost response as ambiguous and may not blindly retry it.
             raise CoreProtocolError()
     if operation == "moderate_cortex_trace":
         action = str(arguments.get("action") or "").strip().lower().replace("-", "_")

@@ -256,6 +256,12 @@ Doctor and repair report:
   --repair-plan
 ```
 
+In the dashboard, use **Quick Doctor** for the daily path. Use **Deep integrity
+scan** when the semantic-index audit is stale, after an interrupted/disk-full
+write, or before a formal readiness ceremony. The header remains live and shows
+governed maintenance while the deep scan runs; the last good Namespace Galaxy
+stays visible instead of being replaced by an empty fallback.
+
 Memory Hygiene queue:
 
 ```bash

@@ -174,6 +174,26 @@ def _hydration_payload(event_ids: Iterable[int] = (1, 2)) -> dict[str, Any]:
         },
         "graph_entries": [_graph_node(1)],
         "graph_relationships": [],
+        "namespace_connectivity": {
+            "scope": "local-authoritative-store",
+            "local_namespace_count": 3,
+            "bridge_record_limit": 100,
+            "active_bridge_records_returned": 1,
+            "incident_bridge_records_returned": 2,
+            "inbound_only_bridge_records_returned": 1,
+            "bridge_records_truncated": False,
+            "connected_context_count_lower_bound": 1,
+            "connected_context_ids": ["CASP-Control-Room"],
+            "connected_context_ids_truncated": False,
+            "pending_proposals_returned": 1,
+            "pending_proposal_records_truncated": False,
+            "pending_context_count_lower_bound": 1,
+            "pending_context_ids": ["PTZPLZ"],
+            "pending_context_ids_truncated": False,
+            "suggestion_evaluation": "on-demand-namespace-map",
+            "automatic_cross_namespace_write": False,
+            "multi_mac_live_sync": False,
+        },
         "cortex_state": {
             "context_id": "default",
             "agent_id": "contract-test-agent",
@@ -959,6 +979,98 @@ def test_agent_hydration_preserves_an_exact_receipt_to_event_mapping() -> None:
     assert response["data"]["event_window"]["returned"] == 2
     assert response["pagination"]["returned"] == 2
     assert response["completeness"]["event_delivery_exact"] is True
+
+
+def test_compact_hydration_distinguishes_namespace_bridges_from_graph_edges() -> None:
+    response = project_response(
+        "agent-hydration",
+        _hydration_payload(()),
+        max_response_bytes=8 * 1024,
+    )
+    connectivity = response["data"]["namespace_connectivity"]
+
+    assert connectivity == {
+        "scope": "local-authoritative-store",
+        "local_namespace_count": 3,
+        "bridge_record_limit": 100,
+        "active_bridge_records_returned": 1,
+        "incident_bridge_records_returned": 2,
+        "inbound_only_bridge_records_returned": 1,
+        "bridge_records_truncated": False,
+        "connected_context_count_lower_bound": 1,
+        "connected_context_ids_returned": 1,
+        "connected_context_ids": ["CASP-Control-Room"],
+        "connected_context_ids_truncated": False,
+        "pending_proposals_returned": 1,
+        "pending_proposal_records_truncated": False,
+        "pending_context_count_lower_bound": 1,
+        "pending_context_ids_returned": 1,
+        "pending_context_ids": ["PTZPLZ"],
+        "pending_context_ids_truncated": False,
+        "suggestion_evaluation": "on-demand-namespace-map",
+        "automatic_cross_namespace_write": False,
+        "multi_mac_live_sync": False,
+    }
+    assert response["data"]["graph"]["summary"]["relationship_count"] == 0
+
+
+def test_compact_hydration_bounds_namespace_ids_with_explicit_totals() -> None:
+    payload = _hydration_payload(())
+    context_ids = [f"connected-{index:02d}" for index in range(20)]
+    connectivity = payload["namespace_connectivity"]
+    connectivity.update(
+        connected_context_count_lower_bound=len(context_ids),
+        connected_context_ids=context_ids,
+        connected_context_ids_truncated=True,
+    )
+
+    response = project_response(
+        "agent-hydration",
+        payload,
+        max_response_bytes=8 * 1024,
+    )
+    projected = response["data"]["namespace_connectivity"]
+
+    assert projected["connected_context_count_lower_bound"] == 20
+    assert projected["connected_context_ids_returned"] == 8
+    assert projected["connected_context_ids"] == context_ids[:8]
+    assert projected["connected_context_ids_truncated"] is True
+    assert response["response_contract"]["omissions"]["connected_context_ids"] == 12
+
+
+def test_compact_hydration_preserves_upstream_connectivity_truncation() -> None:
+    payload = _hydration_payload(())
+    connectivity = payload["namespace_connectivity"]
+    connectivity.update(
+        bridge_records_truncated=True,
+        connected_context_count_lower_bound=1,
+        connected_context_ids=["one-known-neighbor"],
+        connected_context_ids_truncated=True,
+    )
+
+    response = project_response(
+        "agent-hydration",
+        payload,
+        max_response_bytes=8 * 1024,
+    )
+    projected = response["data"]["namespace_connectivity"]
+
+    assert projected["connected_context_ids_returned"] == 1
+    assert projected["connected_context_ids_truncated"] is True
+
+
+def test_hydration_rejects_claimed_automatic_cross_namespace_behavior() -> None:
+    for field in ("automatic_cross_namespace_write", "multi_mac_live_sync"):
+        for mode in ("compact", "full"):
+            payload = _hydration_payload(())
+            payload["namespace_connectivity"][field] = True
+            with _raises(ResponseContractError, match=field):
+                project_response(
+                    "agent-hydration",
+                    payload,
+                    mode=mode,
+                    max_response_bytes=128 * 1024,
+                )
 
 
 def test_agent_hydration_rejects_missing_duplicate_or_non_bijective_receipts() -> None:
