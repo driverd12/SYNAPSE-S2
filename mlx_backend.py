@@ -234,6 +234,7 @@ NAMESPACE_DETAIL_RELATIONSHIP_SCAN_LIMIT = 20_000
 NAMESPACE_DETAIL_MAX_RETURNED_NODES = 500
 NAMESPACE_DETAIL_MAX_RETURNED_CLUSTERS = 500
 NAMESPACE_DETAIL_MAX_RETURNED_EDGES = 2_000
+NAMESPACE_DETAIL_RESPONSE_MAX_BYTES = 768 * 1024
 
 
 class BackendUnavailable(RuntimeError):
@@ -9533,6 +9534,9 @@ class SpikingAttentionBackend:
             context_id=context,
             entry_scan_limit=NAMESPACE_DETAIL_ENTRY_SCAN_LIMIT,
             relationship_scan_limit=NAMESPACE_DETAIL_RELATIONSHIP_SCAN_LIMIT,
+            include_source_text=normalized_level == "neurons",
+            include_relationship_evidence=normalized_level == "neurons",
+            include_node_metadata=normalized_level == "neurons",
         )
         entries = sorted(
             (dict(entry) for entry in snapshot["entries"]),
@@ -9603,7 +9607,6 @@ class SpikingAttentionBackend:
                 dict(cluster)
                 for cluster in eligible_clusters[:bounded_limit]
             ]
-            nodes = [dict(cluster) for cluster in returned_clusters]
             eligible_cluster_ids = {
                 str(cluster["cluster_id"])
                 for cluster in eligible_clusters
@@ -9634,7 +9637,11 @@ class SpikingAttentionBackend:
                 int(edge["stored_relationship_count"])
                 for edge in edges
             )
-            eligible_node_total = eligible_cluster_total
+            # Ganglia have their own first-class collection. Do not duplicate
+            # them into ``nodes``; the browser ignores those copies and they can
+            # otherwise displace aggregate relationship evidence under the
+            # response byte budget.
+            eligible_node_total = 0
         else:
             eligible_entries = [
                 entry
@@ -9776,7 +9783,7 @@ class SpikingAttentionBackend:
                 "rendered_edges": "edge_id ascending",
             },
         }
-        return {
+        payload = {
             "action": "namespace-detail",
             "read_only": True,
             "automatic_cross_namespace_write": False,
@@ -9798,6 +9805,75 @@ class SpikingAttentionBackend:
             "edges": edges,
             "memory_db_path": str(self.memory_store.db_path),
         }
+        return self._bound_namespace_detail_payload(payload)
+
+    def _bound_namespace_detail_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep one detail result safely below the authoritative-core frame."""
+        bounded = dict(payload)
+        bounded["clusters"] = list(payload.get("clusters", []))
+        bounded["nodes"] = list(payload.get("nodes", []))
+        bounded["edges"] = list(payload.get("edges", []))
+        counts = dict(payload.get("counts", {}))
+        truncation = dict(payload.get("truncation", {}))
+        bounded["counts"] = counts
+        bounded["truncation"] = truncation
+        bounded["response_bytes"] = 0
+        truncation["response_byte_limit"] = NAMESPACE_DETAIL_RESPONSE_MAX_BYTES
+
+        def encoded_size() -> int:
+            return len(
+                json.dumps(
+                    bounded,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            )
+
+        def publish_encoded_size() -> int:
+            while True:
+                size = encoded_size()
+                if bounded["response_bytes"] == size:
+                    return size
+                bounded["response_bytes"] = size
+
+        trimmed_for_bytes = False
+        while True:
+            for name in ("nodes", "edges", "clusters"):
+                returned = len(bounded[name])
+                counts[f"returned_{name}"] = returned
+                detail = dict(truncation.get(name, {}))
+                detail["returned"] = returned
+                detail["truncated"] = int(detail.get("total", returned)) > returned
+                truncation[name] = detail
+            counts["raw_relationships_supporting_returned_edges"] = sum(
+                int(edge.get("stored_relationship_count", 1))
+                for edge in bounded["edges"]
+                if isinstance(edge, dict)
+            )
+            truncation["response_trimmed_for_bytes"] = trimmed_for_bytes
+            if trimmed_for_bytes:
+                truncation["truncated"] = True
+            if publish_encoded_size() <= NAMESPACE_DETAIL_RESPONSE_MAX_BYTES:
+                break
+            candidates = [
+                name
+                for name in ("edges", "nodes", "clusters")
+                if bounded[name]
+            ]
+            if not candidates:
+                raise ValueError("namespace detail metadata exceeds byte budget")
+            # Preserve the semantic hierarchy: trim exact edges before memory
+            # nodes, and memory nodes before the ganglion catalog they refer to.
+            selected = candidates[0]
+            rows = bounded[selected]
+            bounded[selected] = rows[: max(0, len(rows) // 2)]
+            trimmed_for_bytes = True
+        return bounded
 
     def _namespace_detail_clusters(
         self,

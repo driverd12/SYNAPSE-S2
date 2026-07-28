@@ -19,6 +19,7 @@ const NAMESPACE_GALAXY_CONTEXT_PARAM = "galaxy_context";
 const NAMESPACE_GALAXY_CLUSTER_PARAM = "galaxy_cluster";
 const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
 const READ_REQUEST_TIMEOUT_MS = 10000;
+const NAMESPACE_DETAIL_REQUEST_TIMEOUT_MS = 30000;
 const DOCTOR_REQUEST_TIMEOUT_MS = 20000;
 const NAMESPACE_GALAXY_VISIBLE_REFRESH_MS = 30000;
 const NAMESPACE_GALAXY_HIDDEN_REFRESH_MS = 120000;
@@ -1371,10 +1372,14 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
     && state.coreHealth.latest
     && state.coreHealth.latest?.backend_lane?.accepting_ordinary_operations === false
   ) {
+    const laneOwner = String(state.coreHealth.latest?.backend_lane?.owner || "").trim();
+    const waitingDetail = laneOwner === "rpc"
+      ? "The core is finishing another request; the last good map remains visible."
+      : "The core is busy with governed maintenance; the last good map remains visible.";
     setNamespaceGalaxyState(
       "warning",
       "Namespace Galaxy waiting",
-      "The core is busy with a governed operation; the last good map remains visible.",
+      waitingDetail,
     );
     return null;
   }
@@ -1510,7 +1515,7 @@ async function enterNamespaceGalaxy(contextId, { pushHistory = false, clusterId 
   galaxy.pan = { x: 0, y: 0 };
   galaxy.zoom = 1;
   updateNamespaceGalaxyChrome();
-  setNamespaceGalaxyState("loading", `Opening ${nextContextId}`, "Reading stored ganglia, neurons, and relationships.");
+  setNamespaceGalaxyState("loading", `Opening ${nextContextId}`, "Reading stored ganglia and aggregate relationships.");
   if (pushHistory) updateNamespaceGalaxyUrl({ contextId: nextContextId, push: true });
   if (state.context !== nextContextId) {
     await applySelectedContext(nextContextId, elements.contextApply);
@@ -1532,36 +1537,23 @@ async function refreshNamespaceDetail({ contextId, clusterId = "" } = {}) {
   const nextClusterId = String(clusterId || "").trim();
   const requestToken = ++galaxy.detailRequestToken;
   try {
-    const neuronRequest = requestJson("/api/namespace-detail", {
+    const payload = await requestJson("/api/namespace-detail", {
       params: {
         context_id: nextContextId,
-        level: "neurons",
+        level: nextClusterId ? "neurons" : "ganglion",
         ...(nextClusterId ? { cluster_id: nextClusterId } : {}),
         limit: NAMESPACE_DETAIL_LIMIT,
       },
+      timeoutMs: NAMESPACE_DETAIL_REQUEST_TIMEOUT_MS,
     });
-    const ganglionRequest = nextClusterId
-      ? Promise.resolve(null)
-      : requestJson("/api/namespace-detail", {
-        params: {
-          context_id: nextContextId,
-          level: "ganglion",
-          limit: NAMESPACE_DETAIL_LIMIT,
-        },
-      }).catch((error) => {
-        logOperation("Namespace ganglion aggregate unavailable", error.message);
-        return null;
-      });
-    const [payload, ganglionPayload] = await Promise.all([neuronRequest, ganglionRequest]);
     if (requestToken !== galaxy.detailRequestToken || galaxy.view !== "namespace") return null;
     if (nextContextId !== galaxy.detailContextId) return null;
     if (nextClusterId !== galaxy.focusedClusterId) return null;
     const detail = normalizeNamespaceDetail(payload);
-    if (ganglionPayload) {
-      const ganglionDetail = normalizeNamespaceDetail(ganglionPayload);
-      detail.aggregateEdges = ganglionDetail.edges;
-      detail.aggregateCounts = ganglionDetail.counts;
-      detail.aggregateTruncation = ganglionDetail.truncation;
+    if (!nextClusterId) {
+      detail.aggregateEdges = detail.edges;
+      detail.aggregateCounts = detail.counts;
+      detail.aggregateTruncation = detail.truncation;
       detail.aggregateAvailable = true;
     }
     if (nextClusterId) {
@@ -1574,7 +1566,8 @@ async function refreshNamespaceDetail({ contextId, clusterId = "" } = {}) {
     galaxy.detailMetricsCache = null;
     renderNamespaceDetail();
     if (detail.empty || (!detail.clusters.length && !detail.nodes.length)) {
-      setNamespaceGalaxyState("empty", `${nextContextId} has no stored neurons`, "This read-only namespace has no graph detail to display yet.");
+      const emptyLayer = nextClusterId ? "neurons" : "ganglia";
+      setNamespaceGalaxyState("empty", `${nextContextId} has no stored ${emptyLayer}`, "This read-only namespace has no graph detail to display yet.");
     } else {
       setNamespaceGalaxyState("ready", `${nextContextId} detail ready`, "");
     }
@@ -1869,6 +1862,11 @@ async function focusNamespaceGanglion(clusterId, { pushHistory = false } = {}) {
   if (galaxy.view !== "namespace" || !nextClusterId) return null;
   const cluster = combinedNamespaceDetail()?.clusters.find((item) => item.clusterId === nextClusterId);
   if (!cluster) return null;
+  if (galaxy.focusedClusterId !== nextClusterId) {
+    galaxy.focusedDetail = null;
+    galaxy.detailMetricsCacheKey = "";
+    galaxy.detailMetricsCache = null;
+  }
   galaxy.focusedClusterId = nextClusterId;
   galaxy.detailSelection = cluster;
   galaxy.keyboardDetailId = cluster.id;
@@ -2549,7 +2547,15 @@ function stableNamespaceHash(value) {
 
 function currentNamespaceDetailLod() {
   if (state.namespaceGalaxy.zoom < NAMESPACE_DETAIL_GANGLION_ZOOM) return "cortex";
-  if (state.namespaceGalaxy.zoom < NAMESPACE_DETAIL_NEURON_ZOOM) return "ganglia";
+  if (
+    state.namespaceGalaxy.zoom < NAMESPACE_DETAIL_NEURON_ZOOM
+    || !state.namespaceGalaxy.focusedClusterId
+    || !state.namespaceGalaxy.focusedDetail
+    || state.namespaceGalaxy.focusedDetail.selectedClusterId
+      !== state.namespaceGalaxy.focusedClusterId
+  ) {
+    return "ganglia";
+  }
   return "neurons";
 }
 

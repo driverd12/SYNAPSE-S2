@@ -41,6 +41,7 @@ from core_runtime_paths import (
 
 SEMANTIC_INDEX_OPERATION_TIMEOUT_SECONDS = 120.0
 NEURAL_OPERATION_TIMEOUT_SECONDS = NEURAL_OPERATION_LANE_SECONDS
+NAMESPACE_DETAIL_OPERATION_TIMEOUT_SECONDS = 25.0
 RECOVERY_OPERATION_TIMEOUT_SECONDS = (
     RECOVERY_MAX_DEADLINE_HORIZON_MS / 1000.0
 )
@@ -593,7 +594,11 @@ class CoreClient:
         return self.call("list_namespace_map", arguments)
 
     def list_namespace_detail(self, **arguments: Any) -> dict[str, Any]:
-        return self.call("list_namespace_detail", arguments)
+        return self.call(
+            "list_namespace_detail",
+            arguments,
+            timeout_seconds=NAMESPACE_DETAIL_OPERATION_TIMEOUT_SECONDS,
+        )
 
     def list_memory_graph(self, **arguments: Any) -> dict[str, Any]:
         return self.call("list_memory_graph", arguments)

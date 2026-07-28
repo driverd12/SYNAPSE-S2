@@ -79,6 +79,43 @@ _RETRIEVAL_GENERATION_KEY_PREFIX = "retrieval_snapshot_generation.v1"
 _RETRIEVAL_GENERATION_MAX = 9_223_372_036_854_775_807
 NAMESPACE_CATALOG_SCHEMA = "synapse-s2.namespace-catalog.v1"
 NAMESPACE_CATALOG_METADATA_PREFIX = "namespace_catalog.v1:"
+_NAMESPACE_GRAPH_CLUSTER_METADATA_KEYS = frozenset(
+    {
+        "context_memory_type",
+        "event_segment",
+        "cortex_trace_type",
+        "context_namespace",
+        "context_namespace_title",
+        "display_label",
+        "context_label",
+        "semantic_facets",
+    }
+)
+_NAMESPACE_GRAPH_NODE_METADATA_KEYS = (
+    _NAMESPACE_GRAPH_CLUSTER_METADATA_KEYS
+    | frozenset(
+        {
+            "display_summary",
+            "detail_badges",
+            "source",
+            "source_tag",
+            "speaker",
+            "sequence_id",
+            "context_namespace_source",
+            "truth_posture",
+            "trace_type",
+        }
+    )
+)
+_NAMESPACE_GRAPH_EMBEDDING_PROVIDER_KEYS = frozenset(
+    {
+        "provider",
+        "provider_type",
+        "model_id",
+        "local_only",
+        "semantic",
+    }
+)
 
 
 BACKUP_RECEIPT_SCHEMA = "synapse-s2.memory-backup.v3"
@@ -9710,6 +9747,9 @@ class DurableMemoryStore:
         context_id: str,
         entry_scan_limit: int = 10_000,
         relationship_scan_limit: int = 20_000,
+        include_source_text: bool = True,
+        include_relationship_evidence: bool = True,
+        include_node_metadata: bool = True,
     ) -> dict[str, Any]:
         """Read a stable, context-isolated graph snapshot for UI drill-down.
 
@@ -9720,6 +9760,12 @@ class DurableMemoryStore:
         context = str(context_id or "").strip()
         if not context:
             raise ValueError("context_id is required")
+        if type(include_source_text) is not bool:
+            raise ValueError("include_source_text must be a boolean")
+        if type(include_relationship_evidence) is not bool:
+            raise ValueError("include_relationship_evidence must be a boolean")
+        if type(include_node_metadata) is not bool:
+            raise ValueError("include_node_metadata must be a boolean")
         bounded_entry_limit = min(max(int(entry_scan_limit), 1), 10_000)
         bounded_relationship_limit = min(
             max(int(relationship_scan_limit), 1),
@@ -9739,9 +9785,19 @@ class DurableMemoryStore:
                     """,
                     (context,),
                 ).fetchone()
+                entry_columns = """
+                    memory_id,
+                    tag,
+                    context_id,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                """
+                if include_source_text:
+                    entry_columns += ", source_text"
                 entry_rows = conn.execute(
-                    """
-                    SELECT *
+                    f"""
+                    SELECT {entry_columns}
                     FROM memory_entries
                     WHERE context_id = ?
                     ORDER BY memory_id
@@ -9770,10 +9826,21 @@ class DurableMemoryStore:
                         (context,),
                     ).fetchone()[0]
                 )
+                relationship_evidence_column = (
+                    ", r.evidence_json" if include_relationship_evidence else ""
+                )
                 relationship_rows = conn.execute(
-                    """
+                    f"""
                     SELECT
-                        r.*,
+                        r.relationship_id,
+                        r.context_id,
+                        r.source_memory_id,
+                        r.target_memory_id,
+                        r.relation_type,
+                        r.weight,
+                        r.created_at,
+                        r.updated_at
+                        {relationship_evidence_column},
                         source.tag AS source_tag,
                         target.tag AS target_tag
                     FROM memory_relationships AS r
@@ -9801,9 +9868,19 @@ class DurableMemoryStore:
                 "last_updated_at": float(
                     entry_stats["last_updated_at"] if entry_stats else 0.0
                 ),
-                "entries": [self._row_to_entry(row) for row in entry_rows],
+                "entries": [
+                    self._row_to_namespace_graph_entry(
+                        row,
+                        include_source_text=include_source_text,
+                        include_node_metadata=include_node_metadata,
+                    )
+                    for row in entry_rows
+                ],
                 "relationships": [
-                    self._row_to_relationship(row)
+                    self._row_to_namespace_graph_relationship(
+                        row,
+                        include_evidence=include_relationship_evidence,
+                    )
                     for row in relationship_rows
                 ],
                 "entry_scan_limit": bounded_entry_limit,
@@ -9823,6 +9900,73 @@ class DurableMemoryStore:
                 context,
             )
             raise
+
+    def _row_to_namespace_graph_entry(
+        self,
+        row: sqlite3.Row,
+        *,
+        include_source_text: bool,
+        include_node_metadata: bool,
+    ) -> dict[str, Any]:
+        raw_metadata = _decode_json(str(row["metadata_json"]), {})
+        raw_metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        metadata_keys = (
+            _NAMESPACE_GRAPH_NODE_METADATA_KEYS
+            if include_node_metadata
+            else _NAMESPACE_GRAPH_CLUSTER_METADATA_KEYS
+        )
+        projected_metadata = {
+            key: raw_metadata[key]
+            for key in metadata_keys
+            if key in raw_metadata
+        }
+        raw_embedding_provider = raw_metadata.get("embedding_provider")
+        if include_node_metadata and isinstance(raw_embedding_provider, dict):
+            projected_metadata["embedding_provider"] = {
+                key: raw_embedding_provider[key]
+                for key in _NAMESPACE_GRAPH_EMBEDDING_PROVIDER_KEYS
+                if key in raw_embedding_provider
+            }
+        safe_metadata = _json_safe(projected_metadata, {})
+        return {
+            "memory_id": redact_capture_text(str(row["memory_id"]))[0],
+            "tag": redact_capture_text(str(row["tag"]))[0],
+            "context_id": redact_capture_text(str(row["context_id"]))[0],
+            "source_text": (
+                redact_capture_text(str(row["source_text"]))[0]
+                if include_source_text
+                else ""
+            ),
+            "metadata": safe_metadata if isinstance(safe_metadata, dict) else {},
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def _row_to_namespace_graph_relationship(
+        self,
+        row: sqlite3.Row,
+        *,
+        include_evidence: bool,
+    ) -> dict[str, Any]:
+        safe_evidence: Any = {}
+        if include_evidence:
+            safe_evidence = _json_safe(
+                _decode_json(str(row["evidence_json"]), {}),
+                {},
+            )
+        return {
+            "relationship_id": redact_capture_text(str(row["relationship_id"]))[0],
+            "context_id": redact_capture_text(str(row["context_id"]))[0],
+            "source_memory_id": redact_capture_text(str(row["source_memory_id"]))[0],
+            "target_memory_id": redact_capture_text(str(row["target_memory_id"]))[0],
+            "source_tag": redact_capture_text(str(row["source_tag"]))[0],
+            "target_tag": redact_capture_text(str(row["target_tag"]))[0],
+            "relation_type": redact_capture_text(str(row["relation_type"]))[0],
+            "weight": round(float(row["weight"]), 6),
+            "evidence": safe_evidence if isinstance(safe_evidence, dict) else {},
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
 
     @staticmethod
     def _retrieval_page_limit(value: Any, *, field: str) -> int:

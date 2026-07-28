@@ -2119,8 +2119,23 @@ class DashboardRuntimeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         index = (root / "web" / "index.html").read_text(encoding="utf-8")
         app = (root / "web" / "app.js").read_text(encoding="utf-8")
+        core_client = (root / "core_client.py").read_text(encoding="utf-8")
 
         self.assertIn("const READ_REQUEST_TIMEOUT_MS = 10000", app)
+        self.assertIn("const NAMESPACE_DETAIL_REQUEST_TIMEOUT_MS = 30000", app)
+        self.assertIn(
+            "NAMESPACE_DETAIL_OPERATION_TIMEOUT_SECONDS = 25.0",
+            core_client,
+        )
+        namespace_method_start = core_client.index("def list_namespace_detail")
+        namespace_method_end = core_client.index(
+            "def list_memory_graph",
+            namespace_method_start,
+        )
+        self.assertIn(
+            "timeout_seconds=NAMESPACE_DETAIL_OPERATION_TIMEOUT_SECONDS",
+            core_client[namespace_method_start:namespace_method_end],
+        )
         self.assertIn('const readOnly = normalizedMethod === "GET"', app)
         self.assertIn("controller.abort()", app)
         self.assertIn("last good data retained", app)
@@ -2135,6 +2150,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("CORE_HEALTH_VISIBLE_REFRESH_MS", app)
         self.assertIn("state.coreHealth.latest?.backend_lane?.accepting_ordinary_operations === false", app)
         self.assertIn('"Namespace Galaxy waiting"', app)
+        self.assertIn('"The core is finishing another request;', app)
+        self.assertIn('"The core is busy with governed maintenance;', app)
         self.assertIn('"deepDoctorReportButton"', app)
         self.assertIn("deep_integrity_scan: String(deepIntegrityScan)", app)
         self.assertIn('include_suggestions: background ? "false" : "true"', app)
@@ -2167,7 +2184,7 @@ class DashboardRuntimeTests(unittest.TestCase):
             "visualMassScore",
             "boundedAreaRadius",
             "applyNamespaceDetailMetrics",
-            'level: "ganglion"',
+            'level: nextClusterId ? "neurons" : "ganglion"',
             "aggregateEdges",
             "averageWeight",
             "storedRelationshipCount",
@@ -2199,10 +2216,36 @@ class DashboardRuntimeTests(unittest.TestCase):
             "Math.sqrt(minimumArea + normalized * (maximumArea - minimumArea))",
             app,
         )
-        self.assertIn(
-            "const [payload, ganglionPayload] = await Promise.all([neuronRequest, ganglionRequest])",
-            app,
+        detail_start = app.index("async function refreshNamespaceDetail")
+        detail_end = app.index("function normalizeNamespaceDetail", detail_start)
+        detail_refresh = app[detail_start:detail_end]
+        self.assertEqual(
+            detail_refresh.count('requestJson("/api/namespace-detail"'),
+            1,
         )
+        self.assertNotIn("Promise.all", detail_refresh)
+        self.assertIn(
+            "timeoutMs: NAMESPACE_DETAIL_REQUEST_TIMEOUT_MS",
+            detail_refresh,
+        )
+        self.assertIn("if (!nextClusterId)", detail_refresh)
+        lod_start = app.index("function currentNamespaceDetailLod")
+        lod_end = app.index("function drawNamespaceDetail", lod_start)
+        lod_contract = app[lod_start:lod_end]
+        self.assertIn("!state.namespaceGalaxy.focusedClusterId", lod_contract)
+        self.assertIn("!state.namespaceGalaxy.focusedDetail", lod_contract)
+        self.assertIn(
+            "state.namespaceGalaxy.focusedDetail.selectedClusterId",
+            lod_contract,
+        )
+        focus_start = app.index("async function focusNamespaceGanglion")
+        focus_end = app.index("function clearNamespaceGanglionFocus", focus_start)
+        focus_contract = app[focus_start:focus_end]
+        clear_position = focus_contract.index("galaxy.focusedDetail = null")
+        assign_position = focus_contract.index(
+            "galaxy.focusedClusterId = nextClusterId",
+        )
+        self.assertLess(clear_position, assign_position)
         self.assertIn("detail.aggregateAvailable = true", app)
         self.assertIn(
             "const clusterMetricEdges = detail.aggregateAvailable ? detail.aggregateEdges : detail.edges",

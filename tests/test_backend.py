@@ -17,6 +17,7 @@ import mlx.core as mx
 import embedding_providers
 import mlx_backend
 from core_authority import CoreAuthorityError, CoreAuthorityLease
+from core_protocol import DEFAULT_MAX_FRAME_BYTES, canonical_json_bytes
 from memory_store import ContextDeliveryRejected
 from mlx_backend import BackendUnavailable
 from mlx_backend import SpikingAttentionBackend
@@ -4237,6 +4238,9 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual({node["cluster_id"] for node in selected["nodes"]}, {selected_cluster_id})
         self.assertEqual({cluster["cluster_id"] for cluster in selected["clusters"]}, {selected_cluster_id})
         self.assertEqual(ganglion["level"], "ganglion")
+        self.assertEqual(ganglion["nodes"], [])
+        self.assertEqual(ganglion["counts"]["eligible_nodes"], 0)
+        self.assertEqual(ganglion["counts"]["returned_nodes"], 0)
         self.assertTrue(ganglion["read_only"])
         self.assertFalse(ganglion["automatic_cross_namespace_write"])
         self.assertEqual(ganglion["counts"]["eligible_edges"], 1)
@@ -4247,6 +4251,174 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(aggregate["average_weight"], 0.8)
         self.assertEqual(aggregate["stored_relationship_count"], 1)
         self.assertFalse(ganglion["counts"]["eligible_edges_is_lower_bound"])
+        self.assertLessEqual(
+            complete["response_bytes"],
+            mlx_backend.NAMESPACE_DETAIL_RESPONSE_MAX_BYTES,
+        )
+        self.assertEqual(
+            complete["response_bytes"],
+            len(canonical_json_bytes(complete)),
+        )
+        self.assertEqual(
+            complete["truncation"]["response_byte_limit"],
+            mlx_backend.NAMESPACE_DETAIL_RESPONSE_MAX_BYTES,
+        )
+        oversized = {
+            **complete,
+            "nodes": [
+                {
+                    **complete["nodes"][index % len(complete["nodes"])],
+                    "node_id": f"oversized-node-{index:05d}",
+                    "memory_id": f"oversized-memory-{index:05d}",
+                    "excerpt": "x" * 240,
+                }
+                for index in range(4_000)
+            ],
+            "counts": {
+                **complete["counts"],
+                "eligible_nodes": 4_000,
+                "returned_nodes": 4_000,
+            },
+            "truncation": {
+                **complete["truncation"],
+                "nodes": {
+                    **complete["truncation"]["nodes"],
+                    "total": 4_000,
+                    "returned": 4_000,
+                    "truncated": False,
+                },
+            },
+            "response_bytes": 0,
+        }
+        bounded = backend._bound_namespace_detail_payload(oversized)
+        self.assertLessEqual(
+            len(canonical_json_bytes(bounded)),
+            mlx_backend.NAMESPACE_DETAIL_RESPONSE_MAX_BYTES,
+        )
+        self.assertEqual(
+            bounded["response_bytes"],
+            len(canonical_json_bytes(bounded)),
+        )
+        self.assertLess(
+            len(
+                canonical_json_bytes(
+                    {
+                        "protocol_version": "synapse-core.v1",
+                        "request_id": "req-namespace-detail-budget",
+                        "caller": "namespace-detail-budget-test",
+                        "operation": "list_namespace_detail",
+                        "request_fingerprint": "b" * 64,
+                        "operation_sequence": 1,
+                        "server_time_unix_ms": 1,
+                        "identity": {
+                            "authority_epoch": "epoch-test",
+                            "config_fingerprint": "a" * 64,
+                            "build_id": "source-test",
+                        },
+                        "ok": True,
+                        "result": bounded,
+                        "error": None,
+                    }
+                )
+            ),
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        self.assertTrue(bounded["truncation"]["response_trimmed_for_bytes"])
+        self.assertTrue(bounded["truncation"]["nodes"]["truncated"])
+        self.assertLess(len(bounded["nodes"]), len(oversized["nodes"]))
+        fixed_point_payload = {
+            **complete,
+            "clusters": [],
+            "edges": [],
+            "nodes": [
+                {
+                    **complete["nodes"][0],
+                    "excerpt": "",
+                }
+            ],
+            "response_bytes": 0,
+        }
+        fixed_point_base = len(canonical_json_bytes(fixed_point_payload))
+        fixed_point_payload["nodes"][0]["excerpt"] = "x" * max(
+            0,
+            100_000 - fixed_point_base,
+        )
+        fixed_point = backend._bound_namespace_detail_payload(
+            fixed_point_payload
+        )
+        self.assertEqual(
+            fixed_point["response_bytes"],
+            len(canonical_json_bytes(fixed_point)),
+        )
+
+        ganglion_clusters = [
+            {
+                **ganglion["clusters"][index % len(ganglion["clusters"])],
+                "cluster_id": f"pressure-cluster-{index:04d}",
+                "node_id": f"pressure-cluster-{index:04d}",
+            }
+            for index in range(300)
+        ]
+        ganglion_edges = [
+            {
+                **ganglion["edges"][0],
+                "edge_id": f"pressure-edge-{index:04d}",
+                "source_id": ganglion_clusters[index % 299]["cluster_id"],
+                "target_id": ganglion_clusters[(index % 299) + 1]["cluster_id"],
+            }
+            for index in range(1_200)
+        ]
+        pressured_ganglion = backend._bound_namespace_detail_payload(
+            {
+                **ganglion,
+                "clusters": ganglion_clusters,
+                "nodes": [],
+                "edges": ganglion_edges,
+                "counts": {
+                    **ganglion["counts"],
+                    "eligible_clusters": len(ganglion_clusters),
+                    "returned_clusters": len(ganglion_clusters),
+                    "eligible_edges": len(ganglion_edges),
+                    "returned_edges": len(ganglion_edges),
+                },
+                "truncation": {
+                    **ganglion["truncation"],
+                    "clusters": {
+                        "total": len(ganglion_clusters),
+                        "returned": len(ganglion_clusters),
+                        "truncated": False,
+                    },
+                    "nodes": {
+                        "total": 0,
+                        "returned": 0,
+                        "truncated": False,
+                    },
+                    "edges": {
+                        "total": len(ganglion_edges),
+                        "returned": len(ganglion_edges),
+                        "truncated": False,
+                    },
+                },
+                "response_bytes": 0,
+            }
+        )
+        self.assertEqual(pressured_ganglion["nodes"], [])
+        self.assertGreater(len(pressured_ganglion["edges"]), 0)
+        self.assertEqual(
+            pressured_ganglion["response_bytes"],
+            len(canonical_json_bytes(pressured_ganglion)),
+        )
+        returned_cluster_ids = {
+            cluster["cluster_id"]
+            for cluster in pressured_ganglion["clusters"]
+        }
+        self.assertTrue(
+            all(
+                edge["source_id"] in returned_cluster_ids
+                and edge["target_id"] in returned_cluster_ids
+                for edge in pressured_ganglion["edges"]
+            )
+        )
         self.assertTrue(bounded_ganglion["truncation"]["truncated"])
         self.assertTrue(bounded_ganglion["truncation"]["clusters"]["truncated"])
         self.assertTrue(bounded_ganglion["truncation"]["edges"]["truncated"])

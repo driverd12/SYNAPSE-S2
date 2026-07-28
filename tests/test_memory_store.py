@@ -1148,7 +1148,13 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 tag="alpha-first",
                 context_id="alpha",
                 source_text="First alpha node.",
-                metadata={},
+                metadata={
+                    "context_memory_type": "event",
+                    "display_label": "Alpha first",
+                    "unrelated_large_payload": {
+                        "api_key": "sk-not-for-namespace-detail",
+                    },
+                },
                 embedding_dimensions=8,
                 spike_indices=[1],
                 neuron_indices=[1],
@@ -1180,6 +1186,7 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 target_memory_id=second["memory_id"],
                 relation_type="temporal_next",
                 weight=0.9,
+                evidence={"sequence_id": "alpha-sequence"},
             )
             # Legacy files can have been edited while foreign keys were off.
             # The snapshot must omit those rows rather than expose a cross-context
@@ -1235,6 +1242,14 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 entry_scan_limit=10,
                 relationship_scan_limit=10,
             )
+            compact_snapshot = store.namespace_graph_snapshot(
+                context_id="alpha",
+                entry_scan_limit=10,
+                relationship_scan_limit=10,
+                include_source_text=False,
+                include_relationship_evidence=False,
+                include_node_metadata=False,
+            )
             deletion = store.delete_entry(
                 context_id="alpha",
                 memory_id=second["memory_id"],
@@ -1257,6 +1272,44 @@ class DurableMemoryStoreTests(unittest.TestCase):
             [valid["relationship_id"]],
         )
         self.assertTrue(first_snapshot["read_only"])
+        compact_entry = next(
+            entry
+            for entry in compact_snapshot["entries"]
+            if entry["memory_id"] == first["memory_id"]
+        )
+        self.assertEqual(compact_entry["source_text"], "")
+        self.assertEqual(
+            compact_entry["metadata"],
+            {
+                "context_memory_type": "event",
+                "display_label": "Alpha first",
+            },
+        )
+        self.assertEqual(compact_snapshot["relationships"][0]["evidence"], {})
+        with self.assertRaisesRegex(
+            ValueError,
+            "include_source_text must be a boolean",
+        ):
+            store.namespace_graph_snapshot(
+                context_id="alpha",
+                include_source_text=1,
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "include_relationship_evidence must be a boolean",
+        ):
+            store.namespace_graph_snapshot(
+                context_id="alpha",
+                include_relationship_evidence="false",
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "include_node_metadata must be a boolean",
+        ):
+            store.namespace_graph_snapshot(
+                context_id="alpha",
+                include_node_metadata=None,
+            )
         self.assertTrue(deletion["deleted"])
         self.assertEqual(after_prune["entry_total"], 1)
         self.assertEqual(after_prune["relationship_total"], 0)
