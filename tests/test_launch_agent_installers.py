@@ -281,6 +281,7 @@ fi
         prior_disabled: bool = False,
         prior_running: bool = True,
         extra: dict[str, str] | None = None,
+        arguments: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         plist = self._plist(dashboard=dashboard)
         if prior:
@@ -297,7 +298,7 @@ fi
             env.update(extra)
         script = "install_dashboard_agent.sh" if dashboard else "install_capture_daemon.sh"
         return subprocess.run(
-            ["bash", str(ROOT / "scripts" / script)],
+            ["bash", str(ROOT / "scripts" / script), *arguments],
             cwd=ROOT,
             env=env,
             text=True,
@@ -305,6 +306,193 @@ fi
             stderr=subprocess.PIPE,
             check=False,
         )
+
+    def test_dashboard_status_is_process_ready_without_any_mutation(self) -> None:
+        plist = self._plist(dashboard=True)
+        plist.parent.mkdir(parents=True, mode=0o700)
+        plist.write_bytes(PRIOR_PLIST)
+        plist.chmod(0o600)
+        fixed_plist_time_ns = 1_700_000_000_123_456_789
+        os.utime(plist, ns=(fixed_plist_time_ns, fixed_plist_time_ns))
+        (self.state / "phase").write_text("prior\n", encoding="utf-8")
+
+        auth_path = self.root / "dashboard-auth" / "dashboard-auth.json"
+        auth_path.parent.mkdir(parents=True, mode=0o700)
+        auth_path.write_text(
+            '{"schema":"synapse-s2.dashboard-auth.v1",'
+            '"host":"127.0.0.1","port":18765,'
+            '"bootstrap_url":"http://127.0.0.1:18765/__dashboard_bootstrap?'
+            'token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",'
+            '"session_header":"HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH"}\n',
+            encoding="utf-8",
+        )
+        auth_path.chmod(0o600)
+        fixed_auth_time_ns = 1_700_000_001_123_456_789
+        os.utime(auth_path, ns=(fixed_auth_time_ns, fixed_auth_time_ns))
+        plist_before = plist.stat()
+        auth_before = auth_path.stat()
+        auth_bytes_before = auth_path.read_bytes()
+
+        result = self._install(
+            dashboard=True,
+            arguments=("status",),
+        )
+        plist_after = plist.stat()
+        auth_after = auth_path.stat()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"action":"status"', result.stdout)
+        self.assertIn('"process_ready":true', result.stdout)
+        self.assertIn('"loopback_listener":true', result.stdout)
+        self.assertIn('"plist_safe":true', result.stdout)
+        self.assertIn('"pid":111', result.stdout)
+        self.assertEqual(plist.read_bytes(), PRIOR_PLIST)
+        self.assertEqual(
+            (plist_after.st_dev, plist_after.st_ino, plist_after.st_mode,
+             plist_after.st_nlink, plist_after.st_size, plist_after.st_mtime_ns),
+            (plist_before.st_dev, plist_before.st_ino, plist_before.st_mode,
+             plist_before.st_nlink, plist_before.st_size, plist_before.st_mtime_ns),
+        )
+        self.assertEqual(auth_path.read_bytes(), auth_bytes_before)
+        self.assertEqual(
+            (auth_after.st_dev, auth_after.st_ino, auth_after.st_mode,
+             auth_after.st_nlink, auth_after.st_size, auth_after.st_mtime_ns),
+            (auth_before.st_dev, auth_before.st_ino, auth_before.st_mode,
+             auth_before.st_nlink, auth_before.st_size, auth_before.st_mtime_ns),
+        )
+        self.assertEqual((self.state / "phase").read_text().strip(), "prior")
+        launchctl_log = (self.state / "launchctl.log").read_text(encoding="utf-8")
+        self.assertNotIn("bootout", launchctl_log)
+        self.assertNotIn("enable", launchctl_log)
+        self.assertNotIn("bootstrap", launchctl_log)
+        self.assertNotIn("kill", launchctl_log)
+        self.assertNotIn("kickstart", launchctl_log)
+        self.assertTrue((self.state / "lsof.log").is_file())
+        self.assertFalse((self.state / "curl.log").exists())
+        self.assertFalse((self.root / "logs" / "dashboard.log").exists())
+        self.assertFalse(
+            (plist.parent / ".test.synapse.dashboard.install.lock").exists()
+        )
+        self.assertEqual(
+            list(plist.parent.glob(".test.synapse.dashboard.*")),
+            [],
+        )
+        self.assertEqual(
+            list(auth_path.parent.glob(".dashboard-health-cookie.*")),
+            [],
+        )
+
+    def test_dashboard_status_reports_absent_without_creating_files(self) -> None:
+        result = self._install(
+            dashboard=True,
+            arguments=("status",),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('"plist_present":false', result.stdout)
+        self.assertIn('"loaded":false', result.stdout)
+        self.assertIn('"process_ready":false', result.stdout)
+        self.assertFalse(self._plist(dashboard=True).exists())
+        self.assertFalse((self.state / "lsof.log").exists())
+        self.assertFalse((self.state / "curl.log").exists())
+        self.assertFalse((self.root / "logs" / "dashboard.log").exists())
+
+    def test_dashboard_status_rejects_loaded_service_without_local_plist(self) -> None:
+        (self.state / "phase").write_text("prior\n", encoding="utf-8")
+
+        result = self._install(
+            dashboard=True,
+            arguments=("status",),
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('"error":"loaded-without-restorable-plist"', result.stdout)
+        self.assertIn('"process_ready":false', result.stdout)
+        self.assertFalse(self._plist(dashboard=True).exists())
+        self.assertFalse((self.state / "lsof.log").exists())
+        self.assertFalse((self.state / "curl.log").exists())
+
+    def test_dashboard_status_reports_disabled_running_service_as_degraded(self) -> None:
+        result = self._install(
+            dashboard=True,
+            prior=True,
+            prior_disabled=True,
+            prior_running=True,
+            arguments=("status",),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('"disabled":true', result.stdout)
+        self.assertIn('"running":true', result.stdout)
+        self.assertIn('"process_ready":false', result.stdout)
+        launchctl_log = (self.state / "launchctl.log").read_text(encoding="utf-8")
+        self.assertNotIn("bootout", launchctl_log)
+        self.assertNotIn("enable", launchctl_log)
+        self.assertNotIn("bootstrap", launchctl_log)
+        self.assertNotIn("kickstart", launchctl_log)
+        self.assertFalse((self.state / "curl.log").exists())
+
+    def test_dashboard_status_rejects_unsafe_plist_without_following_it(self) -> None:
+        outside = self.root / "outside.plist"
+        outside.write_bytes(b"OUTSIDE\n")
+        plist = self._plist(dashboard=True)
+        plist.parent.mkdir(parents=True, mode=0o700)
+        plist.symlink_to(outside)
+
+        result = self._install(
+            dashboard=True,
+            arguments=("status",),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('"error":"launch-agent-plist-unsafe"', result.stdout)
+        self.assertIn('"process_ready":false', result.stdout)
+        self.assertTrue(plist.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"OUTSIDE\n")
+        self.assertFalse((self.state / "launchctl.log").exists())
+        self.assertFalse((self.state / "lsof.log").exists())
+        self.assertFalse((self.state / "curl.log").exists())
+
+    def test_dashboard_installer_rejects_unknown_action_without_restarting(self) -> None:
+        result = self._install(
+            dashboard=True,
+            prior=True,
+            arguments=("statuz",),
+        )
+        plist = self._plist(dashboard=True)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Usage:", result.stderr)
+        self.assertEqual(plist.read_bytes(), PRIOR_PLIST)
+        self.assertEqual((self.state / "phase").read_text().strip(), "prior")
+        self.assertFalse((self.state / "launchctl.log").exists())
+
+    def test_dashboard_installer_rejects_multiple_actions_without_inspection(self) -> None:
+        result = self._install(
+            dashboard=True,
+            prior=True,
+            arguments=("status", "unexpected"),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Usage:", result.stderr)
+        self.assertNotIn("unexpected", result.stderr)
+        self.assertEqual(self._plist(dashboard=True).read_bytes(), PRIOR_PLIST)
+        self.assertEqual((self.state / "phase").read_text().strip(), "prior")
+        self.assertFalse((self.state / "launchctl.log").exists())
+
+    def test_dashboard_installer_rejects_explicit_empty_action(self) -> None:
+        result = self._install(
+            dashboard=True,
+            prior=True,
+            arguments=("",),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Usage:", result.stderr)
+        self.assertEqual(self._plist(dashboard=True).read_bytes(), PRIOR_PLIST)
+        self.assertEqual((self.state / "phase").read_text().strip(), "prior")
+        self.assertFalse((self.state / "launchctl.log").exists())
 
     def test_capture_success_installs_private_plist_after_stable_new_pid(self) -> None:
         result = self._install(dashboard=False, prior=True)

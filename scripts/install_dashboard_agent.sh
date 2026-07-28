@@ -2,6 +2,27 @@
 set -euo pipefail
 umask 077
 
+if [ "$#" -gt 1 ]; then
+  echo "Usage: $0 [install|status]" >&2
+  exit 2
+fi
+if [ "$#" -eq 0 ]; then
+  DASHBOARD_AGENT_ACTION="install"
+else
+  DASHBOARD_AGENT_ACTION="$1"
+fi
+case "$DASHBOARD_AGENT_ACTION" in
+  install|status) ;;
+  -h|--help|help)
+    echo "Usage: $0 [install|status]"
+    exit 0
+    ;;
+  *)
+    echo "Usage: $0 [install|status]" >&2
+    exit 2
+    ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LABEL="${SYNAPSE_S2_DASHBOARD_LABEL:-aero.boom.synapse-s2.dashboard}"
@@ -240,8 +261,9 @@ service_loaded() {
 }
 
 service_disabled() {
-  launchctl print-disabled "gui/$UID_VALUE" 2>/dev/null \
-    | awk -v label="$LABEL" '
+  local disabled_inventory=""
+  disabled_inventory="$(launchctl print-disabled "gui/$UID_VALUE" 2>/dev/null)" || return 2
+  printf '%s\n' "$disabled_inventory" | awk -v label="$LABEL" '
       index($0, "\"" label "\"") && $0 ~ /=>[[:space:]]*true/ { found = 1 }
       END { exit(found ? 0 : 1) }
     '
@@ -474,6 +496,92 @@ verify_dashboard_health() {
   return 1
 }
 
+dashboard_status() {
+  local disabled_status=0
+  local load_status=0
+  local plist_present=false
+  local plist_safe=false
+  local loaded=false
+  local running=false
+  local disabled=false
+  local loopback_listener=false
+  local process_ready=false
+  local observed_pid=""
+  local rendered_pid="null"
+
+  if [ -e "$PLIST" ] || [ -L "$PLIST" ]; then
+    plist_present=true
+    if "$PYTHON" "$SCRIPT_DIR/secure_installer_support.py" validate-regular \
+      --path "$PLIST" >/dev/null 2>&1; then
+      plist_safe=true
+    else
+      printf '{"action":"status","error":"launch-agent-plist-unsafe","label":"%s","plist_present":true,"plist_safe":false,"process_ready":false}\n' "$LABEL"
+      return 2
+    fi
+  fi
+
+  if service_loaded; then
+    load_status=0
+  else
+    load_status=$?
+  fi
+  case "$load_status" in
+    0) loaded=true ;;
+    1) ;;
+    *)
+      printf '{"action":"status","error":"launch-agent-state-unclassified","label":"%s","plist_present":%s,"plist_safe":%s,"process_ready":false}\n' \
+        "$LABEL" "$plist_present" "$plist_safe"
+      return 2
+      ;;
+  esac
+  if [ "$loaded" = true ] && [ "$plist_present" = false ]; then
+    printf '{"action":"status","error":"loaded-without-restorable-plist","label":"%s","loaded":true,"plist_present":false,"plist_safe":false,"process_ready":false}\n' "$LABEL"
+    return 2
+  fi
+
+  if service_disabled; then
+    disabled_status=0
+  else
+    disabled_status=$?
+  fi
+  case "$disabled_status" in
+    0) disabled=true ;;
+    1) ;;
+    *)
+      printf '{"action":"status","error":"launch-agent-policy-unclassified","label":"%s","loaded":%s,"plist_present":%s,"plist_safe":%s,"process_ready":false}\n' \
+        "$LABEL" "$loaded" "$plist_present" "$plist_safe"
+      return 2
+      ;;
+  esac
+
+  if [ "$loaded" = true ] && service_running; then
+    running=true
+    observed_pid="$(service_pid 2>/dev/null || true)"
+    if [ -n "$observed_pid" ]; then
+      rendered_pid="$observed_pid"
+      if listener_is_loopback "$observed_pid"; then
+        loopback_listener=true
+      fi
+    fi
+  fi
+  if [ "$plist_present" = true ] \
+    && [ "$plist_safe" = true ] \
+    && [ "$loaded" = true ] \
+    && [ "$running" = true ] \
+    && [ "$disabled" = false ] \
+    && [ "$rendered_pid" != null ] \
+    && [ "$loopback_listener" = true ]; then
+    process_ready=true
+  fi
+  printf '{"action":"status","disabled":%s,"host":"%s","label":"%s","loaded":%s,"loopback_listener":%s,"pid":%s,"plist_present":%s,"plist_safe":%s,"port":%s,"process_ready":%s,"running":%s}\n' \
+    "$disabled" "$HOST" "$LABEL" "$loaded" "$loopback_listener" "$rendered_pid" \
+    "$plist_present" "$plist_safe" "$PORT" "$process_ready" "$running"
+  if [ "$process_ready" = true ]; then
+    return 0
+  fi
+  return 1
+}
+
 listener_is_loopback() {
   local service_process_id="$1"
   lsof -nP -a -p "$service_process_id" -iTCP:"$PORT" -sTCP:LISTEN -Fn 2>/dev/null \
@@ -693,6 +801,16 @@ case "$HOST" in
     exit 2
     ;;
 esac
+
+if [ "$DASHBOARD_AGENT_ACTION" = status ]; then
+  trap - EXIT HUP INT TERM
+  if dashboard_status; then
+    exit 0
+  else
+    STATUS_RESULT=$?
+    exit "$STATUS_RESULT"
+  fi
+fi
 
 LOCK_MARKER="dashboard:$LABEL"
 INSTALL_LOCK_PATH="$PLIST_DIR/.${LABEL}.install.lock"
