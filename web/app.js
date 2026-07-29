@@ -414,6 +414,7 @@ const WIZARD_FLOWS = {
 const WIZARD_STEPS = WIZARD_FLOWS.intro.steps;
 
 const state = {
+  dashboardAccessRequired: false,
   context: (
     new URLSearchParams(window.location.search).get(NAMESPACE_GALAXY_CONTEXT_PARAM)
     || new URLSearchParams(window.location.search).get("context_id")
@@ -582,7 +583,9 @@ const elements = collectElements([
   "captureSpeaker",
   "captureTag",
   "captureText",
+  "connectionStatusCard",
   "currentEnvelope",
+  "dashboardAccessBanner",
   "engineState",
   "embeddingModelLabel",
   "endpointLabel",
@@ -793,6 +796,13 @@ async function requestJson(
   path,
   { method = "GET", params = {}, body = null, timeoutMs = READ_REQUEST_TIMEOUT_MS } = {},
 ) {
+  if (state.dashboardAccessRequired) {
+    const error = new Error("dashboard authorization required");
+    error.status = 403;
+    error.serverError = "dashboard authorization required";
+    error.dashboardAuthorizationRequired = true;
+    throw error;
+  }
   const normalizedMethod = String(method || "GET").toUpperCase();
   const headers = {};
   if (dashboardSessionCapability) {
@@ -818,7 +828,12 @@ async function requestJson(
       body: body ? JSON.stringify(body) : undefined,
       signal: controller?.signal,
     });
-    payload = await response.json();
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (response.ok) throw error;
+      payload = {};
+    }
   } catch (error) {
     if (readOnly && error?.name === "AbortError") {
       throw new Error(`Read timed out after ${Math.round(boundedTimeoutMs / 1000)}s; last good data retained.`);
@@ -836,12 +851,57 @@ async function requestJson(
       ? `${payload.error || `HTTP ${response.status}`} — copy reconciliation handle: ${handle}`
       : payload.error || `HTTP ${response.status}`;
     const error = new Error(message);
+    error.status = response.status;
+    error.serverError = String(payload?.error || "");
+    error.dashboardAuthorizationRequired = (
+      response.status === 403
+      && error.serverError.trim().toLowerCase() === "dashboard authorization required"
+    );
     if (handle) {
       error.reconciliation = reconciliation;
+    }
+    if (error.dashboardAuthorizationRequired) {
+      renderDashboardAccessRequired(error);
     }
     throw error;
   }
   return payload;
+}
+
+function isDashboardAuthorizationError(error) {
+  return Boolean(error?.dashboardAuthorizationRequired);
+}
+
+function renderDashboardAccessRequired(error) {
+  if (state.dashboardAccessRequired) return;
+  state.dashboardAccessRequired = true;
+  elements.dashboardAccessBanner.hidden = false;
+  document.documentElement.classList.add("dashboard-auth-required");
+  elements.connectionStatusCard.classList.add("authorization-required");
+  elements.headerRuntime.textContent = "AUTH REQUIRED";
+  elements.sidebarStatus.textContent = "AUTH REQUIRED";
+  elements.footerHealth.textContent = "AUTH REQUIRED";
+  elements.headerRuntime.title = [
+    "Dashboard authorization required",
+    "this does not prove the core is offline",
+    "reopen securely with .venv/bin/python scripts/open_dashboard.py",
+  ].join("; ");
+  setNamespaceGalaxyState(
+    "warning",
+    "Dashboard authentication required",
+    "Live namespace data is locked. Reopen securely with .venv/bin/python scripts/open_dashboard.py.",
+  );
+  if (state.coreHealth.refreshTimer !== null) {
+    window.clearTimeout(state.coreHealth.refreshTimer);
+    state.coreHealth.refreshTimer = null;
+  }
+  if (state.namespaceGalaxy.backgroundRefreshTimer !== null) {
+    window.clearTimeout(state.namespaceGalaxy.backgroundRefreshTimer);
+    state.namespaceGalaxy.backgroundRefreshTimer = null;
+  }
+  document.querySelectorAll("button, input, select, textarea").forEach((control) => {
+    control.disabled = true;
+  });
 }
 
 function renderCoreHealth(health) {
@@ -893,6 +953,10 @@ async function refreshCoreHealth({ background = false } = {}) {
     renderCoreHealth(health);
     return health;
   } catch (error) {
+    if (isDashboardAuthorizationError(error)) {
+      renderDashboardAccessRequired(error);
+      return null;
+    }
     const hasLastGood = Boolean(
       coreHealth.latest && coreHealth.lastSuccessfulRefreshAt
     );
@@ -916,6 +980,7 @@ async function refreshCoreHealth({ background = false } = {}) {
 }
 
 function scheduleCoreHealthRefresh({ immediate = false } = {}) {
+  if (state.dashboardAccessRequired) return;
   const coreHealth = state.coreHealth;
   if (coreHealth.refreshTimer !== null) {
     window.clearTimeout(coreHealth.refreshTimer);
@@ -1445,6 +1510,15 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
     return data;
   } catch (error) {
     if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
+    if (isDashboardAuthorizationError(error)) {
+      setNamespaceGalaxyState(
+        "warning",
+        "Dashboard authentication required",
+        "Reopen securely with .venv/bin/python scripts/open_dashboard.py; the core may still be healthy.",
+      );
+      elements.namespaceGalaxyCanvas.title = "Dashboard authentication required; reopen securely from the SYNAPSE-S2 checkout.";
+      return null;
+    }
     if (background && galaxy.data.nodes.length) {
       const ageSeconds = galaxy.lastSuccessfulRefreshAt
         ? Math.max(0, Math.round((Date.now() - galaxy.lastSuccessfulRefreshAt) / 1000))
@@ -1482,6 +1556,7 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
 }
 
 function scheduleNamespaceGalaxyRefresh({ immediate = false } = {}) {
+  if (state.dashboardAccessRequired) return;
   const galaxy = state.namespaceGalaxy;
   if (galaxy.backgroundRefreshTimer !== null) {
     window.clearTimeout(galaxy.backgroundRefreshTimer);

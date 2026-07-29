@@ -833,6 +833,66 @@ textarea {
   padding: 14px 14px 18px;
 }
 
+.dashboard-access-banner {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+  border: 1px solid color-mix(in srgb, var(--amber) 68%, var(--border));
+  border-radius: var(--radius);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--amber) 17%, transparent), transparent 54%),
+    var(--panel);
+  box-shadow: var(--chrome-glow);
+  padding: 12px 14px;
+}
+
+.dashboard-access-banner[hidden] {
+  display: none;
+}
+
+.dashboard-access-banner strong {
+  color: var(--amber);
+  font-family: var(--terminal-font);
+  font-size: 13px;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.dashboard-access-banner p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.dashboard-access-banner code {
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--border));
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.dashboard-auth-required .top-readout .status-dot,
+.sidebar-status.authorization-required .status-dot {
+  background: var(--amber);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--amber) 72%, transparent);
+}
+
+.dashboard-auth-required .main > :not(.dashboard-access-banner) {
+  opacity: 0.68;
+  pointer-events: none;
+  user-select: none;
+}
+
+.dashboard-auth-required :disabled {
+  cursor: not-allowed;
+}
+
 .operator-action-banner {
   display: grid;
   grid-template-columns: minmax(300px, 1fr) auto auto;
@@ -2400,7 +2460,7 @@ textarea {
 .namespace-galaxy-state {
   position: absolute;
   z-index: 3;
-  top: 12px;
+  top: 54px;
   left: 12px;
   display: grid;
   gap: 3px;
@@ -3652,8 +3712,14 @@ textarea {
   }
 
   .operator-action-banner,
+  .dashboard-access-banner,
   .cortex-session-callout {
     grid-template-columns: 1fr;
+  }
+
+  .dashboard-access-banner code {
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   .operator-run-order,
@@ -3771,6 +3837,10 @@ textarea {
   .namespace-galaxy-navigation {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .namespace-galaxy-state {
+    top: 92px;
   }
 
   .namespace-galaxy-depth-row {

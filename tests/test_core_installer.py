@@ -2288,8 +2288,55 @@ else:
         self.assertFalse(result["production_ready"])
         self.assertFalse(result["provisional"])
         self.assertIsNone(result["deployment_mode"])
+        self.assertEqual(result["status_reason"], "stopped")
+        self.assertFalse(result["authenticated_runtime"]["reachable"])
+        self.assertIsNone(result["build_identity"]["matches_current_source"])
+        self.assertFalse(result["replacement_required"])
         self.assertFalse(self.home.exists())
         self.assertFalse(self.core.exists())
+
+    def test_status_classifies_authenticated_build_drift_without_claiming_health(
+        self,
+    ) -> None:
+        config = installer.build_config(self.paths)
+        installer.write_core_config(self.paths.config, config)
+        (self.base / "launchctl-loaded").write_text("loaded", encoding="utf-8")
+        expected_build_id = installer._manifest_build_id(ROOT)
+        observed_build_id = "source-" + ("a" * 24)
+        if observed_build_id == expected_build_id:
+            observed_build_id = "source-" + ("b" * 24)
+        drift = installer.CoreRuntimeBuildDrift(
+            expected_build_id=expected_build_id,
+            observed_build_id=observed_build_id,
+            deployment_mode="authoritative",
+            reported_ready=True,
+            capture_ready=True,
+        )
+        with mock.patch.object(installer, "probe_health", side_effect=drift):
+            result = installer.status(paths=self.paths, launchctl=self._launchctl())
+
+        self.assertEqual(result["status_reason"], "guarded-replacement-required")
+        self.assertTrue(result["authenticated_runtime"]["reachable"])
+        self.assertTrue(result["authenticated_runtime"]["reported_ready"])
+        self.assertTrue(result["authenticated_runtime"]["capture_ready"])
+        self.assertEqual(
+            result["authenticated_runtime"]["deployment_mode"],
+            "authoritative",
+        )
+        self.assertEqual(
+            result["build_identity"]["expected_source_build_id"],
+            expected_build_id,
+        )
+        self.assertEqual(
+            result["build_identity"]["observed_runtime_build_id"],
+            observed_build_id,
+        )
+        self.assertFalse(result["build_identity"]["matches_current_source"])
+        self.assertTrue(result["replacement_required"])
+        self.assertFalse(result["healthy"])
+        self.assertFalse(result["runtime_healthy"])
+        self.assertFalse(result["production_ready"])
+        self.assertFalse(result["capture_ready"])
 
     def test_status_reports_provisional_runtime_without_production_readiness(
         self,
@@ -2311,6 +2358,7 @@ else:
             "ready": True,
             "capture_ready": True,
             "deployment_mode": "replacement-certification",
+            "build_id": installer._manifest_build_id(ROOT),
         }
         with mock.patch.object(
             installer,
@@ -2329,6 +2377,10 @@ else:
         self.assertFalse(result["production_ready"])
         self.assertTrue(result["provisional"])
         self.assertTrue(result["capture_ready"])
+        self.assertEqual(result["status_reason"], "replacement-certification")
+        self.assertTrue(result["authenticated_runtime"]["reachable"])
+        self.assertTrue(result["build_identity"]["matches_current_source"])
+        self.assertFalse(result["replacement_required"])
         self.assertEqual(
             result["deployment_mode"],
             "replacement-certification",
@@ -2555,6 +2607,25 @@ else:
             identity["neural_epoch"] = "epoch-test"
             with self.assertRaisesRegex(installer.CoreInstallerError, "epoch"):
                 installer.probe_health(config)
+            identity["neural_epoch"] = "epoch-1"
+            observed_build_id = "source-" + ("a" * 24)
+            if observed_build_id == installer._manifest_build_id(ROOT):
+                observed_build_id = "source-" + ("b" * 24)
+            identity["build_id"] = observed_build_id
+            with self.assertRaises(installer.CoreRuntimeBuildDrift) as drift:
+                installer.probe_health(config)
+            self.assertEqual(drift.exception.observed_build_id, observed_build_id)
+            self.assertEqual(
+                drift.exception.expected_build_id,
+                installer._manifest_build_id(ROOT),
+            )
+            identity["config_fingerprint"] = "f" * 64
+            with self.assertRaises(installer.CoreInstallerError) as mismatch:
+                installer.probe_health(config)
+            self.assertNotIsInstance(
+                mismatch.exception,
+                installer.CoreRuntimeBuildDrift,
+            )
 
     def test_restored_health_uses_verified_persisted_store_identity(self) -> None:
         with mock.patch.dict(

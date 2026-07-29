@@ -175,6 +175,26 @@
       </aside>
 
       <main class="main">
+        <section
+          id="dashboardAccessBanner"
+          class="dashboard-access-banner"
+          role="alert"
+          aria-live="assertive"
+          aria-label="Dashboard access status"
+          hidden
+        >
+          <div>
+            <strong>Open this dashboard through its secure local launcher</strong>
+            <p>
+              This tab does not have a valid local dashboard session. SYNAPSE-S2 has not reported
+              offline; live core and memory data remain locked. A refresh or bookmarked loopback URL
+              cannot authorize this tab. Any previously displayed data is stale and controls are
+              locked. From the SYNAPSE-S2 repository, run:
+            </p>
+          </div>
+          <code>.venv/bin/python scripts/open_dashboard.py</code>
+        </section>
+
         <section id="operatorActionBanner" class="operator-action-banner pending" aria-live="polite" aria-label="Current operator action">
           <div class="operator-action-copy">
             <div class="operator-action-meta">

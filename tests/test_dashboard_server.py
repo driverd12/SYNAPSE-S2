@@ -2168,6 +2168,42 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("readOnly &&", request_helper)
         self.assertNotIn("controller = new window.AbortController()", request_helper)
 
+    def test_dashboard_authorization_failure_is_not_reported_as_core_offline(self):
+        root = Path(__file__).resolve().parents[1]
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+        styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="dashboardAccessBanner"', index)
+        self.assertIn('role="alert"', index)
+        self.assertIn("SYNAPSE-S2 has not reported", index)
+        self.assertIn("cannot authorize this tab", index)
+        self.assertIn("previously displayed data is stale", index)
+        self.assertIn(".venv/bin/python scripts/open_dashboard.py", index)
+        self.assertIn("dashboardAccessRequired: false", app)
+        self.assertIn('"connectionStatusCard",', app)
+        self.assertIn("error.status = response.status", app)
+        self.assertIn("if (response.ok) throw error", app)
+        self.assertIn("response.status === 403", app)
+        self.assertIn('error.serverError.trim().toLowerCase() === "dashboard authorization required"', app)
+        self.assertNotIn("response.status === 401", app)
+        self.assertIn("error.dashboardAuthorizationRequired", app)
+        self.assertIn("function isDashboardAuthorizationError", app)
+        self.assertIn("function renderDashboardAccessRequired", app)
+        self.assertIn('elements.headerRuntime.textContent = "AUTH REQUIRED"', app)
+        self.assertIn('elements.sidebarStatus.textContent = "AUTH REQUIRED"', app)
+        self.assertIn('elements.footerHealth.textContent = "AUTH REQUIRED"', app)
+        self.assertIn('"Live namespace data is locked.', app)
+        self.assertIn("this does not prove the core is offline", app)
+        self.assertIn('document.querySelectorAll("button, input, select, textarea")', app)
+        self.assertIn("if (state.dashboardAccessRequired) return;", app)
+        self.assertIn(".dashboard-access-banner[hidden]", styles)
+        self.assertIn(".sidebar-status.authorization-required .status-dot", styles)
+        self.assertIn(".dashboard-auth-required .main > :not(.dashboard-access-banner)", styles)
+        self.assertIn("pointer-events: none", styles)
+        self.assertIn(".namespace-galaxy-state {", styles)
+        self.assertIn("top: 54px", styles)
+
     def test_namespace_galaxy_assets_explain_weighted_visual_mass(self):
         root = Path(__file__).resolve().parents[1]
         index = (root / "web" / "index.html").read_text(encoding="utf-8")

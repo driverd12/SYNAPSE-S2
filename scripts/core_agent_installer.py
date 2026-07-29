@@ -103,11 +103,34 @@ LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 LAYOUT_MANIFEST_SCHEMA = "synapse-s2.noncanonical-core-layout.v1"
 EXPECTED_SCHEMA_IDENTITY = "sqlite-53324442-v6"
 EPOCH_RE = re.compile(r"^epoch-[1-9][0-9]*$")
+SOURCE_BUILD_ID_RE = re.compile(r"^source-[0-9a-f]{24}$")
 MAX_LAYOUT_MANIFEST_BYTES = 64 * 1024
 
 
 class CoreInstallerError(RuntimeError):
     """A bounded installer failure that is safe to show to an operator."""
+
+
+class CoreRuntimeBuildDrift(CoreInstallerError):
+    """An authenticated healthy runtime belongs to a different source build."""
+
+    def __init__(
+        self,
+        *,
+        expected_build_id: str,
+        observed_build_id: str,
+        deployment_mode: str,
+        reported_ready: bool,
+        capture_ready: bool,
+    ) -> None:
+        super().__init__(
+            "authoritative-core source build requires guarded replacement"
+        )
+        self.expected_build_id = expected_build_id
+        self.observed_build_id = observed_build_id
+        self.deployment_mode = deployment_mode
+        self.reported_ready = reported_ready
+        self.capture_ready = capture_ready
 
 
 @dataclass(frozen=True)
@@ -1136,11 +1159,7 @@ def probe_health(
         or (require_capture_ready and not capture_ready)
     ):
         raise CoreInstallerError("authoritative-core or embedded capture is not ready")
-    expected = {
-        "config_fingerprint": config.fingerprint,
-        "build_id": _manifest_build_id(ROOT),
-    }
-    if any(identity.get(key) != value for key, value in expected.items()):
+    if identity.get("config_fingerprint") != config.fingerprint:
         raise CoreInstallerError("authoritative-core identity does not match this install")
     if identity["schema_identity"] != EXPECTED_SCHEMA_IDENTITY:
         raise CoreInstallerError("authoritative-core schema identity is not exact v6")
@@ -1172,6 +1191,21 @@ def probe_health(
             )
     _private_socket(config.socket_path)
     _private_token(config.socket_path.with_name(config.socket_path.name + ".token"))
+    expected_build_id = _manifest_build_id(ROOT)
+    observed_build_id = str(identity["build_id"])
+    if (
+        SOURCE_BUILD_ID_RE.fullmatch(expected_build_id) is None
+        or SOURCE_BUILD_ID_RE.fullmatch(observed_build_id) is None
+    ):
+        raise CoreInstallerError("authoritative-core source build identity is invalid")
+    if observed_build_id != expected_build_id:
+        raise CoreRuntimeBuildDrift(
+            expected_build_id=expected_build_id,
+            observed_build_id=observed_build_id,
+            deployment_mode=str(result["deployment_mode"]),
+            reported_ready=True,
+            capture_ready=capture_ready,
+        )
     return {
         "ready": True,
         "capture_ready": capture_ready,
@@ -3161,25 +3195,75 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
     binding_path = default_binding_path(paths.home)
     binding_ready = False
     binding_digest = None
+    expected_build_id = _manifest_build_id(ROOT)
+    authenticated_runtime = {
+        "reachable": False,
+        "reported_ready": False,
+        "deployment_mode": None,
+        "capture_ready": False,
+    }
+    build_identity = {
+        "expected_source_build_id": expected_build_id,
+        "observed_runtime_build_id": None,
+        "matches_current_source": None,
+    }
+    replacement_required = False
+
+    def record_health(health: Mapping[str, Any]) -> None:
+        nonlocal authenticated_runtime, build_identity
+        observed_build_id = str(health.get("build_id") or "") or None
+        authenticated_runtime = {
+            "reachable": True,
+            "reported_ready": bool(health.get("ready")),
+            "deployment_mode": str(health.get("deployment_mode") or "") or None,
+            "capture_ready": bool(health.get("capture_ready")),
+        }
+        build_identity = {
+            "expected_source_build_id": expected_build_id,
+            "observed_runtime_build_id": observed_build_id,
+            "matches_current_source": observed_build_id == expected_build_id,
+        }
+
+    def record_build_drift(drift: CoreRuntimeBuildDrift) -> None:
+        nonlocal authenticated_runtime, build_identity, replacement_required
+        authenticated_runtime = {
+            "reachable": True,
+            "reported_ready": drift.reported_ready,
+            "deployment_mode": drift.deployment_mode,
+            "capture_ready": drift.capture_ready,
+        }
+        build_identity = {
+            "expected_source_build_id": drift.expected_build_id,
+            "observed_runtime_build_id": drift.observed_build_id,
+            "matches_current_source": False,
+        }
+        replacement_required = True
+
     if snapshot.get("running") and paths.config.exists() and not paths.config.is_symlink():
         try:
             health = probe_health(load_core_config(paths.config))
+            record_health(health)
             healthy = bool(health.get("ready"))
             runtime_healthy = healthy
             capture_ready = bool(health.get("capture_ready"))
             deployment_mode = str(health.get("deployment_mode") or "") or None
+        except CoreRuntimeBuildDrift as drift:
+            record_build_drift(drift)
         except Exception:
             try:
                 health = probe_health(
                     load_core_config(paths.config),
                     expected_deployment_mode="replacement-certification",
                 )
+                record_health(health)
                 runtime_healthy = bool(health.get("ready"))
                 capture_ready = bool(health.get("capture_ready"))
                 deployment_mode = str(
                     health.get("deployment_mode") or ""
                 ) or None
                 provisional = runtime_healthy
+            except CoreRuntimeBuildDrift as drift:
+                record_build_drift(drift)
             except Exception:
                 pass
     if paths.config.exists() and not paths.config.is_symlink():
@@ -3197,6 +3281,18 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
             binding_digest = observed_binding.digest
         except Exception:
             pass
+    if healthy and binding_ready:
+        status_reason = "ready"
+    elif healthy:
+        status_reason = "client-binding-mismatch"
+    elif replacement_required:
+        status_reason = "guarded-replacement-required"
+    elif provisional:
+        status_reason = "replacement-certification"
+    elif snapshot.get("running"):
+        status_reason = "runtime-unavailable"
+    else:
+        status_reason = "stopped"
     return _safe_result(
         "status",
         loaded=bool(snapshot.get("loaded")),
@@ -3207,6 +3303,10 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
         production_ready=bool(healthy and binding_ready),
         deployment_mode=deployment_mode,
         provisional=provisional,
+        status_reason=status_reason,
+        authenticated_runtime=authenticated_runtime,
+        build_identity=build_identity,
+        replacement_required=replacement_required,
         capture_ready=capture_ready,
         plist_present=paths.plist.is_file() and not paths.plist.is_symlink(),
         config_present=paths.config.is_file() and not paths.config.is_symlink(),
