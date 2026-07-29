@@ -324,7 +324,7 @@ printf '%s\n' '{"runtime":"ready","effective_enabled":true,"memory_db_path":"/au
         self.assertNotIn("SYNAPSE_S2_EMBEDDING_PROVIDER=", unit_section)
 
     def test_readiness_commands_use_socket_or_marker_without_local_tuning(self) -> None:
-        with TemporaryDirectory() as temporary:
+        with TemporaryDirectory(dir="/tmp") as temporary:
             root = Path(temporary).resolve()
             home = root / "home"
             home.mkdir(mode=0o700)
