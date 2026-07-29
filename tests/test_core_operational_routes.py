@@ -227,7 +227,7 @@ printf '%s\n' '{"runtime":"ready","effective_enabled":true,"memory_db_path":"/au
 
     def test_legacy_capture_refuses_v6_before_any_install_mutation(self) -> None:
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             memory_db = root / "memory.sqlite3"
             with closing(sqlite3.connect(memory_db)) as connection:
                 connection.execute("CREATE TABLE store_metadata(key TEXT PRIMARY KEY, value_json TEXT)")

@@ -407,11 +407,8 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
 
     def test_cli_commands_use_core_route_without_local_topology(self):
         with TemporaryDirectory() as tmp:
-            socket_path = (
-                Path(__file__).resolve().parents[1]
-                / ".synapse_s2"
-                / "core"
-                / "service.sock"
+            socket_path = canonical_core_socket_path(
+                Path(__file__).resolve().parents[1] / ".synapse_s2"
             )
             with mock.patch(
                 "scripts.operator_readiness_certify.default_binding_path",

@@ -89,7 +89,7 @@ class CoreAgentInstallerTests(unittest.TestCase):
         disabled = self.base / "launchctl-disabled"
         log = self.base / "launchctl.log"
         executable.write_text(
-            f"""#!{sys.executable}
+            f"""#!/usr/bin/env python3
 import pathlib
 import sys
 state = pathlib.Path({str(state)!r})
@@ -4480,7 +4480,7 @@ class CoreCutoverPreflightTests(unittest.TestCase):
             log = root / "calls.log"
             fake = root / "launchctl"
             fake.write_text(
-                f"""#!{sys.executable}
+                f"""#!/usr/bin/env python3
 import pathlib
 import sys
 pathlib.Path({str(log)!r}).open('a').write(' '.join(sys.argv[1:]) + '\\n')
@@ -4525,7 +4525,10 @@ raise SystemExit(3)
     def test_launchctl_inventory_fails_closed_when_domain_query_errors(self) -> None:
         with tempfile.TemporaryDirectory(prefix="synapse-preflight-launchctl-error-") as temporary:
             fake = Path(temporary) / "launchctl"
-            fake.write_text(f"#!{sys.executable}\nraise SystemExit(70)\n", encoding="utf-8")
+            fake.write_text(
+                "#!/usr/bin/env python3\nraise SystemExit(70)\n",
+                encoding="utf-8",
+            )
             fake.chmod(0o700)
             with self.assertRaisesRegex(
                 preflight.CutoverPreflightError,
@@ -4544,7 +4547,7 @@ raise SystemExit(3)
             disabled_state = root / "respawner-disabled"
             fake = root / "launchctl"
             fake.write_text(
-                f"""#!{sys.executable}
+                f"""#!/usr/bin/env python3
 import pathlib
 import sys
 disabled = pathlib.Path({str(disabled_state)!r}).exists()
