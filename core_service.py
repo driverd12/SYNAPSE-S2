@@ -4553,6 +4553,8 @@ class AuthoritativeCoreService:
             with self._capture_heartbeat_lock:
                 self._capture_heartbeat.update(
                     {
+                        "ready": False,
+                        "last_error_code": "orphan_reaping_failed",
                         "orphan_reaping_ready": False,
                         "orphan_reap_iteration_count": int(
                             self._capture_heartbeat["orphan_reap_iteration_count"]
