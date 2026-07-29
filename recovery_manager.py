@@ -29,6 +29,7 @@ from capture_daemon import (
     GLOBAL_CAPTURE_LOCK,
     resolve_capture_root,
 )
+from core_authority import CORE_AUTHORITY_LOCK_GENERATION_RE
 from core_request_journal import (
     JOURNAL_APPLICATION_ID,
     JOURNAL_BINDING_SCHEMA,
@@ -71,9 +72,7 @@ RUNTIME_STATE_BINDING_SCHEMA = "synapse-s2.runtime-state-binding.v1"
 RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA = (
     "synapse-s2.runtime-authority-binding.v1"
 )
-RUNTIME_STATE_AUTHORITY_LOCK_RE = re.compile(
-    r"\Alockfs-v1-[0-9a-f]{1,32}-[0-9a-f]{1,32}\Z"
-)
+RUNTIME_STATE_AUTHORITY_LOCK_RE = CORE_AUTHORITY_LOCK_GENERATION_RE
 RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v2"
 LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v1"
 RECOVERY_RETENTION_PLAN_SCHEMA = "synapse-s2.recovery-retention-plan.v1"

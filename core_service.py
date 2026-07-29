@@ -2999,6 +2999,16 @@ class AuthoritativeCoreService:
         logical_snapshot = inspection.get("logical_snapshot")
         if not isinstance(logical_snapshot, dict):
             raise CoreServiceError("service_unavailable")
+        inspected_marker = inspection.get("marker")
+        allow_legacy_lock_transition = bool(
+            isinstance(attestation, Mapping)
+            and attestation.get("lock_generation_transition")
+            == "legacy-v1-to-v2"
+            and isinstance(inspected_marker, Mapping)
+            and self._authority_lease is not None
+            and inspected_marker.get("lock_generation_id")
+            != self._authority_lease.lock_generation_id
+        )
         claim = claim_method(
             instance_id=self._identity["authority_id"],
             config_fingerprint=self.config.fingerprint,
@@ -3034,6 +3044,9 @@ class AuthoritativeCoreService:
                 if attestation is None
                 else int(attestation["expires_at_unix_ms"])
             ),
+            allow_legacy_lock_generation_transition=(
+                allow_legacy_lock_transition
+            ),
         )
         expected_claim_keys = {
             "schema_version",
@@ -3062,7 +3075,6 @@ class AuthoritativeCoreService:
             raise CoreServiceError("service_unavailable")
         expected_epoch_number = int(inspection["next_epoch"])
         expected_epoch = f"epoch-{expected_epoch_number}"
-        inspected_marker = inspection.get("marker")
         existing_restored_digest = (
             None
             if not isinstance(inspected_marker, Mapping)
@@ -3273,6 +3285,23 @@ class AuthoritativeCoreService:
         data_root = self.config.memory_path.parent
         logical_snapshot = inspection.get("logical_snapshot")
         runtime_publication = inspection.get("runtime_publication")
+        lock_generation_matches = bool(
+            isinstance(marker, Mapping)
+            and marker.get("lock_generation_id")
+            == authority.lock_generation_id
+        )
+        if isinstance(marker, Mapping) and not lock_generation_matches:
+            try:
+                authority.validate_legacy_lock_generation_transition(
+                    legacy_generation_id=str(
+                        marker.get("lock_generation_id") or ""
+                    ),
+                    durable_claimed_at=float(marker.get("claimed_at") or 0.0),
+                )
+            except (CoreAuthorityError, TypeError, ValueError):
+                pass
+            else:
+                lock_generation_matches = True
         if (
             not isinstance(marker, Mapping)
             or inspection.get("governance_mode") != "authoritative-v6"
@@ -3287,7 +3316,7 @@ class AuthoritativeCoreService:
             or marker.get("config_fingerprint") != self.config.fingerprint
             or marker.get("protocol_version") != PROTOCOL_VERSION
             or marker.get("root_generation_id") != self._root_generation_id
-            or marker.get("lock_generation_id") != authority.lock_generation_id
+            or not lock_generation_matches
             or marker.get("embedding_space_identity")
             != self.config.embedding_space_identity
             or marker.get("store_identity") != inspection.get("store_identity")
@@ -3378,6 +3407,8 @@ class AuthoritativeCoreService:
             from scripts.core_cutover_preflight import (
                 REPLACEMENT_ADMISSION_NAME,
                 REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA,
+                REPLACEMENT_LOCK_GENERATION_TRANSITION_LEGACY_V1_TO_V2,
+                REPLACEMENT_LOCK_GENERATION_TRANSITION_NONE,
                 verify_replacement_admission_for_core,
             )
 
@@ -3386,6 +3417,33 @@ class AuthoritativeCoreService:
                 / "core"
                 / REPLACEMENT_ADMISSION_NAME
             )
+            marker = inspection.get("marker")
+            expected_lock_transition = (
+                REPLACEMENT_LOCK_GENERATION_TRANSITION_NONE
+            )
+            expected_lock_birthtime_ns: int | None = None
+            if (
+                isinstance(marker, Mapping)
+                and self._authority_lease is not None
+                and marker.get("lock_generation_id")
+                != self._authority_lease.lock_generation_id
+            ):
+                transition = (
+                    self._authority_lease.validate_legacy_lock_generation_transition(
+                        legacy_generation_id=str(
+                            marker.get("lock_generation_id") or ""
+                        ),
+                        durable_claimed_at=float(
+                            marker.get("claimed_at") or 0.0
+                        ),
+                    )
+                )
+                expected_lock_transition = (
+                    REPLACEMENT_LOCK_GENERATION_TRANSITION_LEGACY_V1_TO_V2
+                )
+                expected_lock_birthtime_ns = int(
+                    transition["lock_birthtime_ns"]
+                )
 
             verification = verify_replacement_admission_for_core(
                 root=Path(__file__).resolve().parent,
@@ -3397,6 +3455,17 @@ class AuthoritativeCoreService:
                 inspection=inspection,
                 delivery_audit=delivery_audit,
                 minimum_remaining_seconds=CUTOVER_MINIMUM_REMAINING_SECONDS,
+                expected_candidate_lock_generation_id=(
+                    None
+                    if self._authority_lease is None
+                    else self._authority_lease.lock_generation_id
+                ),
+                expected_lock_generation_transition=(
+                    expected_lock_transition
+                ),
+                expected_lock_generation_transition_birthtime_ns=(
+                    expected_lock_birthtime_ns
+                ),
             )
         except Exception as exc:
             raise CoreServiceError("service_unavailable") from exc
@@ -3514,6 +3583,14 @@ class AuthoritativeCoreService:
             != marker.get("protocol_version")
             or verification.get("predecessor_lock_generation_id")
             != marker.get("lock_generation_id")
+            or verification.get("candidate_lock_generation_id")
+            != self._authority_lease.lock_generation_id
+            or verification.get("lock_generation_transition")
+            != expected_lock_transition
+            or verification.get(
+                "lock_generation_transition_birthtime_ns"
+            )
+            != expected_lock_birthtime_ns
             or verification.get("predecessor_root_generation_id")
             != marker.get("root_generation_id")
             or verification.get("predecessor_embedding_space_identity")
@@ -3897,6 +3974,56 @@ class AuthoritativeCoreService:
                             ),
                         )
                         assert_runtime_binding(dict(marker))
+                        if self._replacement_certification_pending(marker):
+                            complete_interrupted_publication = getattr(
+                                store,
+                                "complete_interrupted_runtime_state_authority_publication",
+                                None,
+                            )
+                            if not callable(complete_interrupted_publication):
+                                raise CoreServiceError(
+                                    "service_unavailable"
+                                )
+                            completed_publication = (
+                                complete_interrupted_publication(
+                                    marker=dict(marker),
+                                    publication=dict(publication),
+                                    runtime_state_path=self.config.state_path,
+                                    expected_config_fingerprint=(
+                                        self.config.fingerprint
+                                    ),
+                                    expected_build_id=self._build_id,
+                                    expected_protocol_version=PROTOCOL_VERSION,
+                                    expected_root_generation_id=str(
+                                        self._root_generation_id or ""
+                                    ),
+                                    expected_embedding_space_identity=(
+                                        self.config.embedding_space_identity
+                                    ),
+                                )
+                            )
+                            if (
+                                not isinstance(completed_publication, Mapping)
+                                or completed_publication.get("status")
+                                != "complete"
+                                or completed_publication.get(
+                                    "authority_epoch_number"
+                                )
+                                != marker.get("epoch")
+                                or completed_publication.get(
+                                    "lock_generation_id"
+                                )
+                                != marker.get("lock_generation_id")
+                            ):
+                                raise CoreServiceError(
+                                    "service_unavailable"
+                                )
+                            # The interrupted migration admission was consumed
+                            # by the already-committed claim.  Stop after
+                            # completing that exact publication so a new,
+                            # recovery-backed v2/none admission must govern the
+                            # next certification attempt.
+                            raise CoreServiceError("service_unavailable")
                     except Exception as recovery_error:
                         raise CoreServiceError("service_unavailable") from recovery_error
             restored_binding_path = (

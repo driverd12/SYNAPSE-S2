@@ -131,12 +131,17 @@ foreign owners, hard-linked private files, and non-private modes. Publication
 of the config and plist uses same-directory temporary files, file `fsync`,
 atomic rename, and parent-directory `fsync`.
 
-The authority lease is bound to the stable device/inode generation of the
-owner-only `authority.lock` regular file. The durable SQLite marker records
-that lock generation together with its exact schema/service flag, epoch,
-instance, configuration, build, protocol, store, request-journal, root
-generation, embedding-space, restored-target lineage, and timestamps. The core
-caches a canonical digest of the complete closed marker after claim. Every live
+The authority lease is bound to one filesystem generation of the owner-only
+`authority.lock` regular file. On macOS, `lockfs-v2` derives the durable
+generation from inode plus rounded filesystem birth time, avoiding the
+mount-assigned `st_dev` value that can change across reboot. Platforms without
+birth time retain `lockfs-v1` device/inode identity. In either case, each live
+held-versus-visible check still compares the current device and inode, owner,
+mode, link count, and pathname identity. The durable SQLite marker records the
+generation together with its exact schema/service flag, epoch, instance,
+configuration, build, protocol, store, request-journal, root generation,
+embedding-space, restored-target lineage, and timestamps. The core caches a
+canonical digest of the complete closed marker after claim. Every live
 authority check revalidates the held lock and visible lock path, the exact
 database inode, the durable schema/migration pair, the lease epoch, and that
 full marker digest. A missing field, added field, malformed value, marker edit,
@@ -150,6 +155,28 @@ only through the explicit signed restored-target flow, with the verified
 restored request-journal binding. Replacement while a service is live fails
 closed immediately. Operators must not delete or recreate `authority.lock` as
 a lock-recovery shortcut.
+
+One compatibility ceremony is narrower than restored-target adoption. A
+reviewed build replacement may migrate an existing `lockfs-v1` marker to
+`lockfs-v2` only when the held and visible private zero-byte lock still have the
+same inode encoded by v1, its birth time predates the durable claim, and the
+signed replacement-admission v3 binds the exact predecessor, candidate,
+transition mode, and birth time. The admission also requires a fresh paired
+recovery bundle, verified isolated restore, clean repository, ready delivery
+audit, unchanged configuration/root/store/journal/runtime/embedding identities,
+and a distinct successor build. The v2 marker and runtime publication advance
+in the normal authority-claim transaction and publication sequence. This lane
+does not admit v2-to-v2 drift, a changed inode, a newly created lock, or
+`recover-existing`.
+
+If that signed migration commits the v2 marker but crashes before the runtime
+publication receipt becomes complete, the next exact-build startup performs
+only the already-bound recovery: it republishes the runtime binding, atomically
+changes the matching receipt from `pending` to `complete`, and stops without
+advancing the epoch or consulting the old transition admission. Operators must
+then rerun replacement staging so fresh recovery evidence produces a v2/`none`
+admission. The legacy v1-to-v2 receipt is never replayed or inferred as
+authorization for the resumed claim.
 
 ## Failed-first-adoption journal recovery
 

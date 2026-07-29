@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import math
 import os
 import re
 import stat
@@ -15,7 +16,19 @@ CORE_AUTHORITY_METADATA_KEY = "core_authority"
 CORE_AUTHORITY_SCHEMA_VERSION = 1
 CORE_AUTHORITY_INSTANCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 CORE_AUTHORITY_LOCK_GENERATION_RE = re.compile(
-    r"lockfs-v1-[0-9a-f]{1,32}-[0-9a-f]{1,32}"
+    r"(?:lockfs-v1-[0-9a-f]{1,32}-[0-9a-f]{1,32}"
+    r"|lockfs-v2-[0-9a-f]{1,32}-[0-9a-f]{1,32})"
+)
+CORE_AUTHORITY_LOCK_TRANSITION_SCHEMA = (
+    "synapse-s2.authority-lock-generation-transition.v1"
+)
+CORE_AUTHORITY_LOCK_TIMESTAMP_TOLERANCE_SECONDS = 1.0
+
+_CORE_AUTHORITY_LOCK_V1_RE = re.compile(
+    r"lockfs-v1-(?P<device>[0-9a-f]{1,32})-(?P<inode>[0-9a-f]{1,32})"
+)
+_CORE_AUTHORITY_LOCK_V2_RE = re.compile(
+    r"lockfs-v2-(?P<inode>[0-9a-f]{1,32})-(?P<birthtime_ns>[0-9a-f]{1,32})"
 )
 
 
@@ -41,16 +54,141 @@ def _private_mode(mode: int) -> int:
     return stat.S_IMODE(mode)
 
 
+def _nanoseconds_from_seconds(value: object, *, field: str) -> int:
+    """Round a finite positive POSIX timestamp to integer nanoseconds."""
+
+    if type(value) not in {int, float} or not math.isfinite(float(value)):
+        raise CoreAuthorityError(f"{field} is invalid")
+    nanoseconds = int(round(float(value) * 1_000_000_000))
+    if nanoseconds <= 0:
+        raise CoreAuthorityError(f"{field} is invalid")
+    return nanoseconds
+
+
+def _lock_birthtime_ns(identity: os.stat_result) -> int | None:
+    """Return rounded inode birth time where the platform exposes it.
+
+    macOS exposes ``st_birthtime`` but not a portable ``st_birthtime_ns``.
+    Converting the reported POSIX timestamp once and encoding the rounded
+    nanoseconds makes the generation independent of mount-assigned device IDs.
+    A platform that advertises an unusable birth time fails closed instead of
+    silently falling back to the weaker legacy identity.
+    """
+
+    if not hasattr(identity, "st_birthtime"):
+        return None
+    return _nanoseconds_from_seconds(
+        getattr(identity, "st_birthtime"),
+        field="authoritative core lock birthtime",
+    )
+
+
+def _parse_lock_generation_id(generation_id: object) -> tuple[str, int, int]:
+    """Parse one closed lock-generation identifier without filesystem access."""
+
+    if not isinstance(generation_id, str):
+        raise CoreAuthorityError("authoritative core lock generation is invalid")
+    legacy = _CORE_AUTHORITY_LOCK_V1_RE.fullmatch(generation_id)
+    if legacy is not None:
+        return (
+            "v1",
+            int(legacy.group("inode"), 16),
+            int(legacy.group("device"), 16),
+        )
+    current = _CORE_AUTHORITY_LOCK_V2_RE.fullmatch(generation_id)
+    if current is not None:
+        return (
+            "v2",
+            int(current.group("inode"), 16),
+            int(current.group("birthtime_ns"), 16),
+        )
+    raise CoreAuthorityError("authoritative core lock generation is invalid")
+
+
+def _validated_legacy_lock_generation_transition(
+    *,
+    legacy_generation_id: object,
+    current_generation_id: object,
+    lock_inode: object,
+    lock_birthtime_ns: object,
+    durable_claimed_at: object,
+    timestamp_tolerance_seconds: object,
+) -> dict[str, object]:
+    """Purely validate the single admissible legacy-v1 to v2 transition."""
+
+    if type(lock_inode) is not int or lock_inode <= 0:
+        raise CoreAuthorityError("authoritative core lock inode is invalid")
+    if type(lock_birthtime_ns) is not int or lock_birthtime_ns <= 0:
+        raise CoreAuthorityError("authoritative core lock birthtime is invalid")
+    if (
+        type(timestamp_tolerance_seconds) not in {int, float}
+        or not math.isfinite(float(timestamp_tolerance_seconds))
+        or float(timestamp_tolerance_seconds) < 0.0
+        or float(timestamp_tolerance_seconds)
+        > CORE_AUTHORITY_LOCK_TIMESTAMP_TOLERANCE_SECONDS
+    ):
+        raise CoreAuthorityError(
+            "authoritative core lock timestamp tolerance is invalid"
+        )
+
+    predecessor_version, predecessor_inode, _predecessor_device = (
+        _parse_lock_generation_id(legacy_generation_id)
+    )
+    current_version, current_inode, current_birthtime_ns = (
+        _parse_lock_generation_id(current_generation_id)
+    )
+    if predecessor_version != "v1" or current_version != "v2":
+        raise CoreAuthorityError(
+            "authoritative core lock generation transition is invalid"
+        )
+    if predecessor_inode != lock_inode or current_inode != lock_inode:
+        raise CoreAuthorityError(
+            "authoritative core lock generation transition changed inode"
+        )
+    if current_birthtime_ns != lock_birthtime_ns:
+        raise CoreAuthorityError(
+            "authoritative core lock generation birthtime is inconsistent"
+        )
+
+    claimed_at_ns = _nanoseconds_from_seconds(
+        durable_claimed_at,
+        field="durable core authority claimed_at",
+    )
+    tolerance_ns = int(
+        round(float(timestamp_tolerance_seconds) * 1_000_000_000)
+    )
+    if lock_birthtime_ns > claimed_at_ns + tolerance_ns:
+        raise CoreAuthorityError(
+            "authoritative core lock was created after the durable claim"
+        )
+
+    return {
+        "schema": CORE_AUTHORITY_LOCK_TRANSITION_SCHEMA,
+        "predecessor_generation_id": legacy_generation_id,
+        "current_generation_id": current_generation_id,
+        "lock_inode": lock_inode,
+        "lock_birthtime_ns": lock_birthtime_ns,
+    }
+
+
 def _lock_generation_id(identity: os.stat_result) -> str:
     """Return the non-copyable filesystem generation of one held lock inode.
 
     A pathname can be unlinked while an old process still holds its descriptor.
-    Binding the durable authority marker to the device/inode pair prevents a
-    successor from treating a replacement pathname as the same lock generation.
-    The old inode cannot be reused while that descriptor remains open.
+    On macOS, binding the marker to inode plus birth time prevents a replacement
+    pathname from being mistaken for the old generation without depending on a
+    mount-assigned device number that can change across a reboot.  Platforms
+    without inode birth time retain the legacy device/inode identity.  The old
+    inode cannot be reused while its descriptor remains open.
     """
 
-    generation = f"lockfs-v1-{int(identity.st_dev):x}-{int(identity.st_ino):x}"
+    birthtime_ns = _lock_birthtime_ns(identity)
+    if birthtime_ns is None:
+        generation = (
+            f"lockfs-v1-{int(identity.st_dev):x}-{int(identity.st_ino):x}"
+        )
+    else:
+        generation = f"lockfs-v2-{int(identity.st_ino):x}-{birthtime_ns:x}"
     if CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(generation) is None:
         raise CoreAuthorityError("authoritative core lock generation is invalid")
     return generation
@@ -331,6 +469,88 @@ class CoreAuthorityLease:
         self.assert_active_for(db_path)
         if self.role != "core":
             raise CoreAuthorityError("authoritative core lease is not active")
+
+    def validate_legacy_lock_generation_transition(
+        self,
+        *,
+        legacy_generation_id: str,
+        durable_claimed_at: float,
+        timestamp_tolerance_seconds: float = 1.0,
+    ) -> dict[str, object]:
+        """Validate a one-time same-inode migration from lockfs-v1 to v2.
+
+        This compatibility proof is intentionally narrow: the caller must hold
+        the active exclusive core lease, the descriptor and visible pathname
+        must still identify the same private zero-byte lock, and the lock's
+        birth time may not postdate the durable authority claim.  At most one
+        second of tolerance is allowed for filesystem timestamp rounding.
+        Nothing is mutated; callers may use the closed result as evidence for a
+        separately governed durable-marker transition.
+        """
+
+        self.assert_core_for(self.db_path)
+        try:
+            held = os.fstat(self.descriptor)
+            visible = self.lock_path.lstat()
+        except OSError as exc:
+            raise CoreAuthorityError(
+                "core authority lock identity is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or held.st_uid != os.getuid()
+            or held.st_nlink != 1
+            or _private_mode(held.st_mode) != 0o600
+            or int(held.st_size) != 0
+            or int(held.st_dev) != self.lock_device
+            or int(held.st_ino) != self.lock_inode
+        ):
+            raise CoreAuthorityError(
+                "held core authority lock is not a private zero-byte file"
+            )
+        if (
+            stat.S_ISLNK(visible.st_mode)
+            or not stat.S_ISREG(visible.st_mode)
+            or visible.st_uid != os.getuid()
+            or visible.st_nlink != 1
+            or _private_mode(visible.st_mode) != 0o600
+            or int(visible.st_size) != 0
+            or int(visible.st_dev) != self.lock_device
+            or int(visible.st_ino) != self.lock_inode
+        ):
+            raise CoreAuthorityError(
+                "visible core authority lock is not the held private zero-byte file"
+            )
+
+        held_birthtime_ns = _lock_birthtime_ns(held)
+        visible_birthtime_ns = _lock_birthtime_ns(visible)
+        if (
+            held_birthtime_ns is None
+            or visible_birthtime_ns is None
+            or held_birthtime_ns != visible_birthtime_ns
+        ):
+            raise CoreAuthorityError(
+                "authoritative core lock birthtime identity is unavailable"
+            )
+        current_generation_id = _lock_generation_id(held)
+        if (
+            current_generation_id != self.lock_generation_id
+            or _lock_generation_id(visible) != self.lock_generation_id
+        ):
+            raise CoreAuthorityError(
+                "authoritative core lock generation identity changed"
+            )
+
+        result = _validated_legacy_lock_generation_transition(
+            legacy_generation_id=legacy_generation_id,
+            current_generation_id=current_generation_id,
+            lock_inode=self.lock_inode,
+            lock_birthtime_ns=held_birthtime_ns,
+            durable_claimed_at=durable_claimed_at,
+            timestamp_tolerance_seconds=timestamp_tolerance_seconds,
+        )
+        self.assert_core_for(self.db_path)
+        return result
 
     def bind_durable_authority(
         self,

@@ -1928,6 +1928,121 @@ class DurableMemoryStore:
         self._assert_filesystem_authority()
         return binding
 
+    def complete_interrupted_runtime_state_authority_publication(
+        self,
+        *,
+        marker: dict[str, Any],
+        publication: dict[str, Any],
+        runtime_state_path: str | os.PathLike[str],
+        expected_config_fingerprint: str,
+        expected_build_id: str,
+        expected_protocol_version: str,
+        expected_root_generation_id: str,
+        expected_embedding_space_identity: str,
+    ) -> dict[str, Any]:
+        """Complete only an exact recovered pending publication.
+
+        The durable marker already committed in another process, so this lane
+        deliberately keeps the current lease unbound.  It revalidates the live
+        marker, pending receipt, runtime path, and every closed identity under
+        the exclusive filesystem lease, then updates only that receipt.  It
+        cannot advance an epoch or authorize a new authority claim.
+        """
+
+        self.interrupted_runtime_publication_binding(
+            marker=marker,
+            publication=publication,
+            runtime_state_path=runtime_state_path,
+            expected_config_fingerprint=expected_config_fingerprint,
+            expected_build_id=expected_build_id,
+            expected_protocol_version=expected_protocol_version,
+            expected_root_generation_id=expected_root_generation_id,
+            expected_embedding_space_identity=expected_embedding_space_identity,
+        )
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "interrupted runtime publication completion requires an "
+                "unbound core lease"
+            )
+        uri = self.db_path.resolve().as_uri() + "?mode=rw"
+        conn = sqlite3.connect(uri, timeout=10.0, isolation_level=None, uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 10000")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                live_marker = self._core_authority_marker(conn)
+                self._validate_core_authority_version_pair(conn, live_marker)
+                live_publication = self._core_runtime_publication(
+                    conn,
+                    live_marker,
+                )
+                if (
+                    live_marker != marker
+                    or live_publication != publication
+                    or live_publication is None
+                    or live_publication.get("status") != "pending"
+                ):
+                    raise CoreAuthorityError(
+                        "interrupted runtime publication changed before completion"
+                    )
+                self.validate_interrupted_runtime_publication_binding(
+                    marker=live_marker,
+                    publication=live_publication,
+                    runtime_state_path=runtime_state_path,
+                    expected_lock_generation_id=lease.lock_generation_id,
+                    expected_config_fingerprint=expected_config_fingerprint,
+                    expected_build_id=expected_build_id,
+                    expected_protocol_version=expected_protocol_version,
+                    expected_root_generation_id=expected_root_generation_id,
+                    expected_embedding_space_identity=(
+                        expected_embedding_space_identity
+                    ),
+                )
+                now = max(
+                    time.time(),
+                    float(live_publication["started_at"]),
+                    float(live_publication["updated_at"]),
+                )
+                completed = {
+                    **live_publication,
+                    "status": "complete",
+                    "completed_at": now,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    """
+                    UPDATE store_metadata
+                    SET value_json = ?, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (
+                        _json_dumps(completed),
+                        now,
+                        CORE_RUNTIME_PUBLICATION_METADATA_KEY,
+                    ),
+                )
+                persisted = self._core_runtime_publication(
+                    conn,
+                    live_marker,
+                )
+                if persisted != completed:
+                    raise CoreAuthorityError(
+                        "interrupted runtime publication completion did not "
+                        "persist exactly"
+                    )
+                self._assert_filesystem_authority()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+        self._assert_filesystem_authority()
+        return completed
+
     @classmethod
     def validate_interrupted_runtime_publication_binding(
         cls,
@@ -2372,6 +2487,7 @@ class DurableMemoryStore:
         attestation_receipt_digest: str | None = None,
         restored_target_binding_receipt_digest: str | None = None,
         attestation_expires_at_unix_ms: int | None = None,
+        allow_legacy_lock_generation_transition: bool = False,
     ) -> dict[str, Any]:
         """Permanently adopt the store after the core backend is fully ready.
 
@@ -2442,6 +2558,10 @@ class DurableMemoryStore:
             clean_restored_binding_digest
         ) is None:
             raise CoreAuthorityError("restored-target binding digest is invalid")
+        if type(allow_legacy_lock_generation_transition) is not bool:
+            raise CoreAuthorityError(
+                "legacy authority-lock generation transition request is invalid"
+            )
         if CORE_STORE_IDENTITY_RE.fullmatch(clean_store_identity) is None:
             raise CoreAuthorityError("core store identity is invalid")
         if CORE_REQUEST_JOURNAL_ID_RE.fullmatch(clean_request_journal_id) is None:
@@ -2598,6 +2718,26 @@ class DurableMemoryStore:
                 lock_generation_changed = marker is not None and (
                     marker["lock_generation_id"] != lease.lock_generation_id
                 )
+                legacy_lock_generation_transition = False
+                if allow_legacy_lock_generation_transition:
+                    if (
+                        marker is None
+                        or not lock_generation_changed
+                        or root_generation_changed
+                        or clean_attestation_digest is None
+                        or clean_restored_binding_digest is not None
+                    ):
+                        raise CoreAuthorityError(
+                            "legacy authority-lock generation transition is not "
+                            "narrowly authorized"
+                        )
+                    lease.validate_legacy_lock_generation_transition(
+                        legacy_generation_id=str(
+                            marker["lock_generation_id"]
+                        ),
+                        durable_claimed_at=float(marker["claimed_at"]),
+                    )
+                    legacy_lock_generation_transition = True
                 if root_generation_changed and not (
                     clean_attestation_digest is not None
                     and clean_restored_binding_digest is not None
@@ -2606,8 +2746,11 @@ class DurableMemoryStore:
                         "core root generation changed without restored-target adoption"
                     )
                 if lock_generation_changed and not (
-                    clean_attestation_digest is not None
-                    and clean_restored_binding_digest is not None
+                    (
+                        clean_attestation_digest is not None
+                        and clean_restored_binding_digest is not None
+                    )
+                    or legacy_lock_generation_transition
                 ):
                     raise CoreAuthorityError(
                         "core authority lock generation changed without "

@@ -19,8 +19,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from core_authority import CoreAuthorityError, CoreAuthorityLease
+from core_authority import (
+    CORE_AUTHORITY_SCHEMA_VERSION,
+    CoreAuthorityError,
+    CoreAuthorityLease,
+)
 from core_request_journal import (
+    JOURNAL_BINDING_SCHEMA,
+    JOURNAL_SCHEMA_VERSION,
     CoreRequestJournal,
     CoreRequestJournalError,
     repair_empty_preclaim_journal_residue,
@@ -52,6 +58,7 @@ from core_protocol import (
 from core_service import (
     BUILD_SOURCE_MANIFEST,
     CORE_OPERATION_CONTRACTS,
+    CORE_STORE_SCHEMA_IDENTITY,
     CORE_STARTUP_FAILURE_SCHEMA,
     LOGGER,
     LONG_RECOVERY_OPERATIONS,
@@ -3874,6 +3881,481 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 successor["instance_id"].startswith(
                     REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX
                 )
+            )
+
+    def test_build_only_replacement_accepts_only_validated_legacy_lock_transition(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            data_root = config.memory_path.parent
+            config = CoreConfig(
+                **{
+                    **config.__dict__,
+                    "capture_root": data_root,
+                }
+            )
+            service = AuthoritativeCoreService(config)
+            config = service.config
+            data_root = config.memory_path.parent
+            service._root_generation_id = "generation-" + ("a" * 24)
+            predecessor_build = "source-" + ("b" * 24)
+            if predecessor_build == service._build_id:
+                predecessor_build = "source-" + ("c" * 24)
+            marker = {
+                "schema_version": CORE_AUTHORITY_SCHEMA_VERSION,
+                "service_required": True,
+                "epoch": 7,
+                "instance_id": "core-predecessor",
+                "config_fingerprint": config.fingerprint,
+                "build_id": predecessor_build,
+                "protocol_version": PROTOCOL_VERSION,
+                "lock_generation_id": "lockfs-v1-deadbeef-1234",
+                "store_identity": "store-" + ("d" * 24),
+                "request_journal_id": "journal-" + ("e" * 24),
+                "request_journal_binding_schema": JOURNAL_BINDING_SCHEMA,
+                "request_journal_schema_version": JOURNAL_SCHEMA_VERSION,
+                "root_generation_id": service._root_generation_id,
+                "embedding_space_identity": config.embedding_space_identity,
+                "restored_target_binding_receipt_digest": None,
+                "claimed_at": 100.0,
+                "updated_at": 100.0,
+            }
+            inspection = {
+                "governance_mode": "authoritative-v6",
+                "schema_identity": CORE_STORE_SCHEMA_IDENTITY,
+                "new_empty_bootstrap": False,
+                "store_identity": marker["store_identity"],
+                "previous_epoch": 7,
+                "next_epoch": 8,
+                "logical_snapshot": {
+                    "schema": "synapse-s2.logical-snapshot.v1",
+                    "sha256": "f" * 64,
+                },
+                "runtime_publication": {
+                    "status": "complete",
+                    "build_id": predecessor_build,
+                    "authority_epoch_number": 7,
+                },
+            }
+            authority = mock.Mock()
+            authority.lock_generation_id = (
+                "lockfs-v2-1234-17979cfe362a0000"
+            )
+            authority.validate_legacy_lock_generation_transition.return_value = {
+                "schema": "synapse-s2.authority-lock-generation-transition.v1",
+                "predecessor_generation_id": marker["lock_generation_id"],
+                "current_generation_id": authority.lock_generation_id,
+                "lock_inode": 0x1234,
+                "lock_birthtime_ns": 1_700_000_000_000_000_000,
+            }
+
+            service._assert_build_only_replacement_candidate(
+                inspection=inspection,
+                marker=marker,
+                authority=authority,
+            )
+            authority.validate_legacy_lock_generation_transition.assert_called_once_with(
+                legacy_generation_id=marker["lock_generation_id"],
+                durable_claimed_at=100.0,
+            )
+
+            authority.validate_legacy_lock_generation_transition.side_effect = (
+                CoreAuthorityError("invalid transition")
+            )
+            with self.assertRaises(CoreServiceError):
+                service._assert_build_only_replacement_candidate(
+                    inspection=inspection,
+                    marker=marker,
+                    authority=authority,
+                )
+
+    def test_legacy_lock_migration_publication_crash_resumes_without_replay(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            data_root = config.memory_path.parent
+            config = CoreConfig(
+                **{
+                    **config.__dict__,
+                    "capture_root": data_root,
+                }
+            )
+            predecessor_service = AuthoritativeCoreService(config)
+            predecessor_service.start()
+            predecessor_service.close()
+
+            lock_path = data_root / "core" / "authority.lock"
+            lock_inode = int(lock_path.lstat().st_ino)
+            predecessor_generation = (
+                f"lockfs-v1-deadbeef-{lock_inode:x}"
+            )
+            candidate_birthtime_ns = 1_000_000_000
+            candidate_generation = (
+                f"lockfs-v2-{lock_inode:x}-{candidate_birthtime_ns:x}"
+            )
+            with closing(sqlite3.connect(config.memory_path)) as connection:
+                marker = json.loads(
+                    connection.execute(
+                        "SELECT value_json FROM store_metadata "
+                        "WHERE key = 'core_authority'"
+                    ).fetchone()[0]
+                )
+                publication = json.loads(
+                    connection.execute(
+                        "SELECT value_json FROM store_metadata "
+                        "WHERE key = 'core_runtime_state_publication'"
+                    ).fetchone()[0]
+                )
+                predecessor_epoch = int(marker["epoch"])
+                marker["lock_generation_id"] = predecessor_generation
+                marker_sha256 = (
+                    DurableMemoryStore._core_authority_marker_sha256(marker)
+                )
+                publication["lock_generation_id"] = predecessor_generation
+                publication["marker_sha256"] = marker_sha256
+                connection.execute(
+                    "UPDATE store_metadata SET value_json = ? "
+                    "WHERE key = 'core_authority'",
+                    (
+                        json.dumps(
+                            marker,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE store_metadata SET value_json = ? "
+                    "WHERE key = 'core_runtime_state_publication'",
+                    (
+                        json.dumps(
+                            publication,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                connection.commit()
+            runtime_payload = json.loads(
+                config.state_path.read_text(encoding="utf-8")
+            )
+            runtime_payload["authority_binding"] = (
+                DurableMemoryStore.runtime_state_authority_binding_for_marker(
+                    marker
+                )
+            )
+            config.state_path.write_text(
+                json.dumps(
+                    runtime_payload,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config.state_path.chmod(0o600)
+
+            candidate_build = "source-" + ("9" * 24)
+            transition = {
+                "schema": (
+                    "synapse-s2.authority-lock-generation-transition.v1"
+                ),
+                "predecessor_generation_id": predecessor_generation,
+                "current_generation_id": candidate_generation,
+                "lock_inode": lock_inode,
+                "lock_birthtime_ns": candidate_birthtime_ns,
+            }
+            legacy_admission = {
+                "receipt_digest": "a" * 64,
+                "expires_at_unix_ms": int(time.time() * 1000) + 300_000,
+                "restored_target_binding_receipt_digest": None,
+                "lock_generation_transition": "legacy-v1-to-v2",
+            }
+            resumed_admission = {
+                **legacy_admission,
+                "receipt_digest": "b" * 64,
+                "lock_generation_transition": "none",
+            }
+
+            with (
+                mock.patch(
+                    "core_service._source_build_id",
+                    return_value=candidate_build,
+                ),
+                mock.patch(
+                    "core_authority._lock_generation_id",
+                    return_value=candidate_generation,
+                ),
+                mock.patch.object(
+                    CoreAuthorityLease,
+                    "validate_legacy_lock_generation_transition",
+                    return_value=transition,
+                ) as transition_validator,
+            ):
+                failed = AuthoritativeCoreService(config)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {REPLACEMENT_ADMISSION_ENV: "1"},
+                    ),
+                    mock.patch.object(
+                        failed,
+                        "_verify_required_replacement_admission",
+                        return_value=legacy_admission,
+                    ),
+                    mock.patch(
+                        "mlx_backend.SpikingAttentionBackend."
+                        "publish_runtime_state_authority_binding",
+                        side_effect=RuntimeError(
+                            "injected migrated publication failure"
+                        ),
+                    ),
+                    self.assertRaises(CoreServiceError),
+                ):
+                    failed.start()
+                failed.close()
+
+                with closing(sqlite3.connect(config.memory_path)) as connection:
+                    stranded_marker = json.loads(
+                        connection.execute(
+                            "SELECT value_json FROM store_metadata "
+                            "WHERE key = 'core_authority'"
+                        ).fetchone()[0]
+                    )
+                    stranded_publication = json.loads(
+                        connection.execute(
+                            "SELECT value_json FROM store_metadata "
+                            "WHERE key = 'core_runtime_state_publication'"
+                        ).fetchone()[0]
+                    )
+                self.assertEqual(
+                    stranded_marker["lock_generation_id"],
+                    candidate_generation,
+                )
+                self.assertEqual(
+                    stranded_marker["epoch"],
+                    predecessor_epoch + 1,
+                )
+                self.assertEqual(stranded_publication["status"], "pending")
+                self.assertEqual(
+                    json.loads(
+                        config.state_path.read_text(encoding="utf-8")
+                    )["authority_binding"]["lock_generation_id"],
+                    predecessor_generation,
+                )
+                transition_calls_after_migration = (
+                    transition_validator.call_count
+                )
+                self.assertGreater(transition_calls_after_migration, 0)
+
+                publication_recovery = AuthoritativeCoreService(config)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {REPLACEMENT_ADMISSION_ENV: "1"},
+                    ),
+                    mock.patch.object(
+                        publication_recovery,
+                        "_verify_required_replacement_admission",
+                        return_value=legacy_admission,
+                    ) as stale_transition_gate,
+                    self.assertRaises(CoreServiceError),
+                ):
+                    publication_recovery.start()
+                stale_transition_gate.assert_not_called()
+                publication_recovery.close()
+                with closing(sqlite3.connect(config.memory_path)) as connection:
+                    recovered_marker = json.loads(
+                        connection.execute(
+                            "SELECT value_json FROM store_metadata "
+                            "WHERE key = 'core_authority'"
+                        ).fetchone()[0]
+                    )
+                    recovered_publication = json.loads(
+                        connection.execute(
+                            "SELECT value_json FROM store_metadata "
+                            "WHERE key = 'core_runtime_state_publication'"
+                        ).fetchone()[0]
+                    )
+                self.assertEqual(
+                    recovered_marker["epoch"],
+                    predecessor_epoch + 1,
+                )
+                self.assertEqual(
+                    recovered_marker["lock_generation_id"],
+                    candidate_generation,
+                )
+                self.assertEqual(
+                    recovered_publication["status"],
+                    "complete",
+                )
+                self.assertEqual(
+                    json.loads(
+                        config.state_path.read_text(encoding="utf-8")
+                    )["authority_binding"],
+                    DurableMemoryStore.runtime_state_authority_binding_for_marker(
+                        recovered_marker
+                    ),
+                )
+                self.assertEqual(
+                    transition_validator.call_count,
+                    transition_calls_after_migration,
+                )
+
+                resumed = AuthoritativeCoreService(config)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {REPLACEMENT_ADMISSION_ENV: "1"},
+                    ),
+                    mock.patch.object(
+                        resumed,
+                        "_verify_required_replacement_admission",
+                        return_value=resumed_admission,
+                    ) as fresh_v2_gate,
+                ):
+                    resumed.start()
+                fresh_v2_gate.assert_called_once()
+                try:
+                    with closing(
+                        sqlite3.connect(config.memory_path)
+                    ) as connection:
+                        live_marker = json.loads(
+                            connection.execute(
+                                "SELECT value_json FROM store_metadata "
+                                "WHERE key = 'core_authority'"
+                            ).fetchone()[0]
+                        )
+                        live_publication = json.loads(
+                            connection.execute(
+                                "SELECT value_json FROM store_metadata "
+                                "WHERE key = 'core_runtime_state_publication'"
+                            ).fetchone()[0]
+                        )
+                    self.assertEqual(
+                        live_marker["lock_generation_id"],
+                        candidate_generation,
+                    )
+                    self.assertEqual(
+                        live_marker["epoch"],
+                        predecessor_epoch + 2,
+                    )
+                    self.assertEqual(live_publication["status"], "complete")
+                    self.assertEqual(
+                        json.loads(
+                            config.state_path.read_text(encoding="utf-8")
+                        )["authority_binding"],
+                        DurableMemoryStore.runtime_state_authority_binding_for_marker(
+                            live_marker
+                        ),
+                    )
+                    self.assertEqual(
+                        transition_validator.call_count,
+                        transition_calls_after_migration,
+                    )
+                finally:
+                    resumed.close()
+
+                replay_lease = CoreAuthorityLease.acquire_core(
+                    config.memory_path,
+                    timeout_seconds=0.0,
+                    instance_id="legacy-transition-replay-test",
+                )
+                replay_store: DurableMemoryStore | None = None
+                replay_journal: CoreRequestJournal | None = None
+                try:
+                    replay_store = (
+                        DurableMemoryStore.open_existing_for_core_maintenance(
+                            config.memory_path,
+                            authority_lease=replay_lease,
+                        )
+                    )
+                    replay_inspection = (
+                        replay_store.inspect_core_authority_preclaim()
+                    )
+                    replay_marker = replay_inspection["marker"]
+                    replay_journal = CoreRequestJournal(
+                        durable_core_root(config.memory_path)
+                        / "requests.sqlite3",
+                        authority_epoch=(
+                            f"epoch-{int(replay_inspection['next_epoch'])}"
+                        ),
+                        require_existing=True,
+                        prune_on_open=False,
+                        allow_migration=False,
+                        store_identity=str(
+                            replay_inspection["store_identity"]
+                        ),
+                        expected_journal_id=str(
+                            replay_marker["request_journal_id"]
+                        ),
+                    )
+                    replay_binding = replay_journal.binding()
+                    with self.assertRaisesRegex(
+                        CoreAuthorityError,
+                        "narrowly authorized",
+                    ):
+                        replay_store.claim_core_authority(
+                            instance_id=replay_lease.instance_id,
+                            config_fingerprint=config.fingerprint,
+                            build_id=candidate_build,
+                            protocol_version=PROTOCOL_VERSION,
+                            expected_store_identity=str(
+                                replay_inspection["store_identity"]
+                            ),
+                            request_journal_id=str(
+                                replay_binding["journal_id"]
+                            ),
+                            request_journal_binding_schema=str(
+                                replay_binding["schema"]
+                            ),
+                            request_journal_schema_version=int(
+                                replay_binding["journal_schema_version"]
+                            ),
+                            expected_preclaim_logical_snapshot_sha256=str(
+                                replay_inspection["logical_snapshot"][
+                                    "sha256"
+                                ]
+                            ),
+                            expected_previous_epoch=int(
+                                replay_inspection["previous_epoch"]
+                            ),
+                            expected_next_epoch=int(
+                                replay_inspection["next_epoch"]
+                            ),
+                            root_generation_id=str(
+                                replay_marker["root_generation_id"]
+                            ),
+                            embedding_space_identity=(
+                                config.embedding_space_identity
+                            ),
+                            attestation_receipt_digest="c" * 64,
+                            attestation_expires_at_unix_ms=(
+                                int(time.time() * 1000) + 300_000
+                            ),
+                            allow_legacy_lock_generation_transition=True,
+                        )
+                finally:
+                    if replay_journal is not None:
+                        replay_journal.close()
+                    if replay_store is not None:
+                        replay_store.close()
+                    replay_lease.close()
+
+            with closing(sqlite3.connect(config.memory_path)) as connection:
+                final_marker = json.loads(
+                    connection.execute(
+                        "SELECT value_json FROM store_metadata "
+                        "WHERE key = 'core_authority'"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(final_marker["epoch"], predecessor_epoch + 2)
+            self.assertEqual(
+                final_marker["lock_generation_id"],
+                candidate_generation,
             )
 
     def test_replacement_admission_rejects_config_drift_before_verification(

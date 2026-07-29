@@ -513,7 +513,27 @@ else:
         }
 
         class FakeLease:
-            lock_generation_id = marker["lock_generation_id"]
+            lock_generation_id = "lockfs-v2-2-3e8"
+
+            def validate_legacy_lock_generation_transition(
+                self,
+                *,
+                legacy_generation_id: str,
+                durable_claimed_at: float,
+            ) -> dict[str, object]:
+                self.transition_arguments = (
+                    legacy_generation_id,
+                    durable_claimed_at,
+                )
+                return {
+                    "schema": (
+                        "synapse-s2.authority-lock-generation-transition.v1"
+                    ),
+                    "predecessor_generation_id": legacy_generation_id,
+                    "current_generation_id": self.lock_generation_id,
+                    "lock_inode": 2,
+                    "lock_birthtime_ns": 1000,
+                }
 
             def assert_core_for(self, path: Path) -> None:
                 self.asserted_path = path
@@ -635,6 +655,28 @@ else:
                 "request"
             ].expected_replay_required_file_count,
             2,
+        )
+        self.assertEqual(
+            publisher.call_args.kwargs[
+                "request"
+            ].candidate_lock_generation_id,
+            lease.lock_generation_id,
+        )
+        self.assertEqual(
+            publisher.call_args.kwargs[
+                "request"
+            ].lock_generation_transition,
+            "legacy-v1-to-v2",
+        )
+        self.assertEqual(
+            publisher.call_args.kwargs[
+                "request"
+            ].lock_generation_transition_birthtime_ns,
+            1000,
+        )
+        self.assertEqual(
+            lease.transition_arguments,
+            (marker["lock_generation_id"], 0.0),
         )
         self.assertEqual(
             publisher.call_args.kwargs["request"].ttl_seconds,
@@ -2291,9 +2333,219 @@ else:
         self.assertEqual(result["status_reason"], "stopped")
         self.assertFalse(result["authenticated_runtime"]["reachable"])
         self.assertIsNone(result["build_identity"]["matches_current_source"])
+        self.assertFalse(
+            result["durable_authority"]["inspection_available"]
+        )
+        self.assertFalse(result["durable_authority"]["inspection_failed"])
+        self.assertFalse(result["operator_action_required"])
         self.assertFalse(result["replacement_required"])
         self.assertFalse(self.home.exists())
         self.assertFalse(self.core.exists())
+
+    def test_stopped_v6_status_reports_exact_durable_authority_read_only(
+        self,
+    ) -> None:
+        self._prepare_recoverable_v6()
+        watched = (
+            self.paths.config,
+            self.paths.memory_db,
+            self.core / "authority.lock",
+            self.paths.state,
+        )
+
+        def snapshot() -> dict[str, tuple[int, int, int, int, str]]:
+            return {
+                str(path): (
+                    int(path.lstat().st_mode),
+                    int(path.lstat().st_size),
+                    int(path.lstat().st_mtime_ns),
+                    int(path.lstat().st_ctime_ns),
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+                for path in watched
+            }
+
+        before = snapshot()
+        before_sidecars = {
+            str(path)
+            for suffix in ("-journal", "-wal", "-shm")
+            if (path := Path(f"{self.paths.memory_db}{suffix}")).exists()
+        }
+        result = installer.status(
+            paths=self.paths,
+            launchctl=self._launchctl(),
+        )
+        after_sidecars = {
+            str(path)
+            for suffix in ("-journal", "-wal", "-shm")
+            if (path := Path(f"{self.paths.memory_db}{suffix}")).exists()
+        }
+
+        durable = result["durable_authority"]
+        self.assertEqual(result["status_reason"], "stopped")
+        self.assertFalse(result["replacement_required"])
+        self.assertTrue(durable["inspection_available"])
+        self.assertEqual(
+            durable["marker_build_id"],
+            installer._manifest_build_id(ROOT),
+        )
+        self.assertTrue(durable["matches_current_source"])
+        self.assertTrue(durable["exact_match"])
+        self.assertFalse(
+            durable["legacy_v1_to_v2_transition_valid"]
+        )
+        self.assertEqual(
+            durable["marker_lock_generation_id"],
+            durable["current_lock_generation_id"],
+        )
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(after_sidecars, before_sidecars)
+
+    def test_stopped_v6_status_requires_guarded_build_replacement(
+        self,
+    ) -> None:
+        self._prepare_recoverable_v6()
+        marker_build_id = installer._manifest_build_id(ROOT)
+        candidate_build_id = "source-" + ("f" * 24)
+        if candidate_build_id == marker_build_id:
+            candidate_build_id = "source-" + ("e" * 24)
+
+        with mock.patch.object(
+            installer,
+            "_manifest_build_id",
+            return_value=candidate_build_id,
+        ):
+            result = installer.status(
+                paths=self.paths,
+                launchctl=self._launchctl(),
+            )
+
+        durable = result["durable_authority"]
+        self.assertEqual(
+            result["status_reason"],
+            "guarded-replacement-required",
+        )
+        self.assertTrue(result["replacement_required"])
+        self.assertTrue(durable["inspection_available"])
+        self.assertEqual(durable["marker_build_id"], marker_build_id)
+        self.assertFalse(durable["matches_current_source"])
+        self.assertTrue(durable["exact_match"])
+        self.assertFalse(
+            durable["legacy_v1_to_v2_transition_valid"]
+        )
+
+    def test_stopped_v6_status_identifies_guarded_legacy_lock_migration(
+        self,
+    ) -> None:
+        with mock.patch(
+            "core_authority._lock_birthtime_ns",
+            return_value=None,
+        ):
+            self._prepare_recoverable_v6()
+
+        with mock.patch(
+            "core_authority._lock_birthtime_ns",
+            return_value=1_000_000_000,
+        ):
+            result = installer.status(
+                paths=self.paths,
+                launchctl=self._launchctl(),
+            )
+
+        durable = result["durable_authority"]
+        self.assertEqual(
+            result["status_reason"],
+            "guarded-lock-migration-required",
+        )
+        self.assertTrue(result["replacement_required"])
+        self.assertTrue(durable["inspection_available"])
+        self.assertTrue(durable["matches_current_source"])
+        self.assertFalse(durable["exact_match"])
+        self.assertTrue(
+            durable["legacy_v1_to_v2_transition_valid"]
+        )
+        self.assertTrue(
+            str(durable["marker_lock_generation_id"]).startswith(
+                "lockfs-v1-"
+            )
+        )
+        self.assertTrue(
+            str(durable["current_lock_generation_id"]).startswith(
+                "lockfs-v2-"
+            )
+        )
+
+    def test_stopped_v6_status_rejects_unrelated_lock_generation(
+        self,
+    ) -> None:
+        with mock.patch(
+            "core_authority._lock_generation_id",
+            return_value="lockfs-v1-1-deadbeef",
+        ):
+            self._prepare_recoverable_v6()
+
+        result = installer.status(
+            paths=self.paths,
+            launchctl=self._launchctl(),
+        )
+
+        durable = result["durable_authority"]
+        self.assertEqual(
+            result["status_reason"],
+            "authority-lock-mismatch",
+        )
+        self.assertTrue(result["replacement_required"])
+        self.assertTrue(durable["inspection_available"])
+        self.assertTrue(durable["matches_current_source"])
+        self.assertFalse(durable["exact_match"])
+        self.assertFalse(
+            durable["legacy_v1_to_v2_transition_valid"]
+        )
+
+    def test_stopped_v6_status_fails_closed_when_lock_is_not_private(
+        self,
+    ) -> None:
+        self._prepare_recoverable_v6()
+        lock_path = self.core / "authority.lock"
+        lock_path.chmod(0o640)
+        lock_bytes = lock_path.read_bytes()
+
+        result = installer.status(
+            paths=self.paths,
+            launchctl=self._launchctl(),
+        )
+
+        self.assertEqual(
+            result["status_reason"],
+            "durable-authority-inspection-failed",
+        )
+        self.assertTrue(result["replacement_required"])
+        self.assertTrue(result["operator_action_required"])
+        self.assertFalse(
+            result["durable_authority"]["inspection_available"]
+        )
+        self.assertTrue(
+            result["durable_authority"]["inspection_failed"]
+        )
+        self.assertTrue(
+            result["durable_authority"]["operator_action_required"]
+        )
+        self.assertEqual(
+            set(result["durable_authority"]),
+            {
+                "inspection_available",
+                "inspection_failed",
+                "operator_action_required",
+                "marker_build_id",
+                "matches_current_source",
+                "marker_lock_generation_id",
+                "current_lock_generation_id",
+                "exact_match",
+                "legacy_v1_to_v2_transition_valid",
+            },
+        )
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o640)
+        self.assertEqual(lock_path.read_bytes(), lock_bytes)
 
     def test_status_classifies_authenticated_build_drift_without_claiming_health(
         self,

@@ -109,9 +109,9 @@ CUTOVER_ATTESTATION_MAX_TTL_SECONDS = 600.0
 # 150-second preclaim floor; an attestation produced at the exact consumer
 # boundary would already be ineligible by the time the service reads it.
 CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS = 180.0
-REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v2"
+REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v3"
 REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA = (
-    "synapse-s2.replacement-admission-verification.v2"
+    "synapse-s2.replacement-admission-verification.v3"
 )
 REPLACEMENT_ADMISSION_NAME = "replacement-admission.json"
 REPLACEMENT_ADMISSION_MAX_BYTES = 64 * 1024
@@ -120,6 +120,14 @@ REPLACEMENT_ADMISSION_MAX_TTL_SECONDS = 1_800.0
 REPLACEMENT_ADMISSION_MIN_VALIDITY_SECONDS = 120.0
 REPLACEMENT_ADMISSION_MAX_PENDING_FILES = 1_000
 REPLACEMENT_CERTIFICATION_INSTANCE_PREFIX = "replacement-certification:"
+REPLACEMENT_LOCK_GENERATION_TRANSITION_NONE = "none"
+REPLACEMENT_LOCK_GENERATION_TRANSITION_LEGACY_V1_TO_V2 = "legacy-v1-to-v2"
+_LEGACY_LOCK_GENERATION_ID = re.compile(
+    r"^lockfs-v1-(?P<device>[0-9a-f]{1,32})-(?P<inode>[0-9a-f]{1,32})$"
+)
+_STABLE_LOCK_GENERATION_ID = re.compile(
+    r"^lockfs-v2-(?P<inode>[0-9a-f]{1,32})-(?P<birthtime_ns>[0-9a-f]{1,32})$"
+)
 MAXIMUM_EVIDENCE_AGE_SECONDS = 86_400.0
 MAXIMUM_UNIX_TIMESTAMP_SECONDS = 253_402_300_799.0
 MAXIMUM_UNIX_TIMESTAMP_MILLISECONDS = 253_402_300_799_000
@@ -205,6 +213,9 @@ _REPLACEMENT_ADMISSION_CONTENT_KEYS = {
     "predecessor_config_fingerprint",
     "predecessor_protocol_version",
     "predecessor_lock_generation_id",
+    "candidate_lock_generation_id",
+    "lock_generation_transition",
+    "lock_generation_transition_birthtime_ns",
     "predecessor_root_generation_id",
     "predecessor_embedding_space_identity",
     "predecessor_request_journal_id",
@@ -434,6 +445,9 @@ class ReplacementAdmissionRequest:
     ttl_seconds: float = REPLACEMENT_ADMISSION_DEFAULT_TTL_SECONDS
     expected_pending_file_count: int = 0
     expected_replay_required_file_count: int | None = None
+    candidate_lock_generation_id: str | None = None
+    lock_generation_transition: str | None = None
+    lock_generation_transition_birthtime_ns: int | None = None
 
 
 def _normal_absolute(path: str | os.PathLike[str], *, name: str) -> Path:
@@ -1668,6 +1682,76 @@ def _replacement_delivery_binding(
     return dict(delivery_audit)
 
 
+def _replacement_lock_generation_binding(
+    *,
+    predecessor_lock_generation_id: object,
+    candidate_lock_generation_id: object = None,
+    lock_generation_transition: object = None,
+    lock_generation_transition_birthtime_ns: object = None,
+) -> dict[str, Any]:
+    """Close one replacement admission over its exact lock generation.
+
+    Ordinary replacements retain the predecessor generation.  The only
+    migration admitted here converts the legacy device/inode encoding to the
+    stable inode/birth-time encoding for that same inode.  No filesystem claim
+    is inferred by this pure validator; callers must provide the birth time
+    observed while holding the candidate lock.
+    """
+
+    predecessor = str(predecessor_lock_generation_id or "")
+    candidate = (
+        predecessor
+        if candidate_lock_generation_id is None
+        else str(candidate_lock_generation_id)
+    )
+    transition = (
+        REPLACEMENT_LOCK_GENERATION_TRANSITION_NONE
+        if lock_generation_transition is None
+        else lock_generation_transition
+    )
+    if (
+        CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(predecessor) is None
+        or CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(candidate) is None
+    ):
+        raise CutoverPreflightError(
+            "replacement lock generation binding is invalid"
+        )
+    if transition == REPLACEMENT_LOCK_GENERATION_TRANSITION_NONE:
+        if (
+            candidate != predecessor
+            or lock_generation_transition_birthtime_ns is not None
+        ):
+            raise CutoverPreflightError(
+                "ordinary replacement must retain the predecessor lock generation"
+            )
+    elif transition == REPLACEMENT_LOCK_GENERATION_TRANSITION_LEGACY_V1_TO_V2:
+        legacy = _LEGACY_LOCK_GENERATION_ID.fullmatch(predecessor)
+        stable = _STABLE_LOCK_GENERATION_ID.fullmatch(candidate)
+        birthtime_ns = lock_generation_transition_birthtime_ns
+        if (
+            legacy is None
+            or stable is None
+            or legacy.group("inode") != stable.group("inode")
+            or type(birthtime_ns) is not int
+            or birthtime_ns <= 0
+            or int(stable.group("birthtime_ns"), 16) != birthtime_ns
+        ):
+            raise CutoverPreflightError(
+                "legacy replacement lock generation transition is invalid"
+            )
+    else:
+        raise CutoverPreflightError(
+            "replacement lock generation transition is unsupported"
+        )
+    return {
+        "candidate_lock_generation_id": candidate,
+        "lock_generation_transition": transition,
+        "lock_generation_transition_birthtime_ns": (
+            lock_generation_transition_birthtime_ns
+        ),
+    }
+
+
 def _replacement_admission_content(
     *,
     created_at_unix_ms: int,
@@ -1680,6 +1764,9 @@ def _replacement_admission_content(
     inspection: Mapping[str, Any],
     delivery_audit: Mapping[str, Any],
     recovery: Mapping[str, Any],
+    candidate_lock_generation_id: str | None = None,
+    lock_generation_transition: str | None = None,
+    lock_generation_transition_birthtime_ns: int | None = None,
 ) -> dict[str, Any]:
     predecessor = _validate_replacement_inspection(
         inspection,
@@ -1688,6 +1775,16 @@ def _replacement_admission_content(
         candidate_config_fingerprint=candidate_config_fingerprint,
     )
     delivery = _validate_ready_delivery_audit(delivery_audit)
+    lock_generation = _replacement_lock_generation_binding(
+        predecessor_lock_generation_id=predecessor[
+            "predecessor_lock_generation_id"
+        ],
+        candidate_lock_generation_id=candidate_lock_generation_id,
+        lock_generation_transition=lock_generation_transition,
+        lock_generation_transition_birthtime_ns=(
+            lock_generation_transition_birthtime_ns
+        ),
+    )
     return {
         "schema": REPLACEMENT_ADMISSION_SCHEMA,
         "created_at_unix_ms": created_at_unix_ms,
@@ -1746,6 +1843,7 @@ def _replacement_admission_content(
             "recovery_restore_proof_receipt_digest"
         ),
         **predecessor,
+        **lock_generation,
         "delivery_audit_sha256": delivery["sha256"],
         "delivery_audit_revision": delivery["audit_revision"],
         "delivery_settled_audit_revision": delivery[
@@ -1981,6 +2079,22 @@ def _validate_replacement_admission(
         != payload.get("delivery_latest_event_id")
     ):
         raise CutoverPreflightError("replacement admission values are invalid")
+    lock_generation = _replacement_lock_generation_binding(
+        predecessor_lock_generation_id=payload.get(
+            "predecessor_lock_generation_id"
+        ),
+        candidate_lock_generation_id=payload.get(
+            "candidate_lock_generation_id"
+        ),
+        lock_generation_transition=payload.get("lock_generation_transition"),
+        lock_generation_transition_birthtime_ns=payload.get(
+            "lock_generation_transition_birthtime_ns"
+        ),
+    )
+    if any(payload.get(key) != value for key, value in lock_generation.items()):
+        raise CutoverPreflightError(
+            "replacement lock generation content binding changed"
+        )
     for field, name in (
         ("recovery_bundle_receipt_path", "recovery bundle receipt"),
         ("recovery_restore_proof_path", "isolated restore proof"),
@@ -2509,6 +2623,11 @@ def publish_replacement_admission(
         inspection=inspection,
         delivery_audit=delivery,
         recovery=recovery,
+        candidate_lock_generation_id=request.candidate_lock_generation_id,
+        lock_generation_transition=request.lock_generation_transition,
+        lock_generation_transition_birthtime_ns=(
+            request.lock_generation_transition_birthtime_ns
+        ),
     )
     store = DurableMemoryStore.open_existing_for_audit(memory_db)
     try:
@@ -2578,6 +2697,15 @@ def publish_replacement_admission(
             "predecessor_build_id": expected_content[
                 "predecessor_build_id"
             ],
+            "candidate_lock_generation_id": expected_content[
+                "candidate_lock_generation_id"
+            ],
+            "lock_generation_transition": expected_content[
+                "lock_generation_transition"
+            ],
+            "lock_generation_transition_birthtime_ns": expected_content[
+                "lock_generation_transition_birthtime_ns"
+            ],
             "authority_epoch_number": expected_content[
                 "authority_epoch_number"
             ],
@@ -2620,6 +2748,9 @@ def verify_replacement_admission_for_core(
     delivery_audit: Mapping[str, Any],
     maximum_evidence_age_seconds: float = 7200.0,
     minimum_remaining_seconds: float = 0.0,
+    expected_candidate_lock_generation_id: str | None = None,
+    expected_lock_generation_transition: str | None = None,
+    expected_lock_generation_transition_birthtime_ns: int | None = None,
 ) -> dict[str, Any]:
     """Reverify a signed successor admission under the acquired core lease."""
 
@@ -2702,6 +2833,11 @@ def verify_replacement_admission_for_core(
         inspection=inspection,
         delivery_audit=delivery,
         recovery=recovery,
+        candidate_lock_generation_id=expected_candidate_lock_generation_id,
+        lock_generation_transition=expected_lock_generation_transition,
+        lock_generation_transition_birthtime_ns=(
+            expected_lock_generation_transition_birthtime_ns
+        ),
     )
     verification_store = DurableMemoryStore.open_existing_for_audit(memory_db)
     try:
@@ -2754,6 +2890,9 @@ def verify_replacement_admission_for_core(
         "predecessor_config_fingerprint",
         "predecessor_protocol_version",
         "predecessor_lock_generation_id",
+        "candidate_lock_generation_id",
+        "lock_generation_transition",
+        "lock_generation_transition_birthtime_ns",
         "predecessor_root_generation_id",
         "predecessor_embedding_space_identity",
         "predecessor_request_journal_id",

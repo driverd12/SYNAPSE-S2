@@ -255,6 +255,106 @@ class ReplacementAdmissionTests(unittest.TestCase):
             content["candidate_config_fingerprint"],
             content["predecessor_config_fingerprint"],
         )
+        self.assertEqual(
+            content["candidate_lock_generation_id"],
+            content["predecessor_lock_generation_id"],
+        )
+        self.assertEqual(content["lock_generation_transition"], "none")
+        self.assertIsNone(
+            content["lock_generation_transition_birthtime_ns"]
+        )
+
+    def test_contract_accepts_only_exact_legacy_v1_to_stable_v2_transition(
+        self,
+    ) -> None:
+        now = int(time.time() * 1000)
+        birthtime_ns = 0x123456789
+        candidate_generation = f"lockfs-v2-b-{birthtime_ns:x}"
+        content = preflight._replacement_admission_content(
+            created_at_unix_ms=now,
+            expires_at_unix_ms=now + 300_000,
+            git_head="a" * 40,
+            candidate_build_id=self.candidate_build_id,
+            candidate_config_fingerprint=self.config_fingerprint,
+            receipt_path=self.receipt_path,
+            restore_proof_path=self.proof_path,
+            inspection=self._inspection(),
+            delivery_audit=self._delivery_audit(),
+            recovery=self._recovery(),
+            candidate_lock_generation_id=candidate_generation,
+            lock_generation_transition="legacy-v1-to-v2",
+            lock_generation_transition_birthtime_ns=birthtime_ns,
+        )
+        payload = self._signed(content)
+        store = DurableMemoryStore.open_existing_for_audit(self.memory_db)
+        try:
+            self.assertEqual(
+                preflight._validate_replacement_admission(
+                    payload,
+                    store=store,
+                    expected_content=content,
+                    expected_auth_key_id=self.auth_key_id,
+                    now_unix_ms=now,
+                ),
+                payload["receipt_digest"],
+            )
+        finally:
+            store.close()
+        self.assertEqual(
+            content["predecessor_lock_generation_id"], "lockfs-v1-a-b"
+        )
+        self.assertEqual(
+            content["candidate_lock_generation_id"], candidate_generation
+        )
+        self.assertEqual(
+            content["lock_generation_transition"], "legacy-v1-to-v2"
+        )
+        self.assertEqual(
+            content["lock_generation_transition_birthtime_ns"], birthtime_ns
+        )
+
+        invalid = (
+            {
+                "candidate_lock_generation_id": "lockfs-v2-c-123456789",
+                "lock_generation_transition": "legacy-v1-to-v2",
+                "lock_generation_transition_birthtime_ns": birthtime_ns,
+            },
+            {
+                "candidate_lock_generation_id": candidate_generation,
+                "lock_generation_transition": "legacy-v1-to-v2",
+                "lock_generation_transition_birthtime_ns": birthtime_ns + 1,
+            },
+            {
+                "candidate_lock_generation_id": candidate_generation,
+                "lock_generation_transition": "legacy-v1-to-v2",
+                "lock_generation_transition_birthtime_ns": True,
+            },
+            {
+                "candidate_lock_generation_id": candidate_generation,
+                "lock_generation_transition": "none",
+                "lock_generation_transition_birthtime_ns": None,
+            },
+            {
+                "candidate_lock_generation_id": "lockfs-v1-a-b",
+                "lock_generation_transition": "legacy-v2-to-v3",
+                "lock_generation_transition_birthtime_ns": None,
+            },
+        )
+        for binding in invalid:
+            with self.subTest(binding=binding), self.assertRaises(
+                preflight.CutoverPreflightError
+            ):
+                preflight._replacement_lock_generation_binding(
+                    predecessor_lock_generation_id="lockfs-v1-a-b",
+                    **binding,
+                )
+        with self.assertRaises(preflight.CutoverPreflightError):
+            preflight._replacement_lock_generation_binding(
+                predecessor_lock_generation_id="lockfs-v2-b-123456789",
+                candidate_lock_generation_id=candidate_generation,
+                lock_generation_transition="legacy-v1-to-v2",
+                lock_generation_transition_birthtime_ns=birthtime_ns,
+            )
 
     def test_contract_binds_exact_pending_capture_counts(self) -> None:
         now = int(time.time() * 1000)
@@ -546,6 +646,103 @@ class ReplacementAdmissionTests(unittest.TestCase):
         self.assertEqual(
             persisted["predecessor_lock_generation_id"],
             inspection["marker"]["lock_generation_id"],
+        )
+        self.assertEqual(
+            verified["candidate_lock_generation_id"],
+            verified["predecessor_lock_generation_id"],
+        )
+        self.assertEqual(verified["lock_generation_transition"], "none")
+        self.assertIsNone(
+            verified["lock_generation_transition_birthtime_ns"]
+        )
+
+    def test_publish_and_core_verify_require_exact_expected_lock_transition(
+        self,
+    ) -> None:
+        inspection = self._inspection()
+        recovery = self._recovery()
+        delivery = self._delivery_audit()
+        birthtime_ns = 0x987654321
+        candidate_generation = f"lockfs-v2-b-{birthtime_ns:x}"
+        request = preflight.ReplacementAdmissionRequest(
+            path=self.admission_path,
+            build_id=self.candidate_build_id,
+            config_fingerprint=self.config_fingerprint,
+            candidate_lock_generation_id=candidate_generation,
+            lock_generation_transition="legacy-v1-to-v2",
+            lock_generation_transition_birthtime_ns=birthtime_ns,
+        )
+        with (
+            mock.patch.object(
+                preflight,
+                "_git_snapshot",
+                return_value=("a" * 40, ""),
+            ),
+            mock.patch(
+                "core_service._manifest_build_id",
+                return_value=self.candidate_build_id,
+            ),
+            mock.patch.object(
+                preflight,
+                "_replacement_recovery_binding",
+                return_value=(recovery, time.time() + 3_600),
+            ),
+            mock.patch.object(
+                preflight,
+                "_replacement_delivery_binding",
+                return_value=delivery,
+            ),
+        ):
+            published = preflight.publish_replacement_admission(
+                request=request,
+                root=ROOT,
+                memory_db=self.memory_db,
+                capture_root=self.data,
+                recovery_bundle_receipt=self.receipt_path,
+                recovery_restore_proof=self.proof_path,
+                inspection=inspection,
+                delivery_audit=delivery,
+            )
+            with self.assertRaisesRegex(
+                preflight.CutoverPreflightError,
+                "content binding changed",
+            ):
+                preflight.verify_replacement_admission_for_core(
+                    root=ROOT,
+                    memory_db=self.memory_db,
+                    capture_root=self.data,
+                    attestation_path=self.admission_path,
+                    expected_build_id=self.candidate_build_id,
+                    expected_config_fingerprint=self.config_fingerprint,
+                    inspection=inspection,
+                    delivery_audit=delivery,
+                )
+            verified = preflight.verify_replacement_admission_for_core(
+                root=ROOT,
+                memory_db=self.memory_db,
+                capture_root=self.data,
+                attestation_path=self.admission_path,
+                expected_build_id=self.candidate_build_id,
+                expected_config_fingerprint=self.config_fingerprint,
+                inspection=inspection,
+                delivery_audit=delivery,
+                expected_candidate_lock_generation_id=candidate_generation,
+                expected_lock_generation_transition="legacy-v1-to-v2",
+                expected_lock_generation_transition_birthtime_ns=(
+                    birthtime_ns
+                ),
+            )
+        self.assertEqual(
+            published["candidate_lock_generation_id"], candidate_generation
+        )
+        self.assertEqual(
+            verified["candidate_lock_generation_id"], candidate_generation
+        )
+        self.assertEqual(
+            verified["lock_generation_transition"], "legacy-v1-to-v2"
+        )
+        self.assertEqual(
+            verified["lock_generation_transition_birthtime_ns"], birthtime_ns
         )
 
     def test_publish_rejects_dirty_source_and_core_verify_rejects_live_drift(self) -> None:

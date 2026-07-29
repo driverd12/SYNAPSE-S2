@@ -8,9 +8,17 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from core_authority import CoreAuthorityError, CoreAuthorityLease
+from core_authority import (
+    CORE_AUTHORITY_LOCK_GENERATION_RE,
+    CORE_AUTHORITY_LOCK_TRANSITION_SCHEMA,
+    CoreAuthorityError,
+    CoreAuthorityLease,
+    _lock_generation_id,
+    _validated_legacy_lock_generation_transition,
+)
 from memory_store import DurableMemoryStore, SQLITE_APPLICATION_ID
 from recovery_manager import VerifiedRecoveryManager
 
@@ -87,6 +95,143 @@ class CoreAuthorityLeaseTests(unittest.TestCase):
             self.addCleanup(replacement.close)
             self.assertNotEqual(replacement.lock_generation_id, generation)
 
+    def test_lock_generation_v2_uses_inode_and_rounded_birthtime_not_device(self) -> None:
+        first = SimpleNamespace(
+            st_dev=0x111,
+            st_ino=0x222,
+            st_birthtime=1_700_000_000.1234567,
+        )
+        second = SimpleNamespace(
+            st_dev=0x999,
+            st_ino=first.st_ino,
+            st_birthtime=first.st_birthtime,
+        )
+        birthtime_ns = int(round(first.st_birthtime * 1_000_000_000))
+        expected = f"lockfs-v2-{first.st_ino:x}-{birthtime_ns:x}"
+
+        self.assertEqual(_lock_generation_id(first), expected)
+        self.assertEqual(_lock_generation_id(second), expected)
+        self.assertIsNotNone(CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(expected))
+
+    def test_lock_generation_retains_v1_without_platform_birthtime(self) -> None:
+        identity = SimpleNamespace(st_dev=0x111, st_ino=0x222)
+        expected = "lockfs-v1-111-222"
+
+        self.assertEqual(_lock_generation_id(identity), expected)
+        self.assertIsNotNone(CORE_AUTHORITY_LOCK_GENERATION_RE.fullmatch(expected))
+
+    def test_invalid_exposed_birthtime_fails_closed_without_v1_fallback(self) -> None:
+        for birthtime in (None, 0.0, float("nan"), float("inf")):
+            with self.subTest(birthtime=birthtime):
+                identity = SimpleNamespace(
+                    st_dev=0x111,
+                    st_ino=0x222,
+                    st_birthtime=birthtime,
+                )
+                with self.assertRaisesRegex(CoreAuthorityError, "birthtime"):
+                    _lock_generation_id(identity)
+
+    def test_core_lease_validates_closed_legacy_v1_to_v2_transition(self) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            core = CoreAuthorityLease.acquire_core(database, timeout_seconds=0.0)
+            self.addCleanup(core.close)
+            observed = os.fstat(core.descriptor)
+            if not hasattr(observed, "st_birthtime"):
+                self.skipTest("filesystem does not expose inode birthtime")
+            birthtime_ns = int(round(observed.st_birthtime * 1_000_000_000))
+            legacy_generation_id = f"lockfs-v1-deadbeef-{observed.st_ino:x}"
+
+            result = core.validate_legacy_lock_generation_transition(
+                legacy_generation_id=legacy_generation_id,
+                durable_claimed_at=max(time.time(), float(observed.st_birthtime)),
+            )
+
+            self.assertEqual(
+                result,
+                {
+                    "schema": CORE_AUTHORITY_LOCK_TRANSITION_SCHEMA,
+                    "predecessor_generation_id": legacy_generation_id,
+                    "current_generation_id": core.lock_generation_id,
+                    "lock_inode": int(observed.st_ino),
+                    "lock_birthtime_ns": birthtime_ns,
+                },
+            )
+
+    def test_legacy_generation_transition_rejects_non_core_or_closed_lease(self) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            local = CoreAuthorityLease.acquire_local(database)
+            observed = os.fstat(local.descriptor)
+            legacy_generation_id = f"lockfs-v1-1-{observed.st_ino:x}"
+            with self.assertRaisesRegex(CoreAuthorityError, "core lease is not active"):
+                local.validate_legacy_lock_generation_transition(
+                    legacy_generation_id=legacy_generation_id,
+                    durable_claimed_at=time.time(),
+                )
+            local.close()
+
+            core = CoreAuthorityLease.acquire_core(database, timeout_seconds=0.0)
+            observed = os.fstat(core.descriptor)
+            legacy_generation_id = f"lockfs-v1-1-{observed.st_ino:x}"
+            core.close()
+            with self.assertRaisesRegex(CoreAuthorityError, "lease is not active"):
+                core.validate_legacy_lock_generation_transition(
+                    legacy_generation_id=legacy_generation_id,
+                    durable_claimed_at=time.time(),
+                )
+
+    def test_legacy_generation_transition_rejects_nonzero_lock(self) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            core = CoreAuthorityLease.acquire_core(database, timeout_seconds=0.0)
+            self.addCleanup(core.close)
+            observed = os.fstat(core.descriptor)
+            if not hasattr(observed, "st_birthtime"):
+                self.skipTest("filesystem does not expose inode birthtime")
+            os.write(core.descriptor, b"x")
+            try:
+                with self.assertRaisesRegex(CoreAuthorityError, "zero-byte"):
+                    core.validate_legacy_lock_generation_transition(
+                        legacy_generation_id=(
+                            f"lockfs-v1-1-{observed.st_ino:x}"
+                        ),
+                        durable_claimed_at=time.time(),
+                    )
+            finally:
+                os.ftruncate(core.descriptor, 0)
+
+    def test_pure_legacy_generation_transition_fails_closed(self) -> None:
+        inode = 0x222
+        birthtime_ns = 1_700_000_000_000_000_000
+        current = f"lockfs-v2-{inode:x}-{birthtime_ns:x}"
+        base = {
+            "legacy_generation_id": f"lockfs-v1-111-{inode:x}",
+            "current_generation_id": current,
+            "lock_inode": inode,
+            "lock_birthtime_ns": birthtime_ns,
+            "durable_claimed_at": 1_700_000_000.0,
+            "timestamp_tolerance_seconds": 1.0,
+        }
+        cases = (
+            ("legacy_generation_id", current, "transition is invalid"),
+            ("legacy_generation_id", "lockfs-v1-111-333", "changed inode"),
+            ("current_generation_id", f"lockfs-v2-333-{birthtime_ns:x}", "changed inode"),
+            (
+                "current_generation_id",
+                f"lockfs-v2-{inode:x}-{birthtime_ns + 1:x}",
+                "birthtime is inconsistent",
+            ),
+            ("durable_claimed_at", 1_699_999_998.0, "created after"),
+            ("timestamp_tolerance_seconds", 1.000001, "tolerance is invalid"),
+        )
+        for field, value, error in cases:
+            with self.subTest(field=field, value=value):
+                arguments = dict(base)
+                arguments[field] = value
+                with self.assertRaisesRegex(CoreAuthorityError, error):
+                    _validated_legacy_lock_generation_transition(**arguments)
+
     def test_core_exclusive_lease_rejects_new_local_backend(self) -> None:
         with TemporaryDirectory() as temporary:
             database = Path(temporary) / "memory.sqlite3"
@@ -95,6 +240,137 @@ class CoreAuthorityLeaseTests(unittest.TestCase):
 
             with self.assertRaisesRegex(CoreAuthorityError, "route through the core client"):
                 CoreAuthorityLease.acquire_local(database)
+
+    def test_claim_requires_explicit_attested_legacy_lock_transition(self) -> None:
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "memory.sqlite3"
+            bootstrap = DurableMemoryStore(database)
+            bootstrap.close()
+            predecessor_lease = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-lock-transition-predecessor",
+            )
+            predecessor = DurableMemoryStore(
+                database,
+                authority_lease=predecessor_lease,
+            )
+            first_claim = self._claim(predecessor, predecessor_lease)
+            predecessor.close()
+            predecessor_lease.close()
+
+            successor_lease = CoreAuthorityLease.acquire_core(
+                database,
+                timeout_seconds=0.0,
+                instance_id="core-lock-transition-successor",
+            )
+            self.addCleanup(successor_lease.close)
+            legacy_generation = (
+                f"lockfs-v1-deadbeef-{successor_lease.lock_inode:x}"
+            )
+            with closing(sqlite3.connect(database)) as conn:
+                marker_row = conn.execute(
+                    "SELECT value_json, updated_at FROM store_metadata "
+                    "WHERE key = 'core_authority'"
+                ).fetchone()
+                publication_row = conn.execute(
+                    "SELECT value_json, updated_at FROM store_metadata "
+                    "WHERE key = 'core_runtime_state_publication'"
+                ).fetchone()
+                marker = json.loads(str(marker_row[0]))
+                publication = json.loads(str(publication_row[0]))
+                marker["lock_generation_id"] = legacy_generation
+                marker_sha256 = DurableMemoryStore._core_authority_marker_sha256(
+                    marker
+                )
+                publication["lock_generation_id"] = legacy_generation
+                publication["marker_sha256"] = marker_sha256
+                conn.execute(
+                    "UPDATE store_metadata SET value_json = ? "
+                    "WHERE key = 'core_authority'",
+                    (
+                        json.dumps(
+                            marker,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE store_metadata SET value_json = ? "
+                    "WHERE key = 'core_runtime_state_publication'",
+                    (
+                        json.dumps(
+                            publication,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                conn.commit()
+
+            successor = DurableMemoryStore.open_existing_for_core_maintenance(
+                database,
+                authority_lease=successor_lease,
+            )
+            self.addCleanup(successor.close)
+            inspection = successor.inspect_core_authority_preclaim()
+            logical_snapshot = inspection["logical_snapshot"]
+            claim_arguments = {
+                "instance_id": successor_lease.instance_id,
+                "config_fingerprint": "a" * 64,
+                "build_id": "test-build",
+                "protocol_version": "synapse-core.v1",
+                "expected_store_identity": str(inspection["store_identity"]),
+                "request_journal_id": "journal-" + ("a" * 24),
+                "request_journal_binding_schema": (
+                    "synapse-s2.request-journal-binding.v1"
+                ),
+                "request_journal_schema_version": 3,
+                "expected_preclaim_logical_snapshot_sha256": str(
+                    logical_snapshot["sha256"]
+                ),
+                "expected_previous_epoch": int(inspection["previous_epoch"]),
+                "expected_next_epoch": int(inspection["next_epoch"]),
+                "root_generation_id": "generation-" + ("a" * 24),
+                "embedding_space_identity": "a" * 64,
+                "attestation_receipt_digest": "c" * 64,
+                "attestation_expires_at_unix_ms": (
+                    int(time.time() * 1000) + 60_000
+                ),
+            }
+            with self.assertRaisesRegex(
+                CoreAuthorityError,
+                "restored-target adoption",
+            ):
+                successor.claim_core_authority(**claim_arguments)
+
+            transition = {
+                "schema": "synapse-s2.authority-lock-generation-transition.v1",
+                "predecessor_generation_id": legacy_generation,
+                "current_generation_id": successor_lease.lock_generation_id,
+                "lock_inode": successor_lease.lock_inode,
+                "lock_birthtime_ns": 1,
+            }
+            with patch.object(
+                successor_lease,
+                "validate_legacy_lock_generation_transition",
+                return_value=transition,
+            ) as validator:
+                claimed = successor.claim_core_authority(
+                    **claim_arguments,
+                    allow_legacy_lock_generation_transition=True,
+                )
+
+            validator.assert_called_once_with(
+                legacy_generation_id=legacy_generation,
+                durable_claimed_at=float(marker["claimed_at"]),
+            )
+            self.assertEqual(
+                claimed["lock_generation_id"],
+                successor_lease.lock_generation_id,
+            )
+            self.assertEqual(claimed["epoch"], first_claim["epoch"] + 1)
 
     def test_store_lifetime_holds_local_fence_and_core_can_take_over_after_close(self) -> None:
         with TemporaryDirectory() as temporary:

@@ -32,7 +32,11 @@ from core_protocol import (  # noqa: E402
     contains_secret_shape,
     decode_canonical_json,
 )
-from core_authority import CoreAuthorityError, CoreAuthorityLease  # noqa: E402
+from core_authority import (  # noqa: E402
+    CoreAuthorityError,
+    CoreAuthorityLease,
+    _lock_generation_id,
+)
 from core_request_journal import (  # noqa: E402
     CoreRequestJournalError,
     repair_empty_preclaim_journal_residue,
@@ -65,6 +69,7 @@ from scripts.core_cutover_preflight import (  # noqa: E402
     CUTOVER_ATTESTATION_NAME,
     REPLACEMENT_ADMISSION_DEFAULT_TTL_SECONDS,
     REPLACEMENT_ADMISSION_MAX_TTL_SECONDS,
+    REPLACEMENT_LOCK_GENERATION_TRANSITION_LEGACY_V1_TO_V2,
     CutoverAttestationRequest,
     CutoverPreflightError,
     ReplacementAdmissionRequest,
@@ -2892,13 +2897,34 @@ def _stage_replacement_frozen(
             )
             inspection = store.inspect_core_authority_preclaim()
             marker = inspection.get("marker")
+            lock_generation_transition: dict[str, object] | None = None
+            lock_generation_matches = bool(
+                isinstance(marker, dict)
+                and marker.get("lock_generation_id")
+                == lease.lock_generation_id
+            )
+            if isinstance(marker, dict) and not lock_generation_matches:
+                try:
+                    lock_generation_transition = (
+                        lease.validate_legacy_lock_generation_transition(
+                            legacy_generation_id=str(
+                                marker.get("lock_generation_id") or ""
+                            ),
+                            durable_claimed_at=float(
+                                marker.get("claimed_at") or 0.0
+                            ),
+                        )
+                    )
+                except (CoreAuthorityError, TypeError, ValueError):
+                    pass
+                else:
+                    lock_generation_matches = True
             if (
                 inspection.get("governance_mode") != "authoritative-v6"
                 or inspection.get("schema_identity") != EXPECTED_SCHEMA_IDENTITY
                 or not isinstance(marker, dict)
                 or marker.get("service_required") is not True
-                or marker.get("lock_generation_id")
-                != lease.lock_generation_id
+                or not lock_generation_matches
                 or marker.get("config_fingerprint") != config.fingerprint
                 or (
                     marker.get("build_id") == candidate_build_id
@@ -2993,6 +3019,25 @@ def _stage_replacement_frozen(
                             ),
                             expected_replay_required_file_count=int(
                                 evidence["replay_required_file_count"]
+                            ),
+                            candidate_lock_generation_id=(
+                                lease.lock_generation_id
+                            ),
+                            lock_generation_transition=(
+                                None
+                                if lock_generation_transition is None
+                                else (
+                                    REPLACEMENT_LOCK_GENERATION_TRANSITION_LEGACY_V1_TO_V2
+                                )
+                            ),
+                            lock_generation_transition_birthtime_ns=(
+                                None
+                                if lock_generation_transition is None
+                                else int(
+                                    lock_generation_transition[
+                                        "lock_birthtime_ns"
+                                    ]
+                                )
                             ),
                         ),
                         root=paths.root,
@@ -3185,6 +3230,270 @@ def uninstall(*, paths: InstallPaths, launchctl: LaunchCtl, wait_seconds: float)
     )
 
 
+@contextmanager
+def _existing_status_authority_lease(
+    paths: InstallPaths,
+) -> Iterator[CoreAuthorityLease]:
+    """Take the existing core lock without creating or repairing any path."""
+
+    _assert_owner_controlled(
+        paths.data_root,
+        kind="data directory",
+        require_mode=0o700,
+    )
+    _assert_owner_controlled(
+        paths.core_root,
+        kind="core directory",
+        require_mode=0o700,
+    )
+    _assert_owner_controlled(
+        paths.config,
+        kind="core service config",
+        require_mode=0o600,
+    )
+    database_before = _assert_owner_controlled(
+        paths.memory_db,
+        kind="memory database",
+        require_mode=0o600,
+    )
+    lock_path = paths.core_root / "authority.lock"
+    lock_before = _assert_owner_controlled(
+        lock_path,
+        kind="authoritative core lock",
+        require_mode=0o600,
+    )
+    if int(lock_before.st_size) != 0:
+        raise CoreInstallerError(
+            "authoritative core lock is not an empty private lock file"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags)
+    except OSError as exc:
+        raise CoreInstallerError(
+            "authoritative core lock could not be opened for status"
+        ) from exc
+
+    lease: CoreAuthorityLease | None = None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held = os.fstat(descriptor)
+        visible = lock_path.lstat()
+        expected_lock_identity = (
+            int(lock_before.st_dev),
+            int(lock_before.st_ino),
+        )
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or held.st_uid != os.getuid()
+            or held.st_nlink != 1
+            or stat.S_IMODE(held.st_mode) != 0o600
+            or int(held.st_size) != 0
+            or (int(held.st_dev), int(held.st_ino)) != expected_lock_identity
+            or stat.S_ISLNK(visible.st_mode)
+            or not stat.S_ISREG(visible.st_mode)
+            or visible.st_uid != held.st_uid
+            or visible.st_nlink != 1
+            or stat.S_IMODE(visible.st_mode) != 0o600
+            or int(visible.st_size) != 0
+            or (int(visible.st_dev), int(visible.st_ino))
+            != expected_lock_identity
+        ):
+            raise CoreInstallerError(
+                "authoritative core lock changed during status inspection"
+            )
+        lease = CoreAuthorityLease(
+            db_path=paths.memory_db.resolve(),
+            descriptor=descriptor,
+            lock_path=lock_path,
+            role="core",
+            owner_pid=os.getpid(),
+            lock_device=int(held.st_dev),
+            lock_inode=int(held.st_ino),
+            lock_generation_id=_lock_generation_id(held),
+            instance_id="core-installer-read-only-status",
+        )
+        lease.bind_database_identity(paths.memory_db)
+        if (
+            lease.database_device,
+            lease.database_inode,
+        ) != (
+            int(database_before.st_dev),
+            int(database_before.st_ino),
+        ):
+            raise CoreInstallerError(
+                "memory database changed during status inspection"
+            )
+        lease.assert_core_for(paths.memory_db)
+        yield lease
+        lease.assert_core_for(paths.memory_db)
+    except BlockingIOError as exc:
+        raise CoreInstallerError(
+            "authoritative core lock is unavailable for status"
+        ) from exc
+    finally:
+        if lease is not None:
+            lease.close()
+        else:
+            os.close(descriptor)
+
+
+def _unavailable_durable_authority_status() -> dict[str, Any]:
+    return {
+        "inspection_available": False,
+        "inspection_failed": False,
+        "operator_action_required": False,
+        "marker_build_id": None,
+        "matches_current_source": None,
+        "marker_lock_generation_id": None,
+        "current_lock_generation_id": None,
+        "exact_match": None,
+        "legacy_v1_to_v2_transition_valid": None,
+    }
+
+
+def _failed_durable_authority_status() -> dict[str, Any]:
+    result = _unavailable_durable_authority_status()
+    result["inspection_failed"] = True
+    result["operator_action_required"] = True
+    return result
+
+
+def _inspect_stopped_durable_authority(
+    *,
+    paths: InstallPaths,
+    expected_build_id: str,
+) -> dict[str, Any]:
+    """Return a content-free, read-only v6 authority diagnosis or fail closed."""
+
+    unavailable = _unavailable_durable_authority_status()
+    failed = _failed_durable_authority_status()
+    lock_path = paths.core_root / "authority.lock"
+    if not any(
+        path.exists() or path.is_symlink()
+        for path in (paths.config, lock_path, paths.state, paths.plist)
+    ):
+        return unavailable
+    store: Any = None
+    try:
+        config = load_core_config(paths.config)
+        if (
+            config.memory_path != paths.memory_db
+            or config.state_path != paths.state
+        ):
+            return failed
+
+        import sqlite3
+
+        from memory_store import DurableMemoryStore, SQLITE_USER_VERSION
+
+        with _existing_status_authority_lease(paths) as lease:
+            store = DurableMemoryStore.open_existing_for_audit(paths.memory_db)
+            store._authority_lease = lease
+            sidecars_before = _validate_sqlite_transients(
+                paths.memory_db,
+                kind="memory database",
+            )
+            uri = paths.memory_db.resolve().as_uri() + "?mode=ro&immutable=1"
+            connection = sqlite3.connect(
+                uri,
+                timeout=10.0,
+                isolation_level=None,
+                uri=True,
+            )
+            try:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA trusted_schema = OFF")
+                connection.execute("BEGIN")
+                try:
+                    store._validate_existing_schema_compatibility_markers(
+                        connection
+                    )
+                    marker = store._core_authority_marker(connection)
+                    store._validate_core_authority_version_pair(
+                        connection,
+                        marker,
+                    )
+                    user_version = int(
+                        connection.execute("PRAGMA user_version").fetchone()[0]
+                    )
+                    if user_version != SQLITE_USER_VERSION:
+                        return unavailable
+                    store._assert_exact_schema_contract(
+                        connection,
+                        user_version=user_version,
+                    )
+                    store._core_runtime_publication(connection, marker)
+                finally:
+                    connection.execute("ROLLBACK")
+            finally:
+                connection.close()
+            if (
+                _validate_sqlite_transients(
+                    paths.memory_db,
+                    kind="memory database",
+                )
+                != sidecars_before
+            ):
+                return failed
+
+            if (
+                not isinstance(marker, dict)
+                or marker.get("service_required") is not True
+                or marker.get("config_fingerprint") != config.fingerprint
+                or marker.get("protocol_version") != PROTOCOL_VERSION
+                or marker.get("embedding_space_identity")
+                != config.embedding_space_identity
+                or marker.get("store_identity")
+                != _store_identity(paths.memory_db)
+            ):
+                return failed
+            marker_build_id = str(marker.get("build_id") or "")
+            marker_lock_generation_id = str(
+                marker.get("lock_generation_id") or ""
+            )
+            if SOURCE_BUILD_ID_RE.fullmatch(marker_build_id) is None:
+                return failed
+
+            current_lock_generation_id = lease.lock_generation_id
+            exact_match = (
+                marker_lock_generation_id == current_lock_generation_id
+            )
+            legacy_transition_valid = False
+            if not exact_match:
+                try:
+                    lease.validate_legacy_lock_generation_transition(
+                        legacy_generation_id=marker_lock_generation_id,
+                        durable_claimed_at=float(marker.get("claimed_at") or 0.0),
+                    )
+                except (CoreAuthorityError, TypeError, ValueError):
+                    pass
+                else:
+                    legacy_transition_valid = True
+            lease.assert_core_for(paths.memory_db)
+            return {
+                "inspection_available": True,
+                "inspection_failed": False,
+                "operator_action_required": False,
+                "marker_build_id": marker_build_id,
+                "matches_current_source": (
+                    marker_build_id == expected_build_id
+                ),
+                "marker_lock_generation_id": marker_lock_generation_id,
+                "current_lock_generation_id": current_lock_generation_id,
+                "exact_match": exact_match,
+                "legacy_v1_to_v2_transition_valid": legacy_transition_valid,
+            }
+    except Exception:
+        return failed
+    finally:
+        if store is not None:
+            store.close()
+
+
 def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
     snapshot = launchctl.snapshot()
     healthy = False
@@ -3207,6 +3516,7 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
         "observed_runtime_build_id": None,
         "matches_current_source": None,
     }
+    durable_authority = _unavailable_durable_authority_status()
     replacement_required = False
 
     def record_health(health: Mapping[str, Any]) -> None:
@@ -3266,6 +3576,19 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
                 record_build_drift(drift)
             except Exception:
                 pass
+    if not snapshot.get("running"):
+        durable_authority = _inspect_stopped_durable_authority(
+            paths=paths,
+            expected_build_id=expected_build_id,
+        )
+        if durable_authority["inspection_failed"] or (
+            durable_authority["inspection_available"]
+            and (
+                durable_authority["matches_current_source"] is False
+                or durable_authority["exact_match"] is False
+            )
+        ):
+            replacement_required = True
     if paths.config.exists() and not paths.config.is_symlink():
         try:
             config = load_core_config(paths.config)
@@ -3285,6 +3608,24 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
         status_reason = "ready"
     elif healthy:
         status_reason = "client-binding-mismatch"
+    elif (
+        not snapshot.get("running")
+        and durable_authority["inspection_failed"]
+    ):
+        status_reason = "durable-authority-inspection-failed"
+    elif (
+        not snapshot.get("running")
+        and durable_authority["inspection_available"]
+        and durable_authority["exact_match"] is False
+        and durable_authority["legacy_v1_to_v2_transition_valid"] is True
+    ):
+        status_reason = "guarded-lock-migration-required"
+    elif (
+        not snapshot.get("running")
+        and durable_authority["inspection_available"]
+        and durable_authority["exact_match"] is False
+    ):
+        status_reason = "authority-lock-mismatch"
     elif replacement_required:
         status_reason = "guarded-replacement-required"
     elif provisional:
@@ -3306,6 +3647,10 @@ def status(*, paths: InstallPaths, launchctl: LaunchCtl) -> dict[str, Any]:
         status_reason=status_reason,
         authenticated_runtime=authenticated_runtime,
         build_identity=build_identity,
+        durable_authority=durable_authority,
+        operator_action_required=bool(
+            durable_authority["operator_action_required"]
+        ),
         replacement_required=replacement_required,
         capture_ready=capture_ready,
         plist_present=paths.plist.is_file() and not paths.plist.is_symlink(),
