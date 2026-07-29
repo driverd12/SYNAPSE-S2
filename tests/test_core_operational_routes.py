@@ -325,7 +325,7 @@ printf '%s\n' '{"runtime":"ready","effective_enabled":true,"memory_db_path":"/au
 
     def test_readiness_commands_use_socket_or_marker_without_local_tuning(self) -> None:
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             home.mkdir(mode=0o700)
             candidate_environment = {
