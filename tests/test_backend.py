@@ -1,3 +1,4 @@
+import errno
 import json
 import hashlib
 import os
@@ -2662,6 +2663,69 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertEqual(finished["finish_reason"], "unit-test-complete")
         self.assertEqual(state["active_session_count"], 0)
 
+    def test_late_client_finish_overrides_orphan_and_survives_reload(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        entered = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Finish after automatic orphan maintenance.",
+            recall_mode="disabled",
+        )
+        child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        child.wait(timeout=5)
+        owner_started_at = time.time() - 60.0
+        backend.attach_client_cortex_session(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entered["session_id"],
+            client_bridge_session_id="late-finish-bridge",
+            owner_pid=child.pid,
+            owner_ppid=os.getpid(),
+            owner_started_at=owner_started_at,
+        )
+        ownership = backend.orphaned_mcp_cortex_session_candidates()
+        maintenance = backend.reap_confirmed_orphaned_cortex_sessions(
+            ownerships=ownership
+        )
+        orphaned = dict(backend.cortex_sessions[entered["session_id"]])
+        caller_finished_at = orphaned["updated_at"] - 30.0
+
+        finished = backend.finish_client_cortex_session(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entered["session_id"],
+            client_bridge_session_id="late-finish-bridge",
+            reason="late-wrapper-exit",
+            finished_at=caller_finished_at,
+        )
+        reloaded = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        persisted = reloaded.cortex_sessions[entered["session_id"]]
+
+        self.assertEqual(maintenance["reaped_count"], 1)
+        self.assertEqual(orphaned["status"], "orphaned")
+        self.assertIn("orphan_reason", orphaned)
+        self.assertEqual(finished["status"], "finished")
+        self.assertEqual(finished["finished_at"], caller_finished_at)
+        self.assertGreaterEqual(finished["updated_at"], orphaned["updated_at"])
+        self.assertNotIn("orphan_reason", finished)
+        self.assertEqual(persisted["status"], "finished")
+        self.assertEqual(persisted["finished_at"], caller_finished_at)
+        self.assertNotIn("orphan_reason", persisted)
+
     def test_cortex_state_scans_beyond_visible_limit_for_typed_counts(self):
         backend = SpikingAttentionBackend(
             dimension=32,
@@ -2699,7 +2763,7 @@ class SpikingAttentionBackendTests(unittest.TestCase):
         self.assertGreaterEqual(state["typed_memory_counts"]["validation"], 1)
         self.assertLessEqual(len(state["working_memory"]), 2)
 
-    def test_cortex_state_is_pure_and_explicit_maintenance_reaps_dead_sessions(self):
+    def test_cortex_orphan_maintenance_reaps_only_dead_mcp_owner(self):
         backend = SpikingAttentionBackend(
             dimension=32,
             num_neurons=24,
@@ -2708,46 +2772,180 @@ class SpikingAttentionBackendTests(unittest.TestCase):
             compile_graph=False,
             state_path=self.state_path,
         )
-        session = backend.enter_spiking_cortex(
+        dead_session = backend.enter_spiking_cortex(
             context_id="demo",
             agent_id="codex",
             task="Represent a wrapped MCP client process.",
             mode="strict",
         )
+        live_session = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex-live",
+            task="Represent a live wrapped MCP client process.",
+            mode="strict",
+        )
+        non_mcp_session = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="operator",
+            task="Represent a non-MCP governed session.",
+            mode="strict",
+        )
         child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
         child.wait(timeout=5)
-        raw_session = dict(backend.cortex_sessions[session["session_id"]])
-        raw_session.update(
+        raw_dead_session = dict(
+            backend.cortex_sessions[dead_session["session_id"]]
+        )
+        raw_dead_session.update(
             {
                 "lease_kind": "mcp-client",
                 "owner_pid": child.pid,
-                "client_bridge_session_id": "unit-test-bridge",
+                "owner_started_at": time.time(),
+                "client_bridge_session_id": "unit-test-dead-bridge",
             }
         )
-        backend.cortex_sessions[session["session_id"]] = backend._normalize_cortex_session(
-            raw_session
+        backend.cortex_sessions[dead_session["session_id"]] = (
+            backend._normalize_cortex_session(raw_dead_session)
+        )
+        raw_live_session = dict(
+            backend.cortex_sessions[live_session["session_id"]]
+        )
+        raw_live_session.update(
+            {
+                "lease_kind": "mcp-client",
+                "owner_pid": os.getpid(),
+                "owner_started_at": time.time(),
+                "client_bridge_session_id": "unit-test-live-bridge",
+            }
+        )
+        backend.cortex_sessions[live_session["session_id"]] = (
+            backend._normalize_cortex_session(raw_live_session)
         )
         backend._persist_runtime_state()
 
-        state_before = backend.get_cortex_state(context_id="demo", agent_id="codex")
-        self.assertEqual(state_before["active_session_count"], 1)
+        state_before = backend.get_cortex_state(context_id="demo")
+        self.assertEqual(state_before["active_session_count"], 3)
         self.assertEqual(
-            backend.cortex_sessions[session["session_id"]]["status"],
+            backend.cortex_sessions[dead_session["session_id"]]["status"],
+            "active",
+        )
+        candidates = backend.orphaned_mcp_cortex_session_candidates()
+        self.assertEqual(
+            [item["session_id"] for item in candidates],
+            [dead_session["session_id"]],
+        )
+
+        maintenance = backend.reap_orphaned_cortex_sessions(context_id="demo")
+        state = backend.get_cortex_state(context_id="demo")
+
+        self.assertEqual(state["active_session_count"], 2)
+        self.assertEqual(maintenance["reaped_count"], 1)
+        self.assertEqual(
+            maintenance["session_ids"],
+            [dead_session["session_id"]],
+        )
+        self.assertEqual(
+            backend.cortex_sessions[dead_session["session_id"]]["status"],
+            "orphaned",
+        )
+        self.assertEqual(
+            backend.cortex_sessions[live_session["session_id"]]["status"],
+            "active",
+        )
+        self.assertEqual(
+            backend.cortex_sessions[non_mcp_session["session_id"]]["status"],
             "active",
         )
 
-        maintenance = backend.reap_orphaned_cortex_sessions(
+    def test_process_probe_treats_only_esrch_as_definitely_missing(self):
+        with patch.object(os, "kill", side_effect=ProcessLookupError()):
+            self.assertFalse(SpikingAttentionBackend._process_is_alive(12345))
+        with patch.object(os, "kill", side_effect=OSError(errno.ESRCH, "missing")):
+            self.assertFalse(SpikingAttentionBackend._process_is_alive(12345))
+        with patch.object(os, "kill", side_effect=PermissionError(errno.EPERM, "denied")):
+            self.assertTrue(SpikingAttentionBackend._process_is_alive(12345))
+        with patch.object(os, "kill", side_effect=OSError(errno.EIO, "unknown")):
+            self.assertTrue(SpikingAttentionBackend._process_is_alive(12345))
+        self.assertTrue(SpikingAttentionBackend._process_is_alive(0))
+
+    def test_orphan_reap_rolls_back_in_memory_when_persistence_fails(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        entered = backend.enter_spiking_cortex(
             context_id="demo",
             agent_id="codex",
+            task="Keep active if orphan persistence fails.",
+            recall_mode="disabled",
         )
-        state = backend.get_cortex_state(context_id="demo", agent_id="codex")
+        child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        child.wait(timeout=5)
+        backend.attach_client_cortex_session(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entered["session_id"],
+            client_bridge_session_id="rollback-bridge",
+            owner_pid=child.pid,
+            owner_ppid=os.getpid(),
+            owner_started_at=time.time() - 60.0,
+        )
+        ownerships = backend.orphaned_mcp_cortex_session_candidates()
 
-        self.assertEqual(state["active_session_count"], 0)
-        self.assertEqual(maintenance["reaped_count"], 1)
-        self.assertEqual(maintenance["session_ids"], [session["session_id"]])
+        with patch.object(
+            backend,
+            "_persist_runtime_state",
+            side_effect=RuntimeError("fixture persistence failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fixture persistence failure"):
+                backend.reap_confirmed_orphaned_cortex_sessions(
+                    ownerships=ownerships
+                )
+
         self.assertEqual(
-            backend.cortex_sessions[session["session_id"]]["status"],
-            "orphaned",
+            backend.cortex_sessions[entered["session_id"]]["status"],
+            "active",
+        )
+        self.assertNotIn(
+            "orphan_reason",
+            backend.cortex_sessions[entered["session_id"]],
+        )
+
+    def test_unknown_process_probe_never_becomes_orphan_candidate(self):
+        backend = SpikingAttentionBackend(
+            dimension=32,
+            num_neurons=24,
+            default_top_k=4,
+            recall_count=4,
+            compile_graph=False,
+            state_path=self.state_path,
+        )
+        entered = backend.enter_spiking_cortex(
+            context_id="demo",
+            agent_id="codex",
+            task="Treat an indeterminate owner probe conservatively.",
+            recall_mode="disabled",
+        )
+        backend.attach_client_cortex_session(
+            context_id="demo",
+            agent_id="codex",
+            session_id=entered["session_id"],
+            client_bridge_session_id="unknown-probe-bridge",
+            owner_pid=12345,
+            owner_ppid=0,
+            owner_started_at=time.time() - 60.0,
+        )
+
+        with patch.object(os, "kill", side_effect=OSError(errno.EIO, "unknown")):
+            candidates = backend.orphaned_mcp_cortex_session_candidates()
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(
+            backend.cortex_sessions[entered["session_id"]]["status"],
+            "active",
         )
 
     def test_moderate_cortex_trace_promotes_demotes_and_prunes(self):

@@ -122,6 +122,10 @@ class FakeBackend:
         self.block_release = threading.Event()
         self.closed = False
         self.reap_count = 0
+        self.reap_failure = False
+        self.orphan_candidate_sweep_count = 0
+        self.orphan_candidate_ownerships: list[dict[str, Any]] = []
+        self.maintenance_events: list[str] | None = None
         self.raw_embedding_dimensions: list[int] = []
         self._counter_lock = threading.Lock()
         self.memory_store: DurableMemoryStore | None = None
@@ -219,7 +223,36 @@ class FakeBackend:
 
     def reap_orphaned_cortex_sessions(self) -> dict[str, Any]:
         self.reap_count += 1
+        if self.reap_failure:
+            raise RuntimeError("orphan maintenance fixture failure")
         return {"reaped_count": 0, "session_ids": []}
+
+    def orphaned_mcp_cortex_session_candidates(self) -> list[dict[str, Any]]:
+        self.orphan_candidate_sweep_count += 1
+        if self.maintenance_events is not None:
+            self.maintenance_events.append("orphan-scan")
+        if self.reap_failure:
+            raise RuntimeError("orphan maintenance fixture failure")
+        return [dict(item) for item in self.orphan_candidate_ownerships]
+
+    def reap_confirmed_orphaned_cortex_sessions(
+        self,
+        *,
+        ownerships: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self.reap_count += 1
+        if self.maintenance_events is not None:
+            self.maintenance_events.append("orphan-reap")
+        if self.reap_failure:
+            raise RuntimeError("orphan maintenance fixture failure")
+        session_ids = [str(item["session_id"]) for item in ownerships]
+        reaped = set(session_ids)
+        self.orphan_candidate_ownerships = [
+            item
+            for item in self.orphan_candidate_ownerships
+            if str(item["session_id"]) not in reaped
+        ]
+        return {"reaped_count": len(session_ids), "session_ids": session_ids}
 
     def close(self) -> None:
         self.closed = True
@@ -316,11 +349,14 @@ class FakeBackend:
 
 
 class FakeCaptureWorker:
-    def __init__(self) -> None:
+    def __init__(self, *, events: list[str] | None = None) -> None:
         self.iterations = 0
+        self.events = events
 
     def process_once(self, *, max_files: int) -> dict[str, int]:
         self.iterations += 1
+        if self.events is not None:
+            self.events.append("capture")
         return {
             "processed_file_count": min(1, max_files),
             "error_file_count": 0,
@@ -328,7 +364,13 @@ class FakeCaptureWorker:
 
 
 class ServiceHarness:
-    def __init__(self, *, capture: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        capture: bool = False,
+        backend: FakeBackend | None = None,
+        capture_worker: FakeCaptureWorker | None = None,
+    ) -> None:
         self.temporary = TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.state_root = self.root / "state"
@@ -346,8 +388,8 @@ class ServiceHarness:
             capture_poll_seconds=0.25,
             authority_timeout_seconds=0.0,
         )
-        self.backend = FakeBackend()
-        self.capture_worker = FakeCaptureWorker()
+        self.backend = backend or FakeBackend()
+        self.capture_worker = capture_worker or FakeCaptureWorker()
         self.service = AuthoritativeCoreService(
             self.config,
             backend_factory=lambda lease: self.backend.attach_memory_store(
@@ -441,6 +483,90 @@ class CoreServiceTests(unittest.TestCase):
 
     def test_startup_does_not_reap_orphaned_cortex_sessions(self) -> None:
         self.assertEqual(self.harness.backend.reap_count, 0)
+
+    def test_capture_orphan_reaping_waits_for_durable_authority_activation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "state"
+            state_root.mkdir(mode=0o700)
+            os.chmod(state_root, 0o700)
+            config = CoreConfig(
+                socket_path=state_root / "core" / "service.sock",
+                state_path=state_root / "runtime_state.json",
+                memory_path=state_root / "memory.sqlite3",
+                capture_root=state_root / "capture",
+                dimension=8,
+                num_neurons=8,
+                default_top_k=4,
+                recall_count=2,
+                capture_poll_seconds=0.25,
+                authority_timeout_seconds=0.0,
+            )
+            backend = FakeBackend()
+            capture_worker = FakeCaptureWorker()
+            service = AuthoritativeCoreService(
+                config,
+                backend_factory=lambda lease: backend.attach_memory_store(
+                    DurableMemoryStore(config.memory_path, authority_lease=lease)
+                ),
+                operation_contracts=TEST_CONTRACTS,
+                operation_handlers_factory=lambda bound_backend: {
+                    "status": bound_backend.status,
+                    "set_enabled": bound_backend.set_enabled,
+                    "register_text_trace": bound_backend.register_text_trace,
+                    "register_trace": bound_backend.register_trace,
+                    "query": bound_backend.query,
+                    "commit_cortical_trace": bound_backend.commit_cortical_trace,
+                    "repair_semantic_indexes": bound_backend.repair_semantic_indexes,
+                    "list_memory": bound_backend.list_memory,
+                    "embedding_provider_info": bound_backend.embedding_provider_info,
+                },
+                capture_worker_factory=lambda _backend, _root: capture_worker,
+            )
+            original_claim = service._claim_durable_authority
+            claim_entered = threading.Event()
+            allow_claim = threading.Event()
+            failures: list[BaseException] = []
+
+            def delayed_claim(**arguments: Any) -> None:
+                claim_entered.set()
+                if not allow_claim.wait(2.0):
+                    raise AssertionError("test authority claim was not released")
+                original_claim(**arguments)
+
+            service._claim_durable_authority = delayed_claim  # type: ignore[method-assign]
+
+            def run() -> None:
+                try:
+                    service.serve_forever()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(claim_entered.wait(2.0))
+                time.sleep(0.15)
+                self.assertEqual(backend.reap_count, 0)
+                self.assertEqual(backend.orphan_candidate_sweep_count, 0)
+                self.assertEqual(capture_worker.iterations, 0)
+
+                allow_claim.set()
+                deadline = time.monotonic() + 2.0
+                while (
+                    time.monotonic() < deadline
+                    and backend.orphan_candidate_sweep_count == 0
+                ):
+                    time.sleep(0.02)
+                self.assertEqual(failures, [])
+                self.assertGreaterEqual(backend.orphan_candidate_sweep_count, 1)
+                self.assertEqual(backend.reap_count, 0)
+                self.assertGreaterEqual(capture_worker.iterations, 1)
+            finally:
+                allow_claim.set()
+                service.close()
+                thread.join(timeout=3.0)
 
     def test_raw_core_client_cannot_export_outside_server_owned_root(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -2172,22 +2298,206 @@ class CoreServiceTests(unittest.TestCase):
 
 
 class CoreCaptureHealthTests(unittest.TestCase):
+    @staticmethod
+    def _dead_ownership(
+        *,
+        owner_pid: int = 987_654,
+        owner_started_at: float = 1_700_000_000.0,
+    ) -> dict[str, Any]:
+        return {
+            "session_id": "ctx_dead_fixture",
+            "client_bridge_session_id": "bridge-dead-fixture",
+            "owner_pid": owner_pid,
+            "owner_started_at": owner_started_at,
+        }
+
+    @staticmethod
+    def _unstarted_maintenance_service(
+        root: Path,
+        backend: FakeBackend,
+    ) -> AuthoritativeCoreService:
+        state_root = root / "state"
+        state_root.mkdir(mode=0o700)
+        os.chmod(state_root, 0o700)
+        service = AuthoritativeCoreService(
+            CoreConfig(
+                socket_path=state_root / "core" / "service.sock",
+                state_path=state_root / "runtime_state.json",
+                memory_path=state_root / "memory.sqlite3",
+                dimension=8,
+                num_neurons=8,
+                default_top_k=4,
+                recall_count=2,
+                authority_timeout_seconds=0.0,
+            )
+        )
+        service._backend = backend
+        return service
+
     def test_capture_loop_uses_core_and_exposes_only_content_free_heartbeat(self) -> None:
-        harness = ServiceHarness(capture=True)
+        events: list[str] = []
+        backend = FakeBackend()
+        backend.maintenance_events = events
+        backend.orphan_candidate_ownerships = [self._dead_ownership()]
+        capture_worker = FakeCaptureWorker(events=events)
+        with mock.patch(
+            "core_service.MCP_CORTEX_ORPHAN_CONFIRMATION_SECONDS",
+            5.0,
+        ):
+            harness = ServiceHarness(
+                capture=True,
+                backend=backend,
+                capture_worker=capture_worker,
+            )
+            deadline = time.monotonic() + 1.0
+            while (
+                time.monotonic() < deadline
+                and backend.orphan_candidate_sweep_count < 1
+            ):
+                time.sleep(0.01)
+            self.assertEqual(backend.reap_count, 0)
+            self.assertEqual(events[:2], ["capture", "orphan-scan"])
         self.addCleanup(harness.close)
-        deadline = time.monotonic() + 2.0
-        health: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            health = harness.client().health()
-            if health["capture"]["ready"]:
-                break
-            time.sleep(0.02)
+
+        with mock.patch(
+            "core_service.MCP_CORTEX_ORPHAN_CONFIRMATION_SECONDS",
+            0.0,
+        ):
+            deadline = time.monotonic() + 2.0
+            health: dict[str, Any] = {}
+            while time.monotonic() < deadline:
+                health = harness.client().health()
+                if (
+                    health["capture"]["ready"]
+                    and health["capture"]["orphan_reaped_session_count"] == 1
+                ):
+                    break
+                time.sleep(0.02)
         capture = health["capture"]
         self.assertTrue(capture["enabled"])
         self.assertTrue(capture["ready"])
         self.assertGreaterEqual(capture["iteration_count"], 1)
+        self.assertTrue(capture["orphan_reaping_enabled"])
+        self.assertTrue(capture["orphan_reaping_ready"])
+        self.assertGreaterEqual(capture["orphan_reap_iteration_count"], 1)
+        self.assertEqual(capture["orphan_reaped_session_count"], 1)
+        self.assertEqual(capture["orphan_reap_error_count"], 0)
+        self.assertIsNone(capture["last_orphan_reap_error_code"])
+        reap_index = events.index("orphan-reap")
+        self.assertGreaterEqual(reap_index, 4)
+        self.assertEqual(reap_index % 2, 0)
+        for index in range(0, reap_index, 2):
+            self.assertEqual(events[index : index + 2], ["capture", "orphan-scan"])
         self.assertNotIn("root", capture)
         self.assertNotIn("file", canonical_json_bytes(capture).decode("utf-8"))
+        self.assertNotIn(
+            "ctx_dead_fixture",
+            canonical_json_bytes(capture).decode("utf-8"),
+        )
+
+    def test_orphan_reap_failure_degrades_then_recovers_without_blocking_capture(
+        self,
+    ) -> None:
+        backend = FakeBackend()
+        backend.reap_failure = True
+        harness = ServiceHarness(capture=True, backend=backend)
+        self.addCleanup(harness.close)
+        deadline = time.monotonic() + 2.0
+        failed_health: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            failed_health = harness.client().health()
+            capture = failed_health["capture"]
+            if capture["orphan_reap_error_count"] >= 1:
+                break
+            time.sleep(0.02)
+
+        failed_capture = failed_health["capture"]
+        self.assertFalse(failed_capture["ready"])
+        self.assertFalse(failed_capture["orphan_reaping_ready"])
+        self.assertGreaterEqual(failed_capture["orphan_reap_error_count"], 1)
+        self.assertEqual(
+            failed_capture["last_orphan_reap_error_code"],
+            "operation_failed",
+        )
+        self.assertEqual(failed_capture["last_error_code"], "orphan_reaping_failed")
+        self.assertGreaterEqual(harness.capture_worker.iterations, 1)
+
+        backend.reap_failure = False
+        deadline = time.monotonic() + 2.0
+        recovered_health: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            recovered_health = harness.client().health()
+            capture = recovered_health["capture"]
+            if capture["ready"] and capture["orphan_reaping_ready"]:
+                break
+            time.sleep(0.02)
+
+        recovered_capture = recovered_health["capture"]
+        self.assertTrue(recovered_capture["ready"])
+        self.assertTrue(recovered_capture["orphan_reaping_ready"])
+        self.assertIsNone(recovered_capture["last_orphan_reap_error_code"])
+        self.assertIsNone(recovered_capture["last_error_code"])
+
+    def test_orphan_confirmation_requires_two_sweeps_and_full_deadline_grace(
+        self,
+    ) -> None:
+        backend = FakeBackend()
+        backend.orphan_candidate_ownerships = [self._dead_ownership()]
+        with TemporaryDirectory() as temporary:
+            service = self._unstarted_maintenance_service(
+                Path(temporary),
+                backend,
+            )
+            with mock.patch(
+                "core_service.time.monotonic",
+                side_effect=[100.0, 114.999, 115.0],
+            ):
+                self.assertTrue(
+                    service._maintain_orphaned_mcp_cortex_sessions_once()
+                )
+                self.assertEqual(backend.reap_count, 0)
+                self.assertTrue(
+                    service._maintain_orphaned_mcp_cortex_sessions_once()
+                )
+                self.assertEqual(backend.reap_count, 0)
+                self.assertTrue(
+                    service._maintain_orphaned_mcp_cortex_sessions_once()
+                )
+
+        self.assertEqual(backend.reap_count, 1)
+        self.assertEqual(backend.orphan_candidate_ownerships, [])
+
+    def test_orphan_confirmation_resets_when_exact_ownership_changes(self) -> None:
+        backend = FakeBackend()
+        backend.orphan_candidate_ownerships = [self._dead_ownership()]
+        with TemporaryDirectory() as temporary:
+            service = self._unstarted_maintenance_service(
+                Path(temporary),
+                backend,
+            )
+            with mock.patch(
+                "core_service.time.monotonic",
+                side_effect=[100.0, 200.0],
+            ):
+                self.assertTrue(
+                    service._maintain_orphaned_mcp_cortex_sessions_once()
+                )
+                backend.orphan_candidate_ownerships = [
+                    self._dead_ownership(
+                        owner_pid=987_655,
+                        owner_started_at=1_700_000_010.0,
+                    )
+                ]
+                self.assertTrue(
+                    service._maintain_orphaned_mcp_cortex_sessions_once()
+                )
+
+        self.assertEqual(backend.reap_count, 0)
+        candidates = service._orphan_reap_candidates
+        self.assertEqual(len(candidates), 1)
+        key, value = next(iter(candidates.items()))
+        self.assertEqual(key[2:], (987_655, 1_700_000_010.0))
+        self.assertEqual(value[0], 1)
 
 
 class RealBackendCoreIntegrationTests(unittest.TestCase):

@@ -138,6 +138,7 @@ CORE_STARTUP_FAILURE_CLASSES = MappingProxyType(
 )
 BACKEND_LANE_CAPTURE_TIMEOUT_SECONDS = 60.0
 BACKEND_LANE_CAPTURE_FILE_SECONDS = 5.0
+MCP_CORTEX_ORPHAN_CONFIRMATION_SECONDS = 15.0
 BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
 NEURAL_OPERATION_LANE_SECONDS = 120.0
 SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS = 120.0
@@ -2684,6 +2685,9 @@ class AuthoritativeCoreService:
         self._capture_thread: threading.Thread | None = None
         self._capture_worker: Any = None
         self._capture_activation_event = threading.Event()
+        self._orphan_reap_candidates: dict[
+            tuple[str, str, int, float], tuple[int, float]
+        ] = {}
         self._root_generation_id: str | None = None
         self._capture_heartbeat_lock = threading.Lock()
         self._capture_heartbeat: dict[str, Any] = {
@@ -2694,6 +2698,12 @@ class AuthoritativeCoreService:
             "error_count": 0,
             "last_success_unix_ms": 0,
             "last_error_code": None,
+            "orphan_reaping_enabled": self.config.capture_root is not None,
+            "orphan_reaping_ready": self.config.capture_root is None,
+            "orphan_reap_iteration_count": 0,
+            "orphan_reaped_session_count": 0,
+            "orphan_reap_error_count": 0,
+            "last_orphan_reap_error_code": None,
         }
         self._build_id = _source_build_id()
         self._deployment_mode = AUTHORITATIVE_DEPLOYMENT_MODE
@@ -4434,6 +4444,151 @@ class AuthoritativeCoreService:
             return
         self._capture_loop()
 
+    def _maintain_orphaned_mcp_cortex_sessions_once(self) -> bool:
+        """Confirm dead MCP owners across two post-capture backend sweeps.
+
+        The embedded capture thread is activated only after durable authority,
+        runtime publication, and path-policy initialization all succeed.  Its
+        backend lane therefore provides the same single-writer fence as capture
+        processing without introducing a startup mutation or a second worker.
+        Requiring the exact ownership tuple in at least two consecutive sweeps
+        and for the CoreClient mutation deadline gives an in-flight finish RPC
+        time to win. Alive, unknown, terminal, or replaced ownership vanishes
+        from the ephemeral candidate map on the next sweep.
+        """
+
+        try:
+            observe = getattr(
+                self._backend,
+                "orphaned_mcp_cortex_session_candidates",
+                None,
+            )
+            reap_confirmed = getattr(
+                self._backend,
+                "reap_confirmed_orphaned_cortex_sessions",
+                None,
+            )
+            if not callable(observe) or not callable(reap_confirmed):
+                raise CoreServiceError("service_unavailable")
+            observed = observe()
+            if not isinstance(observed, list):
+                raise CoreServiceError("service_unavailable")
+            now_monotonic = time.monotonic()
+            next_candidates: dict[
+                tuple[str, str, int, float], tuple[int, float]
+            ] = {}
+            confirmed: list[dict[str, Any]] = []
+            observed_session_ids: set[str] = set()
+            for ownership in observed:
+                if not isinstance(ownership, dict):
+                    raise CoreServiceError("service_unavailable")
+                session_id = ownership.get("session_id")
+                bridge_session_id = ownership.get("client_bridge_session_id")
+                owner_pid = ownership.get("owner_pid")
+                owner_started_at = ownership.get("owner_started_at")
+                if (
+                    not isinstance(session_id, str)
+                    or not session_id
+                    or not isinstance(bridge_session_id, str)
+                    or not bridge_session_id
+                    or type(owner_pid) is not int
+                    or owner_pid <= 0
+                    or not isinstance(owner_started_at, (int, float))
+                    or isinstance(owner_started_at, bool)
+                    or not math.isfinite(float(owner_started_at))
+                    or float(owner_started_at) <= 0.0
+                    or session_id in observed_session_ids
+                ):
+                    raise CoreServiceError("service_unavailable")
+                observed_session_ids.add(session_id)
+                key = (
+                    session_id,
+                    bridge_session_id,
+                    owner_pid,
+                    float(owner_started_at),
+                )
+                previous = self._orphan_reap_candidates.get(key)
+                consecutive = 1 if previous is None else previous[0] + 1
+                first_missing = (
+                    now_monotonic if previous is None else previous[1]
+                )
+                next_candidates[key] = (consecutive, first_missing)
+                if (
+                    consecutive >= 2
+                    and now_monotonic - first_missing
+                    >= MCP_CORTEX_ORPHAN_CONFIRMATION_SECONDS
+                ):
+                    confirmed.append(
+                        {
+                            "session_id": session_id,
+                            "client_bridge_session_id": bridge_session_id,
+                            "owner_pid": owner_pid,
+                            "owner_started_at": float(owner_started_at),
+                        }
+                    )
+            result = (
+                reap_confirmed(ownerships=confirmed)
+                if confirmed
+                else {"reaped_count": 0, "session_ids": []}
+            )
+            if not isinstance(result, dict):
+                raise CoreServiceError("service_unavailable")
+            reaped_count = result.get("reaped_count")
+            session_ids = result.get("session_ids")
+            if (
+                type(reaped_count) is not int
+                or reaped_count < 0
+                or not isinstance(session_ids, list)
+                or len(session_ids) != reaped_count
+                or any(not isinstance(session_id, str) for session_id in session_ids)
+                or len(set(session_ids)) != len(session_ids)
+                or not set(session_ids).issubset(
+                    {item["session_id"] for item in confirmed}
+                )
+            ):
+                raise CoreServiceError("service_unavailable")
+        except Exception:
+            self._orphan_reap_candidates.clear()
+            LOGGER.error("orphaned MCP Cortex session maintenance failed")
+            with self._capture_heartbeat_lock:
+                self._capture_heartbeat.update(
+                    {
+                        "orphan_reaping_ready": False,
+                        "orphan_reap_iteration_count": int(
+                            self._capture_heartbeat["orphan_reap_iteration_count"]
+                        )
+                        + 1,
+                        "orphan_reap_error_count": int(
+                            self._capture_heartbeat["orphan_reap_error_count"]
+                        )
+                        + 1,
+                        "last_orphan_reap_error_code": "operation_failed",
+                    }
+                )
+            return False
+        reaped_session_ids = set(session_ids)
+        self._orphan_reap_candidates = {
+            key: value
+            for key, value in next_candidates.items()
+            if key[0] not in reaped_session_ids
+        }
+        with self._capture_heartbeat_lock:
+            self._capture_heartbeat.update(
+                {
+                    "orphan_reaping_ready": True,
+                    "orphan_reap_iteration_count": int(
+                        self._capture_heartbeat["orphan_reap_iteration_count"]
+                    )
+                    + 1,
+                    "orphan_reaped_session_count": int(
+                        self._capture_heartbeat["orphan_reaped_session_count"]
+                    )
+                    + reaped_count,
+                    "last_orphan_reap_error_code": None,
+                }
+            )
+        return True
+
     def _capture_loop(self) -> None:
         while not self._stop_event.is_set():
             acquired = False
@@ -4465,13 +4620,16 @@ class AuthoritativeCoreService:
                             backend=self._backend,
                             max_bytes=self.config.max_transcript_bytes,
                         )
+                    orphan_reaping_ready = (
+                        self._maintain_orphaned_mcp_cortex_sessions_once()
+                    )
                 self._assert_live_authority()
                 processed = int(result.get("processed_file_count", 0))
                 errors = int(result.get("error_file_count", 0))
                 with self._capture_heartbeat_lock:
                     self._capture_heartbeat.update(
                         {
-                            "ready": True,
+                            "ready": orphan_reaping_ready,
                             "iteration_count": int(
                                 self._capture_heartbeat["iteration_count"]
                             )
@@ -4485,7 +4643,11 @@ class AuthoritativeCoreService:
                             )
                             + max(0, errors),
                             "last_success_unix_ms": int(time.time() * 1000),
-                            "last_error_code": None,
+                            "last_error_code": (
+                                None
+                                if orphan_reaping_ready
+                                else "orphan_reaping_failed"
+                            ),
                         }
                     )
             except CoreServiceError:

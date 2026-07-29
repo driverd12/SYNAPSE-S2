@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import logging
@@ -5108,13 +5109,15 @@ class SpikingAttentionBackend:
         ended_at = time.time() if finished_at is None else float(finished_at)
         if not math.isfinite(ended_at) or ended_at <= 0.0:
             raise ValueError("finished_at must be a positive finite timestamp")
+        processed_at = time.time()
         finished_session = dict(session)
+        finished_session.pop("orphan_reason", None)
         finished_session.update(
             {
                 "status": "finished",
                 "finished_at": ended_at,
                 "finish_reason": clean_reason[:240] or "client-session-finish",
-                "updated_at": ended_at,
+                "updated_at": processed_at,
             }
         )
         self.cortex_sessions[clean_session_id] = self._normalize_cortex_session(
@@ -5824,6 +5827,66 @@ class SpikingAttentionBackend:
             "mutation_performed": bool(session_ids),
         }
 
+    def orphaned_mcp_cortex_session_candidates(self) -> list[dict[str, Any]]:
+        """Observe exact ownership tuples whose process is definitely absent."""
+
+        candidates: list[dict[str, Any]] = []
+        for session_id, session in self.cortex_sessions.items():
+            ownership = self._mcp_cortex_session_ownership(session_id, session)
+            if ownership is None:
+                continue
+            if self._process_is_alive(ownership["owner_pid"]):
+                continue
+            candidates.append(ownership)
+        candidates.sort(key=lambda item: str(item["session_id"]))
+        return candidates
+
+    def reap_confirmed_orphaned_cortex_sessions(
+        self,
+        *,
+        ownerships: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Recheck and persist only exact ownership tuples confirmed by core."""
+
+        confirmed: set[tuple[str, str, int, float]] = set()
+        for ownership in ownerships:
+            if not isinstance(ownership, dict):
+                raise ValueError("ownership must be an object")
+            session_id = ownership.get("session_id")
+            bridge_session_id = ownership.get("client_bridge_session_id")
+            owner_pid = ownership.get("owner_pid")
+            owner_started_at = ownership.get("owner_started_at")
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or not isinstance(bridge_session_id, str)
+                or not bridge_session_id
+                or type(owner_pid) is not int
+                or owner_pid <= 0
+                or not isinstance(owner_started_at, (int, float))
+                or isinstance(owner_started_at, bool)
+                or not math.isfinite(float(owner_started_at))
+                or float(owner_started_at) <= 0.0
+            ):
+                raise ValueError("invalid MCP Cortex ownership")
+            ownership_tuple = (
+                session_id,
+                bridge_session_id,
+                owner_pid,
+                float(owner_started_at),
+            )
+            if ownership_tuple in confirmed:
+                raise ValueError("duplicate MCP Cortex ownership")
+            confirmed.add(ownership_tuple)
+        session_ids = self._reap_orphaned_cortex_sessions(
+            confirmed_ownerships=confirmed,
+        )
+        return {
+            "reaped_count": len(session_ids),
+            "session_ids": session_ids,
+            "mutation_performed": bool(session_ids),
+        }
+
     def create_goal(
         self,
         *,
@@ -6307,9 +6370,11 @@ class SpikingAttentionBackend:
         *,
         context_id: str = "",
         agent_id: str = "",
+        confirmed_ownerships: set[tuple[str, str, int, float]] | None = None,
     ) -> list[str]:
         now = time.time()
         changed = False
+        previous_sessions: dict[str, dict[str, Any]] = {}
         reaped_session_ids: list[str] = []
         for session_id, session in list(self.cortex_sessions.items()):
             if session.get("status") != "active":
@@ -6320,7 +6385,21 @@ class SpikingAttentionBackend:
                 continue
             if session.get("lease_kind") != "mcp-client":
                 continue
-            owner_pid = int(session.get("owner_pid", 0) or 0)
+            ownership = self._mcp_cortex_session_ownership(session_id, session)
+            if ownership is None:
+                continue
+            ownership_tuple = (
+                str(ownership["session_id"]),
+                str(ownership["client_bridge_session_id"]),
+                int(ownership["owner_pid"]),
+                float(ownership["owner_started_at"]),
+            )
+            if (
+                confirmed_ownerships is not None
+                and ownership_tuple not in confirmed_ownerships
+            ):
+                continue
+            owner_pid = int(ownership["owner_pid"])
             if self._process_is_alive(owner_pid):
                 continue
             orphaned = dict(session)
@@ -6333,25 +6412,65 @@ class SpikingAttentionBackend:
                     "orphan_reason": f"owner pid {owner_pid} is not running",
                 }
             )
-            self.cortex_sessions[session_id] = self._normalize_cortex_session(orphaned)
+            previous_sessions[session_id] = dict(session)
+            self.cortex_sessions[session_id] = self._normalize_cortex_session(
+                orphaned
+            )
             changed = True
             reaped_session_ids.append(str(session_id))
         if changed:
-            self._persist_runtime_state()
+            try:
+                self._persist_runtime_state()
+            except Exception:
+                for session_id, previous in previous_sessions.items():
+                    self.cortex_sessions[session_id] = previous
+                raise
         return sorted(reaped_session_ids)
+
+    @staticmethod
+    def _mcp_cortex_session_ownership(
+        session_id: str,
+        session: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if session.get("status") != "active":
+            return None
+        if session.get("lease_kind") != "mcp-client":
+            return None
+        bridge_session_id = session.get("client_bridge_session_id")
+        owner_pid = session.get("owner_pid")
+        owner_started_at = session.get("owner_started_at")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(bridge_session_id, str)
+            or not bridge_session_id
+            or type(owner_pid) is not int
+            or owner_pid <= 0
+            or not isinstance(owner_started_at, (int, float))
+            or isinstance(owner_started_at, bool)
+            or not math.isfinite(float(owner_started_at))
+            or float(owner_started_at) <= 0.0
+        ):
+            return None
+        return {
+            "session_id": session_id,
+            "client_bridge_session_id": bridge_session_id,
+            "owner_pid": owner_pid,
+            "owner_started_at": float(owner_started_at),
+        }
 
     @staticmethod
     def _process_is_alive(pid: int) -> bool:
         if pid <= 0:
-            return False
+            return True
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            return exc.errno != errno.ESRCH
         return True
 
     def _active_cortex_session(
