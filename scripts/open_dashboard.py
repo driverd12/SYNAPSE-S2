@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -19,6 +22,8 @@ DASHBOARD_AUTH_SCHEMA = "synapse-s2.dashboard-auth.v1"
 DASHBOARD_BOOTSTRAP_PATH = "/__dashboard_bootstrap"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{40,128}\Z")
+CHROME_BINARY = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+CHROME_APP_RELAY_TIMEOUT_SECONDS = 10.0
 
 
 class DashboardOpenError(RuntimeError):
@@ -118,6 +123,63 @@ def _validated_bootstrap_url(payload: dict[str, Any]) -> str:
     return value
 
 
+def _open_default_browser(bootstrap_url: str) -> None:
+    escaped_url = bootstrap_url.replace("\\", "\\\\").replace('"', '\\"')
+    subprocess.run(
+        ["/usr/bin/osascript", "-"],
+        input=f'open location "{escaped_url}"\n',
+        text=True,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _open_chrome_app(bootstrap_url: str) -> None:
+    """Open an app-framed Chrome window without placing the capability in argv."""
+    if not CHROME_BINARY.is_file():
+        raise DashboardOpenError("Google Chrome is unavailable")
+
+    requested = threading.Event()
+    nonce = secrets.token_urlsafe(24)
+    expected_path = f"/{nonce}"
+
+    class BootstrapRelay(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            if self.path != expected_path:
+                self.send_error(404)
+                return
+            self.send_response(302)
+            self.send_header("Location", bootstrap_url)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            requested.set()
+
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+    relay = http.server.ThreadingHTTPServer(("127.0.0.1", 0), BootstrapRelay)
+    relay.daemon_threads = True
+    relay_thread = threading.Thread(target=relay.serve_forever, daemon=True)
+    relay_thread.start()
+    relay_url = f"http://127.0.0.1:{relay.server_port}{expected_path}"
+    try:
+        subprocess.Popen(
+            [str(CHROME_BINARY), f"--app={relay_url}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if not requested.wait(CHROME_APP_RELAY_TIMEOUT_SECONDS):
+            raise DashboardOpenError("Chrome did not request the secure dashboard relay")
+    finally:
+        relay.shutdown()
+        relay.server_close()
+        relay_thread.join(timeout=1.0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Open the authenticated SYNAPSE-S2 dashboard.")
     parser.add_argument(
@@ -127,6 +189,20 @@ def build_parser() -> argparse.ArgumentParser:
             str(Path(__file__).resolve().parent.parent / ".synapse_s2" / "dashboard-auth.json"),
         ),
     )
+    launch_mode = parser.add_mutually_exclusive_group()
+    launch_mode.add_argument(
+        "--chrome-app",
+        dest="chrome_app",
+        action="store_true",
+        default=True,
+        help="Open an app-framed Google Chrome window through a one-shot loopback relay (default).",
+    )
+    launch_mode.add_argument(
+        "--browser-tab",
+        dest="chrome_app",
+        action="store_false",
+        help="Open an authenticated tab in the system browser instead.",
+    )
     return parser
 
 
@@ -135,23 +211,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = _read_owner_auth_file(Path(args.auth_file))
         bootstrap_url = _validated_bootstrap_url(payload)
-        escaped_url = bootstrap_url.replace("\\", "\\\\").replace('"', '\\"')
-        script = f'open location "{escaped_url}"\n'
-        subprocess.run(
-            ["/usr/bin/osascript", "-"],
-            input=script,
-            text=True,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if args.chrome_app:
+            _open_chrome_app(bootstrap_url)
+        else:
+            _open_default_browser(bootstrap_url)
     except (DashboardOpenError, OSError, subprocess.CalledProcessError):
         print(
             "Authenticated dashboard launch failed; verify the dashboard service and private auth file.",
             file=sys.stderr,
         )
         return 2
-    print("Opened authenticated SYNAPSE-S2 dashboard.")
+    mode = " in Chrome app mode" if args.chrome_app else ""
+    print(f"Opened authenticated SYNAPSE-S2 dashboard{mode}.")
     return 0
 
 

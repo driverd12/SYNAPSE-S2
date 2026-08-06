@@ -799,6 +799,9 @@ scripts/install_dashboard_agent.sh
 .venv/bin/python scripts/open_dashboard.py
 ```
 
+This opens the authenticated dashboard as a Chrome app window by default. Use
+`--browser-tab` only when a conventional authenticated browser tab is preferred.
+
 Do not open a bare loopback URL. The helper reads the rotating bootstrap from
 the owner-only `dashboard-auth.json` (`0600` inside a `0700` directory) without
 placing it in argv. Bootstrap sets the port-specific HttpOnly,

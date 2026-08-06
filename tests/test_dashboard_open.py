@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import http.client
 import json
 import stat
 import sys
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -49,7 +51,7 @@ class DashboardOpenTests(unittest.TestCase):
                 session_header=session_header,
             )
             with mock.patch.object(open_dashboard.subprocess, "run") as run:
-                status = open_dashboard.main(["--auth-file", str(path)])
+                status = open_dashboard.main(["--auth-file", str(path), "--browser-tab"])
 
         self.assertEqual(status, 0)
         self.assertEqual(run.call_args.args[0], ["/usr/bin/osascript", "-"])
@@ -58,6 +60,66 @@ class DashboardOpenTests(unittest.TestCase):
         self.assertNotIn(session_header, " ".join(run.call_args.args[0]))
         self.assertNotIn(session_header, run.call_args.kwargs["input"])
         self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_chrome_app_uses_one_shot_relay_without_capability_in_argv(self):
+        token = "E" * 43
+        bootstrap_url = f"http://127.0.0.1:8765/__dashboard_bootstrap?token={token}"
+        observed: dict[str, object] = {}
+        request_finished = threading.Event()
+
+        def launch(argv: list[str], **kwargs: object) -> mock.Mock:
+            observed["argv"] = argv
+            observed["kwargs"] = kwargs
+            relay_url = open_dashboard.urlparse(argv[1].removeprefix("--app="))
+
+            def request_relay() -> None:
+                connection = http.client.HTTPConnection(relay_url.hostname, relay_url.port, timeout=2)
+                try:
+                    connection.request("GET", relay_url.path)
+                    response = connection.getresponse()
+                    observed["status"] = response.status
+                    observed["location"] = response.getheader("Location")
+                    response.read()
+                finally:
+                    connection.close()
+                    request_finished.set()
+
+            threading.Thread(target=request_relay, daemon=True).start()
+            return mock.Mock()
+
+        with TemporaryDirectory() as temporary:
+            chrome_binary = Path(temporary) / "Google Chrome"
+            chrome_binary.touch()
+            with mock.patch.object(open_dashboard, "CHROME_BINARY", chrome_binary):
+                with mock.patch.object(open_dashboard.subprocess, "Popen", side_effect=launch):
+                    open_dashboard._open_chrome_app(bootstrap_url)
+
+        self.assertTrue(request_finished.wait(1))
+        argv = observed["argv"]
+        self.assertIsInstance(argv, list)
+        self.assertNotIn(token, " ".join(argv))
+        self.assertEqual(observed["status"], 302)
+        self.assertEqual(observed["location"], bootstrap_url)
+        self.assertTrue(observed["kwargs"]["start_new_session"])
+
+    def test_main_routes_chrome_app_launch_through_secure_launcher(self):
+        token = "F" * 43
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "private"
+            path = self.write_auth(
+                root,
+                url=f"http://127.0.0.1:8765/__dashboard_bootstrap?token={token}",
+            )
+            with mock.patch.object(open_dashboard, "_open_chrome_app") as launch:
+                status = open_dashboard.main(["--auth-file", str(path), "--chrome-app"])
+
+        self.assertEqual(status, 0)
+        launch.assert_called_once()
+        self.assertIn(token, launch.call_args.args[0])
+
+    def test_chrome_app_is_the_default_launch_mode(self):
+        args = open_dashboard.build_parser().parse_args([])
+        self.assertTrue(args.chrome_app)
 
     def test_main_rejects_world_readable_auth_file_before_opening(self):
         token = "B" * 43
