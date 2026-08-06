@@ -83,6 +83,10 @@ from redaction import (
     SecretSafeArgumentParser,
     reject_sensitive_identifier,
 )
+from replacement_policy import (
+    REPLACEMENT_CAPTURE_MAX_BATCHES,
+    replacement_capture_pending_limit,
+)
 
 
 LOGGER = logging.getLogger("synapse_s2.core_service")
@@ -175,6 +179,7 @@ BUILD_SOURCE_MANIFEST = (
     "replication_manager.py",
     "replication_protocol.py",
     "replication_store.py",
+    "replacement_policy.py",
     "scripts/core_cutover_preflight.py",
     "transcript_capture.py",
     "pyproject.toml",
@@ -220,6 +225,35 @@ class CoreServiceError(RuntimeError):
     def __init__(self, code: str = "service_unavailable") -> None:
         super().__init__(code)
         self.code = code
+
+
+def _replacement_capture_counts_are_valid(
+    verification: Mapping[str, Any],
+    *,
+    batch_size: int,
+) -> bool:
+    """Validate the signed capture set against the shared replacement cap."""
+
+    try:
+        pending_limit = replacement_capture_pending_limit(
+            batch_size=batch_size,
+            batch_count=REPLACEMENT_CAPTURE_MAX_BATCHES,
+        )
+    except ValueError:
+        return False
+    pending = verification.get("recovery_pending_file_count")
+    replay_files = verification.get("recovery_replay_required_file_count")
+    replay_captures = verification.get(
+        "recovery_replay_required_capture_count"
+    )
+    return bool(
+        type(pending) is int
+        and 0 <= pending <= pending_limit
+        and type(replay_files) is int
+        and 0 <= replay_files <= pending
+        and type(replay_captures) is int
+        and replay_captures == replay_files
+    )
 
 
 @dataclass(frozen=True)
@@ -3542,23 +3576,10 @@ class AuthoritativeCoreService:
                 is None
                 for field in signed_sha256_fields
             )
-            or type(verification.get("recovery_pending_file_count")) is not int
-            or int(verification["recovery_pending_file_count"]) < 0
-            or int(verification["recovery_pending_file_count"])
-            > self.config.capture_max_files
-            or type(
-                verification.get("recovery_replay_required_file_count")
+            or not _replacement_capture_counts_are_valid(
+                verification,
+                batch_size=self.config.capture_max_files,
             )
-            is not int
-            or int(verification["recovery_replay_required_file_count"]) < 0
-            or int(verification["recovery_replay_required_file_count"])
-            > int(verification["recovery_pending_file_count"])
-            or type(
-                verification.get("recovery_replay_required_capture_count")
-            )
-            is not int
-            or verification.get("recovery_replay_required_capture_count")
-            != verification.get("recovery_replay_required_file_count")
             or verification.get("runtime_state_required") is not True
             or verification.get("runtime_state_present") is not True
             or verification.get("request_journal_id")

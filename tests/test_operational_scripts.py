@@ -1048,6 +1048,10 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
         self.assertIn("dashboard_server.py", script)
         self.assertIn("127.0.0.1", script)
         self.assertIn("SYNAPSE_S2_CORE_BINDING", script)
+        self.assertIn(
+            '$HOME/Library/Logs/SYNAPSE-S2/dashboard.log',
+            script,
+        )
         self.assertIn("SYNAPSE_S2_EMBEDDING_PROVIDER", script)
         self.assertIn("Qwen3-Embedding-0.6B-4bit-DWQ", script)
         self.assertIn("umask 077", script)

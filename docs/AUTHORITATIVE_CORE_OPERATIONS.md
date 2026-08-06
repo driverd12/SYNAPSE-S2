@@ -117,6 +117,7 @@ admission cannot stop the daemon before Python starts:
 | Cutover attestation | `.synapse_s2/core/cutover-attestation.json` | `0600` |
 | Runtime state | `.synapse_s2/runtime_state.json` | `0600` |
 | Core log | `~/Library/Logs/SYNAPSE-S2/core-service.log` | `0600` |
+| Dashboard log | `~/Library/Logs/SYNAPSE-S2/dashboard.log` | `0600` |
 | Durable memory | `.synapse_s2/memory.sqlite3` | `0600` |
 | Capture transport root | `.synapse_s2/` | `0700` |
 | Core runtime directory | `.synapse_s2/core/` | `0700` |
@@ -463,6 +464,27 @@ changing permissions on an existing caller-owned directory.
      --codex-disabled-for-certification
    ```
 
+   Replacement staging admits one configured capture batch by default. If an
+   extended outage left a larger but otherwise clean queue, first resolve every
+   error, temporary, malformed-claim, reconciliation, and receipt-backed item;
+   keep all writers and respawners quiescent; then compute the smallest whole
+   number of configured batches covering the observed pending-plus-processing
+   count. A reviewed recovery may pass that explicit bound (maximum 32 batches
+   and 1,000 signed files) and a longer bounded activation wait:
+
+   ```bash
+   scripts/install_core_agent.sh stage-replacement \
+     --confirm \
+     --expected-revision '<exact ready audit revision>' \
+     --replacement-capture-batches '<reviewed batch count>' \
+     --wait-seconds 600
+   ```
+
+   The selected batch count does not alter the production CoreConfig or weaken
+   transport classification. The exact queued set is still signed into the
+   recovery evidence, every file must drain exactly once, and any unexpected,
+   ambiguous, unsafe, or remaining item triggers verified candidate cleanup.
+
    `stage-replacement` accepts only a build-only successor with unchanged
    configuration, protocol, root generation, lock inode, embedding space,
    store, and request journal. Under one exclusive authority and capture lock
@@ -488,10 +510,11 @@ changing permissions on an existing caller-owned directory.
    Final wrapper shutdown may leave a bounded set of durable session-boundary
    drops after every old writer is already disabled. An interrupted provisional
    core may also leave valid payloads inside its atomic processing claims.
-   Staging permits at most one configured capture batch across the inbox and
-   well-formed processing claims only when every temporary, malformed-claim,
-   error, and reconciliation class is zero; that exact queued set is included
-   in the signed recovery bundle. Before taking that recovery point, the
+   Staging permits one configured capture batch by default, or the explicit
+   reviewed multi-batch bound above, across the inbox and well-formed processing
+   claims only when every temporary, malformed-claim, error, and reconciliation
+   class is zero; that exact queued set is included in the signed recovery
+   bundle. Before taking that recovery point, the
    installer publishes an owner-only, time-bounded capture freeze under the
    same global capture lock used by every producer. Session-boundary records
    that arrive during proof or activation are atomically written to a private
@@ -515,9 +538,11 @@ changing permissions on an existing caller-owned directory.
    are never silently skipped or deleted.
    Candidate activation first proves the authority, socket, journal, and backend
    while allowing the admitted capture worker to report `ready: false` only
-   during its first in-flight iteration. The installer then uses the separate
-   bounded drain window and requires a second stabilized health proof with the
-   capture worker fully ready. One daemon iteration coalesces repairable MLX
+   during its first in-flight iteration. The installer then lets the drain use
+   the unused portion of the two signed activation waits and requires a second
+   stabilized health proof with the capture worker fully ready. It never
+   extends the admission TTL or consumes the reserved certification window.
+   One daemon iteration coalesces repairable MLX
    trace/cache/runtime refreshes across the admitted files, so a durable batch
    pays that refresh cost once without weakening per-capture SQLite atomicity,
    receipts, or archive moves. Drain observation uses nonblocking lock probes so

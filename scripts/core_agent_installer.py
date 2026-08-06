@@ -65,6 +65,10 @@ from core_service import (  # noqa: E402
     load_core_config,
     write_core_config,
 )
+from replacement_policy import (  # noqa: E402
+    REPLACEMENT_CAPTURE_MAX_BATCHES,
+    replacement_capture_pending_limit as shared_replacement_capture_pending_limit,
+)
 from scripts.core_cutover_preflight import (  # noqa: E402
     CUTOVER_ATTESTATION_NAME,
     REPLACEMENT_ADMISSION_DEFAULT_TTL_SECONDS,
@@ -1334,6 +1338,35 @@ def replacement_activation_seconds_remaining(
     return remaining_milliseconds // 1000
 
 
+def replacement_capture_drain_wait_seconds(
+    *,
+    activation_started_monotonic: float,
+    wait_seconds: float,
+) -> float:
+    """Let capture drain use the unused portion of both signed activation waits."""
+
+    if (
+        not isinstance(activation_started_monotonic, (int, float))
+        or isinstance(activation_started_monotonic, bool)
+        or not math.isfinite(float(activation_started_monotonic))
+        or not isinstance(wait_seconds, (int, float))
+        or isinstance(wait_seconds, bool)
+        or not math.isfinite(float(wait_seconds))
+        or float(wait_seconds) <= 0.0
+    ):
+        raise CoreInstallerError("replacement activation budget is invalid")
+    remaining = (
+        float(activation_started_monotonic)
+        + (2.0 * float(wait_seconds))
+        - time.monotonic()
+    )
+    if remaining <= 0.0:
+        raise CoreInstallerError(
+            "replacement activation budget expired before capture drain"
+        )
+    return remaining
+
+
 def validate_replacement_capture_transport(
     status: Mapping[str, Any] | None,
     *,
@@ -1370,6 +1403,22 @@ def validate_replacement_capture_transport(
             "replacement staging requires bounded, unambiguous capture transport"
         )
     return int(pending) + int(processing)
+
+
+def replacement_capture_pending_limit(
+    *,
+    batch_size: int,
+    batch_count: int,
+) -> int:
+    """Return the explicit bounded queue limit for replacement staging."""
+
+    try:
+        return shared_replacement_capture_pending_limit(
+            batch_size=batch_size,
+            batch_count=batch_count,
+        )
+    except ValueError as exc:
+        raise CoreInstallerError(str(exc)) from exc
 
 
 def capture_transport_status(
@@ -2691,11 +2740,16 @@ def stage_replacement(
     maximum_evidence_age_seconds: float,
     confirm: bool,
     expected_revision: str | None,
+    capture_batch_count: int = 1,
 ) -> dict[str, Any]:
     """Freeze late producers around the exact signed replacement lane."""
 
     if confirm is not True:
         raise CoreInstallerError("replacement staging requires --confirm")
+    replacement_capture_pending_limit(
+        batch_size=1,
+        batch_count=capture_batch_count,
+    )
     reviewed_revision = str(expected_revision or "").strip().lower()
     if re.fullmatch(r"[0-9a-f]{64}", reviewed_revision) is None:
         raise CoreInstallerError(
@@ -2732,6 +2786,7 @@ def stage_replacement(
             maximum_evidence_age_seconds=maximum_evidence_age_seconds,
             confirm=confirm,
             expected_revision=expected_revision,
+            capture_batch_count=capture_batch_count,
         )
         thaw = release_capture_replacement_freeze(
             root=paths.capture_root,
@@ -2822,6 +2877,7 @@ def _stage_replacement_frozen(
     maximum_evidence_age_seconds: float,
     confirm: bool,
     expected_revision: str | None,
+    capture_batch_count: int = 1,
 ) -> dict[str, Any]:
     """Admit one exact current build long enough to certify it live.
 
@@ -2853,6 +2909,10 @@ def _stage_replacement_frozen(
 
     _validate_install_sources(paths)
     config = build_config(paths)
+    capture_pending_limit = replacement_capture_pending_limit(
+        batch_size=config.capture_max_files,
+        batch_count=capture_batch_count,
+    )
     candidate_build_id = _manifest_build_id(paths.root)
     staged_plist = paths.core_root / f"{label}.replacement-stage.plist"
     expected_plist = plist_payload(
@@ -2958,7 +3018,7 @@ def _stage_replacement_frozen(
             capture = manager.daemon.status()
             admitted_pending_file_count = validate_replacement_capture_transport(
                 capture,
-                maximum_pending_files=config.capture_max_files,
+                maximum_pending_files=capture_pending_limit,
             )
             restore_root = Path(temporary) / "isolated-restore"
             with manager.guarded_recovery_transaction(
@@ -3101,6 +3161,7 @@ def _stage_replacement_frozen(
         activated = False
         certification_seconds_remaining: int | None = None
         try:
+            activation_started_monotonic = time.monotonic()
             launchctl.enable()
             launchctl.bootstrap(staged_plist)
             launchctl.kickstart()
@@ -3120,7 +3181,12 @@ def _stage_replacement_frozen(
                 admitted_receipt_backed_file_count=int(
                     guarded_evidence.get("receipt_backed_file_count") or 0
                 ),
-                wait_seconds=wait_seconds,
+                wait_seconds=replacement_capture_drain_wait_seconds(
+                    activation_started_monotonic=(
+                        activation_started_monotonic
+                    ),
+                    wait_seconds=wait_seconds,
+                ),
             )
             health = wait_for_health(
                 launchctl=launchctl,
@@ -3167,6 +3233,8 @@ def _stage_replacement_frozen(
             provisional=True,
             persistent=False,
             drained_pending_file_count=admitted_pending_file_count,
+            capture_batch_count=capture_batch_count,
+            capture_pending_limit=capture_pending_limit,
             certification_seconds_remaining=certification_seconds_remaining,
             staged_plist=str(staged_plist),
             admission={
@@ -3704,6 +3772,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact 64-hex delivery audit revision reviewed immediately before action",
     )
     parser.add_argument(
+        "--replacement-capture-batches",
+        type=int,
+        default=1,
+        help=(
+            "explicit number of configured capture batches admitted during "
+            "replacement staging; defaults to 1 and is bounded"
+        ),
+    )
+    parser.add_argument(
         "--restored-target",
         action="store_true",
         help=(
@@ -3727,6 +3804,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CoreInstallerError("maximum evidence age must be between 60 and 86400 seconds")
         if args.restored_target and args.action != "install":
             raise CoreInstallerError("restored-target is valid only for install")
+        if (
+            args.action != "stage-replacement"
+            and args.replacement_capture_batches != 1
+        ):
+            raise CoreInstallerError(
+                "replacement-capture-batches is valid only for stage-replacement"
+            )
+        replacement_capture_pending_limit(
+            batch_size=1,
+            batch_count=args.replacement_capture_batches,
+        )
         delivery_integrity_flags = bool(args.repair or args.confirm or args.expected_revision)
         if delivery_integrity_flags and args.action not in {
             "context-delivery-integrity",
@@ -3824,6 +3912,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             if args.expected_revision
                             else None
                         ),
+                        capture_batch_count=args.replacement_capture_batches,
                     )
                 elif args.action == "recover-existing":
                     result = recover_existing(

@@ -84,6 +84,7 @@ from core_service import (
     _load_or_create_authentication_key,
     _load_or_create_store_generation,
     _manifest_build_id,
+    _replacement_capture_counts_are_valid,
     _source_build_id,
     config_from_wire,
     load_core_config,
@@ -92,6 +93,11 @@ from core_service import (
 from memory_store import ContextDeliveryRejected, DurableMemoryStore
 from mlx_backend import SpikingAttentionBackend
 from redaction import SECRET_SAFE_LOG_FORMAT, SecretRedactingFormatter
+from replacement_policy import (
+    REPLACEMENT_CAPTURE_MAX_BATCHES,
+    REPLACEMENT_CAPTURE_MAX_PENDING_FILES,
+    replacement_capture_pending_limit,
+)
 
 
 TEST_CONTRACTS = {
@@ -110,6 +116,52 @@ TEST_CONTRACTS = {
         "embedding_provider_info",
     )
 }
+
+
+class ReplacementCapturePolicyTests(unittest.TestCase):
+    def test_multibatch_limit_is_finite_and_shared(self) -> None:
+        self.assertEqual(
+            replacement_capture_pending_limit(
+                batch_size=50,
+                batch_count=20,
+            ),
+            REPLACEMENT_CAPTURE_MAX_PENDING_FILES,
+        )
+        self.assertEqual(
+            replacement_capture_pending_limit(
+                batch_size=50,
+                batch_count=REPLACEMENT_CAPTURE_MAX_BATCHES,
+            ),
+            REPLACEMENT_CAPTURE_MAX_PENDING_FILES,
+        )
+        with self.assertRaises(ValueError):
+            replacement_capture_pending_limit(
+                batch_size=50,
+                batch_count=REPLACEMENT_CAPTURE_MAX_BATCHES + 1,
+            )
+
+    def test_core_consumer_accepts_signed_multibatch_count_within_hard_cap(
+        self,
+    ) -> None:
+        counts = {
+            "recovery_pending_file_count": 983,
+            "recovery_replay_required_file_count": 983,
+            "recovery_replay_required_capture_count": 983,
+        }
+        self.assertTrue(
+            _replacement_capture_counts_are_valid(counts, batch_size=50)
+        )
+        self.assertFalse(
+            _replacement_capture_counts_are_valid(
+                {
+                    **counts,
+                    "recovery_pending_file_count": 1_001,
+                    "recovery_replay_required_file_count": 1_001,
+                    "recovery_replay_required_capture_count": 1_001,
+                },
+                batch_size=50,
+            )
+        )
 
 
 class FakeBackend:

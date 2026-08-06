@@ -926,7 +926,32 @@ else:
                     wait_seconds=600,
                 )
 
-    def test_replacement_capture_transport_admits_only_one_clean_pending_batch(
+        with mock.patch.object(
+            installer.time,
+            "monotonic",
+            return_value=1_150.0,
+        ):
+            self.assertEqual(
+                installer.replacement_capture_drain_wait_seconds(
+                    activation_started_monotonic=1_000.0,
+                    wait_seconds=100.0,
+                ),
+                50.0,
+            )
+        with mock.patch.object(
+            installer.time,
+            "monotonic",
+            return_value=1_201.0,
+        ), self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "expired before capture drain",
+        ):
+            installer.replacement_capture_drain_wait_seconds(
+                activation_started_monotonic=1_000.0,
+                wait_seconds=100.0,
+            )
+
+    def test_replacement_capture_transport_admits_only_a_bounded_clean_queue(
         self,
     ) -> None:
         clean = {
@@ -972,6 +997,37 @@ else:
             installer.validate_replacement_capture_transport(
                 malformed,
                 maximum_pending_files=50,
+            )
+
+        self.assertEqual(
+            installer.replacement_capture_pending_limit(
+                batch_size=50,
+                batch_count=20,
+            ),
+            1000,
+        )
+        self.assertEqual(
+            installer.replacement_capture_pending_limit(
+                batch_size=50,
+                batch_count=32,
+            ),
+            1000,
+        )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "between 1 and 32",
+        ):
+            installer.replacement_capture_pending_limit(
+                batch_size=50,
+                batch_count=33,
+            )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "batch size",
+        ):
+            installer.replacement_capture_pending_limit(
+                batch_size=0,
+                batch_count=1,
             )
 
         admitted = {
