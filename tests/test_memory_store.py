@@ -2279,6 +2279,48 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(migration_count, 1)
         self.assertGreaterEqual(receipt_count, 1)
 
+    def test_secret_content_scrub_removes_plain_source_raw_digest_oracle(self):
+        raw_digest = "ab" * 32
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            entry = store.upsert_entry(
+                tag="legacy-source-digest",
+                context_id="demo",
+                source_text="safe before legacy injection",
+                metadata={},
+                embedding_dimensions=4,
+                spike_indices=[1],
+                neuron_indices=[1],
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE memory_entries SET source_text = ? WHERE memory_id = ?",
+                    (f"diagnostic input_sha256={raw_digest}", entry["memory_id"]),
+                )
+                conn.execute(
+                    "DELETE FROM store_migrations WHERE key = 'secret_content_scrub_v3'"
+                )
+                conn.commit()
+
+            reopened = DurableMemoryStore(db_path)
+            durable_entry = reopened.get_entry(entry["memory_id"])
+            with closing(sqlite3.connect(db_path)) as conn:
+                receipt_payloads = [
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT payload_json
+                        FROM store_maintenance_receipts
+                        WHERE operation_type = 'secret-content-scrub'
+                        """
+                    ).fetchall()
+                ]
+
+        self.assertIsNone(durable_entry)
+        self.assertTrue(receipt_payloads)
+        self.assertNotIn(raw_digest, "\n".join(receipt_payloads))
+
     def test_secret_identifier_migration_fails_closed_without_echoing_value(self):
         marker = "SYNTHETIC_ONLY_LEGACY_IDENTIFIER_SECRET_42"
         with TemporaryDirectory() as tmp:

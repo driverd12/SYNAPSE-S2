@@ -785,6 +785,63 @@ source build differs from the durable marker. In that case, do not use
 incident may proceed to `recover-existing` only when all of that action's
 independent identity and sealed-SQLite gates also pass.
 
+### Offline secret-content preclaim repair
+
+If replacement staging stops because its fresh backup fails only the secret-
+content recovery invariants, do not retry staging and do not edit SQLite
+directly. Use the installer-only preclaim lane while the exact core label and
+all client writers remain stopped:
+
+```bash
+scripts/install_core_agent.sh stop
+scripts/install_core_agent.sh secret-content-integrity
+scripts/install_core_agent.sh secret-content-integrity \
+  --repair --confirm \
+  --expected-revision '<exact 64-hex audit revision>'
+scripts/install_core_agent.sh secret-content-integrity
+```
+
+The first command is a content-free read-only audit. It reports only counts by
+schema column, integrity booleans, and a digest of the row/column repair-plan
+shape; it never hashes or returns a stored value. Identifier findings,
+unclassified text columns, SQLite corruption, foreign-key errors, or any
+noncanonical schema block repair. The repair requires the exact reviewed
+revision, the existing installer lock, a positively disabled and unloaded
+LaunchAgent, and one exclusive unclaimed core lease. It never starts or enables
+a service.
+
+Before mutation the lane creates and structurally verifies an owner-only
+SQLite safety backup. That pre-repair artifact can contain the residue being
+removed, so it is rollback evidence rather than a promotable recovery point.
+One `BEGIN EXCLUSIVE` transaction runs only the deterministic legacy content
+scrub: credential-bearing or raw-digest-derived memory source/tag rows are
+deleted with cascading retrieval artifacts; metadata and non-derived event
+content are redacted in place; derived surface terms are rebuilt. The existing
+`secret-content-scrub` receipt and a separate
+`secret-content-preclaim-repair` action proof contain counts and artifact
+identities only. The action proof is inserted as `pending` in the same
+transaction as the scrub and binds the reviewed revision, safety-backup
+identity, and repaired-state revision. The scrub can therefore never become a
+bare, apparently-ready commit without a resumable proof record.
+
+After commit, the lane requires a complete checkpoint, SQLite quick and full
+integrity checks, zero foreign-key errors, a no-mutation migration contract
+check, and a fresh audit with zero redaction, raw-digest, identifier, or
+unclassified-column findings. It then creates a second owner-only proof
+snapshot and runs the complete recovery-invariant inspector; the action is
+successful only when that snapshot is restore eligible. Only then is the exact
+pending action receipt promoted to `verified`. If execution stops after the
+scrub commit, the next audit reports `committed_unverified` with one pending
+receipt rather than `ready`. Review its new exact audit revision and rerun the
+same repair command; it resumes checkpoint, integrity, safety-backup, and proof-
+backup verification and promotes that same receipt without scrubbing again.
+A pre-commit failure rolls back and discards its unused backup. A post-commit
+proof failure preserves the available backups and pending content-free action
+receipt, leaves the service stopped, and blocks replacement staging until the
+resume completes. Staging independently rechecks this audit immediately before
+recovery publication and accepts only `ready` with zero pending or invalid
+pending receipts.
+
 The recovery admission proof requires both SQLite main databases to be sealed.
 A rollback journal, incomplete WAL/SHM pair, nonzero WAL, nonprivate sidecar, or
 sidecar drift fails closed. The only tolerated clean-close residue is an exact

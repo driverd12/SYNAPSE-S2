@@ -2712,6 +2712,109 @@ def context_delivery_integrity(
                 lease.close()
 
 
+def secret_content_integrity(
+    *,
+    paths: InstallPaths,
+    launchctl: LaunchCtl,
+    wait_seconds: float,
+    repair: bool,
+    confirm: bool,
+    expected_revision: str | None,
+) -> dict[str, Any]:
+    """Audit or narrowly scrub secret-bearing content before replacement."""
+
+    snapshot = launchctl.snapshot()
+    disabled = launchctl.disabled()
+    if snapshot.get("loaded") or snapshot.get("running") or not disabled:
+        raise CoreInstallerError(
+            "secret content integrity requires the exact core LaunchAgent "
+            "to be disabled and unloaded"
+        )
+    if repair:
+        if confirm is not True:
+            raise CoreInstallerError("secret content integrity repair requires --confirm")
+        if re.fullmatch(r"[0-9a-f]{64}", str(expected_revision or "")) is None:
+            raise CoreInstallerError(
+                "secret content integrity repair requires one exact reviewed revision"
+            )
+    elif confirm or expected_revision:
+        raise CoreInstallerError(
+            "repair confirmation and revision are valid only with --repair"
+        )
+
+    _validate_install_sources(paths)
+    from memory_store import DurableMemoryStore
+
+    lease: CoreAuthorityLease | None = None
+    store: DurableMemoryStore | None = None
+    try:
+        lease = CoreAuthorityLease.acquire_core(
+            paths.memory_db,
+            timeout_seconds=min(float(wait_seconds), 30.0),
+            instance_id="core-installer-secret-content-integrity",
+        )
+        store = DurableMemoryStore.open_existing_for_core_maintenance(
+            paths.memory_db,
+            authority_lease=lease,
+        )
+        inspection = store.inspect_core_authority_preclaim()
+        marker = inspection.get("marker")
+        if (
+            inspection.get("governance_mode") != "authoritative-v6"
+            or inspection.get("schema_identity") != EXPECTED_SCHEMA_IDENTITY
+            or not isinstance(marker, dict)
+            or marker.get("service_required") is not True
+        ):
+            raise CoreInstallerError(
+                "secret content integrity requires an authoritative v6 store"
+            )
+        audit = store.audit_secret_content_preclaim_repair()
+        result: dict[str, Any] | None = None
+        if repair:
+            result = store.repair_secret_content_preclaim(
+                expected_revision=str(expected_revision),
+                confirm=True,
+            )
+            lease.assert_core_for(paths.memory_db)
+        final_snapshot = launchctl.snapshot()
+        final_disabled = launchctl.disabled()
+        if (
+            final_snapshot.get("loaded")
+            or final_snapshot.get("running")
+            or not final_disabled
+        ):
+            raise CoreInstallerError(
+                "exact core LaunchAgent changed during secret content integrity"
+            )
+        lease.assert_core_for(paths.memory_db)
+        replacement_required = str(marker.get("build_id") or "") != (
+            _manifest_build_id(paths.root)
+        )
+        return _safe_result(
+            "secret-content-integrity",
+            status=(result["status"] if result is not None else audit["status"]),
+            service_state={
+                "loaded": False,
+                "running": False,
+                "disabled": final_disabled,
+            },
+            replacement_required=replacement_required,
+            audit=audit,
+            repair=result,
+        )
+    except CoreInstallerError:
+        raise
+    except Exception as exc:
+        raise CoreInstallerError("secret content integrity operation failed") from exc
+    finally:
+        try:
+            if store is not None:
+                store.close()
+        finally:
+            if lease is not None:
+                lease.close()
+
+
 def replacement_capture_freeze_ttl_seconds(wait_seconds: float) -> float:
     """Keep producers out of the signed inbox across proof and activation."""
 
@@ -3010,6 +3113,23 @@ def _stage_replacement_frozen(
                 raise CoreInstallerError(
                     "replacement staging delivery audit changed or is not ready"
                 )
+            secret_audit = store.audit_secret_content_preclaim_repair()
+            if (
+                secret_audit.get("status") != "ready"
+                or secret_audit.get("repair_required") is not False
+                or int(secret_audit.get("pending_repair_receipt_count") or 0)
+                != 0
+                or int(
+                    secret_audit.get(
+                        "invalid_pending_repair_receipt_count"
+                    )
+                    or 0
+                )
+                != 0
+            ):
+                raise CoreInstallerError(
+                    "replacement staging secret-content audit is not ready"
+                )
             manager = VerifiedRecoveryManager(
                 store,
                 capture_root=paths.capture_root,
@@ -3035,10 +3155,14 @@ def _stage_replacement_frozen(
                     guarded_evidence = evidence
                     live_inspection = store.inspect_core_authority_preclaim()
                     live_audit = store.audit_context_delivery_publication_repair()
+                    live_secret_audit = (
+                        store.audit_secret_content_preclaim_repair()
+                    )
                     if (
                         dict(live_inspection) != dict(inspection)
                         or dict(live_audit) != dict(audit)
                         or live_audit.get("audit_revision") != reviewed_revision
+                        or dict(live_secret_audit) != dict(secret_audit)
                     ):
                         raise CoreInstallerError(
                             "replacement predecessor changed before signed publication"
@@ -3744,6 +3868,7 @@ def build_parser() -> argparse.ArgumentParser:
             "recover-existing",
             "repair-preclaim-residue",
             "context-delivery-integrity",
+            "secret-content-integrity",
             "publish-binding",
             "status",
             "stop",
@@ -3759,7 +3884,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repair",
         action="store_true",
-        help="apply only the reviewed derived delivery-publication repair",
+        help="apply only the exact reviewed offline integrity repair",
     )
     parser.add_argument(
         "--confirm",
@@ -3769,7 +3894,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-revision",
         default="",
-        help="exact 64-hex delivery audit revision reviewed immediately before action",
+        help="exact 64-hex integrity audit revision reviewed immediately before action",
     )
     parser.add_argument(
         "--replacement-capture-batches",
@@ -3815,14 +3940,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size=1,
             batch_count=args.replacement_capture_batches,
         )
-        delivery_integrity_flags = bool(args.repair or args.confirm or args.expected_revision)
-        if delivery_integrity_flags and args.action not in {
+        reviewed_integrity_flags = bool(args.repair or args.confirm or args.expected_revision)
+        if reviewed_integrity_flags and args.action not in {
             "context-delivery-integrity",
+            "secret-content-integrity",
             "stage-replacement",
             "repair-preclaim-residue",
         }:
             raise CoreInstallerError(
-                "reviewed delivery flags are valid only for delivery integrity "
+                "reviewed integrity flags are valid only for an integrity repair "
                 "or replacement staging"
             )
         if args.action == "stage-replacement" and args.repair:
@@ -3844,6 +3970,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             raise CoreInstallerError(
                 "context-delivery-integrity does not accept cutover evidence "
+                "or restart flags"
+            )
+        if args.action == "secret-content-integrity" and (
+            args.evidence_manifest or args.force_restart
+        ):
+            raise CoreInstallerError(
+                "secret-content-integrity does not accept cutover evidence "
                 "or restart flags"
             )
         if args.action == "stage-replacement" and (
@@ -3948,6 +4081,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 elif args.action == "context-delivery-integrity":
                     result = context_delivery_integrity(
+                        paths=paths,
+                        launchctl=launchctl,
+                        wait_seconds=args.wait_seconds,
+                        repair=bool(args.repair),
+                        confirm=bool(args.confirm),
+                        expected_revision=(
+                            str(args.expected_revision).strip().lower()
+                            if args.expected_revision
+                            else None
+                        ),
+                    )
+                elif args.action == "secret-content-integrity":
+                    result = secret_content_integrity(
                         paths=paths,
                         launchctl=launchctl,
                         wait_seconds=args.wait_seconds,

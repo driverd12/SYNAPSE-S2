@@ -474,6 +474,12 @@ else:
             "repair_required": False,
             "audit_revision": revision,
         }
+        secret_audit = {
+            "status": "ready",
+            "repair_required": False,
+            "pending_repair_receipt_count": 0,
+            "invalid_pending_repair_receipt_count": 0,
+        }
         capture = {
             "transport_ready": True,
             "missing_transport_directories": [],
@@ -547,6 +553,9 @@ else:
 
             def audit_context_delivery_publication_repair(self) -> dict[str, object]:
                 return dict(audit)
+
+            def audit_secret_content_preclaim_repair(self) -> dict[str, object]:
+                return dict(secret_audit)
 
             def close(self) -> None:
                 self.closed = True
@@ -715,6 +724,101 @@ else:
         )
         launch_log = (self.base / "launchctl.log").read_text(encoding="utf-8")
         self.assertIn(str(staged_plist), launch_log)
+
+    def test_stage_replacement_refuses_committed_unverified_secret_repair(
+        self,
+    ) -> None:
+        environment = {
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+            "SYNAPSE_S2_TRANSCRIPT_POLL": "false",
+            "MLX_DEVICE": "cpu",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = installer.build_config(self.paths)
+        revision = "a" * 64
+
+        class FakeLease:
+            lock_generation_id = "lockfs-v2-2-3e8"
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeStore:
+            def inspect_core_authority_preclaim(self) -> dict[str, object]:
+                return {
+                    "governance_mode": "authoritative-v6",
+                    "schema_identity": installer.EXPECTED_SCHEMA_IDENTITY,
+                    "store_identity": "store-" + ("d" * 24),
+                    "marker": {
+                        "service_required": True,
+                        "lock_generation_id": FakeLease.lock_generation_id,
+                        "config_fingerprint": config.fingerprint,
+                        "build_id": "source-" + ("b" * 24),
+                        "root_generation_id": "generation-" + ("c" * 24),
+                    },
+                }
+
+            def audit_context_delivery_publication_repair(
+                self,
+            ) -> dict[str, object]:
+                return {
+                    "status": "ready",
+                    "repair_required": False,
+                    "audit_revision": revision,
+                }
+
+            def audit_secret_content_preclaim_repair(
+                self,
+            ) -> dict[str, object]:
+                return {
+                    "status": "committed_unverified",
+                    "repair_required": False,
+                    "pending_repair_receipt_count": 1,
+                    "invalid_pending_repair_receipt_count": 0,
+                }
+
+            def close(self) -> None:
+                self.closed = True
+
+        (self.base / "launchctl-disabled").write_text(
+            "disabled", encoding="utf-8"
+        )
+        with mock.patch.object(
+            installer,
+            "_validate_install_sources",
+        ), mock.patch.object(
+            installer,
+            "build_config",
+            return_value=config,
+        ), mock.patch.object(
+            installer,
+            "_load_recovery_root_generation",
+            return_value="generation-" + ("c" * 24),
+        ), mock.patch.object(
+            CoreAuthorityLease,
+            "acquire_core",
+            return_value=FakeLease(),
+        ), mock.patch.object(
+            DurableMemoryStore,
+            "open_existing_for_core_maintenance",
+            return_value=FakeStore(),
+        ), self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "secret-content audit is not ready",
+        ):
+            installer._stage_replacement_frozen(
+                paths=self.paths,
+                label="aero.boom.synapse-s2.core.test",
+                launchctl=self._launchctl(),
+                wait_seconds=2.0,
+                maximum_evidence_age_seconds=7200.0,
+                confirm=True,
+                expected_revision=revision,
+            )
 
     def test_stage_replacement_drains_capture_deferred_during_signed_proof(
         self,
@@ -1830,6 +1934,331 @@ else:
                 confirm=False,
                 expected_revision=None,
             )
+
+    def test_secret_content_integrity_repairs_only_reviewed_offline_content(
+        self,
+    ) -> None:
+        self._prepare_recoverable_v6()
+        raw_digest = "ab" * 32
+        secret_marker = "SYNTHETIC_PRECLAIM_SECRET_42"
+        digest_memory_id = "s2_" + ("1" * 32)
+        metadata_memory_id = "s2_" + ("2" * 32)
+        digest_source_text = f"diagnostic input_sha256={raw_digest}"
+        metadata_source_json = json.dumps(
+            {
+                "client_secret": secret_marker,
+                "safe": "retained",
+            }
+        )
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            connection.executemany(
+                """
+                INSERT INTO memory_entries (
+                    memory_id, tag, context_id, source_text, metadata_json,
+                    embedding_dimensions, spike_indices_json,
+                    neuron_indices_json, created_at, updated_at
+                ) VALUES (?, ?, 'default', ?, ?, 8, '[]', '[]', 200.0, 200.0)
+                """,
+                (
+                    (
+                        digest_memory_id,
+                        "legacy-raw-digest-source",
+                        digest_source_text,
+                        "{}",
+                    ),
+                    (
+                        metadata_memory_id,
+                        "legacy-secret-metadata",
+                        "safe source text",
+                        metadata_source_json,
+                    ),
+                ),
+            )
+            connection.commit()
+        self._seal_sqlite_fixture(self.memory_db)
+        launchctl = self._launchctl()
+        launchctl.disable()
+
+        audited = installer.secret_content_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "requires --confirm",
+        ):
+            installer.secret_content_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=True,
+                confirm=False,
+                expected_revision=audited["audit"]["audit_revision"],
+            )
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "operation failed",
+        ):
+            installer.secret_content_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=True,
+                confirm=True,
+                expected_revision="0" * 64,
+            )
+        repaired = installer.secret_content_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=True,
+            confirm=True,
+            expected_revision=audited["audit"]["audit_revision"],
+        )
+        verified = installer.secret_content_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            digest_row = connection.execute(
+                "SELECT 1 FROM memory_entries WHERE memory_id = ?",
+                (digest_memory_id,),
+            ).fetchone()
+            metadata_json = str(
+                connection.execute(
+                    "SELECT metadata_json FROM memory_entries WHERE memory_id = ?",
+                    (metadata_memory_id,),
+                ).fetchone()[0]
+            )
+            action_receipt = connection.execute(
+                """
+                SELECT payload_json
+                FROM store_maintenance_receipts
+                WHERE operation_type = 'secret-content-preclaim-repair'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+        self.assertEqual(audited["status"], "repairable")
+        serialized_audit = json.dumps(audited, sort_keys=True)
+        self.assertNotIn(raw_digest, serialized_audit)
+        self.assertNotIn(secret_marker, serialized_audit)
+        self.assertNotIn(
+            hashlib.sha256(digest_source_text.encode("utf-8")).hexdigest(),
+            serialized_audit,
+        )
+        self.assertNotIn(
+            hashlib.sha256(metadata_source_json.encode("utf-8")).hexdigest(),
+            serialized_audit,
+        )
+        self.assertNotIn("scan_source_sha256", serialized_audit)
+        self.assertNotIn("finding_source_sha256", serialized_audit)
+        self.assertIn("repair_plan_sha256", serialized_audit)
+        self.assertEqual(audited["audit"]["content_finding_count"], 2)
+        self.assertEqual(
+            audited["audit"]["raw_digest_changing_cell_count"],
+            1,
+        )
+        self.assertEqual(repaired["status"], "repaired")
+        self.assertTrue(repaired["repair"]["verification_passed"])
+        self.assertTrue(repaired["repair"]["action_receipt_verified"])
+        self.assertTrue(
+            repaired["repair"]["proof_backup"]["snapshot_restore_eligible"]
+        )
+        self.assertEqual(verified["status"], "ready")
+        self.assertEqual(verified["audit"]["content_finding_count"], 0)
+        self.assertEqual(verified["audit"]["identifier_finding_count"], 0)
+        self.assertIsNone(digest_row)
+        self.assertNotIn(secret_marker, metadata_json)
+        self.assertEqual(json.loads(metadata_json)["safe"], "retained")
+        self.assertIsNotNone(action_receipt)
+        self.assertNotIn(secret_marker, str(action_receipt[0]))
+        self.assertNotIn(raw_digest, str(action_receipt[0]))
+        self.assertEqual(
+            installer.build_parser()
+            .parse_args(["secret-content-integrity"])
+            .action,
+            "secret-content-integrity",
+        )
+        log_verbs = {
+            line.split()[0]
+            for line in (self.base / "launchctl.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        }
+        self.assertTrue(
+            log_verbs.isdisjoint(
+                {"enable", "bootstrap", "bootout", "kickstart"}
+            )
+        )
+
+    def test_secret_content_integrity_refuses_loaded_or_enabled_core(self) -> None:
+        self._prepare_recoverable_v6()
+        launchctl = self._launchctl()
+        launchctl.bootstrap(self.paths.plist)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "disabled and unloaded",
+        ):
+            installer.secret_content_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=False,
+                confirm=False,
+                expected_revision=None,
+            )
+        launchctl.bootout(wait_seconds=2.0)
+        with self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "disabled and unloaded",
+        ):
+            installer.secret_content_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=False,
+                confirm=False,
+                expected_revision=None,
+            )
+
+    def test_secret_content_integrity_resumes_committed_unverified_repair(
+        self,
+    ) -> None:
+        self._prepare_recoverable_v6()
+        secret_marker = "SYNTHETIC_CRASH_RESUME_SECRET_42"
+        memory_id = "s2_" + ("3" * 32)
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            connection.execute(
+                """
+                INSERT INTO memory_entries (
+                    memory_id, tag, context_id, source_text, metadata_json,
+                    embedding_dimensions, spike_indices_json,
+                    neuron_indices_json, created_at, updated_at
+                ) VALUES (?, 'legacy-secret-resume', 'default', ?, '{}',
+                          8, '[]', '[]', 201.0, 201.0)
+                """,
+                (memory_id, f"client_secret={secret_marker}"),
+            )
+            connection.commit()
+        self._seal_sqlite_fixture(self.memory_db)
+        launchctl = self._launchctl()
+        launchctl.disable()
+        reviewed = installer.secret_content_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+
+        with (
+            mock.patch.object(
+                DurableMemoryStore,
+                "_verify_pending_secret_content_preclaim_repair",
+                side_effect=RuntimeError("synthetic post-commit interruption"),
+            ),
+            mock.patch("memory_store.LOGGER.exception"),
+            self.assertRaisesRegex(
+                installer.CoreInstallerError,
+                "operation failed",
+            ),
+        ):
+            installer.secret_content_integrity(
+                paths=self.paths,
+                launchctl=launchctl,
+                wait_seconds=2.0,
+                repair=True,
+                confirm=True,
+                expected_revision=reviewed["audit"]["audit_revision"],
+            )
+
+        pending = installer.secret_content_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            source_row = connection.execute(
+                "SELECT source_text FROM memory_entries WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            source_text = None if source_row is None else str(source_row[0])
+            pending_rows = connection.execute(
+                """
+                SELECT payload_json
+                FROM store_maintenance_receipts
+                WHERE operation_type = 'secret-content-preclaim-repair'
+                """
+            ).fetchall()
+
+        resumed = installer.secret_content_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=True,
+            confirm=True,
+            expected_revision=pending["audit"]["audit_revision"],
+        )
+        ready = installer.secret_content_integrity(
+            paths=self.paths,
+            launchctl=launchctl,
+            wait_seconds=2.0,
+            repair=False,
+            confirm=False,
+            expected_revision=None,
+        )
+        with closing(sqlite3.connect(self.memory_db)) as connection:
+            receipt_rows = connection.execute(
+                """
+                SELECT payload_json
+                FROM store_maintenance_receipts
+                WHERE operation_type = 'secret-content-preclaim-repair'
+                """
+            ).fetchall()
+
+        self.assertEqual(pending["status"], "committed_unverified")
+        self.assertEqual(pending["audit"]["pending_repair_receipt_count"], 1)
+        self.assertEqual(
+            pending["audit"]["invalid_pending_repair_receipt_count"],
+            0,
+        )
+        self.assertTrue(
+            source_text is None or secret_marker not in source_text
+        )
+        self.assertEqual(len(pending_rows), 1)
+        self.assertEqual(
+            json.loads(str(pending_rows[0][0]))["verification_status"],
+            "pending",
+        )
+        self.assertEqual(resumed["status"], "verified")
+        self.assertTrue(resumed["repair"]["action_receipt_verified"])
+        self.assertTrue(
+            resumed["repair"]["proof_backup"][
+                "snapshot_restore_eligible"
+            ]
+        )
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(ready["audit"]["pending_repair_receipt_count"], 0)
+        self.assertEqual(len(receipt_rows), 1)
+        self.assertEqual(
+            json.loads(str(receipt_rows[0][0]))["verification_status"],
+            "verified",
+        )
 
     def test_recovery_identity_failures_never_mutate_launchd(self) -> None:
         self._prepare_recoverable_v6()

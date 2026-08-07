@@ -8025,6 +8025,13 @@ class DurableMemoryStore:
         return inserted_count
 
     @staticmethod
+    def _redact_legacy_text_value(raw_value: Any) -> tuple[str, int]:
+        raw_text = str(raw_value or "")
+        safe_text, redaction_count = redact_capture_text(raw_text)
+        safe_text, digest_removals = strip_untrusted_raw_digest_text(safe_text)
+        return safe_text, int(redaction_count) + int(digest_removals)
+
+    @staticmethod
     def _redact_legacy_json_document(raw_value: Any) -> tuple[str, int]:
         raw_text = str(raw_value or "")
         try:
@@ -8116,8 +8123,8 @@ class DurableMemoryStore:
             raw_tag = str(row["tag"] or "")
             raw_source_text = str(row["source_text"] or "")
             raw_metadata_json = str(row["metadata_json"] or "")
-            safe_tag, tag_redactions = redact_capture_text(raw_tag)
-            safe_source_text, source_redactions = redact_capture_text(
+            safe_tag, tag_redactions = self._redact_legacy_text_value(raw_tag)
+            safe_source_text, source_redactions = self._redact_legacy_text_value(
                 raw_source_text
             )
             safe_metadata_json, metadata_redactions = self._redact_legacy_json_document(
@@ -8222,7 +8229,9 @@ class DurableMemoryStore:
                             self._redact_legacy_json_document(raw_value)
                         )
                     else:
-                        safe_value, redaction_count = redact_capture_text(raw_value)
+                        safe_value, redaction_count = (
+                            self._redact_legacy_text_value(raw_value)
+                        )
                     if redaction_count and safe_value != raw_value:
                         updates[column_name] = safe_value
                         count_key = f"{table_name}.{column_name}"
@@ -17666,8 +17675,16 @@ class DurableMemoryStore:
                 scanned_bytes += value_bytes
                 if value_bytes > value_byte_limit or scanned_bytes > scan_byte_limit:
                     raise RuntimeError("backup secret audit exceeded its bounded byte limit")
-                safe_value, _ = redact_capture_text(raw_value)
-                digest_safe, _ = strip_untrusted_raw_digest_text(safe_value)
+                is_json_document = column_name.endswith("_json") or (
+                    table_name,
+                    column_name,
+                ) == ("store_metadata", "value_json")
+                if is_json_document:
+                    safe_value, _ = self._redact_legacy_json_document(raw_value)
+                    digest_safe = safe_value
+                else:
+                    safe_value, _ = redact_capture_text(raw_value)
+                    digest_safe, _ = strip_untrusted_raw_digest_text(safe_value)
                 if safe_value != raw_value:
                     redaction_changes += 1
                 if digest_safe != safe_value:
@@ -17681,6 +17698,984 @@ class DurableMemoryStore:
             "raw_digest_changing_cell_count": digest_changes,
             "unclassified_text_column_count": len(unclassified),
         }
+
+    def _secret_content_preclaim_receipt_inventory(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        """Classify content-free action receipts for the offline scrub lane."""
+
+        rows = conn.execute(
+            """
+            SELECT operation_id, before_revision, after_revision,
+                   payload_json, created_at
+            FROM store_maintenance_receipts
+            WHERE operation_type = 'secret-content-preclaim-repair'
+            ORDER BY created_at ASC, operation_id ASC
+            """
+        ).fetchall()
+        pending: list[dict[str, Any]] = []
+        verified: list[dict[str, Any]] = []
+        invalid_count = 0
+        invalid_pending_count = 0
+        pending_fields = {
+            "protocol_version",
+            "content_free",
+            "verification_status",
+            "reviewed_finding_count",
+            "reviewed_redaction_changing_cell_count",
+            "reviewed_raw_digest_changing_cell_count",
+            "changed_index_row_count",
+            "repaired_state_revision",
+            "safety_backup_path",
+            "safety_backup_sha256",
+            "safety_backup_size_bytes",
+        }
+        verified_fields = pending_fields | {
+            "proof_backup_path",
+            "proof_backup_sha256",
+            "proof_backup_size_bytes",
+            "proof_backup_snapshot_revision",
+            "proof_backup_restore_eligible",
+            "verified_at",
+        }
+        backup_parent = (self.db_path.parent / "backups").resolve()
+        for row in rows:
+            payload = _decode_json(str(row["payload_json"]), None)
+            status = (
+                str(payload.get("verification_status") or "")
+                if isinstance(payload, dict)
+                else ""
+            )
+            expected_fields = (
+                pending_fields
+                if status == "pending"
+                else verified_fields
+                if status == "verified"
+                else set()
+            )
+            paths = (
+                [Path(str(payload.get("safety_backup_path") or ""))]
+                if isinstance(payload, dict)
+                else []
+            )
+            if status == "verified" and isinstance(payload, dict):
+                paths.append(Path(str(payload.get("proof_backup_path") or "")))
+            payload_valid = bool(
+                isinstance(payload, dict)
+                and set(payload) == expected_fields
+                and payload.get("protocol_version")
+                == "secret-content-preclaim-repair.v1"
+                and payload.get("content_free") is True
+                and all(
+                    type(payload.get(field)) is int
+                    and int(payload[field]) >= 0
+                    for field in (
+                        "reviewed_finding_count",
+                        "reviewed_redaction_changing_cell_count",
+                        "reviewed_raw_digest_changing_cell_count",
+                        "changed_index_row_count",
+                    )
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(payload.get("repaired_state_revision") or ""),
+                )
+                is not None
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(payload.get("safety_backup_sha256") or ""),
+                )
+                is not None
+                and type(payload.get("safety_backup_size_bytes")) is int
+                and int(payload["safety_backup_size_bytes"]) > 0
+                and all(
+                    path.is_absolute()
+                    and path.parent.resolve() == backup_parent
+                    and path.name == path.resolve().name
+                    for path in paths
+                )
+                and (
+                    status != "verified"
+                    or (
+                        re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            str(payload.get("proof_backup_sha256") or ""),
+                        )
+                        is not None
+                        and type(payload.get("proof_backup_size_bytes")) is int
+                        and int(payload["proof_backup_size_bytes"]) > 0
+                        and re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            str(
+                                payload.get("proof_backup_snapshot_revision")
+                                or ""
+                            ),
+                        )
+                        is not None
+                        and payload.get("proof_backup_restore_eligible") is True
+                        and self._context_delivery_timestamp_is_valid(
+                            payload.get("verified_at")
+                        )
+                    )
+                )
+            )
+            operation_id = str(row["operation_id"])
+            before_revision = str(row["before_revision"])
+            after_revision = str(row["after_revision"])
+            created_at = row["created_at"]
+            row_valid = bool(
+                re.fullmatch(r"s2maint_[0-9a-f]{32}", operation_id)
+                and re.fullmatch(r"[0-9a-f]{64}", before_revision)
+                and re.fullmatch(r"[0-9a-f]{64}", after_revision)
+                and self._context_delivery_timestamp_is_valid(created_at)
+            )
+            if not payload_valid or not row_valid:
+                invalid_count += 1
+                invalid_pending_count += int(status == "pending")
+                continue
+            record = {
+                "operation_id": operation_id,
+                "before_revision": before_revision,
+                "after_revision": after_revision,
+                "payload": dict(payload),
+                "payload_sha256": hashlib.sha256(
+                    _json_dumps(payload).encode("utf-8")
+                ).hexdigest(),
+                "created_at": float(created_at),
+            }
+            (pending if status == "pending" else verified).append(record)
+        return {
+            "invalid_count": invalid_count,
+            "invalid_pending_count": invalid_pending_count,
+            "pending": pending,
+            "verified": verified,
+        }
+
+    def _secret_content_repair_audit(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        """Return an exact content-free review token for offline scrubbing."""
+
+        self._validate_existing_schema_compatibility_markers(conn)
+        if int(conn.execute("PRAGMA user_version").fetchone()[0]) != SQLITE_USER_VERSION:
+            raise RuntimeError(
+                "secret content repair requires the current authoritative schema"
+            )
+        quick_check_ok = [str(row[0]) for row in conn.execute("PRAGMA quick_check")] == [
+            "ok"
+        ]
+        integrity_check_ok = [
+            str(row[0]) for row in conn.execute("PRAGMA integrity_check")
+        ] == ["ok"]
+        foreign_key_error_count = sum(1 for _ in conn.execute("PRAGMA foreign_key_check"))
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_schema "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        text_columns: set[tuple[str, str]] = set()
+        for table_name in tables:
+            for row in conn.execute(f'PRAGMA table_xinfo("{table_name}")').fetchall():
+                column_type = str(row[2] or "").upper()
+                if any(marker in column_type for marker in ("CHAR", "CLOB", "TEXT")):
+                    text_columns.add((table_name, str(row[1])))
+        classified = (
+            set(LEGACY_SECRET_CONTENT_COLUMNS)
+            | set(LEGACY_SECRET_IDENTIFIER_COLUMNS)
+            | set(LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS)
+        )
+        unclassified = text_columns - classified
+        derived_identifier_tables = {"memory_spikes", "memory_surface_terms"}
+        content_columns = text_columns & set(LEGACY_SECRET_CONTENT_COLUMNS)
+        identifier_columns = (
+            text_columns
+            & (
+                set(LEGACY_SECRET_IDENTIFIER_COLUMNS)
+                | set(LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS)
+            )
+        ) - {
+            column
+            for column in text_columns
+            if column[0] in derived_identifier_tables
+        }
+        scan_limit = int(os.getenv("SYNAPSE_S2_BACKUP_SECRET_SCAN_MAX_CELLS", "2000000"))
+        scan_byte_limit = int(
+            os.getenv("SYNAPSE_S2_BACKUP_SECRET_SCAN_MAX_BYTES", str(2 * 1024**3))
+        )
+        value_byte_limit = int(
+            os.getenv("SYNAPSE_S2_BACKUP_SCAN_MAX_VALUE_BYTES", str(16 * 1024**2))
+        )
+        if scan_limit <= 0 or scan_byte_limit <= 0 or value_byte_limit <= 0:
+            raise ValueError("secret content repair audit limits must be positive")
+
+        scanned_cell_count = 0
+        scanned_byte_count = 0
+        content_findings: dict[str, int] = {}
+        identifier_findings: dict[str, int] = {}
+        redaction_changing_cell_count = 0
+        raw_digest_changing_cell_count = 0
+        finding_records: list[tuple[str, str, str, str, bool, bool]] = []
+        for table_name, column_name in sorted(content_columns | identifier_columns):
+            is_content = (table_name, column_name) in content_columns
+            if is_content:
+                cursor = conn.execute(
+                    f'SELECT rowid, "{column_name}" FROM "{table_name}" '
+                    f'WHERE "{column_name}" IS NOT NULL ORDER BY rowid'
+                )
+            else:
+                cursor = conn.execute(
+                    f'SELECT DISTINCT "{column_name}" FROM "{table_name}" '
+                    f'WHERE "{column_name}" IS NOT NULL ORDER BY "{column_name}"'
+                )
+            for column_ordinal, row in enumerate(cursor, start=1):
+                scanned_cell_count += 1
+                if scanned_cell_count > scan_limit:
+                    raise RuntimeError(
+                        "secret content repair audit exceeded its bounded scan limit"
+                    )
+                cell_identity = (
+                    str(row[0]) if is_content else f"distinct-{column_ordinal}"
+                )
+                raw_value = str(row[1] if is_content else row[0])
+                value_bytes = len(raw_value.encode("utf-8"))
+                scanned_byte_count += value_bytes
+                if value_bytes > value_byte_limit or scanned_byte_count > scan_byte_limit:
+                    raise RuntimeError(
+                        "secret content repair audit exceeded its bounded byte limit"
+                    )
+                is_json_document = column_name.endswith("_json") or (
+                    table_name,
+                    column_name,
+                ) == ("store_metadata", "value_json")
+                if is_json_document:
+                    safe_value, _ = self._redact_legacy_json_document(raw_value)
+                    digest_safe = safe_value
+                else:
+                    safe_value, _ = redact_capture_text(raw_value)
+                    digest_safe, _ = strip_untrusted_raw_digest_text(safe_value)
+                redaction_changed = safe_value != raw_value
+                digest_changed = digest_safe != safe_value
+                if not redaction_changed and not digest_changed:
+                    continue
+                redaction_changing_cell_count += int(redaction_changed)
+                raw_digest_changing_cell_count += int(digest_changed)
+                column_key = f"{table_name}.{column_name}"
+                findings = content_findings if is_content else identifier_findings
+                findings[column_key] = findings.get(column_key, 0) + 1
+                finding_records.append(
+                    (
+                        "content" if is_content else "identifier",
+                        table_name,
+                        column_name,
+                        cell_identity,
+                        redaction_changed,
+                        digest_changed,
+                    )
+                )
+        repair_plan_sha256 = hashlib.sha256(
+            _json_dumps(sorted(finding_records)).encode("utf-8")
+        ).hexdigest()
+        content_finding_count = sum(content_findings.values())
+        identifier_finding_count = sum(identifier_findings.values())
+        base_blocked = bool(
+            not quick_check_ok
+            or not integrity_check_ok
+            or foreign_key_error_count
+            or unclassified
+            or identifier_finding_count
+        )
+        settled_status = (
+            "blocked"
+            if base_blocked
+            else "repairable"
+            if content_finding_count
+            else "ready"
+        )
+        settled_revision_seed = {
+            "protocol_version": "secret-content-preclaim-repair.v1",
+            "status": settled_status,
+            "repair_plan_sha256": repair_plan_sha256,
+            "content_findings_by_column": content_findings,
+            "identifier_findings_by_column": identifier_findings,
+            "redaction_changing_cell_count": redaction_changing_cell_count,
+            "raw_digest_changing_cell_count": raw_digest_changing_cell_count,
+            "unclassified_text_column_count": len(unclassified),
+            "quick_check_ok": quick_check_ok,
+            "integrity_check_ok": integrity_check_ok,
+            "foreign_key_error_count": foreign_key_error_count,
+        }
+        settled_audit_revision = hashlib.sha256(
+            _json_dumps(settled_revision_seed).encode("utf-8")
+        ).hexdigest()
+        receipt_inventory = self._secret_content_preclaim_receipt_inventory(conn)
+        pending_receipts = list(receipt_inventory["pending"])
+        receipt_integrity_error_count = int(receipt_inventory["invalid_count"])
+        pending_receipt_semantic_error_count = sum(
+            1
+            for receipt in pending_receipts
+            if (
+                receipt["after_revision"] != settled_audit_revision
+                or receipt["payload"]["repaired_state_revision"]
+                != settled_audit_revision
+                or int(receipt["payload"]["reviewed_finding_count"]) <= 0
+                or settled_status != "ready"
+            )
+        )
+        receipt_binding_error_count = sum(
+            1
+            for receipt in (
+                *pending_receipts,
+                *receipt_inventory["verified"],
+            )
+            if receipt["after_revision"]
+            != receipt["payload"]["repaired_state_revision"]
+        )
+        receipt_semantic_error_count = (
+            pending_receipt_semantic_error_count
+            + receipt_binding_error_count
+        )
+        if (
+            base_blocked
+            or receipt_integrity_error_count
+            or receipt_semantic_error_count
+            or len(pending_receipts) > 1
+        ):
+            status = "blocked"
+        elif content_finding_count:
+            status = "blocked" if pending_receipts else "repairable"
+        elif len(pending_receipts) == 1:
+            status = "committed_unverified"
+        else:
+            status = "ready"
+        revision_seed = {
+            "settled_audit_revision": settled_audit_revision,
+            "receipt_integrity_error_count": receipt_integrity_error_count,
+            "receipt_semantic_error_count": receipt_semantic_error_count,
+            "pending_receipts": [
+                {
+                    "operation_id": receipt["operation_id"],
+                    "before_revision": receipt["before_revision"],
+                    "after_revision": receipt["after_revision"],
+                    "payload_sha256": receipt["payload_sha256"],
+                }
+                for receipt in pending_receipts
+            ],
+        }
+        return {
+            **settled_revision_seed,
+            "status": status,
+            "audit_revision": hashlib.sha256(
+                _json_dumps(revision_seed).encode("utf-8")
+            ).hexdigest(),
+            "settled_audit_revision": settled_audit_revision,
+            "content_finding_count": content_finding_count,
+            "identifier_finding_count": identifier_finding_count,
+            "scanned_cell_count": scanned_cell_count,
+            "scanned_byte_count": scanned_byte_count,
+            "repair_required": status == "repairable",
+            "repair_receipt_integrity_error_count": (
+                receipt_integrity_error_count
+            ),
+            "repair_receipt_semantic_error_count": (
+                receipt_semantic_error_count
+            ),
+            "pending_repair_receipt_semantic_error_count": (
+                pending_receipt_semantic_error_count
+            ),
+            "pending_repair_receipt_count": len(pending_receipts),
+            "invalid_pending_repair_receipt_count": int(
+                receipt_inventory["invalid_pending_count"]
+            ),
+            "content_free": True,
+        }
+
+    def audit_secret_content_preclaim_repair(self) -> dict[str, Any]:
+        """Audit secret-bearing residue without exposing any stored value."""
+
+        with closing(self._connect_read_only()) as conn:
+            conn.execute("PRAGMA trusted_schema = OFF")
+            conn.execute("BEGIN")
+            try:
+                return self._secret_content_repair_audit(conn)
+            finally:
+                conn.rollback()
+
+    def _verify_secret_content_safety_backup(
+        self,
+        backup: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._verify_context_delivery_publication_backup(
+            {
+                "safety_backup_path": backup["backup_path"],
+                "safety_backup_sha256": backup["sha256"],
+                "safety_backup_size_bytes": int(backup["size_bytes"]),
+            }
+        )
+
+    def _verify_secret_content_proof_backup(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        verification = self._verify_secret_content_safety_backup(
+            {
+                "backup_path": payload["proof_backup_path"],
+                "sha256": payload["proof_backup_sha256"],
+                "size_bytes": int(payload["proof_backup_size_bytes"]),
+            }
+        )
+        inspection = self._inspect_backup_snapshot(
+            Path(str(payload["proof_backup_path"]))
+        )
+        if (
+            inspection["restore_eligible"] is not True
+            or str(inspection["snapshot_revision"])
+            != str(payload["proof_backup_snapshot_revision"])
+            or payload["proof_backup_restore_eligible"] is not True
+        ):
+            raise RuntimeError(
+                "secret content repair proof backup failed restore verification"
+            )
+        return {
+            **verification,
+            "snapshot_revision": str(inspection["snapshot_revision"]),
+            "snapshot_restore_eligible": True,
+        }
+
+    def _prove_secret_content_preclaim_repair_durable(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        lease: CoreAuthorityLease,
+        receipt: dict[str, Any],
+        receipt_status: str,
+    ) -> dict[str, Any]:
+        if receipt_status not in {"pending", "verified"}:
+            raise ValueError("secret content receipt status is invalid")
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+        if (
+            checkpoint is None
+            or int(checkpoint[0]) != 0
+            or int(checkpoint[1]) != int(checkpoint[2])
+        ):
+            raise RuntimeError("secret content repair checkpoint was incomplete")
+        lease.assert_core_for(self.db_path)
+        quick_check = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
+        integrity_check = [
+            str(row[0]) for row in conn.execute("PRAGMA integrity_check")
+        ]
+        foreign_key_error_count = sum(
+            1 for _ in conn.execute("PRAGMA foreign_key_check")
+        )
+        self._run_migrations(conn, allow_mutation=False)
+        audit = self._secret_content_repair_audit(conn)
+        expected_status = (
+            "committed_unverified" if receipt_status == "pending" else "ready"
+        )
+        inventory = self._secret_content_preclaim_receipt_inventory(conn)
+        candidates = inventory[receipt_status]
+        matches = [
+            candidate
+            for candidate in candidates
+            if candidate["operation_id"] == receipt["operation_id"]
+            and candidate["before_revision"] == receipt["before_revision"]
+            and candidate["after_revision"] == receipt["after_revision"]
+            and candidate["created_at"] == receipt["created_at"]
+            and candidate["payload_sha256"] == receipt["payload_sha256"]
+        ]
+        if (
+            quick_check != ["ok"]
+            or integrity_check != ["ok"]
+            or foreign_key_error_count != 0
+            or audit["status"] != expected_status
+            or int(audit["content_finding_count"]) != 0
+            or int(audit["identifier_finding_count"]) != 0
+            or int(audit["redaction_changing_cell_count"]) != 0
+            or int(audit["raw_digest_changing_cell_count"]) != 0
+            or inventory["invalid_count"]
+            or len(matches) != 1
+        ):
+            raise RuntimeError(
+                "secret content repair durable state failed verification"
+            )
+        current = matches[0]
+        if (
+            current["after_revision"] != audit["settled_audit_revision"]
+            or current["payload"]["repaired_state_revision"]
+            != audit["settled_audit_revision"]
+        ):
+            raise RuntimeError(
+                "secret content repair receipt is not bound to repaired state"
+            )
+        safety_verification = self._verify_secret_content_safety_backup(
+            {
+                "backup_path": current["payload"]["safety_backup_path"],
+                "sha256": current["payload"]["safety_backup_sha256"],
+                "size_bytes": int(
+                    current["payload"]["safety_backup_size_bytes"]
+                ),
+            }
+        )
+        proof_verification = (
+            None
+            if receipt_status == "pending"
+            else self._verify_secret_content_proof_backup(current["payload"])
+        )
+        return {
+            "audit": audit,
+            "receipt": current,
+            "checkpoint": [int(value) for value in checkpoint],
+            "quick_check": quick_check,
+            "integrity_check": integrity_check,
+            "foreign_key_error_count": foreign_key_error_count,
+            "safety_backup_verification": safety_verification,
+            "proof_backup_verification": proof_verification,
+        }
+
+    def _verify_pending_secret_content_preclaim_repair(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        lease: CoreAuthorityLease,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        pending_proof = self._prove_secret_content_preclaim_repair_durable(
+            conn,
+            lease=lease,
+            receipt=receipt,
+            receipt_status="pending",
+        )
+        pending_receipt = pending_proof["receipt"]
+        pending_payload = dict(pending_receipt["payload"])
+        pending_payload_sha256 = str(pending_receipt["payload_sha256"])
+
+        proof_backup = self._verified_safety_backup(
+            conn,
+            label="post-secret-content-repair-proof",
+        )
+        proof_inspection = self._inspect_backup_snapshot(
+            Path(str(proof_backup["backup_path"]))
+        )
+        if proof_inspection["restore_eligible"] is not True:
+            raise RuntimeError(
+                "secret content repair proof backup is not restore eligible"
+            )
+
+        conn.execute("BEGIN EXCLUSIVE")
+        try:
+            lease.assert_core_for(self.db_path)
+            current_audit = self._secret_content_repair_audit(conn)
+            if current_audit["status"] != "committed_unverified":
+                raise RuntimeError("secret content pending state changed")
+            inventory = self._secret_content_preclaim_receipt_inventory(conn)
+            matching = [
+                candidate
+                for candidate in inventory["pending"]
+                if candidate["operation_id"] == pending_receipt["operation_id"]
+                and candidate["payload_sha256"] == pending_payload_sha256
+                and candidate["before_revision"]
+                == pending_receipt["before_revision"]
+                and candidate["after_revision"]
+                == pending_receipt["after_revision"]
+                and candidate["created_at"] == pending_receipt["created_at"]
+            ]
+            if inventory["invalid_count"] or len(matching) != 1:
+                raise RuntimeError("secret content pending receipt changed")
+            current_receipt = matching[0]
+            current_payload = current_receipt["payload"]
+            if (
+                current_receipt["after_revision"]
+                != current_audit["settled_audit_revision"]
+                or current_payload["repaired_state_revision"]
+                != current_audit["settled_audit_revision"]
+            ):
+                raise RuntimeError(
+                    "secret content pending receipt is not bound to repaired state"
+                )
+            verified_payload = {
+                **current_payload,
+                "verification_status": "verified",
+                "proof_backup_path": str(proof_backup["backup_path"]),
+                "proof_backup_sha256": str(proof_backup["sha256"]),
+                "proof_backup_size_bytes": int(proof_backup["size_bytes"]),
+                "proof_backup_snapshot_revision": str(
+                    proof_inspection["snapshot_revision"]
+                ),
+                "proof_backup_restore_eligible": True,
+                "verified_at": max(
+                    time.time(),
+                    float(current_receipt["created_at"]),
+                ),
+            }
+            cursor = conn.execute(
+                """
+                UPDATE store_maintenance_receipts
+                SET payload_json = ?
+                WHERE operation_id = ?
+                  AND before_revision = ?
+                  AND after_revision = ?
+                  AND created_at = ?
+                  AND payload_json = ?
+                """,
+                (
+                    _json_dumps(verified_payload),
+                    current_receipt["operation_id"],
+                    current_receipt["before_revision"],
+                    current_receipt["after_revision"],
+                    current_receipt["created_at"],
+                    _json_dumps(current_payload),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("secret content pending receipt changed")
+            lease.assert_core_for(self.db_path)
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+        inventory = self._secret_content_preclaim_receipt_inventory(conn)
+        verified_matches = [
+            candidate
+            for candidate in inventory["verified"]
+            if candidate["operation_id"] == pending_receipt["operation_id"]
+        ]
+        if inventory["invalid_count"] or len(verified_matches) != 1:
+            raise RuntimeError(
+                "secret content verified receipt did not persist"
+            )
+        final_proof = self._prove_secret_content_preclaim_repair_durable(
+            conn,
+            lease=lease,
+            receipt=verified_matches[0],
+            receipt_status="verified",
+        )
+        return {
+            **final_proof,
+            "pending_checkpoint": pending_proof["checkpoint"],
+            "proof_backup": {
+                **proof_backup,
+                "snapshot_revision": str(
+                    proof_inspection["snapshot_revision"]
+                ),
+                "snapshot_restore_eligible": True,
+            },
+        }
+
+    def repair_secret_content_preclaim(
+        self,
+        *,
+        expected_revision: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Scrub only reviewed content under an unclaimed offline core lease."""
+
+        if confirm is not True:
+            raise ValueError("secret content repair requires confirm=True")
+        expected = str(expected_revision or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+            raise ValueError("secret content repair requires a reviewed audit revision")
+        lease = self._assert_filesystem_authority()
+        if lease.role != "core" or lease.durable_epoch is not None:
+            raise CoreAuthorityError(
+                "secret content repair requires an unclaimed core maintenance lease"
+            )
+
+        safety_backup: dict[str, Any] | None = None
+        repair_committed = False
+        try:
+            with closing(self._connect_existing_write()) as conn:
+                before_data_version = int(
+                    conn.execute("PRAGMA data_version").fetchone()[0]
+                )
+                before = self._secret_content_repair_audit(conn)
+                if before["audit_revision"] != expected:
+                    raise RuntimeError(
+                        "secret content repair plan is stale; rerun the audit"
+                    )
+                if before["status"] == "ready":
+                    inventory = self._secret_content_preclaim_receipt_inventory(
+                        conn
+                    )
+                    latest_verified = (
+                        inventory["verified"][-1]
+                        if inventory["verified"]
+                        else None
+                    )
+                    proof = (
+                        None
+                        if latest_verified is None
+                        else self._prove_secret_content_preclaim_repair_durable(
+                            conn,
+                            lease=lease,
+                            receipt=latest_verified,
+                            receipt_status="verified",
+                        )
+                    )
+                    if proof is None:
+                        checkpoint_row = conn.execute(
+                            "PRAGMA wal_checkpoint(FULL)"
+                        ).fetchone()
+                        if (
+                            checkpoint_row is None
+                            or int(checkpoint_row[0]) != 0
+                            or int(checkpoint_row[1]) != int(checkpoint_row[2])
+                        ):
+                            raise RuntimeError(
+                                "secret content ready checkpoint was incomplete"
+                            )
+                        lease.assert_core_for(self.db_path)
+                        quick_check = [
+                            str(row[0])
+                            for row in conn.execute("PRAGMA quick_check")
+                        ]
+                        integrity_check = [
+                            str(row[0])
+                            for row in conn.execute("PRAGMA integrity_check")
+                        ]
+                        foreign_key_error_count = sum(
+                            1
+                            for _ in conn.execute("PRAGMA foreign_key_check")
+                        )
+                        if (
+                            quick_check != ["ok"]
+                            or integrity_check != ["ok"]
+                            or foreign_key_error_count != 0
+                        ):
+                            raise RuntimeError(
+                                "secret content ready verification failed"
+                            )
+                    return {
+                        "action": "secret-content-preclaim-repair",
+                        "status": "ready",
+                        "operation_id": (
+                            None
+                            if latest_verified is None
+                            else latest_verified["operation_id"]
+                        ),
+                        "repair_confirmed": True,
+                        "expected_revision": expected,
+                        "before": before,
+                        "after": before if proof is None else proof["audit"],
+                        "safety_backup": None,
+                        "proof_backup": None,
+                        "checkpoint": (
+                            [int(value) for value in checkpoint_row]
+                            if proof is None
+                            else proof["checkpoint"]
+                        ),
+                        "quick_check": (
+                            quick_check if proof is None else proof["quick_check"]
+                        ),
+                        "integrity_check": (
+                            integrity_check
+                            if proof is None
+                            else proof["integrity_check"]
+                        ),
+                        "foreign_key_error_count": (
+                            foreign_key_error_count
+                            if proof is None
+                            else proof["foreign_key_error_count"]
+                        ),
+                        "action_receipt_verified": bool(proof),
+                        "verification_passed": True,
+                    }
+                if before["status"] == "committed_unverified":
+                    inventory = self._secret_content_preclaim_receipt_inventory(
+                        conn
+                    )
+                    if (
+                        inventory["invalid_count"]
+                        or len(inventory["pending"]) != 1
+                    ):
+                        raise RuntimeError(
+                            "secret content pending receipt is ambiguous"
+                        )
+                    pending_receipt = inventory["pending"][0]
+                    proof = self._verify_pending_secret_content_preclaim_repair(
+                        conn,
+                        lease=lease,
+                        receipt=pending_receipt,
+                    )
+                    payload = pending_receipt["payload"]
+                    return {
+                        "action": "secret-content-preclaim-repair",
+                        "status": "verified",
+                        "operation_id": pending_receipt["operation_id"],
+                        "repair_confirmed": True,
+                        "expected_revision": expected,
+                        "reviewed_finding_count": int(
+                            payload["reviewed_finding_count"]
+                        ),
+                        "changed_index_row_count": int(
+                            payload["changed_index_row_count"]
+                        ),
+                        "safety_backup": {
+                            "backup_path": payload["safety_backup_path"],
+                            **proof["safety_backup_verification"],
+                        },
+                        "proof_backup": proof["proof_backup"],
+                        "before": before,
+                        "after": proof["audit"],
+                        "checkpoint": proof["checkpoint"],
+                        "quick_check": proof["quick_check"],
+                        "integrity_check": proof["integrity_check"],
+                        "foreign_key_error_count": proof[
+                            "foreign_key_error_count"
+                        ],
+                        "action_receipt_verified": True,
+                        "verification_passed": True,
+                    }
+                if before["status"] != "repairable":
+                    raise RuntimeError(
+                        "secret content state is not narrowly repairable"
+                    )
+                safety_backup = self._verified_safety_backup(
+                    conn,
+                    label="pre-secret-content-repair",
+                )
+                if int(conn.execute("PRAGMA data_version").fetchone()[0]) != (
+                    before_data_version
+                ):
+                    raise RuntimeError(
+                        "memory store changed during the safety backup; rerun the audit"
+                    )
+
+                conn.execute("BEGIN EXCLUSIVE")
+                try:
+                    lease.assert_core_for(self.db_path)
+                    current = self._secret_content_repair_audit(conn)
+                    if (
+                        current["audit_revision"] != expected
+                        or current["status"] != "repairable"
+                    ):
+                        raise RuntimeError(
+                            "secret content repair plan changed before mutation"
+                        )
+                    changed_index_row_count = self._scrub_legacy_secret_content(conn)
+                    after_mutation = self._secret_content_repair_audit(conn)
+                    if after_mutation["status"] != "ready":
+                        raise RuntimeError(
+                            "secret content repair verification failed; transaction "
+                            "rolled back "
+                            f"(status={after_mutation['status']}, "
+                            "content_findings="
+                            f"{after_mutation['content_finding_count']}, "
+                            "content_columns="
+                            f"{after_mutation['content_findings_by_column']}, "
+                            "identifier_findings="
+                            f"{after_mutation['identifier_finding_count']})"
+                        )
+                    operation_id = "s2maint_" + uuid.uuid4().hex
+                    created_at = time.time()
+                    receipt_payload = {
+                        "protocol_version": (
+                            "secret-content-preclaim-repair.v1"
+                        ),
+                        "content_free": True,
+                        "verification_status": "pending",
+                        "reviewed_finding_count": int(
+                            current["content_finding_count"]
+                        ),
+                        "reviewed_redaction_changing_cell_count": int(
+                            current["redaction_changing_cell_count"]
+                        ),
+                        "reviewed_raw_digest_changing_cell_count": int(
+                            current["raw_digest_changing_cell_count"]
+                        ),
+                        "changed_index_row_count": int(
+                            changed_index_row_count
+                        ),
+                        "repaired_state_revision": str(
+                            after_mutation["settled_audit_revision"]
+                        ),
+                        "safety_backup_path": str(
+                            safety_backup["backup_path"]
+                        ),
+                        "safety_backup_sha256": str(safety_backup["sha256"]),
+                        "safety_backup_size_bytes": int(
+                            safety_backup["size_bytes"]
+                        ),
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO store_maintenance_receipts (
+                            operation_id, operation_type, context_id,
+                            before_revision, after_revision, payload_json,
+                            created_at
+                        ) VALUES (?, 'secret-content-preclaim-repair', NULL,
+                                  ?, ?, ?, ?)
+                        """,
+                        (
+                            operation_id,
+                            expected,
+                            str(after_mutation["settled_audit_revision"]),
+                            _json_dumps(receipt_payload),
+                            created_at,
+                        ),
+                    )
+                    lease.assert_core_for(self.db_path)
+                    conn.commit()
+                    repair_committed = True
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+
+                inventory = self._secret_content_preclaim_receipt_inventory(
+                    conn
+                )
+                pending_matches = [
+                    receipt
+                    for receipt in inventory["pending"]
+                    if receipt["operation_id"] == operation_id
+                ]
+                if inventory["invalid_count"] or len(pending_matches) != 1:
+                    raise RuntimeError(
+                        "secret content pending receipt did not persist"
+                    )
+                proof = self._verify_pending_secret_content_preclaim_repair(
+                    conn,
+                    lease=lease,
+                    receipt=pending_matches[0],
+                )
+                verified = proof["audit"]
+            return {
+                "action": "secret-content-preclaim-repair",
+                "status": "repaired",
+                "operation_id": operation_id,
+                "repair_confirmed": True,
+                "expected_revision": expected,
+                "reviewed_finding_count": int(before["content_finding_count"]),
+                "changed_index_row_count": int(changed_index_row_count),
+                "safety_backup": {
+                    **safety_backup,
+                    **proof["safety_backup_verification"],
+                },
+                "proof_backup": proof["proof_backup"],
+                "before": before,
+                "after": verified,
+                "checkpoint": proof["checkpoint"],
+                "quick_check": proof["quick_check"],
+                "integrity_check": proof["integrity_check"],
+                "foreign_key_error_count": proof["foreign_key_error_count"],
+                "action_receipt_verified": True,
+                "verification_passed": True,
+            }
+        except Exception:
+            if safety_backup is not None and not repair_committed:
+                try:
+                    self._discard_safety_backup(safety_backup)
+                except Exception:
+                    LOGGER.exception(
+                        "failed to discard unused secret content repair backup"
+                    )
+            LOGGER.exception("failed to repair secret content preclaim state")
+            raise
 
     def _inspect_backup_snapshot(self, path: Path) -> dict[str, Any]:
         uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
