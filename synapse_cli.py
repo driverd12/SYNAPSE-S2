@@ -27,6 +27,19 @@ from token_contracts import (
 )
 
 
+def _direct_cli_requests_explicit_local_route(argv: list[str]) -> bool:
+    """Preserve reviewed offline lanes while protecting implicit CLI routing."""
+
+    for token in argv:
+        if token == "--":
+            break
+        if token in {"--memory-db", "--state"} or token.startswith(
+            ("--memory-db=", "--state=")
+        ):
+            return True
+    return False
+
+
 _STARTUP_IMPORT_ERROR: Exception | None = None
 _CONTRACT_COMMAND_SURFACES = {
     "agent-brief": "agent-hydration",
@@ -38,8 +51,25 @@ _CONTRACT_COMMAND_SURFACES = {
 try:
     # A reviewed binding must be loaded, canonicalized, and matched to its
     # private CoreConfig before any backend module can observe MLX/provider
-    # environment. Legacy no-binding v5 invocations remain unchanged.
-    from core_client_binding import apply_binding_environment
+    # environment. A directly executed CLI auto-discovers the installed
+    # owner-only binding before a foreign project directory or cwd can select
+    # an unrelated repo-local database. Explicit --memory-db/--state remains
+    # the reviewed offline v5 escape hatch; imported-library behavior is
+    # unchanged.
+    from core_client_binding import (
+        BINDING_ENV,
+        apply_binding_environment,
+        default_binding_path,
+    )
+
+    if (
+        __name__ == "__main__"
+        and BINDING_ENV not in os.environ
+        and not _direct_cli_requests_explicit_local_route(sys.argv[1:])
+    ):
+        installed_binding = default_binding_path()
+        if installed_binding.exists() or installed_binding.is_symlink():
+            os.environ[BINDING_ENV] = str(installed_binding)
 
     apply_binding_environment()
     from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop

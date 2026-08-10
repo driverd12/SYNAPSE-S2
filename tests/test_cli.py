@@ -13,12 +13,80 @@ from memory_store import DurableMemoryStore
 from mlx_backend import SpikingAttentionBackend
 from capture_daemon import CaptureInboxDaemon
 from core_client import CoreClient, CoreOutcomeUnknown
+from core_client_binding import binding_for_config, write_core_client_binding
+from core_service import CoreConfig, write_core_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
+    def test_direct_cli_prefers_installed_binding_over_foreign_project_cwd(self):
+        with TemporaryDirectory(dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            home = root / "home"
+            repo = root / "synapse"
+            data = repo / ".synapse_s2"
+            core = data / "core"
+            foreign_project = root / "Agentic-Win11_Imaging"
+            home.mkdir(mode=0o700)
+            core.mkdir(parents=True, mode=0o700)
+            foreign_project.mkdir()
+            config = CoreConfig(
+                socket_path=core / "service.sock",
+                state_path=data / "runtime_state.json",
+                memory_path=data / "memory.sqlite3",
+                capture_root=data,
+                dimension=8,
+                num_neurons=16,
+                default_top_k=4,
+            )
+            write_core_config(core / "service.json", config)
+            binding = binding_for_config(
+                repo_root=repo,
+                data_root=data,
+                config=config,
+                core_label="aero.boom.synapse-s2.core",
+                authority_mode="candidate-local-v5",
+            )
+            binding_path = (
+                home / ".config" / "synapse-s2" / "core-binding.json"
+            )
+            write_core_client_binding(binding_path, binding)
+            environment = os.environ.copy()
+            for key in list(environment):
+                if key.startswith("SYNAPSE_S2_") or key in {
+                    "CLAUDE_PROJECT_DIR",
+                    "CODEX_PROJECT_DIR",
+                    "MLX_DEVICE",
+                    "PYTHONHOME",
+                    "PYTHONPATH",
+                }:
+                    environment.pop(key, None)
+            environment.update(
+                {
+                    "CODEX_PROJECT_DIR": str(foreign_project),
+                    "HOME": str(home),
+                    "PYTHONNOUSERSITE": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "synapse_cli.py"), "--json", "status"],
+                cwd=foreign_project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["memory_db_path"], str(config.memory_path))
+            self.assertFalse((foreign_project / ".synapse_s2").exists())
+
     def test_preflight_default_launcher_uses_current_home(self):
         import synapse_cli
 
