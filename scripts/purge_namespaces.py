@@ -967,7 +967,17 @@ def authoritative_client() -> tuple[CoreClient, CoreClientBinding]:
     # Use the protocol's full control-plane window so a committed delete is not
     # reported as outcome-unknown merely because the generic 15-second client
     # default elapsed first.
-    return CoreClient(caller=SOURCE_SURFACE, default_timeout_seconds=30.0), binding
+    return (
+        CoreClient(
+            socket_path=binding.socket_path,
+            state_path=binding.state_path,
+            replication_inbox_root=binding.replication_inbox_root,
+            caller=SOURCE_SURFACE,
+            expected_config_fingerprint=binding.config_fingerprint,
+            default_timeout_seconds=30.0,
+        ),
+        binding,
+    )
 
 
 def build_parser() -> SecretSafeArgumentParser:

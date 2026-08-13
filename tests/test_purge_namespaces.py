@@ -6,6 +6,8 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest import mock
 
 from scripts import purge_namespaces as purge
 
@@ -214,6 +216,38 @@ def candidate_state(*, catalog: bool = False) -> dict:
 
 
 class NamespacePurgeTests(unittest.TestCase):
+    def test_authoritative_client_uses_every_reviewed_split_route(self):
+        binding = SimpleNamespace(
+            authority_mode="authoritative-core-v6",
+            socket_path=Path("/private/tmp/synapse-run/service.sock"),
+            state_path=Path("/private/tmp/synapse-data/runtime_state.json"),
+            replication_inbox_root=Path("/private/tmp/synapse-data/replication/inbox"),
+            config_fingerprint="a" * 64,
+        )
+        core = object()
+        with mock.patch.dict(
+            purge.os.environ,
+            {purge.BINDING_ENV: "/private/tmp/core-binding.json"},
+        ), mock.patch(
+            "scripts.purge_namespaces.apply_binding_environment",
+            return_value=binding,
+        ), mock.patch(
+            "scripts.purge_namespaces.CoreClient",
+            return_value=core,
+        ) as constructor:
+            observed_core, observed_binding = purge.authoritative_client()
+
+        self.assertIs(observed_core, core)
+        self.assertIs(observed_binding, binding)
+        constructor.assert_called_once_with(
+            socket_path=binding.socket_path,
+            state_path=binding.state_path,
+            replication_inbox_root=binding.replication_inbox_root,
+            caller=purge.SOURCE_SURFACE,
+            expected_config_fingerprint=binding.config_fingerprint,
+            default_timeout_seconds=30.0,
+        )
+
     def test_owner_bound_catalog_probe_detects_metadata_without_writing(self):
         with TemporaryDirectory() as temporary:
             database = Path(temporary) / "memory.sqlite3"
