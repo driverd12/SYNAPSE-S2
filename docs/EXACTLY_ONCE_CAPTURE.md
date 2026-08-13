@@ -78,6 +78,16 @@ Abandoned processing claims are recoverable. Historical error files are not
 automatically retried because old JSONL prefixes may have been partially applied
 before `capture.v2` existed.
 
+When an inbox processor is routed through `CoreClient`, a
+`service_unavailable` failure before authoritative submission is transport
+backpressure, not bad capture evidence. The daemon leaves the payload in its
+private atomic processing claim, creates no error sidecar or receipt, and lets a
+later authoritative worker retry the same capture ID. Only `CoreUnavailable`
+receives this treatment. A post-connect `outcome_unknown` may already have
+reached the mutation journal and remains governed error evidence requiring
+reconciliation; deterministic backend and payload failures likewise retain the
+existing quarantine path.
+
 ### Incomplete write artifacts
 
 Files that still have a recognized inbox temporary name are transport debris,

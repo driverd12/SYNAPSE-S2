@@ -20,6 +20,7 @@ from capture_daemon import (
     release_capture_replacement_freeze,
     write_capture_drop,
 )
+from core_client import CoreOutcomeUnknown, CoreUnavailable
 from mlx_backend import SpikingAttentionBackend
 
 
@@ -1777,7 +1778,7 @@ class CaptureInboxDaemonTests(unittest.TestCase):
     def test_backend_error_is_quarantined_and_not_automatically_retried(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            backend = RecordingBackend(error=RuntimeError("backend unavailable"))
+            backend = RecordingBackend(error=RuntimeError("service_unavailable"))
             daemon = CaptureInboxDaemon(root=root, backend=backend)
             write_capture_drop(root=root, text="A failed capture must be quarantined.")
 
@@ -1785,7 +1786,74 @@ class CaptureInboxDaemonTests(unittest.TestCase):
             retry = daemon.process_once()
 
         self.assertEqual(result["error_file_count"], 1)
+        self.assertEqual(result["errors"][0]["error"], "service_unavailable")
         self.assertEqual(len(backend.calls), 1)
+        self.assertEqual(retry["processed_file_count"], 0)
+        self.assertEqual(retry["error_file_count"], 0)
+
+    def test_offline_authoritative_core_defers_without_error_then_processes_once(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend = RecordingBackend(error=CoreUnavailable())
+            daemon = CaptureInboxDaemon(root=root, backend=backend)
+            write_capture_drop(
+                root=root,
+                text="A clean boundary remains queued while the core is offline.",
+            )
+
+            deferred = daemon.process_once()
+            deferred_status = daemon.status()
+
+            self.assertEqual(deferred["processed_file_count"], 0)
+            self.assertEqual(deferred["error_file_count"], 0)
+            self.assertEqual(deferred["deferred_file_count"], 1)
+            self.assertEqual(deferred_status["pending_file_count"], 0)
+            self.assertEqual(deferred_status["processing_file_count"], 1)
+            self.assertEqual(deferred_status["unresolved_error_count"], 0)
+            self.assertEqual(list((root / "capture_errors").iterdir()), [])
+            self.assertEqual(list((root / "capture_receipts").iterdir()), [])
+            self.assertEqual(len(backend.calls), 1)
+            self.assertEqual(len(backend.effects), 0)
+
+            backend.error = None
+            recovered = CaptureInboxDaemon(
+                root=root,
+                backend=backend,
+            ).process_once()
+
+        self.assertEqual(recovered["processed_file_count"], 1)
+        self.assertEqual(recovered["error_file_count"], 0)
+        self.assertEqual(recovered["deferred_file_count"], 0)
+        self.assertEqual(len(backend.calls), 2)
+        self.assertEqual(len(backend.effects), 1)
+
+    def test_outcome_unknown_remains_terminal_error_evidence(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend = RecordingBackend(
+                error=CoreOutcomeUnknown(
+                    caller="capture-test",
+                    request_id="req-capture-ambiguous",
+                    operation="capture_conversation",
+                )
+            )
+            daemon = CaptureInboxDaemon(root=root, backend=backend)
+            write_capture_drop(
+                root=root,
+                text="An ambiguous submission must not be blindly replayed.",
+            )
+
+            result = daemon.process_once()
+            status = daemon.status()
+            retry = daemon.process_once()
+
+        self.assertEqual(result["processed_file_count"], 0)
+        self.assertEqual(result["error_file_count"], 1)
+        self.assertEqual(result["deferred_file_count"], 0)
+        self.assertEqual(result["errors"][0]["error"], "outcome_unknown")
+        self.assertGreater(status["unresolved_error_count"], 0)
+        self.assertEqual(len(backend.calls), 1)
+        self.assertEqual(len(backend.effects), 0)
         self.assertEqual(retry["processed_file_count"], 0)
         self.assertEqual(retry["error_file_count"], 0)
 

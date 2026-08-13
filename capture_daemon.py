@@ -4318,11 +4318,27 @@ class CaptureInboxDaemon:
             # The SQLite capture_operations ledger is authoritative. Even a
             # matching transport receipt must replay through the backend so a
             # restored database cannot silently lose a capture.
-            result = self._capture_payload(
-                path=path,
-                payload=payload,
-                request=request,
-            )
+            try:
+                result = self._capture_payload(
+                    path=path,
+                    payload=payload,
+                    request=request,
+                )
+            except Exception as exc:
+                # Import locally: core_client imports the service contract, and
+                # the service constructs this daemon for its embedded worker.
+                # CoreUnavailable proves that the authoritative request never
+                # reached a service capable of accepting it. Preserve the
+                # atomic processing claim for the next authoritative worker;
+                # post-connect CoreOutcomeUnknown and every other failure must
+                # continue through the governed error-evidence path.
+                from core_client import CoreUnavailable
+
+                if isinstance(exc, CoreUnavailable):
+                    raise CaptureDeferred(
+                        "authoritative core unavailable before capture submission"
+                    ) from exc
+                raise
             try:
                 compact_result = self._compact_capture_result(result)
                 receipt_payload = {
