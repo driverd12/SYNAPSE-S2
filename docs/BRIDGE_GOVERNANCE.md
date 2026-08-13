@@ -222,7 +222,7 @@ Do not use a bare loopback URL or unauthenticated `curl` as an operator path.
 | Map/catalog and suggestions | `namespace-map` | `list_namespace_map` | `list_spiking_namespace_map` | `GET /api/namespace-map` |
 | Propose | `namespace-link-propose` | `propose_namespace_link` | `propose_spiking_namespace_link` | `POST /api/namespace-link-proposals` |
 | List proposals | `namespace-link-proposals` | `list_namespace_link_proposals` | — | `GET /api/namespace-link-proposals` |
-| History | `namespace-link-history` | `list_namespace_link_history` | `list_spiking_namespace_link_history` | — |
+| History | `namespace-link-history` | `list_namespace_link_history` | `list_spiking_namespace_link_history` | `GET /api/namespace-link-history` |
 | CAS approve/reject | `namespace-link-review` | `review_namespace_link` | reject only: `reject_spiking_namespace_link` | `POST /api/namespace-link-reviews` |
 | Direct compatibility approval | `namespace-link` | `approve_namespace_link` | deliberately unavailable | `POST /api/namespace-links` |
 | Disable | `namespace-link-disable` | `disable_namespace_link` | — | — |
@@ -256,6 +256,60 @@ reviewing a bridge:
 ```
 
 Stop if the audit is `degraded`. Do not approve around an integrity error.
+
+### Connect IT operations and Project Citadel deliberately
+
+`IT-OPS-WORKLOG` and `PROJECT_CITADEL` use the normal two-step governance
+flow; they have no special-case trust or automatic linkage. The proposal below
+remains isolated until a later review approves the exact returned revision.
+Use a current change-record identifier in evidence and choose an expiry that
+matches the reviewed operational need.
+
+```bash
+LINK_EXPIRES_AT="$(( $(date +%s) + 2592000 ))"
+proposal_json="$(
+  .venv/bin/python synapse_cli.py --json namespace-link-propose \
+    --source-context IT-OPS-WORKLOG \
+    --target-context PROJECT_CITADEL \
+    --relation-type operational-handoff \
+    --direction bidirectional \
+    --weight 0.8 \
+    --reason 'Reviewed operational handoff requires bounded one-hop recall.' \
+    --evidence '{"change_record":"CHG-REPLACE-ME"}' \
+    --link-expires-at "$LINK_EXPIRES_AT" \
+    --governance-request-id "bridge-it-ops-citadel-$(date +%s)"
+)" || exit 1
+
+PROPOSAL_ID="$(printf '%s' "$proposal_json" | \
+  .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["proposal"]["proposal_id"])')"
+EXPECTED_REVISION="$(printf '%s' "$proposal_json" | \
+  .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["proposal"]["revision"])')"
+printf '%s\n' "$proposal_json"
+```
+
+Inspect the proposal before continuing. Approval is a separate CAS-bound
+operation and must use the exact inspected revision:
+
+```bash
+.venv/bin/python synapse_cli.py --json namespace-link-review \
+  --proposal-id "$PROPOSAL_ID" \
+  --decision approve \
+  --expected-revision "$EXPECTED_REVISION" \
+  --reason 'Reviewed endpoints, evidence, direction, expiry, and recall scope.' \
+  --governance-request-id "bridge-review-${PROPOSAL_ID}"
+
+.venv/bin/python synapse_cli.py --json namespace-link-history \
+  --proposal-id "$PROPOSAL_ID" \
+  --limit 100
+.venv/bin/python synapse_cli.py --json namespace-link-audit
+```
+
+Dashboard clients use the equivalent authenticated API sequence:
+`POST /api/namespace-link-proposals`, inspect the returned proposal and
+revision, `POST /api/namespace-link-reviews`, then verify with
+`GET /api/namespace-link-history?proposal_id=...` and
+`GET /api/namespace-link-governance`. The direct compatibility endpoint is not
+part of this flow.
 
 ### Propose and capture the reviewed revision
 

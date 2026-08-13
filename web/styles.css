@@ -44,6 +44,14 @@
   --galaxy-text: #f3fff8;
   --galaxy-muted: #abc1b6;
   --galaxy-label-bg: rgba(5, 13, 15, 0.86);
+  --neuron-context: #087f8c;
+  --neuron-memory: #2867a8;
+  --neuron-app: #ad5d00;
+  --neuron-temporal: #7047b8;
+  --neuron-image: #b72d78;
+  --neuron-audio: #267a37;
+  --neuron-file: #8b6b00;
+  --neuron-unknown: #6d7880;
   --log-bg: #120f0b;
   --log-text: #d7ffc2;
   --terminal-font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
@@ -102,6 +110,14 @@
   --galaxy-text: #f0ffe8;
   --galaxy-muted: #93aa9c;
   --galaxy-label-bg: rgba(3, 8, 12, 0.84);
+  --neuron-context: #22d3c5;
+  --neuron-memory: #60a5fa;
+  --neuron-app: #f59e0b;
+  --neuron-temporal: #c084fc;
+  --neuron-image: #f472b6;
+  --neuron-audio: #4ade80;
+  --neuron-file: #facc15;
+  --neuron-unknown: #94a3b8;
   --log-bg: #030707;
   --log-text: #d8ffb0;
   --accent-gradient: linear-gradient(135deg, var(--teal) 0%, var(--green) 46%, var(--magenta) 100%);
@@ -2628,6 +2644,48 @@ textarea {
   font-size: 11px;
 }
 
+.namespace-bridge-builder {
+  flex-basis: 100%;
+  width: 100%;
+  border: 1px solid color-mix(in srgb, var(--teal) 42%, var(--row));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--teal-soft) 42%, var(--panel));
+  padding: 8px;
+}
+
+.namespace-bridge-builder summary {
+  color: var(--teal-strong);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.namespace-bridge-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.namespace-bridge-form label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.namespace-bridge-form input,
+.namespace-bridge-form select {
+  height: 34px;
+  font-size: 11px;
+}
+
+.namespace-bridge-form small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .namespace-galaxy-current {
   display: inline-flex;
   align-items: center;
@@ -2711,6 +2769,83 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.semantic-neuron-legend {
+  display: flex;
+  flex-basis: 100%;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  padding: 8px;
+}
+
+.semantic-neuron-legend strong {
+  flex-basis: 100%;
+  color: var(--text);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.semantic-neuron-key {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 2px solid currentColor;
+  background: color-mix(in srgb, currentColor 28%, var(--panel));
+}
+
+.semantic-neuron-key.context {
+  color: var(--neuron-context);
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
+}
+
+.semantic-neuron-key.memory {
+  color: var(--neuron-memory);
+  border-radius: 50%;
+}
+
+.semantic-neuron-key.app {
+  color: var(--neuron-app);
+  border-radius: 3px;
+}
+
+.semantic-neuron-key.temporal {
+  width: 11px;
+  height: 11px;
+  margin-inline: 1px;
+  color: var(--neuron-temporal);
+  transform: rotate(45deg);
+}
+
+.semantic-neuron-key.image {
+  width: 15px;
+  height: 11px;
+  color: var(--neuron-image);
+  border-radius: 1px;
+}
+
+.semantic-neuron-key.audio {
+  width: 16px;
+  height: 10px;
+  color: var(--neuron-audio);
+  border-radius: 50%;
+}
+
+.semantic-neuron-key.file {
+  color: var(--neuron-file);
+  clip-path: polygon(0 0, 66% 0, 100% 34%, 100% 100%, 0 100%);
+}
+
+.semantic-neuron-key.unknown {
+  color: var(--neuron-unknown);
+  border-style: dashed;
+  border-radius: 50%;
+  background: transparent;
 }
 
 .namespace-key {
@@ -3068,6 +3203,47 @@ textarea {
 .namespace-event-node {
   fill: color-mix(in srgb, var(--purple) 18%, var(--panel));
   stroke: var(--purple);
+}
+
+.graph-node.semantic-context {
+  fill: color-mix(in srgb, var(--neuron-context) 28%, var(--panel));
+  stroke: var(--neuron-context);
+}
+
+.graph-node.semantic-memory {
+  fill: color-mix(in srgb, var(--neuron-memory) 24%, var(--panel));
+  stroke: var(--neuron-memory);
+}
+
+.graph-node.semantic-app {
+  fill: color-mix(in srgb, var(--neuron-app) 25%, var(--panel));
+  stroke: var(--neuron-app);
+}
+
+.graph-node.semantic-temporal {
+  fill: color-mix(in srgb, var(--neuron-temporal) 24%, var(--panel));
+  stroke: var(--neuron-temporal);
+}
+
+.graph-node.semantic-image {
+  fill: color-mix(in srgb, var(--neuron-image) 24%, var(--panel));
+  stroke: var(--neuron-image);
+}
+
+.graph-node.semantic-audio {
+  fill: color-mix(in srgb, var(--neuron-audio) 24%, var(--panel));
+  stroke: var(--neuron-audio);
+}
+
+.graph-node.semantic-file {
+  fill: color-mix(in srgb, var(--neuron-file) 24%, var(--panel));
+  stroke: var(--neuron-file);
+}
+
+.graph-node.semantic-unknown {
+  fill: color-mix(in srgb, var(--neuron-unknown) 16%, var(--panel));
+  stroke: var(--neuron-unknown);
+  stroke-dasharray: 4 3;
 }
 
 .graph-label {

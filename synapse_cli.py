@@ -933,7 +933,7 @@ def command_namespace_link_proposals(args: argparse.Namespace) -> dict[str, Any]
     backend = build_backend(args)
     return backend.list_namespace_link_proposals(
         context_id=args.context,
-        state=args.state,
+        state=args.proposal_state,
         limit=args.limit,
     )
 
@@ -2488,7 +2488,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     namespace_link_proposals = subparsers.add_parser("namespace-link-proposals")
     namespace_link_proposals.add_argument("--context", default="")
-    namespace_link_proposals.add_argument("--state", default="")
+    namespace_link_proposals.add_argument(
+        "--state", dest="proposal_state", default=""
+    )
     namespace_link_proposals.add_argument("--limit", type=int, default=500)
     namespace_link_proposals.set_defaults(func=command_namespace_link_proposals)
 

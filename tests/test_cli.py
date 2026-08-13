@@ -21,6 +21,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
+    def test_namespace_link_proposal_state_does_not_override_runtime_state_path(self):
+        import synapse_cli
+
+        arguments = synapse_cli.build_parser().parse_args(
+            [
+                "namespace-link-proposals",
+                "--context",
+                "IT-OPS-WORKLOG",
+                "--state",
+                "pending",
+            ]
+        )
+
+        self.assertIsNone(arguments.state)
+        self.assertEqual(arguments.proposal_state, "pending")
+
     def test_direct_cli_prefers_installed_binding_over_foreign_project_cwd(self):
         with TemporaryDirectory(dir="/tmp") as temporary:
             root = Path(temporary).resolve()

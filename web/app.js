@@ -1421,6 +1421,7 @@ function initializeNamespaceGalaxy() {
     handleNamespaceGalaxyListAction(button);
   });
   elements.namespaceGalaxyInspector.addEventListener("click", handleNamespaceGalaxyInspectorClick);
+  elements.namespaceGalaxyInspector.addEventListener("submit", handleNamespaceGalaxyInspectorSubmit);
   window.addEventListener("popstate", restoreNamespaceGalaxyFromUrl);
   resizeNamespaceGalaxyCanvas();
   updateRecallScopeHelp();
@@ -1699,7 +1700,7 @@ function normalizeNamespaceDetail(payload = {}) {
     .map((rawNode) => {
       const memoryId = String(rawNode?.memory_id ?? "").trim();
       if (!memoryId) return null;
-      return {
+      const normalized = {
         kind: "memory",
         id: String(rawNode?.node_id || memoryId),
         memoryId,
@@ -1717,6 +1718,8 @@ function normalizeNamespaceDetail(payload = {}) {
         detailBadges: Array.isArray(rawNode?.detail_badges) ? rawNode.detail_badges.map(String) : [],
         raw: rawNode,
       };
+      normalized.semanticType = semanticNeuronType(normalized);
+      return normalized;
     })
     .filter(Boolean);
   const edges = (Array.isArray(payload.edges) ? payload.edges : [])
@@ -2328,6 +2331,150 @@ function namespaceEvidenceText(value) {
 function compactNamespaceEvidence(value, maxLength = 520) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+const SEMANTIC_NEURON_TYPES = Object.freeze({
+  context: { label: "Namespace / context", className: "semantic-context" },
+  memory: { label: "Memory / text", className: "semantic-memory" },
+  app: { label: "App event", className: "semantic-app" },
+  temporal: { label: "Temporal event", className: "semantic-temporal" },
+  image: { label: "Image", className: "semantic-image" },
+  audio: { label: "Audio", className: "semantic-audio" },
+  file: { label: "File / document", className: "semantic-file" },
+  unknown: { label: "Unknown", className: "semantic-unknown" },
+});
+
+function semanticNeuronSafeValues(value) {
+  const raw = value?.raw && typeof value.raw === "object" ? value.raw : {};
+  const metadata = value?.metadata && typeof value.metadata === "object" ? value.metadata : {};
+  const provenance = value?.provenance && typeof value.provenance === "object" ? value.provenance : {};
+  const sources = [value, raw, metadata, provenance];
+  const keys = [
+    "semantic_type",
+    "neuron_type",
+    "node_type",
+    "context_memory_type",
+    "content_kind",
+    "content_type",
+    "media_type",
+    "mime_type",
+    "file_type",
+    "file_extension",
+    "document_type",
+    "artifact_type",
+    "event_type",
+    "source_surface",
+    "source",
+    "source_tag",
+    "app_name",
+    "application",
+    "trace_type",
+  ];
+  const values = [];
+  sources.forEach((source) => {
+    keys.forEach((key) => {
+      const item = source?.[key];
+      if (["string", "number", "boolean"].includes(typeof item)) values.push(String(item));
+    });
+  });
+  [value?.semanticFacets, value?.detailBadges, raw?.semantic_facets, raw?.detail_badges, metadata?.semantic_facets, metadata?.detail_badges]
+    .filter(Array.isArray)
+    .forEach((items) => items.slice(0, 16).forEach((item) => {
+      if (["string", "number", "boolean"].includes(typeof item)) values.push(String(item));
+    }));
+  if (typeof value?.nodeType === "string") values.push(value.nodeType);
+  if (typeof value?.tag === "string") values.push(value.tag);
+  return values.map((item) => item.trim().toLowerCase()).filter(Boolean);
+}
+
+function semanticNeuronType(value = {}) {
+  const raw = value?.raw && typeof value.raw === "object" ? value.raw : {};
+  const metadata = value?.metadata && typeof value.metadata === "object" ? value.metadata : {};
+  const evidence = semanticNeuronSafeValues(value);
+  const normalizeType = (item) => String(item || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  const exactType = new Map([
+    ["namespace", "context"], ["context", "context"], ["topic", "context"],
+    ["goal", "context"], ["objective", "context"],
+    ["memory", "memory"], ["text", "memory"], ["concept", "memory"], ["trace", "memory"],
+    ["app", "app"], ["app_event", "app"], ["application_event", "app"],
+    ["app_connect", "app"], ["app_snapshot", "app"],
+    ["event", "temporal"], ["temporal", "temporal"], ["temporal_event", "temporal"],
+    ["timeline", "temporal"], ["sequence", "temporal"], ["session_boundary", "temporal"],
+    ["image", "image"], ["photo", "image"], ["screenshot", "image"], ["vision", "image"],
+    ["audio", "audio"], ["sound", "audio"], ["speech", "audio"], ["voice", "audio"],
+    ["file", "file"], ["document", "file"], ["pdf", "file"],
+    ["spreadsheet", "file"], ["workbook", "file"], ["presentation", "file"],
+    ["attachment", "file"], ["unknown", "unknown"],
+  ]);
+  const explicitTypes = [
+    metadata?.context_memory_type,
+    raw?.context_memory_type,
+    metadata?.semantic_type,
+    raw?.semantic_type,
+    metadata?.neuron_type,
+    raw?.neuron_type,
+  ];
+  for (const candidate of explicitTypes) {
+    const resolved = exactType.get(normalizeType(candidate));
+    if (resolved) return resolved;
+  }
+  const mediaType = [raw?.media_type, raw?.mime_type, metadata?.media_type, metadata?.mime_type, metadata?.content_type]
+    .filter((item) => typeof item === "string")
+    .join(" ")
+    .toLowerCase();
+  if (/\bimage\//.test(mediaType)) return "image";
+  if (/\baudio\//.test(mediaType)) return "audio";
+  if (/\b(application\/pdf|text\/csv|application\/msword|application\/vnd\.)/.test(mediaType)) return "file";
+
+  const nodeType = exactType.get(normalizeType(value?.nodeType || raw?.node_type));
+  if (nodeType && nodeType !== "memory" && nodeType !== "unknown") return nodeType;
+  const sourceSurface = [raw?.source_surface, metadata?.source_surface, value?.source, metadata?.source, metadata?.source_tag]
+    .filter((item) => typeof item === "string")
+    .join(" ")
+    .toLowerCase();
+  if (
+    /\b(app[-_ ]?(connect|snapshot|event|selection)|frontmost[-_ ]?(app|selection))\b/.test(sourceSurface)
+    || /\bapplication[-_ ]?(event|snapshot|capture|selection)\b/.test(sourceSurface)
+  ) return "app";
+  const eventType = normalizeType(raw?.event_type || metadata?.event_type);
+  if (
+    metadata?.event_segment === true
+    || raw?.event_segment === true
+    || exactType.get(eventType) === "temporal"
+  ) return "temporal";
+
+  const fileExtension = normalizeType(raw?.file_extension || metadata?.file_extension).replace(/^\./, "");
+  if (["png", "jpg", "jpeg", "gif", "webp", "heic", "svg"].includes(fileExtension)) return "image";
+  if (["wav", "mp3", "m4a", "aac", "flac", "ogg"].includes(fileExtension)) return "audio";
+  if (["pdf", "doc", "docx", "csv", "xls", "xlsx", "ppt", "pptx", "md", "txt"].includes(fileExtension)) return "file";
+
+  const exactFacets = [
+    value?.semanticFacets,
+    value?.detailBadges,
+    raw?.semantic_facets,
+    raw?.detail_badges,
+    metadata?.semantic_facets,
+    metadata?.detail_badges,
+  ].filter(Array.isArray).flat().map(normalizeType);
+  for (const candidate of exactFacets) {
+    const resolved = exactType.get(candidate);
+    if (resolved && !["memory", "unknown"].includes(resolved)) return resolved;
+  }
+  if (nodeType === "unknown") return "unknown";
+  if (evidence.length || typeof value?.tag === "string") return "memory";
+  return "unknown";
+}
+
+function semanticNeuronDescriptor(value) {
+  const type = typeof value === "string" ? value : semanticNeuronType(value);
+  return { type, ...(SEMANTIC_NEURON_TYPES[type] || SEMANTIC_NEURON_TYPES.unknown) };
+}
+
+function semanticNeuronLabel(value) {
+  return semanticNeuronDescriptor(value).label;
 }
 
 function renderNamespaceGalaxy(data) {
@@ -2951,19 +3098,103 @@ function drawNamespaceMemoryNode(context, projected, palette, lod, neighborhood)
   const hovered = state.namespaceGalaxy.detailHover?.kind === "memory"
     && state.namespaceGalaxy.detailHover.id === projected.item.id;
   const local = !neighborhood || neighborhood.ids.has(projected.item.id);
+  const semanticType = projected.item.semanticType || semanticNeuronType(projected.item);
+  const semanticColor = namespaceSemanticNeuronColor(semanticType, palette);
+  const radius = projected.radius + (selected ? 1.3 : 0);
   context.save();
-  context.fillStyle = selected ? palette.selected : palette.neuron;
+  context.fillStyle = semanticColor;
   context.globalAlpha = selected || hovered
     ? 1
     : local
       ? lod === "neurons" ? 0.84 : 0.7
       : 0.22;
-  context.shadowColor = selected ? palette.selected : palette.neuron;
+  context.shadowColor = semanticColor;
   context.shadowBlur = selected || hovered ? 10 : 4;
-  context.beginPath();
-  context.arc(projected.x, projected.y, projected.radius + (selected ? 1.3 : 0), 0, Math.PI * 2);
+  traceSemanticNeuronCanvasPath(context, semanticType, projected.x, projected.y, radius);
   context.fill();
+  context.shadowBlur = 0;
+  context.strokeStyle = semanticColor;
+  context.lineWidth = 1;
+  if (semanticType === "unknown") context.setLineDash([2, 2]);
+  context.stroke();
+  context.setLineDash([]);
+  if (selected || hovered) {
+    context.globalAlpha = selected ? 0.98 : 0.78;
+    context.strokeStyle = selected ? palette.selected : palette.text;
+    context.lineWidth = selected ? 2.2 : 1.4;
+    context.beginPath();
+    context.arc(projected.x, projected.y, radius + 3.2, 0, Math.PI * 2);
+    context.stroke();
+  }
   context.restore();
+}
+
+function namespaceSemanticNeuronColor(type, palette) {
+  return {
+    context: palette.neuronContext,
+    memory: palette.neuronMemory,
+    app: palette.neuronApp,
+    temporal: palette.neuronTemporal,
+    image: palette.neuronImage,
+    audio: palette.neuronAudio,
+    file: palette.neuronFile,
+    unknown: palette.neuronUnknown,
+  }[type] || palette.neuronUnknown;
+}
+
+function traceSemanticNeuronCanvasPath(context, type, x, y, radius) {
+  context.beginPath();
+  if (type === "context") {
+    for (let index = 0; index < 6; index += 1) {
+      const angle = -Math.PI / 2 + index * Math.PI / 3;
+      const pointX = x + Math.cos(angle) * radius;
+      const pointY = y + Math.sin(angle) * radius;
+      if (index === 0) context.moveTo(pointX, pointY);
+      else context.lineTo(pointX, pointY);
+    }
+    context.closePath();
+    return;
+  }
+  if (type === "app") {
+    const corner = radius * 0.32;
+    context.moveTo(x - radius + corner, y - radius);
+    context.lineTo(x + radius - corner, y - radius);
+    context.quadraticCurveTo(x + radius, y - radius, x + radius, y - radius + corner);
+    context.lineTo(x + radius, y + radius - corner);
+    context.quadraticCurveTo(x + radius, y + radius, x + radius - corner, y + radius);
+    context.lineTo(x - radius + corner, y + radius);
+    context.quadraticCurveTo(x - radius, y + radius, x - radius, y + radius - corner);
+    context.lineTo(x - radius, y - radius + corner);
+    context.quadraticCurveTo(x - radius, y - radius, x - radius + corner, y - radius);
+    context.closePath();
+    return;
+  }
+  if (type === "temporal") {
+    context.moveTo(x, y - radius * 1.18);
+    context.lineTo(x + radius * 1.18, y);
+    context.lineTo(x, y + radius * 1.18);
+    context.lineTo(x - radius * 1.18, y);
+    context.closePath();
+    return;
+  }
+  if (type === "image") {
+    context.rect(x - radius * 1.25, y - radius * 0.88, radius * 2.5, radius * 1.76);
+    return;
+  }
+  if (type === "audio") {
+    context.ellipse(x, y, radius * 1.35, radius * 0.78, 0, 0, Math.PI * 2);
+    return;
+  }
+  if (type === "file") {
+    context.moveTo(x - radius, y - radius * 1.15);
+    context.lineTo(x + radius * 0.35, y - radius * 1.15);
+    context.lineTo(x + radius, y - radius * 0.5);
+    context.lineTo(x + radius, y + radius * 1.15);
+    context.lineTo(x - radius, y + radius * 1.15);
+    context.closePath();
+    return;
+  }
+  context.arc(x, y, radius, 0, Math.PI * 2);
 }
 
 function drawNamespaceDetailLabels(context, ganglia, memories, palette, width, height, lod) {
@@ -3111,6 +3342,14 @@ function namespaceGalaxyPalette() {
     labelBackground: value("--galaxy-label-bg", "rgba(3, 8, 12, 0.82)"),
     neuron: value("--galaxy-neuron", "#79f6ee"),
     neuronMuted: value("--galaxy-neuron-muted", "#2b6f70"),
+    neuronContext: value("--neuron-context", "#22d3c5"),
+    neuronMemory: value("--neuron-memory", "#60a5fa"),
+    neuronApp: value("--neuron-app", "#f59e0b"),
+    neuronTemporal: value("--neuron-temporal", "#c084fc"),
+    neuronImage: value("--neuron-image", "#f472b6"),
+    neuronAudio: value("--neuron-audio", "#4ade80"),
+    neuronFile: value("--neuron-file", "#facc15"),
+    neuronUnknown: value("--neuron-unknown", "#94a3b8"),
   };
 }
 
@@ -3586,6 +3825,7 @@ function renderNamespaceGalaxyInspector(item) {
       item.contextId === state.context
         ? '<span class="namespace-galaxy-current">Current sidebar context</span>'
         : `<button type="button" class="secondary-button" data-galaxy-action="load" data-galaxy-context="${escapeHtml(item.contextId)}">Load sidebar context</button>`,
+      renderManualNamespaceBridgeComposer(item.contextId),
     ].join("");
     renderNamespaceSuggestionList(item.contextId);
     return;
@@ -3648,6 +3888,45 @@ function renderNamespaceGalaxyInspector(item) {
     `<button type="button" class="secondary-button" data-galaxy-action="load" data-galaxy-context="${escapeHtml(item.targetContextId)}">Load target</button>`,
   ].join("");
   renderNamespaceSuggestionList(state.context);
+}
+
+function renderManualNamespaceBridgeComposer(sourceContextId) {
+  const targets = state.namespaceGalaxy.data.nodes
+    .filter((node) => node.contextId !== sourceContextId)
+    .sort((left, right) => left.contextId.localeCompare(right.contextId, undefined, { sensitivity: "base" }));
+  if (!targets.length) {
+    return '<span class="namespace-galaxy-current">Add another namespace before proposing a bridge</span>';
+  }
+  const targetOptions = targets
+    .map((node) => `<option value="${escapeHtml(node.contextId)}">${escapeHtml(node.contextId)}</option>`)
+    .join("");
+  return `
+    <details class="namespace-bridge-builder">
+      <summary>Bridge namespaces</summary>
+      <form class="namespace-bridge-form" data-galaxy-bridge-form data-source-context="${escapeHtml(sourceContextId)}">
+        <label>From<input name="source_context_id" value="${escapeHtml(sourceContextId)}" readonly></label>
+        <label>To<select name="target_context_id" required>${targetOptions}</select></label>
+        <label>Relationship<select name="relation_type" required>
+          <option value="operational-handoff">Operational handoff</option>
+          <option value="related">Related memory</option>
+          <option value="supports">Supports</option>
+          <option value="depends_on">Depends on</option>
+        </select></label>
+        <label>Recall direction<select name="direction" required>
+          <option value="bidirectional">Both namespaces</option>
+          <option value="directed">From source to target only</option>
+        </select></label>
+        <label>Strength<select name="weight" required>
+          <option value="0.35">Low</option>
+          <option value="0.6" selected>Medium</option>
+          <option value="0.85">High</option>
+        </select></label>
+        <label>Why should connected recall be allowed?<input name="reason" required minlength="12" maxlength="500" placeholder="Evidence and intended recall benefit"></label>
+        <button type="submit" class="primary-button">Create pending proposal</button>
+        <small>This creates an isolated proposal only. Recall does not expand until a separate explicit approval.</small>
+      </form>
+    </details>
+  `;
 }
 
 function namespaceLinkIsRecallableFrom(link, contextId) {
@@ -3742,6 +4021,13 @@ function handleNamespaceGalaxyInspectorClick(event) {
   }
 }
 
+function handleNamespaceGalaxyInspectorSubmit(event) {
+  const form = event.target.closest?.("[data-galaxy-bridge-form]");
+  if (!form) return;
+  event.preventDefault();
+  void proposeManualNamespaceBridge(form);
+}
+
 async function connectSelectedNamespaceSuggestion(button) {
   const suggestion = state.namespaceGalaxy.selection;
   if (!suggestion || suggestion.kind !== "suggestion") return null;
@@ -3759,6 +4045,45 @@ async function connectSelectedNamespaceSuggestion(button) {
       });
       state.namespaceGalaxy.selection = null;
       await refreshNamespaceGalaxy();
+      return payload;
+    }, { refresh: false });
+  } catch {
+    return null;
+  }
+}
+
+async function proposeManualNamespaceBridge(form) {
+  if (!form?.reportValidity()) return null;
+  const submitButton = form.querySelector('button[type="submit"]');
+  const values = new FormData(form);
+  const sourceContextId = String(form.dataset.sourceContext || values.get("source_context_id") || "").trim();
+  const targetContextId = String(values.get("target_context_id") || "").trim();
+  if (!sourceContextId || !targetContextId || sourceContextId === targetContextId || !submitButton) return null;
+  try {
+    return await withBusy(submitButton, "Propose namespace bridge", async () => {
+      const payload = await requestJson("/api/namespace-link-proposals", {
+        method: "POST",
+        body: {
+          source_context_id: sourceContextId,
+          target_context_id: targetContextId,
+          relation_type: String(values.get("relation_type") || "operational-handoff"),
+          direction: String(values.get("direction") || "bidirectional"),
+          weight: Number(values.get("weight") || 0.6),
+          reason: String(values.get("reason") || "").trim(),
+        },
+      });
+      const proposalId = String(payload?.proposal?.proposal_id || payload?.proposal_id || "");
+      state.namespaceGalaxy.selection = null;
+      const data = await refreshNamespaceGalaxy();
+      const pendingProposal = data?.proposals.find((proposal) => (
+        proposal.proposalId === proposalId
+        || (
+          proposal.sourceContextId === sourceContextId
+          && proposal.targetContextId === targetContextId
+          && proposal.governanceState === "pending"
+        )
+      ));
+      if (pendingProposal) selectNamespaceGalaxyItem(pendingProposal, { focusCanvas: false });
       return payload;
     }, { refresh: false });
   } catch {
@@ -3921,6 +4246,7 @@ function detailFactsFor(item) {
     ];
   }
   return [
+    ["Semantic type", semanticNeuronLabel(item.semanticType || semanticNeuronType(item))],
     ["Type", item.nodeType],
     ["Visible connected edges", formatNumber(item.relationshipCount)],
     ["Visible weighted degree", formatNumber(item.weightedDegree, 2)],
@@ -3983,8 +4309,9 @@ function renderNamespaceDetailList() {
     const visible = visibleNamespaceDetailNodes(detail, lod);
     rows.push(...visible.map((node) => {
       const current = state.namespaceGalaxy.detailSelection?.id === node.id ? "true" : "false";
-      const label = `${node.label}: ${node.nodeType}, ${formatNumber(node.relationshipCount)} visible connected edges, ${formatNumber(node.weightedDegree, 2)} visible weighted degree, ${formatNumber(node.visualMassScore * 100)} percent relative size`;
-      return `<div role="listitem"><button type="button" data-galaxy-action="inspect-neuron" data-galaxy-neuron="${escapeHtml(node.id)}" aria-label="${escapeHtml(label)}" aria-current="${current}"><span>${escapeHtml(node.label)}</span><small>${escapeHtml(node.nodeType)} · degree ${escapeHtml(formatNumber(node.weightedDegree, 2))}</small></button></div>`;
+      const semanticLabel = semanticNeuronLabel(node.semanticType || semanticNeuronType(node));
+      const label = `${node.label}: ${semanticLabel}, stored type ${node.nodeType}, ${formatNumber(node.relationshipCount)} visible connected edges, ${formatNumber(node.weightedDegree, 2)} visible weighted degree, ${formatNumber(node.visualMassScore * 100)} percent relative size`;
+      return `<div role="listitem"><button type="button" data-galaxy-action="inspect-neuron" data-galaxy-neuron="${escapeHtml(node.id)}" aria-label="${escapeHtml(label)}" aria-current="${current}"><span>${escapeHtml(node.label)}</span><small>${escapeHtml(semanticLabel)} · ${escapeHtml(node.nodeType)} · degree ${escapeHtml(formatNumber(node.weightedDegree, 2))}</small></button></div>`;
     }));
   }
   elements.namespaceGalaxyList.innerHTML = rows.length
@@ -5237,9 +5564,10 @@ function renderGraph(graph, status) {
     class: "graph-node-group context-node-group",
     transform: `translate(${GRAPH_WIDTH / 2} ${GRAPH_HEIGHT / 2})`,
   });
-  appendSvg(contextGroup, "circle", {
-    r: 28,
-    class: "graph-node context-node",
+  appendSvg(contextGroup, "title", {}, `${contextLabel}\nSemantic type: Namespace / context`);
+  appendSvg(contextGroup, "polygon", {
+    points: "0,-30 26,-15 26,15 0,30 -26,15 -26,-15",
+    class: "graph-node context-node semantic-context",
   });
   appendSvg(contextGroup, "text", {
     y: 4,
@@ -5250,19 +5578,18 @@ function renderGraph(graph, status) {
   for (const entry of visible) {
     const position = state.graph.nodePositions.get(String(entry.memory_id));
     if (!position) continue;
+    const semantic = semanticNeuronDescriptor(entry);
     const group = appendSvg(nodeLayer, "g", {
-      class: "graph-node-group",
+      class: `graph-node-group ${semantic.className}-group`,
       "data-node-id": entry.memory_id,
+      "data-semantic-type": semantic.type,
       transform: `translate(${position.x} ${position.y})`,
       tabindex: "0",
       role: "button",
-      "aria-label": `Move ${graphNodeLabel(entry)}`,
+      "aria-label": `Move ${graphNodeLabel(entry)}; semantic type ${semantic.label}`,
     });
     appendSvg(group, "title", {}, graphNodeTitle(entry));
-    appendSvg(group, "circle", {
-      r: entry.metadata?.event_segment ? 20 : 18,
-      class: nodeClass(entry),
-    });
+    appendSemanticGraphNode(group, entry, entry.metadata?.event_segment ? 20 : 18);
     appendSvg(group, "text", {
       y: 34,
       "text-anchor": "middle",
@@ -5279,6 +5606,57 @@ function renderGraph(graph, status) {
   }
 
   applyGraphTransform();
+}
+
+function appendSemanticGraphNode(group, entry, radius) {
+  const semantic = semanticNeuronDescriptor(entry);
+  const attributes = { class: nodeClass(entry) };
+  if (semantic.type === "context") {
+    return appendSvg(group, "polygon", {
+      ...attributes,
+      points: `0,${-radius} ${radius * 0.86},${-radius * 0.5} ${radius * 0.86},${radius * 0.5} 0,${radius} ${-radius * 0.86},${radius * 0.5} ${-radius * 0.86},${-radius * 0.5}`,
+    });
+  }
+  if (semantic.type === "app") {
+    return appendSvg(group, "rect", {
+      ...attributes,
+      x: -radius,
+      y: -radius,
+      width: radius * 2,
+      height: radius * 2,
+      rx: 6,
+    });
+  }
+  if (semantic.type === "temporal") {
+    return appendSvg(group, "polygon", {
+      ...attributes,
+      points: `0,${-radius * 1.12} ${radius * 1.12},0 0,${radius * 1.12} ${-radius * 1.12},0`,
+    });
+  }
+  if (semantic.type === "image") {
+    return appendSvg(group, "rect", {
+      ...attributes,
+      x: -radius * 1.2,
+      y: -radius * 0.82,
+      width: radius * 2.4,
+      height: radius * 1.64,
+      rx: 2,
+    });
+  }
+  if (semantic.type === "audio") {
+    return appendSvg(group, "ellipse", {
+      ...attributes,
+      rx: radius * 1.25,
+      ry: radius * 0.76,
+    });
+  }
+  if (semantic.type === "file") {
+    return appendSvg(group, "path", {
+      ...attributes,
+      d: `M ${-radius},${-radius * 1.12} H ${radius * 0.34} L ${radius},${-radius * 0.46} V ${radius * 1.12} H ${-radius} Z`,
+    });
+  }
+  return appendSvg(group, "circle", { ...attributes, r: radius });
 }
 
 function renderNeuralInspector(graph, status, profile) {
@@ -5331,21 +5709,22 @@ function renderNeuralInspector(graph, status, profile) {
 }
 
 function formatSpikeSubLabel(entry) {
+  const semanticLabel = semanticNeuronLabel(entry);
   const facets = semanticFacets(entry).slice(0, state.neuralInspector ? 3 : 2);
   if (facets.length) {
-    return facets.join(" / ");
+    return `${semanticLabel} · ${facets.join(" / ")}`;
   }
   const contextMemoryType = entry.metadata?.context_memory_type;
   if (contextMemoryType) {
-    return String(contextMemoryType).replaceAll("_", " ");
+    return `${semanticLabel} · ${String(contextMemoryType).replaceAll("_", " ")}`;
   }
   const spikeCount = Number(entry.spike_count || 0);
-  if (!spikeCount) return "";
+  if (!spikeCount) return semanticLabel;
   const neuronCount = Number(entry.neuron_count || 0);
   if (state.neuralInspector) {
-    return `${formatNumber(spikeCount)} coords / ${formatNumber(neuronCount)} neurons`;
+    return `${semanticLabel} · ${formatNumber(spikeCount)} coords / ${formatNumber(neuronCount)} neurons`;
   }
-  return `${formatNumber(spikeCount)} active coords`;
+  return `${semanticLabel} · ${formatNumber(spikeCount)} active coords`;
 }
 
 function layoutGraph(entries, width, height) {
@@ -5377,15 +5756,17 @@ function edgeClass(relationship, weight) {
 }
 
 function nodeClass(entry) {
+  const semantic = semanticNeuronDescriptor(entry);
   const contextMemoryType = entry.metadata?.context_memory_type;
-  if (contextMemoryType === "namespace") return "graph-node namespace-node";
-  if (contextMemoryType === "topic") return "graph-node topic-node";
-  if (contextMemoryType === "goal") return "graph-node goal-node";
-  if (contextMemoryType === "objective") return "graph-node objective-node";
-  if (contextMemoryType === "event") return "graph-node namespace-event-node";
-  if (entry.metadata?.event_segment) return "graph-node event-node";
-  if (entry.metadata?.source_tag || entry.metadata?.source) return "graph-node concept-node";
-  return "graph-node";
+  let legacyClass = "";
+  if (contextMemoryType === "namespace") legacyClass = "namespace-node";
+  else if (contextMemoryType === "topic") legacyClass = "topic-node";
+  else if (contextMemoryType === "goal") legacyClass = "goal-node";
+  else if (contextMemoryType === "objective") legacyClass = "objective-node";
+  else if (contextMemoryType === "event") legacyClass = "namespace-event-node";
+  else if (entry.metadata?.event_segment) legacyClass = "event-node";
+  else if (entry.metadata?.source_tag || entry.metadata?.source) legacyClass = "concept-node";
+  return ["graph-node", legacyClass, semantic.className].filter(Boolean).join(" ");
 }
 
 function graphNodeLabel(entry) {
@@ -5404,6 +5785,7 @@ function graphNodeTitle(entry) {
   const facets = semanticFacets(entry);
   const lines = [
     graphNodeLabel(entry),
+    `semantic type: ${semanticNeuronLabel(entry)}`,
     entry.metadata?.display_summary || entry.source_text || "",
     facets.length ? `facets: ${facets.join(" / ")}` : "",
     `tag: ${entry.tag}`,

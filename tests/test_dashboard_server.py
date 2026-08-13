@@ -16,7 +16,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from unittest import mock
 
 from capture_daemon import write_capture_drop
@@ -1208,6 +1208,111 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(audit_status, 200)
         self.assertEqual(audit["status"], "ready")
 
+    def test_dashboard_governs_it_ops_citadel_bridge_and_exposes_history(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            for context_id in ("IT-OPS-WORKLOG", "PROJECT_CITADEL"):
+                runtime.backend.register_trace(
+                    tag=f"{context_id.lower()}-bridge-evidence",
+                    embedding=runtime.backend.embed_text(
+                        f"{context_id} reviewed operational handoff"
+                    ),
+                    context_id=context_id,
+                    source_text=f"{context_id} reviewed operational handoff",
+                )
+
+            proposed_status, proposed = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/namespace-link-proposals",
+                    json.dumps(
+                        {
+                            "source_context_id": "IT-OPS-WORKLOG",
+                            "target_context_id": "PROJECT_CITADEL",
+                            "relation_type": "operational-handoff",
+                            "direction": "bidirectional",
+                            "weight": 0.8,
+                            "evidence": {"change_record": "bridge-flow-test"},
+                            "reason": (
+                                "Reviewed IT operations and Project Citadel work "
+                                "require bounded one-hop connected recall."
+                            ),
+                            "governance_request_id": "dashboard-it-ops-citadel-proposal",
+                        }
+                    ).encode(),
+                )
+            )
+            proposal = proposed["proposal"]
+            pending_status, pending = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/namespace-map?context_id=IT-OPS-WORKLOG",
+                )
+            )
+            reviewed_status, reviewed = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/namespace-link-reviews",
+                    json.dumps(
+                        {
+                            "proposal_id": proposal["proposal_id"],
+                            "decision": "approve",
+                            "expected_revision": proposal["revision"],
+                            "reason": (
+                                "Reviewed endpoints, evidence, direction, and "
+                                "one-hop recall scope."
+                            ),
+                            "governance_request_id": "dashboard-it-ops-citadel-review",
+                        }
+                    ).encode(),
+                )
+            )
+            history_status, history = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/namespace-link-history?"
+                    + urlencode(
+                        {
+                            "proposal_id": proposal["proposal_id"],
+                            "limit": 10,
+                        }
+                    ),
+                )
+            )
+            approved_status, approved = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/namespace-map?context_id=IT-OPS-WORKLOG&"
+                    "include_suggestions=false",
+                )
+            )
+
+        self.assertEqual(proposed_status, 200)
+        self.assertEqual(proposed["state"], "pending")
+        self.assertEqual(pending_status, 200)
+        self.assertEqual(pending["link_count"], 0)
+        self.assertEqual(reviewed_status, 200)
+        self.assertEqual(reviewed["state"], "approved")
+        self.assertFalse(reviewed["automatic_cross_namespace_write"])
+        self.assertEqual(history_status, 200)
+        self.assertEqual(history["event_count"], 2)
+        self.assertTrue(history["read_only"])
+        self.assertTrue(history["append_only"])
+        self.assertEqual(
+            {event["action"] for event in history["events"]},
+            {"propose", "approve"},
+        )
+        self.assertEqual(approved_status, 200)
+        self.assertEqual(approved["link_count"], 1)
+        link = approved["links"][0]
+        self.assertEqual(
+            {link["source_context_id"], link["target_context_id"]},
+            {"IT-OPS-WORKLOG", "PROJECT_CITADEL"},
+        )
+        self.assertEqual(link["direction"], "bidirectional")
+        self.assertTrue(link["approved"])
+        self.assertTrue(link["enabled"])
+
     def test_api_errors_hide_internal_details_by_default(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -2312,6 +2417,71 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Visible weighted degree", app)
         self.assertIn("@media (max-width: 720px)", styles)
         self.assertIn("@media (prefers-reduced-motion: reduce)", styles)
+
+    def test_dashboard_semantic_neurons_and_governed_bridge_composer_are_explicit(self):
+        root = Path(__file__).resolve().parents[1]
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+        styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
+
+        for label in (
+            "Namespace / context",
+            "Memory / text",
+            "App event",
+            "Temporal event",
+            "Image",
+            "Audio",
+            "File / document",
+            "Unknown",
+        ):
+            self.assertIn(label, index)
+            self.assertIn(label, app)
+        for token in (
+            "SEMANTIC_NEURON_TYPES",
+            "semanticNeuronSafeValues",
+            "semanticNeuronType",
+            "traceSemanticNeuronCanvasPath",
+            "appendSemanticGraphNode",
+            "data-semantic-type",
+            "Semantic type",
+        ):
+            self.assertIn(token, app)
+        classifier_start = app.index("function semanticNeuronType")
+        classifier_end = app.index("function semanticNeuronDescriptor", classifier_start)
+        classifier = app[classifier_start:classifier_end]
+        self.assertIn("const explicitTypes", classifier)
+        self.assertIn("metadata?.context_memory_type", classifier)
+        self.assertIn("const exactFacets", classifier)
+        self.assertIn("const fileExtension", classifier)
+        self.assertNotIn("const joined", classifier)
+        self.assertNotIn(".test(joined)", classifier)
+        for token in (
+            "--neuron-context",
+            "--neuron-memory",
+            "--neuron-app",
+            "--neuron-temporal",
+            "--neuron-image",
+            "--neuron-audio",
+            "--neuron-file",
+            "--neuron-unknown",
+            ".semantic-neuron-key.unknown",
+            "stroke-dasharray: 4 3",
+        ):
+            self.assertIn(token, styles)
+
+        self.assertIn("Bridge namespaces", app)
+        self.assertIn("Create pending proposal", app)
+        self.assertIn("Operational handoff", app)
+        self.assertIn("Recall direction", app)
+        self.assertIn("Recall does not expand until a separate explicit approval", app)
+        composer_start = app.index("async function proposeManualNamespaceBridge")
+        composer_end = app.index("async function reviewSelectedNamespaceProposal", composer_start)
+        composer = app[composer_start:composer_end]
+        self.assertIn('requestJson("/api/namespace-link-proposals"', composer)
+        self.assertNotIn('requestJson("/api/namespace-links"', composer)
+        self.assertIn('direction: String(values.get("direction")', composer)
+        self.assertIn("selectNamespaceGalaxyItem(pendingProposal", composer)
+        self.assertIn("handleNamespaceGalaxyInspectorSubmit", app)
 
     def test_namespace_galaxy_review_regressions_stay_fixed(self):
         root = Path(__file__).resolve().parents[1]

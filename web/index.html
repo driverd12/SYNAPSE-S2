@@ -407,6 +407,17 @@
             <span><i class="namespace-key namespace-key-disabled" aria-hidden="true"></i>Disabled bridge</span>
             <span><i class="namespace-key namespace-key-proposal" aria-hidden="true"></i>Pending proposal (isolated)</span>
             <span><i class="namespace-key namespace-key-suggested" aria-hidden="true"></i>Suggestions never affect size or recall</span>
+            <div class="semantic-neuron-legend" aria-label="Semantic neuron type legend">
+              <strong>Neuron semantics inside namespaces</strong>
+              <span><i class="semantic-neuron-key context" aria-hidden="true"></i>Namespace / context</span>
+              <span><i class="semantic-neuron-key memory" aria-hidden="true"></i>Memory / text</span>
+              <span><i class="semantic-neuron-key app" aria-hidden="true"></i>App event</span>
+              <span><i class="semantic-neuron-key temporal" aria-hidden="true"></i>Temporal event</span>
+              <span><i class="semantic-neuron-key image" aria-hidden="true"></i>Image</span>
+              <span><i class="semantic-neuron-key audio" aria-hidden="true"></i>Audio</span>
+              <span><i class="semantic-neuron-key file" aria-hidden="true"></i>File / document</span>
+              <span><i class="semantic-neuron-key unknown" aria-hidden="true"></i>Unknown</span>
+            </div>
             <p class="namespace-galaxy-encoding-note">Galaxy size: 58% relative log memory volume, 27% relative log indexed term/relationship density, 15% relative log enabled approved bridge-weight centrality. Density blends 55% indexed surface terms/memory with 45% relationships/memory when both exist; missing inputs are omitted and remaining weights renormalize. Internal layers state their formula and sample scope in the inspector.</p>
           </div>
 
@@ -917,10 +928,15 @@
                   <div><dt>Events</dt><dd id="graphActiveCount">--</dd></div>
                   <div><dt>Last Prune</dt><dd id="graphLastPrune">--</dd></div>
                 </dl>
-                <div class="legend-list">
-                  <span><i class="legend-dot concept"></i>Concept</span>
-                  <span><i class="legend-dot event"></i>Event</span>
-                  <span><i class="legend-dot context"></i>Context</span>
+                <div class="legend-list" aria-label="Graph semantic and relationship legend">
+                  <span><i class="semantic-neuron-key context" aria-hidden="true"></i>Namespace / context</span>
+                  <span><i class="semantic-neuron-key memory" aria-hidden="true"></i>Memory / text</span>
+                  <span><i class="semantic-neuron-key app" aria-hidden="true"></i>App event</span>
+                  <span><i class="semantic-neuron-key temporal" aria-hidden="true"></i>Temporal event</span>
+                  <span><i class="semantic-neuron-key image" aria-hidden="true"></i>Image</span>
+                  <span><i class="semantic-neuron-key audio" aria-hidden="true"></i>Audio</span>
+                  <span><i class="semantic-neuron-key file" aria-hidden="true"></i>File / document</span>
+                  <span><i class="semantic-neuron-key unknown" aria-hidden="true"></i>Unknown</span>
                   <span><i class="legend-line associative"></i>Associative Link</span>
                   <span><i class="legend-line temporal"></i>Temporal Link</span>
                 </div>

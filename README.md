@@ -321,6 +321,31 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 Expected Retrieval v2 output is a `synapse-s2.token-contract.v1` `memory-retrieval` envelope containing ranked registered traces such as `production-memory-contract` and linked event traces from `production-preflight-brief`. The read does not run the recurrent network, apply STDP or pruning, update runtime state, mark activity, or populate the legacy query cache. It fingerprints the redacted prompt without storing or returning the raw prompt.
 Event ingestion additionally creates segmented memories such as `production-preflight-brief-event-001` and relationship edges such as `temporal_next` and `semantic_overlap`. Event boundaries are driven by the configured local embedding provider's cosine-distance surprise when available, while retaining lexical surprise as an auditable fallback.
 
+The dashboard also recognizes typed reference neurons. Store a concise, non-secret
+description or locator and set `metadata.context_memory_type` to `image`, `audio`,
+or `file`; Namespace Galaxy and Memory Graph render those types with distinct
+colors and shapes, alongside context, app, temporal, ordinary-memory, and unknown
+neurons. This deliberately stores a searchable reference, not the binary payload:
+
+```bash
+.venv/bin/python synapse_cli.py --json remember-text \
+  --context default --tag media-reference \
+  --text "Image reference: rack elevation showing switch and patch-panel labels." \
+  --metadata '{"context_memory_type":"image","display_label":"Rack elevation"}'
+.venv/bin/python synapse_cli.py --json remember-text \
+  --context default --tag media-reference \
+  --text "Audio reference: operator intercom check recorded for commissioning review." \
+  --metadata '{"context_memory_type":"audio","display_label":"Intercom check"}'
+.venv/bin/python synapse_cli.py --json remember-text \
+  --context default --tag file-reference \
+  --text "File reference: approved commissioning checklist in the project workspace." \
+  --metadata '{"context_memory_type":"file","display_label":"Commissioning checklist"}'
+```
+
+Do not place credentials, private keys, or sensitive file contents in these
+descriptions. The graph legend is always visible, so color is never the only type
+indicator.
+
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `$HOME/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, replication, or neural configuration. Authoritative exports, recovery paths, and the private replication inbox are published explicitly by the binding and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode`, `metadata.semantic_surprise_score`, and `metadata.lexical_surprise_score`, so operators can tell whether a boundary was cut by semantic embedding distance or by lexical fallback.
@@ -644,6 +669,33 @@ Hand-prune bad or sensitive memory from the same durable store:
 ```
 
 Supported prune targets are `event`, `memory`, `relationship`, `context_event`, `temporal`, and `associative`. Mode-wide `temporal` and `associative` pruning removes all matching edges in the selected context, so prefer a single node or relationship ID when possible.
+
+For a known disposable namespace, first create a pinned signed recovery point,
+then use the authoritative-only batch helper. Preview is read-only and returns a
+revision; commit re-inventories the same targets and refuses if that revision,
+delivery leases, pending proposals, or active bridges changed:
+
+```bash
+.venv/bin/python synapse_cli.py --json backup-recovery \
+  --purpose operator-namespace-cleanup --pinned
+.venv/bin/python scripts/purge_namespaces.py preview \
+  --context demo --context codex-ui-validation
+.venv/bin/python scripts/purge_namespaces.py commit \
+  --context demo --context codex-ui-validation \
+  --reason "Remove reviewed disposable UI validation namespaces." \
+  --expected-revision "<revision-from-preview>" \
+  --confirm
+```
+
+The helper refuses `default`, `global`, cataloged namespaces, active bridges,
+pending proposals, and delivery leases. Mutations always pass through the
+authoritative core; an owner-bound read-only metadata probe detects catalog rows
+because this release cannot archive them. The helper suppresses per-target audit
+events that would recreate an emptied namespace, writes a sanitized start audit
+in `default` before deletion, verifies disappearance, then writes a completion
+audit. Because the supported prune primitives are per item, the batch reports
+that it is not atomic; if transport returns `outcome_unknown`, reconcile the
+supplied request ID before any retry.
 
 ### 4. Toggle Runtime Behavior
 

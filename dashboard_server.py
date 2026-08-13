@@ -521,6 +521,29 @@ class DashboardRuntime:
                     limit=limit,
                 )
             )
+        if method == "GET" and path == "/api/namespace-link-history":
+            proposal_id = str(params.get("proposal_id", [""])[0] or "").strip()
+            context_link_id = str(
+                params.get("context_link_id", [""])[0] or ""
+            ).strip()
+            if len(proposal_id.encode("utf-8")) > 256:
+                raise DashboardError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "proposal_id is too large",
+                )
+            if len(context_link_id.encode("utf-8")) > 256:
+                raise DashboardError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "context_link_id is too large",
+                )
+            limit = self._int_param(params, "limit", 500, minimum=1, maximum=2_000)
+            return self._json_response(
+                self.backend.list_namespace_link_history(
+                    proposal_id=proposal_id,
+                    context_link_id=context_link_id,
+                    limit=limit,
+                )
+            )
         if method == "GET" and path == "/api/namespace-link-governance":
             return self._json_response(
                 self.backend.audit_namespace_link_governance()
