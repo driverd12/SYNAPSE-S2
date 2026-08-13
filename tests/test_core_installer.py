@@ -428,6 +428,7 @@ else:
             {
                 "SYNAPSE_S2_BUILD_ID": installer._manifest_build_id(ROOT),
                 "MLX_DEVICE": "gpu",
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV: "600",
             },
         )
         self.assertEqual(plist["StandardOutPath"], str(self.paths.log))
@@ -624,7 +625,13 @@ else:
             installer,
             "capture_transport_status",
             return_value=post_capture_status,
-        ) as post_capture:
+        ) as post_capture, mock.patch.dict(
+            os.environ,
+            {
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV: "nan",
+            },
+            clear=False,
+        ):
             result = installer.stage_replacement(
                 paths=self.paths,
                 label="aero.boom.synapse-s2.core.test",
@@ -649,6 +656,13 @@ else:
             ],
             "1",
         )
+        self.assertEqual(
+            payload["EnvironmentVariables"][
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+            ],
+            "600",
+        )
+        self.assertEqual(result["backup_inspection_timeout_seconds"], 600.0)
         self.assertFalse(
             installer.default_binding_path(self.home).exists()
         )
@@ -1055,6 +1069,171 @@ else:
                 wait_seconds=100.0,
             )
 
+    def test_core_backup_inspection_policy_ignores_shell_override(self) -> None:
+        for raw in (
+            "",
+            "0600",
+            "6e2",
+            "nan",
+            "inf",
+            "0",
+            "601",
+            "86400",
+        ):
+            with self.subTest(raw=raw), mock.patch.dict(
+                os.environ,
+                {installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV: raw},
+                clear=True,
+            ):
+                with installer.core_backup_inspection_timeout_policy():
+                    self.assertEqual(
+                        os.environ[installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV],
+                        "600",
+                    )
+                self.assertEqual(
+                    os.environ[installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV],
+                    raw,
+                )
+        with mock.patch.object(
+            installer,
+            "CORE_BACKUP_INSPECTION_TIMEOUT_SECONDS",
+            float("inf"),
+        ), self.assertRaisesRegex(
+            installer.CoreInstallerError,
+            "policy is invalid",
+        ):
+            installer.canonical_core_backup_inspection_timeout()
+
+    def test_final_install_pins_preflight_and_persistent_launch_policy(
+        self,
+    ) -> None:
+        environment = {
+            installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV: "nan",
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+            "SYNAPSE_S2_TRANSCRIPT_POLL": "false",
+            "MLX_DEVICE": "cpu",
+        }
+        observed: list[str | None] = []
+
+        def preflight(**_kwargs: object) -> dict[str, object]:
+            observed.append(
+                os.getenv(installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV)
+            )
+            return {"ready": True}
+
+        with mock.patch.dict(
+            os.environ,
+            environment,
+            clear=True,
+        ), mock.patch.object(
+            installer,
+            "_preflight",
+            side_effect=preflight,
+        ), mock.patch.object(
+            installer,
+            "wait_for_health",
+            return_value={**self._health(), "pid": 4242},
+        ):
+            result = self._install()
+            self.assertEqual(
+                os.environ[installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV],
+                "nan",
+            )
+
+        self.assertEqual(result["status"], "healthy")
+        self.assertEqual(observed, ["600"])
+        persisted = plistlib.loads(self.paths.plist.read_bytes())
+        self.assertEqual(
+            persisted["EnvironmentVariables"][
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+            ],
+            "600",
+        )
+
+    def test_candidate_and_production_plists_pin_backup_inspection_timeout(
+        self,
+    ) -> None:
+        environment = {
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "semantic-hash",
+            "SYNAPSE_S2_TRANSCRIPT_POLL": "false",
+            "MLX_DEVICE": "cpu",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = installer.build_config(self.paths)
+
+        candidate = plistlib.loads(
+            installer.plist_payload(
+                label="aero.boom.synapse-s2.core.test",
+                paths=self.paths,
+                config=config,
+                keep_alive=False,
+                replacement_admission=True,
+            )
+        )
+        candidate_environment = candidate["EnvironmentVariables"]
+        self.assertEqual(
+            candidate_environment[
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+            ],
+            "600",
+        )
+        self.assertEqual(
+            candidate_environment["SYNAPSE_S2_REPLACEMENT_ADMISSION"],
+            "1",
+        )
+        production = plistlib.loads(
+            installer.plist_payload(
+                label="aero.boom.synapse-s2.core.test",
+                paths=self.paths,
+                config=config,
+            )
+        )
+        self.assertEqual(
+            production["EnvironmentVariables"][
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+            ],
+            "600",
+        )
+        self.assertNotIn(
+            "SYNAPSE_S2_REPLACEMENT_ADMISSION",
+            production["EnvironmentVariables"],
+        )
+        candidate_db = self.base / "candidate-inspection.sqlite3"
+        seeded = DurableMemoryStore(candidate_db)
+        seeded.close()
+        inspector = DurableMemoryStore.open_existing_for_audit(candidate_db)
+        try:
+            with mock.patch.dict(
+                os.environ,
+                dict(candidate_environment),
+                clear=True,
+            ), mock.patch(
+                "memory_store.os.getenv",
+                wraps=os.getenv,
+            ) as getenv:
+                inspected = inspector._inspect_backup_snapshot(candidate_db)
+        finally:
+            inspector.close()
+        self.assertEqual(
+            inspected["logical_snapshot"]["schema"],
+            "synapse-s2.logical-snapshot.v1",
+        )
+        self.assertIn(
+            mock.call(
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV,
+                "120",
+            ),
+            getenv.call_args_list,
+        )
+
     def test_replacement_capture_transport_admits_only_a_bounded_clean_queue(
         self,
     ) -> None:
@@ -1355,6 +1534,7 @@ else:
             {
                 "SYNAPSE_S2_BUILD_ID": installer._manifest_build_id(ROOT),
                 "MLX_DEVICE": "gpu",
+                installer.CORE_BACKUP_INSPECTION_TIMEOUT_ENV: "600",
             },
         )
 

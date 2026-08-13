@@ -96,6 +96,10 @@ DEFAULT_PRODUCTION_NEURAL_REVISION = "6c3ae70858513f1a78e9cdca3cae330d9075cd2a"
 DEFAULT_PRODUCTION_MLX_DEVICE = "gpu"
 REPLACEMENT_CERTIFICATION_MIN_REMAINING_SECONDS = 300.0
 REPLACEMENT_ACTIVATION_HEADROOM_SECONDS = 300.0
+CORE_BACKUP_INSPECTION_TIMEOUT_ENV = (
+    "SYNAPSE_S2_BACKUP_INSPECTION_TIMEOUT_SECONDS"
+)
+CORE_BACKUP_INSPECTION_TIMEOUT_SECONDS = 600.0
 CAPTURE_TRANSPORT_ZERO_DEBT_FIELDS = (
     "inbox_temp_file_count",
     "processing_empty_claim_count",
@@ -950,6 +954,11 @@ def plist_payload(
         # exact closed CoreConfig value so launchd cannot silently fall
         # back to "default" for a reviewed cpu/gpu configuration.
         "MLX_DEVICE": closed_config.mlx_device,
+        # Recovery bindings are reverified inside both provisional and final
+        # launchd processes.  Pin the same finite large-store horizon used by
+        # installer-side proof; never inherit a shorter or unbounded shell
+        # value at either authority transition.
+        CORE_BACKUP_INSPECTION_TIMEOUT_ENV: canonical_core_backup_inspection_timeout(),
     }
     if replacement_admission:
         # This narrowly selects the signed, short-lived successor-admission
@@ -2518,16 +2527,17 @@ def install(
     launchctl.disable()
     # A replacement is never started until the old authority is fully gone and
     # the signed backup is proven equal to the now-quiescent live database.
-    preflight_result = _preflight(
-        paths=paths,
-        evidence_manifest=evidence_manifest,
-        maximum_evidence_age_seconds=maximum_evidence_age_seconds,
-        launchctl_bin=launchctl_bin,
-        ps_bin=ps_bin,
-        label=label,
-        config=config,
-        restored_target=restored_target,
-    )
+    with core_backup_inspection_timeout_policy():
+        preflight_result = _preflight(
+            paths=paths,
+            evidence_manifest=evidence_manifest,
+            maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+            launchctl_bin=launchctl_bin,
+            ps_bin=ps_bin,
+            label=label,
+            config=config,
+            restored_target=restored_target,
+        )
 
     for directory in {
         paths.data_root,
@@ -2834,6 +2844,37 @@ def replacement_capture_freeze_ttl_seconds(wait_seconds: float) -> float:
     )
 
 
+def canonical_core_backup_inspection_timeout() -> str:
+    """Return the one reviewed finite launchd/installer inspection horizon."""
+
+    seconds = CORE_BACKUP_INSPECTION_TIMEOUT_SECONDS
+    if (
+        not isinstance(seconds, (int, float))
+        or isinstance(seconds, bool)
+        or not math.isfinite(float(seconds))
+        or float(seconds) != 600.0
+    ):
+        raise CoreInstallerError("core backup inspection policy is invalid")
+    return format(float(seconds), ".15g")
+
+
+@contextmanager
+def core_backup_inspection_timeout_policy() -> Iterator[None]:
+    """Pin publisher/preflight proof to the same policy as both launch plists."""
+
+    canonical = canonical_core_backup_inspection_timeout()
+    present = CORE_BACKUP_INSPECTION_TIMEOUT_ENV in os.environ
+    previous = os.environ.get(CORE_BACKUP_INSPECTION_TIMEOUT_ENV)
+    os.environ[CORE_BACKUP_INSPECTION_TIMEOUT_ENV] = canonical
+    try:
+        yield
+    finally:
+        if present and previous is not None:
+            os.environ[CORE_BACKUP_INSPECTION_TIMEOUT_ENV] = previous
+        else:
+            os.environ.pop(CORE_BACKUP_INSPECTION_TIMEOUT_ENV, None)
+
+
 def stage_replacement(
     *,
     paths: InstallPaths,
@@ -2881,16 +2922,17 @@ def stage_replacement(
     )
     freeze_released = False
     try:
-        result = _stage_replacement_frozen(
-            paths=paths,
-            label=label,
-            launchctl=launchctl,
-            wait_seconds=wait_seconds,
-            maximum_evidence_age_seconds=maximum_evidence_age_seconds,
-            confirm=confirm,
-            expected_revision=expected_revision,
-            capture_batch_count=capture_batch_count,
-        )
+        with core_backup_inspection_timeout_policy():
+            result = _stage_replacement_frozen(
+                paths=paths,
+                label=label,
+                launchctl=launchctl,
+                wait_seconds=wait_seconds,
+                maximum_evidence_age_seconds=maximum_evidence_age_seconds,
+                confirm=confirm,
+                expected_revision=expected_revision,
+                capture_batch_count=capture_batch_count,
+            )
         thaw = release_capture_replacement_freeze(
             root=paths.capture_root,
             freeze_id=str(freeze["freeze_id"]),
@@ -3359,6 +3401,9 @@ def _stage_replacement_frozen(
             drained_pending_file_count=admitted_pending_file_count,
             capture_batch_count=capture_batch_count,
             capture_pending_limit=capture_pending_limit,
+            backup_inspection_timeout_seconds=(
+                CORE_BACKUP_INSPECTION_TIMEOUT_SECONDS
+            ),
             certification_seconds_remaining=certification_seconds_remaining,
             staged_plist=str(staged_plist),
             admission={

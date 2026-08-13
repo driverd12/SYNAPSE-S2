@@ -492,7 +492,15 @@ changing permissions on an existing caller-owned directory.
    binds the ready delivery audit and clean current Git build into a private,
    dynamically budgeted admission (ten minutes by default and at most thirty
    minutes for the longest bounded activation wait), and starts the candidate
-   from a separate non-`KeepAlive` plist. Health reports
+   from a separate non-`KeepAlive` plist. Publisher proof and launchd startup
+   both pin `SYNAPSE_S2_BACKUP_INSPECTION_TIMEOUT_SECONDS=600`; shell values do
+   not override it. The same finite value is present in the temporary candidate
+   and persistent production plists because each process independently
+   reverifies its signed recovery binding before claiming authority. This
+   prevents either launch from silently falling back to the library's
+   120-second default after the installer completed a valid large-store proof.
+   The SQLite VM-step and maximum-value limits remain independently bounded and
+   unchanged. Health reports
    `deployment_mode: replacement-certification`; the process self-fences when
    that admission expires. Its durable authority marker remains explicitly
    provisional, so a crash or manual restart without fresh final cutover
