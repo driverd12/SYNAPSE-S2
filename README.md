@@ -346,6 +346,31 @@ Do not place credentials, private keys, or sensitive file contents in these
 descriptions. The graph legend is always visible, so color is never the only type
 indicator.
 
+For a real local image, use the dashboard Image memory picker or the bound CLI:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-image \
+  --context default \
+  --path /absolute/path/to/rack-elevation.jpg \
+  --label "Rack elevation" \
+  --description "Approved rack elevation showing switch and patch-panel placement." \
+  --confirm
+.venv/bin/python synapse_cli.py --json image-cache-audit
+```
+
+The original file is decoded transiently, remains untouched at its source path,
+and is never copied into SYNAPSE-S2 or SQLite. CLI capture accepts an absolute
+owner-readable PNG, JPEG, or HEIC path up to 20 MB; the dashboard accepts PNG or
+JPEG and downsamples in the browser. The verified binding data root receives only an owner-only JPEG thumbnail
+with a maximum edge of 320 pixels and a private integrity manifest; the durable
+typed memory receives the searchable
+description plus a bounded numeric RGB tensor, color histogram, edge histogram,
+and difference bits. Visual descriptors are kept separate from the deployed text
+embedding space. The thumbnail cache is local and non-authoritative: it is not yet
+included in paired recovery or multi-Mac replication, while the description and
+descriptor metadata are durable memory. Browser thumbnail reads require the same
+dual dashboard authorization as every other `/api/*` read.
+
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `$HOME/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, replication, or neural configuration. Authoritative exports, recovery paths, and the private replication inbox are published explicitly by the binding and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode`, `metadata.semantic_surprise_score`, and `metadata.lexical_surprise_score`, so operators can tell whether a boundary was cut by semantic embedding distance or by lexical fallback.
@@ -823,7 +848,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only, bounded threaded adapter for the same authoritative core used by MCP and the CLI. It admits at most eight active handlers behind backlog 32, requires complete request headers inside an absolute one-second pre-authentication deadline, uses five-second post-header I/O timeouts, and performs bounded shutdown. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and signed paired recovery points. Its rich local HTTP payloads are intentionally separate from the installed MCP compact-response projector, so the 12,288-byte agent budget does not remove graph or drill-down evidence from the browser.
+The dashboard is a loopback-only, bounded threaded adapter for the same authoritative core used by MCP and the CLI. It admits at most eight active handlers behind backlog 32, requires complete request headers inside an absolute one-second pre-authentication deadline, uses five-second post-header I/O timeouts, and performs bounded shutdown. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation and image capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and signed paired recovery points. A hidden far-right Impact control opens content-free recall/yield/bridge/graph/latency/resource analytics plus an editable `$0`-to-upper-bound cost what-if; it is explicitly not provider billing or proven savings. Current coverage is one all-namespace local aggregate of dashboard `/api/query` only—not MCP, CLI, or agent hydration—and approximate tokens are response UTF-8 bytes divided by four. Reported recall latency covers backend retrieval, not full HTTP delivery. Its rich local HTTP payloads are intentionally separate from the installed MCP compact-response projector, so the 12,288-byte agent budget does not remove graph or drill-down evidence from the browser.
 
 ### Connected namespace recall and neural galaxy
 

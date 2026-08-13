@@ -3666,6 +3666,138 @@ textarea {
   gap: 12px;
 }
 
+.image-capture-form {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--row);
+  padding-top: 12px;
+}
+
+.image-capture-heading,
+.image-capture-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.image-capture-heading > div,
+.image-capture-state {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.image-capture-heading strong,
+.image-capture-state strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 820;
+}
+
+.image-capture-heading small,
+.image-capture-state small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.local-only-badge {
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--teal) 50%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--teal) 8%, var(--panel));
+  padding: 4px 8px;
+  color: var(--teal-strong);
+  font-family: var(--terminal-font);
+  font-size: 10px;
+  font-weight: 820;
+}
+
+.image-capture-fields {
+  display: grid;
+  grid-template-columns: minmax(180px, .85fr) minmax(160px, .7fr) minmax(260px, 1.45fr);
+  gap: 10px;
+}
+
+.image-capture-description textarea {
+  min-height: 70px;
+}
+
+.image-capture-actions {
+  justify-content: flex-start;
+}
+
+.image-capture-actions button {
+  margin-left: auto;
+}
+
+#imageCapturePreview {
+  width: 80px;
+  height: 58px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--input);
+  object-fit: contain;
+}
+
+.image-capture-state.ready strong {
+  color: var(--teal-strong);
+}
+
+.image-capture-state.error strong {
+  color: var(--danger);
+}
+
+.image-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.image-gallery-card {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 7px;
+}
+
+.image-gallery-card img {
+  width: 58px;
+  height: 44px;
+  border-radius: 5px;
+  background: var(--input);
+  object-fit: contain;
+}
+
+.image-gallery-card span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.image-gallery-card strong,
+.image-gallery-card small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-gallery-card strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.image-gallery-card small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .context-bus-state {
   display: flex;
   align-items: center;
@@ -3785,7 +3917,8 @@ textarea {
     minmax(160px, 0.82fr)
     minmax(140px, 0.72fr)
     minmax(130px, 0.62fr)
-    minmax(140px, 0.72fr);
+    minmax(140px, 0.72fr)
+    minmax(86px, 0.42fr);
   align-items: center;
   border-top: 1px solid var(--border);
   background: var(--shell);
@@ -3803,6 +3936,119 @@ textarea {
 
 .bottom-bar div:first-child {
   border-left: 0;
+}
+
+.impact-toggle {
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 1px;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  background: color-mix(in srgb, var(--teal) 4%, var(--shell));
+  padding: 0 12px;
+  color: var(--text);
+}
+
+.impact-toggle:hover,
+.impact-toggle[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--teal) 12%, var(--shell));
+}
+
+.impact-toggle strong,
+.impact-toggle small {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.impact-toggle strong {
+  color: var(--teal-strong);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.impact-toggle small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.impact-drawer {
+  position: fixed;
+  z-index: 40;
+  right: 12px;
+  bottom: 66px;
+  width: min(620px, calc(100vw - 24px));
+  max-height: min(640px, calc(100vh - 90px));
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow), var(--chrome-glow);
+  padding: 16px;
+}
+
+.impact-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.impact-drawer-header h2 {
+  font-size: 18px;
+}
+
+.impact-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.impact-metrics > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.impact-metrics span,
+.impact-metrics small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.impact-metrics span {
+  font-weight: 760;
+  text-transform: uppercase;
+}
+
+.impact-metrics strong {
+  color: var(--text);
+  font-family: var(--terminal-font);
+  font-size: 18px;
+}
+
+.impact-assumptions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.impact-assumptions label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .bottom-bar strong {
@@ -3916,6 +4162,14 @@ textarea {
 
   .write-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .image-capture-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .image-capture-description {
+    grid-column: 1 / -1;
   }
 
   .cortex-workbench {
@@ -4129,6 +4383,37 @@ textarea {
     min-height: 44px;
     border-left: 0;
     border-top: 1px solid var(--border);
+  }
+
+  .impact-toggle {
+    min-height: 44px;
+    border-top: 1px solid var(--border);
+    border-left: 0;
+    padding: 8px 18px;
+  }
+
+  .impact-drawer {
+    right: 8px;
+    bottom: 8px;
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+  }
+
+  .impact-metrics,
+  .impact-assumptions,
+  .image-capture-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .image-capture-heading,
+  .image-capture-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .image-capture-actions button {
+    width: 100%;
+    margin-left: 0;
   }
 
   .operator-guide {

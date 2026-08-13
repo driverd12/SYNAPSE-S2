@@ -1133,6 +1133,42 @@
                   Capture conversation
                 </button>
               </form>
+
+              <form id="imageCaptureForm" class="write-form image-capture-form">
+                <div class="image-capture-heading">
+                  <div>
+                    <strong>Image memory</strong>
+                    <small>SYNAPSE-S2 does not upload or retain the full-resolution file; your source remains untouched. It keeps a small thumbnail, bounded numeric descriptors, and your searchable description.</small>
+                  </div>
+                  <span class="local-only-badge">LOCAL DERIVATIVES</span>
+                </div>
+                <div class="image-capture-fields">
+                  <div class="field-grid">
+                    <label for="imageCaptureFile">Local image</label>
+                    <input id="imageCaptureFile" type="file" accept="image/png,image/jpeg" />
+                  </div>
+                  <div class="field-grid">
+                    <label for="imageCaptureLabel">Memory label</label>
+                    <input id="imageCaptureLabel" autocomplete="off" maxlength="120" placeholder="Rack elevation" />
+                  </div>
+                  <div class="field-grid image-capture-description">
+                    <label for="imageCaptureDescription">Searchable description</label>
+                    <textarea id="imageCaptureDescription" rows="3" maxlength="4096" placeholder="What matters in this image, where it came from, and what future recall should find"></textarea>
+                  </div>
+                </div>
+                <div class="image-capture-actions">
+                  <img id="imageCapturePreview" alt="Selected low-resolution image preview" hidden />
+                  <div id="imageCaptureState" class="image-capture-state" aria-live="polite">
+                    <strong>No image selected</strong>
+                    <small>PNG or JPEG; up to 20 MB. The browser downsamples before local capture.</small>
+                  </div>
+                  <button id="imageCaptureButton" class="secondary-button" type="submit">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m4 17 5-5 4 4 2-2 5 4"/></svg>
+                    Capture image memory
+                  </button>
+                </div>
+                <div id="imageGallery" class="image-gallery" aria-live="polite" aria-label="Cached image memory thumbnails"></div>
+              </form>
             </div>
           </article>
 
@@ -1164,7 +1200,32 @@
         <div><strong>Compute</strong><small id="footerGpu">MLX --</small></div>
         <div><strong>Contexts</strong><small id="footerContexts">--</small></div>
         <div><strong>Time</strong><small id="footerTime">--</small></div>
+        <button id="impactToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="impactDrawer" title="Show approximate SYNAPSE-S2 impact">
+          <strong>≈ Impact</strong><small id="footerImpact">hidden</small>
+        </button>
       </footer>
+      <aside id="impactDrawer" class="impact-drawer" hidden aria-labelledby="impactTitle">
+        <div class="impact-drawer-header">
+          <div>
+            <p class="section-label">Approximate impact</p>
+            <h2 id="impactTitle">What SYNAPSE-S2 is doing for you</h2>
+          </div>
+          <button id="impactCloseButton" class="icon-button compact" type="button" aria-label="Hide impact panel">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
+          </button>
+        </div>
+        <div id="impactMetrics" class="impact-metrics" aria-live="polite">
+          <div><span>Recall assists</span><strong>--</strong><small>dashboard coverage</small></div>
+          <div><span>Bridge assists</span><strong>--</strong><small>approved one-hop evidence</small></div>
+          <div><span>Recall p95</span><strong>--</strong><small>milliseconds</small></div>
+          <div><span>Equivalent estimate</span><strong>--</strong><small>not billing</small></div>
+        </div>
+        <div class="impact-assumptions">
+          <label>Example input rate ($ / 1M tokens)<input id="impactTokenRate" type="number" min="0" max="1000" step="0.01" value="5" /></label>
+          <label>Assumed tokens displaced / assist<input id="impactTokensPerAssist" type="number" min="0" max="1000000" step="100" value="1500" /></label>
+        </div>
+        <p id="impactCaveat" class="panel-note">Illustrative equivalent only. This is not a provider bill or a proven counterfactual saving; edit the assumptions to match your workflow.</p>
+      </aside>
       <aside id="recipeDrawer" class="recipe-drawer" hidden aria-label="Operator recipes">
         <div class="recipe-drawer-header">
           <div>

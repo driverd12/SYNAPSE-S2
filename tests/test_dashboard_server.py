@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import http.client
 import json
@@ -41,6 +42,8 @@ from dashboard_server import (
     SynapseDashboardServer,
     main,
 )
+from image_capture import ImageCaptureNotFound, ThumbnailResult
+from impact_metrics import ImpactMetricsStore
 from mlx_backend import SpikingAttentionBackend
 from transcript_capture import TranscriptCaptureManager
 
@@ -633,6 +636,212 @@ class DashboardRuntimeTests(unittest.TestCase):
         for stage in ("status", "profile", "graph", "system"):
             self.assertIn(stage, payload["timings_ms"])
 
+    def test_query_records_content_free_impact_and_projects_honest_cost_range(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime._impact_store = ImpactMetricsStore(Path(tmp))
+            query_status, query = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/query",
+                    json.dumps(
+                        {
+                            "context_id": "demo",
+                            "prompt": "local dashboard memory",
+                            "recall_scope": "local",
+                            "result_limit": 4,
+                        }
+                    ).encode("utf-8"),
+                )
+            )
+            impact_status, impact = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/impact?context_id=demo&price_per_million=5&assumed_tokens_per_assist=1500",
+                )
+            )
+
+        self.assertEqual(query_status, 200)
+        self.assertGreaterEqual(len(query["results"]), 1)
+        self.assertEqual(impact_status, 200)
+        self.assertEqual(impact["schema"], "synapse-s2.dashboard-impact.v1")
+        self.assertEqual(impact["requested_context_id"], "demo")
+        self.assertEqual(
+            impact["coverage"]["scope"],
+            "dashboard-recall-all-contexts",
+        )
+        self.assertFalse(impact["coverage"]["context_partitioned"])
+        self.assertEqual(impact["metrics"]["recall_attempts"], 1)
+        self.assertEqual(impact["metrics"]["recall_completed"], 1)
+        self.assertGreaterEqual(impact["metrics"]["recall_with_results"], 1)
+        self.assertEqual(impact["equivalent_cost_estimate"]["range_min_usd"], 0.0)
+        self.assertFalse(impact["equivalent_cost_estimate"]["savings_proven"])
+        self.assertTrue(impact["coverage"]["content_free"])
+
+    def test_impact_rejects_nonfinite_price(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime._impact_store = ImpactMetricsStore(Path(tmp))
+            status, payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/impact?context_id=demo&price_per_million=nan",
+                )
+            )
+
+        self.assertEqual(status, 400)
+        self.assertIn("finite", payload["error"])
+
+    def test_authenticated_image_routes_capture_typed_memory_and_serve_thumbnail(self):
+        thumbnail = b"\xff\xd8\xffsynthetic-thumbnail"
+
+        class FakeImageCache:
+            def capture_image(self, _path, *, media_id):
+                return {
+                    "media_id": media_id,
+                    "cache_ready": True,
+                    "idempotent_replay": False,
+                    "public_metadata": {
+                        "schema": "synapse-s2.image-artifact.v1",
+                        "context_memory_type": "image",
+                        "media_id": media_id,
+                        "mime_type": "image/jpeg",
+                        "source_dimensions": {"width": 32, "height": 16},
+                        "thumbnail_dimensions": {"width": 32, "height": 16},
+                        "visual_descriptor": {
+                            "schema": "synapse-s2.visual-descriptor.rgb16-v1"
+                        },
+                    },
+                }
+
+            def get_thumbnail(self, media_id):
+                return ThumbnailResult(media_id, "image/jpeg", thumbnail)
+
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime._image_cache = FakeImageCache()
+            body = json.dumps(
+                {
+                    "context_id": "demo",
+                    "display_label": "Rack elevation",
+                    "description": "Rack elevation showing the approved switch layout.",
+                    "thumbnail_data_url": (
+                        "data:image/jpeg;base64,"
+                        + base64.b64encode(thumbnail).decode("ascii")
+                    ),
+                    "capture_id": "s2cap_" + "a" * 32,
+                    "confirm": True,
+                }
+            ).encode("utf-8")
+            capture_status, capture = self.decode(
+                runtime.handle("POST", "/api/capture-image", body)
+            )
+            gallery_status, gallery = self.decode(
+                runtime.handle("GET", "/api/media-cache?context_id=demo&limit=12")
+            )
+            binary_status, binary_headers, binary_body = runtime.handle(
+                "GET",
+                f"/api/media-thumbnail?media_id={capture['media_id']}",
+            )
+
+        self.assertEqual(capture_status, 200)
+        self.assertFalse(capture["raw_original_stored"])
+        self.assertFalse(capture["thumbnail_cache_authoritative"])
+        capture_json = json.dumps(capture, sort_keys=True)
+        self.assertNotIn("synthetic-thumbnail", capture_json)
+        self.assertNotIn("thumbnail_data_url", capture_json)
+        self.assertNotIn(str(tmp), capture_json)
+        self.assertEqual(gallery_status, 200)
+        self.assertEqual(gallery["item_count"], 1)
+        self.assertEqual(gallery["items"][0]["display_label"], "Rack elevation")
+        self.assertEqual(binary_status, 200)
+        self.assertEqual(binary_headers["Content-Type"], "image/jpeg")
+        self.assertEqual(binary_headers["Cache-Control"], "private, no-store")
+        self.assertEqual(binary_body, thumbnail)
+
+    def test_image_capture_rejects_unconfirmed_malformed_and_oversized_derivatives(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime._image_cache = mock.Mock()
+            base = {
+                "context_id": "demo",
+                "display_label": "Rejected image",
+                "description": "This payload must never be captured.",
+                "capture_id": "s2cap_" + "c" * 32,
+            }
+            refused_status, refused = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-image",
+                    json.dumps(
+                        {
+                            **base,
+                            "confirm": False,
+                            "thumbnail_data_url": "data:image/jpeg;base64,/9j/",
+                        }
+                    ).encode("utf-8"),
+                )
+            )
+            malformed_status, malformed = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-image",
+                    json.dumps(
+                        {
+                            **base,
+                            "confirm": True,
+                            "thumbnail_data_url": "data:image/jpeg;base64,%%%%",
+                        }
+                    ).encode("utf-8"),
+                )
+            )
+            oversized_status, oversized = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-image",
+                    json.dumps(
+                        {
+                            **base,
+                            "confirm": True,
+                            "thumbnail_data_url": (
+                                "data:image/jpeg;base64,"
+                                + base64.b64encode(
+                                    b"\xff\xd8\xff" + b"x" * (72 * 1024)
+                                ).decode("ascii")
+                            ),
+                        }
+                    ).encode("utf-8"),
+                )
+            )
+
+        self.assertEqual(refused_status, 400)
+        self.assertIn("confirm", refused["error"])
+        self.assertEqual(malformed_status, 400)
+        self.assertIn("encoding", malformed["error"])
+        self.assertEqual(oversized_status, 413)
+        self.assertIn("limit", oversized["error"])
+        runtime._image_cache.capture_image.assert_not_called()
+
+    def test_missing_node_local_image_thumbnail_is_a_quiet_not_found(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime._image_cache = mock.Mock()
+            runtime._image_cache.get_thumbnail.side_effect = ImageCaptureNotFound(
+                "image cache object is unavailable"
+            )
+            status, payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/media-thumbnail?media_id=s2img_" + "a" * 32,
+                )
+            )
+
+        self.assertEqual(status, 404)
+        self.assertEqual(
+            payload["error"],
+            "cached image thumbnail is unavailable on this Mac",
+        )
+
     def test_snapshot_can_defer_graph_for_fast_hydration(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -689,7 +898,9 @@ class DashboardRuntimeTests(unittest.TestCase):
                 "/api/status?context_id=demo",
                 "/api/core-health",
                 "/api/profile",
+                "/api/impact?context_id=demo",
                 "/api/graph?context_id=demo&limit=10",
+                "/api/media-cache?context_id=demo&limit=10",
                 "/api/namespace-map?context_id=demo&limit=10",
                 "/api/namespace-detail?context_id=demo&level=cortex&limit=10",
                 "/api/context-events?context_id=demo&limit=1",
@@ -1333,11 +1544,17 @@ class DashboardRuntimeTests(unittest.TestCase):
                     ).encode(),
                 )
             )
+            impact_aggregate = runtime.impact_store().load()
 
         self.assertEqual(status, 500)
         self.assertEqual(payload["error"], "dashboard request failed")
         self.assertIn("error_id", payload)
         self.assertNotIn("detail", payload)
+        self.assertEqual(
+            impact_aggregate["dashboard_recall"]["error_count"],
+            1,
+        )
+        self.assertNotIn("trigger failure", json.dumps(impact_aggregate, sort_keys=True))
 
     def test_debug_error_details_are_redacted_and_path_free(self):
         with TemporaryDirectory() as tmp:
@@ -1937,6 +2154,18 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Magic Capture", index)
         self.assertIn("captureInboxButton", index)
         self.assertIn("captureInboxState", index)
+        self.assertIn("imageCaptureForm", index)
+        self.assertIn("imageCapturePreview", index)
+        self.assertIn("imageGallery", index)
+        self.assertIn("impactToggleButton", index)
+        self.assertIn("impactDrawer", index)
+        self.assertIn('id="impactDrawer" class="impact-drawer" hidden', index)
+        self.assertIn('aria-controls="impactDrawer"', index)
+        self.assertIn("not a provider bill or a proven counterfactual", index)
+        self.assertIn("IMAGE_DIMENSION_PROBE_MAX_BYTES", app)
+        self.assertIn("imageDimensionsFromHeader", app)
+        self.assertIn("resizeWidth: decodeWidth", app)
+        self.assertIn("if (stored === null) return fallback", app)
         self.assertIn("App Connect", index)
         self.assertIn("appConnectButton", index)
         self.assertIn("appConnectForm", index)
@@ -2165,6 +2394,10 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("captureRetries: new Map()", app)
         self.assertIn("retryableCaptureRequest", app)
         self.assertIn("finishRetryableCapture", app)
+        self.assertIn('requestJson("/api/capture-image"', app)
+        self.assertIn('requestBlob("/api/media-thumbnail"', app)
+        self.assertIn('requestJson("/api/impact"', app)
+        self.assertIn("setImpactDrawerOpen", app)
         self.assertIn("const body = { ...retry.body, capture_id: retry.captureId }", app)
         self.assertIn("/api/context-events", app)
         self.assertIn("danger-button", styles)
@@ -2194,6 +2427,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("compact-action", styles)
         self.assertIn("cortex-session-callout", styles)
         self.assertIn("cortex-memory-actions", styles)
+        self.assertIn("image-capture-form", styles)
+        self.assertIn("impact-drawer", styles)
+        self.assertIn("impact-toggle", styles)
         self.assertNotIn("board-demo", index)
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)

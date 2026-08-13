@@ -21,6 +21,79 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
+    def test_capture_image_cli_requires_confirmation_and_routes_typed_metadata(self):
+        import synapse_cli
+
+        parser = synapse_cli.build_parser()
+        refused = parser.parse_args(
+            [
+                "capture-image",
+                "--path",
+                "/tmp/local-image.jpg",
+                "--label",
+                "Rack elevation",
+                "--description",
+                "Approved rack elevation and switch placement.",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "--confirm"):
+            synapse_cli.command_capture_image(refused)
+
+        accepted = parser.parse_args(
+            [
+                "capture-image",
+                "--context",
+                "project_citadel",
+                "--path",
+                "/tmp/local-image.jpg",
+                "--label",
+                "Rack elevation",
+                "--description",
+                "Approved rack elevation and switch placement.",
+                "--capture-id",
+                "s2cap_" + "b" * 32,
+                "--confirm",
+            ]
+        )
+        backend = mock.Mock()
+        backend.capture_conversation.return_value = {
+            "capture_id": accepted.capture_id,
+            "event_count": 1,
+        }
+        cache = mock.Mock()
+        cache.capture_image.return_value = {
+            "cache_ready": True,
+            "idempotent_replay": False,
+            "public_metadata": {
+                "schema": "synapse-s2.image-artifact.v1",
+                "context_memory_type": "image",
+                "media_id": "placeholder",
+                "thumbnail_dimensions": {"width": 64, "height": 32},
+                "visual_descriptor": {
+                    "schema": "synapse-s2.visual-descriptor.rgb16-v1"
+                },
+            },
+        }
+        with (
+            mock.patch.object(synapse_cli, "binding_from_environment", return_value=mock.sentinel.binding),
+            mock.patch.object(synapse_cli, "build_backend", return_value=backend),
+            mock.patch.object(synapse_cli, "ImageCaptureCache", return_value=cache),
+        ):
+            payload = synapse_cli.command_capture_image(accepted)
+
+        self.assertEqual(payload["action"], "capture-image-memory")
+        self.assertFalse(payload["raw_original_stored"])
+        self.assertFalse(payload["thumbnail_cache_authoritative"])
+        self.assertEqual(payload["capture"]["event_count"], 1)
+        self.assertNotIn("memory_db_path", payload["capture"])
+        capture_arguments = backend.capture_conversation.call_args.kwargs
+        self.assertEqual(capture_arguments["context_id"], "project_citadel")
+        self.assertEqual(
+            capture_arguments["metadata"]["context_memory_type"],
+            "image",
+        )
+        self.assertFalse(capture_arguments["metadata"]["raw_original_stored"])
+
     def test_namespace_link_proposal_state_does_not_override_runtime_state_path(self):
         import synapse_cli
 

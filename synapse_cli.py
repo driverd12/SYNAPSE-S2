@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
@@ -59,6 +61,7 @@ try:
     from core_client_binding import (
         BINDING_ENV,
         apply_binding_environment,
+        binding_from_environment,
         default_binding_path,
     )
 
@@ -73,6 +76,7 @@ try:
 
     apply_binding_environment()
     from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
+    from image_capture import ImageCaptureCache
     import mlx_backend
     from mlx_backend import (
         DEFAULT_NUM_NEURONS,
@@ -591,6 +595,85 @@ def command_capture_session(args: argparse.Namespace) -> dict[str, Any]:
         metadata=parse_metadata(args.metadata),
         capture_id=args.capture_id or None,
     )
+
+
+def command_capture_image(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.confirm:
+        raise ValueError("--confirm is required before capturing an image memory")
+    binding = binding_from_environment()
+    if binding is None:
+        raise ValueError("a verified SYNAPSE-S2 core binding is required")
+    backend = build_backend(args)
+    capture_id = args.capture_id or new_capture_id()
+    if re.fullmatch(r"s2cap_[0-9a-f]{32}", capture_id) is None:
+        raise ValueError(
+            "--capture-id must use canonical s2cap_<32 lowercase hex> format"
+        )
+    description = str(args.description or "").strip()
+    if not description:
+        raise ValueError("--description must provide searchable image context")
+    label = str(args.label or "").strip()
+    if not label:
+        raise ValueError("--label is required")
+    media_id = f"s2img_{hashlib.sha256(capture_id.encode('ascii')).hexdigest()[:32]}"
+    cached = ImageCaptureCache(binding).capture_image(
+        str(Path(args.path).expanduser()),
+        media_id=media_id,
+    )
+    metadata = {
+        **cached["public_metadata"],
+        "display_label": label,
+        "display_summary": description,
+        "source": "cli-image-capture",
+        "source_surface": "cli",
+        "raw_original_stored": False,
+        "thumbnail_cache_authoritative": False,
+    }
+    capture = backend.capture_conversation(
+        text=description,
+        context_id=args.context,
+        source_tag=(
+            args.tag
+            or mlx_backend.sanitize_tag(f"image-{label}").replace(" ", "-")
+        ),
+        speaker=args.speaker,
+        surprise_threshold=0.5,
+        min_segment_sentences=64,
+        metadata=metadata,
+        capture_id=capture_id,
+    )
+    capture_receipt = {
+        "protocol": str(capture.get("protocol") or "capture.v2"),
+        "capture_id": str(capture.get("capture_id") or capture_id),
+        "event_count": int(capture.get("event_count") or 0),
+        "relationship_count": int(capture.get("relationship_count") or 0),
+        "sequence_id": str(capture.get("sequence_id") or ""),
+        "idempotent_replay": bool(capture.get("idempotent_replay")),
+    }
+    return {
+        "action": "capture-image-memory",
+        "context_id": mlx_backend.sanitize_context_id(args.context),
+        "capture_id": capture_id,
+        "media_id": media_id,
+        "capture": capture_receipt,
+        "media": {
+            "media_id": media_id,
+            "display_label": label,
+            "thumbnail_dimensions": metadata["thumbnail_dimensions"],
+            "descriptor_schema": metadata["visual_descriptor"]["schema"],
+            "cache_ready": bool(cached["cache_ready"]),
+            "cache_idempotent_replay": bool(cached.get("idempotent_replay")),
+        },
+        "raw_original_stored": False,
+        "thumbnail_cache_authoritative": False,
+    }
+
+
+def command_image_cache_audit(_args: argparse.Namespace) -> dict[str, Any]:
+    binding = binding_from_environment()
+    if binding is None:
+        raise ValueError("a verified SYNAPSE-S2 core binding is required")
+    return ImageCaptureCache(binding).audit()
 
 
 def command_prune_memory(args: argparse.Namespace) -> dict[str, Any]:
@@ -2238,6 +2321,30 @@ def build_parser() -> argparse.ArgumentParser:
     capture_session.add_argument("--surprise-threshold", type=float, default=0.5)
     capture_session.add_argument("--min-segment-sentences", type=int, default=1)
     capture_session.set_defaults(func=command_capture_session)
+
+    capture_image = subparsers.add_parser(
+        "capture-image",
+        help="Capture a local image as a private thumbnail plus visual descriptor memory.",
+    )
+    add_context(capture_image)
+    capture_image.add_argument("--path", required=True)
+    capture_image.add_argument("--label", required=True)
+    capture_image.add_argument("--description", required=True)
+    capture_image.add_argument("--tag", default="")
+    capture_image.add_argument("--speaker", default="operator")
+    capture_image.add_argument(
+        "--capture-id",
+        default="",
+        help="reuse an s2cap_ id only when retrying the same logical image capture",
+    )
+    capture_image.add_argument("--confirm", action="store_true")
+    capture_image.set_defaults(func=command_capture_image)
+
+    image_cache_audit = subparsers.add_parser(
+        "image-cache-audit",
+        help="Verify the private thumbnail cache without reading image memory content.",
+    )
+    image_cache_audit.set_defaults(func=command_image_cache_audit)
 
     prune_memory = subparsers.add_parser("prune-memory")
     add_context(prune_memory)

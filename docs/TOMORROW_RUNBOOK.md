@@ -349,6 +349,20 @@ Event graph ingestion:
 
 The graph output should show event tags like `production-preflight-brief-event-001` and at least one `temporal_next` relationship. Event memory metadata should also include `surprise_model`, `surprise_mode`, `semantic_surprise_score`, and `lexical_surprise_score`. `surprise_mode: embedding` means the boundary was cut from the configured local provider's cosine-distance signal; `surprise_mode: lexical` means SYNAPSE-S2 used the hardened token-overlap fallback.
 
+Image-cache post-upgrade check:
+
+```bash
+.venv/bin/python synapse_cli.py --json image-cache-audit
+```
+
+Require `healthy: true` and `corrupt_count: 0`. This is an integrity-only check
+unless an authoritative reference set is supplied internally; it does not prove
+that every typed image memory has a local thumbnail. The thumbnail cache is
+node-local and is not yet part of paired recovery or replication. Pruning an
+image memory does not automatically remove its external thumbnail in this
+release, so do not promise complete derivative deletion until the governed
+memory-and-media prune lane is implemented.
+
 Agent context hydration:
 
 ```bash

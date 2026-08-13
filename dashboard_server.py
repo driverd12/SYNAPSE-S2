@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import hmac
 import importlib.util
@@ -16,6 +18,7 @@ import stat
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import tomllib
 import uuid
@@ -25,13 +28,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
-from core_client_binding import apply_binding_environment
+from core_client_binding import CoreClientBinding, apply_binding_environment
 
 
 # The owner-only binding is the authority pointer for persistent clients.  It
 # must populate the process environment before any adapter module can inspect
 # routing state during import.
-apply_binding_environment()
+BOUND_CORE_BINDING = apply_binding_environment()
 
 from capture_daemon import CaptureInboxDaemon  # noqa: E402
 from core_client import (  # noqa: E402
@@ -40,6 +43,13 @@ from core_client import (  # noqa: E402
     outcome_unknown_projection,
 )
 import mlx_backend  # noqa: E402
+from image_capture import (  # noqa: E402
+    ImageCaptureCache,
+    ImageCaptureError,
+    ImageCaptureNotFound,
+    validate_media_id,
+)
+from impact_metrics import ImpactMetricsError, ImpactMetricsStore  # noqa: E402
 from redaction import (  # noqa: E402
     SECRET_SAFE_LOG_FORMAT,
     SecretSafeArgumentParser,
@@ -66,6 +76,7 @@ ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 MAX_JSON_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 64 * 1024
+MAX_IMAGE_THUMBNAIL_BYTES = 72 * 1024
 DASHBOARD_SESSION_COOKIE_NAME = "synapse_s2_dashboard_session"
 DASHBOARD_SESSION_HEADER_NAME = "X-Synapse-Dashboard-Session"
 DASHBOARD_SESSION_FRAGMENT_KEY = "synapse_dashboard_session"
@@ -87,7 +98,7 @@ SECURITY_HEADERS = {
         "default-src 'self'; "
         "script-src 'self'; "
         "style-src 'self'; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
         "connect-src 'self'; "
         "base-uri 'none'; "
         "frame-ancestors 'none'; "
@@ -192,8 +203,18 @@ class DashboardError(Exception):
 class DashboardRuntime:
     """Small request router shared by the HTTP handler and unit tests."""
 
-    def __init__(self, backend: mlx_backend.SpikingAttentionBackend | None = None) -> None:
+    def __init__(
+        self,
+        backend: mlx_backend.SpikingAttentionBackend | None = None,
+        *,
+        binding: CoreClientBinding | None = None,
+        image_cache: ImageCaptureCache | None = None,
+        impact_store: ImpactMetricsStore | None = None,
+    ) -> None:
         self._backend = backend
+        self._binding = binding if binding is not None else BOUND_CORE_BINDING
+        self._image_cache = image_cache
+        self._impact_store = impact_store
         self.started_at = time.time()
         self._system_info_cache: dict[str, Any] | None = None
         self._confirmation_tokens: dict[str, dict[str, Any]] = {}
@@ -230,6 +251,32 @@ class DashboardRuntime:
         if self._backend is not None:
             return self._backend.state_path.parent
         return None
+
+    def _bound_data_root(self) -> Path:
+        if self._binding is not None:
+            return self._binding.data_root
+        root = self._capture_root()
+        if root is None:
+            raise DashboardError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "verified local data root is unavailable",
+            )
+        return Path(root).expanduser().absolute()
+
+    def image_cache(self) -> ImageCaptureCache:
+        if self._image_cache is None:
+            if self._binding is None:
+                raise DashboardError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "verified core binding is required for image capture",
+                )
+            self._image_cache = ImageCaptureCache(self._binding)
+        return self._image_cache
+
+    def impact_store(self) -> ImpactMetricsStore:
+        if self._impact_store is None:
+            self._impact_store = ImpactMetricsStore(self._bound_data_root())
+        return self._impact_store
 
     def _replication_core(self) -> CoreClient:
         backend = self.backend
@@ -462,6 +509,50 @@ class DashboardRuntime:
                 )
             return self._json_response(
                 self.backend.resource_profile(benchmark_quick_prune=False)
+            )
+        if method == "GET" and path == "/api/impact":
+            price = self._float_param(
+                params,
+                "price_per_million",
+                0.0,
+                minimum=0.0,
+                maximum=1_000.0,
+            )
+            assumed_tokens = self._int_param(
+                params,
+                "assumed_tokens_per_assist",
+                1_500,
+                minimum=0,
+                maximum=1_000_000,
+            )
+            context = self._context_from_params(params)
+            return self._json_response(
+                self.impact_projection(
+                    context_id=context,
+                    price_per_million=price,
+                    assumed_tokens_per_assist=assumed_tokens,
+                )
+            )
+        if method == "GET" and path == "/api/media-cache":
+            context = self._context_from_params(params)
+            limit = self._int_param(params, "limit", 12, minimum=1, maximum=50)
+            return self._json_response(
+                self.list_image_memories(context_id=context, limit=limit)
+            )
+        if method == "GET" and path == "/api/media-thumbnail":
+            media_id = validate_media_id(
+                str(params.get("media_id", [""])[0] or "").strip()
+            )
+            try:
+                thumbnail = self.image_cache().get_thumbnail(media_id)
+            except ImageCaptureNotFound as exc:
+                raise DashboardError(
+                    HTTPStatus.NOT_FOUND,
+                    "cached image thumbnail is unavailable on this Mac",
+                ) from exc
+            return self._binary_response(
+                thumbnail.data,
+                content_type=thumbnail.content_type,
             )
         if method == "GET" and path == "/api/replication/identity":
             return self._json_response(
@@ -976,14 +1067,29 @@ class DashboardRuntime:
                     }
                 )
             candidate_limit = min(max(result_limit * 4, 16), 500)
-            retrieval = self.backend.retrieve_text_v2(
-                prompt,
-                context_id=context,
-                recall_scope=recall_scope,
-                result_limit=result_limit,
-                candidate_limit=candidate_limit,
-                include_graph_neighbors=raw_include_graph,
-            )
+            try:
+                retrieval = self.backend.retrieve_text_v2(
+                    prompt,
+                    context_id=context,
+                    recall_scope=recall_scope,
+                    result_limit=result_limit,
+                    candidate_limit=candidate_limit,
+                    include_graph_neighbors=raw_include_graph,
+                )
+            except Exception:
+                elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+                self._record_dashboard_recall(
+                    succeeded=False,
+                    latency_ms=elapsed_ms,
+                    recall_scope=recall_scope,
+                    results=[],
+                    response_payload={
+                        "schema": "synapse-s2.dashboard-retrieval.v2",
+                        "status": "error",
+                        "raw_input_stored": False,
+                    },
+                )
+                raise
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
             results = self._dashboard_retrieval_v2_items(retrieval)
             scope = retrieval.get("scope") if isinstance(retrieval.get("scope"), dict) else {}
@@ -994,8 +1100,7 @@ class DashboardRuntime:
                 if isinstance(record, dict)
                 and str(record.get("resolved_context_id") or "")
             ]
-            return self._json_response(
-                {
+            response_payload = {
                     "schema": "synapse-s2.dashboard-retrieval.v2",
                     "context_id": context,
                     "recall_scope": recall_scope,
@@ -1023,7 +1128,14 @@ class DashboardRuntime:
                     "query_id": retrieval.get("retrieval_id")
                     or self._query_id(context=context),
                 }
+            self._record_dashboard_recall(
+                succeeded=True,
+                latency_ms=elapsed_ms,
+                recall_scope=recall_scope,
+                results=results,
+                response_payload=response_payload,
             )
+            return self._json_response(response_payload)
         if method == "POST" and path == "/api/namespace-link-proposals":
             payload = self._parse_json_body(body)
             evidence = payload.get("evidence", {})
@@ -1206,6 +1318,9 @@ class DashboardRuntime:
                 capture_id=self._capture_id_payload(payload),
             )
             return self._json_response(capture)
+        if method == "POST" and path == "/api/capture-image":
+            payload = self._parse_json_body(body)
+            return self._json_response(self.capture_image_memory(payload))
         if method == "POST" and path == "/api/app-connect":
             payload = self._parse_json_body(body)
             context = self._context_from_payload(payload)
@@ -2936,6 +3051,309 @@ class DashboardRuntime:
             ),
         }
 
+    def _record_dashboard_recall(
+        self,
+        *,
+        succeeded: bool,
+        latency_ms: float,
+        recall_scope: str,
+        results: list[dict[str, Any]],
+        response_payload: dict[str, Any],
+    ) -> None:
+        try:
+            response_bytes = len(
+                json.dumps(
+                    response_payload,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            )
+            self.impact_store().record_dashboard_recall(
+                succeeded=succeeded,
+                latency_ms=latency_ms,
+                result_count=len(results) if succeeded else 0,
+                bridge_eligible=succeeded and recall_scope == "connected",
+                connected_assist=succeeded
+                and any(str(item.get("via_context_link_id") or "") for item in results),
+                graph_assist=succeeded
+                and any(item.get("kind") == "linked" for item in results),
+                response_bytes=response_bytes,
+            )
+        except (ImpactMetricsError, OSError, ValueError):
+            LOGGER.warning("dashboard impact outcome could not be recorded", exc_info=True)
+
+    def impact_projection(
+        self,
+        *,
+        context_id: str,
+        price_per_million: float,
+        assumed_tokens_per_assist: int,
+    ) -> dict[str, Any]:
+        projection = self.impact_store().project(
+            input_price_per_million_tokens=price_per_million,
+        )
+        status = self.backend.status(context_id=context_id)
+        profile = self.backend.resource_profile(benchmark_quick_prune=False)
+        recall = projection["recall"]
+        assistance = projection["assistance"]
+        performance = projection["performance"]
+        completed = int(recall["completed_count"])
+        yielded = int(recall["nonempty_result_count"])
+        price = float(price_per_million)
+        assumed_tokens = int(assumed_tokens_per_assist)
+        upper_tokens = yielded * assumed_tokens
+        upper_usd = round((upper_tokens * price) / 1_000_000.0, 8)
+        trace_count = int(status.get("registered_trace_count") or 0)
+        cache_count = int(status.get("registered_trace_cache_count") or 0)
+        delivery_count = int(status.get("context_bus_delivery_count") or 0)
+        ack_count = int(status.get("context_bus_ack_receipt_count") or 0)
+        target_max = float((profile.get("target_envelope_mb") or {}).get("max") or 0.0)
+        current_mb = float(profile.get("estimated_total_mb") or 0.0)
+        return {
+            "schema": "synapse-s2.dashboard-impact.v1",
+            "requested_context_id": context_id,
+            "coverage": {
+                "scope": "dashboard-recall-all-contexts",
+                "started_at": projection["coverage"]["first_recorded_at"],
+                "updated_at": projection["coverage"]["updated_at"],
+                "content_free": True,
+                "context_partitioned": False,
+            },
+            "metrics": {
+                "recall_attempts": int(recall["attempt_count"]),
+                "recall_completed": completed,
+                "recall_errors": int(recall["error_count"]),
+                "recall_with_results": yielded,
+                "connected_assists": int(assistance["connected_assist_count"]),
+                "graph_assists": int(assistance["graph_assist_count"]),
+                "response_estimated_tokens": int(
+                    performance["estimated_response_tokens_total"]
+                ),
+            },
+            "performance": {
+                "recall_p50_ms": performance["latency_ms"]["p50"],
+                "recall_p95_ms": performance["latency_ms"]["p95"],
+                "latency_sample_count": performance["latency_ms"]["sample_count"],
+                "bounded_recent_window": True,
+            },
+            "reliability": {
+                "delivery_ack_ratio": (
+                    None
+                    if delivery_count <= 0
+                    else round(min(1.0, ack_count / delivery_count), 6)
+                ),
+                "delivery_count": delivery_count,
+                "ack_receipt_count": ack_count,
+                "recall_error_rate": recall["error_rate"],
+            },
+            "resources": {
+                "trace_cache_coverage": (
+                    None
+                    if trace_count <= 0
+                    else round(min(1.0, cache_count / trace_count), 6)
+                ),
+                "registered_trace_count": trace_count,
+                "registered_trace_cache_count": cache_count,
+                "envelope_headroom_mb": round(target_max - current_mb, 3),
+                "estimated_topology_mb": current_mb,
+            },
+            "equivalent_cost_estimate": {
+                "range_min_usd": 0.0,
+                "range_max_usd": upper_usd,
+                "observed_response_equivalent_usd": projection["cost"].get(
+                    "estimated_model_input_equivalent_cost_usd"
+                ),
+                "input_price_per_million_tokens": price,
+                "assumed_tokens_per_nonempty_recall": assumed_tokens,
+                "upper_bound_tokens": upper_tokens,
+                "savings_proven": False,
+                "label": "illustrative $0-to-upper-bound range; not billing",
+            },
+            "caveat": (
+                "The dollar range is an editable what-if, not provider billing or "
+                "a measured no-SYNAPSE counterfactual. Yield is not correctness; "
+                "warm coverage is occupancy, not a cache hit rate."
+            ),
+        }
+
+    def list_image_memories(
+        self,
+        *,
+        context_id: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        listing = self.backend.list_memory(
+            context_id=context_id,
+            limit=200,
+            include_global=False,
+            include_vectors=False,
+            recall_scope="local",
+        )
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in listing.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            metadata = entry.get("metadata")
+            if not isinstance(metadata, dict) or metadata.get("context_memory_type") != "image":
+                continue
+            try:
+                media_id = validate_media_id(metadata.get("media_id"))
+            except (TypeError, ValueError):
+                continue
+            if media_id in seen:
+                continue
+            seen.add(media_id)
+            dimensions = metadata.get("thumbnail_dimensions")
+            dimensions = dimensions if isinstance(dimensions, dict) else {}
+            items.append(
+                {
+                    "media_id": media_id,
+                    "display_label": str(metadata.get("display_label") or entry.get("tag") or "Image memory"),
+                    "thumbnail_width": int(dimensions.get("width") or 0),
+                    "thumbnail_height": int(dimensions.get("height") or 0),
+                    "created_at": float(entry.get("created_at") or 0.0),
+                    "cache_authoritative": False,
+                }
+            )
+            if len(items) >= limit:
+                break
+        return {
+            "schema": "synapse-s2.image-memory-gallery.v1",
+            "context_id": context_id,
+            "items": items,
+            "item_count": len(items),
+            "scan_limit": 200,
+            "thumbnail_cache_authoritative": False,
+        }
+
+    def _decode_image_thumbnail(self, value: Any) -> bytes:
+        text = str(value or "")
+        prefix = "data:image/jpeg;base64,"
+        if not text.startswith(prefix):
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "thumbnail_data_url must be a JPEG data URL",
+            )
+        encoded = text[len(prefix) :]
+        if not encoded or len(encoded) > ((MAX_IMAGE_THUMBNAIL_BYTES + 2) // 3) * 4:
+            raise DashboardError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "image thumbnail exceeds the local capture limit",
+            )
+        try:
+            thumbnail = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "image thumbnail encoding is invalid",
+            ) from exc
+        if (
+            not thumbnail
+            or len(thumbnail) > MAX_IMAGE_THUMBNAIL_BYTES
+            or not thumbnail.startswith(b"\xff\xd8\xff")
+        ):
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "image thumbnail is not a bounded JPEG",
+            )
+        return thumbnail
+
+    def capture_image_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("confirm") is not True:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "confirm must be true before capturing an image memory",
+            )
+        context = self._context_from_payload(payload)
+        label = self._text_payload(payload, "display_label", max_bytes=512)
+        description = self._text_payload(payload, "description", max_bytes=4_096)
+        capture_id = self._capture_id_payload(payload) or f"s2cap_{uuid.uuid4().hex}"
+        if re.fullmatch(r"s2cap_[0-9a-f]{32}", capture_id) is None:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "capture_id must use canonical s2cap_<32 lowercase hex> format",
+            )
+        thumbnail = self._decode_image_thumbnail(payload.get("thumbnail_data_url"))
+        media_id = f"s2img_{hashlib.sha256(capture_id.encode('ascii')).hexdigest()[:32]}"
+        data_root = self._bound_data_root()
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".dashboard-image-",
+                suffix=".jpg",
+                dir=str(data_root),
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                os.fchmod(descriptor, 0o600)
+                view = memoryview(thumbnail)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise ImageCaptureError("image derivative write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            cached = self.image_cache().capture_image(
+                temporary_path,
+                media_id=media_id,
+            )
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+        public_metadata = dict(cached["public_metadata"])
+        public_metadata.update(
+            {
+                "display_label": label,
+                "display_summary": description,
+                "source": "dashboard-image-capture",
+                "source_surface": "dashboard",
+                "raw_original_stored": False,
+                "thumbnail_cache_authoritative": False,
+            }
+        )
+        capture = self.backend.capture_conversation(
+            text=description,
+            context_id=context,
+            source_tag=mlx_backend.sanitize_tag(f"image-{label}").replace(" ", "-"),
+            speaker="dashboard-operator",
+            surprise_threshold=0.5,
+            min_segment_sentences=64,
+            metadata=public_metadata,
+            capture_id=capture_id,
+        )
+        capture_receipt = {
+            "protocol": str(capture.get("protocol") or "capture.v2"),
+            "capture_id": str(capture.get("capture_id") or capture_id),
+            "event_count": int(capture.get("event_count") or 0),
+            "relationship_count": int(capture.get("relationship_count") or 0),
+            "sequence_id": str(capture.get("sequence_id") or ""),
+            "idempotent_replay": bool(capture.get("idempotent_replay")),
+        }
+        return {
+            "action": "capture-image-memory",
+            "context_id": context,
+            "media_id": media_id,
+            "capture_id": capture_id,
+            "capture": capture_receipt,
+            "media": {
+                "media_id": media_id,
+                "display_label": label,
+                "thumbnail_dimensions": public_metadata["thumbnail_dimensions"],
+                "descriptor_schema": public_metadata["visual_descriptor"]["schema"],
+                "cache_ready": bool(cached["cache_ready"]),
+                "cache_idempotent_replay": bool(cached.get("idempotent_replay")),
+            },
+            "raw_original_stored": False,
+            "thumbnail_cache_authoritative": False,
+            "searchable_description_stored": True,
+        }
+
     def wrap_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("confirm") is not True:
             raise DashboardError(
@@ -3711,6 +4129,20 @@ class DashboardRuntime:
             **SECURITY_HEADERS,
         }, body
 
+    def _binary_response(
+        self,
+        body: bytes,
+        *,
+        content_type: str,
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> tuple[int, dict[str, str], bytes]:
+        return int(status), {
+            "Content-Type": content_type,
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            **SECURITY_HEADERS,
+        }, bytes(body)
+
     def _parse_json_body(self, body: bytes) -> dict[str, Any]:
         if len(body) > MAX_JSON_BODY_BYTES:
             raise DashboardError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "JSON body too large")
@@ -4182,6 +4614,11 @@ class DashboardRuntime:
             value = float(params.get(key, [str(default)])[0])
         except (TypeError, ValueError) as exc:
             raise DashboardError(HTTPStatus.BAD_REQUEST, f"{key} must be a number") from exc
+        if not math.isfinite(value):
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                f"{key} must be a finite number",
+            )
         return min(max(value, minimum), maximum)
 
     def _required_bool(self, payload: dict[str, Any], key: str) -> bool:

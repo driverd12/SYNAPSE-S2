@@ -25,6 +25,13 @@ const NAMESPACE_GALAXY_VISIBLE_REFRESH_MS = 30000;
 const NAMESPACE_GALAXY_HIDDEN_REFRESH_MS = 120000;
 const CORE_HEALTH_VISIBLE_REFRESH_MS = 5000;
 const CORE_HEALTH_HIDDEN_REFRESH_MS = 30000;
+const IMPACT_RATE_STORAGE_KEY = "synapse-s2-impact-rate-v1";
+const IMPACT_TOKENS_STORAGE_KEY = "synapse-s2-impact-tokens-v1";
+const IMAGE_SOURCE_MAX_BYTES = 20 * 1024 * 1024;
+const IMAGE_SOURCE_MAX_PIXELS = 40_000_000;
+const IMAGE_DIMENSION_PROBE_MAX_BYTES = 2 * 1024 * 1024;
+const IMAGE_THUMBNAIL_MAX_EDGE = 320;
+const IMAGE_THUMBNAIL_MAX_BYTES = 72 * 1024;
 
 function loadDashboardSessionCapability() {
   const rawFragment = window.location.hash.startsWith("#")
@@ -489,6 +496,14 @@ const state = {
     apps: [],
     connections: [],
   },
+  imageCapture: {
+    prepared: null,
+    objectUrl: "",
+    galleryObjectUrls: [],
+  },
+  impact: {
+    open: false,
+  },
   captureRetries: new Map(),
   operator: {
     receipts: [],
@@ -596,6 +611,7 @@ const elements = collectElements([
   "footerContexts",
   "footerGpu",
   "footerHealth",
+  "footerImpact",
   "footerMemory",
   "footerTime",
   "goalLedger",
@@ -615,6 +631,21 @@ const elements = collectElements([
   "headroomState",
   "headerRuntime",
   "hydrateLabel",
+  "imageCaptureButton",
+  "imageCaptureDescription",
+  "imageCaptureFile",
+  "imageCaptureForm",
+  "imageCaptureLabel",
+  "imageCapturePreview",
+  "imageCaptureState",
+  "imageGallery",
+  "impactCaveat",
+  "impactCloseButton",
+  "impactDrawer",
+  "impactMetrics",
+  "impactTokenRate",
+  "impactTokensPerAssist",
+  "impactToggleButton",
   "ingestForm",
   "ingestMinSentences",
   "ingestTag",
@@ -763,6 +794,7 @@ const elements = collectElements([
 elements.contextInput.value = state.context;
 elements.endpointLabel.textContent = window.location.host || "127.0.0.1:8765";
 applyTheme(loadTheme());
+initializeImpactPanel();
 initializeGraphInteractions();
 initializeNamespaceGalaxy();
 initializeSectionNavigation();
@@ -866,6 +898,44 @@ async function requestJson(
     throw error;
   }
   return payload;
+}
+
+async function requestBlob(path, { params = {}, timeoutMs = READ_REQUEST_TIMEOUT_MS } = {}) {
+  if (state.dashboardAccessRequired) throw new Error("dashboard authorization required");
+  const headers = dashboardSessionCapability
+    ? { [DASHBOARD_SESSION_HEADER_NAME]: dashboardSessionCapability }
+    : {};
+  const controller = typeof window.AbortController === "function"
+    ? new window.AbortController()
+    : null;
+  const timeout = controller
+    ? window.setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || READ_REQUEST_TIMEOUT_MS))
+    : null;
+  try {
+    const response = await fetch(apiUrl(path, params), {
+      method: "GET",
+      headers,
+      signal: controller?.signal,
+    });
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = payload?.error || message;
+      } catch (_error) {
+        // Binary endpoints may fail without a JSON body.
+      }
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
+    }
+    return response.blob();
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("Image preview timed out; last good data retained.");
+    throw error;
+  } finally {
+    if (timeout !== null) window.clearTimeout(timeout);
+  }
 }
 
 function isDashboardAuthorizationError(error) {
@@ -1068,6 +1138,10 @@ async function refreshSnapshot() {
   const shellElapsedMs = elapsedMs(started);
   renderSnapshot(state.snapshot, shellElapsedMs);
   const namespaceMapPromise = refreshNamespaceGalaxy();
+  const imageGalleryPromise = refreshImageGallery().catch((error) => {
+    logOperation("Image gallery refresh failed", error.message);
+    return null;
+  });
   if (operationLogIsIdle()) {
     logSnapshotResponse(state.snapshot, shellElapsedMs);
   }
@@ -1085,7 +1159,7 @@ async function refreshSnapshot() {
   } catch (error) {
     logOperation("Graph refresh failed", error.message);
   }
-  await namespaceMapPromise;
+  await Promise.all([namespaceMapPromise, imageGalleryPromise]);
   return state.snapshot;
 }
 
@@ -4580,6 +4654,252 @@ function renderCaptureInbox(captureInbox) {
   `;
 }
 
+function setImageCaptureState(headline, detail, mode = "") {
+  elements.imageCaptureState.className = `image-capture-state ${mode}`.trim();
+  elements.imageCaptureState.innerHTML = `
+    <strong>${escapeHtml(headline)}</strong>
+    <small>${escapeHtml(detail)}</small>
+  `;
+}
+
+function revokePreparedImagePreview() {
+  if (state.imageCapture.objectUrl) {
+    URL.revokeObjectURL(state.imageCapture.objectUrl);
+    state.imageCapture.objectUrl = "";
+  }
+  elements.imageCapturePreview.removeAttribute("src");
+  elements.imageCapturePreview.hidden = true;
+}
+
+function blobFromCanvas(canvas, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => blob ? resolve(blob) : reject(new Error("Could not encode a safe image thumbnail.")),
+      "image/jpeg",
+      quality,
+    );
+  });
+}
+
+function dataUrlFromBlob(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read the generated image thumbnail."));
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function sha256Hex(buffer) {
+  const digest = await window.crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function imageDimensionsFromHeader(bytes) {
+  const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (
+    bytes.length >= 24
+    && pngSignature.every((value, index) => bytes[index] === value)
+    && bytes[12] === 0x49
+    && bytes[13] === 0x48
+    && bytes[14] === 0x44
+    && bytes[15] === 0x52
+  ) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return { format: "png", width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    const startOfFrameMarkers = new Set([
+      0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
+      0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+    ]);
+    let cursor = 2;
+    while (cursor < bytes.length) {
+      if (bytes[cursor] !== 0xff) return null;
+      while (cursor < bytes.length && bytes[cursor] === 0xff) cursor += 1;
+      if (cursor >= bytes.length) break;
+      const marker = bytes[cursor];
+      cursor += 1;
+      if (marker === 0xd9 || marker === 0xda) break;
+      if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (cursor + 1 >= bytes.length) break;
+      const segmentLength = (bytes[cursor] << 8) | bytes[cursor + 1];
+      if (segmentLength < 2) return null;
+      if (startOfFrameMarkers.has(marker)) {
+        if (cursor + 7 > bytes.length || segmentLength < 7) return null;
+        return {
+          format: "jpeg",
+          width: (bytes[cursor + 5] << 8) | bytes[cursor + 6],
+          height: (bytes[cursor + 3] << 8) | bytes[cursor + 4],
+        };
+      }
+      cursor += segmentLength;
+    }
+  }
+  return null;
+}
+
+async function inspectImageDimensions(file) {
+  const probeSize = Math.min(file.size, IMAGE_DIMENSION_PROBE_MAX_BYTES);
+  const bytes = new Uint8Array(await file.slice(0, probeSize).arrayBuffer());
+  const dimensions = imageDimensionsFromHeader(bytes);
+  if (!dimensions) {
+    throw new Error("Could not safely inspect this PNG or JPEG before decoding it.");
+  }
+  if (
+    dimensions.width <= 0
+    || dimensions.height <= 0
+    || dimensions.width * dimensions.height > IMAGE_SOURCE_MAX_PIXELS
+  ) {
+    throw new Error("Image dimensions exceed the 40-megapixel safety limit.");
+  }
+  return dimensions;
+}
+
+async function prepareImageCaptureFile(file) {
+  if (!file) throw new Error("Choose a local image first.");
+  if (file.size <= 0 || file.size > IMAGE_SOURCE_MAX_BYTES) {
+    throw new Error("Image must be between 1 byte and 20 MB.");
+  }
+  const sourceDimensions = await inspectImageDimensions(file);
+  const sourceScale = Math.min(
+    1,
+    IMAGE_THUMBNAIL_MAX_EDGE / Math.max(sourceDimensions.width, sourceDimensions.height),
+  );
+  const decodeWidth = Math.max(1, Math.round(sourceDimensions.width * sourceScale));
+  const decodeHeight = Math.max(1, Math.round(sourceDimensions.height * sourceScale));
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file, {
+      resizeWidth: decodeWidth,
+      resizeHeight: decodeHeight,
+      resizeQuality: "high",
+    });
+  } catch (_error) {
+    throw new Error("This browser could not decode that image. PNG and JPEG are the most reliable choices.");
+  }
+  try {
+    if (
+      bitmap.width <= 0
+      || bitmap.height <= 0
+      || bitmap.width > decodeWidth
+      || bitmap.height > decodeHeight
+    ) {
+      throw new Error("The browser did not honor the bounded image decode request.");
+    }
+    let edgeScale = 1;
+    let thumbnail = null;
+    let canvas = null;
+    for (const quality of [0.82, 0.7, 0.58, 0.46]) {
+      canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * edgeScale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * edgeScale));
+      const context = canvas.getContext("2d", { alpha: false, willReadFrequently: false });
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      thumbnail = await blobFromCanvas(canvas, quality);
+      if (thumbnail.size <= IMAGE_THUMBNAIL_MAX_BYTES) break;
+      edgeScale *= 0.82;
+    }
+    if (!thumbnail || !canvas || thumbnail.size > IMAGE_THUMBNAIL_MAX_BYTES) {
+      throw new Error("Generated thumbnail exceeds the 72 KB local-capture limit.");
+    }
+    const thumbnailBytes = await thumbnail.arrayBuffer();
+    return {
+      thumbnailDataUrl: await dataUrlFromBlob(thumbnail),
+      thumbnailBlob: thumbnail,
+      thumbnailSha256: await sha256Hex(thumbnailBytes),
+      originalWidth: sourceDimensions.width,
+      originalHeight: sourceDimensions.height,
+      thumbnailWidth: canvas.width,
+      thumbnailHeight: canvas.height,
+    };
+  } finally {
+    bitmap.close?.();
+  }
+}
+
+async function handleImageCaptureSelection() {
+  const file = elements.imageCaptureFile.files?.[0] || null;
+  state.imageCapture.prepared = null;
+  revokePreparedImagePreview();
+  if (!file) {
+    setImageCaptureState("No image selected", "PNG or JPEG; up to 20 MB.");
+    return;
+  }
+  elements.imageCaptureFile.disabled = true;
+  setImageCaptureState("Preparing local derivatives", "Preparing a bounded thumbnail and retry fingerprint…", "pending");
+  try {
+    const prepared = await prepareImageCaptureFile(file);
+    state.imageCapture.prepared = prepared;
+    state.imageCapture.objectUrl = URL.createObjectURL(prepared.thumbnailBlob);
+    elements.imageCapturePreview.src = state.imageCapture.objectUrl;
+    elements.imageCapturePreview.hidden = false;
+    setImageCaptureState(
+      "Thumbnail ready",
+      `${formatNumber(prepared.originalWidth)}×${formatNumber(prepared.originalHeight)} source → ${formatNumber(prepared.thumbnailWidth)}×${formatNumber(prepared.thumbnailHeight)} cached preview; SYNAPSE-S2 leaves the source untouched.`,
+      "ready",
+    );
+  } catch (error) {
+    elements.imageCaptureFile.value = "";
+    setImageCaptureState("Image preparation failed", error.message, "error");
+  } finally {
+    elements.imageCaptureFile.disabled = false;
+  }
+}
+
+function clearImageGalleryObjectUrls() {
+  state.imageCapture.galleryObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+  state.imageCapture.galleryObjectUrls = [];
+}
+
+async function loadImageGalleryThumbnail(image, mediaId) {
+  try {
+    const blob = await requestBlob("/api/media-thumbnail", { params: { media_id: mediaId } });
+    const url = URL.createObjectURL(blob);
+    state.imageCapture.galleryObjectUrls.push(url);
+    image.src = url;
+  } catch (_error) {
+    image.alt = "Cached thumbnail unavailable";
+  }
+}
+
+function renderImageGallery(payload = {}) {
+  clearImageGalleryObjectUrls();
+  elements.imageGallery.replaceChildren();
+  const items = Array.isArray(payload.items) ? payload.items.slice(0, 12) : [];
+  items.forEach((item) => {
+    const mediaId = String(item.media_id || "");
+    if (!/^s2img_[0-9a-f]{32}$/.test(mediaId)) return;
+    const card = document.createElement("article");
+    card.className = "image-gallery-card";
+    const image = document.createElement("img");
+    image.alt = `${String(item.display_label || "Image memory")} cached thumbnail`;
+    image.loading = "lazy";
+    const text = document.createElement("span");
+    const label = document.createElement("strong");
+    label.textContent = String(item.display_label || "Image memory");
+    const detail = document.createElement("small");
+    detail.textContent = `${formatNumber(item.thumbnail_width || 0)}×${formatNumber(item.thumbnail_height || 0)} · ${formatTimestamp(item.created_at)}`;
+    text.append(label, detail);
+    card.append(image, text);
+    elements.imageGallery.append(card);
+    void loadImageGalleryThumbnail(image, mediaId);
+  });
+  if (!elements.imageGallery.childElementCount) {
+    elements.imageGallery.innerHTML = '<div class="memory-ledger-empty">No cached image memories in this namespace</div>';
+  }
+}
+
+async function refreshImageGallery() {
+  const payload = await requestJson("/api/media-cache", {
+    params: { context_id: state.context, limit: 12 },
+  });
+  renderImageGallery(payload);
+  return payload;
+}
+
 function setAppConnectState(headline, detail, mode = "") {
   elements.appConnectState.className = `capture-inbox-state ${mode}`.trim();
   elements.appConnectState.innerHTML = `
@@ -6459,6 +6779,90 @@ function renderFooter(snapshot, status, profile, contextCount) {
   elements.footerTime.textContent = formatClock(snapshot.generated_at);
 }
 
+function loadStoredImpactNumber(key, fallback) {
+  try {
+    const stored = window.localStorage.getItem(key);
+    if (stored === null) return fallback;
+    const value = Number(stored);
+    return Number.isFinite(value) && value >= 0 ? value : fallback;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function storeImpactAssumptions() {
+  try {
+    window.localStorage.setItem(IMPACT_RATE_STORAGE_KEY, String(Math.max(0, Number(elements.impactTokenRate.value) || 0)));
+    window.localStorage.setItem(IMPACT_TOKENS_STORAGE_KEY, String(Math.max(0, Number(elements.impactTokensPerAssist.value) || 0)));
+  } catch (_error) {
+    // Local preference persistence is best-effort; telemetry contains no content.
+  }
+}
+
+function initializeImpactPanel() {
+  elements.impactTokenRate.value = String(loadStoredImpactNumber(IMPACT_RATE_STORAGE_KEY, 5));
+  elements.impactTokensPerAssist.value = String(loadStoredImpactNumber(IMPACT_TOKENS_STORAGE_KEY, 1500));
+}
+
+function impactMetric(label, value, detail) {
+  return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></div>`;
+}
+
+function renderImpact(payload = {}) {
+  const metrics = payload.metrics || {};
+  const performance = payload.performance || {};
+  const reliability = payload.reliability || {};
+  const resources = payload.resources || {};
+  const estimate = payload.equivalent_cost_estimate || {};
+  const completed = Number(metrics.recall_completed || 0);
+  const yielded = Number(metrics.recall_with_results || 0);
+  const yieldRate = completed > 0 ? yielded / completed : 0;
+  const estimateMaxUsd = Number(estimate.range_max_usd || 0);
+  const estimateLabel = `$0–$${formatNumber(estimateMaxUsd, estimateMaxUsd < 1 ? 3 : 2)}`;
+  elements.impactMetrics.innerHTML = [
+    impactMetric("Recall assists", formatNumber(yielded), `${formatNumber(yieldRate * 100, 1)}% non-empty yield`),
+    impactMetric("Bridge assists", formatNumber(metrics.connected_assists || 0), "approved one-hop evidence"),
+    impactMetric("Graph assists", formatNumber(metrics.graph_assists || 0), "same-context neighbors"),
+    impactMetric("Recall p50 / p95", `${formatNumber(performance.recall_p50_ms, 1)} / ${formatNumber(performance.recall_p95_ms, 1)} ms`, "backend retrieval only"),
+    impactMetric("Approx output", formatNumber(metrics.response_estimated_tokens || 0), "bytes ÷ 4; not tokenizer billing"),
+    impactMetric("Warm coverage", resources.trace_cache_coverage === null ? "--" : `${formatNumber(resources.trace_cache_coverage * 100, 1)}%`, "occupancy, not hit rate"),
+    impactMetric("Delivery ACK", reliability.delivery_ack_ratio === null ? "--" : `${formatNumber(reliability.delivery_ack_ratio * 100, 1)}%`, "current cumulative counters"),
+    impactMetric("Illustrative input equivalent", estimateLabel, "editable upper bound; not billing"),
+  ].join("");
+  elements.footerImpact.textContent = completed > 0
+    ? (estimateMaxUsd > 0 ? `what-if ≤$${formatNumber(estimateMaxUsd, estimateMaxUsd < 1 ? 3 : 2)}` : `${formatNumber(completed)} recalls`)
+    : "ready";
+  const coverage = payload.coverage || {};
+  const started = coverage.started_at ? formatTimestamp(coverage.started_at) : "no dashboard recalls recorded yet";
+  elements.impactCaveat.textContent = `${String(payload.caveat || "Illustrative equivalent only; not provider billing or a proven counterfactual saving.")} Coverage: all dashboard namespaces since ${started}.`;
+}
+
+async function refreshImpact() {
+  const price = clamp(Number(elements.impactTokenRate.value) || 0, 0, 1000);
+  const tokens = clamp(Number(elements.impactTokensPerAssist.value) || 0, 0, 1_000_000);
+  const payload = await requestJson("/api/impact", {
+    params: {
+      context_id: state.context,
+      price_per_million: price,
+      assumed_tokens_per_assist: tokens,
+    },
+  });
+  renderImpact(payload);
+  return payload;
+}
+
+function setImpactDrawerOpen(open) {
+  state.impact.open = Boolean(open);
+  elements.impactDrawer.hidden = !state.impact.open;
+  elements.impactToggleButton.setAttribute("aria-expanded", String(state.impact.open));
+  if (state.impact.open) {
+    void refreshImpact().catch((error) => {
+      elements.impactCaveat.textContent = `Impact metrics unavailable: ${error.message}`;
+    });
+    elements.impactCloseButton.focus({ preventScroll: true });
+  }
+}
+
 function renderQueryResult(payload) {
   const items = Array.isArray(payload.results)
     ? payload.results
@@ -7513,6 +7917,39 @@ elements.recipesCloseButton.addEventListener("click", () => {
   elements.recipesToggleButton.setAttribute("aria-expanded", "false");
 });
 
+elements.impactToggleButton.addEventListener("click", () => {
+  setImpactDrawerOpen(!state.impact.open);
+});
+
+elements.impactCloseButton.addEventListener("click", () => {
+  setImpactDrawerOpen(false);
+  elements.impactToggleButton.focus({ preventScroll: true });
+});
+
+[elements.impactTokenRate, elements.impactTokensPerAssist].forEach((input) => {
+  input.addEventListener("change", () => {
+    storeImpactAssumptions();
+    if (state.impact.open) void refreshImpact();
+  });
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.impact.open) {
+    setImpactDrawerOpen(false);
+    elements.impactToggleButton.focus({ preventScroll: true });
+  }
+});
+
+document.addEventListener("pointerdown", (event) => {
+  if (
+    state.impact.open
+    && !elements.impactDrawer.contains(event.target)
+    && !elements.impactToggleButton.contains(event.target)
+  ) {
+    setImpactDrawerOpen(false);
+  }
+});
+
 elements.startWorkButton.addEventListener("click", () => {
   runStartWork(elements.startWorkButton);
 });
@@ -7736,6 +8173,65 @@ elements.captureForm.addEventListener("submit", async (event) => {
     elements.captureText.value = "";
     return payload;
   });
+});
+
+elements.imageCaptureFile.addEventListener("change", () => {
+  void handleImageCaptureSelection();
+});
+
+elements.imageCaptureForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const prepared = state.imageCapture.prepared;
+  const label = elements.imageCaptureLabel.value.trim();
+  const description = elements.imageCaptureDescription.value.trim();
+  if (!prepared) {
+    setImageCaptureState("Image capture rejected", "Choose and prepare a local image first.", "error");
+    elements.imageCaptureFile.focus();
+    return;
+  }
+  if (!label) {
+    setImageCaptureState("Image capture rejected", "Add a short memory label.", "error");
+    elements.imageCaptureLabel.focus();
+    return;
+  }
+  const text = description ? `${label}. ${description}` : label;
+  const captureBody = {
+    context_id: state.context,
+    display_label: label,
+    description: text,
+    thumbnail_data_url: prepared.thumbnailDataUrl,
+    confirm: true,
+  };
+  const retry = retryableCaptureRequest(
+    "image-capture",
+    {
+      context_id: state.context,
+      display_label: label,
+      description: text,
+      thumbnail_sha256: prepared.thumbnailSha256,
+    },
+    captureBody,
+  );
+  try {
+    await withBusy(elements.imageCaptureButton, "Capture image memory", async () => {
+      const payload = await requestJson("/api/capture-image", {
+        method: "POST",
+        body: { ...retry.body, capture_id: retry.captureId },
+        timeoutMs: 30000,
+      });
+      finishRetryableCapture("image-capture", retry.captureId);
+      setImageCaptureState("Image memory captured", "Thumbnail and numeric descriptors are local; the full-resolution source was not retained.", "ready");
+      state.imageCapture.prepared = null;
+      elements.imageCaptureFile.value = "";
+      elements.imageCaptureLabel.value = "";
+      elements.imageCaptureDescription.value = "";
+      revokePreparedImagePreview();
+      await refreshImageGallery();
+      return payload;
+    });
+  } catch (error) {
+    setImageCaptureState("Image capture needs attention", error.message, "error");
+  }
 });
 
 elements.pruneForm.addEventListener("submit", async (event) => {
