@@ -49,6 +49,7 @@ from scripts.core_agent_installer import (
     DEFAULT_LABEL as DEFAULT_CORE_LABEL,
     LaunchCtl,
     build_config as build_candidate_core_config,
+    core_backup_inspection_timeout_policy,
     resolve_paths as resolve_candidate_core_paths,
 )
 from memory_store import DurableMemoryStore
@@ -4239,11 +4240,14 @@ class OperatorReadinessCertifier:
                         dir=staging_root,
                     ) as temporary:
                         restore_root = Path(temporary) / "isolated-restore"
-                        with manager.guarded_recovery_transaction(
-                            restore_root,
-                            purpose="operator-readiness",
-                            pinned=True,
-                        ) as publication:
+                        with (
+                            core_backup_inspection_timeout_policy(),
+                            manager.guarded_recovery_transaction(
+                                restore_root,
+                                purpose="operator-readiness",
+                                pinned=True,
+                            ) as publication,
+                        ):
 
                             def publish(guarded_evidence: dict[str, Any]) -> None:
                                 nonlocal callback_started

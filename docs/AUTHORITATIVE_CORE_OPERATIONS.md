@@ -425,6 +425,16 @@ changing permissions on an existing caller-owned directory.
    tag, and marker together. This keeps historical certification traces from
    crowding or accidentally satisfying the proof without weakening the normal
    production ranker.
+   The entire guarded recovery transaction also runs under the installer's
+   canonical 600-second backup-inspection policy. Ambient shell values cannot
+   shorten or enlarge that reviewed bound, and the prior environment is
+   restored after the transaction unwinds. On Dans-MBP, SQLite recorded the
+   certifier inspection as `interrupted` about 121 seconds after the publication
+   journal completed while this environment value was absent, directly matching
+   the prior 120-second default; the four downstream recovery-proof skips were
+   then mechanical consequences. That exact certifier failure is time-causally
+   attributable to the policy mismatch, but it is not evidence that the earlier
+   candidate's generic cutover-attestation rejection had the same sole cause.
    Those transient Phase-A processes do not authorize reopening an external
    persistent wrapper. Treat the returned manifest as immediately perishable
    and proceed directly to the next two commands.

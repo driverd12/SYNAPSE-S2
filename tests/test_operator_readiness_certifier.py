@@ -24,6 +24,7 @@ from core_service import CoreConfig, write_core_config
 from capture_daemon import CaptureInboxDaemon
 from memory_store import DurableMemoryStore
 from recovery_manager import VerifiedRecoveryManager
+from scripts.core_agent_installer import CORE_BACKUP_INSPECTION_TIMEOUT_ENV
 from scripts import core_cutover_preflight as preflight
 
 from scripts.operator_readiness_certify import (
@@ -2695,6 +2696,141 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             self.assertEqual(result["overall_status"], "blocked")
             with CoreAuthorityLease.acquire_local(core_paths.memory_db):
                 pass
+
+    def test_guarded_recovery_pins_and_restores_backup_inspection_timeout(self):
+        for ambient in (None, "nan"):
+            with self.subTest(ambient=ambient), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                certifier, _, core_paths = self._bound_certifier(root)
+                certifier.pack_dir.mkdir(parents=True, mode=0o700)
+                certifier.artifact_dir.mkdir(mode=0o700)
+                certifier.results = [
+                    CheckResult(
+                        check_id="capture_inbox",
+                        label="Capture inbox",
+                        status="ready",
+                        required=True,
+                        detail="Phase A was clean.",
+                    )
+                ]
+                observations: list[tuple[str, str | None]] = []
+
+                class Publication:
+                    def publish(self, callback):
+                        observations.append(
+                            (
+                                "publish",
+                                os.environ.get(
+                                    CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+                                ),
+                            )
+                        )
+                        return callback(
+                            {"capture_transport_at_publication": {}}
+                        )
+
+                class Transaction:
+                    def __enter__(self):
+                        observations.append(
+                            (
+                                "enter",
+                                os.environ.get(
+                                    CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+                                ),
+                            )
+                        )
+                        return Publication()
+
+                    def __exit__(self, _exc_type, _exc, _traceback):
+                        observations.append(
+                            (
+                                "exit",
+                                os.environ.get(
+                                    CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+                                ),
+                            )
+                        )
+                        return False
+
+                manager = mock.Mock()
+
+                def guarded_transaction(*_args, **_kwargs):
+                    observations.append(
+                        (
+                            "create",
+                            os.environ.get(
+                                CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+                            ),
+                        )
+                    )
+                    return Transaction()
+
+                manager.guarded_recovery_transaction.side_effect = (
+                    guarded_transaction
+                )
+                store = mock.Mock()
+                inventory = {
+                    "inventory_available": True,
+                    "process_findings": [],
+                    "process_findings_truncated": False,
+                    "loaded_categories": [],
+                    "launch_agents": {},
+                }
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    if ambient is None:
+                        os.environ.pop(
+                            CORE_BACKUP_INSPECTION_TIMEOUT_ENV,
+                            None,
+                        )
+                    else:
+                        os.environ[
+                            CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+                        ] = ambient
+                    with (
+                        mock.patch(
+                            "scripts.operator_readiness_certify.DurableMemoryStore.open_existing_for_core_maintenance",
+                            return_value=store,
+                        ),
+                        mock.patch(
+                            "scripts.operator_readiness_certify.VerifiedRecoveryManager",
+                            return_value=manager,
+                        ),
+                        mock.patch.object(
+                            certifier,
+                            "_collect_quiescence_inventory",
+                            return_value=(True, inventory),
+                        ),
+                        mock.patch.object(
+                            certifier,
+                            "_record_guarded_recovery_evidence",
+                        ),
+                        mock.patch.object(
+                            certifier,
+                            "_finalize",
+                            return_value={"overall_status": "unit-test"},
+                        ),
+                    ):
+                        certifier._guarded_recovery_and_finalize()
+
+                    self.assertEqual(
+                        os.environ.get(
+                            CORE_BACKUP_INSPECTION_TIMEOUT_ENV
+                        ),
+                        ambient,
+                    )
+
+                self.assertEqual(
+                    observations,
+                    [
+                        ("create", "600"),
+                        ("enter", "600"),
+                        ("publish", "600"),
+                        ("exit", "600"),
+                    ],
+                )
+                store.close.assert_called_once_with()
+                with CoreAuthorityLease.acquire_local(core_paths.memory_db):
+                    pass
 
     def test_finalize_failure_releases_authority_and_guard_context(self):
         with TemporaryDirectory() as tmp:
