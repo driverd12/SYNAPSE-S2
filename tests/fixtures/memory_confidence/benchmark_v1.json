@@ -1,0 +1,171 @@
+{
+  "schema": "synapse-s2.memory-confidence-fixture.v1",
+  "version": 1,
+  "fixed_epoch": 1786600000.0,
+  "backend": {
+    "dimension": 32,
+    "num_neurons": 24,
+    "default_top_k": 6,
+    "recall_count": 12,
+    "embedding_provider": "semantic-hash"
+  },
+  "thresholds": {
+    "minimum_dimension_pass_rate": 1.0,
+    "maximum_namespace_leakage_count": 0,
+    "maximum_logical_deletion_residue_count": 0,
+    "maximum_media_residue_count": 0
+  },
+  "required_dimensions": [
+    "static_state",
+    "dynamic_tracking",
+    "workflow_knowledge",
+    "environment_gotcha",
+    "premise_awareness",
+    "factual_recall",
+    "updates_supersession",
+    "temporal_order",
+    "abstention",
+    "bridge_isolation",
+    "image_description_recall",
+    "deletion_residue"
+  ],
+  "documents": [
+    {
+      "document_id": "fact-access-window",
+      "context_id": "operations",
+      "tag": "ironbird-access-window",
+      "label": "IronBird access window",
+      "text": "IronBird access window IB-ACCESS-0630 begins at 06:30 Mountain time.",
+      "memory_type": "text"
+    },
+    {
+      "document_id": "static-console-mode",
+      "context_id": "operations",
+      "tag": "console-static-mode",
+      "label": "Console static mode",
+      "text": "The current static console state STATIC-CONSOLE-214 is local-only maintenance mode.",
+      "memory_type": "app_event"
+    },
+    {
+      "document_id": "workflow-recovery",
+      "context_id": "operations",
+      "tag": "recovery-workflow",
+      "label": "Recovery workflow",
+      "text": "Workflow RUNBOOK-RECOVER-317 requires verify authority, check one listener, run readiness, then launch the dashboard.",
+      "memory_type": "file"
+    },
+    {
+      "document_id": "gotcha-loopback-auth",
+      "context_id": "operations",
+      "tag": "loopback-auth-gotcha",
+      "label": "Loopback authentication gotcha",
+      "text": "Environment gotcha GOTCHA-BOOKMARK-418: a bookmarked loopback dashboard cannot authorize a new tab; use the secure launcher.",
+      "memory_type": "text"
+    },
+    {
+      "document_id": "timeline-preflight",
+      "context_id": "operations",
+      "tag": "timeline-preflight",
+      "label": "Timeline preflight",
+      "text": "Temporal checkpoint TIME-PREFLIGHT-204 completed before system verification.",
+      "memory_type": "temporal_event"
+    },
+    {
+      "document_id": "timeline-verification",
+      "context_id": "operations",
+      "tag": "timeline-verification",
+      "label": "Timeline verification",
+      "text": "Temporal checkpoint TIME-VERIFY-205 completed after preflight.",
+      "memory_type": "temporal_event"
+    },
+    {
+      "document_id": "bridge-approved",
+      "context_id": "project-citadel",
+      "tag": "citadel-approved-fact",
+      "label": "Approved Citadel evidence",
+      "text": "Approved project Citadel bridge evidence CITADEL-LINK-9902 is available.",
+      "memory_type": "text"
+    },
+    {
+      "document_id": "bridge-isolated",
+      "context_id": "finance-isolated",
+      "tag": "citadel-isolated-decoy",
+      "label": "Isolated decoy evidence",
+      "text": "Private finance decoy CITADEL-LINK-9902 must remain outside connected recall.",
+      "memory_type": "text"
+    },
+    {
+      "document_id": "local-distractor",
+      "context_id": "operations",
+      "tag": "operator-handbook",
+      "label": "Operator handbook",
+      "text": "The operator handbook covers staffing, maintenance, routing, and ordinary handoff procedures.",
+      "memory_type": "file"
+    }
+  ],
+  "update_case": {
+    "context_id": "operations",
+    "tag": "primary-uplink",
+    "label": "Primary uplink assignment",
+    "initial_text": "Primary uplink assignment was retired route ORCHID-OLD-447.",
+    "current_text": "Primary uplink assignment is current route COBALT-CURRENT-882.",
+    "retired_marker": "ORCHID-OLD-447",
+    "current_marker": "COBALT-CURRENT-882"
+  },
+  "temporal_case": {
+    "context_id": "operations",
+    "before_document_id": "timeline-preflight",
+    "after_document_id": "timeline-verification",
+    "relation_type": "temporal_next",
+    "prompt": "TIME-PREFLIGHT-204 TIME-VERIFY-205"
+  },
+  "bridge_case": {
+    "source_context_id": "operations",
+    "target_context_id": "project-citadel",
+    "isolated_context_id": "finance-isolated",
+    "relation_type": "approved-operational-overlap",
+    "approved_document_id": "bridge-approved",
+    "isolated_document_id": "bridge-isolated",
+    "prompt": "CITADEL-LINK-9902"
+  },
+  "image_case": {
+    "context_id": "operations",
+    "tag": "image-orange-airframe",
+    "label": "Orange airframe on snowy taxiway",
+    "description": "Image evidence IMG-ORANGE-731 shows an orange airframe parked on a snowy taxiway beside a blue hangar.",
+    "prompt": "IMG-ORANGE-731 orange airframe snowy taxiway blue hangar",
+    "media_id": "s2img_11111111111111111111111111111111"
+  },
+  "queries": {
+    "static_state": {
+      "context_id": "operations",
+      "prompt": "STATIC-CONSOLE-214 current console state",
+      "expected_document_id": "static-console-mode"
+    },
+    "factual": {
+      "context_id": "operations",
+      "prompt": "IB-ACCESS-0630 IronBird access window",
+      "expected_document_id": "fact-access-window"
+    },
+    "workflow": {
+      "context_id": "operations",
+      "prompt": "RUNBOOK-RECOVER-317 recovery workflow",
+      "expected_document_id": "workflow-recovery"
+    },
+    "gotcha": {
+      "context_id": "operations",
+      "prompt": "GOTCHA-BOOKMARK-418 loopback dashboard",
+      "expected_document_id": "gotcha-loopback-auth"
+    },
+    "premise_awareness": {
+      "context_id": "operations",
+      "prompt": "PREMISE-WIFI-999 approved wireless route",
+      "required_marker": "PREMISE-WIFI-999"
+    },
+    "abstention": {
+      "context_id": "operations",
+      "prompt": "NEVER-SEEN-PREMISE-1907",
+      "required_marker": "NEVER-SEEN-PREMISE-1907"
+    }
+  }
+}

@@ -1155,6 +1155,24 @@
                     <label for="imageCaptureDescription">Searchable description</label>
                     <textarea id="imageCaptureDescription" rows="3" maxlength="4096" placeholder="What matters in this image, where it came from, and what future recall should find"></textarea>
                   </div>
+                  <div class="field-grid image-vision-controls">
+                    <label for="imageVisionMode">Apple Vision enrichment</label>
+                    <select id="imageVisionMode">
+                      <option value="off" selected>Off (baseline)</option>
+                      <option value="feature-print">Feature print</option>
+                      <option value="ocr">OCR</option>
+                      <option value="all">Feature print + OCR</option>
+                    </select>
+                    <small>Optional, on-device, and short-lived. Feature vectors stay in the private node-local cache.</small>
+                  </div>
+                  <label class="image-vision-check">
+                    <input id="imageVisionRequired" type="checkbox" />
+                    Fail capture if requested enrichment is unavailable
+                  </label>
+                  <label id="imageVisionOcrConsentRow" class="image-vision-check" hidden>
+                    <input id="imageVisionOcrConsent" type="checkbox" />
+                    Store redacted OCR text as a searchable recall cue
+                  </label>
                 </div>
                 <div class="image-capture-actions">
                   <img id="imageCapturePreview" alt="Selected low-resolution image preview" hidden />

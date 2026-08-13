@@ -33,6 +33,11 @@ from embedding_providers import (
     resolve_embedding_provider_config,
 )
 from event_segmenter import BayesianSurpriseEventSegmenter
+from harmonic_memory import (
+    HARMONIC_SCAFFOLD_SCHEMA,
+    build_harmonic_scaffold,
+    harmonic_scaffold_facets,
+)
 from bridge_governance import (
     BridgeGovernance,
     BridgeGovernanceInvalidTransition,
@@ -8147,31 +8152,106 @@ class SpikingAttentionBackend:
                 ),
                 "raw_text_stored": False,
             }
+        clean_tag = sanitize_tag(tag)
+        memory_id = self.memory_store.stable_memory_id(
+            context_id=context_id,
+            tag=clean_tag,
+        )
         payload = self.embed_text_payload(redacted_text)
         base_metadata = {
             **safe_metadata,
             "embedding_provider": payload["provenance"],
         }
+        surface_details = self._surface_node_details(
+            tag=tag,
+            text=redacted_text,
+            metadata=base_metadata,
+        )
+        scaffold: dict[str, Any] | None = None
+        if (
+            bool(base_metadata.get("event_segment"))
+            and base_metadata.get("harmonic_scaffold_enabled") is not False
+        ):
+            scaffold_metadata = {**base_metadata, **surface_details}
+            source_facets = (
+                list(base_metadata.get("semantic_facets") or [])
+                if isinstance(base_metadata.get("semantic_facets"), (list, tuple))
+                else []
+            )
+            surface_facets = (
+                list(surface_details.get("semantic_facets") or [])
+                if isinstance(surface_details.get("semantic_facets"), (list, tuple))
+                else []
+            )
+            scaffold_metadata["semantic_facets"] = [
+                *source_facets,
+                *surface_facets,
+            ][:32]
+            scaffold = build_harmonic_scaffold(
+                source_text=redacted_text,
+                context_id=context_id,
+                source_memory_id=memory_id,
+                source_tag=clean_tag,
+                metadata=scaffold_metadata,
+            )
+        caller_facets = (
+            list(base_metadata.get("semantic_facets") or [])
+            if isinstance(base_metadata.get("semantic_facets"), (list, tuple))
+            else []
+        )
+        generated_facets = (
+            harmonic_scaffold_facets(
+                {"harmonic_scaffold": scaffold},
+                limit=16,
+            )
+            if scaffold is not None
+            else []
+        )
+        generated_facets.extend(
+            list(surface_details.get("semantic_facets") or [])
+            if isinstance(surface_details.get("semantic_facets"), (list, tuple))
+            else []
+        )
+        merged_facets: list[str] = []
+        seen_facets: set[str] = set()
+        generated_facet_budget = 24
+        generated_facets_added = 0
+        facet_candidates = [
+            (value, False) for value in caller_facets
+        ] + [
+            (value, True) for value in generated_facets
+        ]
+        for raw_facet, is_generated in facet_candidates:
+            facet = self._clean_context_label(str(raw_facet or ""))
+            identity = facet.casefold()
+            if not facet or identity in seen_facets:
+                continue
+            if is_generated and generated_facets_added >= generated_facet_budget:
+                continue
+            seen_facets.add(identity)
+            merged_facets.append(facet)
+            if is_generated:
+                generated_facets_added += 1
         merged_metadata = self._json_safe_metadata(
             {
                 **base_metadata,
-                **self._surface_node_details(
-                    tag=tag,
-                    text=redacted_text,
-                    metadata=base_metadata,
+                **surface_details,
+                "semantic_facets": merged_facets,
+                **(
+                    {
+                        "harmonic_scaffold": scaffold,
+                        "harmonic_scaffold_schema": HARMONIC_SCAFFOLD_SCHEMA,
+                    }
+                    if scaffold is not None
+                    else {}
                 ),
             }
         )
-        clean_tag = sanitize_tag(tag)
         embedding = self._coerce_embedding(payload["embedding"])
         self._ensure_projection_shape(int(embedding.shape[0]))
         sensory_spikes = self.encode_to_spikes_top_k(embedding)
         spike_indices = self._active_indices_from_spikes(sensory_spikes)
         neuron_indices = self._project_sensory_indices(spike_indices)
-        memory_id = self.memory_store.stable_memory_id(
-            context_id=context_id,
-            tag=clean_tag,
-        )
         return {
             "memory_id": memory_id,
             "tag": clean_tag,
@@ -8575,6 +8655,29 @@ class SpikingAttentionBackend:
             "relationships": namespace_relationships,
             "automated": True,
         }
+        scaffolded_events = []
+        for event in event_records:
+            planned_entry = entries_by_id.get(str(event.get("memory_id") or ""), {})
+            planned_metadata = planned_entry.get("metadata")
+            planned_metadata = (
+                planned_metadata if isinstance(planned_metadata, dict) else {}
+            )
+            scaffold = planned_metadata.get("harmonic_scaffold")
+            if isinstance(scaffold, dict):
+                scaffolded_events.append(scaffold)
+        harmonic_scaffolding = {
+            "schema": HARMONIC_SCAFFOLD_SCHEMA,
+            "source_event_count": len(event_records),
+            "scaffolded_event_count": len(scaffolded_events),
+            "cue_anchor_count": sum(
+                len(scaffold.get("cue_anchors") or [])
+                for scaffold in scaffolded_events
+                if isinstance(scaffold.get("cue_anchors"), list)
+            ),
+            "generation_mode": "deterministic-not-learned",
+            "source_backed": True,
+            "max_expansion_hops": 0,
+        }
         result = {
             "context_id": context_id,
             "source_tag": source_tag,
@@ -8588,6 +8691,7 @@ class SpikingAttentionBackend:
             "action": "capture-conversation",
             "speaker": speaker,
             "context_namespace": context_namespace,
+            "harmonic_scaffolding": harmonic_scaffolding,
         }
         deployment = {
             "context_id": context_id,
@@ -8603,6 +8707,7 @@ class SpikingAttentionBackend:
                 "event_count": len(event_records),
                 "relationship_count": len(relationship_results),
                 "context_namespace": context_namespace,
+                "harmonic_scaffolding": harmonic_scaffolding,
                 "events": event_records,
                 "relationships": relationship_results,
             },
@@ -10776,14 +10881,30 @@ class SpikingAttentionBackend:
 
     def _surface_facets_for_entry(self, entry: dict[str, Any]) -> list[str]:
         metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        scaffold_facets = harmonic_scaffold_facets(metadata, limit=16)
         facets = metadata.get("semantic_facets")
         if isinstance(facets, (list, tuple)):
-            return [str(facet) for facet in facets[:8] if str(facet).strip()]
-        return self._surface_facets(
-            label=self._surface_label_for_entry(entry),
-            text=str(entry.get("source_text") or ""),
-            metadata=metadata,
-        )
+            stored_facets = [
+                str(facet) for facet in facets[:24] if str(facet).strip()
+            ]
+        else:
+            stored_facets = self._surface_facets(
+                label=self._surface_label_for_entry(entry),
+                text=str(entry.get("source_text") or ""),
+                metadata=metadata,
+            )
+        combined: list[str] = []
+        seen: set[str] = set()
+        for raw_facet in [*scaffold_facets, *stored_facets]:
+            facet = self._clean_context_label(str(raw_facet or ""))
+            identity = facet.casefold()
+            if not facet or identity in seen:
+                continue
+            seen.add(identity)
+            combined.append(facet)
+            if len(combined) >= 24:
+                break
+        return combined
 
     def _summarize_relationship_modes(
         self,

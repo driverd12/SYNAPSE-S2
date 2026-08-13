@@ -36,6 +36,10 @@ from core_client_binding import CoreClientBinding, apply_binding_environment
 # routing state during import.
 BOUND_CORE_BINDING = apply_binding_environment()
 
+from apple_vision_enrichment import (  # noqa: E402
+    ocr_cue_text,
+    validate_vision_mode,
+)
 from capture_daemon import CaptureInboxDaemon  # noqa: E402
 from core_client import (  # noqa: E402
     CoreClient,
@@ -3268,6 +3272,26 @@ class DashboardRuntime:
         context = self._context_from_payload(payload)
         label = self._text_payload(payload, "display_label", max_bytes=512)
         description = self._text_payload(payload, "description", max_bytes=4_096)
+        try:
+            vision_mode = validate_vision_mode(payload.get("vision_enrichment", "off"))
+        except ValueError as exc:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        vision_required = payload.get("require_vision_enrichment", False)
+        if type(vision_required) is not bool:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "require_vision_enrichment must be a boolean",
+            )
+        if vision_required and vision_mode == "off":
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "required Vision enrichment must select a mode",
+            )
+        if vision_mode in {"ocr", "all"} and payload.get("confirm_vision_ocr") is not True:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "confirm_vision_ocr must be true because recognized text is stored and indexed",
+            )
         capture_id = self._capture_id_payload(payload) or f"s2cap_{uuid.uuid4().hex}"
         if re.fullmatch(r"s2cap_[0-9a-f]{32}", capture_id) is None:
             raise DashboardError(
@@ -3296,10 +3320,16 @@ class DashboardRuntime:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-            cached = self.image_cache().capture_image(
-                temporary_path,
-                media_id=media_id,
-            )
+            cache_arguments: dict[str, Any] = {"media_id": media_id}
+            if vision_mode != "off":
+                cache_arguments.update(
+                    {
+                        "vision_mode": vision_mode,
+                        "vision_required": vision_required,
+                        "vision_input_derivative": "thumbnail-transient-downsampled",
+                    }
+                )
+            cached = self.image_cache().capture_image(temporary_path, **cache_arguments)
         finally:
             if temporary_path is not None:
                 try:
@@ -3307,6 +3337,16 @@ class DashboardRuntime:
                 except FileNotFoundError:
                     pass
         public_metadata = dict(cached["public_metadata"])
+        vision_ocr_cue = ocr_cue_text(public_metadata.get("vision_enrichment"))
+        vision_receipt = dict(
+            cached.get("vision_enrichment")
+            or {
+                "provider": "apple-vision",
+                "requested_mode": vision_mode,
+                "status": "disabled" if vision_mode == "off" else "not-present",
+                "persisted": False,
+            }
+        )
         public_metadata.update(
             {
                 "display_label": label,
@@ -3315,10 +3355,14 @@ class DashboardRuntime:
                 "source_surface": "dashboard",
                 "raw_original_stored": False,
                 "thumbnail_cache_authoritative": False,
+                "vision_ocr_indexed": bool(vision_ocr_cue),
             }
         )
+        capture_text = description
+        if vision_ocr_cue:
+            capture_text = f"{description}\nImage OCR cues:\n{vision_ocr_cue}"
         capture = self.backend.capture_conversation(
-            text=description,
+            text=capture_text,
             context_id=context,
             source_tag=mlx_backend.sanitize_tag(f"image-{label}").replace(" ", "-"),
             speaker="dashboard-operator",
@@ -3348,6 +3392,8 @@ class DashboardRuntime:
                 "descriptor_schema": public_metadata["visual_descriptor"]["schema"],
                 "cache_ready": bool(cached["cache_ready"]),
                 "cache_idempotent_replay": bool(cached.get("idempotent_replay")),
+                "vision_enrichment": vision_receipt,
+                "vision_ocr_indexed": bool(vision_ocr_cue),
             },
             "raw_original_stored": False,
             "thumbnail_cache_authoritative": False,

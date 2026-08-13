@@ -3719,6 +3719,32 @@ textarea {
   gap: 10px;
 }
 
+.image-vision-controls {
+  grid-column: 1 / -1;
+}
+
+.image-vision-controls small,
+.image-vision-check {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.image-vision-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.image-vision-check[hidden] {
+  display: none;
+}
+
+.image-vision-check input {
+  width: auto;
+  margin: 0;
+}
+
 .image-capture-description textarea {
   min-height: 70px;
 }

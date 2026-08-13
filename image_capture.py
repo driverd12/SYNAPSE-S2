@@ -18,10 +18,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from apple_vision_enrichment import (
+    AppleVisionEnricher,
+    AppleVisionError,
+    AppleVisionUnavailable,
+    VisionEnricher,
+    optional_enrichment_status,
+    privatize_vision_enrichment,
+    validate_input_derivative,
+    validate_optional_enrichment_status,
+    validate_public_vision_enrichment,
+    validate_vision_enrichment,
+    validate_vision_mode,
+)
 from core_client_binding import CoreClientBinding, validate_core_client_binding
 
 
 IMAGE_ARTIFACT_SCHEMA = "synapse-s2.image-artifact.v1"
+IMAGE_ARTIFACT_ENRICHED_SCHEMA = "synapse-s2.image-artifact.v2"
+IMAGE_ARTIFACT_SCHEMAS = frozenset(
+    {IMAGE_ARTIFACT_SCHEMA, IMAGE_ARTIFACT_ENRICHED_SCHEMA}
+)
 VISUAL_DESCRIPTOR_SCHEMA = "synapse-s2.visual-descriptor.rgb16-v1"
 MEDIA_ID_RE = re.compile(r"^s2img_[0-9a-f]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -29,13 +46,14 @@ MAX_SOURCE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 100_000_000
 MAX_THUMBNAIL_EDGE = 320
 MAX_THUMBNAIL_BYTES = 512 * 1024
+MAX_FEATURE_PRINT_BYTES = 64 * 1024
 MAX_OBJECTS = 10_000
 SIPS_TIMEOUT_SECONDS = 20.0
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _JPEG_MAGIC = b"\xff\xd8\xff"
 _HEIC_BRANDS = frozenset({b"heic", b"heix", b"hevc", b"hevx"})
-_PUBLIC_METADATA_FIELDS = frozenset(
+_BASE_PUBLIC_METADATA_FIELDS = frozenset(
     {
         "schema",
         "context_memory_type",
@@ -46,7 +64,10 @@ _PUBLIC_METADATA_FIELDS = frozenset(
         "visual_descriptor",
     }
 )
-_MANIFEST_FIELDS = frozenset(
+_ENRICHED_PUBLIC_METADATA_FIELDS = _BASE_PUBLIC_METADATA_FIELDS | {
+    "vision_enrichment"
+}
+_BASE_MANIFEST_FIELDS = frozenset(
     {
         "schema",
         "media_id",
@@ -59,6 +80,14 @@ _MANIFEST_FIELDS = frozenset(
         "public_metadata",
     }
 )
+_ENRICHED_MANIFEST_FIELDS = _BASE_MANIFEST_FIELDS | {
+    "feature_print_sha256",
+    "feature_print_size_bytes",
+}
+_OPTIONAL_VISION_MANIFEST_FIELDS = _BASE_MANIFEST_FIELDS | {
+    "requested_vision_mode",
+    "optional_vision_receipt",
+}
 
 
 class ImageCaptureError(RuntimeError):
@@ -562,14 +591,23 @@ def _decode_exact_base64(value: Any, *, expected_bytes: int) -> bytes:
 
 
 def _validate_public_metadata(value: Any, *, media_id: str | None = None) -> dict[str, Any]:
-    if not isinstance(value, dict) or frozenset(value) != _PUBLIC_METADATA_FIELDS:
+    if not isinstance(value, dict):
+        raise ImageCaptureError("image public metadata contract is invalid")
+    schema = value.get("schema")
+    expected_fields = (
+        _BASE_PUBLIC_METADATA_FIELDS
+        if schema == IMAGE_ARTIFACT_SCHEMA
+        else _ENRICHED_PUBLIC_METADATA_FIELDS
+        if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA
+        else frozenset()
+    )
+    if not expected_fields or frozenset(value) != expected_fields:
         raise ImageCaptureError("image public metadata contract is invalid")
     canonical_media_id = validate_media_id(value.get("media_id"))
     if media_id is not None and canonical_media_id != media_id:
         raise ImageCaptureError("image public metadata identity changed")
     if (
-        value.get("schema") != IMAGE_ARTIFACT_SCHEMA
-        or value.get("context_memory_type") != "image"
+        value.get("context_memory_type") != "image"
         or value.get("mime_type") not in {"image/png", "image/jpeg", "image/heic"}
     ):
         raise ImageCaptureError("image public metadata contract is invalid")
@@ -622,6 +660,11 @@ def _validate_public_metadata(value: Any, *, media_id: str | None = None) -> dic
     _decode_exact_base64(descriptor.get("tensor_data"), expected_bytes=16 * 16 * 3)
     _decode_exact_base64(descriptor.get("rgb_histogram_data"), expected_bytes=3 * 16)
     _decode_exact_base64(descriptor.get("edge_histogram_data"), expected_bytes=8)
+    if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA:
+        try:
+            validate_public_vision_enrichment(value.get("vision_enrichment"))
+        except (AppleVisionError, ValueError) as exc:
+            raise ImageCaptureError("image Vision enrichment contract is invalid") from exc
     return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
 
 
@@ -638,6 +681,7 @@ class ImageCaptureCache:
         binding: CoreClientBinding,
         *,
         converter: Converter | None = None,
+        vision_enricher: VisionEnricher | None = None,
     ) -> None:
         try:
             canonical = validate_core_client_binding(binding.to_wire())
@@ -648,6 +692,7 @@ class ImageCaptureCache:
         self.objects_root = self.root / "objects"
         self.lock_path = self.root / ".media-cache.lock"
         self.converter = converter or _sips_converter
+        self.vision_enricher = vision_enricher
 
     def _validate_data_root(self) -> None:
         try:
@@ -713,13 +758,63 @@ class ImageCaptureCache:
         manifest: dict[str, Any],
         thumbnail: bytes,
         idempotent_replay: bool,
+        requested_vision_mode: str = "off",
+        optional_vision_receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         media_id = validate_media_id(manifest.get("media_id"))
         public_metadata = _validate_public_metadata(
             manifest.get("public_metadata"),
             media_id=media_id,
         )
-        return {
+        enrichment = public_metadata.get("vision_enrichment")
+        stored_optional_receipt = manifest.get("optional_vision_receipt")
+        if stored_optional_receipt is not None:
+            try:
+                optional_vision_receipt = validate_optional_enrichment_status(
+                    stored_optional_receipt
+                )
+            except (AppleVisionError, ValueError) as exc:
+                raise ImageCaptureError(
+                    "image optional Vision receipt is invalid"
+                ) from exc
+        if isinstance(enrichment, dict):
+            feature = enrichment.get("feature_print")
+            ocr = enrichment.get("ocr")
+            vision_receipt = {
+                "provider": "apple-vision",
+                "requested_mode": requested_vision_mode,
+                "stored_mode": str(enrichment.get("mode") or ""),
+                "status": str(enrichment.get("status") or "failed"),
+                "persisted": True,
+                "input_derivative": str(enrichment.get("input_derivative") or ""),
+                "feature_print_ready": bool(
+                    isinstance(feature, dict) and feature.get("status") == "ready"
+                ),
+                "ocr_ready": bool(isinstance(ocr, dict) and ocr.get("status") == "ready"),
+                "ocr_redaction_count": int(
+                    ocr.get("redaction_count") or 0
+                    if isinstance(ocr, dict)
+                    else 0
+                ),
+            }
+        elif optional_vision_receipt is not None:
+            vision_receipt = dict(optional_vision_receipt)
+        elif requested_vision_mode == "off":
+            vision_receipt = {
+                "provider": "apple-vision",
+                "requested_mode": "off",
+                "status": "disabled",
+                "persisted": False,
+            }
+        else:
+            vision_receipt = {
+                "provider": "apple-vision",
+                "requested_mode": requested_vision_mode,
+                "status": "not-present",
+                "failure_code": "idempotent-existing-not-enriched",
+                "persisted": False,
+            }
+        projection = {
             "action": "capture-image-cache",
             "media_id": media_id,
             "cache_ready": True,
@@ -730,15 +825,50 @@ class ImageCaptureCache:
             "source_path_stored": False,
             "public_digest_stored": False,
         }
+        if requested_vision_mode != "off" or isinstance(enrichment, dict):
+            projection["vision_enrichment"] = vision_receipt
+        return projection
+
+    def _vision_enrich(
+        self,
+        source: Path,
+        *,
+        mode: str,
+        input_derivative: str,
+    ) -> dict[str, Any]:
+        enricher = self.vision_enricher
+        if enricher is None:
+            return AppleVisionEnricher(self.binding).enrich(
+                source,
+                mode,
+                input_derivative,
+            )
+        return validate_vision_enrichment(
+            enricher(source, mode, input_derivative),
+            requested_mode=mode,
+        )
 
     def capture_image(
         self,
         source_path: str | os.PathLike[str],
         *,
         media_id: str | None = None,
+        vision_mode: str = "off",
+        vision_required: bool = False,
+        vision_input_derivative: str = "source-transient-downsampled",
     ) -> dict[str, Any]:
         source = _normal_source_path(source_path)
         canonical_media_id = validate_media_id(media_id) if media_id is not None else new_media_id()
+        canonical_vision_mode = validate_vision_mode(vision_mode)
+        if type(vision_required) is not bool:
+            raise ValueError("vision_required must be a boolean")
+        if vision_required and canonical_vision_mode == "off":
+            raise ValueError("vision_required needs an enabled Vision enrichment mode")
+        canonical_input_derivative = (
+            validate_input_derivative(vision_input_derivative)
+            if canonical_vision_mode != "off"
+            else "source-transient-downsampled"
+        )
         self._prepare_cache()
         with _open_source(source) as (source_fd, source_stat):
             source_sha256, prefix = _hash_source(source_fd, int(source_stat.st_size))
@@ -756,10 +886,32 @@ class ImageCaptureCache:
                     raise ValueError(
                         "media_id is already present for a different image derivative"
                     )
+                existing_enrichment = existing_manifest.get("public_metadata", {}).get(
+                    "vision_enrichment"
+                )
+                existing_vision_mode = (
+                    str(existing_enrichment.get("mode") or "")
+                    if isinstance(existing_enrichment, dict)
+                    else str(existing_manifest.get("requested_vision_mode") or "off")
+                )
+                if existing_vision_mode != canonical_vision_mode:
+                    raise ImageCaptureError(
+                        "existing image derivative uses a different Vision "
+                        "enrichment mode"
+                    )
+                if vision_required and (
+                    not isinstance(existing_enrichment, dict)
+                    or existing_enrichment.get("mode") != canonical_vision_mode
+                    or existing_enrichment.get("status") != "ready"
+                ):
+                    raise ImageCaptureError(
+                        "existing image derivative does not satisfy required Vision enrichment"
+                    )
                 return self._capture_projection(
                     manifest=existing_manifest,
                     thumbnail=existing_thumbnail,
                     idempotent_replay=True,
+                    requested_vision_mode=canonical_vision_mode,
                 )
             with tempfile.TemporaryDirectory(
                 prefix=".image-work-",
@@ -792,26 +944,78 @@ class ImageCaptureCache:
                 )
                 if not thumbnail_bytes.startswith(_JPEG_MAGIC):
                     raise ImageCaptureError("thumbnail conversion did not produce JPEG")
-                public_metadata = _validate_public_metadata(
-                    {
-                        "schema": IMAGE_ARTIFACT_SCHEMA,
-                        "context_memory_type": "image",
-                        "media_id": canonical_media_id,
-                        "mime_type": source_mime_type,
-                        "source_dimensions": {
-                            "width": conversion.source_width,
-                            "height": conversion.source_height,
-                        },
-                        "thumbnail_dimensions": {
-                            "width": thumbnail_width,
-                            "height": thumbnail_height,
-                        },
-                        "visual_descriptor": descriptor,
+                vision_enrichment: dict[str, Any] | None = None
+                feature_print_bytes: bytes | None = None
+                optional_vision_receipt: dict[str, Any] | None = None
+                if canonical_vision_mode != "off":
+                    try:
+                        raw_vision_enrichment = self._vision_enrich(
+                            source,
+                            mode=canonical_vision_mode,
+                            input_derivative=canonical_input_derivative,
+                        )
+                        vision_enrichment, feature_print_bytes = (
+                            privatize_vision_enrichment(raw_vision_enrichment)
+                        )
+                    except AppleVisionUnavailable as exc:
+                        if vision_required:
+                            raise ImageCaptureError(
+                                "required Apple Vision enrichment is unavailable"
+                            ) from exc
+                        optional_vision_receipt = optional_enrichment_status(
+                            mode=canonical_vision_mode,
+                            input_derivative=canonical_input_derivative,
+                            status="unavailable",
+                            failure_code="helper-unavailable",
+                        )
+                    except (AppleVisionError, ValueError) as exc:
+                        if vision_required:
+                            raise ImageCaptureError(
+                                "required Apple Vision enrichment failed"
+                            ) from exc
+                        optional_vision_receipt = optional_enrichment_status(
+                            mode=canonical_vision_mode,
+                            input_derivative=canonical_input_derivative,
+                            status="failed",
+                            failure_code="enrichment-failed",
+                        )
+                    _assert_source_unchanged(source, source_stat)
+                    if (
+                        vision_required
+                        and isinstance(vision_enrichment, dict)
+                        and vision_enrichment.get("status") != "ready"
+                    ):
+                        raise ImageCaptureError(
+                            "required Apple Vision enrichment was incomplete"
+                        )
+                artifact_schema = (
+                    IMAGE_ARTIFACT_ENRICHED_SCHEMA
+                    if vision_enrichment is not None
+                    else IMAGE_ARTIFACT_SCHEMA
+                )
+                metadata_document: dict[str, Any] = {
+                    "schema": artifact_schema,
+                    "context_memory_type": "image",
+                    "media_id": canonical_media_id,
+                    "mime_type": source_mime_type,
+                    "source_dimensions": {
+                        "width": conversion.source_width,
+                        "height": conversion.source_height,
                     },
+                    "thumbnail_dimensions": {
+                        "width": thumbnail_width,
+                        "height": thumbnail_height,
+                    },
+                    "visual_descriptor": descriptor,
+                }
+                if vision_enrichment is not None:
+                    metadata_document["vision_enrichment"] = vision_enrichment
+                public_metadata = _validate_public_metadata(
+                    metadata_document,
                     media_id=canonical_media_id,
                 )
                 manifest = {
-                    "schema": IMAGE_ARTIFACT_SCHEMA,
+                    "schema": artifact_schema,
                     "media_id": canonical_media_id,
                     "source_mime_type": source_mime_type,
                     "source_size_bytes": int(source_stat.st_size),
@@ -821,11 +1025,24 @@ class ImageCaptureCache:
                     "created_at": time.time(),
                     "public_metadata": public_metadata,
                 }
+                if artifact_schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA:
+                    manifest["feature_print_sha256"] = (
+                        hashlib.sha256(feature_print_bytes).hexdigest()
+                        if feature_print_bytes is not None
+                        else ""
+                    )
+                    manifest["feature_print_size_bytes"] = len(feature_print_bytes or b"")
+                elif optional_vision_receipt is not None:
+                    manifest["requested_vision_mode"] = canonical_vision_mode
+                    manifest["optional_vision_receipt"] = dict(
+                        optional_vision_receipt
+                    )
                 try:
                     self._publish_object(
                         media_id=canonical_media_id,
                         thumbnail_bytes=thumbnail_bytes,
                         manifest=manifest,
+                        feature_print_bytes=feature_print_bytes,
                     )
                 except ValueError:
                     # A concurrent retry may have published the same deterministic
@@ -839,15 +1056,43 @@ class ImageCaptureCache:
                         source_sha256,
                     ):
                         raise
+                    existing_enrichment = existing_manifest.get(
+                        "public_metadata", {}
+                    ).get("vision_enrichment")
+                    existing_vision_mode = (
+                        str(existing_enrichment.get("mode") or "")
+                        if isinstance(existing_enrichment, dict)
+                        else str(
+                            existing_manifest.get("requested_vision_mode") or "off"
+                        )
+                    )
+                    if existing_vision_mode != canonical_vision_mode:
+                        raise ImageCaptureError(
+                            "concurrent image derivative uses a different Vision "
+                            "enrichment mode"
+                        )
+                    if vision_required and (
+                        not isinstance(existing_enrichment, dict)
+                        or existing_enrichment.get("mode") != canonical_vision_mode
+                        or existing_enrichment.get("status") != "ready"
+                    ):
+                        raise ImageCaptureError(
+                            "concurrent image derivative does not satisfy required "
+                            "Vision enrichment"
+                        )
                     return self._capture_projection(
                         manifest=existing_manifest,
                         thumbnail=existing_thumbnail,
                         idempotent_replay=True,
+                        requested_vision_mode=canonical_vision_mode,
+                        optional_vision_receipt=optional_vision_receipt,
                     )
         return self._capture_projection(
             manifest=manifest,
             thumbnail=thumbnail_bytes,
             idempotent_replay=False,
+            requested_vision_mode=canonical_vision_mode,
+            optional_vision_receipt=optional_vision_receipt,
         )
 
     @staticmethod
@@ -902,12 +1147,17 @@ class ImageCaptureCache:
         media_id: str,
         thumbnail_bytes: bytes,
         manifest: dict[str, Any],
+        feature_print_bytes: bytes | None = None,
     ) -> None:
         stage = Path(tempfile.mkdtemp(prefix=f".stage-{media_id}-", dir=str(self.root)))
         os.chmod(stage, 0o700)
         published = False
         try:
             _write_private_exclusive(stage / "thumbnail.jpg", thumbnail_bytes)
+            if feature_print_bytes is not None:
+                if not feature_print_bytes or len(feature_print_bytes) > MAX_FEATURE_PRINT_BYTES:
+                    raise ImageCaptureError("private feature print exceeds the safe bound")
+                _write_private_exclusive(stage / "feature-print.bin", feature_print_bytes)
             manifest_bytes = (
                 json.dumps(
                     manifest,
@@ -929,7 +1179,7 @@ class ImageCaptureCache:
                 published = True
         finally:
             if not published and stage.exists() and not stage.is_symlink():
-                for filename in ("thumbnail.jpg", "manifest.json"):
+                for filename in ("thumbnail.jpg", "feature-print.bin", "manifest.json"):
                     try:
                         (stage / filename).unlink()
                     except FileNotFoundError:
@@ -959,7 +1209,10 @@ class ImageCaptureCache:
                 pass
             raise
         names = sorted(path.name for path in object_root.iterdir())
-        if names != ["manifest.json", "thumbnail.jpg"]:
+        if names not in (
+            ["manifest.json", "thumbnail.jpg"],
+            ["feature-print.bin", "manifest.json", "thumbnail.jpg"],
+        ):
             raise ImageCaptureError("image cache object inventory is invalid")
         manifest_bytes = _read_private_regular(
             object_root / "manifest.json",
@@ -973,7 +1226,20 @@ class ImageCaptureCache:
             object_root / "thumbnail.jpg",
             maximum_bytes=MAX_THUMBNAIL_BYTES,
         )
-        self._validate_manifest(manifest, media_id=canonical_media_id, thumbnail=thumbnail)
+        feature_print = (
+            _read_private_regular(
+                object_root / "feature-print.bin",
+                maximum_bytes=MAX_FEATURE_PRINT_BYTES,
+            )
+            if "feature-print.bin" in names
+            else None
+        )
+        self._validate_manifest(
+            manifest,
+            media_id=canonical_media_id,
+            thumbnail=thumbnail,
+            feature_print=feature_print,
+        )
         return manifest, thumbnail
 
     @staticmethod
@@ -982,11 +1248,26 @@ class ImageCaptureCache:
         *,
         media_id: str,
         thumbnail: bytes,
+        feature_print: bytes | None,
     ) -> dict[str, Any]:
-        if not isinstance(value, dict) or frozenset(value) != _MANIFEST_FIELDS:
+        if not isinstance(value, dict):
+            raise ImageCaptureError("image cache manifest contract is invalid")
+        schema = value.get("schema")
+        observed_fields = frozenset(value)
+        valid_fields = (
+            observed_fields in {
+                _BASE_MANIFEST_FIELDS,
+                _OPTIONAL_VISION_MANIFEST_FIELDS,
+            }
+            if schema == IMAGE_ARTIFACT_SCHEMA
+            else observed_fields == _ENRICHED_MANIFEST_FIELDS
+            if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA
+            else False
+        )
+        if not valid_fields:
             raise ImageCaptureError("image cache manifest contract is invalid")
         if (
-            value.get("schema") != IMAGE_ARTIFACT_SCHEMA
+            value.get("schema") not in IMAGE_ARTIFACT_SCHEMAS
             or value.get("media_id") != media_id
             or value.get("source_mime_type") not in {"image/png", "image/jpeg", "image/heic"}
             or type(value.get("source_size_bytes")) is not int
@@ -1002,7 +1283,67 @@ class ImageCaptureCache:
             or not thumbnail.startswith(_JPEG_MAGIC)
         ):
             raise ImageCaptureError("image cache manifest verification failed")
-        public_metadata = _validate_public_metadata(value.get("public_metadata"), media_id=media_id)
+        if schema == IMAGE_ARTIFACT_SCHEMA and feature_print is not None:
+            raise ImageCaptureError("legacy image cache object has an unexpected feature print")
+        if observed_fields == _OPTIONAL_VISION_MANIFEST_FIELDS:
+            try:
+                optional_receipt = validate_optional_enrichment_status(
+                    value.get("optional_vision_receipt")
+                )
+                requested_mode = validate_vision_mode(
+                    value.get("requested_vision_mode")
+                )
+            except (AppleVisionError, ValueError) as exc:
+                raise ImageCaptureError(
+                    "image optional Vision receipt is invalid"
+                ) from exc
+            if (
+                requested_mode == "off"
+                or optional_receipt.get("mode") != requested_mode
+            ):
+                raise ImageCaptureError(
+                    "image optional Vision receipt is inconsistent"
+                )
+        public_metadata = _validate_public_metadata(
+            value.get("public_metadata"),
+            media_id=media_id,
+        )
+        if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA:
+            expected_size = value.get("feature_print_size_bytes")
+            expected_digest = str(value.get("feature_print_sha256") or "")
+            enrichment = public_metadata.get("vision_enrichment")
+            public_feature = (
+                enrichment.get("feature_print")
+                if isinstance(enrichment, dict)
+                else None
+            )
+            feature_is_ready = (
+                isinstance(public_feature, dict)
+                and public_feature.get("status") == "ready"
+            )
+            if feature_is_ready:
+                if (
+                    feature_print is None
+                    or type(expected_size) is not int
+                    or expected_size != len(feature_print)
+                    or public_feature.get("byte_count") != expected_size
+                    or not 0 < expected_size <= MAX_FEATURE_PRINT_BYTES
+                    or SHA256_RE.fullmatch(expected_digest) is None
+                    or hashlib.sha256(feature_print).hexdigest() != expected_digest
+                ):
+                    raise ImageCaptureError(
+                        "image feature-print cache verification failed"
+                    )
+            elif (
+                feature_print is not None
+                or expected_size != 0
+                or expected_digest != ""
+            ):
+                raise ImageCaptureError(
+                    "image cache has an unexpected feature print"
+                )
+        if public_metadata.get("schema") != value.get("schema"):
+            raise ImageCaptureError("image cache manifest schema binding changed")
         if public_metadata.get("mime_type") != value.get("source_mime_type"):
             raise ImageCaptureError("image cache manifest MIME binding changed")
         return dict(value)
@@ -1151,6 +1492,10 @@ class ImageCaptureCache:
             ):
                 raise ImageCaptureError("image cache object changed before prune")
             os.unlink("thumbnail.jpg", dir_fd=descriptor)
+            try:
+                os.unlink("feature-print.bin", dir_fd=descriptor)
+            except FileNotFoundError:
+                pass
             os.unlink("manifest.json", dir_fd=descriptor)
             os.fsync(descriptor)
         finally:
@@ -1160,6 +1505,7 @@ class ImageCaptureCache:
 
 __all__ = [
     "ConversionResult",
+    "IMAGE_ARTIFACT_ENRICHED_SCHEMA",
     "IMAGE_ARTIFACT_SCHEMA",
     "ImageCaptureCache",
     "ImageCaptureError",

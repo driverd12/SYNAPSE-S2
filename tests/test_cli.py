@@ -93,6 +93,87 @@ class SynapseCliTests(unittest.TestCase):
             "image",
         )
         self.assertFalse(capture_arguments["metadata"]["raw_original_stored"])
+        cache.capture_image.assert_called_once_with(
+            "/tmp/local-image.jpg",
+            media_id="s2img_"
+            + __import__("hashlib").sha256(accepted.capture_id.encode("ascii")).hexdigest()[:32],
+            vision_mode="off",
+            vision_required=False,
+            vision_input_derivative="source-transient-downsampled",
+        )
+
+        enriched = parser.parse_args(
+            [
+                "capture-image",
+                "--path",
+                "/tmp/local-image.jpg",
+                "--label",
+                "Rack elevation",
+                "--description",
+                "Approved rack elevation.",
+                "--vision-enrichment",
+                "all",
+                "--require-vision-enrichment",
+                "--confirm",
+            ]
+        )
+        self.assertEqual(enriched.vision_enrichment, "all")
+        self.assertTrue(enriched.require_vision_enrichment)
+
+    def test_capture_image_cli_indexes_only_projected_redacted_ocr_cue(self):
+        import synapse_cli
+
+        arguments = synapse_cli.build_parser().parse_args(
+            [
+                "capture-image",
+                "--path",
+                "/tmp/local-image.jpg",
+                "--label",
+                "Rack elevation",
+                "--description",
+                "Approved rack elevation.",
+                "--vision-enrichment",
+                "ocr",
+                "--confirm",
+            ]
+        )
+        backend = mock.Mock()
+        backend.capture_conversation.return_value = {"event_count": 1}
+        cache = mock.Mock()
+        cache.capture_image.return_value = {
+            "cache_ready": True,
+            "idempotent_replay": False,
+            "vision_enrichment": {"status": "ready", "persisted": True},
+            "public_metadata": {
+                "schema": "synapse-s2.image-artifact.v2",
+                "context_memory_type": "image",
+                "media_id": "placeholder",
+                "thumbnail_dimensions": {"width": 64, "height": 32},
+                "visual_descriptor": {
+                    "schema": "synapse-s2.visual-descriptor.rgb16-v1"
+                },
+                "vision_enrichment": {"provider": "apple-vision"},
+            },
+        }
+        with (
+            mock.patch.object(
+                synapse_cli,
+                "binding_from_environment",
+                return_value=mock.sentinel.binding,
+            ),
+            mock.patch.object(synapse_cli, "build_backend", return_value=backend),
+            mock.patch.object(synapse_cli, "ImageCaptureCache", return_value=cache),
+            mock.patch.object(synapse_cli, "ocr_cue_text", return_value="Rack 42"),
+        ):
+            result = synapse_cli.command_capture_image(arguments)
+
+        captured = backend.capture_conversation.call_args.kwargs
+        self.assertEqual(
+            captured["text"],
+            "Approved rack elevation.\nImage OCR cues:\nRack 42",
+        )
+        self.assertTrue(captured["metadata"]["vision_ocr_indexed"])
+        self.assertTrue(result["media"]["vision_ocr_indexed"])
 
     def test_namespace_link_proposal_state_does_not_override_runtime_state_path(self):
         import synapse_cli

@@ -822,6 +822,77 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("limit", oversized["error"])
         runtime._image_cache.capture_image.assert_not_called()
 
+    def test_image_vision_requires_ocr_consent_and_labels_thumbnail_enrichment(self):
+        thumbnail = b"\xff\xd8\xffsynthetic-thumbnail"
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            runtime._image_cache = mock.Mock()
+            runtime._image_cache.capture_image.return_value = {
+                "cache_ready": True,
+                "idempotent_replay": False,
+                "vision_enrichment": {
+                    "provider": "apple-vision",
+                    "requested_mode": "feature-print",
+                    "stored_mode": "feature-print",
+                    "status": "ready",
+                    "persisted": True,
+                    "input_derivative": "thumbnail-transient-downsampled",
+                },
+                "public_metadata": {
+                    "schema": "synapse-s2.image-artifact.v1",
+                    "context_memory_type": "image",
+                    "media_id": "s2img_" + "d" * 32,
+                    "mime_type": "image/jpeg",
+                    "source_dimensions": {"width": 32, "height": 16},
+                    "thumbnail_dimensions": {"width": 32, "height": 16},
+                    "visual_descriptor": {
+                        "schema": "synapse-s2.visual-descriptor.rgb16-v1"
+                    },
+                },
+            }
+            base = {
+                "context_id": "demo",
+                "display_label": "Rack elevation",
+                "description": "Approved rack elevation.",
+                "thumbnail_data_url": "data:image/jpeg;base64,"
+                + base64.b64encode(thumbnail).decode("ascii"),
+                "capture_id": "s2cap_" + "d" * 32,
+                "confirm": True,
+            }
+            denied_status, denied = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-image",
+                    json.dumps({**base, "vision_enrichment": "ocr"}).encode("utf-8"),
+                )
+            )
+            accepted_status, accepted = self.decode(
+                runtime.handle(
+                    "POST",
+                    "/api/capture-image",
+                    json.dumps(
+                        {
+                            **base,
+                            "vision_enrichment": "feature-print",
+                            "require_vision_enrichment": True,
+                        }
+                    ).encode("utf-8"),
+                )
+            )
+
+        self.assertEqual(denied_status, 400)
+        self.assertIn("recognized text", denied["error"])
+        self.assertEqual(accepted_status, 200)
+        self.assertEqual(accepted["media"]["vision_enrichment"]["status"], "ready")
+        runtime._image_cache.capture_image.assert_called_once()
+        call = runtime._image_cache.capture_image.call_args
+        self.assertEqual(call.kwargs["vision_mode"], "feature-print")
+        self.assertTrue(call.kwargs["vision_required"])
+        self.assertEqual(
+            call.kwargs["vision_input_derivative"],
+            "thumbnail-transient-downsampled",
+        )
+
     def test_missing_node_local_image_thumbnail_is_a_quiet_not_found(self):
         with TemporaryDirectory() as tmp:
             runtime = self.make_runtime(tmp)
@@ -2395,6 +2466,12 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("retryableCaptureRequest", app)
         self.assertIn("finishRetryableCapture", app)
         self.assertIn('requestJson("/api/capture-image"', app)
+        self.assertIn('id="imageVisionMode"', index)
+        self.assertIn('id="imageVisionOcrConsent"', index)
+        self.assertIn("confirm_vision_ocr", app)
+        self.assertIn("updateImageVisionControls", app)
+        self.assertIn("image-vision-check", styles)
+        self.assertIn(".image-vision-check[hidden]", styles)
         self.assertIn('requestBlob("/api/media-thumbnail"', app)
         self.assertIn('requestJson("/api/impact"', app)
         self.assertIn("setImpactDrawerOpen", app)

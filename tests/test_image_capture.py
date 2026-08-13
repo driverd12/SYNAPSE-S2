@@ -25,6 +25,42 @@ from image_capture import (
 )
 
 
+def _fake_vision_enrichment(_source: Path, mode: str, derivative: str) -> dict:
+    feature_data = struct.pack("<4f", 0.1, 0.2, 0.3, 0.4)
+    payload = {
+        "schema": "synapse-s2.apple-vision-enrichment.v1",
+        "provider": "apple-vision",
+        "mode": mode,
+        "status": "ready",
+        "input_derivative": derivative,
+        "input_dimensions": {"width": 32, "height": 16},
+    }
+    if mode in {"feature-print", "all"}:
+        payload["feature_print"] = {
+            "status": "ready",
+            "schema": "synapse-s2.apple-vision-feature-print.v1",
+            "request_revision": 2,
+            "element_type": "float32",
+            "element_count": 4,
+            "encoding": "base64-little-endian",
+            "data": base64.b64encode(feature_data).decode("ascii"),
+        }
+    if mode in {"ocr", "all"}:
+        payload["ocr"] = {
+            "status": "ready",
+            "schema": "synapse-s2.apple-vision-ocr.v1",
+            "request_revision": 3,
+            "recognition_level": "accurate",
+            "language_correction": True,
+            "automatic_language_detection": True,
+            "observation_count": 1,
+            "mean_confidence": 0.95,
+            "text": "Rack label API token=sk-synthetic1234567890",
+            "truncated": False,
+        }
+    return payload
+
+
 def _png_bytes(width: int = 32, height: int = 16) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         return (
@@ -336,6 +372,153 @@ class ImageCaptureTests(unittest.TestCase):
         self.assertEqual(audit["invalid_entry_count"], 1)
         self.assertNotIn(unsafe_name, json.dumps(audit, sort_keys=True))
         self.assertIn("invalid-entry-0001", audit["corrupt_ids"])
+
+    def test_optional_vision_privately_stores_feature_bytes_and_redacts_ocr(self) -> None:
+        media_id = "s2img_" + "9" * 32
+        cache = ImageCaptureCache(
+            self.binding,
+            converter=_fake_converter,
+            vision_enricher=_fake_vision_enrichment,
+        )
+
+        result = cache.capture_image(
+            self.source,
+            media_id=media_id,
+            vision_mode="all",
+            vision_required=True,
+        )
+
+        self.assertEqual(result["public_metadata"]["schema"], "synapse-s2.image-artifact.v2")
+        enrichment = result["public_metadata"]["vision_enrichment"]
+        feature = enrichment["feature_print"]
+        self.assertNotIn("data", feature)
+        self.assertEqual(feature["storage"], "private-node-local-media-cache")
+        self.assertNotIn("sk-synthetic", enrichment["ocr"]["text"])
+        self.assertGreater(enrichment["ocr"]["redaction_count"], 0)
+        object_root = cache.objects_root / media_id
+        self.assertEqual(
+            sorted(path.name for path in object_root.iterdir()),
+            ["feature-print.bin", "manifest.json", "thumbnail.jpg"],
+        )
+        feature_path = object_root / "feature-print.bin"
+        self.assertEqual(stat.S_IMODE(feature_path.stat().st_mode), 0o600)
+        self.assertEqual(feature_path.read_bytes(), struct.pack("<4f", 0.1, 0.2, 0.3, 0.4))
+        manifest_text = (object_root / "manifest.json").read_text(encoding="utf-8")
+        self.assertNotIn(base64.b64encode(feature_path.read_bytes()).decode("ascii"), manifest_text)
+        self.assertTrue(cache.audit(referenced_media_ids=[media_id])["healthy"])
+
+        feature_path.unlink()
+        manifest_path = object_root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["feature_print_sha256"] = ""
+        manifest["feature_print_size_bytes"] = 0
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        manifest_path.chmod(0o600)
+        tampered = cache.audit(referenced_media_ids=[media_id])
+        self.assertFalse(tampered["healthy"])
+        self.assertEqual(tampered["corrupt_ids"], [media_id])
+
+    def test_optional_vision_failure_returns_receipt_but_required_fails_closed(self) -> None:
+        def unavailable(_source: Path, _mode: str, _derivative: str) -> dict:
+            from apple_vision_enrichment import AppleVisionUnavailable
+
+            raise AppleVisionUnavailable("synthetic unavailable")
+
+        optional = ImageCaptureCache(
+            self.binding,
+            converter=_fake_converter,
+            vision_enricher=unavailable,
+        ).capture_image(
+            self.source,
+            media_id="s2img_" + "a" * 32,
+            vision_mode="feature-print",
+        )
+        self.assertEqual(optional["vision_enrichment"]["status"], "unavailable")
+        self.assertNotIn("vision_enrichment", optional["public_metadata"])
+        replay = ImageCaptureCache(
+            self.binding,
+            converter=_fake_converter,
+            vision_enricher=unavailable,
+        ).capture_image(
+            self.source,
+            media_id="s2img_" + "a" * 32,
+            vision_mode="feature-print",
+        )
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["vision_enrichment"]["status"], "unavailable")
+        self.assertEqual(
+            replay["vision_enrichment"]["mode"],
+            "feature-print",
+        )
+
+        required_cache = ImageCaptureCache(
+            self.binding,
+            converter=_fake_converter,
+            vision_enricher=unavailable,
+        )
+        required_id = "s2img_" + "b" * 32
+        with self.assertRaisesRegex(ImageCaptureError, "required Apple Vision"):
+            required_cache.capture_image(
+                self.source,
+                media_id=required_id,
+                vision_mode="feature-print",
+                vision_required=True,
+            )
+        self.assertFalse((required_cache.objects_root / required_id).exists())
+
+    def test_concurrent_plain_publication_cannot_satisfy_required_vision(self) -> None:
+        media_id = "s2img_" + "c" * 32
+        required_cache = ImageCaptureCache(
+            self.binding,
+            converter=_fake_converter,
+            vision_enricher=_fake_vision_enrichment,
+        )
+        plain_cache = ImageCaptureCache(self.binding, converter=_fake_converter)
+
+        def publish_plain_then_collide(**_kwargs) -> None:
+            plain_cache.capture_image(self.source, media_id=media_id)
+            raise ValueError("media_id is already present in the image cache")
+
+        with mock.patch.object(
+            required_cache,
+            "_publish_object",
+            side_effect=publish_plain_then_collide,
+        ):
+            with self.assertRaisesRegex(
+                ImageCaptureError,
+                "concurrent image derivative",
+            ):
+                required_cache.capture_image(
+                    self.source,
+                    media_id=media_id,
+                    vision_mode="feature-print",
+                    vision_required=True,
+                )
+
+    def test_replay_cannot_change_or_disable_stored_vision_mode(self) -> None:
+        media_id = "s2img_" + "d" * 32
+        cache = ImageCaptureCache(
+            self.binding,
+            converter=_fake_converter,
+            vision_enricher=_fake_vision_enrichment,
+        )
+        cache.capture_image(
+            self.source,
+            media_id=media_id,
+            vision_mode="ocr",
+        )
+
+        with self.assertRaisesRegex(ImageCaptureError, "different Vision"):
+            cache.capture_image(self.source, media_id=media_id, vision_mode="off")
+        with self.assertRaisesRegex(ImageCaptureError, "different Vision"):
+            cache.capture_image(
+                self.source,
+                media_id=media_id,
+                vision_mode="feature-print",
+            )
 
     def test_cache_root_comes_only_from_a_verified_binding(self) -> None:
         cache = self.cache()

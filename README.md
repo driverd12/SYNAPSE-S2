@@ -191,6 +191,8 @@ The single-pack readiness certification runbook is in `docs/OPERATOR_READINESS_C
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
 The point-in-time live status report is in `docs/CURRENT_STATUS.md`.
+The bounded source-backed primary-abstraction and cue-anchor contract is in
+`docs/HARMONIC_MEMORY.md`.
 The durable idempotency, crash-recovery, and rollout contract for capture
 producers is in `docs/EXACTLY_ONCE_CAPTURE.md`.
 The bounded installed-client response profiles, receipt-safety invariants, and
@@ -357,6 +359,30 @@ For a real local image, use the dashboard Image memory picker or the bound CLI:
   --confirm
 .venv/bin/python synapse_cli.py --json image-cache-audit
 ```
+
+Apple Vision enrichment is optional and off by default. Feature prints support
+image-to-image similarity only; they are not captions or text-to-image search.
+OCR may be inaccurate and may expose text visible in the image, so selecting OCR
+is explicit consent to store its redacted output as a searchable cue:
+
+```bash
+.venv/bin/python synapse_cli.py --json capture-image \
+  --context default \
+  --path /absolute/path/to/rack-elevation.jpg \
+  --label "Rack elevation" \
+  --description "Approved rack elevation." \
+  --vision-enrichment all \
+  --require-vision-enrichment \
+  --confirm
+```
+
+Omit `--require-vision-enrichment` to let an unavailable local helper produce a
+visible optional/unavailable receipt while the baseline image capture succeeds.
+The short-lived native helper analyzes a derivative with a maximum edge of 2048
+pixels. Learned feature-print bytes remain owner-only in the node-local media
+cache; durable memory stores only the versioned provider/revision/type/count
+reference plus redacted OCR when requested. Neither thumbnail nor feature-print
+bytes is currently included in paired recovery or multi-Mac replication.
 
 The original file is decoded transiently, remains untouched at its source path,
 and is never copied into SYNAPSE-S2 or SQLite. CLI capture accepts an absolute

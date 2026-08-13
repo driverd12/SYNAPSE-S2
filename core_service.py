@@ -172,6 +172,7 @@ BUILD_SOURCE_MANIFEST = (
     "core_service.py",
     "embedding_providers.py",
     "event_segmenter.py",
+    "harmonic_memory.py",
     "memory_store.py",
     "mlx_backend.py",
     "recovery_manager.py",

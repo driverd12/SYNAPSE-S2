@@ -116,6 +116,8 @@ LEGACY_EVENT_DERIVED_METADATA_FIELDS = frozenset(
         "display_summary",
         "embedding_provider",
         "event_segment",
+        "harmonic_scaffold",
+        "harmonic_scaffold_schema",
         "keywords",
         "lexical_surprise_score",
         "segment_id",

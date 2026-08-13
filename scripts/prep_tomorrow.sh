@@ -163,11 +163,17 @@ echo "=== compile check ==="
 .venv/bin/python - <<'PY'
 from pathlib import Path
 
-paths = """backend_router.py capture_daemon.py client_session_bridge.py core_authority.py core_client.py core_client_binding.py core_protocol.py core_request_journal.py core_service.py cortex_contract.py embedding_providers.py event_segmenter.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py token_contracts.py dashboard_server.py client_config.py scripts/core_agent_installer.py scripts/core_cutover_preflight.py scripts/install_client_configs.py scripts/secure_installer_support.py scripts/smoke_dashboard.py scripts/operator_readiness_certify.py scripts/measure_token_contracts.py""".split()
+paths = """apple_vision_enrichment.py backend_router.py capture_daemon.py client_session_bridge.py core_authority.py core_client.py core_client_binding.py core_protocol.py core_request_journal.py core_service.py cortex_contract.py embedding_providers.py event_segmenter.py harmonic_memory.py image_capture.py memory_store.py mlx_backend.py mcp_client_wrapper.py mcp_server.py synapse_cli.py token_contracts.py dashboard_server.py client_config.py scripts/core_agent_installer.py scripts/core_cutover_preflight.py scripts/install_client_configs.py scripts/measure_memory_confidence.py scripts/secure_installer_support.py scripts/smoke_dashboard.py scripts/operator_readiness_certify.py scripts/measure_token_contracts.py""".split()
 for raw in paths:
     path = Path(raw)
     compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
+
+if command -v xcrun >/dev/null 2>&1; then
+  xcrun --sdk macosx swiftc -parse native/apple_vision_enrich.swift
+else
+  echo "Apple Vision helper parse skipped: xcrun unavailable (optional lane)."
+fi
 
 echo "=== build identity ==="
 BUILD_ID="$(.venv/bin/python - <<'PY'

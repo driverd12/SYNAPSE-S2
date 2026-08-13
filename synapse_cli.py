@@ -75,6 +75,7 @@ try:
             os.environ[BINDING_ENV] = str(installed_binding)
 
     apply_binding_environment()
+    from apple_vision_enrichment import ocr_cue_text
     from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
     from image_capture import ImageCaptureCache
     import mlx_backend
@@ -619,6 +620,21 @@ def command_capture_image(args: argparse.Namespace) -> dict[str, Any]:
     cached = ImageCaptureCache(binding).capture_image(
         str(Path(args.path).expanduser()),
         media_id=media_id,
+        vision_mode=args.vision_enrichment,
+        vision_required=bool(args.require_vision_enrichment),
+        vision_input_derivative="source-transient-downsampled",
+    )
+    vision_ocr_cue = ocr_cue_text(
+        cached["public_metadata"].get("vision_enrichment")
+    )
+    vision_receipt = dict(
+        cached.get("vision_enrichment")
+        or {
+            "provider": "apple-vision",
+            "requested_mode": str(args.vision_enrichment),
+            "status": "disabled" if args.vision_enrichment == "off" else "not-present",
+            "persisted": False,
+        }
     )
     metadata = {
         **cached["public_metadata"],
@@ -628,9 +644,13 @@ def command_capture_image(args: argparse.Namespace) -> dict[str, Any]:
         "source_surface": "cli",
         "raw_original_stored": False,
         "thumbnail_cache_authoritative": False,
+        "vision_ocr_indexed": bool(vision_ocr_cue),
     }
+    capture_text = description
+    if vision_ocr_cue:
+        capture_text = f"{description}\nImage OCR cues:\n{vision_ocr_cue}"
     capture = backend.capture_conversation(
-        text=description,
+        text=capture_text,
         context_id=args.context,
         source_tag=(
             args.tag
@@ -663,6 +683,8 @@ def command_capture_image(args: argparse.Namespace) -> dict[str, Any]:
             "descriptor_schema": metadata["visual_descriptor"]["schema"],
             "cache_ready": bool(cached["cache_ready"]),
             "cache_idempotent_replay": bool(cached.get("idempotent_replay")),
+            "vision_enrichment": vision_receipt,
+            "vision_ocr_indexed": bool(vision_ocr_cue),
         },
         "raw_original_stored": False,
         "thumbnail_cache_authoritative": False,
@@ -2330,6 +2352,20 @@ def build_parser() -> argparse.ArgumentParser:
     capture_image.add_argument("--path", required=True)
     capture_image.add_argument("--label", required=True)
     capture_image.add_argument("--description", required=True)
+    capture_image.add_argument(
+        "--vision-enrichment",
+        choices=("off", "feature-print", "ocr", "all"),
+        default="off",
+        help=(
+            "opt in to local Apple Vision feature prints and/or OCR; OCR text is "
+            "redacted, stored, and indexed as a recall cue"
+        ),
+    )
+    capture_image.add_argument(
+        "--require-vision-enrichment",
+        action="store_true",
+        help="fail the capture unless every requested Vision component succeeds",
+    )
     capture_image.add_argument("--tag", default="")
     capture_image.add_argument("--speaker", default="operator")
     capture_image.add_argument(

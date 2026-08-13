@@ -98,6 +98,13 @@ class CaptureLedgerReconciliationTests(unittest.TestCase):
             ).fetchall()
             for entry in entry_rows:
                 metadata = json.loads(str(entry["metadata_json"]))
+                if metadata.get("event_segment") is True and not isinstance(
+                    metadata.get("harmonic_scaffold"),
+                    dict,
+                ):
+                    raise AssertionError(
+                        "legacy repair fixture is missing derived harmonic metadata"
+                    )
                 metadata.pop("capture_id", None)
                 metadata.pop("capture_protocol", None)
                 if metadata.get("event_segment") is True:

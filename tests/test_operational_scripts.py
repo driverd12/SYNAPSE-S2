@@ -343,6 +343,10 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
         self.assertIn("unset SYNAPSE_S2_CORE_BINDING SYNAPSE_S2_CORE_SOCKET", unit_test_section)
         self.assertIn("unset SYNAPSE_S2_EMBEDDING_PROVIDER", unit_test_section)
         self.assertNotIn("SYNAPSE_S2_EMBEDDING_PROVIDER=semantic-hash", unit_test_section)
+        self.assertIn(
+            "xcrun --sdk macosx swiftc -parse native/apple_vision_enrich.swift",
+            script,
+        )
 
     def test_prep_tomorrow_certifies_immutably_before_explicit_apply(self):
         script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text(encoding="utf-8")

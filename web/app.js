@@ -638,6 +638,10 @@ const elements = collectElements([
   "imageCaptureLabel",
   "imageCapturePreview",
   "imageCaptureState",
+  "imageVisionMode",
+  "imageVisionRequired",
+  "imageVisionOcrConsent",
+  "imageVisionOcrConsentRow",
   "imageGallery",
   "impactCaveat",
   "impactCloseButton",
@@ -8179,11 +8183,27 @@ elements.imageCaptureFile.addEventListener("change", () => {
   void handleImageCaptureSelection();
 });
 
+function updateImageVisionControls() {
+  const mode = elements.imageVisionMode.value;
+  const enabled = mode !== "off";
+  const includesOcr = mode === "ocr" || mode === "all";
+  elements.imageVisionRequired.disabled = !enabled;
+  if (!enabled) elements.imageVisionRequired.checked = false;
+  elements.imageVisionOcrConsentRow.hidden = !includesOcr;
+  elements.imageVisionOcrConsent.required = includesOcr;
+  if (!includesOcr) elements.imageVisionOcrConsent.checked = false;
+}
+
+elements.imageVisionMode.addEventListener("change", updateImageVisionControls);
+updateImageVisionControls();
+
 elements.imageCaptureForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const prepared = state.imageCapture.prepared;
   const label = elements.imageCaptureLabel.value.trim();
   const description = elements.imageCaptureDescription.value.trim();
+  const visionMode = elements.imageVisionMode.value;
+  const includesOcr = visionMode === "ocr" || visionMode === "all";
   if (!prepared) {
     setImageCaptureState("Image capture rejected", "Choose and prepare a local image first.", "error");
     elements.imageCaptureFile.focus();
@@ -8194,6 +8214,15 @@ elements.imageCaptureForm.addEventListener("submit", async (event) => {
     elements.imageCaptureLabel.focus();
     return;
   }
+  if (includesOcr && !elements.imageVisionOcrConsent.checked) {
+    setImageCaptureState(
+      "Image capture rejected",
+      "Confirm that redacted OCR text may be stored and indexed.",
+      "error",
+    );
+    elements.imageVisionOcrConsent.focus();
+    return;
+  }
   const text = description ? `${label}. ${description}` : label;
   const captureBody = {
     context_id: state.context,
@@ -8201,6 +8230,9 @@ elements.imageCaptureForm.addEventListener("submit", async (event) => {
     description: text,
     thumbnail_data_url: prepared.thumbnailDataUrl,
     confirm: true,
+    vision_enrichment: visionMode,
+    require_vision_enrichment: elements.imageVisionRequired.checked,
+    confirm_vision_ocr: includesOcr && elements.imageVisionOcrConsent.checked,
   };
   const retry = retryableCaptureRequest(
     "image-capture",
@@ -8209,6 +8241,9 @@ elements.imageCaptureForm.addEventListener("submit", async (event) => {
       display_label: label,
       description: text,
       thumbnail_sha256: prepared.thumbnailSha256,
+      vision_enrichment: visionMode,
+      require_vision_enrichment: elements.imageVisionRequired.checked,
+      confirm_vision_ocr: includesOcr && elements.imageVisionOcrConsent.checked,
     },
     captureBody,
   );
@@ -8217,14 +8252,24 @@ elements.imageCaptureForm.addEventListener("submit", async (event) => {
       const payload = await requestJson("/api/capture-image", {
         method: "POST",
         body: { ...retry.body, capture_id: retry.captureId },
-        timeoutMs: 30000,
+        timeoutMs: visionMode === "off" ? 30000 : 150000,
       });
       finishRetryableCapture("image-capture", retry.captureId);
-      setImageCaptureState("Image memory captured", "Thumbnail and numeric descriptors are local; the full-resolution source was not retained.", "ready");
+      const vision = payload.media?.vision_enrichment || {};
+      const visionDetail = vision.status === "ready"
+        ? ` Apple Vision ${vision.stored_mode || vision.requested_mode} enrichment is ready.`
+        : vision.status && vision.status !== "disabled"
+          ? ` Optional Apple Vision status: ${vision.status}.`
+          : "";
+      setImageCaptureState("Image memory captured", `Thumbnail and numeric descriptors are local; the full-resolution source was not retained.${visionDetail}`, "ready");
       state.imageCapture.prepared = null;
       elements.imageCaptureFile.value = "";
       elements.imageCaptureLabel.value = "";
       elements.imageCaptureDescription.value = "";
+      elements.imageVisionMode.value = "off";
+      elements.imageVisionRequired.checked = false;
+      elements.imageVisionOcrConsent.checked = false;
+      updateImageVisionControls();
       revokePreparedImagePreview();
       await refreshImageGallery();
       return payload;

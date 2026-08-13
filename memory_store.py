@@ -38,6 +38,7 @@ from core_authority import (
     CoreAuthorityLease,
 )
 from core_request_journal import JOURNAL_BINDING_SCHEMA, JOURNAL_SCHEMA_VERSION
+from harmonic_memory import harmonic_scaffold_index_terms
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
     SecretRedactingFormatter,
@@ -11132,6 +11133,8 @@ class DurableMemoryStore:
                     add_terms(value, weight)
             else:
                 add_terms(values, weight)
+        for value in harmonic_scaffold_index_terms(safe_metadata, limit=32):
+            add_terms(value, 4.0)
         add_terms(str(source_text or "")[:MAX_SURFACE_INDEX_SOURCE_CHARS], 1.0)
 
         rows = [
