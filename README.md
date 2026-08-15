@@ -508,9 +508,11 @@ After the fresh audit is ready, create the complete recovery point:
 ```
 
 Paired backup, verification, isolated restore, capture-ledger recovery, signed
-retention, and replication checkpoint create/stage use a closed authenticated
-recovery-maintenance lane with a one-hour deadline. Ordinary memory and bridge
-operations retain the five-minute protocol ceiling. While this lane is active,
+retention, replication checkpoint create/stage, and the replication status
+read's full staged-checkpoint semantic audit use a closed authenticated
+recovery/replication-maintenance lane with a one-hour deadline. Ordinary memory
+and bridge operations retain the five-minute protocol ceiling. While this lane
+is active,
 authenticated health reports `operational_state: "maintenance"`,
 `accepting_ordinary_operations: false`, a fixed `backend_lane.owner`, and
 `deadline_remaining_ms`; let the operation finish. A lost mutation response is
@@ -855,7 +857,7 @@ The MCP server exposes these tools:
 | `list_spiking_namespace_link_history` | Inspect bounded append-only bridge-governance history by proposal or durable link id. |
 | `audit_spiking_namespace_link_governance` | Read-only integrity audit across governance projections, receipts, and durable link rows. |
 | `get_spiking_replication_identity` | Read this authoritative core's signed offline-replication identity; it cannot pair a peer or mutate state. |
-| `get_spiking_replication_status` | Read bounded peer/checkpoint/ACK status; all replication mutations remain operator-CLI only. |
+| `get_spiking_replication_status` | Run the bounded long replication-integrity status read across peer/checkpoint/ACK evidence; all replication mutations remain operator-CLI only. |
 | `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Atomically acknowledge exact receipt ids after their deployments were consumed. |

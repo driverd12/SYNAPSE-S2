@@ -11,6 +11,8 @@ overwrites either Mac's live memory database.
 - Only the authoritative core may pair or revoke peers, create checkpoints,
   stage received checkpoints, or record acknowledgements.
 - MCP and dashboard surfaces expose signed identity and bounded status only.
+  Status performs the same full staged-checkpoint semantic audit as the CLI and
+  may remain in authenticated replication maintenance for up to one hour.
 - There is no SSH client, network listener, peer discovery, live cutover, or
   multi-writer merge path in this protocol.
 - Imported descriptors, checkpoint directories, and acknowledgements must be
@@ -232,13 +234,18 @@ temporary copies were not swept into backups or cloud sync before cleanup.
 
 Checkpoint creation and staging are exclusive maintenance operations that
 create, hash, verify, and—for staging—restore a complete paired recovery point.
-They belong to the authenticated closed recovery allowlist and receive a
-bounded one-hour synchronous deadline. Ordinary operations, pairing, peer
-revocation, signed ACK recording, and bridge governance retain the five-minute
-protocol ceiling. Waiting to acquire the serialized maintenance lane is also
-capped at five minutes, so queued callers cannot consume the one-hour execution
-budget before admission. There is no unbounded or hidden server claim and no
-asynchronous job contract. If the caller loses the response, the result is
+The `replication-status` and `replication-peer-list` reads also verify every
+current peer, checkpoint directory, acknowledgement, recovery bundle, and
+staged isolated restore before reporting semantic integrity. These three
+replication operations belong to the authenticated closed long-replication
+allowlist and receive a bounded one-hour synchronous deadline. Ordinary
+operations, pairing, peer revocation, signed ACK recording, and bridge
+governance retain the five-minute protocol ceiling. Waiting to acquire the
+serialized maintenance lane is also capped at five minutes, so queued callers
+cannot consume the one-hour execution budget before admission. There is no
+unbounded or hidden server claim and no asynchronous job contract. A lost
+status response is a retry-safe read and does not enter the mutation journal.
+If a checkpoint create or stage caller loses the response, the result is
 `outcome_unknown`: preserve its caller and request ID, use the normal
 `request-status` reconciliation path, and do not blindly submit a new logical
 operation:
@@ -268,9 +275,10 @@ expiry, or cutover/admission tickets.
 ## Ledger witness operations and residual limits
 
 Normal status verifies the current signed anchor, its current history receipt,
-the signed external high-water witness, and the neutral high-water revision in
-the authoritative memory database. It intentionally does not scan the entire
-anchor history on every request. Schedule a core-exclusive
+the signed external high-water witness, the neutral high-water revision in the
+authoritative memory database, and every current checkpoint/ACK artifact path.
+It intentionally does not scan the entire historical anchor receipt chain on
+every request. Schedule a core-exclusive
 `ReplicationLedger.audit_anchor_history(maximum=...)` maintenance audit after
 each replication transfer window and at least weekly. Treat any failure as a
 stop condition. This release does not install that scheduler or expose a

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from core_protocol import (
     LONG_RECOVERY_OPERATIONS,
+    LONG_REPLICATION_OPERATIONS,
     MAX_DEADLINE_HORIZON_MS,
     PROTOCOL_VERSION,
     RECOVERY_MAX_DEADLINE_HORIZON_MS,
@@ -169,6 +170,16 @@ class CoreProtocolTests(unittest.TestCase):
         self.assertEqual(MAX_DEADLINE_HORIZON_MS, 300_000)
         self.assertEqual(RECOVERY_MAX_DEADLINE_HORIZON_MS, 3_600_000)
         self.assertEqual(
+            LONG_REPLICATION_OPERATIONS,
+            frozenset(
+                {
+                    "replication_status",
+                    "replication_create_checkpoint",
+                    "replication_stage_checkpoint",
+                }
+            ),
+        )
+        self.assertEqual(
             LONG_RECOVERY_OPERATIONS,
             frozenset(
                 {
@@ -180,6 +191,7 @@ class CoreProtocolTests(unittest.TestCase):
                     "plan_recovery_retention",
                     "apply_recovery_retention",
                     "restore_retired_recovery",
+                    "replication_status",
                     "replication_create_checkpoint",
                     "replication_stage_checkpoint",
                 }
@@ -226,7 +238,6 @@ class CoreProtocolTests(unittest.TestCase):
         ordinary_operations = (
             "health",
             "request_status",
-            "replication_status",
             "approve_namespace_link",
             "replication_pair_peer",
             "replication_revoke_peer",

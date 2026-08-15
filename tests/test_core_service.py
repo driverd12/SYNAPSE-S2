@@ -62,6 +62,7 @@ from core_service import (
     CORE_STARTUP_FAILURE_SCHEMA,
     LOGGER,
     LONG_RECOVERY_OPERATIONS,
+    LONG_REPLICATION_OPERATIONS,
     MAX_ACTIVE_CONNECTIONS,
     LONG_NEURAL_OPERATIONS,
     NEURAL_OPERATION_LANE_SECONDS,
@@ -1659,9 +1660,23 @@ class CoreServiceTests(unittest.TestCase):
 
     def test_replication_lane_is_bounded_and_health_reports_maintenance(self) -> None:
         service = self.harness.service
-        floor = service._backend_lane_timeout_floor(
-            "replication_create_checkpoint"
+        self.assertEqual(
+            LONG_REPLICATION_OPERATIONS,
+            frozenset(
+                {
+                    "replication_status",
+                    "replication_create_checkpoint",
+                    "replication_stage_checkpoint",
+                }
+            ),
         )
+        for operation in sorted(LONG_REPLICATION_OPERATIONS):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    service._backend_lane_timeout_floor(operation),
+                    REPLICATION_MAINTENANCE_LANE_SECONDS,
+                )
+        floor = service._backend_lane_timeout_floor("replication_status")
         self.assertEqual(floor, REPLICATION_MAINTENANCE_LANE_SECONDS)
         self.assertEqual(floor, RECOVERY_MAINTENANCE_LANE_SECONDS)
         self.assertEqual(floor, 3_600.0)
@@ -5441,6 +5456,7 @@ class CoreClientRetryTests(unittest.TestCase):
                 plan_token="b" * 64,
                 confirm=True,
             )
+            client.replication_status()
             client.replication_create_checkpoint("peer-123")
             client.replication_stage_checkpoint(manifest)
             with self.assertRaises(CoreUnavailable):

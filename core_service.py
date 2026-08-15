@@ -42,6 +42,7 @@ from core_protocol import (
     CORE_CONFIG_VERSION,
     DEFAULT_MAX_FRAME_BYTES,
     LONG_RECOVERY_OPERATIONS,
+    LONG_REPLICATION_OPERATIONS,
     MAX_DEADLINE_HORIZON_MS,
     PROTOCOL_VERSION,
     RECOVERY_MAX_DEADLINE_HORIZON_MS,
@@ -152,10 +153,11 @@ BACKEND_LANE_RPC_TIMEOUT_SECONDS = 30.0
 NEURAL_OPERATION_LANE_SECONDS = 120.0
 SEMANTIC_INDEX_MAINTENANCE_LANE_SECONDS = 120.0
 # Ordinary protocol requests remain capped at 300 seconds.  The authenticated,
-# closed recovery allowlist receives one bounded hour because paired recovery
-# on a large local store legitimately performs stable copies, hashing, capture
-# reconciliation, and isolated restore proof.  It remains synchronous: a lost
-# response is still reconciled through request_status and never blind-replayed.
+# closed recovery/replication allowlist receives one bounded hour because paired
+# recovery and replication status on a large local store legitimately perform
+# stable copies, hashing, capture reconciliation, and isolated restore proof.
+# Long mutations remain synchronous: a lost mutation response is reconciled
+# through request_status and never blind-replayed.
 RECOVERY_MAINTENANCE_LANE_SECONDS = (
     RECOVERY_MAX_DEADLINE_HORIZON_MS / 1000.0
 )
@@ -875,12 +877,6 @@ REPLICATION_OPERATIONS = frozenset(
         "replication_create_checkpoint",
         "replication_stage_checkpoint",
         "replication_record_acknowledgement",
-    }
-)
-LONG_REPLICATION_OPERATIONS = frozenset(
-    {
-        "replication_create_checkpoint",
-        "replication_stage_checkpoint",
     }
 )
 LONG_SEMANTIC_INDEX_OPERATIONS = frozenset(

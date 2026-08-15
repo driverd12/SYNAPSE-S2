@@ -558,9 +558,10 @@ Create the recovery point only after that gate is ready:
 ```
 
 Recovery work is an explicit authenticated maintenance class. Paired backup,
-verification, isolated restore, capture-ledger recovery, signed retention, and
-replication checkpoint create/stage receive a bounded one-hour execution
-deadline; ordinary and bridge-governance RPCs remain capped at five minutes.
+verification, isolated restore, capture-ledger recovery, signed retention,
+replication checkpoint create/stage, and the replication status read's full
+semantic audit receive a bounded one-hour execution deadline; ordinary and
+bridge-governance RPCs remain capped at five minutes.
 During a healthy long run, health reports `operational_state: "maintenance"`,
 `accepting_ordinary_operations: false`, the fixed lane owner, and
 `deadline_remaining_ms`. Wait for completion. If the connection is lost,

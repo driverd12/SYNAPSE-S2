@@ -24,6 +24,13 @@ MAX_CONTAINER_ITEMS = 10_000
 MAX_STRING_BYTES = 262_144
 MAX_DEADLINE_HORIZON_MS = 300_000
 RECOVERY_MAX_DEADLINE_HORIZON_MS = 3_600_000
+LONG_REPLICATION_OPERATIONS = frozenset(
+    {
+        "replication_status",
+        "replication_create_checkpoint",
+        "replication_stage_checkpoint",
+    }
+)
 LONG_RECOVERY_OPERATIONS = frozenset(
     {
         "backup_recovery_bundle",
@@ -34,10 +41,8 @@ LONG_RECOVERY_OPERATIONS = frozenset(
         "plan_recovery_retention",
         "apply_recovery_retention",
         "restore_retired_recovery",
-        "replication_create_checkpoint",
-        "replication_stage_checkpoint",
     }
-)
+) | LONG_REPLICATION_OPERATIONS
 
 REQUEST_FIELDS = frozenset(
     {

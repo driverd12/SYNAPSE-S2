@@ -582,22 +582,24 @@ changing permissions on an existing caller-owned directory.
    Cortex recall and trace commits, goal writes, certification benchmarks, and
    consolidation. A caller cannot shorten that floor and turn a healthy native
    mutation into an avoidable `outcome_unknown`; longer valid deadlines remain
-   valid up to the protocol maximum. Ordinary status and graph control-plane
-   reads retain the 30-second lane fence. Every core RPC and capture worker also
-   enters the backend's MLX thread-local stream context before array execution,
-   so serialized work remains valid even though accepted requests run on
-   different OS threads.
+   valid up to the protocol maximum. Ordinary non-replication status and graph
+   control-plane reads retain the 30-second lane fence. Every core RPC and
+   capture worker also enters the backend's MLX thread-local stream context
+   before array execution, so serialized work remains valid even though
+   accepted requests run on different OS threads.
 
    Paired backup, verification, isolated restore, capture-ledger recovery,
-   signed retention, and replication checkpoint create/stage use a separate
-   closed authenticated recovery-maintenance class. Those ten operations have
-   a one-hour client, protocol, and backend-lane budget because a verified
-   large-store copy can legitimately outlive five minutes. All ordinary,
-   bridge-governance, pairing, revocation, and ACK operations retain their
-   existing shorter bounds. Health remains authenticated during recovery and
-   reports the fixed lane owner plus `deadline_remaining_ms`; a lost mutation
-   response still requires exact `request-status` reconciliation and is never
-   replayed automatically. Waiting to acquire the serialized lane remains
+   signed retention, replication checkpoint create/stage, and the replication
+   status read's full staged-checkpoint semantic audit use a separate closed
+   authenticated recovery/replication-maintenance class. Those eleven operations
+   have a one-hour client, protocol, and backend-lane budget because a verified
+   large-store copy or staged semantic audit can legitimately outlive five
+   minutes. All ordinary, bridge-governance, pairing, revocation, and ACK
+   operations retain their existing shorter bounds. Health remains authenticated
+   during recovery and reports the fixed lane owner plus `deadline_remaining_ms`;
+   a lost mutation response still requires exact `request-status`
+   reconciliation and is never replayed automatically. Waiting to acquire the
+   serialized lane remains
    capped at five minutes, preventing the longer execution budget from becoming
    an hour-long worker queue. This execution budget does not modify evidence
    freshness or any signed plan, proposal, admission, or final-cutover expiry.
