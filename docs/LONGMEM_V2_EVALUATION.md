@@ -6,6 +6,54 @@ interaction contract** — trajectories are inserted sequentially and questions
 are answered with compact text/image evidence — while staying honest about
 what it does and does not prove.
 
+## Pinned official-harness runner
+
+`scripts/run_longmem_v2_official.py` is a separate frontier lane that imports
+the official harness without editing its pristine pinned checkout, then adds a
+small wrapper-only SYNAPSE lifecycle shim. It never installs dependencies or
+downloads data. First run
+the content-free registry/preflight check:
+
+```sh
+LONGMEM_V2_OFFICIAL_ROOT=/absolute/path/to/pinned/longmemeval-v2 \
+LONGMEM_V2_OFFICIAL_DEPS=/absolute/path/to/operator-staged/dependencies \
+.venv/bin/python scripts/run_longmem_v2_official.py --verify-only
+```
+
+For a full run, the questions, haystack, and trajectories JSON files are
+streamed into bounded owner-private copies. The trajectories tree must contain
+only regular files/directories; prepare screenshot data in official copy mode,
+not symlink mode. The output parent must already exist and the final output
+name must not exist—the wrapper stages under its private run root, validates
+the result tree, and publishes it once with an atomic no-clobber rename.
+
+Only the pinned harness's reader/evaluator tuning flags are accepted after
+`--`; wrapper-owned flags cannot be repeated or overridden. API-key files are
+copied into the private run root and removed at completion. Per-question
+SYNAPSE memories are closed in a `finally` guard (including failed queries),
+while shared memories remain available for the full question stream and are
+closed before teardown.
+
+Loading a saved memory requires independent operator provenance:
+
+```sh
+.venv/bin/python scripts/run_longmem_v2_official.py \
+  --domain web \
+  --questions-path /absolute/path/questions.json \
+  --haystack-path /absolute/path/haystack.json \
+  --trajectories-path /absolute/path/trajectories.json \
+  --output-dir /absolute/new/output-name \
+  --memory-config-path /absolute/path/synapse-config.json \
+  --load-memory-dir /absolute/path/memory_state \
+  --expected-artifact-manifest-sha256 <out-of-band-sha256>
+```
+
+The expected manifest digest is supplied out of band, never trusted from the
+artifact, and is runtime-only—it is not written into a saved memory config.
+Verification and wrapper completion records always carry
+`official_score_claimed: false`; only a separately reviewed complete official
+reader/evaluator run can support a benchmark-score claim.
+
 ## This is not the official benchmark
 
 - **No official score is ever claimed.** Every report carries
