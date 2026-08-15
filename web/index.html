@@ -1186,6 +1186,16 @@
                   </button>
                 </div>
                 <div id="imageGallery" class="image-gallery" aria-live="polite" aria-label="Cached image memory thumbnails"></div>
+                <section id="imageSimilarPanel" class="image-similar-panel" hidden role="region" aria-label="Similar image results">
+                  <div class="image-similar-header">
+                    <strong id="imageSimilarTitle">Similar images</strong>
+                    <button id="imageSimilarClose" class="secondary-button image-similar-close" type="button" aria-label="Close similar image results">Close</button>
+                  </div>
+                  <p class="image-similar-note">Deterministic node-local feature-print distance; scores are uncalibrated and never a truth probability.</p>
+                  <div id="imageSimilarWarnings" class="image-similar-warnings" aria-live="polite"></div>
+                  <div id="imageSimilarState" class="image-capture-state" aria-live="polite"></div>
+                  <div id="imageSimilarResults" class="image-similar-results" aria-label="Ranked similar image cards"></div>
+                </section>
               </form>
             </div>
           </article>

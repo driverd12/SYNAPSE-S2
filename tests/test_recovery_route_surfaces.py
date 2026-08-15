@@ -34,6 +34,7 @@ class RecoveryRouteSurfaceTests(unittest.TestCase):
                 "expected_capture_sha256": None,
                 "expected_request_journal_sha256": None,
                 "expected_runtime_state_sha256": None,
+                "expected_media_sha256": None,
             }
             with mock.patch("synapse_cli.build_backend", return_value=client), mock.patch(
                 "backend_router.build_maintenance_backend",
@@ -155,6 +156,7 @@ class RecoveryRouteSurfaceTests(unittest.TestCase):
                 expected_capture_sha256=None,
                 expected_request_journal_sha256=None,
                 expected_runtime_state_sha256=None,
+                expected_media_sha256=None,
             )
             restore.assert_called_once_with(
                 str(receipt),
@@ -163,6 +165,7 @@ class RecoveryRouteSurfaceTests(unittest.TestCase):
                 expected_capture_sha256=None,
                 expected_request_journal_sha256=None,
                 expected_runtime_state_sha256=None,
+                expected_media_sha256=None,
                 confirm=True,
             )
             plan.assert_called_once_with(keep_latest=4, max_age_days=10.0)
@@ -301,6 +304,7 @@ class RecoveryRouteSurfaceTests(unittest.TestCase):
                 expected_capture_sha256=None,
                 expected_request_journal_sha256=None,
                 expected_runtime_state_sha256=None,
+                expected_media_sha256=None,
             )
             module.restore_recovery_bundle_isolated.assert_called_once_with(
                 str(receipt),
@@ -309,6 +313,7 @@ class RecoveryRouteSurfaceTests(unittest.TestCase):
                 expected_capture_sha256=None,
                 expected_request_journal_sha256=None,
                 expected_runtime_state_sha256=None,
+                expected_media_sha256=None,
                 confirm=True,
             )
 

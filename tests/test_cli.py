@@ -21,6 +21,67 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SynapseCliTests(unittest.TestCase):
+    def test_image_similar_transient_cli_reuses_exact_transient_helper(self):
+        import synapse_cli
+
+        parser = synapse_cli.build_parser()
+        args = parser.parse_args(
+            [
+                "image-similar-transient",
+                "--source",
+                "/private/tmp/query.png",
+                "--context",
+                "demo",
+                "--limit",
+                "3",
+            ]
+        )
+        referenced = "s2img_" + "1" * 32
+        fake_backend = mock.Mock()
+        fake_backend.list_media_references.return_value = {
+            "media_ids": [referenced],
+            "context_id": "demo",
+            "recall_scope": "local",
+            "resolved_context_count": 1,
+        }
+        sentinel_binding = object()
+        with (
+            mock.patch.object(
+                synapse_cli,
+                "binding_from_environment",
+                return_value=sentinel_binding,
+            ),
+            mock.patch.object(
+                synapse_cli, "build_backend", return_value=fake_backend
+            ),
+            mock.patch.object(
+                synapse_cli.media_similarity,
+                "query_similar_media_transient",
+                return_value={
+                    "action": "media-similarity-transient-recall",
+                    "results": [],
+                },
+            ) as transient,
+        ):
+            payload = synapse_cli.command_image_similar_transient(args)
+
+        fake_backend.list_media_references.assert_called_once_with(
+            context_id="demo",
+            recall_scope="local",
+        )
+        transient.assert_called_once()
+        call = transient.call_args
+        self.assertIs(call.args[0], sentinel_binding)
+        self.assertEqual(call.args[1], Path("/private/tmp/query.png"))
+        self.assertEqual(call.kwargs["scope_media_ids"], [referenced])
+        self.assertEqual(call.kwargs["result_limit"], 3)
+        # The CLI must reuse the exact helper: no enricher injection, no
+        # alternate trust surface for the transient lane.
+        self.assertNotIn("vision_enricher", call.kwargs)
+        self.assertEqual(payload["context_id"], "demo")
+        self.assertEqual(payload["recall_scope"], "local")
+        self.assertEqual(payload["action"], "media-similarity-transient-recall")
+
     def test_capture_image_cli_requires_confirmation_and_routes_typed_metadata(self):
         import synapse_cli
 
@@ -335,6 +396,7 @@ class SynapseCliTests(unittest.TestCase):
 
         digest = "a" * 64
         runtime_digest = "c" * 64
+        media_digest = "d" * 64
         backend = mock.Mock()
         backend.verify_recovery_bundle.return_value = {"verified": True}
         backend.restore_recovery_bundle_isolated.return_value = {"verified": True}
@@ -351,6 +413,7 @@ class SynapseCliTests(unittest.TestCase):
                 expected_capture_sha256=None,
                 expected_request_journal_sha256=digest,
                 expected_runtime_state_sha256=runtime_digest,
+                expected_media_sha256=media_digest,
             )
             restore_args = mock.Mock(
                 receipt=receipt,
@@ -360,6 +423,7 @@ class SynapseCliTests(unittest.TestCase):
                 expected_capture_sha256=None,
                 expected_request_journal_sha256=digest,
                 expected_runtime_state_sha256=runtime_digest,
+                expected_media_sha256=media_digest,
                 confirm=True,
             )
 
@@ -377,6 +441,7 @@ class SynapseCliTests(unittest.TestCase):
             expected_capture_sha256=None,
             expected_request_journal_sha256=digest,
             expected_runtime_state_sha256=runtime_digest,
+            expected_media_sha256=media_digest,
         )
         backend.restore_recovery_bundle_isolated.assert_called_once_with(
             receipt,
@@ -386,6 +451,7 @@ class SynapseCliTests(unittest.TestCase):
             expected_capture_sha256=None,
             expected_request_journal_sha256=digest,
             expected_runtime_state_sha256=runtime_digest,
+            expected_media_sha256=media_digest,
             confirm=True,
         )
 

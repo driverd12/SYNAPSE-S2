@@ -52,10 +52,22 @@ from scripts.operator_readiness_certify import (
     runtime_status_from_mcp_envelope,
     sanitize_evidence_text,
     write_private_text,
+    _guarded_media_recovery_contract,
 )
 
 
 class OperatorReadinessCertifierTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Keep ordinary unit fixtures isolated from a real operator binding on
+        # the host. Tests that exercise binding discovery install their own
+        # narrower patch inside the test body.
+        self._default_binding_patch = mock.patch(
+            "scripts.operator_readiness_certify.default_binding_path",
+            return_value=Path("/private/tmp/synapse-s2-unit-missing-binding.json"),
+        )
+        self._default_binding_patch.start()
+        self.addCleanup(self._default_binding_patch.stop)
+
     @staticmethod
     def _set_canonical_contract_size(structured):
         contract = structured["response_contract"]
@@ -351,7 +363,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         recovery_proof_path.write_text(
             json.dumps(
                 {
-                    "schema": "synapse-s2.recovery-bundle-restore.v2",
+                    "schema": "synapse-s2.recovery-bundle-restore.v3",
                     "mode": "isolated-recovery-proof",
                     "verified": True,
                     "cutover_ready": True,
@@ -363,6 +375,12 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     "missing_transport_ledger_count": 0,
                     "capture_ledger_binding": binding,
                     "reconciliation": reconciliation,
+                    "media_included": False,
+                    "media_recovery_complete": True,
+                    "media_reference_count": 0,
+                    "media_sha256": None,
+                    "media_manifest_sha256": None,
+                    "media_object_count": 0,
                 },
                 indent=2,
                 sort_keys=True,
@@ -379,11 +397,17 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 "ledger_audit_revision": "b" * 64,
             },
             "bundle": {
+                "bundle_schema": "synapse-s2.recovery-bundle.v3",
                 "bundle_verified": True,
                 "cutover_ready": True,
                 "capture_file_count": 7,
                 "capture_ledger_binding": binding,
                 "reconciliation": reconciliation,
+                "media_included": False,
+                "media_archive_sha256": None,
+                "media_manifest_sha256": None,
+                "media_object_count": 0,
+                "media_reconciliation": {"referenced_count": 0},
             },
             "verification": {
                 "verified": True,
@@ -394,6 +418,10 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 },
                 "capture_ledger_binding": binding,
                 "reconciliation": reconciliation,
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_reference_count": 0,
+                "media": None,
             },
             "restore": {
                 "verified": True,
@@ -402,9 +430,164 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 "missing_transport_ledger_count": 0,
                 "capture_ledger_binding": binding,
                 "reconciliation": reconciliation,
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_reference_count": 0,
+                "media_object_count": 0,
                 "recovery_proof_path": str(recovery_proof_path),
             },
         }
+
+    @staticmethod
+    def _media_contract_evidence(
+        *,
+        bundle_schema: str,
+        restore_schema: str,
+        references: int = 0,
+    ):
+        included = references > 0
+        media_sha256 = "1" * 64 if included else None
+        manifest_sha256 = "2" * 64 if included else None
+        media = (
+            {
+                "sha256": media_sha256,
+                "manifest_sha256": manifest_sha256,
+                "object_count": references,
+                "referenced_count": references,
+                "verified": True,
+            }
+            if included
+            else None
+        )
+        bundle = {
+            "bundle_schema": bundle_schema,
+            "media_included": included,
+            "media_archive_sha256": media_sha256,
+            "media_manifest_sha256": manifest_sha256,
+            "media_object_count": references,
+            "media_reconciliation": {"referenced_count": references},
+        }
+        verification = {
+            "governance_mode": "pre-governed-v5",
+            "media_included": included,
+            "media_recovery_complete": True,
+            "media_reference_count": references,
+            "media": media,
+        }
+        restore = {
+            "media_included": included,
+            "media_recovery_complete": True,
+            "media_reference_count": references,
+            "media_object_count": references,
+        }
+        proof = {
+            "schema": restore_schema,
+            "governance_mode": "pre-governed-v5",
+            "store_generation": "legacy-v5",
+            "authority_epoch_number": None,
+            "media_included": included,
+            "media_recovery_complete": True,
+            "media_reference_count": references,
+            "media_sha256": media_sha256,
+            "media_manifest_sha256": manifest_sha256,
+            "media_object_count": references,
+        }
+        return bundle, verification, restore, proof
+
+    def test_media_recovery_contract_accepts_regenerated_zero_ref_v1_v2_v3(self):
+        for bundle_schema, restore_schema in (
+            (
+                "synapse-s2.recovery-bundle.v1",
+                "synapse-s2.recovery-bundle-restore.v1",
+            ),
+            (
+                "synapse-s2.recovery-bundle.v2",
+                "synapse-s2.recovery-bundle-restore.v2",
+            ),
+            (
+                "synapse-s2.recovery-bundle.v3",
+                "synapse-s2.recovery-bundle-restore.v3",
+            ),
+        ):
+            with self.subTest(bundle_schema=bundle_schema):
+                evidence = self._media_contract_evidence(
+                    bundle_schema=bundle_schema,
+                    restore_schema=restore_schema,
+                )
+                ready, metrics = _guarded_media_recovery_contract(
+                    bundle=evidence[0],
+                    verification=evidence[1],
+                    restore=evidence[2],
+                    proof=evidence[3],
+                )
+                self.assertTrue(ready)
+                self.assertTrue(metrics["media_recovery_complete"])
+                self.assertEqual(metrics["media_reference_count"], 0)
+                self.assertEqual(metrics["media_object_count"], 0)
+
+    def test_media_recovery_contract_accepts_exact_referenced_v3(self):
+        evidence = self._media_contract_evidence(
+            bundle_schema="synapse-s2.recovery-bundle.v3",
+            restore_schema="synapse-s2.recovery-bundle-restore.v3",
+            references=2,
+        )
+        ready, metrics = _guarded_media_recovery_contract(
+            bundle=evidence[0],
+            verification=evidence[1],
+            restore=evidence[2],
+            proof=evidence[3],
+        )
+        self.assertTrue(ready)
+        self.assertTrue(metrics["media_included"])
+        self.assertEqual(metrics["media_object_count"], 2)
+        self.assertEqual(metrics["media_reference_count"], 2)
+
+    def test_media_recovery_contract_rejects_omission_tamper_and_mismatch(self):
+        mutations = (
+            lambda phases: phases[3].pop("media_recovery_complete"),
+            lambda phases: phases[3].__setitem__("media_sha256", "f" * 64),
+            lambda phases: phases[2].__setitem__("media_reference_count", 1),
+        )
+        for mutate in mutations:
+            phases = list(
+                self._media_contract_evidence(
+                    bundle_schema="synapse-s2.recovery-bundle.v3",
+                    restore_schema="synapse-s2.recovery-bundle-restore.v3",
+                    references=2,
+                )
+            )
+            mutate(phases)
+            ready, _metrics = _guarded_media_recovery_contract(
+                bundle=phases[0],
+                verification=phases[1],
+                restore=phases[2],
+                proof=phases[3],
+            )
+            self.assertFalse(ready)
+
+    def test_media_recovery_contract_refuses_legacy_image_references(self):
+        for bundle_schema, restore_schema in (
+            (
+                "synapse-s2.recovery-bundle.v1",
+                "synapse-s2.recovery-bundle-restore.v1",
+            ),
+            (
+                "synapse-s2.recovery-bundle.v2",
+                "synapse-s2.recovery-bundle-restore.v2",
+            ),
+        ):
+            phases = self._media_contract_evidence(
+                bundle_schema=bundle_schema,
+                restore_schema=restore_schema,
+                references=1,
+            )
+            ready, _metrics = _guarded_media_recovery_contract(
+                bundle=phases[0],
+                verification=phases[1],
+                restore=phases[2],
+                proof=phases[3],
+            )
+            self.assertFalse(ready)
 
     def test_cli_commands_use_core_route_without_local_topology(self):
         with TemporaryDirectory() as tmp:

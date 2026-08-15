@@ -4961,5 +4961,317 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertTrue(accepted_payload["operation_id"].startswith("s2maint_"))
 
 
+class DashboardMediaSimilarityTests(unittest.TestCase):
+    """The stored-image similarity route is read-only, authoritative, and content-free."""
+
+    def setUp(self) -> None:
+        from tempfile import TemporaryDirectory as _TemporaryDirectory
+
+        from core_client_binding import CoreClientBinding
+        from tests.test_media_similarity import (
+            _fake_converter,
+            _png_bytes,
+            _vision_payload,
+        )
+        from image_capture import ImageCaptureCache
+
+        temporary_parent = Path("/private/tmp")
+        self.temporary = _TemporaryDirectory(
+            prefix="s2-dashboard-media-similar-",
+            dir=str(temporary_parent) if temporary_parent.is_dir() else None,
+        )
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo_root = self.root / "repo"
+        self.data_root = self.repo_root / ".synapse_s2"
+        core_root = self.data_root / "core"
+        core_root.mkdir(parents=True, mode=0o700)
+        self.data_root.chmod(0o700)
+        self.binding = CoreClientBinding(
+            repo_root=self.repo_root,
+            data_root=self.data_root,
+            config_path=core_root / "service.json",
+            socket_path=core_root / "service.sock",
+            state_path=self.data_root / "runtime_state.json",
+            memory_path=self.data_root / "memory.sqlite3",
+            capture_root=self.data_root,
+            export_root=self.data_root / "exports",
+            backup_root=self.data_root / "backups",
+            recovery_root=self.data_root / "recovery",
+            replication_inbox_root=self.data_root / "replication" / "inbox",
+            core_label="dashboard-media-similar-test-core",
+            config_digest="a" * 64,
+            config_fingerprint="b" * 64,
+            embedding_space_identity="c" * 64,
+            layout="canonical",
+            authority_mode="authoritative-core-v6",
+        )
+        self.backend = SpikingAttentionBackend(
+            dimension=16,
+            num_neurons=12,
+            default_top_k=2,
+            recall_count=3,
+            compile_graph=False,
+            state_path=self.root / "state.json",
+            memory_path=self.root / "memory.sqlite3",
+        )
+        self.addCleanup(self.backend.memory_store.close)
+        self._png_bytes = _png_bytes
+        self._vision_payload = _vision_payload
+        self._fake_converter = _fake_converter
+        self._image_cache_class = ImageCaptureCache
+
+    def _capture(self, media_id: str, elements: tuple[float, ...]) -> None:
+        source = self.root / f"source-{media_id}.png"
+        source.write_bytes(self._png_bytes(seed=int(media_id[6:8], 16)))
+        source.chmod(0o600)
+
+        def enricher(_source, mode, derivative):
+            return self._vision_payload(mode, derivative, elements=elements)
+
+        self._image_cache_class(
+            self.binding,
+            converter=self._fake_converter,
+            vision_enricher=enricher,
+        ).capture_image(
+            source,
+            media_id=media_id,
+            vision_mode="feature-print",
+            vision_required=True,
+        )
+
+    def _reference(self, media_id: str, index: int, context: str = "demo") -> None:
+        self.backend.memory_store.upsert_entry(
+            tag=f"dashboard-image-memory-{index}",
+            context_id=context,
+            source_text=f"dashboard image memory fixture {index}",
+            metadata={"context_memory_type": "image", "media_id": media_id},
+            embedding_dimensions=16,
+            spike_indices=[1],
+            neuron_indices=[2],
+            registered_at=100.0 + index,
+        )
+
+    def _runtime(self, backend=None, binding="default") -> DashboardRuntime:
+        return DashboardRuntime(
+            backend if backend is not None else self.backend,
+            binding=self.binding if binding == "default" else binding,
+        )
+
+    @staticmethod
+    def _decode(response):
+        status, headers, body = response
+        assert headers["Content-Type"] == "application/json; charset=utf-8"
+        return status, json.loads(body.decode("utf-8"))
+
+    def test_media_similar_ranks_only_authoritative_scope_and_ignores_client_candidates(self):
+        query_id = "s2img_" + "0" * 32
+        near_id = "s2img_" + "1" * 32
+        far_id = "s2img_" + "2" * 32
+        orphan_id = "s2img_" + "3" * 32
+        vectors = {
+            query_id: (0.0, 0.0, 0.0, 0.0),
+            near_id: (0.5, 0.0, 0.0, 0.0),
+            far_id: (2.0, 0.0, 0.0, 0.0),
+            orphan_id: (0.0, 0.0, 0.0, 0.0),
+        }
+        for index, media_id in enumerate((query_id, near_id, far_id)):
+            self._reference(media_id, index)
+        for media_id, vector in vectors.items():
+            self._capture(media_id, vector)
+        runtime = self._runtime()
+
+        status, payload = self._decode(
+            runtime.handle(
+                "GET",
+                "/api/media-similar?media_id="
+                + query_id
+                + "&context_id=demo&limit=5"
+                # Client-supplied candidate IDs must be ignored, never trusted.
+                + "&candidate_ids=" + orphan_id,
+            )
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["media_id"] for item in payload["results"]], [near_id, far_id]
+        )
+        self.assertEqual(payload["context_id"], "demo")
+        self.assertEqual(payload["recall_scope"], "local")
+        self.assertFalse(payload["feature_print_bytes_returned"])
+        self.assertFalse(payload["confidence"]["calibrated"])
+        self.assertIn("warning", payload["confidence"])
+        rendered = json.dumps(payload, sort_keys=True)
+        self.assertNotIn(orphan_id, rendered)
+        self.assertNotIn(str(self.data_root), rendered)
+        import base64 as _base64
+        import struct as _struct
+
+        for vector in vectors.values():
+            encoded = _base64.b64encode(_struct.pack("<4f", *vector)).decode("ascii")
+            self.assertNotIn(encoded, rendered)
+
+    def test_media_similar_is_read_only_and_rejects_non_get(self):
+        query_id = "s2img_" + "0" * 32
+        near_id = "s2img_" + "1" * 32
+        for index, media_id in enumerate((query_id, near_id)):
+            self._reference(media_id, index)
+            self._capture(media_id, (float(index), 0.0, 0.0, 0.0))
+        backend = self.backend
+        mutation_calls: list[str] = []
+
+        class MutationGuard:
+            def __getattr__(self, name):
+                target = getattr(backend, name)
+                contract = CORE_OPERATION_CONTRACTS.get(name)
+                if contract is None or not contract.mutation:
+                    return target
+
+                def forbidden(*_args, **_kwargs):
+                    mutation_calls.append(name)
+                    raise AssertionError(
+                        f"media-similar GET invoked mutation operation {name}"
+                    )
+
+                return forbidden
+
+        runtime = self._runtime(backend=MutationGuard())
+        route = f"/api/media-similar?media_id={query_id}&context_id=demo"
+
+        get_status, _headers, _body = runtime.handle("GET", route)
+        post_status, _post_headers, _post_body = runtime.handle(
+            "POST", route, b"{}"
+        )
+
+        self.assertEqual(get_status, 200)
+        self.assertEqual(post_status, 404)
+        self.assertEqual(mutation_calls, [])
+
+    def test_media_similar_validates_input_without_reflection(self):
+        runtime = self._runtime()
+        hostile = "..%2F..%2Fetc%2Fpasswd"
+
+        invalid_status, invalid = self._decode(
+            runtime.handle("GET", f"/api/media-similar?media_id={hostile}")
+        )
+        scope_status, scope = self._decode(
+            runtime.handle(
+                "GET",
+                "/api/media-similar?media_id=s2img_"
+                + "a" * 32
+                + "&recall_scope=everything",
+            )
+        )
+        limit_status, limit = self._decode(
+            runtime.handle(
+                "GET",
+                "/api/media-similar?media_id=s2img_"
+                + "a" * 32
+                + "&limit=abc",
+            )
+        )
+        missing_status, missing = self._decode(
+            runtime.handle(
+                "GET",
+                "/api/media-similar?media_id=s2img_" + "a" * 32,
+            )
+        )
+
+        self.assertEqual(invalid_status, 400)
+        self.assertNotIn("passwd", invalid["error"])
+        self.assertNotIn("..", invalid["error"])
+        self.assertEqual(scope_status, 400)
+        self.assertNotIn("everything", scope["error"])
+        self.assertEqual(limit_status, 400)
+        self.assertEqual(missing_status, 404)
+        self.assertEqual(
+            missing["error"],
+            "query image is not referenced inside this recall scope",
+        )
+        for payload in (invalid, scope, limit, missing):
+            self.assertNotIn(str(self.data_root), json.dumps(payload))
+
+    def test_media_similar_requires_verified_core_binding(self):
+        query_id = "s2img_" + "0" * 32
+        self._reference(query_id, 0)
+        runtime = self._runtime(binding=None)
+        if runtime._binding is not None:
+            runtime._binding = None
+
+        status, payload = self._decode(
+            runtime.handle(
+                "GET", f"/api/media-similar?media_id={query_id}&context_id=demo"
+            )
+        )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            payload["error"], "image similarity requires a verified core binding"
+        )
+
+    def test_media_similar_surfaces_integrity_drift_as_conflict(self):
+        import shutil
+
+        query_id = "s2img_" + "0" * 32
+        missing_id = "s2img_" + "1" * 32
+        for index, media_id in enumerate((query_id, missing_id)):
+            self._reference(media_id, index)
+            self._capture(media_id, (float(index), 0.0, 0.0, 0.0))
+        media_root = self.data_root / "media-cache"
+        victims = [
+            path
+            for path in media_root.rglob(missing_id)
+            if path.is_dir()
+        ]
+        self.assertTrue(victims)
+        for victim in victims:
+            shutil.rmtree(victim)
+        runtime = self._runtime()
+
+        status, payload = self._decode(
+            runtime.handle(
+                "GET", f"/api/media-similar?media_id={query_id}&context_id=demo"
+            )
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn("local cache derivative", payload["error"])
+        self.assertNotIn(str(self.data_root), payload["error"])
+
+    def test_similarity_ui_assets_are_accessible_and_content_free(self):
+        html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+        styles = (ROOT / "web" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn('<section id="imageSimilarPanel"', html)
+        self.assertIn('role="region" aria-label="Similar image results"', html)
+        self.assertIn('aria-label="Close similar image results"', html)
+        self.assertIn('id="imageSimilarState" class="image-capture-state" aria-live="polite"', html)
+        self.assertIn('id="imageSimilarWarnings" class="image-similar-warnings" aria-live="polite"', html)
+        # The panel must not render until a query is requested.
+        self.assertIn('class="image-similar-panel" hidden', html)
+        self.assertIn("uncalibrated", html)
+
+        self.assertIn('"/api/media-similar"', script)
+        # The browser names only the query, context, scope and limits.
+        self.assertNotIn("candidate_ids", script)
+        self.assertNotIn("scope_media_ids", script)
+        self.assertNotIn("feature_print_bytes", script)
+        self.assertIn("Find images similar to", script)
+        self.assertIn("state.imageCapture.similarOpen", script)
+        self.assertIn("closeImageSimilar()", script)
+        self.assertIn("similarObjectUrls.forEach((url) => URL.revokeObjectURL(url))", script)
+        # Result media IDs are re-validated client-side before any thumbnail fetch.
+        self.assertGreaterEqual(script.count("/^s2img_[0-9a-f]{32}$/"), 2)
+        escape_handler = script[script.index("event.key === \"Escape\" && state.imageCapture.similarOpen"):]
+        self.assertIn("closeImageSimilar()", escape_handler[:200])
+
+        self.assertIn(".image-similar-panel", styles)
+        self.assertIn("overflow-x: hidden", styles)
+        narrow = styles[styles.index("@media (max-width: 430px)"):]
+        self.assertIn(".image-similar-results", narrow)
+        self.assertIn("grid-template-columns: 1fr", narrow)
+
+
 if __name__ == "__main__":
     unittest.main()

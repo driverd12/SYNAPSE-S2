@@ -3,12 +3,16 @@ from __future__ import annotations
 import hashlib
 import copy
 import base64
+import binascii
 import json
 import os
+import shutil
 import sqlite3
+import struct
 import tempfile
 import time
 import unittest
+import zlib
 from contextlib import closing
 from pathlib import Path
 from unittest import mock
@@ -17,18 +21,26 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from core_authority import CoreAuthorityLease
+from core_client_binding import CoreClientBinding
 from core_request_journal import CoreRequestJournal
+from image_capture import ConversionResult, ImageCaptureCache
 from memory_store import DurableMemoryStore
 from recovery_manager import VerifiedRecoveryManager
 from replication_manager import ReplicationManager
 from replication_protocol import (
     AUTH_FIELDS,
+    BASE_NODE_CAPABILITIES,
+    MEDIA_ARTIFACT_CAPABILITY,
+    NODE_CAPABILITIES,
+    NODE_DESCRIPTOR_SCHEMA,
+    REPLICATION_PROTOCOL_VERSION,
     ReplicationProtocolError,
     checkpoint_id_for,
     read_private_json,
     sign_payload,
     validate_ack,
     validate_checkpoint,
+    validate_descriptor_transition,
     validate_node_descriptor,
     write_private_json_exclusive,
 )
@@ -1128,6 +1140,1187 @@ class ReplicationManagerTests(unittest.TestCase):
                     expected_size=source.stat().st_size,
                 )
         self.assertIn(opened["source"], closed)
+
+    # ------------------------------------------------------------------
+    # Recovery-bundle v3 media artifact replication
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _media_png_bytes(seed: int) -> bytes:
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + kind
+                + data
+                + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+            )
+
+        width, height = 32, 16
+        rows = bytearray()
+        for y in range(height):
+            rows.append(0)
+            for x in range(width):
+                rows.extend(
+                    ((x * 7 + seed) % 256, (y * 13 + seed) % 256, ((x + y) * 11 + seed) % 256)
+                )
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+            + chunk(b"IEND", b"")
+        )
+
+    @staticmethod
+    def _media_converter(source: Path, work_root: Path) -> ConversionResult:
+        del source
+        width, height = 32, 16
+        row_stride = ((width * 24 + 31) // 32) * 4
+        pixel_bytes = bytearray()
+        for source_y in range(height - 1, -1, -1):
+            row = bytearray()
+            for x in range(width):
+                row.extend(((x * 3) % 256, (source_y * 5) % 256, ((x + source_y) * 7) % 256))
+            row.extend(b"\x00" * (row_stride - len(row)))
+            pixel_bytes.extend(row)
+        pixel_offset = 14 + 40
+        bmp = (
+            b"BM"
+            + struct.pack("<IHHI", pixel_offset + len(pixel_bytes), 0, 0, pixel_offset)
+            + struct.pack(
+                "<IiiHHIIiiII", 40, width, height, 1, 24, 0, len(pixel_bytes), 2835, 2835, 0, 0
+            )
+            + bytes(pixel_bytes)
+        )
+        bmp_path = work_root / "normalized.bmp"
+        thumbnail_path = work_root / "thumbnail.jpg"
+        bmp_path.write_bytes(bmp)
+        thumbnail_path.write_bytes(b"\xff\xd8\xff\xe0replication-media-thumb\xff\xd9")
+        bmp_path.chmod(0o600)
+        thumbnail_path.chmod(0o600)
+        return ConversionResult(
+            source_width=32, source_height=16, bmp_path=bmp_path, thumbnail_path=thumbnail_path
+        )
+
+    def _attach_media(
+        self,
+        store: DurableMemoryStore,
+        node_root: Path,
+        media_id: str,
+        elements: tuple[float, ...],
+    ) -> None:
+        """Reference one image memory and place its validated cache object."""
+
+        store.upsert_entry(
+            tag=f"replication-image-{media_id[-6:]}",
+            context_id="default",
+            source_text="Replication media fixture",
+            metadata={"context_memory_type": "image", "media_id": media_id},
+            embedding_dimensions=8,
+            spike_indices=[1],
+            neuron_indices=[2],
+            registered_at=100.0,
+        )
+        parent = Path("/private/tmp")
+        with tempfile.TemporaryDirectory(
+            prefix="s2-replication-media-",
+            dir=str(parent) if parent.is_dir() else None,
+        ) as fixture_name:
+            fixture_root = Path(fixture_name)
+            fixture_root.chmod(0o700)
+            repo_root = fixture_root / "repo"
+            data_root = repo_root / ".synapse_s2"
+            (data_root / "core").mkdir(parents=True, mode=0o700)
+            data_root.chmod(0o700)
+            binding = CoreClientBinding(
+                repo_root=repo_root,
+                data_root=data_root,
+                config_path=data_root / "core" / "service.json",
+                socket_path=data_root / "core" / "service.sock",
+                state_path=data_root / "runtime_state.json",
+                memory_path=data_root / "memory.sqlite3",
+                capture_root=data_root,
+                export_root=data_root / "exports",
+                backup_root=data_root / "backups",
+                recovery_root=data_root / "recovery",
+                replication_inbox_root=data_root / "replication" / "inbox",
+                core_label="replication-media-fixture-core",
+                config_digest="a" * 64,
+                config_fingerprint="b" * 64,
+                embedding_space_identity="c" * 64,
+                layout="canonical",
+                authority_mode="authoritative-core-v6",
+            )
+            source = fixture_root / "source.png"
+            source.write_bytes(self._media_png_bytes(seed=len(media_id)))
+            source.chmod(0o600)
+
+            def enricher(_source: Path, mode: str, derivative: str) -> dict:
+                feature_data = struct.pack(f"<{len(elements)}f", *elements)
+                return {
+                    "schema": "synapse-s2.apple-vision-enrichment.v1",
+                    "provider": "apple-vision",
+                    "mode": mode,
+                    "status": "ready",
+                    "input_derivative": derivative,
+                    "input_dimensions": {"width": 32, "height": 16},
+                    "feature_print": {
+                        "status": "ready",
+                        "schema": "synapse-s2.apple-vision-feature-print.v1",
+                        "request_revision": 2,
+                        "element_type": "float32",
+                        "element_count": len(elements),
+                        "encoding": "base64-little-endian",
+                        "data": base64.b64encode(feature_data).decode("ascii"),
+                    },
+                }
+
+            ImageCaptureCache(
+                binding,
+                converter=self._media_converter,
+                vision_enricher=enricher,
+            ).capture_image(
+                source,
+                media_id=media_id,
+                vision_mode="feature-print",
+                vision_required=True,
+            )
+            objects_root = node_root / "media-cache" / "objects"
+            (node_root / "media-cache").mkdir(mode=0o700, exist_ok=True)
+            objects_root.mkdir(mode=0o700, exist_ok=True)
+            shutil.move(
+                str(data_root / "media-cache" / "objects" / media_id),
+                str(objects_root / media_id),
+            )
+
+    def _media_source(self) -> tuple[ReplicationManager, str]:
+        source = self.manager("source")
+        media_id = "s2img_" + "a" * 32
+        self._attach_media(
+            source.store,
+            self.root / "source",
+            media_id,
+            (0.25, 0.5, 0.75, 1.0),
+        )
+        return source, media_id
+
+    def test_v3_media_artifact_is_bound_through_stage_and_ack(self):
+        source, media_id = self._media_source()
+        receiver = self.manager("receiver")
+        self.pair(source, receiver)
+        exported = source.create_checkpoint(receiver.node_id)
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        records = {str(item["kind"]): item for item in manifest["artifacts"]}
+        self.assertIn("media", records)
+        self.assertEqual(len(manifest["artifacts"]), 8)
+        receipt = read_private_json(
+            Path(str(exported["checkpoint_directory"]))
+            / str(manifest["bundle_receipt_name"])
+        )
+        self.assertEqual(receipt["schema"], "synapse-s2.recovery-bundle.v3")
+        self.assertEqual(records["media"]["sha256"], receipt["media_sha256"])
+        self.assertEqual(records["media"]["name"], receipt["media_artifact_name"])
+
+        staged = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(staged["verified"])
+        restore_root = Path(str(staged["restore_root"]))
+        restored_objects = restore_root / "media-cache" / "objects"
+        self.assertEqual(
+            sorted(path.name for path in restored_objects.iterdir()),
+            [media_id],
+        )
+        proof = read_private_json(restore_root / "recovery-proof.receipt.json")
+        self.assertIs(proof["media_included"], True)
+        self.assertIs(proof["media_recovery_complete"], True)
+        self.assertEqual(proof["media_sha256"], receipt["media_sha256"])
+        # The receiver's live cache is never touched by staging.
+        self.assertFalse((self.root / "receiver" / "media-cache").exists())
+
+        replay = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["ack_digest"], staged["ack_digest"])
+        recorded = source.record_acknowledgement(staged["ack_path"])
+        self.assertEqual(recorded["state"], "acknowledged")
+
+    def test_media_artifact_missing_swapped_or_tampered_is_rejected(self):
+        source, _media_id = self._media_source()
+        receiver = self.manager("receiver")
+        self.pair(source, receiver)
+        exported = source.create_checkpoint(receiver.node_id)
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        records = [dict(item) for item in manifest["artifacts"]]
+        media_record = next(item for item in records if item["kind"] == "media")
+
+        # Missing media artifact: manifest without the media record while the
+        # signed v3 receipt still requires it.
+        without_media = [item for item in records if item["kind"] != "media"]
+        missing_path = self.signed_variant(
+            source,
+            exported,
+            name="missing-media",
+            changes={
+                "artifacts": without_media,
+                "artifact_count": len(without_media),
+                "artifact_total_bytes": sum(
+                    int(item["size_bytes"]) for item in without_media
+                ),
+            },
+        )
+        with self.assertRaises((ReplicationProtocolError, ValueError, RuntimeError)):
+            receiver.stage_checkpoint(missing_path)
+
+        # Swapped media digest: a validly-shaped manifest that binds a foreign
+        # digest for the media artifact.
+        swapped_records = [
+            {**item, "sha256": "f" * 64} if item["kind"] == "media" else item
+            for item in records
+        ]
+        swapped_path = self.signed_variant(
+            source,
+            exported,
+            name="swapped-media",
+            changes={"artifacts": swapped_records},
+        )
+        with self.assertRaises((ReplicationProtocolError, ValueError, RuntimeError)):
+            receiver.stage_checkpoint(swapped_path)
+
+        # Tampered media bytes under the correct manifest.
+        tampered_root = self.root / "tampered-media"
+        tampered_root.mkdir(mode=0o700)
+        original_root = Path(str(exported["checkpoint_directory"]))
+        for item in records:
+            data = (original_root / str(item["name"])).read_bytes()
+            destination = tampered_root / str(item["name"])
+            destination.write_bytes(data)
+            destination.chmod(0o600)
+        media_path = tampered_root / str(media_record["name"])
+        tampered = bytearray(media_path.read_bytes())
+        tampered[len(tampered) // 2] ^= 0x01
+        media_path.write_bytes(bytes(tampered))
+        media_path.chmod(0o600)
+        manifest_path = tampered_root / "checkpoint.manifest.json"
+        write_private_json_exclusive(source.store, manifest_path, manifest)
+        with self.assertRaises((ReplicationProtocolError, ValueError, RuntimeError)):
+            receiver.stage_checkpoint(manifest_path)
+        self.assertFalse(
+            (self.root / "receiver" / "media-cache").exists()
+        )
+
+    def test_downgraded_media_absent_checkpoint_fails_closed(self):
+        source, _media_id = self._media_source()
+        receiver = self.manager("receiver")
+        self.pair(source, receiver)
+        exported = source.create_checkpoint(receiver.node_id)
+        original_root = Path(str(exported["checkpoint_directory"]))
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        records = [dict(item) for item in manifest["artifacts"]]
+        receipt_name = str(manifest["bundle_receipt_name"])
+        receipt = read_private_json(original_root / receipt_name)
+
+        downgraded = {
+            key: value
+            for key, value in receipt.items()
+            if not key.startswith("media_")
+        }
+        downgraded["schema"] = "synapse-s2.recovery-bundle.v2"
+        source.store._authenticate_receipt(downgraded)
+        variant_root = self.root / "downgraded-media"
+        variant_root.mkdir(mode=0o700)
+        downgraded_records = []
+        for item in records:
+            if item["kind"] == "media":
+                continue
+            if item["kind"] == "bundle_receipt":
+                destination = variant_root / receipt_name
+                write_private_json_exclusive(source.store, destination, downgraded)
+                payload = destination.read_bytes()
+                downgraded_records.append(
+                    {
+                        **item,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "size_bytes": len(payload),
+                    }
+                )
+                continue
+            data = (original_root / str(item["name"])).read_bytes()
+            destination = variant_root / str(item["name"])
+            destination.write_bytes(data)
+            destination.chmod(0o600)
+            downgraded_records.append(item)
+        unsigned = {
+            key: value for key, value in manifest.items() if key not in AUTH_FIELDS
+        }
+        unsigned["artifacts"] = downgraded_records
+        unsigned["artifact_count"] = len(downgraded_records)
+        unsigned["artifact_total_bytes"] = sum(
+            int(item["size_bytes"]) for item in downgraded_records
+        )
+        unsigned["bundle_receipt_digest"] = str(downgraded["receipt_digest"])
+        variant = sign_payload(source.store, unsigned)
+        validate_checkpoint(variant)
+        manifest_path = variant_root / "checkpoint.manifest.json"
+        write_private_json_exclusive(source.store, manifest_path, variant)
+
+        # A signed v2 checkpoint whose database still references image
+        # memories but that ships no media stages is incomplete: it must
+        # never verify, advance lineage, or earn a cutover-ready ACK.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "does not match its recovery proof inputs"
+        ):
+            receiver.stage_checkpoint(manifest_path)
+        self.assertIsNone(
+            receiver.ledger.latest_checkpoint(
+                lineage_id=str(variant["lineage_id"]), direction="incoming"
+            )
+        )
+        staged_lineage = (
+            receiver.staged_root
+            / str(variant["lineage_id"])
+            / str(variant["checkpoint_id"])
+        )
+        self.assertFalse(staged_lineage.exists())
+
+    def _downgrade_node(self, manager: ReplicationManager) -> dict[str, object]:
+        """Rewrite a node's active descriptor to the legacy baseline list."""
+
+        baseline = sign_payload(
+            manager.store,
+            {
+                "schema": NODE_DESCRIPTOR_SCHEMA,
+                "protocol_version": REPLICATION_PROTOCOL_VERSION,
+                "node_id": manager.node_id,
+                "role": "offline-checkpoint-peer",
+                "capabilities": list(BASE_NODE_CAPABILITIES),
+                "created_at": time.time(),
+            },
+        )
+        validate_node_descriptor(baseline)
+        manager.descriptor_path.unlink()
+        write_private_json_exclusive(manager.store, manager.descriptor_path, baseline)
+        manager._descriptor = baseline
+        return baseline
+
+    def test_bilateral_media_activation_requires_both_nodes_and_pins(self):
+        source, media_id = self._media_source()
+        receiver = self.manager("receiver")
+        source_baseline = self._downgrade_node(source)
+        receiver_baseline = self._downgrade_node(receiver)
+        lineage = self.pair(source, receiver)
+
+        # State 1: both nodes baseline.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "this node's active descriptor"
+        ):
+            source.create_checkpoint(receiver.node_id)
+
+        # State 2: sender node upgraded, target pin still baseline.
+        source_full = source.upgrade_node_descriptor(
+            expected_current_digest=str(source_baseline["receipt_digest"]),
+            confirm=True,
+        )
+        self.assertEqual(
+            [str(item) for item in source_full["capabilities"]],
+            list(NODE_CAPABILITIES),
+        )
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "target peer does not advertise"
+        ):
+            source.create_checkpoint(receiver.node_id)
+
+        # State 3: receiver node upgraded too, but the sender's pin of the
+        # receiver has not been re-reviewed, so media stays blocked.
+        receiver_full = receiver.upgrade_node_descriptor(
+            expected_current_digest=str(receiver_baseline["receipt_digest"]),
+            confirm=True,
+        )
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "target peer does not advertise"
+        ):
+            source.create_checkpoint(receiver.node_id)
+
+        upgraded_pin = source.upgrade_peer_descriptor(
+            receiver.node_descriptor(),
+            expected_descriptor_digest=str(receiver_full["receipt_digest"]),
+            expected_previous_descriptor_digest=str(
+                receiver_baseline["receipt_digest"]
+            ),
+            confirm=True,
+        )
+        self.assertEqual(
+            upgraded_pin["descriptor_digest"], str(receiver_full["receipt_digest"])
+        )
+        exported = source.create_checkpoint(receiver.node_id)
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        self.assertIn(
+            "media", {str(item["kind"]) for item in manifest["artifacts"]}
+        )
+        status = source.status()
+        pinned = {str(item["peer_id"]): item for item in status["peers"]}
+        self.assertEqual(
+            pinned[receiver.node_id]["previous_descriptor_digest"],
+            str(receiver_baseline["receipt_digest"]),
+        )
+        self.assertTrue(pinned[receiver.node_id]["media_ready"])
+
+        # State 4: the receiver's own pin of the source is still baseline, so
+        # the receiver independently rejects the media checkpoint before any
+        # staging work, regardless of what the sender enforced.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "pinned source peer"
+        ):
+            receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertIsNone(
+            receiver.ledger.latest_checkpoint(
+                lineage_id=lineage, direction="incoming"
+            )
+        )
+        self.assertFalse(
+            (receiver.staged_root / lineage / str(manifest["checkpoint_id"])).exists()
+        )
+
+        receiver.upgrade_peer_descriptor(
+            source.node_descriptor(),
+            expected_descriptor_digest=str(source_full["receipt_digest"]),
+            expected_previous_descriptor_digest=str(
+                source_baseline["receipt_digest"]
+            ),
+            confirm=True,
+        )
+        staged = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(staged["verified"])
+        restore_root = Path(str(staged["restore_root"]))
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (restore_root / "media-cache" / "objects").iterdir()
+            ),
+            [media_id],
+        )
+
+    def test_non_media_replication_stays_compatible_between_baseline_nodes(self):
+        # A legacy baseline sender (old code, v2 recovery bundle, no media
+        # artifact, no image references) must keep replicating into a
+        # receiver whose own descriptor and pinned source evidence are both
+        # baseline: the media gates never fire on non-media checkpoints.
+        source = self.manager("plain-source")
+        receiver = self.manager("plain-receiver")
+        self.pair(source, receiver)
+        exported = source.create_checkpoint(receiver.node_id)
+        original_root = Path(str(exported["checkpoint_directory"]))
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        receipt_name = str(manifest["bundle_receipt_name"])
+        receipt = read_private_json(original_root / receipt_name)
+        legacy_receipt = {
+            key: value
+            for key, value in receipt.items()
+            if not key.startswith("media_")
+        }
+        legacy_receipt["schema"] = "synapse-s2.recovery-bundle.v2"
+        source.store._authenticate_receipt(legacy_receipt)
+        variant_root = self.root / "legacy-plain"
+        variant_root.mkdir(mode=0o700)
+        legacy_records = []
+        for item in [dict(entry) for entry in manifest["artifacts"]]:
+            if item["kind"] == "media":
+                continue
+            if item["kind"] == "bundle_receipt":
+                destination = variant_root / receipt_name
+                write_private_json_exclusive(
+                    source.store, destination, legacy_receipt
+                )
+                payload = destination.read_bytes()
+                legacy_records.append(
+                    {
+                        **item,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "size_bytes": len(payload),
+                    }
+                )
+                continue
+            data = (original_root / str(item["name"])).read_bytes()
+            destination = variant_root / str(item["name"])
+            destination.write_bytes(data)
+            destination.chmod(0o600)
+            legacy_records.append(item)
+        unsigned = {
+            key: value for key, value in manifest.items() if key not in AUTH_FIELDS
+        }
+        unsigned["artifacts"] = legacy_records
+        unsigned["artifact_count"] = len(legacy_records)
+        unsigned["artifact_total_bytes"] = sum(
+            int(item["size_bytes"]) for item in legacy_records
+        )
+        unsigned["bundle_receipt_digest"] = str(legacy_receipt["receipt_digest"])
+        variant = sign_payload(source.store, unsigned)
+        validate_checkpoint(variant)
+        manifest_path = variant_root / "checkpoint.manifest.json"
+        write_private_json_exclusive(source.store, manifest_path, variant)
+
+        # Emulate a legacy receiver: baseline active descriptor and a source
+        # pinned before capability negotiation (no descriptor evidence).
+        self._downgrade_node(receiver)
+        (
+            receiver.peers_root
+            / f"{source.node_id}.descriptor.{str(source.node_descriptor()['receipt_digest'])}.json"
+        ).unlink()
+        staged = receiver.stage_checkpoint(manifest_path)
+        self.assertTrue(staged["verified"])
+        self.assertTrue(staged["memory_recovery_cutover_ready"])
+        proof = read_private_json(
+            Path(str(staged["restore_root"])) / "recovery-proof.receipt.json"
+        )
+        self.assertIs(proof["media_included"], False)
+
+    def test_current_v3_zero_reference_checkpoint_replicates_between_baseline_nodes(self):
+        # A current node whose database references zero image memories
+        # natively produces a verified media-absent v3 bundle: two
+        # baseline-descriptor nodes must complete the full create/stage/ack
+        # round trip because no media artifact means no media-artifact-v1
+        # activation is required on either side.
+        source = self.manager("zero-source")
+        receiver = self.manager("zero-receiver")
+        self._downgrade_node(source)
+        self._downgrade_node(receiver)
+        lineage = self.pair(source, receiver)
+
+        exported = source.create_checkpoint(receiver.node_id)
+        self.assertTrue(exported["memory_recovery_cutover_ready"])
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        self.assertNotIn(
+            "media", {str(item["kind"]) for item in manifest["artifacts"]}
+        )
+        receipt = read_private_json(
+            Path(str(exported["checkpoint_directory"]))
+            / str(manifest["bundle_receipt_name"])
+        )
+        self.assertEqual(receipt["schema"], "synapse-s2.recovery-bundle.v3")
+        self.assertIs(receipt["media_included"], False)
+        self.assertIsNone(receipt["media_sha256"])
+
+        staged = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(staged["verified"])
+        self.assertTrue(staged["memory_recovery_cutover_ready"])
+        restore_root = Path(str(staged["restore_root"]))
+        proof = read_private_json(restore_root / "recovery-proof.receipt.json")
+        self.assertIs(proof["media_included"], False)
+        self.assertTrue(proof["media_recovery_complete"])
+        self.assertEqual(
+            proof["media_recovery"], "media-not-required-zero-references"
+        )
+        self.assertEqual(proof["media_object_count"], 0)
+        self.assertFalse((restore_root / "media-cache").exists())
+
+        recorded = source.record_acknowledgement(staged["ack_path"])
+        self.assertEqual(recorded["state"], "acknowledged")
+        self.assertEqual(
+            source.status()["checkpoint_counts"]["outgoing:acknowledged"], 1
+        )
+        self.assertIsNotNone(
+            receiver.ledger.latest_checkpoint(
+                lineage_id=lineage, direction="incoming"
+            )
+        )
+
+    def test_baseline_sender_with_image_references_is_rejected_at_create(self):
+        # The zero-reference compatibility path never weakens the media gate:
+        # as soon as the database references an image memory, the bundle
+        # includes its media archive, and a baseline sender must be blocked
+        # at creation before any checkpoint is published or lineage advances.
+        source, _media_id = self._media_source()
+        receiver = self.manager("receiver")
+        self._downgrade_node(source)
+        lineage = self.pair(source, receiver)
+        with self.assertRaisesRegex(
+            ReplicationProtocolError,
+            "this node's active descriptor does not advertise media-artifact-v1",
+        ):
+            source.create_checkpoint(receiver.node_id)
+        self.assertIsNone(
+            source.ledger.latest_checkpoint(
+                lineage_id=lineage, direction="outgoing"
+            )
+        )
+        self.assertEqual(source.status()["checkpoint_counts"], {})
+
+    def test_descriptor_upgrade_evidence_survives_cas_crash_and_replays(self):
+        source, _media_id = self._media_source()
+        receiver = self.manager("receiver")
+        receiver_baseline = self._downgrade_node(receiver)
+        self.pair(source, receiver)
+        receiver_full = receiver.upgrade_node_descriptor(
+            expected_current_digest=str(receiver_baseline["receipt_digest"]),
+            confirm=True,
+        )
+        new_digest = str(receiver_full["receipt_digest"])
+        previous_digest = str(receiver_baseline["receipt_digest"])
+
+        with mock.patch.object(
+            source.ledger,
+            "update_peer_descriptor",
+            side_effect=RuntimeError("simulated crash before the ledger pointer"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                source.upgrade_peer_descriptor(
+                    receiver.node_descriptor(),
+                    expected_descriptor_digest=new_digest,
+                    expected_previous_descriptor_digest=previous_digest,
+                    confirm=True,
+                )
+        # Evidence and the signed transition receipt were published before
+        # the crash, but the anchored ledger pointer never moved: media stays
+        # blocked and the pinned digest is unchanged.
+        evidence_path = (
+            source.peers_root / f"{receiver.node_id}.descriptor.{new_digest}.json"
+        )
+        transition_path = (
+            source.peers_root / f"{receiver.node_id}.transition.{new_digest}.json"
+        )
+        self.assertTrue(evidence_path.exists())
+        self.assertTrue(transition_path.exists())
+        transition = validate_descriptor_transition(
+            read_private_json(transition_path)
+        )
+        self.assertEqual(
+            str(transition["previous_descriptor_digest"]), previous_digest
+        )
+        self.assertEqual(str(transition["descriptor_digest"]), new_digest)
+        self.assertEqual(str(transition["recorder_node_id"]), source.node_id)
+        pinned = source.ledger.peer(receiver.node_id)
+        self.assertEqual(str(pinned["descriptor_digest"]), previous_digest)
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "target peer does not advertise"
+        ):
+            source.create_checkpoint(receiver.node_id)
+
+        # A retry reconciles the pre-CAS evidence idempotently and completes
+        # the compare-and-swap.
+        upgraded = source.upgrade_peer_descriptor(
+            receiver.node_descriptor(),
+            expected_descriptor_digest=new_digest,
+            expected_previous_descriptor_digest=previous_digest,
+            confirm=True,
+        )
+        self.assertEqual(upgraded["descriptor_digest"], new_digest)
+
+        # A replay after a lost response converges on the same pinned state.
+        replay = source.upgrade_peer_descriptor(
+            receiver.node_descriptor(),
+            expected_descriptor_digest=new_digest,
+            expected_previous_descriptor_digest=previous_digest,
+            confirm=True,
+        )
+        self.assertEqual(replay["descriptor_digest"], new_digest)
+        exported = source.create_checkpoint(receiver.node_id)
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        self.assertIn(
+            "media", {str(item["kind"]) for item in manifest["artifacts"]}
+        )
+
+    def test_tampered_descriptor_evidence_fails_closed_and_surfaces_in_status(self):
+        source, _media_id = self._media_source()
+        receiver = self.manager("receiver")
+        self.pair(source, receiver)
+        digest = str(receiver.node_descriptor()["receipt_digest"])
+        evidence_path = (
+            source.peers_root / f"{receiver.node_id}.descriptor.{digest}.json"
+        )
+        document = json.loads(evidence_path.read_text(encoding="utf-8"))
+        document["capabilities"] = ["tampered-capability"]
+        evidence_path.write_text(
+            json.dumps(document, sort_keys=True), encoding="utf-8"
+        )
+        evidence_path.chmod(0o600)
+        with self.assertRaises(ReplicationProtocolError):
+            source.create_checkpoint(receiver.node_id)
+        status = source.status()
+        pinned = {str(item["peer_id"]): item for item in status["peers"]}
+        self.assertEqual(
+            pinned[receiver.node_id]["capability_state"],
+            "invalid-descriptor-evidence",
+        )
+        self.assertFalse(pinned[receiver.node_id]["media_ready"])
+        # Tampered pinned evidence is an integrity defect, not a display
+        # detail: the global verdict degrades with the exact reason while
+        # the per-peer surface stays visible.
+        self.assertIsNotNone(pinned[receiver.node_id]["evidence_problem"])
+        self.assertEqual(status["integrity"]["state"], "degraded")
+        self.assertFalse(status["integrity"]["semantic_paths_verified"])
+        self.assertTrue(status["integrity"]["anchor_verified"])
+        self.assertTrue(
+            any(
+                receiver.node_id in reason
+                for reason in status["integrity"]["descriptor_evidence_problems"]
+            )
+        )
+
+    def test_tampered_active_node_descriptor_degrades_global_integrity(self):
+        node = self.manager("solo-node-tamper")
+        document = json.loads(node.descriptor_path.read_text(encoding="utf-8"))
+        document["capabilities"] = list(document["capabilities"]) + [
+            "tampered-capability"
+        ]
+        node.descriptor_path.write_text(
+            json.dumps(document, sort_keys=True), encoding="utf-8"
+        )
+        node.descriptor_path.chmod(0o600)
+        status = node.status()
+        self.assertEqual(
+            status["node_descriptor_state"], "invalid-descriptor-evidence"
+        )
+        self.assertEqual(status["capabilities"], [])
+        self.assertFalse(status["media_artifact_capable"])
+        self.assertEqual(status["integrity"]["state"], "degraded")
+        self.assertFalse(status["integrity"]["semantic_paths_verified"])
+        self.assertIn(
+            "active node descriptor evidence is missing or tampered",
+            status["integrity"]["descriptor_evidence_problems"],
+        )
+        # The missing pointer file degrades identically.
+        node.descriptor_path.unlink()
+        status = node.status()
+        self.assertEqual(status["integrity"]["state"], "degraded")
+        self.assertFalse(status["integrity"]["semantic_paths_verified"])
+
+    def test_upgraded_pin_requires_exact_cross_bound_transition_receipt(self):
+        source = self.manager("source")
+        receiver = self.manager("receiver")
+        receiver_baseline = self._downgrade_node(receiver)
+        self.pair(source, receiver)
+        receiver_full = receiver.upgrade_node_descriptor(
+            expected_current_digest=str(receiver_baseline["receipt_digest"]),
+            confirm=True,
+        )
+        source.upgrade_peer_descriptor(
+            receiver.node_descriptor(),
+            expected_descriptor_digest=str(receiver_full["receipt_digest"]),
+            expected_previous_descriptor_digest=str(
+                receiver_baseline["receipt_digest"]
+            ),
+            confirm=True,
+        )
+        status = source.status()
+        self.assertEqual(status["integrity"]["state"], "ready")
+        self.assertTrue(status["integrity"]["semantic_paths_verified"])
+        pinned = {str(item["peer_id"]): item for item in status["peers"]}
+        self.assertEqual(
+            pinned[receiver.node_id]["previous_descriptor_digest"],
+            str(receiver_baseline["receipt_digest"]),
+        )
+
+        transition_path = (
+            source.peers_root
+            / f"{receiver.node_id}.transition.{receiver_full['receipt_digest']}.json"
+        )
+        original_transition = transition_path.read_bytes()
+        original_record = json.loads(original_transition.decode("utf-8"))
+
+        def degraded_reason() -> str:
+            status = source.status()
+            self.assertEqual(status["integrity"]["state"], "degraded")
+            self.assertFalse(status["integrity"]["semantic_paths_verified"])
+            pinned = {
+                str(item["peer_id"]): item for item in status["peers"]
+            }
+            entry = pinned[receiver.node_id]
+            self.assertEqual(
+                entry["capability_state"], "invalid-descriptor-evidence"
+            )
+            self.assertEqual(entry["capabilities"], [])
+            self.assertFalse(entry["media_ready"])
+            problems = status["integrity"]["descriptor_evidence_problems"]
+            self.assertEqual(len(problems), 1)
+            return str(problems[0])
+
+        # Missing old->new transition receipt for an upgraded pin.
+        transition_path.unlink()
+        self.assertIn("lacks its signed transition receipt", degraded_reason())
+
+        # Properly signed receipt whose binding names the wrong direction:
+        # signature validity alone is never enough, the receipt must
+        # cross-bind recorder, peer, lineage, direction, key, and digests.
+        forged = {
+            key: value
+            for key, value in original_record.items()
+            if key not in AUTH_FIELDS
+        }
+        forged["direction"] = "receive" if forged["direction"] == "send" else "send"
+        write_private_json_exclusive(
+            source.store, transition_path, sign_payload(source.store, forged)
+        )
+        self.assertIn("not cross-bound", degraded_reason())
+
+        # Byte-level tampering breaks the signature itself.
+        transition_path.unlink()
+        tampered = dict(original_record)
+        tampered["previous_descriptor_digest"] = "d" * 64
+        transition_path.write_text(
+            json.dumps(tampered, sort_keys=True), encoding="utf-8"
+        )
+        transition_path.chmod(0o600)
+        degraded_reason()
+
+        # Restoring the genuine receipt returns the node to ready.
+        transition_path.unlink()
+        transition_path.write_bytes(original_transition)
+        transition_path.chmod(0o600)
+        status = source.status()
+        self.assertEqual(status["integrity"]["state"], "ready")
+        self.assertTrue(status["integrity"]["semantic_paths_verified"])
+        self.assertEqual(
+            status["integrity"]["descriptor_evidence_problems"], []
+        )
+
+        # An upgraded pin whose descriptor document evidence disappears is
+        # inconsistent, never silently legacy-baseline.
+        (
+            source.peers_root
+            / f"{receiver.node_id}.descriptor.{receiver_full['receipt_digest']}.json"
+        ).unlink()
+        self.assertIn(
+            "upgraded peer descriptor evidence is missing", degraded_reason()
+        )
+
+    def test_status_surfaces_capability_activation_and_legacy_pins(self):
+        source = self.manager("source")
+        receiver = self.manager("receiver")
+        self.pair(source, receiver)
+        status = source.status()
+        self.assertTrue(status["media_artifact_capable"])
+        self.assertEqual(status["node_descriptor_state"], "valid")
+        self.assertEqual(
+            status["descriptor_digest"],
+            str(source.node_descriptor()["receipt_digest"]),
+        )
+        self.assertEqual(status["capabilities"], list(NODE_CAPABILITIES))
+        pinned = {str(item["peer_id"]): item for item in status["peers"]}
+        entry = pinned[receiver.node_id]
+        self.assertEqual(entry["capability_state"], MEDIA_ARTIFACT_CAPABILITY)
+        self.assertEqual(entry["capabilities"], list(NODE_CAPABILITIES))
+        self.assertTrue(entry["media_ready"])
+        self.assertIsNone(entry["previous_descriptor_digest"])
+
+        # A peer pinned before capability negotiation has no descriptor
+        # evidence: it must surface as legacy and never media-ready.
+        digest = str(receiver.node_descriptor()["receipt_digest"])
+        (
+            source.peers_root / f"{receiver.node_id}.descriptor.{digest}.json"
+        ).unlink()
+        status = source.status()
+        pinned = {str(item["peer_id"]): item for item in status["peers"]}
+        entry = pinned[receiver.node_id]
+        self.assertEqual(entry["capability_state"], "legacy-no-descriptor")
+        self.assertEqual(entry["capabilities"], list(BASE_NODE_CAPABILITIES))
+        self.assertFalse(entry["media_ready"])
+
+    def test_node_descriptor_upgrade_preserves_immutable_evidence(self):
+        node = self.manager("solo")
+        baseline = self._downgrade_node(node)
+        previous_digest = str(baseline["receipt_digest"])
+        with self.assertRaises(ValueError):
+            node.upgrade_node_descriptor(expected_current_digest=previous_digest)
+        # The compare-and-swap binds the operator's reviewed digest: a stale
+        # or wrong digest is rejected before any evidence or pointer moves.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "reviewed current descriptor digest"
+        ):
+            node.upgrade_node_descriptor(
+                expected_current_digest="f" * 64, confirm=True
+            )
+        self.assertEqual(
+            str(read_private_json(node.descriptor_path)["receipt_digest"]),
+            previous_digest,
+        )
+        upgraded = node.upgrade_node_descriptor(
+            expected_current_digest=previous_digest, confirm=True
+        )
+        new_digest = str(upgraded["receipt_digest"])
+        self.assertNotEqual(previous_digest, new_digest)
+        self.assertEqual(
+            [str(item) for item in upgraded["capabilities"]],
+            list(NODE_CAPABILITIES),
+        )
+        old_evidence = node.root / f"node-descriptor.{previous_digest}.json"
+        new_evidence = node.root / f"node-descriptor.{new_digest}.json"
+        self.assertTrue(old_evidence.exists())
+        self.assertTrue(new_evidence.exists())
+        self.assertEqual(
+            str(read_private_json(old_evidence)["receipt_digest"]),
+            previous_digest,
+        )
+        active = read_private_json(node.descriptor_path)
+        self.assertEqual(str(active["receipt_digest"]), new_digest)
+        # A replay after a lost response is idempotent and needs no confirm,
+        # whether the retried review names the now-active digest or the
+        # preserved pre-upgrade descriptor it replaced.
+        again = node.upgrade_node_descriptor(expected_current_digest=new_digest)
+        self.assertEqual(str(again["receipt_digest"]), new_digest)
+        retried = node.upgrade_node_descriptor(
+            expected_current_digest=previous_digest
+        )
+        self.assertEqual(str(retried["receipt_digest"]), new_digest)
+        # A digest that never named one of this node's descriptors stays
+        # rejected even after the upgrade completed.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "reviewed current descriptor digest"
+        ):
+            node.upgrade_node_descriptor(expected_current_digest="e" * 64)
+
+    def test_peer_upgrade_replay_never_synthesizes_deleted_transition_history(self):
+        # Once the ledger compare-and-swap pins the new digest, a replay must
+        # validate the already-published transition receipt against the
+        # anchored predecessor record: it never signs new history from a
+        # caller-supplied predecessor, so a deleted receipt stays failed and
+        # an arbitrary claimed predecessor is rejected outright.
+        source = self.manager("source")
+        receiver = self.manager("receiver")
+        receiver_baseline = self._downgrade_node(receiver)
+        self.pair(source, receiver)
+        receiver_full = receiver.upgrade_node_descriptor(
+            expected_current_digest=str(receiver_baseline["receipt_digest"]),
+            confirm=True,
+        )
+        new_digest = str(receiver_full["receipt_digest"])
+        previous_digest = str(receiver_baseline["receipt_digest"])
+        source.upgrade_peer_descriptor(
+            receiver.node_descriptor(),
+            expected_descriptor_digest=new_digest,
+            expected_previous_descriptor_digest=previous_digest,
+            confirm=True,
+        )
+        transition_path = (
+            source.peers_root
+            / f"{receiver.node_id}.transition.{new_digest}.json"
+        )
+        original_transition = transition_path.read_bytes()
+        transition_path.unlink()
+
+        # An arbitrary caller predecessor conflicts with the anchored audit
+        # record and is rejected before any evidence could be signed.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "recorded predecessor"
+        ):
+            source.upgrade_peer_descriptor(
+                receiver.node_descriptor(),
+                expected_descriptor_digest=new_digest,
+                expected_previous_descriptor_digest="f" * 64,
+                confirm=True,
+            )
+        self.assertFalse(transition_path.exists())
+
+        # The correct predecessor still cannot resurrect the deleted receipt:
+        # the replay fails and the node stays degraded.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "lacks its signed transition receipt"
+        ):
+            source.upgrade_peer_descriptor(
+                receiver.node_descriptor(),
+                expected_descriptor_digest=new_digest,
+                expected_previous_descriptor_digest=previous_digest,
+                confirm=True,
+            )
+        self.assertFalse(transition_path.exists())
+        status = source.status()
+        self.assertEqual(status["integrity"]["state"], "degraded")
+
+        # Restoring the genuine receipt makes the replay idempotent again.
+        transition_path.write_bytes(original_transition)
+        transition_path.chmod(0o600)
+        replay = source.upgrade_peer_descriptor(
+            receiver.node_descriptor(),
+            expected_descriptor_digest=new_digest,
+            expected_previous_descriptor_digest=previous_digest,
+            confirm=True,
+        )
+        self.assertEqual(replay["descriptor_digest"], new_digest)
+        status = source.status()
+        self.assertEqual(status["integrity"]["state"], "ready")
+        self.assertEqual(
+            status["integrity"]["descriptor_evidence_problems"], []
+        )
+        self.assertEqual(
+            status["integrity"]["descriptor_evidence_problem_total"], 0
+        )
+        self.assertFalse(
+            status["integrity"]["descriptor_evidence_problems_truncated"]
+        )
+
+    def test_node_upgrade_replay_rejects_staged_but_never_active_candidate(self):
+        # Candidate evidence is published before the pointer swap, so a crash
+        # between the two leaves a fully signed candidate that never became
+        # active. A retry converges on a NEW candidate, and the stale one is
+        # rejected forever: only the active digest and the exact predecessor
+        # named by the active descriptor's swap receipt replay idempotently.
+        node = self.manager("swap-crash")
+        baseline = self._downgrade_node(node)
+        previous_digest = str(baseline["receipt_digest"])
+        with mock.patch(
+            "replication_manager.os.replace",
+            side_effect=OSError("simulated crash before the pointer swap"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated crash"):
+                node.upgrade_node_descriptor(
+                    expected_current_digest=previous_digest, confirm=True
+                )
+        # The active pointer never moved.
+        self.assertEqual(
+            str(read_private_json(node.descriptor_path)["receipt_digest"]),
+            previous_digest,
+        )
+        staged = sorted(node.root.glob("node-descriptor.next.*.json"))
+        self.assertEqual(len(staged), 1)
+        stale_digest = staged[0].name.split(".")[2]
+        self.assertTrue(
+            (
+                node.root / f"node-descriptor.transition.{stale_digest}.json"
+            ).exists()
+        )
+        # The staged candidate is not the active descriptor, so replaying its
+        # digest is rejected even before the retry.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "reviewed current descriptor digest"
+        ):
+            node.upgrade_node_descriptor(expected_current_digest=stale_digest)
+
+        retried = node.upgrade_node_descriptor(
+            expected_current_digest=previous_digest, confirm=True
+        )
+        new_digest = str(retried["receipt_digest"])
+        self.assertNotEqual(new_digest, stale_digest)
+        self.assertEqual(
+            str(read_private_json(node.descriptor_path)["receipt_digest"]),
+            new_digest,
+        )
+        # Response-loss replays accept the active digest and the exact
+        # predecessor recorded by the swap receipt.
+        self.assertEqual(
+            str(
+                node.upgrade_node_descriptor(expected_current_digest=new_digest)[
+                    "receipt_digest"
+                ]
+            ),
+            new_digest,
+        )
+        self.assertEqual(
+            str(
+                node.upgrade_node_descriptor(
+                    expected_current_digest=previous_digest
+                )["receipt_digest"]
+            ),
+            new_digest,
+        )
+        # The staged-but-never-active candidate can never be laundered into
+        # history, even though its signed evidence and receipt still exist.
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "reviewed current descriptor digest"
+        ):
+            node.upgrade_node_descriptor(expected_current_digest=stale_digest)
+
+    def test_media_gates_fail_closed_on_deleted_or_tampered_transition(self):
+        # Media enforcement uses the same integrity-verified capability
+        # resolver as status: once a pin was upgraded, a deleted or tampered
+        # old->new transition receipt blocks media at create AND at stage,
+        # never quietly resolving the peer to baseline while status degrades.
+        source, media_id = self._media_source()
+        receiver = self.manager("receiver")
+        source_baseline = self._downgrade_node(source)
+        receiver_baseline = self._downgrade_node(receiver)
+        lineage = self.pair(source, receiver)
+        source_full = source.upgrade_node_descriptor(
+            expected_current_digest=str(source_baseline["receipt_digest"]),
+            confirm=True,
+        )
+        receiver_full = receiver.upgrade_node_descriptor(
+            expected_current_digest=str(receiver_baseline["receipt_digest"]),
+            confirm=True,
+        )
+        source.upgrade_peer_descriptor(
+            receiver.node_descriptor(),
+            expected_descriptor_digest=str(receiver_full["receipt_digest"]),
+            expected_previous_descriptor_digest=str(
+                receiver_baseline["receipt_digest"]
+            ),
+            confirm=True,
+        )
+        receiver.upgrade_peer_descriptor(
+            source.node_descriptor(),
+            expected_descriptor_digest=str(source_full["receipt_digest"]),
+            expected_previous_descriptor_digest=str(
+                source_baseline["receipt_digest"]
+            ),
+            confirm=True,
+        )
+
+        # Sender side: the target pin's transition receipt disappears.
+        sender_transition = (
+            source.peers_root
+            / f"{receiver.node_id}.transition.{receiver_full['receipt_digest']}.json"
+        )
+        sender_original = sender_transition.read_bytes()
+        sender_transition.unlink()
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "failed integrity verification"
+        ):
+            source.create_checkpoint(receiver.node_id)
+        self.assertIsNone(
+            source.ledger.latest_checkpoint(
+                lineage_id=lineage, direction="outgoing"
+            )
+        )
+        # A byte-tampered receipt fails identically.
+        tampered = json.loads(sender_original.decode("utf-8"))
+        tampered["previous_descriptor_digest"] = "d" * 64
+        sender_transition.write_text(
+            json.dumps(tampered, sort_keys=True), encoding="utf-8"
+        )
+        sender_transition.chmod(0o600)
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "failed integrity verification"
+        ):
+            source.create_checkpoint(receiver.node_id)
+        sender_transition.unlink()
+        sender_transition.write_bytes(sender_original)
+        sender_transition.chmod(0o600)
+        exported = source.create_checkpoint(receiver.node_id)
+        manifest = read_private_json(Path(str(exported["manifest_path"])))
+        self.assertIn(
+            "media", {str(item["kind"]) for item in manifest["artifacts"]}
+        )
+
+        # Receiver side: the pinned source's transition receipt disappears
+        # before staging; the media checkpoint is rejected before any
+        # staging work or ledger effect.
+        receiver_transition = (
+            receiver.peers_root
+            / f"{source.node_id}.transition.{source_full['receipt_digest']}.json"
+        )
+        receiver_original = receiver_transition.read_bytes()
+        receiver_transition.unlink()
+        with self.assertRaisesRegex(
+            ReplicationProtocolError, "failed integrity verification"
+        ):
+            receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertIsNone(
+            receiver.ledger.latest_checkpoint(
+                lineage_id=lineage, direction="incoming"
+            )
+        )
+        self.assertFalse(
+            (
+                receiver.staged_root / lineage / str(manifest["checkpoint_id"])
+            ).exists()
+        )
+        receiver_transition.write_bytes(receiver_original)
+        receiver_transition.chmod(0o600)
+        staged = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(staged["verified"])
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (
+                    Path(str(staged["restore_root"])) / "media-cache" / "objects"
+                ).iterdir()
+            ),
+            [media_id],
+        )
 
 
 if __name__ == "__main__":

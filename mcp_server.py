@@ -79,6 +79,7 @@ AGENT_ID_RE = re.compile(r"[^A-Za-z0-9_.:@-]+")
 _SCHEMA_INVALID_STRING = "[INVALID_STRING]"
 _SCHEMA_INVALID_INTEGER = "[INVALID_INTEGER]"
 _SCHEMA_INVALID_BOOLEAN = "[INVALID_BOOLEAN]"
+_SCHEMA_INVALID_NUMBER = "[INVALID_NUMBER]"
 
 
 def _schema_safe_string(value: Any) -> str:
@@ -95,6 +96,20 @@ def _schema_safe_integer(value: Any) -> int | str:
             return _SCHEMA_INVALID_INTEGER
         return value
     return _SCHEMA_INVALID_INTEGER
+
+
+def _schema_safe_number(value: Any) -> float | int | str:
+    if isinstance(value, bool):
+        return _SCHEMA_INVALID_NUMBER
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            reject_sensitive_identifier(value, field="number input")
+        except ValueError:
+            return _SCHEMA_INVALID_NUMBER
+        return value
+    return _SCHEMA_INVALID_NUMBER
 
 
 def _schema_safe_boolean(value: Any) -> bool | str:
@@ -158,6 +173,11 @@ ToolBooleanInput = Annotated[
     bool | str,
     BeforeValidator(_schema_safe_boolean),
     WithJsonSchema({"type": "boolean"}),
+]
+ToolNumberInput = Annotated[
+    float | int | str,
+    BeforeValidator(_schema_safe_number),
+    WithJsonSchema({"type": "number", "exclusiveMinimum": 0, "maximum": 10}),
 ]
 RetrievalResultLimitInput = Annotated[
     int | str,
@@ -249,6 +269,18 @@ _CONTRACT_TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
             "max_response_bytes",
         }
     ),
+    "query_spiking_media_similarity": frozenset(
+        {
+            "media_id",
+            "context_id",
+            "recall_scope",
+            "result_limit",
+            "candidate_limit",
+            "time_budget_seconds",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
 }
 _CONTRACT_TOOL_SURFACES = {
     "retrieve_spiking_memory_v2": "memory-retrieval",
@@ -256,6 +288,7 @@ _CONTRACT_TOOL_SURFACES = {
     "list_spiking_memory_graph": "memory-graph",
     "hydrate_spiking_agent_context": "agent-hydration",
     "get_spiking_cortex_state": "cortex-state",
+    "query_spiking_media_similarity": "media-similarity",
 }
 
 
@@ -900,6 +933,37 @@ def _validate_bounded_integer(
     return parsed
 
 
+def _validate_bounded_number(
+    value: Any,
+    *,
+    field_name: str,
+    maximum: float,
+) -> float:
+    """Validate a positive bounded number without echoing raw input."""
+
+    if isinstance(value, bool) or value == _SCHEMA_INVALID_NUMBER:
+        raise ValueError(f"{field_name} must be a number")
+    if isinstance(value, str):
+        try:
+            reject_sensitive_identifier(value, field=field_name)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be a number") from exc
+        if not re.fullmatch(
+            r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)", value.strip()
+        ):
+            raise ValueError(f"{field_name} must be a number")
+        parsed = float(value.strip())
+    elif isinstance(value, (int, float)):
+        parsed = float(value)
+    else:
+        raise ValueError(f"{field_name} must be a number")
+    if not (0 < parsed <= maximum):
+        raise ValueError(
+            f"{field_name} must be greater than 0 and at most {maximum}"
+        )
+    return parsed
+
+
 def _validate_recall_scope(recall_scope: str) -> str:
     normalized = str(recall_scope or "local").strip().lower()
     if normalized == "broad":
@@ -1195,6 +1259,120 @@ def retrieve_spiking_memory_v2(
         LOGGER.exception("Retrieval v2 failed for context_id=%s", context)
         return _contract_tool_result(
             _contract_error("memory-retrieval", exc, max_response_bytes=budget)
+        )
+
+
+@mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    annotations={
+        "title": "Rank Similar SYNAPSE-S2 Image Memories",
+        "readOnlyHint": True,
+    },
+)
+def query_spiking_media_similarity(
+    media_id: ToolStringInput,
+    context_id: ToolStringInput = "default",
+    recall_scope: RetrievalScopeInput = "local",
+    result_limit: ToolIntegerInput = 10,
+    candidate_limit: ToolIntegerInput = 128,
+    time_budget_seconds: ToolNumberInput = 2.0,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Rank cached images against one already-referenced image by private
+    Apple Vision feature print; returns only content-free media IDs, scores,
+    and public descriptors."""
+
+    context = "unknown"
+    budget: int | None = _token_error_budget(surface="media-similarity")
+    try:
+        budget = _token_response_budget(
+            surface="media-similarity",
+            max_response_bytes=max_response_bytes,
+        )
+        configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+        mode = normalize_response_mode(response_mode, default=configured_mode)
+        import media_similarity as media_similarity_module
+        from core_client_binding import binding_from_environment
+        from image_capture import validate_media_id as _validate_media_id
+
+        canonical_media_id = _validate_media_id(
+            _validate_tool_string(media_id, field_name="media_id")
+        )
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
+        scope = _validate_retrieval_scope(recall_scope)
+        bounded_result_limit = _validate_bounded_integer(
+            result_limit,
+            field_name="result_limit",
+            minimum=1,
+            maximum=media_similarity_module.MAX_RESULT_LIMIT,
+        )
+        bounded_candidate_limit = _validate_bounded_integer(
+            candidate_limit,
+            field_name="candidate_limit",
+            minimum=1,
+            maximum=media_similarity_module.MAX_CANDIDATE_LIMIT,
+        )
+        if bounded_candidate_limit < bounded_result_limit:
+            raise ValueError(
+                "candidate_limit must be greater than or equal to result_limit"
+            )
+        bounded_time_budget = (
+            _validate_bounded_number(
+                time_budget_seconds,
+                field_name="time_budget_seconds",
+                maximum=media_similarity_module.MAX_TIME_BUDGET_SECONDS,
+            )
+            if time_budget_seconds not in (None, "")
+            else None
+        )
+        binding = binding_from_environment()
+        if binding is None:
+            raise ValueError(
+                "a verified SYNAPSE-S2 core binding is required for media recall"
+            )
+        _, mlx_backend = _load_backend()
+        references = mlx_backend.get_backend().list_media_references(
+            context_id=context,
+            recall_scope=scope,
+        )
+        payload = media_similarity_module.query_similar_media(
+            binding,
+            canonical_media_id,
+            scope_media_ids=references["media_ids"],
+            result_limit=bounded_result_limit,
+            candidate_limit=bounded_candidate_limit,
+            time_budget_seconds=bounded_time_budget,
+        )
+        payload = {
+            **payload,
+            "context_id": str(references["context_id"]),
+            "recall_scope": str(references["recall_scope"]),
+            "resolved_context_count": int(references["resolved_context_count"]),
+        }
+        return _contract_tool_result(
+            project_response(
+                "media-similarity",
+                payload,
+                mode=mode,
+                max_response_bytes=budget,
+            )
+        )
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid media similarity request for context_id=%s: %s",
+            context,
+            exc,
+        )
+        return _contract_tool_result(
+            _contract_error("media-similarity", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("media similarity failed for context_id=%s", context)
+        return _contract_tool_result(
+            _contract_error("media-similarity", exc, max_response_bytes=budget)
         )
 
 
@@ -3330,6 +3508,7 @@ def verify_spiking_recovery(
     expected_capture_sha256: str = "",
     expected_request_journal_sha256: str = "",
     expected_runtime_state_sha256: str = "",
+    expected_media_sha256: str = "",
 ) -> str:
     """Cryptographically verify a paired recovery bundle without restoring it."""
     try:
@@ -3360,6 +3539,7 @@ def verify_spiking_recovery(
                 expected_request_journal_sha256 or None
             ),
             expected_runtime_state_sha256=expected_runtime_state_sha256 or None,
+            expected_media_sha256=expected_media_sha256 or None,
         )
         return json.dumps(payload, sort_keys=True)
     except ValueError as exc:
@@ -3384,6 +3564,7 @@ def restore_spiking_recovery_proof(
     expected_capture_sha256: str = "",
     expected_request_journal_sha256: str = "",
     expected_runtime_state_sha256: str = "",
+    expected_media_sha256: str = "",
     confirm: bool = False,
 ) -> str:
     """Materialize an isolated paired restore proof; never overwrite live state."""
@@ -3428,6 +3609,7 @@ def restore_spiking_recovery_proof(
                 expected_request_journal_sha256 or None
             ),
             expected_runtime_state_sha256=expected_runtime_state_sha256 or None,
+            expected_media_sha256=expected_media_sha256 or None,
             confirm=bool(confirm),
         )
         return json.dumps(payload, sort_keys=True)

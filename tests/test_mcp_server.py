@@ -61,6 +61,7 @@ class McpServerTests(unittest.TestCase):
     def test_recovery_tools_forward_expected_journal_and_runtime_digests(self):
         digest = "b" * 64
         runtime_digest = "c" * 64
+        media_digest = "d" * 64
         backend = mock.Mock()
         backend.verify_recovery_bundle.return_value = {"verified": True}
         backend.restore_recovery_bundle_isolated.return_value = {"verified": True}
@@ -76,6 +77,7 @@ class McpServerTests(unittest.TestCase):
                     receipt,
                     expected_request_journal_sha256=digest,
                     expected_runtime_state_sha256=runtime_digest,
+                    expected_media_sha256=media_digest,
                 )
             )
             restored = json.loads(
@@ -84,6 +86,7 @@ class McpServerTests(unittest.TestCase):
                     output_root,
                     expected_request_journal_sha256=digest,
                     expected_runtime_state_sha256=runtime_digest,
+                    expected_media_sha256=media_digest,
                     confirm=True,
                 )
             )
@@ -96,6 +99,7 @@ class McpServerTests(unittest.TestCase):
             expected_capture_sha256=None,
             expected_request_journal_sha256=digest,
             expected_runtime_state_sha256=runtime_digest,
+            expected_media_sha256=media_digest,
         )
         backend.restore_recovery_bundle_isolated.assert_called_once_with(
             str(Path(receipt).resolve()),
@@ -104,6 +108,7 @@ class McpServerTests(unittest.TestCase):
             expected_capture_sha256=None,
             expected_request_journal_sha256=digest,
             expected_runtime_state_sha256=runtime_digest,
+            expected_media_sha256=media_digest,
             confirm=True,
         )
 
@@ -561,6 +566,7 @@ class McpServerTests(unittest.TestCase):
             "list_spiking_memory_graph",
             "hydrate_spiking_agent_context",
             "get_spiking_cortex_state",
+            "query_spiking_media_similarity",
         }
         selected = {tool.name: tool for tool in tools if tool.name in selected_names}
         self.assertEqual(set(selected), selected_names)
@@ -600,6 +606,31 @@ class McpServerTests(unittest.TestCase):
             result.structured_content["response_contract"]["serialized_bytes"],
         )
 
+    def test_every_token_contract_tool_is_registered_in_strict_maps(self):
+        import token_contracts
+
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        contracted = {
+            tool.name: tool
+            for tool in tools
+            if (tool.output_schema or {})
+            .get("properties", {})
+            .get("schema", {})
+            .get("const")
+            == "synapse-s2.token-contract.v1"
+        }
+        self.assertIn("query_spiking_media_similarity", contracted)
+        self.assertEqual(set(contracted), set(mcp_server._CONTRACT_TOOL_ARGUMENTS))
+        self.assertEqual(set(contracted), set(mcp_server._CONTRACT_TOOL_SURFACES))
+        for name, tool in contracted.items():
+            with self.subTest(tool=name):
+                self.assertEqual(
+                    set(tool.parameters.get("properties", {})),
+                    set(mcp_server._CONTRACT_TOOL_ARGUMENTS[name]),
+                )
+                surface = mcp_server._CONTRACT_TOOL_SURFACES[name]
+                self.assertIn(surface, token_contracts.DEFAULT_RESPONSE_BYTES)
+
     def test_fastmcp_contract_arguments_never_reflect_prevalidation_secrets(self):
         secret = "SYNTHETIC_ONLY_PREVALIDATION_SECRET_1234"
         credential = f"password={secret}"
@@ -629,6 +660,37 @@ class McpServerTests(unittest.TestCase):
             ("get_spiking_cortex_state", {"agent_id": {"password": secret}}),
             ("get_spiking_cortex_state", {"context_id": {"password": secret}}),
             ("get_spiking_cortex_state", {"limit": credential}),
+            ("query_spiking_media_similarity", {"media_id": {"password": secret}}),
+            ("query_spiking_media_similarity", {"media_id": credential}),
+            (
+                "query_spiking_media_similarity",
+                {
+                    "media_id": "s2img_" + "0" * 32,
+                    "context_id": {"password": secret},
+                },
+            ),
+            (
+                "query_spiking_media_similarity",
+                {"media_id": "s2img_" + "0" * 32, "result_limit": credential},
+            ),
+            (
+                "query_spiking_media_similarity",
+                {"media_id": "s2img_" + "0" * 32, "candidate_limit": credential},
+            ),
+            (
+                "query_spiking_media_similarity",
+                {
+                    "media_id": "s2img_" + "0" * 32,
+                    "time_budget_seconds": credential,
+                },
+            ),
+            (
+                "query_spiking_media_similarity",
+                {
+                    "media_id": "s2img_" + "0" * 32,
+                    "time_budget_seconds": {"password": secret},
+                },
+            ),
         )
         for tool_name, arguments in cases:
             with self.subTest(tool=tool_name, field=next(iter(arguments))):
@@ -671,6 +733,11 @@ class McpServerTests(unittest.TestCase):
                 "agent-hydration",
             ),
             ("get_spiking_cortex_state", {}, "cortex-state"),
+            (
+                "query_spiking_media_similarity",
+                {"media_id": "s2img_" + "0" * 32},
+                "media-similarity",
+            ),
         )
         for tool_name, required_arguments, operation in cases:
             for run_middleware in (True, False):
@@ -741,6 +808,11 @@ class McpServerTests(unittest.TestCase):
                 "prompt",
             ),
             ("get_spiking_cortex_state", {}, "context_id"),
+            (
+                "query_spiking_media_similarity",
+                {"media_id": "s2img_" + "0" * 32},
+                "context_id",
+            ),
         )
 
         async def exercise(tool_name, arguments):
@@ -825,6 +897,10 @@ class McpServerTests(unittest.TestCase):
                 {"agent_id": "codex-desktop"},
             ),
             ("get_spiking_cortex_state", {}),
+            (
+                "query_spiking_media_similarity",
+                {"media_id": "s2img_" + "0" * 32},
+            ),
         )
 
         async def exercise():
@@ -891,6 +967,10 @@ class McpServerTests(unittest.TestCase):
             ("list_spiking_memory_graph", {}),
             ("hydrate_spiking_agent_context", {"agent_id": "codex-desktop"}),
             ("get_spiking_cortex_state", {}),
+            (
+                "query_spiking_media_similarity",
+                {"media_id": "s2img_" + "0" * 32},
+            ),
         )
         secret = "password=SYNTHETIC_INVALID_BUDGET_1234"
         with mock.patch.dict(
@@ -1732,6 +1812,44 @@ class McpServerTests(unittest.TestCase):
             bundle["capture_ledger_binding"],
         )
         self.assertTrue(Path(restored["recovery_proof_path"]).exists())
+
+        # This fixture snapshot references zero image memories, so its
+        # current-v3 bundle is verified media-absent: pinning any expected
+        # media digest is rejected as such. The media-bearing digest-mismatch
+        # path is covered by the recovery suite's media fixtures.
+        media_rejected = json.loads(
+            mcp_server.verify_spiking_recovery(
+                bundle["bundle_receipt_path"],
+                expected_media_sha256="d" * 64,
+            )
+        )
+        self.assertIn(
+            "does not contain a media artifact", media_rejected["error"]
+        )
+        media_restore_rejected = json.loads(
+            mcp_server.restore_spiking_recovery_proof(
+                bundle["bundle_receipt_path"],
+                str(capture_root / "restore-media-rejected"),
+                expected_media_sha256="d" * 64,
+                confirm=True,
+            )
+        )
+        self.assertIn(
+            "does not contain a media artifact",
+            media_restore_rejected["error"],
+        )
+        digest_secret = "password=SYNTHETIC_MEDIA_DIGEST_SECRET_1234"
+        malformed = json.loads(
+            mcp_server.verify_spiking_recovery(
+                bundle["bundle_receipt_path"],
+                expected_media_sha256=digest_secret,
+            )
+        )
+        self.assertIn("error", malformed)
+        self.assertNotIn(
+            "SYNTHETIC_MEDIA_DIGEST_SECRET_1234",
+            json.dumps(malformed, sort_keys=True),
+        )
 
     def test_recovery_restore_tool_rejects_output_outside_export_root(self):
         payload = json.loads(

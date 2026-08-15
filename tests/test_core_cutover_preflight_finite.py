@@ -22,6 +22,126 @@ from operator_readiness_contract import (
 
 
 class CoreCutoverPreflightFiniteTests(unittest.TestCase):
+    @staticmethod
+    def _media_summary(*, bundle_schema: str, restore_schema: str, references: int = 0):
+        included = references > 0
+        return {
+            "recovery_bundle_schema": bundle_schema,
+            "recovery_restore_schema": restore_schema,
+            "media_included": included,
+            "media_recovery_complete": True,
+            "media_sha256": "1" * 64 if included else None,
+            "media_manifest_sha256": "2" * 64 if included else None,
+            "media_object_count": references,
+            "media_reference_count": references,
+        }
+
+    def test_media_summary_accepts_zero_v1_v2_v3_and_referenced_v3(self) -> None:
+        for bundle_schema, restore_schema in (
+            (
+                preflight.LEGACY_RECOVERY_BUNDLE_SCHEMA,
+                preflight.LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            ),
+            (
+                preflight.PRIOR_RECOVERY_BUNDLE_SCHEMA,
+                preflight.PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            ),
+            (
+                preflight.RECOVERY_BUNDLE_SCHEMA,
+                preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            ),
+        ):
+            summary = self._media_summary(
+                bundle_schema=bundle_schema,
+                restore_schema=restore_schema,
+            )
+            self.assertEqual(
+                preflight._validate_media_recovery_summary(summary),
+                summary,
+            )
+        referenced = self._media_summary(
+            bundle_schema=preflight.RECOVERY_BUNDLE_SCHEMA,
+            restore_schema=preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            references=2,
+        )
+        self.assertEqual(
+            preflight._validate_media_recovery_summary(referenced),
+            referenced,
+        )
+
+    def test_media_summary_refuses_omission_mismatch_and_legacy_references(self) -> None:
+        current = self._media_summary(
+            bundle_schema=preflight.RECOVERY_BUNDLE_SCHEMA,
+            restore_schema=preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            references=2,
+        )
+        mutations = (
+            lambda value: value.pop("media_recovery_complete"),
+            lambda value: value.__setitem__(
+                "recovery_restore_schema",
+                preflight.PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            ),
+            lambda value: value.__setitem__("media_object_count", 1),
+        )
+        for mutate in mutations:
+            changed = dict(current)
+            mutate(changed)
+            with self.assertRaises(preflight.CutoverPreflightError):
+                preflight._validate_media_recovery_summary(changed)
+        legacy = self._media_summary(
+            bundle_schema=preflight.LEGACY_RECOVERY_BUNDLE_SCHEMA,
+            restore_schema=preflight.LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            references=1,
+        )
+        with self.assertRaisesRegex(
+            preflight.CutoverPreflightError,
+            "legacy",
+        ):
+            preflight._validate_media_recovery_summary(legacy)
+
+    def test_media_artifact_binding_rejects_old_or_tampered_restore_proof(self) -> None:
+        summary = self._media_summary(
+            bundle_schema=preflight.RECOVERY_BUNDLE_SCHEMA,
+            restore_schema=preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            references=1,
+        )
+        parsed = {
+            "media_included": True,
+            "media_recovery_complete": True,
+            "media_reference_count": 1,
+            "media": {
+                "sha256": "1" * 64,
+                "manifest_sha256": "2" * 64,
+                "object_count": 1,
+                "referenced_count": 1,
+                "verified": True,
+            },
+        }
+        proof = {
+            "schema": preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            "media_included": True,
+            "media_recovery_complete": True,
+            "media_reference_count": 1,
+            "media_sha256": "1" * 64,
+            "media_manifest_sha256": "2" * 64,
+            "media_object_count": 1,
+        }
+        preflight._validate_recovery_media_artifact_binding(
+            summary=summary,
+            parsed=parsed,
+            restore_proof=proof,
+        )
+        for changed in (
+            {key: value for key, value in proof.items() if key != "media_sha256"},
+            {**proof, "media_sha256": "f" * 64},
+        ):
+            with self.assertRaises(preflight.CutoverPreflightError):
+                preflight._validate_recovery_media_artifact_binding(
+                    summary=summary,
+                    parsed=parsed,
+                    restore_proof=changed,
+                )
+
     def test_cli_rejects_non_finite_maximum_evidence_age_with_json_failure(self) -> None:
         for value in ("nan", "inf", "-inf"):
             with self.subTest(value=value):
@@ -123,6 +243,16 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                 "cutover_ready": True,
                 "capture_ledger_binding": {"verified": True},
                 "reconciliation": reconciliation,
+                "recovery_bundle_schema": preflight.RECOVERY_BUNDLE_SCHEMA,
+                "recovery_restore_schema": (
+                    preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA
+                ),
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_sha256": None,
+                "media_manifest_sha256": None,
+                "media_object_count": 0,
+                "media_reference_count": 0,
             }
             recovery_checks = {
                 check_id: {

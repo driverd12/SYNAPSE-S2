@@ -161,11 +161,12 @@ One compatibility ceremony is narrower than restored-target adoption. A
 reviewed build replacement may migrate an existing `lockfs-v1` marker to
 `lockfs-v2` only when the held and visible private zero-byte lock still have the
 same inode encoded by v1, its birth time predates the durable claim, and the
-signed replacement-admission v3 binds the exact predecessor, candidate,
-transition mode, and birth time. The admission also requires a fresh paired
-recovery bundle, verified isolated restore, clean repository, ready delivery
-audit, unchanged configuration/root/store/journal/runtime/embedding identities,
-and a distinct successor build. The v2 marker and runtime publication advance
+signed replacement-admission v4 binds the exact predecessor, candidate,
+transition mode, birth time, and explicit media-recovery completeness contract.
+The admission also requires a fresh paired recovery bundle, verified isolated
+restore, clean repository, ready delivery audit, unchanged
+configuration/root/store/journal/runtime/embedding identities, and a distinct
+successor build. The v2 marker and runtime publication advance
 in the normal authority-claim transaction and publication sequence. This lane
 does not admit v2-to-v2 drift, a changed inode, a newly created lock, or
 `recover-existing`.
@@ -662,10 +663,12 @@ changing permissions on an existing caller-owned directory.
    ```
 
    Immediately before any install mutation, the installer publishes a signed
-   `synapse-s2.core-cutover-attestation.v1` at the canonical core path. The
+   `synapse-s2.core-cutover-attestation.v2` at the canonical core path. The
    owner-only receipt binds the current clean Git HEAD, deterministic source
    build ID, config fingerprint, evidence-manifest digest, governance
    generation, exact logical database digest, exact capture-manifest digest,
+   recovery media schema/completeness, media archive and manifest digests, and
+   media object/reference counts,
    runtime-state presence and canonical digest, and (for v6) the exact request-
    journal logical digest and source binding receipt. It also binds the signed
    recovery-bundle and isolated-restore receipt digests. The receipt is valid

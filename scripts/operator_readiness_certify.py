@@ -53,7 +53,15 @@ from scripts.core_agent_installer import (
     resolve_paths as resolve_candidate_core_paths,
 )
 from memory_store import DurableMemoryStore
-from recovery_manager import VerifiedRecoveryManager
+from recovery_manager import (
+    LEGACY_RECOVERY_BUNDLE_SCHEMA,
+    LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    PRIOR_RECOVERY_BUNDLE_SCHEMA,
+    PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    RECOVERY_BUNDLE_SCHEMA,
+    RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    VerifiedRecoveryManager,
+)
 from operator_readiness_contract import (
     OPERATOR_READINESS_REQUIRED_PROOF_IDS,
     QUIESCENCE_POLICY_SCHEMA,
@@ -100,6 +108,7 @@ CHILD_ENV_ALLOWLIST = frozenset(
 )
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 BUILD_ID_RE = re.compile(r"^source-[0-9a-f]{24}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUNTIME_BUILD_IDENTITY_SCHEMA = "synapse-s2.runtime-build-identity-proof.v1"
 RAW_DIGEST_TEXT_RE = re.compile(
     r"(?i)(?:['\"]?)(?:input_sha256|raw_input_sha256|raw_sha256|"
@@ -117,6 +126,167 @@ _PROVIDER_EXPECTATIONS = {
     "mlx-neural-v1": ("mlx-neural-v1", "mlx-neural"),
 }
 REQUIRED_PROOFS = list(OPERATOR_READINESS_REQUIRED_PROOF_IDS)
+
+_RECOVERY_RESTORE_SCHEMAS = {
+    LEGACY_RECOVERY_BUNDLE_SCHEMA: LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    PRIOR_RECOVERY_BUNDLE_SCHEMA: PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    RECOVERY_BUNDLE_SCHEMA: RECOVERY_BUNDLE_RESTORE_SCHEMA,
+}
+_MEDIA_RECOVERY_METRIC_KEYS = (
+    "recovery_bundle_schema",
+    "recovery_restore_schema",
+    "media_included",
+    "media_recovery_complete",
+    "media_sha256",
+    "media_manifest_sha256",
+    "media_object_count",
+    "media_reference_count",
+)
+
+
+def _guarded_media_recovery_contract(
+    *,
+    bundle: dict[str, Any],
+    verification: dict[str, Any],
+    restore: dict[str, Any],
+    proof: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Return one content-free media contract bound across all recovery phases.
+
+    Legacy receipts are accepted only when a *newly generated* verification
+    and isolated proof explicitly establish that the database has zero image
+    references.  Merely omitting media fields never grants compatibility.
+    """
+
+    bundle_schema = bundle.get("bundle_schema")
+    restore_schema = proof.get("schema")
+    expected_restore_schema = _RECOVERY_RESTORE_SCHEMAS.get(bundle_schema)
+    default = {
+        "recovery_bundle_schema": bundle_schema,
+        "recovery_restore_schema": restore_schema,
+        "media_included": False,
+        "media_recovery_complete": False,
+        "media_sha256": None,
+        "media_manifest_sha256": None,
+        "media_object_count": 0,
+        "media_reference_count": 0,
+    }
+    if expected_restore_schema is None or restore_schema != expected_restore_schema:
+        return False, default
+
+    required_phase_fields = (
+        (verification, ("media_included", "media_recovery_complete", "media_reference_count")),
+        (restore, ("media_included", "media_recovery_complete", "media_reference_count")),
+        (proof, ("media_included", "media_recovery_complete", "media_reference_count")),
+    )
+    if any(any(key not in phase for key in keys) for phase, keys in required_phase_fields):
+        return False, default
+    if (
+        type(bundle.get("media_included")) is not bool
+        or not isinstance(bundle.get("media_reconciliation"), dict)
+        or type(bundle["media_reconciliation"].get("referenced_count")) is not int
+        or any(type(phase.get("media_included")) is not bool for phase, _ in required_phase_fields)
+        or any(
+            type(phase.get("media_recovery_complete")) is not bool
+            for phase, _ in required_phase_fields
+        )
+        or any(
+            type(phase.get("media_reference_count")) is not int
+            or int(phase["media_reference_count"]) < 0
+            for phase, _ in required_phase_fields
+        )
+    ):
+        return False, default
+
+    references = int(verification["media_reference_count"])
+    included = bool(verification["media_included"])
+    phase_references = (
+        int(bundle["media_reconciliation"]["referenced_count"]),
+        int(restore["media_reference_count"]),
+        int(proof["media_reference_count"]),
+    )
+    if (
+        any(value != references for value in phase_references)
+        or bundle.get("media_included") is not included
+        or restore.get("media_included") is not included
+        or proof.get("media_included") is not included
+        or verification.get("media_recovery_complete") is not True
+        or restore.get("media_recovery_complete") is not True
+        or proof.get("media_recovery_complete") is not True
+    ):
+        return False, default
+
+    # v1 is a narrowly retained pre-governed format, never an authoritative
+    # shortcut.  Both legacy schemas are media-free and require explicit zero
+    # reference evidence from the current verifier and restorer.
+    if bundle_schema == LEGACY_RECOVERY_BUNDLE_SCHEMA and (
+        verification.get("governance_mode") != "pre-governed-v5"
+        or proof.get("governance_mode") != "pre-governed-v5"
+        or proof.get("store_generation") != "legacy-v5"
+        or proof.get("authority_epoch_number") is not None
+    ):
+        return False, default
+    if bundle_schema in {
+        LEGACY_RECOVERY_BUNDLE_SCHEMA,
+        PRIOR_RECOVERY_BUNDLE_SCHEMA,
+    }:
+        if included or references != 0 or verification.get("media") is not None:
+            return False, default
+        return True, {
+            **default,
+            "media_recovery_complete": True,
+        }
+
+    if references == 0:
+        if (
+            included
+            or verification.get("media") is not None
+            or bundle.get("media_archive_sha256") is not None
+            or bundle.get("media_manifest_sha256") is not None
+            or bundle.get("media_object_count") != 0
+            or restore.get("media_object_count") != 0
+            or proof.get("media_sha256") is not None
+            or proof.get("media_manifest_sha256") is not None
+            or proof.get("media_object_count") != 0
+        ):
+            return False, default
+        return True, {
+            **default,
+            "media_recovery_complete": True,
+        }
+
+    media = verification.get("media")
+    media_sha256 = bundle.get("media_archive_sha256")
+    manifest_sha256 = bundle.get("media_manifest_sha256")
+    object_count = bundle.get("media_object_count")
+    if (
+        not included
+        or not isinstance(media, dict)
+        or media.get("verified") is not True
+        or SHA256_RE.fullmatch(str(media_sha256 or "")) is None
+        or SHA256_RE.fullmatch(str(manifest_sha256 or "")) is None
+        or type(object_count) is not int
+        or object_count != references
+        or media.get("sha256") != media_sha256
+        or media.get("manifest_sha256") != manifest_sha256
+        or media.get("object_count") != object_count
+        or media.get("referenced_count") != references
+        or restore.get("media_object_count") != object_count
+        or proof.get("media_sha256") != media_sha256
+        or proof.get("media_manifest_sha256") != manifest_sha256
+        or proof.get("media_object_count") != object_count
+    ):
+        return False, default
+    return True, {
+        "recovery_bundle_schema": bundle_schema,
+        "recovery_restore_schema": restore_schema,
+        "media_included": True,
+        "media_recovery_complete": True,
+        "media_sha256": media_sha256,
+        "media_manifest_sha256": manifest_sha256,
+        "media_object_count": object_count,
+        "media_reference_count": references,
+    }
 
 
 @dataclasses.dataclass
@@ -3951,10 +4121,57 @@ class OperatorReadinessCertifier:
         )
 
         bundle = dict(evidence.get("bundle") or {})
+        verification = dict(evidence.get("verification") or {})
+        restore = dict(evidence.get("restore") or {})
         bundle_binding = dict(bundle.get("capture_ledger_binding") or {})
         bundle_reconciliation = dict(bundle.get("reconciliation") or {})
+        verify_binding = dict(verification.get("capture_ledger_binding") or {})
+        verify_reconciliation = dict(verification.get("reconciliation") or {})
+        restore_binding = dict(restore.get("capture_ledger_binding") or {})
+        restore_reconciliation = dict(restore.get("reconciliation") or {})
+
+        # Read the exact isolated proof before grading any of the three
+        # recovery checks.  This lets every proof surface carry the same media
+        # binding and prevents a ready backup/verify pair from being detached
+        # from the isolated restore that established completeness.
+        proof_source = Path(str(restore.get("recovery_proof_path") or ""))
+        proof: dict[str, Any] = {}
+        proof_source_bytes = b""
+        proof_contract_ready = False
+        if proof_source.is_file() and not proof_source.is_symlink():
+            try:
+                proof_source_bytes = read_private_regular_bytes(
+                    proof_source,
+                    max_bytes=1024 * 1024,
+                )
+                loaded = json.loads(proof_source_bytes.decode("utf-8"))
+                if isinstance(loaded, dict):
+                    proof = loaded
+                    proof_contract_ready = (
+                        proof.get("schema")
+                        in set(_RECOVERY_RESTORE_SCHEMAS.values())
+                        and proof.get("mode") == "isolated-recovery-proof"
+                        and proof.get("verified") is True
+                        and proof.get("cutover_ready") is True
+                        and proof.get("missing_transport_ledger_count") == 0
+                        and proof.get("capture_ledger_binding")
+                        == restore_binding
+                        and self._reconciliation_ready(
+                            proof.get("reconciliation")
+                        )
+                    )
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                proof_contract_ready = False
+        media_ready, media_metrics = _guarded_media_recovery_contract(
+            bundle=bundle,
+            verification=verification,
+            restore=restore,
+            proof=proof,
+        )
         backup_ready = (
-            bundle.get("bundle_verified") is True
+            proof_contract_ready
+            and media_ready
+            and bundle.get("bundle_verified") is True
             and bundle.get("cutover_ready") is True
             and self._capture_binding_ready(bundle_binding)
             and self._reconciliation_ready(bundle_reconciliation)
@@ -3981,13 +4198,11 @@ class OperatorReadinessCertifier:
                 "capture_ledger_binding": bundle_binding,
                 "reconciliation": bundle_reconciliation,
                 "guarded": True,
+                **media_metrics,
             },
             duration_ms=duration_ms,
         )
 
-        verification = dict(evidence.get("verification") or {})
-        verify_binding = dict(verification.get("capture_ledger_binding") or {})
-        verify_reconciliation = dict(verification.get("reconciliation") or {})
         verify_ready = (
             backup_ready
             and verification.get("verified") is True
@@ -4021,48 +4236,13 @@ class OperatorReadinessCertifier:
                 "capture_ledger_binding": verify_binding,
                 "reconciliation": verify_reconciliation,
                 "guarded": True,
+                **media_metrics,
             },
             duration_ms=duration_ms,
             preserve_crypto_fields=True,
         )
 
-        restore = dict(evidence.get("restore") or {})
-        restore_binding = dict(restore.get("capture_ledger_binding") or {})
-        restore_reconciliation = dict(restore.get("reconciliation") or {})
-        proof_source = Path(str(restore.get("recovery_proof_path") or ""))
-        proof: dict[str, Any] = {}
-        proof_source_bytes = b""
-        proof_ready = False
-        if proof_source.is_file() and not proof_source.is_symlink():
-            try:
-                proof_source_bytes = read_private_regular_bytes(
-                    proof_source,
-                    max_bytes=1024 * 1024,
-                )
-                loaded = json.loads(proof_source_bytes.decode("utf-8"))
-                if isinstance(loaded, dict):
-                    proof = loaded
-                    proof_ready = (
-                        proof.get("schema")
-                        in {
-                            "synapse-s2.recovery-bundle-restore.v1",
-                            "synapse-s2.recovery-bundle-restore.v2",
-                        }
-                        and proof.get("mode") == "isolated-recovery-proof"
-                        and proof.get("verified") is True
-                        and proof.get("cutover_ready") is True
-                        and int(
-                            proof.get("missing_transport_ledger_count") or 0
-                        )
-                        == 0
-                        and proof.get("capture_ledger_binding")
-                        == restore_binding
-                        and self._reconciliation_ready(
-                            proof.get("reconciliation")
-                        )
-                    )
-            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-                proof_ready = False
+        proof_ready = proof_contract_ready and media_ready
         extra_artifacts: dict[str, str] = {}
         if proof_ready:
             durable_proof = (
@@ -4113,6 +4293,7 @@ class OperatorReadinessCertifier:
                 "capture_ledger_binding": restore_binding,
                 "reconciliation": restore_reconciliation,
                 "guarded": True,
+                **media_metrics,
             },
             duration_ms=duration_ms,
             artifact_paths=extra_artifacts,

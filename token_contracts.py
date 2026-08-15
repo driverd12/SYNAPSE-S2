@@ -31,6 +31,7 @@ DEFAULT_RESPONSE_BYTES = {
     "memory-list": 32 * 1024,
     "memory-graph": 48 * 1024,
     "cortex-state": 16 * 1024,
+    "media-similarity": 16 * 1024,
 }
 COMPACT_SOURCE_LIMITS = {
     "agent-events": 8,
@@ -39,6 +40,7 @@ COMPACT_SOURCE_LIMITS = {
     "memory-list": 50,
     "memory-graph": 30,
     "cortex-state": 20,
+    "media-similarity": 10,
 }
 COMPACT_RETRIEVAL_ITEM_BYTES = {
     "memory-list": 1_024,
@@ -64,6 +66,8 @@ SURFACE_ALIASES = {
     "memory-graph": "memory-graph",
     "cortex": "cortex-state",
     "cortex-state": "cortex-state",
+    "image-similar": "media-similarity",
+    "media-similarity": "media-similarity",
 }
 _SAFE_CODE_RE = re.compile(r"[^a-z0-9_.:-]+")
 _CONTEXT_DELIVERY_ID_RE = re.compile(r"[A-Za-z0-9_.:@-]+")
@@ -412,6 +416,7 @@ def project_response(
         "memory-list": project_memory_list,
         "memory-graph": project_memory_graph,
         "cortex-state": project_cortex_state,
+        "media-similarity": project_media_similarity,
     }[normalized_surface]
     return projector(payload, max_response_bytes=budget)
 
@@ -1582,6 +1587,182 @@ def project_cortex_state(
     return _finalize(envelope, budget=budget, shrinkers=shrinkers)
 
 
+@_audited_projection
+def project_media_similarity(
+    payload: dict[str, Any],
+    *,
+    max_response_bytes: Any = None,
+) -> dict[str, Any]:
+    """Project bounded image-to-image recall without any feature-byte leakage."""
+
+    budget = normalize_response_budget(
+        max_response_bytes,
+        default_bytes=DEFAULT_RESPONSE_BYTES["media-similarity"],
+    )
+    _validate_surface_identities("media-similarity", payload)
+    query = payload.get("query")
+    candidate = payload.get("candidate")
+    confidence = payload.get("confidence")
+    if (
+        not isinstance(query, dict)
+        or not isinstance(candidate, dict)
+        or not isinstance(confidence, dict)
+    ):
+        raise ResponseContractError("media similarity control metadata is invalid")
+    media_id = _atomic_identifier(
+        query.get("media_id"), field="media_id", max_chars=64
+    )
+    feature_fields = (
+        "provider",
+        "schema",
+        "request_revision",
+        "element_type",
+        "element_count",
+        "input_derivative",
+    )
+    clean_query = {
+        "media_id": media_id,
+        **{field: query.get(field) for field in feature_fields},
+    }
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        raise ResponseContractError("media similarity results are invalid")
+    results: list[dict[str, Any]] = []
+    for item in raw_results[: COMPACT_SOURCE_LIMITS["media-similarity"]]:
+        if not isinstance(item, dict):
+            raise ResponseContractError("media similarity result item is invalid")
+        feature = item.get("feature_print")
+        if not isinstance(feature, dict) or "data" in feature or "data" in item:
+            raise ResponseContractError(
+                "media similarity result must not carry feature bytes"
+            )
+        results.append(
+            {
+                "rank": _safe_int(item.get("rank")),
+                "media_id": _atomic_identifier(
+                    item.get("media_id"), field="media_id", max_chars=64
+                ),
+                "distance": _safe_number(item.get("distance")),
+                "score": _unit_number(item.get("score"), field="score"),
+                "artifact_schema": _clean_text(str(item.get("artifact_schema") or ""), 64),
+                "mime_type": _clean_text(str(item.get("mime_type") or ""), 32),
+                "source_dimensions": {
+                    "width": _safe_int((item.get("source_dimensions") or {}).get("width")),
+                    "height": _safe_int((item.get("source_dimensions") or {}).get("height")),
+                },
+                "thumbnail_dimensions": {
+                    "width": _safe_int((item.get("thumbnail_dimensions") or {}).get("width")),
+                    "height": _safe_int((item.get("thumbnail_dimensions") or {}).get("height")),
+                },
+                "thumbnail_available": bool(item.get("thumbnail_available")),
+                "feature_print": {
+                    field: feature.get(field) for field in feature_fields
+                },
+            }
+        )
+    projection_truncated = len(raw_results) > len(results)
+    if projection_truncated:
+        _record_projection_omission("media_similarity_results", len(raw_results) - len(results))
+    candidate_fields = (
+        "scope_reference_count",
+        "scanned_count",
+        "compatible_count",
+        "incompatible_count",
+        "missing_feature_count",
+        "candidate_limit",
+    )
+    clean_candidate = {
+        field: _safe_int(candidate.get(field)) for field in candidate_fields
+    }
+    clean_candidate["truncated"] = bool(candidate.get("truncated"))
+    result_truncated = bool(payload.get("result_truncated")) or projection_truncated
+    data = {
+        "context_id": _atomic_identifier(
+            payload.get("context_id") or "default",
+            field="context_id",
+            max_chars=128,
+        ),
+        "recall_scope": str(payload.get("recall_scope") or "local"),
+        "resolved_context_count": _safe_int(payload.get("resolved_context_count")),
+        "distance_metric": str(payload.get("distance_metric")),
+        "query": clean_query,
+        "result_count": len(results),
+        "results": results,
+        "result_limit": _safe_int(payload.get("result_limit")),
+        "result_truncated": result_truncated,
+        "candidate": clean_candidate,
+        "confidence": {
+            "calibrated": False,
+            "signal": _clean_text(str(confidence.get("signal") or ""), 64),
+            "warning": _clean_text(str(confidence.get("warning") or ""), 240),
+        },
+        "deterministic_tie_break": _clean_text(
+            str(payload.get("deterministic_tie_break") or ""), 64
+        ),
+        "feature_print_bytes_returned": False,
+        "raw_original_stored": False,
+    }
+    envelope = _base_envelope(
+        surface="media-similarity",
+        mode="compact",
+        budget=budget,
+        data=data,
+        provenance={
+            "source": "node-local-media-cache",
+            "context_id": data["context_id"],
+            "recall_scope": data["recall_scope"],
+            "distance_metric": data["distance_metric"],
+        },
+        pagination={
+            "supported": False,
+            "strategy": "deterministic-bounded-top-k",
+            "requested_limit": data["result_limit"],
+            "effective_limit": (
+                min(
+                    data["result_limit"],
+                    COMPACT_SOURCE_LIMITS["media-similarity"],
+                )
+                if data["result_limit"]
+                else data["result_limit"]
+            ),
+            "returned": len(results),
+            "has_more": result_truncated,
+            "next_cursor": None,
+        },
+        completeness={
+            "complete": not (result_truncated or clean_candidate["truncated"]),
+            "candidate_scan_truncated": clean_candidate["truncated"],
+            "result_set_truncated": result_truncated,
+            "reason": (
+                "bounded-result-set-has-more"
+                if result_truncated or clean_candidate["truncated"]
+                else "bounded-scan-complete"
+            ),
+        },
+        continuation={
+            "strategy": "refine-query-or-increase-result-limit",
+            "cursor": None,
+        },
+        warnings=[
+            _warning(
+                "uncalibrated-similarity",
+                "info",
+                "Feature-print distance is a deterministic node-local ranking "
+                "signal, not a truth probability.",
+            )
+        ],
+    )
+    return _finalize(
+        envelope,
+        budget=budget,
+        shrinkers=[
+            lambda: _drop_last(
+                envelope["data"]["results"], envelope, "media_similarity_results"
+            ),
+        ],
+    )
+
+
 def _base_envelope(
     *,
     surface: str,
@@ -1667,6 +1848,11 @@ def _refresh_dynamic_counts(envelope: dict[str, Any]) -> None:
         if isinstance(envelope.get("pagination"), dict)
         else {}
     )
+    if operation == "media-similarity":
+        results = data.get("results") if isinstance(data.get("results"), list) else []
+        data["result_count"] = len(results)
+        pagination["returned"] = len(results)
+        return
     if operation == "agent-hydration":
         recall = data.get("recall") if isinstance(data.get("recall"), dict) else {}
         graph = data.get("graph") if isinstance(data.get("graph"), dict) else {}
@@ -3515,6 +3701,28 @@ def _validate_cortex_counts(payload: dict[str, Any]) -> None:
 
 
 def _validate_surface_identities(surface: str, payload: dict[str, Any]) -> None:
+    if surface == "media-similarity":
+        if payload.get("schema") != "synapse-s2.media-similarity.v1":
+            raise ResponseContractError("media similarity schema is unsupported")
+        if payload.get("distance_metric") != "s2-feature-vector-l2-v1":
+            raise ResponseContractError("media similarity metric is unsupported")
+        if payload.get("feature_print_bytes_returned") is not False:
+            raise ResponseContractError(
+                "media similarity must never return feature bytes"
+            )
+        if payload.get("raw_original_stored") is not False:
+            raise ResponseContractError(
+                "media similarity must never store raw originals"
+            )
+        confidence = payload.get("confidence")
+        if (
+            not isinstance(confidence, dict)
+            or confidence.get("calibrated") is not False
+        ):
+            raise ResponseContractError(
+                "media similarity confidence is not uncalibrated"
+            )
+        return
     if surface == "memory-retrieval":
         if payload.get("schema") != "synapse-retrieval.v2":
             raise ResponseContractError("retrieval schema is unsupported")

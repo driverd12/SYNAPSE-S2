@@ -16,6 +16,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import zlib
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -37,6 +38,16 @@ from core_request_journal import (
     JOURNAL_SCHEMA_VERSION,
     SAFE_ERROR_CODES as REQUEST_JOURNAL_SAFE_ERROR_CODES,
 )
+from image_capture import (
+    IMAGE_ARTIFACT_ENRICHED_SCHEMA,
+    IMAGE_ARTIFACT_SCHEMA,
+    MAX_FEATURE_PRINT_BYTES,
+    MAX_OBJECTS as MAX_MEDIA_OBJECTS,
+    MAX_THUMBNAIL_BYTES,
+    ImageCaptureError,
+    ImageCaptureNotFound,
+    MediaObjectReader,
+)
 from memory_store import (
     BACKUP_DIGEST_RE,
     BACKUP_CRITICAL_TABLES,
@@ -50,11 +61,13 @@ from memory_store import (
     _json_dumps,
     _matching_backup_schema_contract_versions,
     capture_request_fingerprint,
+    media_references_from_connection,
 )
 from redaction import redact_capture_text, reject_sensitive_identifier, strip_untrusted_raw_digest_text
 
 
-RECOVERY_BUNDLE_SCHEMA = "synapse-s2.recovery-bundle.v2"
+RECOVERY_BUNDLE_SCHEMA = "synapse-s2.recovery-bundle.v3"
+PRIOR_RECOVERY_BUNDLE_SCHEMA = "synapse-s2.recovery-bundle.v2"
 LEGACY_RECOVERY_BUNDLE_SCHEMA = "synapse-s2.recovery-bundle.v1"
 REQUEST_JOURNAL_RESTORE_BINDING_SCHEMA = (
     "synapse-s2.request-journal-restore-binding.v1"
@@ -68,12 +81,29 @@ REQUEST_JOURNAL_IDENTIFIER_RE = re.compile(
     r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z"
 )
 CAPTURE_ARCHIVE_MANIFEST_SCHEMA = "synapse-s2.capture-archive.v1"
+MEDIA_ARCHIVE_MANIFEST_SCHEMA = "synapse-s2.media-archive.v1"
+MAX_MEDIA_ARCHIVE_FILES = MAX_MEDIA_OBJECTS * 3
+MAX_MEDIA_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_MEDIA_ARCHIVE_TOTAL_BYTES = 4 * 1024**3
+# The decompressed tar stream may hold at most every declared member byte,
+# the manifest, one 1 KiB header/padding allowance per member, and the tar
+# end-of-archive marker; anything larger is a smuggled payload.
+MAX_MEDIA_ARCHIVE_DECOMPRESSED_BYTES = (
+    MAX_MEDIA_ARCHIVE_TOTAL_BYTES
+    + MAX_MEDIA_MANIFEST_BYTES
+    + (MAX_MEDIA_ARCHIVE_FILES + 2) * 1024
+    + 64 * 1024
+)
+# gzip never inflates its input by more than a small framing overhead, so the
+# compressed envelope is bounded by the decompressed ceiling plus slack.
+MAX_MEDIA_ARCHIVE_ENVELOPE_BYTES = MAX_MEDIA_ARCHIVE_DECOMPRESSED_BYTES + 1024 * 1024
 RUNTIME_STATE_BINDING_SCHEMA = "synapse-s2.runtime-state-binding.v1"
 RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA = (
     "synapse-s2.runtime-authority-binding.v1"
 )
 RUNTIME_STATE_AUTHORITY_LOCK_RE = CORE_AUTHORITY_LOCK_GENERATION_RE
-RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v2"
+RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v3"
+PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v2"
 LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA = "synapse-s2.recovery-bundle-restore.v1"
 RECOVERY_RETENTION_PLAN_SCHEMA = "synapse-s2.recovery-retention-plan.v1"
 RECOVERY_RETIREMENT_RECEIPT_SCHEMA = "synapse-s2.recovery-retirement.v1"
@@ -135,6 +165,64 @@ LEGACY_EVENT_DERIVED_METADATA_FIELDS = frozenset(
         "temporal",
     }
 )
+
+
+def _require_single_bounded_gzip_stream(
+    archive_path: Path,
+    *,
+    max_decompressed_bytes: int,
+    on_payload: Callable[[bytes, int], None] | None = None,
+) -> int:
+    """Measure one strictly bounded gzip member and reject smuggled bytes.
+
+    A digest-signed media envelope must be exactly one gzip stream whose
+    decompressed payload stays within the supplied ceiling. Bytes after the
+    gzip stream ends (appended raw or recompressed data) and streams that
+    inflate past the ceiling are rejected before any tar member is trusted.
+    Returns the exact decompressed byte count so callers can bind it to the
+    manifest-declared member sizes. ``on_payload`` observes each decompressed
+    piece with its absolute stream offset.
+    """
+
+    decompressor = zlib.decompressobj(wbits=31)
+    decompressed_bytes = 0
+    with archive_path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            if decompressor.eof:
+                raise ValueError(
+                    "media archive has trailing data after its gzip stream"
+                )
+            try:
+                remaining = max_decompressed_bytes - decompressed_bytes
+                produced = decompressor.decompress(chunk, remaining + 1)
+                if on_payload is not None and produced:
+                    on_payload(produced, decompressed_bytes)
+                decompressed_bytes += len(produced)
+                while (
+                    decompressor.unconsumed_tail
+                    and decompressed_bytes <= max_decompressed_bytes
+                ):
+                    remaining = max_decompressed_bytes - decompressed_bytes
+                    produced = decompressor.decompress(
+                        decompressor.unconsumed_tail, remaining + 1
+                    )
+                    if on_payload is not None and produced:
+                        on_payload(produced, decompressed_bytes)
+                    decompressed_bytes += len(produced)
+            except zlib.error as exc:
+                raise ValueError("media archive gzip envelope is invalid") from exc
+            if decompressed_bytes > max_decompressed_bytes:
+                raise ValueError(
+                    "media archive decompresses past its size ceiling"
+                )
+    if not decompressor.eof:
+        raise ValueError("media archive gzip stream is truncated")
+    if decompressor.unused_data:
+        raise ValueError("media archive has trailing data after its gzip stream")
+    return decompressed_bytes
 
 
 @contextmanager
@@ -506,7 +594,7 @@ class VerifiedRecoveryManager:
                 relative_directory.is_absolute()
                 or ".." in relative_directory.parts
                 or not isinstance(artifact_names, list)
-                or len(artifact_names) not in {4, 5, 6, 7}
+                or len(artifact_names) not in {4, 5, 6, 7, 8}
                 or len(set(artifact_names)) != len(artifact_names)
                 or any(
                     not isinstance(name, str)
@@ -641,6 +729,13 @@ class VerifiedRecoveryManager:
     @staticmethod
     def _capture_archive_path(database_path: Path) -> Path:
         return database_path.with_name(database_path.name + ".capture.tar.gz")
+
+    @staticmethod
+    def _media_archive_path(database_path: Path) -> Path:
+        return database_path.with_name(database_path.name + ".media.tar.gz")
+
+    def _media_root(self) -> Path:
+        return self.store.db_path.parent / "media-cache"
 
     @staticmethod
     def _bundle_receipt_path(database_path: Path) -> Path:
@@ -4704,6 +4799,612 @@ class VerifiedRecoveryManager:
             self.store._fsync_directory(output_path.parent)
             raise
 
+    def _media_inventory(
+        self,
+        *,
+        referenced_media_ids: list[str],
+        database_binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build the digest-bound media inventory for one immutable DB snapshot.
+
+        The reference set must come from the immutable database artifact, never
+        the live store. A referenced object that is missing or fails validation
+        blocks publication; valid orphans are excluded from the archive and
+        reported content-free.
+        """
+
+        reader = MediaObjectReader(self._media_root())
+        stored_ids = reader.object_ids()
+        referenced = sorted({str(media_id) for media_id in referenced_media_ids})
+        if len(referenced) > MAX_MEDIA_OBJECTS:
+            raise RuntimeError("media inventory reference bound exceeded")
+        missing = sorted(set(referenced) - set(stored_ids))
+        if missing:
+            raise RuntimeError(
+                "referenced media derivatives are missing from the local cache "
+                f"(missing={len(missing)})"
+            )
+        objects: list[dict[str, Any]] = []
+        total_bytes = 0
+        file_count = 0
+        for media_id in referenced:
+            try:
+                manifest, files = reader.read_object_artifacts(media_id)
+            except (ImageCaptureError, ValueError, OSError) as exc:
+                raise RuntimeError(
+                    "referenced media derivative failed verification"
+                ) from exc
+            file_records = []
+            for name in sorted(files):
+                data = files[name]
+                total_bytes += len(data)
+                file_count += 1
+                if (
+                    file_count > MAX_MEDIA_ARCHIVE_FILES
+                    or total_bytes > MAX_MEDIA_ARCHIVE_TOTAL_BYTES
+                ):
+                    raise RuntimeError("media inventory exceeded its bounds")
+                file_records.append(
+                    {
+                        "name": name,
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "size_bytes": len(data),
+                    }
+                )
+            objects.append(
+                {
+                    "media_id": media_id,
+                    "artifact_schema": str(manifest["schema"]),
+                    "files": file_records,
+                }
+            )
+        orphaned = sorted(set(stored_ids) - set(referenced))
+        for media_id in orphaned:
+            try:
+                reader.read_object_artifacts(media_id)
+            except (ImageCaptureError, ValueError, OSError) as exc:
+                raise RuntimeError(
+                    "orphaned media derivative failed verification; repair or "
+                    "prune the cache before paired backup"
+                ) from exc
+        reconciliation = {
+            "referenced_count": len(referenced),
+            "archived_object_count": len(objects),
+            "missing_count": 0,
+            "missing_media_ids": [],
+            "orphan_count": len(orphaned),
+            "orphan_media_ids": orphaned,
+        }
+        manifest_seed = {
+            "schema": MEDIA_ARCHIVE_MANIFEST_SCHEMA,
+            "object_count": len(objects),
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "database_binding": database_binding,
+            "reconciliation": reconciliation,
+            "objects": objects,
+        }
+        manifest_sha256 = hashlib.sha256(
+            _json_dumps(manifest_seed).encode("utf-8")
+        ).hexdigest()
+        return {**manifest_seed, "manifest_sha256": manifest_sha256}
+
+    def _write_media_archive(
+        self,
+        output_path: Path,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        if output_path.exists() or output_path.is_symlink():
+            raise FileExistsError("media archive already exists; refusing overwrite")
+        reader = MediaObjectReader(self._media_root())
+        temporary = self.store._unique_private_temp_path(
+            output_path.parent,
+            prefix=f".{output_path.name}.",
+        )
+        published = False
+        try:
+            with tarfile.open(temporary, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+                manifest_bytes = (
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8")
+                if len(manifest_bytes) > MAX_MEDIA_MANIFEST_BYTES:
+                    raise RuntimeError("media manifest exceeds its size bound")
+                manifest_info = tarfile.TarInfo("media-manifest.json")
+                manifest_info.size = len(manifest_bytes)
+                manifest_info.mode = 0o600
+                manifest_info.mtime = 0
+                archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+                for record in manifest["objects"]:
+                    media_id = str(record["media_id"])
+                    _manifest, files = reader.read_object_artifacts(media_id)
+                    expected_files = {
+                        str(item["name"]): item for item in record["files"]
+                    }
+                    if set(files) != set(expected_files):
+                        raise RuntimeError(
+                            "media object changed after inventory creation"
+                        )
+                    for name in sorted(files):
+                        data = files[name]
+                        expected = expected_files[name]
+                        if (
+                            len(data) != int(expected["size_bytes"])
+                            or hashlib.sha256(data).hexdigest()
+                            != str(expected["sha256"])
+                        ):
+                            raise RuntimeError(
+                                "media object changed after inventory creation"
+                            )
+                        info = tarfile.TarInfo(f"media/objects/{media_id}/{name}")
+                        info.size = len(data)
+                        info.mode = 0o600
+                        info.mtime = 0
+                        archive.addfile(info, io.BytesIO(data))
+            self.store._fsync_file(temporary)
+            temporary_digest, temporary_size, _ = self.store._hash_stable_regular_file(
+                temporary
+            )
+            os.link(temporary, output_path, follow_symlinks=False)
+            published = True
+            temporary_metadata = os.lstat(temporary)
+            output_metadata = os.lstat(output_path)
+            if (temporary_metadata.st_dev, temporary_metadata.st_ino) != (
+                output_metadata.st_dev,
+                output_metadata.st_ino,
+            ):
+                raise RuntimeError("media archive publication identity mismatch")
+            os.chmod(output_path, 0o600, follow_symlinks=False)
+            self.store._fsync_file(output_path)
+            final_digest, final_size, _ = self.store._hash_stable_regular_file(output_path)
+            if (
+                not secrets.compare_digest(temporary_digest, final_digest)
+                or temporary_size != final_size
+            ):
+                raise RuntimeError("media archive changed during publication")
+            temporary.unlink()
+            self.store._fsync_directory(output_path.parent)
+            return {"sha256": final_digest, "size_bytes": final_size}
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            if published:
+                output_path.unlink(missing_ok=True)
+            self.store._fsync_directory(output_path.parent)
+            raise
+
+    def _verify_media_archive(
+        self,
+        archive_path: Path,
+        *,
+        expected_sha256: str,
+        expected_manifest_sha256: str,
+        database_binding: dict[str, Any] | None = None,
+        retain_verified_snapshot: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            archive_metadata = os.lstat(archive_path)
+        except FileNotFoundError as exc:
+            raise ValueError("media archive does not exist") from exc
+        if stat.S_ISLNK(archive_metadata.st_mode) or not stat.S_ISREG(
+            archive_metadata.st_mode
+        ):
+            raise ValueError("media archive must be a non-symlink regular file")
+        staging_dir = self.store._backup_verification_staging_dir()
+        staged = self.store._unique_private_temp_path(
+            staging_dir,
+            prefix=f".{archive_path.name}.media-verify.",
+        )
+        retained = False
+        try:
+            copied = self.store._copy_stable_regular_file(archive_path, staged)
+            if not secrets.compare_digest(str(copied["sha256"]), expected_sha256):
+                raise RuntimeError("media archive digest verification failed")
+            verification = self._verify_media_archive_snapshot(
+                staged,
+                expected_sha256=expected_sha256,
+                expected_manifest_sha256=expected_manifest_sha256,
+                database_binding=database_binding,
+            )
+            if retain_verified_snapshot:
+                retained = True
+                verification["verified_snapshot_path"] = str(staged)
+            return verification
+        finally:
+            if not retained:
+                staged.unlink(missing_ok=True)
+            self.store._fsync_directory(staging_dir)
+
+    def _verify_media_archive_snapshot(
+        self,
+        archive_path: Path,
+        *,
+        expected_sha256: str,
+        expected_manifest_sha256: str,
+        database_binding: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        digest, size_bytes, _ = self.store._hash_stable_regular_file(archive_path)
+        if not secrets.compare_digest(digest, expected_sha256):
+            raise RuntimeError("media archive digest verification failed")
+        if size_bytes > MAX_MEDIA_ARCHIVE_ENVELOPE_BYTES:
+            raise ValueError("media archive envelope exceeds its size ceiling")
+        decompressed_stream_bytes = _require_single_bounded_gzip_stream(
+            archive_path,
+            max_decompressed_bytes=MAX_MEDIA_ARCHIVE_DECOMPRESSED_BYTES,
+        )
+        with tarfile.open(archive_path, mode="r:gz") as archive:
+            members = archive.getmembers()
+            if len(members) > MAX_MEDIA_ARCHIVE_FILES + 1:
+                raise RuntimeError("media archive contains too many members")
+            if any(not member.isfile() for member in members):
+                raise ValueError("media archive contains a non-file member")
+            manifest_members = [
+                member for member in members if member.name == "media-manifest.json"
+            ]
+            if len(manifest_members) != 1:
+                raise ValueError("media archive manifest is missing or ambiguous")
+            manifest_member = manifest_members[0]
+            if manifest_member.size > MAX_MEDIA_MANIFEST_BYTES:
+                raise ValueError("media archive manifest exceeds its size limit")
+            extracted_manifest = archive.extractfile(manifest_member)
+            if extracted_manifest is None:
+                raise ValueError("media archive manifest cannot be read")
+            manifest_raw = extracted_manifest.read(MAX_MEDIA_MANIFEST_BYTES + 1)
+            if len(manifest_raw) > MAX_MEDIA_MANIFEST_BYTES:
+                raise ValueError("media archive manifest exceeds its size limit")
+            try:
+                manifest = json.loads(manifest_raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("media archive manifest is invalid") from exc
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("schema") != MEDIA_ARCHIVE_MANIFEST_SCHEMA
+                or set(manifest)
+                != {
+                    "schema",
+                    "object_count",
+                    "file_count",
+                    "total_bytes",
+                    "database_binding",
+                    "reconciliation",
+                    "objects",
+                    "manifest_sha256",
+                }
+            ):
+                raise ValueError("media archive manifest schema is unsupported")
+            manifest_seed = {
+                key: value for key, value in manifest.items() if key != "manifest_sha256"
+            }
+            calculated_manifest_digest = hashlib.sha256(
+                _json_dumps(manifest_seed).encode("utf-8")
+            ).hexdigest()
+            if (
+                not secrets.compare_digest(
+                    str(manifest.get("manifest_sha256") or ""),
+                    calculated_manifest_digest,
+                )
+                or not secrets.compare_digest(
+                    calculated_manifest_digest,
+                    expected_manifest_sha256,
+                )
+            ):
+                raise RuntimeError("media archive manifest digest verification failed")
+            binding = manifest.get("database_binding")
+            if not isinstance(binding, dict):
+                raise ValueError("media archive database binding is invalid")
+            if database_binding is not None and binding != database_binding:
+                raise RuntimeError("media archive database binding mismatch")
+            reconciliation = manifest.get("reconciliation")
+            objects = manifest.get("objects")
+            if (
+                not isinstance(reconciliation, dict)
+                or set(reconciliation)
+                != {
+                    "referenced_count",
+                    "archived_object_count",
+                    "missing_count",
+                    "missing_media_ids",
+                    "orphan_count",
+                    "orphan_media_ids",
+                }
+                or reconciliation.get("missing_count") != 0
+                or reconciliation.get("missing_media_ids") != []
+                or not isinstance(objects, list)
+                or type(reconciliation.get("referenced_count")) is not int
+                or type(reconciliation.get("archived_object_count")) is not int
+                or type(reconciliation.get("orphan_count")) is not int
+                or not isinstance(reconciliation.get("orphan_media_ids"), list)
+                or reconciliation["archived_object_count"] != len(objects)
+                or reconciliation["referenced_count"] != len(objects)
+                or reconciliation["orphan_count"]
+                != len(reconciliation["orphan_media_ids"])
+            ):
+                raise ValueError("media archive reconciliation is invalid")
+            expected_members: dict[str, dict[str, Any]] = {}
+            object_ids: list[str] = []
+            declared_files = 0
+            declared_bytes = 0
+            for record in objects:
+                if (
+                    not isinstance(record, dict)
+                    or set(record) != {"media_id", "artifact_schema", "files"}
+                    or record.get("artifact_schema")
+                    not in (IMAGE_ARTIFACT_SCHEMA, IMAGE_ARTIFACT_ENRICHED_SCHEMA)
+                    or not isinstance(record.get("files"), list)
+                    or not record["files"]
+                ):
+                    raise ValueError("media archive object record is invalid")
+                media_id = str(record["media_id"])
+                if re.fullmatch(r"s2img_[0-9a-f]{32}", media_id) is None:
+                    raise ValueError("media archive object identity is invalid")
+                object_ids.append(media_id)
+                names = sorted(str(item.get("name")) for item in record["files"])
+                if names not in (
+                    ["manifest.json", "thumbnail.jpg"],
+                    ["feature-print.bin", "manifest.json", "thumbnail.jpg"],
+                ):
+                    raise ValueError("media archive object inventory is invalid")
+                for item in record["files"]:
+                    if (
+                        not isinstance(item, dict)
+                        or set(item) != {"name", "sha256", "size_bytes"}
+                        or BACKUP_DIGEST_RE.fullmatch(str(item.get("sha256") or ""))
+                        is None
+                        or type(item.get("size_bytes")) is not int
+                        or item["size_bytes"] <= 0
+                    ):
+                        raise ValueError("media archive file record is invalid")
+                    maximum = (
+                        MAX_THUMBNAIL_BYTES
+                        if item["name"] == "thumbnail.jpg"
+                        else MAX_FEATURE_PRINT_BYTES
+                        if item["name"] == "feature-print.bin"
+                        else 64 * 1024
+                    )
+                    if item["size_bytes"] > maximum:
+                        raise ValueError("media archive file exceeds its size bound")
+                    member_name = f"media/objects/{media_id}/{item['name']}"
+                    if member_name in expected_members:
+                        raise ValueError("media archive file record is duplicated")
+                    expected_members[member_name] = dict(item)
+                    declared_files += 1
+                    declared_bytes += int(item["size_bytes"])
+            if len(set(object_ids)) != len(object_ids):
+                raise ValueError("media archive object identity is duplicated")
+            if (
+                int(manifest["object_count"]) != len(object_ids)
+                or int(manifest["file_count"]) != declared_files
+                or int(manifest["total_bytes"]) != declared_bytes
+                or declared_files > MAX_MEDIA_ARCHIVE_FILES
+                or declared_bytes > MAX_MEDIA_ARCHIVE_TOTAL_BYTES
+            ):
+                raise RuntimeError("media archive manifest totals are inconsistent")
+            # Bind the measured gzip payload to the manifest-declared member
+            # bytes plus bounded tar headers/padding, so a signed envelope
+            # cannot smuggle data hidden after the tar end-of-archive marker.
+            declared_stream_ceiling = (
+                declared_bytes
+                + int(manifest_member.size)
+                + (declared_files + 2) * 1024
+                + 64 * 1024
+            )
+            if decompressed_stream_bytes > declared_stream_ceiling:
+                raise ValueError(
+                    "media archive stream exceeds its declared payload"
+                )
+            member_names = [
+                member.name for member in members if member.name != "media-manifest.json"
+            ]
+            if (
+                len(member_names) != len(set(member_names))
+                or set(member_names) != set(expected_members)
+            ):
+                raise RuntimeError("media archive members do not match the manifest")
+            for member in members:
+                if member.name == "media-manifest.json":
+                    continue
+                record = expected_members[member.name]
+                if member.size != int(record["size_bytes"]):
+                    raise RuntimeError("media archive member size drifted")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise ValueError("media archive member cannot be read")
+                data = extracted.read(int(record["size_bytes"]) + 1)
+                if (
+                    len(data) != int(record["size_bytes"])
+                    or hashlib.sha256(data).hexdigest() != str(record["sha256"])
+                ):
+                    raise RuntimeError("media archive member digest mismatch")
+            # Canonical member layout: every member is one plain 512-byte
+            # header followed by its data, members are contiguous from offset
+            # zero, and no extended (PAX/GNU) header blocks exist. The writer
+            # only emits short USTAR-representable names, so any other layout
+            # is foreign structure a permissive tar parser would tolerate.
+            ordered_members = sorted(members, key=lambda item: int(item.offset))
+            expected_offset = 0
+            zero_intervals: list[tuple[int, int]] = []
+            for member in ordered_members:
+                if (
+                    int(member.offset) != expected_offset
+                    or int(member.offset_data)
+                    != int(member.offset) + tarfile.BLOCKSIZE
+                ):
+                    raise ValueError(
+                        "media archive member layout is not canonical"
+                    )
+                data_end = int(member.offset_data) + int(member.size)
+                padded_end = int(member.offset_data) + (
+                    (int(member.size) + 511) // 512
+                ) * 512
+                if padded_end > data_end:
+                    zero_intervals.append((data_end, padded_end))
+                expected_offset = padded_end
+            tar_data_end = expected_offset
+        # Exact canonical tar extent: after the last member's padded data the
+        # stream may hold only the two zero end-of-archive blocks and zero
+        # padding up to the record boundary, and every member's data padding
+        # must itself be zero. Any nonzero byte in a padding region, or any
+        # stream length other than the canonical padded extent, is smuggled
+        # data the tar parser would silently ignore.
+        canonical_extent = (
+            (tar_data_end + 1024 + tarfile.RECORDSIZE - 1)
+            // tarfile.RECORDSIZE
+        ) * tarfile.RECORDSIZE
+        interval_index = 0
+
+        def _require_canonical_padding(piece: bytes, start: int) -> None:
+            nonlocal interval_index
+            end = start + len(piece)
+            while interval_index < len(zero_intervals):
+                zero_start, zero_end = zero_intervals[interval_index]
+                if zero_start >= end:
+                    break
+                low = max(zero_start - start, 0)
+                high = min(zero_end - start, len(piece))
+                segment = piece[low:high]
+                if segment.count(0) != len(segment):
+                    raise ValueError(
+                        "media archive hides data inside a member's padding"
+                    )
+                if zero_end > end:
+                    break
+                interval_index += 1
+            if end <= tar_data_end:
+                return
+            tail = piece[max(tar_data_end - start, 0):]
+            if tail.count(0) != len(tail):
+                raise ValueError(
+                    "media archive hides data after its tar end-of-archive marker"
+                )
+
+        exact_stream_bytes = _require_single_bounded_gzip_stream(
+            archive_path,
+            max_decompressed_bytes=MAX_MEDIA_ARCHIVE_DECOMPRESSED_BYTES,
+            on_payload=_require_canonical_padding,
+        )
+        if exact_stream_bytes != canonical_extent:
+            raise ValueError("media archive stream extent is not canonical")
+        # Restorability parity: run the exact restore-path extraction and
+        # MediaObjectReader semantic validation, so a digest-consistent but
+        # semantically invalid embedded object manifest, thumbnail, or
+        # feature print can never verify as restorable.
+        staging_dir = self.store._backup_verification_staging_dir()
+        parity_target = self.store._unique_private_temp_path(
+            staging_dir,
+            prefix=f".{archive_path.name}.restore-parity.",
+        )
+        try:
+            parity_target.unlink()
+            self._extract_media_archive(archive_path, manifest, parity_target)
+        except (ImageCaptureError, ImageCaptureNotFound) as exc:
+            raise ValueError(
+                "media archive failed restore-parity validation"
+            ) from exc
+        finally:
+            shutil.rmtree(parity_target, ignore_errors=True)
+            parity_target.unlink(missing_ok=True)
+            self.store._fsync_directory(staging_dir)
+        return {
+            "sha256": digest,
+            "size_bytes": size_bytes,
+            "manifest_sha256": str(manifest["manifest_sha256"]),
+            "object_count": int(manifest["object_count"]),
+            "file_count": int(manifest["file_count"]),
+            "total_bytes": int(manifest["total_bytes"]),
+            "referenced_count": int(reconciliation["referenced_count"]),
+            "orphan_count": int(reconciliation["orphan_count"]),
+            "object_ids": sorted(object_ids),
+            "manifest": manifest,
+            "verified": True,
+        }
+
+    def _extract_media_archive(
+        self,
+        archive_path: Path,
+        manifest: dict[str, Any],
+        target: Path,
+    ) -> None:
+        """Materialize verified media derivatives beneath one private root."""
+
+        if target.exists() or target.is_symlink():
+            raise FileExistsError("media restore target already exists")
+        target.mkdir(mode=0o700, parents=False)
+        try:
+            objects_root = target / "objects"
+            objects_root.mkdir(mode=0o700, parents=False)
+            records: dict[str, dict[str, Any]] = {}
+            for record in manifest["objects"]:
+                media_id = str(record["media_id"])
+                for item in record["files"]:
+                    records[f"media/objects/{media_id}/{item['name']}"] = dict(item)
+            with tarfile.open(archive_path, mode="r:gz") as archive:
+                members = archive.getmembers()
+                if any(not member.isfile() for member in members):
+                    raise ValueError("media restore archive contains a non-file member")
+                media_members = [
+                    member
+                    for member in members
+                    if member.name != "media-manifest.json"
+                ]
+                media_names = [member.name for member in media_members]
+                if (
+                    len(media_names) != len(set(media_names))
+                    or set(media_names) != set(records)
+                    or sum(
+                        member.name == "media-manifest.json" for member in members
+                    )
+                    != 1
+                ):
+                    raise RuntimeError(
+                        "media restore archive members do not match the manifest"
+                    )
+                for member in media_members:
+                    record = records[member.name]
+                    relative = Path(member.name)
+                    if (
+                        relative.is_absolute()
+                        or ".." in relative.parts
+                        or len(relative.parts) != 4
+                        or relative.parts[0] != "media"
+                        or relative.parts[1] != "objects"
+                    ):
+                        raise ValueError("media restore member path is unsafe")
+                    destination = objects_root / relative.parts[2] / relative.parts[3]
+                    destination.parent.mkdir(mode=0o700, parents=False, exist_ok=True)
+                    if destination.exists() or destination.is_symlink():
+                        raise FileExistsError("media restore member already exists")
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise ValueError("media restore member cannot be read")
+                    data = extracted.read(int(record["size_bytes"]) + 1)
+                    if (
+                        len(data) != int(record["size_bytes"])
+                        or hashlib.sha256(data).hexdigest() != str(record["sha256"])
+                    ):
+                        raise RuntimeError("media restore member digest mismatch")
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    descriptor = os.open(destination, flags, 0o600)
+                    try:
+                        offset = 0
+                        while offset < len(data):
+                            offset += os.write(descriptor, data[offset:])
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            restored_reader = MediaObjectReader(target)
+            restored_ids = restored_reader.object_ids()
+            expected_ids = sorted(
+                str(record["media_id"]) for record in manifest["objects"]
+            )
+            if restored_ids != expected_ids:
+                raise RuntimeError("restored media objects do not match the manifest")
+            for media_id in restored_ids:
+                restored_reader.read_object_artifacts(media_id)
+            self.store._fsync_directory(target)
+        except BaseException:
+            shutil.rmtree(target, ignore_errors=True)
+            raise
+
     def _snapshot_capture_ledger_bindings(
         self,
         conn: sqlite3.Connection,
@@ -5360,6 +6061,22 @@ class VerifiedRecoveryManager:
             "authority_epoch_number",
         }
 
+    @staticmethod
+    def _media_receipt_expected_keys() -> set[str]:
+        return {
+            "media_included",
+            "media_schema",
+            "media_artifact_name",
+            "media_sha256",
+            "media_size_bytes",
+            "media_manifest_sha256",
+            "media_object_count",
+            "media_file_count",
+            "media_total_bytes",
+            "media_referenced_count",
+            "media_orphan_count",
+        }
+
     def _read_bundle_receipt(self, path: Path) -> tuple[dict[str, Any], bool]:
         data, metadata = self._read_private_regular(path, max_bytes=1024 * 1024)
         if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
@@ -5373,13 +6090,82 @@ class VerifiedRecoveryManager:
         schema_name = payload.get("schema")
         expected_keys = (
             self._bundle_receipt_expected_keys()
+            | self._media_receipt_expected_keys()
             if schema_name == RECOVERY_BUNDLE_SCHEMA
+            else self._bundle_receipt_expected_keys()
+            if schema_name == PRIOR_RECOVERY_BUNDLE_SCHEMA
             else self._legacy_bundle_receipt_expected_keys()
             if schema_name == LEGACY_RECOVERY_BUNDLE_SCHEMA
             else set()
         )
         if not expected_keys or set(payload) != expected_keys:
             raise ValueError("recovery bundle receipt contract is unsupported")
+        if schema_name == RECOVERY_BUNDLE_SCHEMA:
+            if payload.get("media_included") is True:
+                if (
+                    payload.get("media_schema") != MEDIA_ARCHIVE_MANIFEST_SCHEMA
+                    or not isinstance(payload.get("media_artifact_name"), str)
+                    or BACKUP_DIGEST_RE.fullmatch(
+                        str(payload.get("media_sha256") or "")
+                    )
+                    is None
+                    or BACKUP_DIGEST_RE.fullmatch(
+                        str(payload.get("media_manifest_sha256") or "")
+                    )
+                    is None
+                    or type(payload.get("media_size_bytes")) is not int
+                    or int(payload["media_size_bytes"]) <= 0
+                    or any(
+                        type(payload.get(field)) is not int or int(payload[field]) < 0
+                        for field in (
+                            "media_object_count",
+                            "media_file_count",
+                            "media_total_bytes",
+                            "media_referenced_count",
+                            "media_orphan_count",
+                        )
+                    )
+                    or int(payload["media_object_count"])
+                    != int(payload["media_referenced_count"])
+                    or int(payload["media_object_count"]) > MAX_MEDIA_OBJECTS
+                    or int(payload["media_file_count"]) > MAX_MEDIA_ARCHIVE_FILES
+                    or int(payload["media_total_bytes"])
+                    > MAX_MEDIA_ARCHIVE_TOTAL_BYTES
+                ):
+                    raise ValueError("recovery bundle media binding is invalid")
+            elif payload.get("media_included") is False:
+                # Media-absent form for zero-reference snapshots: every media
+                # binding is an explicit null and every count an explicit
+                # zero, except the orphan reconciliation count which reports
+                # unreferenced cache objects that were deliberately excluded.
+                if (
+                    any(
+                        payload.get(field) is not None
+                        for field in (
+                            "media_schema",
+                            "media_artifact_name",
+                            "media_sha256",
+                            "media_size_bytes",
+                            "media_manifest_sha256",
+                        )
+                    )
+                    or any(
+                        type(payload.get(field)) is not int
+                        or int(payload[field]) != 0
+                        for field in (
+                            "media_object_count",
+                            "media_file_count",
+                            "media_total_bytes",
+                            "media_referenced_count",
+                        )
+                    )
+                    or type(payload.get("media_orphan_count")) is not int
+                    or int(payload["media_orphan_count"]) < 0
+                    or int(payload["media_orphan_count"]) > MAX_MEDIA_OBJECTS
+                ):
+                    raise ValueError("recovery bundle media binding is invalid")
+            else:
+                raise ValueError("recovery bundle media binding is invalid")
         digest_fields = (
             "database_sha256",
             "database_snapshot_revision",
@@ -5423,7 +6209,7 @@ class VerifiedRecoveryManager:
             or not math.isfinite(float(payload["created_at"]))
         ):
             raise ValueError("recovery bundle receipt field types are invalid")
-        if schema_name == RECOVERY_BUNDLE_SCHEMA:
+        if schema_name in (RECOVERY_BUNDLE_SCHEMA, PRIOR_RECOVERY_BUNDLE_SCHEMA):
             governance_mode = payload.get("governance_mode")
             journal_required = payload.get("request_journal_required")
             if (
@@ -6213,6 +6999,7 @@ class VerifiedRecoveryManager:
         database_path: Path | None = None
         database_receipt_path: Path | None = None
         capture_archive_path: Path | None = None
+        media_archive_path: Path | None = None
         bundle_receipt_path: Path | None = None
         request_journal_path: Path | None = None
         request_journal_binding_receipt_path: Path | None = None
@@ -6289,11 +7076,13 @@ class VerifiedRecoveryManager:
                 database_path = resolved_parent / database_path.name
                 database_receipt_path = self.store._backup_receipt_path(database_path)
                 capture_archive_path = self._capture_archive_path(database_path)
+                media_archive_path = self._media_archive_path(database_path)
                 bundle_receipt_path = self._bundle_receipt_path(database_path)
                 base_artifact_paths = (
                     database_path,
                     database_receipt_path,
                     capture_archive_path,
+                    media_archive_path,
                 )
                 if journal_required or runtime_state_present:
                     runtime_state_artifact_path = self._runtime_state_artifact_path(
@@ -6587,6 +7376,26 @@ class VerifiedRecoveryManager:
                 if self._validate_capture_source_root() != root_provenance:
                     raise RuntimeError("capture source root changed during archive creation")
                 with closing(sqlite3.connect(database_uri, uri=True)) as snapshot:
+                    media_references = media_references_from_connection(snapshot)
+                if media_archive_path is None:
+                    raise RuntimeError("media archive path is unavailable")
+                media_manifest = self._media_inventory(
+                    referenced_media_ids=media_references["media_ids"],
+                    database_binding=database_binding,
+                )
+                # A snapshot without image references ships no media artifact:
+                # the receipt states media_included=false with explicit null
+                # bindings, stays fully verified, and remains compatible with
+                # baseline replication peers that advertise no media
+                # capability. Any referenced image memory requires the archive.
+                media_included = bool(int(media_references["reference_count"]))
+                if media_included:
+                    media = self._write_media_archive(
+                        media_archive_path, media_manifest
+                    )
+                else:
+                    media = None
+                with closing(sqlite3.connect(database_uri, uri=True)) as snapshot:
                     snapshot.row_factory = sqlite3.Row
                     ledger_postflight = self._capture_ledger_audit_locked(
                         snapshot,
@@ -6643,6 +7452,33 @@ class VerifiedRecoveryManager:
                     "capture_file_count": int(manifest["file_count"]),
                     "capture_total_bytes": int(manifest["total_bytes"]),
                     "capture_protocol_version": "capture.v2",
+                    "media_included": media_included,
+                    "media_schema": (
+                        MEDIA_ARCHIVE_MANIFEST_SCHEMA if media_included else None
+                    ),
+                    "media_artifact_name": (
+                        media_archive_path.name if media_included else None
+                    ),
+                    "media_sha256": (
+                        str(media["sha256"]) if media is not None else None
+                    ),
+                    "media_size_bytes": (
+                        int(media["size_bytes"]) if media is not None else None
+                    ),
+                    "media_manifest_sha256": (
+                        str(media_manifest["manifest_sha256"])
+                        if media_included
+                        else None
+                    ),
+                    "media_object_count": int(media_manifest["object_count"]),
+                    "media_file_count": int(media_manifest["file_count"]),
+                    "media_total_bytes": int(media_manifest["total_bytes"]),
+                    "media_referenced_count": int(
+                        media_manifest["reconciliation"]["referenced_count"]
+                    ),
+                    "media_orphan_count": int(
+                        media_manifest["reconciliation"]["orphan_count"]
+                    ),
                     "governance_mode": str(live_governance["governance_mode"]),
                     "store_identity": self._store_identity(),
                     "store_generation": str(live_governance["store_generation"]),
@@ -6831,6 +7667,20 @@ class VerifiedRecoveryManager:
                     "capture_manifest_sha256": str(manifest["manifest_sha256"]),
                     "capture_file_count": int(manifest["file_count"]),
                     "capture_total_bytes": int(manifest["total_bytes"]),
+                    "media_included": media_included,
+                    "media_archive_path": (
+                        str(media_archive_path) if media_included else None
+                    ),
+                    "media_archive_sha256": (
+                        str(media["sha256"]) if media is not None else None
+                    ),
+                    "media_manifest_sha256": (
+                        str(media_manifest["manifest_sha256"])
+                        if media_included
+                        else None
+                    ),
+                    "media_object_count": int(media_manifest["object_count"]),
+                    "media_reconciliation": dict(media_manifest["reconciliation"]),
                     "reconciliation": dict(manifest["reconciliation"]),
                     "capture_ledger_binding": dict(
                         verified["capture_ledger_binding"]
@@ -6861,6 +7711,7 @@ class VerifiedRecoveryManager:
         expected_capture_sha256: str | None = None,
         expected_request_journal_sha256: str | None = None,
         expected_runtime_state_sha256: str | None = None,
+        expected_media_sha256: str | None = None,
     ) -> dict[str, Any]:
         with self._repository_lock():
             return self._verify_bundle_locked(
@@ -6869,6 +7720,7 @@ class VerifiedRecoveryManager:
                 expected_capture_sha256=expected_capture_sha256,
                 expected_request_journal_sha256=expected_request_journal_sha256,
                 expected_runtime_state_sha256=expected_runtime_state_sha256,
+                expected_media_sha256=expected_media_sha256,
             )
 
     def _verify_bundle_locked(
@@ -6879,6 +7731,7 @@ class VerifiedRecoveryManager:
         expected_capture_sha256: str | None = None,
         expected_request_journal_sha256: str | None = None,
         expected_runtime_state_sha256: str | None = None,
+        expected_media_sha256: str | None = None,
     ) -> dict[str, Any]:
         reject_sensitive_identifier(receipt_path, field="recovery_bundle_receipt")
         receipt_file = Path(receipt_path).expanduser().absolute()
@@ -6887,21 +7740,27 @@ class VerifiedRecoveryManager:
         supplied_capture = str(expected_capture_sha256 or "").strip().lower()
         supplied_journal = str(expected_request_journal_sha256 or "").strip().lower()
         supplied_runtime = str(expected_runtime_state_sha256 or "").strip().lower()
+        supplied_media = str(expected_media_sha256 or "").strip().lower()
         for supplied in (
             supplied_db,
             supplied_capture,
             supplied_journal,
             supplied_runtime,
+            supplied_media,
         ):
             if supplied and not BACKUP_DIGEST_RE.fullmatch(supplied):
                 raise ValueError("expected recovery digest must be lowercase SHA-256")
         journal_required = bool(receipt.get("request_journal_required"))
         runtime_state_required = bool(receipt.get("runtime_state_required"))
+        media_included = bool(receipt.get("media_included"))
+        if supplied_media and not media_included:
+            raise ValueError("recovery bundle does not contain a media artifact")
         required_reviewed_digests = bool(
             supplied_db
             and supplied_capture
             and (supplied_journal if journal_required else True)
             and (supplied_runtime if runtime_state_required else True)
+            and (supplied_media if media_included else True)
         )
         if not identity_trusted and not required_reviewed_digests:
             raise ValueError(
@@ -6930,6 +7789,13 @@ class VerifiedRecoveryManager:
         ):
             raise ValueError(
                 "reviewed request-journal digest does not match the bundle receipt"
+            )
+        if media_included and supplied_media and not secrets.compare_digest(
+            supplied_media,
+            str(receipt["media_sha256"]),
+        ):
+            raise ValueError(
+                "reviewed media digest does not match the bundle receipt"
             )
         if supplied_runtime and not runtime_state_required:
             raise ValueError("recovery bundle does not contain a runtime-state artifact")
@@ -6961,7 +7827,7 @@ class VerifiedRecoveryManager:
         runtime_state: dict[str, Any] | None = None
         runtime_state_path: Path | None = None
         if (
-            bundle_schema == RECOVERY_BUNDLE_SCHEMA
+            bundle_schema in (RECOVERY_BUNDLE_SCHEMA, PRIOR_RECOVERY_BUNDLE_SCHEMA)
             and bool(receipt.get("runtime_state_required"))
         ):
             runtime_state_path = receipt_file.parent / self.store._validate_backup_artifact_name(
@@ -7272,6 +8138,50 @@ class VerifiedRecoveryManager:
                 legacy_database_binding,
             ):
                 raise RuntimeError("capture archive database binding mismatch")
+        with closing(sqlite3.connect(database_uri, uri=True)) as snapshot:
+            media_references = media_references_from_connection(snapshot)
+        if (
+            bundle_schema == RECOVERY_BUNDLE_SCHEMA
+            and not media_included
+            and int(media_references["reference_count"])
+        ):
+            # A current-schema receipt may state media_included=false only for
+            # a snapshot without image references; anything else is a
+            # dishonest bundle, not a legacy compatibility case.
+            raise RuntimeError(
+                "recovery bundle omits its media archive while the database "
+                "references image memories"
+            )
+        media: dict[str, Any] | None = None
+        media_archive_file: Path | None = None
+        if media_included:
+            media_archive_file = receipt_file.parent / self.store._validate_backup_artifact_name(
+                receipt["media_artifact_name"],
+                field="media artifact name",
+            )
+            media = self._verify_media_archive(
+                media_archive_file,
+                expected_sha256=str(receipt["media_sha256"]),
+                expected_manifest_sha256=str(receipt["media_manifest_sha256"]),
+                database_binding=database_binding,
+            )
+            media_mismatches = (
+                int(receipt["media_size_bytes"]) != int(media["size_bytes"]),
+                int(receipt["media_object_count"]) != int(media["object_count"]),
+                int(receipt["media_file_count"]) != int(media["file_count"]),
+                int(receipt["media_total_bytes"]) != int(media["total_bytes"]),
+                int(receipt["media_referenced_count"])
+                != int(media["referenced_count"]),
+                int(receipt["media_orphan_count"]) != int(media["orphan_count"]),
+                sorted(media_references["media_ids"]) != list(media["object_ids"]),
+            )
+            if any(media_mismatches):
+                raise RuntimeError(
+                    "media archive does not match its signed bundle binding"
+                )
+        media_recovery_complete = bool(
+            media_included or media_references["reference_count"] == 0
+        )
         reconciliation = dict(capture["manifest"]["reconciliation"])
         capture_ledger_binding = dict(capture["capture_ledger_binding"])
         pending_state = self._canonical_pending_capture_state(
@@ -7281,6 +8191,10 @@ class VerifiedRecoveryManager:
             bool(capture_ledger_binding["verified"])
             and not bool(reconciliation["replay_required_file_count"])
             and pending_state.get("pending_file_count") == 0
+            # A bundle whose database still references image memories that no
+            # archived media artifact can restore stays inspectable but must
+            # never be promoted to an authoritative cutover candidate.
+            and media_recovery_complete
             and (
                 governance_mode == "pre-governed-v5"
                 or (
@@ -7296,7 +8210,8 @@ class VerifiedRecoveryManager:
             or str(receipt["database_snapshot_revision"])
             != str(database["snapshot_revision"])
             or (
-                bundle_schema == RECOVERY_BUNDLE_SCHEMA
+                bundle_schema
+                in (RECOVERY_BUNDLE_SCHEMA, PRIOR_RECOVERY_BUNDLE_SCHEMA)
                 and (
                     str(receipt["database_logical_snapshot_schema"])
                     != str(database["logical_snapshot_schema"])
@@ -7355,7 +8270,8 @@ class VerifiedRecoveryManager:
             "governance_mode": governance_mode,
             "store_identity": (
                 str(receipt["store_identity"])
-                if bundle_schema == RECOVERY_BUNDLE_SCHEMA
+                if bundle_schema
+                in (RECOVERY_BUNDLE_SCHEMA, PRIOR_RECOVERY_BUNDLE_SCHEMA)
                 else self._store_identity()
             ),
             "store_generation": store_generation,
@@ -7397,6 +8313,32 @@ class VerifiedRecoveryManager:
                     ),
                     "verified": True,
                 }
+            ),
+            "media_included": media_included,
+            "media_recovery_complete": media_recovery_complete,
+            "media_reference_count": int(media_references["reference_count"]),
+            "media": (
+                {
+                    "artifact_path": str(media_archive_file),
+                    "sha256": str(media["sha256"]),
+                    "size_bytes": int(media["size_bytes"]),
+                    "manifest_sha256": str(media["manifest_sha256"]),
+                    "object_count": int(media["object_count"]),
+                    "file_count": int(media["file_count"]),
+                    "total_bytes": int(media["total_bytes"]),
+                    "referenced_count": int(media["referenced_count"]),
+                    "orphan_count": int(media["orphan_count"]),
+                    "verified": True,
+                }
+                if media is not None
+                else None
+            ),
+            "media_recovery": (
+                "media-archive-verified"
+                if media_included
+                else "media-not-required-zero-references"
+                if bundle_schema == RECOVERY_BUNDLE_SCHEMA
+                else "legacy-media-not-present"
             ),
             "cutover_ready": cutover_ready,
             "receipt_identity_trusted": identity_trusted,
@@ -7493,6 +8435,7 @@ class VerifiedRecoveryManager:
         expected_capture_sha256: str | None = None,
         expected_request_journal_sha256: str | None = None,
         expected_runtime_state_sha256: str | None = None,
+        expected_media_sha256: str | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
         with self._repository_lock():
@@ -7503,6 +8446,7 @@ class VerifiedRecoveryManager:
                 expected_capture_sha256=expected_capture_sha256,
                 expected_request_journal_sha256=expected_request_journal_sha256,
                 expected_runtime_state_sha256=expected_runtime_state_sha256,
+                expected_media_sha256=expected_media_sha256,
                 confirm=confirm,
             )
 
@@ -7515,6 +8459,7 @@ class VerifiedRecoveryManager:
         expected_capture_sha256: str | None = None,
         expected_request_journal_sha256: str | None = None,
         expected_runtime_state_sha256: str | None = None,
+        expected_media_sha256: str | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
         if not confirm:
@@ -7529,6 +8474,7 @@ class VerifiedRecoveryManager:
             expected_capture_sha256=expected_capture_sha256,
             expected_request_journal_sha256=expected_request_journal_sha256,
             expected_runtime_state_sha256=expected_runtime_state_sha256,
+            expected_media_sha256=expected_media_sha256,
         )
         receipt_file = Path(str(verified["bundle_receipt_path"]))
         receipt, _ = self._read_bundle_receipt(receipt_file)
@@ -7637,7 +8583,24 @@ class VerifiedRecoveryManager:
         verified_capture_snapshot = Path(
             str(capture_verification.pop("verified_snapshot_path"))
         )
+        media_included = bool(receipt.get("media_included"))
+        media_verification: dict[str, Any] | None = None
+        verified_media_snapshot: Path | None = None
         try:
+            if media_included:
+                media_archive_source = receipt_file.parent / str(
+                    receipt["media_artifact_name"]
+                )
+                media_verification = self._verify_media_archive(
+                    media_archive_source,
+                    expected_sha256=str(receipt["media_sha256"]),
+                    expected_manifest_sha256=str(receipt["media_manifest_sha256"]),
+                    database_binding=database_binding,
+                    retain_verified_snapshot=True,
+                )
+                verified_media_snapshot = Path(
+                    str(media_verification.pop("verified_snapshot_path"))
+                )
             target_root.mkdir(mode=0o700, parents=False)
             database_target = target_root / "memory.sqlite3"
             database_restore = self.store.restore_backup(
@@ -7855,9 +8818,53 @@ class VerifiedRecoveryManager:
                 raise RuntimeError(
                     "paired recovery proof found capture transport without authoritative ledger rows"
                 )
+            with closing(
+                sqlite3.connect(restored_database_uri, uri=True)
+            ) as conn:
+                restored_media_references = media_references_from_connection(conn)
+            media_target: Path | None = None
+            if media_included:
+                if (
+                    media_verification is None
+                    or verified_media_snapshot is None
+                ):
+                    raise RuntimeError("media restore lost its verified archive")
+                media_target = target_root / "media-cache"
+                self._extract_media_archive(
+                    verified_media_snapshot,
+                    media_verification["manifest"],
+                    media_target,
+                )
+                if (
+                    sorted(restored_media_references["media_ids"])
+                    != list(media_verification["object_ids"])
+                ):
+                    raise RuntimeError(
+                        "restored media references do not match the verified "
+                        "media archive"
+                    )
+            if (
+                receipt.get("schema") == RECOVERY_BUNDLE_SCHEMA
+                and not media_included
+                and int(restored_media_references["reference_count"])
+            ):
+                raise RuntimeError(
+                    "recovery bundle omits its media archive while the "
+                    "database references image memories"
+                )
+            media_recovery_complete = bool(
+                media_included
+                or restored_media_references["reference_count"] == 0
+            )
+            media_absent_verified = bool(
+                receipt.get("schema") == RECOVERY_BUNDLE_SCHEMA
+                and not media_included
+            )
             proof_schema = (
                 RECOVERY_BUNDLE_RESTORE_SCHEMA
                 if receipt.get("schema") == RECOVERY_BUNDLE_SCHEMA
+                else PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA
+                if receipt.get("schema") == PRIOR_RECOVERY_BUNDLE_SCHEMA
                 else LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA
             )
             restored_pending_state = self._canonical_pending_capture_state(
@@ -7894,6 +8901,9 @@ class VerifiedRecoveryManager:
                         "replay_required_file_count"
                     ]
                 )
+                # Restored proofs mirror verification: incomplete media
+                # recovery keeps the proof inspectable but never cutover-ready.
+                and media_recovery_complete
                 and (
                     verified["governance_mode"] == "pre-governed-v5"
                     or (
@@ -7964,6 +8974,52 @@ class VerifiedRecoveryManager:
                     and request_journal_binding_payload is not None
                     and request_journal_restore_binding is not None
                 ),
+                "media_included": media_included,
+                "media_recovery_complete": media_recovery_complete,
+                "media_recovery": (
+                    "media-archive-restored"
+                    if media_included
+                    else "media-not-required-zero-references"
+                    if media_absent_verified
+                    else "legacy-media-not-present"
+                ),
+                "media_reference_count": int(
+                    restored_media_references["reference_count"]
+                ),
+                "media_artifact_relative": (
+                    "media-cache" if media_included else None
+                ),
+                "media_sha256": (
+                    str(media_verification["sha256"])
+                    if media_verification is not None
+                    else None
+                ),
+                "media_manifest_sha256": (
+                    str(media_verification["manifest_sha256"])
+                    if media_verification is not None
+                    else None
+                ),
+                "media_object_count": (
+                    int(media_verification["object_count"])
+                    if media_verification is not None
+                    else 0
+                    if media_absent_verified
+                    else None
+                ),
+                "media_file_count": (
+                    int(media_verification["file_count"])
+                    if media_verification is not None
+                    else 0
+                    if media_absent_verified
+                    else None
+                ),
+                "media_orphan_count": (
+                    int(media_verification["orphan_count"])
+                    if media_verification is not None
+                    else int(receipt["media_orphan_count"])
+                    if media_absent_verified
+                    else None
+                ),
                 "runtime_state_required": bool(
                     receipt.get("runtime_state_required")
                 ),
@@ -8012,6 +9068,21 @@ class VerifiedRecoveryManager:
                 "restore_root": str(target_root),
                 "database_restore": database_restore,
                 "capture_restore_path": str(capture_target),
+                "media_included": media_included,
+                "media_recovery_complete": media_recovery_complete,
+                "media_restore_path": (
+                    str(media_target) if media_target is not None else None
+                ),
+                "media_object_count": (
+                    int(media_verification["object_count"])
+                    if media_verification is not None
+                    else 0
+                    if media_absent_verified
+                    else None
+                ),
+                "media_reference_count": int(
+                    restored_media_references["reference_count"]
+                ),
                 "request_journal_restore_path": (
                     None
                     if request_journal_restore is None
@@ -8068,6 +9139,8 @@ class VerifiedRecoveryManager:
             raise
         finally:
             verified_capture_snapshot.unlink(missing_ok=True)
+            if verified_media_snapshot is not None:
+                verified_media_snapshot.unlink(missing_ok=True)
             self.store._fsync_directory(verified_capture_snapshot.parent)
 
     def _retention_directory(
@@ -8131,6 +9204,8 @@ class VerifiedRecoveryManager:
             str(receipt["database_receipt_name"]),
             str(receipt["capture_artifact_name"]),
         ]
+        if bool(receipt.get("media_included")):
+            artifact_names_list.append(str(receipt["media_artifact_name"]))
         if bool(receipt.get("request_journal_required")):
             artifact_names_list.extend(
                 (
@@ -8243,6 +9318,7 @@ class VerifiedRecoveryManager:
                 candidate.name.endswith(".sqlite3")
                 or candidate.name.endswith(".sqlite3.receipt.json")
                 or candidate.name.endswith(".sqlite3.capture.tar.gz")
+                or candidate.name.endswith(".sqlite3.media.tar.gz")
                 or candidate.name.endswith(".sqlite3.requests.sqlite3")
                 or candidate.name.endswith(
                     ".sqlite3.requests.binding.receipt.json"

@@ -4434,6 +4434,21 @@ class SpikingAttentionBackend:
         )
         return entry_position, relationship_position
 
+    def list_media_references(
+        self,
+        *,
+        context_id: str = "default",
+        recall_scope: str = "local",
+        limit: int = 10_000,
+    ) -> dict[str, Any]:
+        """Authoritative scope-filtered image media references (content-free)."""
+
+        return self.memory_store.list_media_references(
+            context_id=sanitize_context_id(context_id),
+            recall_scope=sanitize_recall_scope(recall_scope),
+            limit=limit,
+        )
+
     def list_memory(
         self,
         *,
@@ -11263,6 +11278,7 @@ class SpikingAttentionBackend:
         expected_capture_sha256: str | None = None,
         expected_request_journal_sha256: str | None = None,
         expected_runtime_state_sha256: str | None = None,
+        expected_media_sha256: str | None = None,
     ) -> dict[str, Any]:
         from recovery_manager import VerifiedRecoveryManager
 
@@ -11275,6 +11291,7 @@ class SpikingAttentionBackend:
             expected_capture_sha256=expected_capture_sha256,
             expected_request_journal_sha256=expected_request_journal_sha256,
             expected_runtime_state_sha256=expected_runtime_state_sha256,
+            expected_media_sha256=expected_media_sha256,
         )
 
     def restore_recovery_bundle_isolated(
@@ -11287,6 +11304,7 @@ class SpikingAttentionBackend:
         expected_capture_sha256: str | None = None,
         expected_request_journal_sha256: str | None = None,
         expected_runtime_state_sha256: str | None = None,
+        expected_media_sha256: str | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
         from recovery_manager import VerifiedRecoveryManager
@@ -11301,6 +11319,7 @@ class SpikingAttentionBackend:
             expected_capture_sha256=expected_capture_sha256,
             expected_request_journal_sha256=expected_request_journal_sha256,
             expected_runtime_state_sha256=expected_runtime_state_sha256,
+            expected_media_sha256=expected_media_sha256,
             confirm=confirm,
         )
 
@@ -12490,6 +12509,7 @@ def verify_recovery_bundle(
     expected_capture_sha256: str | None = None,
     expected_request_journal_sha256: str | None = None,
     expected_runtime_state_sha256: str | None = None,
+    expected_media_sha256: str | None = None,
 ) -> dict[str, Any]:
     backend = get_backend()
     if _is_authoritative_core_client(backend):
@@ -12503,6 +12523,7 @@ def verify_recovery_bundle(
             expected_capture_sha256=expected_capture_sha256,
             expected_request_journal_sha256=expected_request_journal_sha256,
             expected_runtime_state_sha256=expected_runtime_state_sha256,
+            expected_media_sha256=expected_media_sha256,
         )
     return backend.verify_recovery_bundle(
         receipt_path,
@@ -12511,6 +12532,7 @@ def verify_recovery_bundle(
         expected_capture_sha256=expected_capture_sha256,
         expected_request_journal_sha256=expected_request_journal_sha256,
         expected_runtime_state_sha256=expected_runtime_state_sha256,
+        expected_media_sha256=expected_media_sha256,
     )
 
 
@@ -12523,6 +12545,7 @@ def restore_recovery_bundle_isolated(
     expected_capture_sha256: str | None = None,
     expected_request_journal_sha256: str | None = None,
     expected_runtime_state_sha256: str | None = None,
+    expected_media_sha256: str | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
     backend = get_backend()
@@ -12538,6 +12561,7 @@ def restore_recovery_bundle_isolated(
             expected_capture_sha256=expected_capture_sha256,
             expected_request_journal_sha256=expected_request_journal_sha256,
             expected_runtime_state_sha256=expected_runtime_state_sha256,
+            expected_media_sha256=expected_media_sha256,
             confirm=confirm,
         )
     return backend.restore_recovery_bundle_isolated(
@@ -12548,6 +12572,7 @@ def restore_recovery_bundle_isolated(
         expected_capture_sha256=expected_capture_sha256,
         expected_request_journal_sha256=expected_request_journal_sha256,
         expected_runtime_state_sha256=expected_runtime_state_sha256,
+        expected_media_sha256=expected_media_sha256,
         confirm=confirm,
     )
 

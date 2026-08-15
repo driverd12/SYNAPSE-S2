@@ -78,6 +78,7 @@ try:
     from apple_vision_enrichment import ocr_cue_text
     from capture_daemon import CaptureInboxDaemon, new_capture_id, write_capture_drop
     from image_capture import ImageCaptureCache
+    import media_similarity
     import mlx_backend
     from mlx_backend import (
         DEFAULT_NUM_NEURONS,
@@ -696,6 +697,56 @@ def command_image_cache_audit(_args: argparse.Namespace) -> dict[str, Any]:
     if binding is None:
         raise ValueError("a verified SYNAPSE-S2 core binding is required")
     return ImageCaptureCache(binding).audit()
+
+
+def command_image_similar(args: argparse.Namespace) -> dict[str, Any]:
+    binding = binding_from_environment()
+    if binding is None:
+        raise ValueError("a verified SYNAPSE-S2 core binding is required")
+    backend = build_backend(args)
+    references = backend.list_media_references(
+        context_id=args.context,
+        recall_scope=args.recall_scope,
+    )
+    result = media_similarity.query_similar_media(
+        binding,
+        args.media_id,
+        scope_media_ids=references["media_ids"],
+        result_limit=args.limit,
+        candidate_limit=args.candidate_limit,
+        time_budget_seconds=args.time_budget,
+    )
+    return {
+        **result,
+        "context_id": str(references["context_id"]),
+        "recall_scope": str(references["recall_scope"]),
+        "resolved_context_count": int(references["resolved_context_count"]),
+    }
+
+
+def command_image_similar_transient(args: argparse.Namespace) -> dict[str, Any]:
+    binding = binding_from_environment()
+    if binding is None:
+        raise ValueError("a verified SYNAPSE-S2 core binding is required")
+    backend = build_backend(args)
+    references = backend.list_media_references(
+        context_id=args.context,
+        recall_scope=args.recall_scope,
+    )
+    result = media_similarity.query_similar_media_transient(
+        binding,
+        Path(args.source).expanduser().absolute(),
+        scope_media_ids=references["media_ids"],
+        result_limit=args.limit,
+        candidate_limit=args.candidate_limit,
+        time_budget_seconds=args.time_budget,
+    )
+    return {
+        **result,
+        "context_id": str(references["context_id"]),
+        "recall_scope": str(references["recall_scope"]),
+        "resolved_context_count": int(references["resolved_context_count"]),
+    }
 
 
 def command_prune_memory(args: argparse.Namespace) -> dict[str, Any]:
@@ -1795,6 +1846,7 @@ def command_verify_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
             expected_capture_sha256=args.expected_capture_sha256,
             expected_request_journal_sha256=args.expected_request_journal_sha256,
             expected_runtime_state_sha256=args.expected_runtime_state_sha256,
+            expected_media_sha256=args.expected_media_sha256,
         )
     return backend.verify_recovery_bundle(
         receipt_path,
@@ -1803,6 +1855,7 @@ def command_verify_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
         expected_capture_sha256=args.expected_capture_sha256,
         expected_request_journal_sha256=args.expected_request_journal_sha256,
         expected_runtime_state_sha256=args.expected_runtime_state_sha256,
+        expected_media_sha256=args.expected_media_sha256,
     )
 
 
@@ -1830,6 +1883,7 @@ def command_restore_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
             expected_capture_sha256=args.expected_capture_sha256,
             expected_request_journal_sha256=args.expected_request_journal_sha256,
             expected_runtime_state_sha256=args.expected_runtime_state_sha256,
+            expected_media_sha256=args.expected_media_sha256,
             confirm=bool(args.confirm),
         )
     return backend.restore_recovery_bundle_isolated(
@@ -1840,6 +1894,7 @@ def command_restore_recovery_bundle(args: argparse.Namespace) -> dict[str, Any]:
         expected_capture_sha256=args.expected_capture_sha256,
         expected_request_journal_sha256=args.expected_request_journal_sha256,
         expected_runtime_state_sha256=args.expected_runtime_state_sha256,
+        expected_media_sha256=args.expected_media_sha256,
         confirm=bool(args.confirm),
     )
 
@@ -1905,6 +1960,27 @@ def command_replication_peer_revoke(args: argparse.Namespace) -> dict[str, Any]:
     return _replication_core(args).replication_revoke_peer(
         peer_id=args.peer_id,
         reason=args.reason,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_replication_node_upgrade(args: argparse.Namespace) -> dict[str, Any]:
+    return _replication_core(args).replication_upgrade_node_descriptor(
+        expected_current_digest=args.expected_current_digest,
+        confirm=bool(args.confirm),
+    )
+
+
+def command_replication_peer_upgrade(args: argparse.Namespace) -> dict[str, Any]:
+    core = _replication_core(args)
+    return core.replication_upgrade_peer_descriptor(
+        _replication_inbox_path(
+            core,
+            args.descriptor,
+            field="replication descriptor path",
+        ),
+        args.expected_descriptor_digest,
+        args.expected_previous_descriptor_digest,
         confirm=bool(args.confirm),
     )
 
@@ -2381,6 +2457,99 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify the private thumbnail cache without reading image memory content.",
     )
     image_cache_audit.set_defaults(func=command_image_cache_audit)
+
+    image_similar = subparsers.add_parser(
+        "image-similar",
+        help=(
+            "Rank cached images against one captured image by private Apple "
+            "Vision feature print; returns only media IDs, scores, and public "
+            "descriptors."
+        ),
+    )
+    add_context(image_similar)
+    image_similar.add_argument("--media-id", required=True)
+    image_similar.add_argument(
+        "--recall-scope",
+        choices=("local", "connected", "all"),
+        default="local",
+        help="authoritative reference scope the query and candidates must be in",
+    )
+    image_similar.add_argument(
+        "--limit",
+        type=int,
+        default=media_similarity.DEFAULT_RESULT_LIMIT,
+        help=f"maximum ranked results (1-{media_similarity.MAX_RESULT_LIMIT})",
+    )
+    image_similar.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=media_similarity.DEFAULT_CANDIDATE_LIMIT,
+        help=(
+            "maximum compatible candidates to score "
+            f"(1-{media_similarity.MAX_CANDIDATE_LIMIT})"
+        ),
+    )
+    image_similar.add_argument(
+        "--time-budget",
+        type=float,
+        default=media_similarity.DEFAULT_TIME_BUDGET_SECONDS,
+        help=(
+            "hard similarity deadline in seconds "
+            f"(maximum {media_similarity.MAX_TIME_BUDGET_SECONDS})"
+        ),
+    )
+    image_similar.set_defaults(func=command_image_similar)
+
+    image_similar_transient = subparsers.add_parser(
+        "image-similar-transient",
+        help=(
+            "Rank cached images against a private local query image without "
+            "storing it: the feature print is computed transiently by the "
+            "same short-lived Apple Vision helper, compared in memory, and "
+            "no query object, vector, digest, or path is persisted or "
+            "returned."
+        ),
+    )
+    add_context(image_similar_transient)
+    image_similar_transient.add_argument(
+        "--source",
+        required=True,
+        help=(
+            "absolute path to an owner-only (0600) regular image file; the "
+            "file stays caller-owned and may be deleted right after the query"
+        ),
+    )
+    image_similar_transient.add_argument(
+        "--recall-scope",
+        choices=("local", "connected", "all"),
+        default="local",
+        help="authoritative reference scope the candidates must be in",
+    )
+    image_similar_transient.add_argument(
+        "--limit",
+        type=int,
+        default=media_similarity.DEFAULT_RESULT_LIMIT,
+        help=f"maximum ranked results (1-{media_similarity.MAX_RESULT_LIMIT})",
+    )
+    image_similar_transient.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=media_similarity.DEFAULT_CANDIDATE_LIMIT,
+        help=(
+            "maximum compatible candidates to score "
+            f"(1-{media_similarity.MAX_CANDIDATE_LIMIT})"
+        ),
+    )
+    image_similar_transient.add_argument(
+        "--time-budget",
+        type=float,
+        default=media_similarity.DEFAULT_TIME_BUDGET_SECONDS,
+        help=(
+            "hard candidate-scan deadline in seconds "
+            f"(maximum {media_similarity.MAX_TIME_BUDGET_SECONDS})"
+        ),
+    )
+    image_similar_transient.set_defaults(func=command_image_similar_transient)
 
     prune_memory = subparsers.add_parser("prune-memory")
     add_context(prune_memory)
@@ -3024,6 +3193,36 @@ def build_parser() -> argparse.ArgumentParser:
     replication_peer_revoke.add_argument("--confirm", action="store_true")
     replication_peer_revoke.set_defaults(func=command_replication_peer_revoke)
 
+    replication_node_upgrade = subparsers.add_parser(
+        "replication-node-upgrade",
+        help="Re-sign this node's descriptor with the full capability list.",
+    )
+    replication_node_upgrade.add_argument(
+        "--expected-current-digest",
+        required=True,
+        help="Reviewed receipt_digest of the currently active node descriptor.",
+    )
+    replication_node_upgrade.add_argument("--confirm", action="store_true")
+    replication_node_upgrade.set_defaults(func=command_replication_node_upgrade)
+
+    replication_peer_upgrade = subparsers.add_parser(
+        "replication-peer-upgrade",
+        help="Re-pin a peer's upgraded, independently reviewed descriptor.",
+    )
+    replication_peer_upgrade.add_argument("--descriptor", required=True)
+    replication_peer_upgrade.add_argument(
+        "--expected-descriptor-digest",
+        required=True,
+        help="Independently verified receipt_digest of the upgraded descriptor.",
+    )
+    replication_peer_upgrade.add_argument(
+        "--expected-previous-descriptor-digest",
+        required=True,
+        help="The exact descriptor digest currently pinned for the peer.",
+    )
+    replication_peer_upgrade.add_argument("--confirm", action="store_true")
+    replication_peer_upgrade.set_defaults(func=command_replication_peer_upgrade)
+
     replication_peer_list = subparsers.add_parser("replication-peer-list")
     replication_peer_list.set_defaults(func=command_replication_peer_list)
 
@@ -3064,6 +3263,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_recovery.add_argument("--expected-capture-sha256", default=None)
     verify_recovery.add_argument("--expected-request-journal-sha256", default=None)
     verify_recovery.add_argument("--expected-runtime-state-sha256", default=None)
+    verify_recovery.add_argument("--expected-media-sha256", default=None)
     verify_recovery.set_defaults(func=command_verify_recovery_bundle)
 
     restore_recovery = subparsers.add_parser("restore-recovery-proof")
@@ -3078,6 +3278,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore_recovery.add_argument("--expected-capture-sha256", default=None)
     restore_recovery.add_argument("--expected-request-journal-sha256", default=None)
     restore_recovery.add_argument("--expected-runtime-state-sha256", default=None)
+    restore_recovery.add_argument("--expected-media-sha256", default=None)
     restore_recovery.add_argument("--confirm", action="store_true")
     restore_recovery.set_defaults(func=command_restore_recovery_bundle)
 

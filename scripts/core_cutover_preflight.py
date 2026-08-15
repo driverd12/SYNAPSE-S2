@@ -44,6 +44,7 @@ from memory_store import (  # noqa: E402
     SQLITE_APPLICATION_ID,
     SQLITE_USER_VERSION,
     DurableMemoryStore,
+    media_references_from_connection,
 )
 from core_authority import (  # noqa: E402
     CORE_AUTHORITY_INSTANCE_RE,
@@ -62,7 +63,10 @@ from core_request_journal import (  # noqa: E402
     JOURNAL_SCHEMA_VERSION,
 )
 from recovery_manager import (  # noqa: E402
+    LEGACY_RECOVERY_BUNDLE_SCHEMA,
     LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    PRIOR_RECOVERY_BUNDLE_SCHEMA,
+    PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
     RECOVERY_BUNDLE_SCHEMA,
     RECOVERY_BUNDLE_RESTORE_SCHEMA,
     VerifiedRecoveryManager,
@@ -100,8 +104,26 @@ _STORE_IDENTITY = re.compile(r"^store-[0-9a-f]{24}$")
 _STORE_GENERATION = re.compile(r"^epoch-[1-9][0-9]*$")
 _REQUEST_JOURNAL_ID = re.compile(r"^journal-[0-9a-f]{24}$")
 _BUILD_ID = re.compile(r"^source-[0-9a-f]{24}$")
-CUTOVER_ATTESTATION_SCHEMA = "synapse-s2.core-cutover-attestation.v1"
-CUTOVER_VERIFICATION_SCHEMA = "synapse-s2.core-cutover-verification.v1"
+_RECOVERY_RESTORE_SCHEMAS = {
+    LEGACY_RECOVERY_BUNDLE_SCHEMA: LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    PRIOR_RECOVERY_BUNDLE_SCHEMA: PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    RECOVERY_BUNDLE_SCHEMA: RECOVERY_BUNDLE_RESTORE_SCHEMA,
+}
+_RESTORE_RECOVERY_SCHEMAS = {
+    value: key for key, value in _RECOVERY_RESTORE_SCHEMAS.items()
+}
+_MEDIA_RECOVERY_METRIC_KEYS = (
+    "recovery_bundle_schema",
+    "recovery_restore_schema",
+    "media_included",
+    "media_recovery_complete",
+    "media_sha256",
+    "media_manifest_sha256",
+    "media_object_count",
+    "media_reference_count",
+)
+CUTOVER_ATTESTATION_SCHEMA = "synapse-s2.core-cutover-attestation.v2"
+CUTOVER_VERIFICATION_SCHEMA = "synapse-s2.core-cutover-verification.v2"
 CUTOVER_ATTESTATION_NAME = "cutover-attestation.json"
 CUTOVER_ATTESTATION_PRESERVATION_SCHEMA = (
     "synapse-s2.core-cutover-attestation-preservation.v1"
@@ -112,9 +134,9 @@ CUTOVER_ATTESTATION_MAX_TTL_SECONDS = 600.0
 # 150-second preclaim floor; an attestation produced at the exact consumer
 # boundary would already be ineligible by the time the service reads it.
 CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS = 180.0
-REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v3"
+REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v4"
 REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA = (
-    "synapse-s2.replacement-admission-verification.v3"
+    "synapse-s2.replacement-admission-verification.v4"
 )
 REPLACEMENT_ADMISSION_NAME = "replacement-admission.json"
 REPLACEMENT_ADMISSION_MAX_BYTES = 64 * 1024
@@ -157,6 +179,14 @@ _CUTOVER_ATTESTATION_CONTENT_KEYS = {
     "database_logical_snapshot_schema",
     "database_logical_snapshot_sha256",
     "capture_manifest_sha256",
+    "recovery_bundle_schema",
+    "recovery_restore_schema",
+    "media_included",
+    "media_recovery_complete",
+    "media_sha256",
+    "media_manifest_sha256",
+    "media_object_count",
+    "media_reference_count",
     "runtime_state_required",
     "runtime_state_present",
     "runtime_state_canonical_sha256",
@@ -193,6 +223,14 @@ _REPLACEMENT_ADMISSION_CONTENT_KEYS = {
     "database_logical_snapshot_schema",
     "database_logical_snapshot_sha256",
     "capture_manifest_sha256",
+    "recovery_bundle_schema",
+    "recovery_restore_schema",
+    "media_included",
+    "media_recovery_complete",
+    "media_sha256",
+    "media_manifest_sha256",
+    "media_object_count",
+    "media_reference_count",
     "recovery_pending_file_count",
     "recovery_replay_required_file_count",
     "recovery_replay_required_capture_count",
@@ -1000,6 +1038,7 @@ def _validate_cutover_attestation(
         is None
     ):
         raise CutoverPreflightError("cutover attestation values are invalid")
+    _validate_media_recovery_summary(_media_recovery_content(payload))
     _normal_absolute(
         str(payload.get("evidence_manifest_path") or ""),
         name="attested evidence manifest",
@@ -1810,6 +1849,7 @@ def _replacement_admission_content(
             "database_logical_snapshot_sha256"
         ),
         "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
+        **_media_recovery_content(recovery),
         "recovery_pending_file_count": recovery.get(
             "recovery_pending_file_count"
         ),
@@ -2084,6 +2124,7 @@ def _validate_replacement_admission(
         != payload.get("delivery_latest_event_id")
     ):
         raise CutoverPreflightError("replacement admission values are invalid")
+    _validate_media_recovery_summary(_media_recovery_content(payload))
     lock_generation = _replacement_lock_generation_binding(
         predecessor_lock_generation_id=payload.get(
             "predecessor_lock_generation_id"
@@ -2202,6 +2243,7 @@ def publish_cutover_attestation(
             "database_logical_snapshot_sha256"
         ),
         "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
+        **_media_recovery_content(recovery),
         "runtime_state_required": recovery.get("runtime_state_required"),
         "runtime_state_present": recovery.get("runtime_state_present"),
         "runtime_state_canonical_sha256": recovery.get(
@@ -2421,6 +2463,7 @@ def verify_cutover_attestation_for_core(
             "database_logical_snapshot_sha256"
         ),
         "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
+        **_media_recovery_content(recovery),
         "runtime_state_required": recovery.get("runtime_state_required"),
         "runtime_state_present": recovery.get("runtime_state_present"),
         "runtime_state_canonical_sha256": recovery.get(
@@ -2485,6 +2528,7 @@ def verify_cutover_attestation_for_core(
             "database_logical_snapshot_sha256"
         ],
         "capture_manifest_sha256": recovery["capture_manifest_sha256"],
+        **_media_recovery_content(recovery),
         "runtime_state_required": recovery["runtime_state_required"],
         "runtime_state_present": recovery["runtime_state_present"],
         "runtime_state_canonical_sha256": recovery[
@@ -2729,6 +2773,10 @@ def publish_replacement_admission(
             "recovery_replay_required_capture_count": expected_content[
                 "recovery_replay_required_capture_count"
             ],
+            **{
+                key: expected_content[key]
+                for key in _MEDIA_RECOVERY_METRIC_KEYS
+            },
             "verified": True,
         }
     except CutoverPreflightError:
@@ -2872,6 +2920,7 @@ def verify_replacement_admission_for_core(
         "database_logical_snapshot_schema",
         "database_logical_snapshot_sha256",
         "capture_manifest_sha256",
+        *_MEDIA_RECOVERY_METRIC_KEYS,
         "recovery_pending_file_count",
         "recovery_replay_required_file_count",
         "recovery_replay_required_capture_count",
@@ -3566,7 +3615,69 @@ def _validate_zero_replay_debt(
             raise CutoverPreflightError(f"{name} contains unresolved work")
 
 
-def _validate_recovery_metrics(check: Mapping[str, Any], *, restore: bool = False) -> None:
+def _validate_media_recovery_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    if set(summary) != set(_MEDIA_RECOVERY_METRIC_KEYS):
+        raise CutoverPreflightError("recovery media evidence is incomplete")
+    bundle_schema = summary.get("recovery_bundle_schema")
+    restore_schema = summary.get("recovery_restore_schema")
+    if (
+        _RECOVERY_RESTORE_SCHEMAS.get(bundle_schema) != restore_schema
+        or type(summary.get("media_included")) is not bool
+        or summary.get("media_recovery_complete") is not True
+        or type(summary.get("media_object_count")) is not int
+        or int(summary["media_object_count"]) < 0
+        or type(summary.get("media_reference_count")) is not int
+        or int(summary["media_reference_count"]) < 0
+    ):
+        raise CutoverPreflightError("recovery media evidence is invalid")
+    included = bool(summary["media_included"])
+    object_count = int(summary["media_object_count"])
+    reference_count = int(summary["media_reference_count"])
+    media_sha256 = summary.get("media_sha256")
+    manifest_sha256 = summary.get("media_manifest_sha256")
+    if bundle_schema in {
+        LEGACY_RECOVERY_BUNDLE_SCHEMA,
+        PRIOR_RECOVERY_BUNDLE_SCHEMA,
+    }:
+        if (
+            included
+            or object_count != 0
+            or reference_count != 0
+            or media_sha256 is not None
+            or manifest_sha256 is not None
+        ):
+            raise CutoverPreflightError(
+                "legacy recovery media evidence is not zero-reference"
+            )
+    elif reference_count == 0:
+        if (
+            included
+            or object_count != 0
+            or media_sha256 is not None
+            or manifest_sha256 is not None
+        ):
+            raise CutoverPreflightError(
+                "zero-reference recovery media evidence is invalid"
+            )
+    elif (
+        not included
+        or object_count != reference_count
+        or _SHA256.fullmatch(str(media_sha256 or "")) is None
+        or _SHA256.fullmatch(str(manifest_sha256 or "")) is None
+    ):
+        raise CutoverPreflightError("referenced recovery media evidence is invalid")
+    return dict(summary)
+
+
+def _media_recovery_content(recovery: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: recovery.get(key) for key in _MEDIA_RECOVERY_METRIC_KEYS}
+
+
+def _validate_recovery_metrics(
+    check: Mapping[str, Any],
+    *,
+    restore: bool = False,
+) -> dict[str, Any]:
     metrics = check.get("metrics")
     if not isinstance(metrics, dict):
         raise CutoverPreflightError("recovery evidence metrics are invalid")
@@ -3581,6 +3692,85 @@ def _validate_recovery_metrics(check: Mapping[str, Any], *, restore: bool = Fals
         metrics.get("reconciliation"),
         name="recovery reconciliation",
     )
+    return _validate_media_recovery_summary(
+        {key: metrics.get(key) for key in _MEDIA_RECOVERY_METRIC_KEYS}
+    )
+
+
+def _validate_recovery_media_artifact_binding(
+    *,
+    summary: Mapping[str, Any],
+    parsed: Mapping[str, Any],
+    restore_proof: Mapping[str, Any],
+) -> None:
+    """Cross-bind explicit readiness metrics to verifier and restore bytes."""
+
+    included = bool(summary["media_included"])
+    references = int(summary["media_reference_count"])
+    objects = int(summary["media_object_count"])
+    required_parsed = {
+        "media_included",
+        "media_recovery_complete",
+        "media_reference_count",
+        "media",
+    }
+    required_proof = {
+        "media_included",
+        "media_recovery_complete",
+        "media_reference_count",
+        "media_sha256",
+        "media_manifest_sha256",
+        "media_object_count",
+    }
+    if not required_parsed.issubset(parsed) or not required_proof.issubset(
+        restore_proof
+    ):
+        raise CutoverPreflightError(
+            "recovery media proof was not regenerated by the current verifier"
+        )
+    if restore_proof.get("schema") != summary.get("recovery_restore_schema"):
+        raise CutoverPreflightError(
+            "recovery media metrics do not match the isolated proof schema"
+        )
+    if (
+        parsed.get("media_included") is not included
+        or parsed.get("media_recovery_complete") is not True
+        or parsed.get("media_reference_count") != references
+        or restore_proof.get("media_included") is not included
+        or restore_proof.get("media_recovery_complete") is not True
+        or restore_proof.get("media_reference_count") != references
+    ):
+        raise CutoverPreflightError(
+            "verified recovery media does not match isolated restore"
+        )
+    if not included:
+        if (
+            parsed.get("media") is not None
+            or restore_proof.get("media_sha256") is not None
+            or restore_proof.get("media_manifest_sha256") is not None
+            or restore_proof.get("media_object_count") not in (None, 0)
+        ):
+            raise CutoverPreflightError(
+                "media-free recovery proof contains an inconsistent artifact"
+            )
+        return
+    parsed_media = parsed.get("media")
+    if (
+        not isinstance(parsed_media, dict)
+        or parsed_media.get("verified") is not True
+        or parsed_media.get("sha256") != summary.get("media_sha256")
+        or parsed_media.get("manifest_sha256")
+        != summary.get("media_manifest_sha256")
+        or parsed_media.get("object_count") != objects
+        or parsed_media.get("referenced_count") != references
+        or restore_proof.get("media_sha256") != summary.get("media_sha256")
+        or restore_proof.get("media_manifest_sha256")
+        != summary.get("media_manifest_sha256")
+        or restore_proof.get("media_object_count") != objects
+    ):
+        raise CutoverPreflightError(
+            "verified recovery media artifact does not match isolated restore"
+        )
 
 
 def _validate_restore_governance(proof: Mapping[str, Any]) -> str:
@@ -3592,6 +3782,7 @@ def _validate_restore_governance(proof: Mapping[str, Any]) -> str:
         schema_name
         not in {
             LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+            PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
             RECOVERY_BUNDLE_RESTORE_SCHEMA,
         }
         or governance_mode not in {"pre-governed-v5", "authoritative-v6"}
@@ -3786,9 +3977,13 @@ def validate_evidence_contract(
     backup = _check_by_id(manifest, "recovery_backup")
     verify = _check_by_id(manifest, "recovery_verify")
     restore = _check_by_id(manifest, "recovery_restore")
-    _validate_recovery_metrics(backup)
-    _validate_recovery_metrics(verify)
-    _validate_recovery_metrics(restore, restore=True)
+    backup_media = _validate_recovery_metrics(backup)
+    verify_media = _validate_recovery_metrics(verify)
+    restore_media = _validate_recovery_metrics(restore, restore=True)
+    if backup_media != verify_media or backup_media != restore_media:
+        raise CutoverPreflightError(
+            "operator-readiness recovery media evidence is not cross-bound"
+        )
     verify_metrics = verify.get("metrics")
     if not isinstance(verify_metrics, dict) or verify_metrics.get("verified") is not True:
         raise CutoverPreflightError("signed recovery verification is not ready")
@@ -3836,6 +4031,11 @@ def validate_evidence_contract(
         raise CutoverPreflightError("isolated restore proof escaped its evidence pack")
     restore_proof = _read_json(restore_path, name="isolated restore proof")
     restore_governance = _validate_restore_governance(restore_proof)
+    _validate_recovery_media_artifact_binding(
+        summary=backup_media,
+        parsed=parsed,
+        restore_proof=restore_proof,
+    )
     restore_binding = restore_proof.get("capture_ledger_binding")
     if (
         restore_proof.get("mode") != "isolated-recovery-proof"
@@ -3858,7 +4058,10 @@ def validate_evidence_contract(
         raise CutoverPreflightError(
             "verified recovery and isolated restore governance do not match"
         )
-    if restore_proof.get("schema") == RECOVERY_BUNDLE_RESTORE_SCHEMA:
+    if restore_proof.get("schema") in {
+        PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+        RECOVERY_BUNDLE_RESTORE_SCHEMA,
+    }:
         parsed_database = parsed.get("database")
         parsed_capture_manifest = parsed.get("capture_manifest_sha256")
         parsed_runtime = parsed.get("runtime_state")
@@ -4197,12 +4400,19 @@ def verify_recovery_binding(
         receipt, identity_trusted = manager._read_bundle_receipt(receipt_path)
         if not identity_trusted:
             raise CutoverPreflightError("recovery bundle signer is not trusted locally")
-        if (
-            receipt.get("schema") != RECOVERY_BUNDLE_SCHEMA
-            or restore_proof.get("schema") != RECOVERY_BUNDLE_RESTORE_SCHEMA
+        bundle_schema = receipt.get("schema")
+        restore_schema = restore_proof.get("schema")
+        if _RECOVERY_RESTORE_SCHEMAS.get(bundle_schema) != restore_schema:
+            raise CutoverPreflightError(
+                "cutover recovery bundle and isolated proof schemas do not match"
+            )
+        if bundle_schema == LEGACY_RECOVERY_BUNDLE_SCHEMA and (
+            restore_proof.get("governance_mode") != "pre-governed-v5"
+            or restore_proof.get("store_generation") != "legacy-v5"
+            or restore_proof.get("authority_epoch_number") is not None
         ):
             raise CutoverPreflightError(
-                "cutover requires current exact-state recovery evidence"
+                "legacy v1 recovery is allowed only for pre-governed state"
             )
         database_path = receipt_path.parent / str(receipt["database_artifact_name"])
         database_receipt_path = receipt_path.parent / str(receipt["database_receipt_name"])
@@ -4260,19 +4470,30 @@ def verify_recovery_binding(
             raise CutoverPreflightError(
                 "evidence artifact does not match its signed recovery bundle"
             )
+        exact_receipt = bundle_schema != LEGACY_RECOVERY_BUNDLE_SCHEMA
+        expected_logical_schema = (
+            receipt.get("database_logical_snapshot_schema")
+            if exact_receipt
+            else parsed_database.get("logical_snapshot_schema")
+        )
+        expected_logical_sha256 = (
+            receipt.get("database_logical_snapshot_sha256")
+            if exact_receipt
+            else parsed_database.get("logical_snapshot_sha256")
+        )
         if (
             parsed_database.get("logical_snapshot_schema")
-            != receipt.get("database_logical_snapshot_schema")
+            != expected_logical_schema
             or parsed_database.get("logical_snapshot_sha256")
-            != receipt.get("database_logical_snapshot_sha256")
+            != expected_logical_sha256
             or database_receipt.get("logical_snapshot_schema")
-            != receipt.get("database_logical_snapshot_schema")
+            != expected_logical_schema
             or database_receipt.get("logical_snapshot_sha256")
-            != receipt.get("database_logical_snapshot_sha256")
+            != expected_logical_sha256
             or restore_proof.get("database_logical_snapshot_schema")
-            != receipt.get("database_logical_snapshot_schema")
+            != expected_logical_schema
             or restore_proof.get("database_logical_snapshot_sha256")
-            != receipt.get("database_logical_snapshot_sha256")
+            != expected_logical_sha256
         ):
             raise CutoverPreflightError(
                 "signed recovery database logical snapshots do not match"
@@ -4284,22 +4505,38 @@ def verify_recovery_binding(
             not inspection.get("restore_eligible")
             or not isinstance(live_authority, dict)
             or live_database.get("schema")
-            != receipt.get("database_logical_snapshot_schema")
+            != expected_logical_schema
             or live_database.get("sha256")
-            != receipt.get("database_logical_snapshot_sha256")
+            != expected_logical_sha256
         ):
             raise CutoverPreflightError("verified recovery is stale relative to the live database")
-        governance_mode = str(receipt.get("governance_mode") or "")
+        governance_mode = str(
+            (
+                receipt.get("governance_mode")
+                if exact_receipt
+                else parsed.get("governance_mode")
+            )
+            or ""
+        )
         store_identity = manager._store_identity()
-        store_generation = str(receipt.get("store_generation") or "")
-        authority_epoch = receipt.get("authority_epoch_number")
+        store_generation = str(
+            (
+                receipt.get("store_generation")
+                if exact_receipt
+                else parsed.get("store_generation")
+            )
+            or ""
+        )
+        authority_epoch = (
+            receipt.get("authority_epoch_number") if exact_receipt else None
+        )
         if (
             parsed.get("governance_mode") != governance_mode
             or restore_proof.get("governance_mode") != governance_mode
             or live_authority.get("governance_mode") != governance_mode
             or parsed.get("store_identity") != store_identity
             or restore_proof.get("store_identity") != store_identity
-            or receipt.get("store_identity") != store_identity
+            or (exact_receipt and receipt.get("store_identity") != store_identity)
             or parsed.get("store_generation") != store_generation
             or restore_proof.get("store_generation") != store_generation
             or live_authority.get("store_generation") != store_generation
@@ -4321,12 +4558,8 @@ def verify_recovery_binding(
                 "schema_contract_version"
             ),
             "snapshot_revision": receipt.get("database_snapshot_revision"),
-            "logical_snapshot_schema": receipt.get(
-                "database_logical_snapshot_schema"
-            ),
-            "logical_snapshot_sha256": receipt.get(
-                "database_logical_snapshot_sha256"
-            ),
+            "logical_snapshot_schema": expected_logical_schema,
+            "logical_snapshot_sha256": expected_logical_sha256,
             "capture_operation_count": receipt.get("capture_operation_count"),
             "capture_operation_highwater_micros": receipt.get(
                 "capture_operation_highwater_micros"
@@ -4336,10 +4569,124 @@ def verify_recovery_binding(
                 "capture_root_identity_digest"
             ),
         }
-        if parsed_capture_binding != expected_capture_binding:
+        legacy_capture_binding = dict(expected_capture_binding)
+        legacy_capture_binding.pop("logical_snapshot_schema")
+        legacy_capture_binding.pop("logical_snapshot_sha256")
+        if parsed_capture_binding not in (
+            expected_capture_binding,
+            legacy_capture_binding,
+        ):
             raise CutoverPreflightError(
                 "verified capture manifest has the wrong database binding"
             )
+
+        parsed_media = parsed.get("media")
+        media_summary = _validate_media_recovery_summary(
+            {
+                "recovery_bundle_schema": bundle_schema,
+                "recovery_restore_schema": restore_schema,
+                "media_included": parsed.get("media_included"),
+                "media_recovery_complete": parsed.get(
+                    "media_recovery_complete"
+                ),
+                "media_sha256": (
+                    parsed_media.get("sha256")
+                    if isinstance(parsed_media, dict)
+                    else None
+                ),
+                "media_manifest_sha256": (
+                    parsed_media.get("manifest_sha256")
+                    if isinstance(parsed_media, dict)
+                    else None
+                ),
+                "media_object_count": (
+                    parsed_media.get("object_count")
+                    if isinstance(parsed_media, dict)
+                    else 0
+                ),
+                "media_reference_count": parsed.get(
+                    "media_reference_count"
+                ),
+            }
+        )
+        _validate_recovery_media_artifact_binding(
+            summary=media_summary,
+            parsed=parsed,
+            restore_proof=restore_proof,
+        )
+        with closing(store._connect_read_only()) as media_connection:
+            live_media_references = media_references_from_connection(
+                media_connection
+            )
+        if int(live_media_references["reference_count"]) != int(
+            media_summary["media_reference_count"]
+        ):
+            raise CutoverPreflightError(
+                "verified recovery media references are stale"
+            )
+        if bundle_schema == RECOVERY_BUNDLE_SCHEMA:
+            if receipt.get("media_included") is not media_summary["media_included"]:
+                raise CutoverPreflightError(
+                    "signed recovery media inclusion does not match verification"
+                )
+            if media_summary["media_included"]:
+                media_path = receipt_path.parent / str(
+                    receipt["media_artifact_name"]
+                )
+                _assert_no_symlink_components(
+                    media_path,
+                    name="recovery media archive",
+                )
+                media_sha256, media_size = _stable_sha256(
+                    media_path,
+                    name="recovery media archive",
+                )
+                verified_media = manager._verify_media_archive(
+                    media_path,
+                    expected_sha256=str(receipt["media_sha256"]),
+                    expected_manifest_sha256=str(
+                        receipt["media_manifest_sha256"]
+                    ),
+                    database_binding=dict(parsed_capture_binding),
+                )
+                live_media = manager._media_inventory(
+                    referenced_media_ids=list(live_media_references["media_ids"]),
+                    database_binding=dict(parsed_capture_binding),
+                )
+                if (
+                    media_sha256 != media_summary["media_sha256"]
+                    or media_sha256 != receipt.get("media_sha256")
+                    or media_size != receipt.get("media_size_bytes")
+                    or verified_media.get("manifest_sha256")
+                    != media_summary["media_manifest_sha256"]
+                    or verified_media.get("object_count")
+                    != media_summary["media_object_count"]
+                    or verified_media.get("referenced_count")
+                    != media_summary["media_reference_count"]
+                    or sorted(live_media_references["media_ids"])
+                    != list(verified_media.get("object_ids") or [])
+                    or live_media.get("manifest_sha256")
+                    != media_summary["media_manifest_sha256"]
+                    or live_media.get("object_count")
+                    != media_summary["media_object_count"]
+                    or receipt.get("media_object_count")
+                    != media_summary["media_object_count"]
+                    or receipt.get("media_referenced_count")
+                    != media_summary["media_reference_count"]
+                ):
+                    raise CutoverPreflightError(
+                        "signed recovery media artifact is stale or mismatched"
+                    )
+            elif (
+                media_summary["media_reference_count"] != 0
+                or receipt.get("media_sha256") is not None
+                or receipt.get("media_manifest_sha256") is not None
+                or receipt.get("media_object_count") != 0
+                or receipt.get("media_referenced_count") != 0
+            ):
+                raise CutoverPreflightError(
+                    "signed zero-reference recovery media binding is invalid"
+                )
         live_capture = (
             _recompute_live_capture_manifest_with_held_repository_lock(
                 manager,
@@ -4366,7 +4713,7 @@ def verify_recovery_binding(
             != receipt.get("capture_file_count")
             or live_capture.get("total_bytes") != receipt.get("capture_total_bytes")
             or parsed_capture.get("total_bytes") != receipt.get("capture_total_bytes")
-            or live_capture.get("database_binding") != expected_capture_binding
+            or live_capture.get("database_binding") != parsed_capture_binding
             or live_capture.get("reconciliation") != parsed.get("reconciliation")
             or live_capture.get("reconciliation")
             != restore_proof.get("reconciliation")
@@ -4624,6 +4971,7 @@ def verify_recovery_binding(
             "database_logical_snapshot_schema": str(live_database["schema"]),
             "database_logical_snapshot_sha256": str(live_database["sha256"]),
             "capture_manifest_sha256": str(live_capture["manifest_sha256"]),
+            **media_summary,
             "runtime_state_required": runtime_required,
             "runtime_state_present": bool(live_runtime["present"]),
             "runtime_state_canonical_sha256": runtime_canonical_sha256,

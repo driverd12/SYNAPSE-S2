@@ -72,6 +72,62 @@ Inspect or revoke pins with:
   --peer-id 's2node_<32 hex>' --reason '<operator reason>' --confirm
 ```
 
+### Activate media replication on an existing pair
+
+Peers created before `media-artifact-v1` remain valid for database-only
+checkpoints, but referenced-media checkpoints fail closed until capability
+evidence is active in both directions. Upgrade the receiver first, then the
+sender, and do not create a referenced-media checkpoint until both status
+reports are ready.
+
+On each Mac, save the current local `descriptor_digest` and the other Mac's
+pinned peer `descriptor_digest` from these read-only commands:
+
+```bash
+.venv/bin/python synapse_cli.py --json replication-status
+.venv/bin/python synapse_cli.py --json replication-peer-list
+```
+
+Then upgrade each Mac's active node descriptor with the exact reviewed local
+digest. Use `umask 077` because the resulting descriptor will be copied to the
+other Mac:
+
+```bash
+umask 077
+.venv/bin/python synapse_cli.py --json replication-node-upgrade \
+  --expected-current-digest '<that Mac current descriptor_digest>' \
+  --confirm > upgraded-node.json
+```
+
+Independently compare each upgraded descriptor's `node_id`, `auth_key_id`,
+`receipt_digest`, and `capabilities` through the same trusted channel used for
+initial pairing. The capability list must contain `media-artifact-v1`. Copy
+each complete upgraded descriptor into the other Mac's core-owned replication
+inbox, then replace each existing pin with an exact compare-and-swap:
+
+```bash
+# On the sender, upgrade its pinned receiver descriptor.
+.venv/bin/python synapse_cli.py --json replication-peer-upgrade \
+  --descriptor receiver-upgraded-node.json \
+  --expected-descriptor-digest '<verified receiver upgraded receipt_digest>' \
+  --expected-previous-descriptor-digest '<sender previously pinned receiver digest>' \
+  --confirm
+
+# On the receiver, upgrade its pinned sender descriptor.
+.venv/bin/python synapse_cli.py --json replication-peer-upgrade \
+  --descriptor sender-upgraded-node.json \
+  --expected-descriptor-digest '<verified sender upgraded receipt_digest>' \
+  --expected-previous-descriptor-digest '<receiver previously pinned sender digest>' \
+  --confirm
+```
+
+Re-run `replication-status` on both Macs. Continue only when each report has
+`integrity.state: ready`, `media_artifact_capable: true`, and the relevant peer
+has `media_ready: true`, `evidence_problem: null`, and a capability list that
+contains `media-artifact-v1`. A stale digest, missing transition receipt,
+one-sided upgrade, or tampered descriptor blocks media checkpoint creation or
+staging without changing the replication ledger.
+
 ## Checkpoint and acknowledgement flow
 
 Create a target-bound checkpoint on the sender:
@@ -80,6 +136,17 @@ Create a target-bound checkpoint on the sender:
 .venv/bin/python synapse_cli.py --json replication-checkpoint-create \
   --peer-id 's2node_<receiver id>'
 ```
+
+A checkpoint packs the verified paired recovery bundle: the memory database,
+its backup receipt, the capture archive, the sealed media archive (thumbnails,
+private Apple Vision feature prints, and per-object manifests for every image
+memory referenced by the bundled database; `synapse-s2.recovery-bundle.v3`),
+optional request-journal and runtime-state artifacts, and the signed bundle
+receipt. Full-resolution originals are never copied, and media bytes travel
+only inside the digest-bound sealed archive. Older media-absent v2/v1 bundle
+receipts stay verifiable; their staging proofs report
+`media_recovery_complete: false` whenever the bundled database still
+references image memories, so incompleteness is visible rather than silent.
 
 Copy the entire returned `checkpoint_directory`, without changing its internal
 names or modes, into the receiver's replication inbox. Then stage its manifest:

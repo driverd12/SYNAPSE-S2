@@ -479,6 +479,9 @@ class CoreClient:
     def list_memory(self, **arguments: Any) -> dict[str, Any]:
         return self.call("list_memory", arguments)
 
+    def list_media_references(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("list_media_references", arguments)
+
     def publish_context_event(self, **arguments: Any) -> dict[str, Any]:
         return self.call("publish_context_event", arguments)
 
@@ -739,6 +742,28 @@ class CoreClient:
 
     def replication_revoke_peer(self, **arguments: Any) -> dict[str, Any]:
         return self.call("replication_revoke_peer", arguments)
+
+    def replication_upgrade_node_descriptor(
+        self, **arguments: Any
+    ) -> dict[str, Any]:
+        return self.call("replication_upgrade_node_descriptor", arguments)
+
+    def replication_upgrade_peer_descriptor(
+        self,
+        descriptor_path: str | os.PathLike[str],
+        expected_descriptor_digest: str,
+        expected_previous_descriptor_digest: str,
+        **arguments: Any,
+    ) -> dict[str, Any]:
+        return self.call(
+            "replication_upgrade_peer_descriptor",
+            {
+                "descriptor_path": str(descriptor_path),
+                "expected_descriptor_digest": expected_descriptor_digest,
+                "expected_previous_descriptor_digest": expected_previous_descriptor_digest,
+                **arguments,
+            },
+        )
 
     def replication_create_checkpoint(
         self,

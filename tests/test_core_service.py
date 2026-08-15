@@ -2779,6 +2779,133 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=5.0)
 
+    def test_replication_upgrade_descriptor_is_admitted_once_from_the_inbox(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary).resolve())
+            service = AuthoritativeCoreService(config)
+            failures: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    service.serve_forever()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not config.socket_path.exists():
+                if failures:
+                    break
+                time.sleep(0.02)
+            try:
+                self.assertEqual(failures, [])
+                client = CoreClient(
+                    socket_path=config.socket_path,
+                    caller="replication-upgrade-path-test",
+                    default_timeout_seconds=3.0,
+                )
+                descriptor = client.replication_identity()
+                digest = str(descriptor["receipt_digest"])
+                journal = service._request_journal
+                self.assertIsNotNone(journal)
+                assert journal is not None
+
+                def journal_rows() -> int:
+                    with closing(sqlite3.connect(journal.path)) as connection:
+                        return int(
+                            connection.execute(
+                                "SELECT count(*) FROM request_journal"
+                            ).fetchone()[0]
+                        )
+
+                before = journal_rows()
+                outside_path = (
+                    config.memory_path.parent / "replication" / "peer.json"
+                )
+                outside_path.write_text(
+                    json.dumps(descriptor, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.chmod(outside_path, 0o600)
+                with self.assertRaises(CoreRemoteError) as outside:
+                    client.call(
+                        "replication_upgrade_peer_descriptor",
+                        {
+                            "descriptor_path": str(outside_path),
+                            "expected_descriptor_digest": digest,
+                            "expected_previous_descriptor_digest": "0" * 64,
+                            "confirm": True,
+                        },
+                        request_id="req-replication-upgrade-outside-inbox",
+                    )
+                self.assertEqual(outside.exception.code, "path_not_authorized")
+                self.assertEqual(journal_rows(), before)
+
+                inbox_path = (
+                    config.memory_path.parent
+                    / "replication"
+                    / "inbox"
+                    / "upgrade.json"
+                )
+                inbox_path.write_text(
+                    json.dumps(descriptor, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.chmod(inbox_path, 0o600)
+                with self.assertRaises(CoreRemoteError) as mismatched:
+                    client.call(
+                        "replication_upgrade_peer_descriptor",
+                        {
+                            "descriptor_path": str(inbox_path),
+                            "expected_descriptor_digest": "f" * 64,
+                            "expected_previous_descriptor_digest": "0" * 64,
+                            "confirm": True,
+                        },
+                        request_id="req-replication-upgrade-bad-digest",
+                    )
+                self.assertEqual(mismatched.exception.code, "invalid_request")
+                self.assertEqual(journal_rows(), before)
+
+                authorized, tokens = service._authorize_operation_arguments(
+                    "replication_upgrade_peer_descriptor",
+                    {
+                        "descriptor_path": str(inbox_path),
+                        "expected_descriptor_digest": digest,
+                        "expected_previous_descriptor_digest": "0" * 64,
+                        "confirm": True,
+                    },
+                )
+                try:
+                    admitted = authorized["descriptor_path"]
+                    self.assertIsInstance(admitted, dict)
+                    self.assertEqual(str(admitted["receipt_digest"]), digest)
+                    # A pathname swap after journal admission must not change
+                    # the dispatched document: the validated dict is the only
+                    # thing handed to the manager, which never reopens the
+                    # client-supplied pathname.
+                    inbox_path.write_text(
+                        json.dumps(
+                            dict(descriptor, node_id="s2node_" + "0" * 32),
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        str(admitted["node_id"]), str(descriptor["node_id"])
+                    )
+                    self.assertEqual(str(admitted["receipt_digest"]), digest)
+                finally:
+                    for token in tokens:
+                        token.close()
+            finally:
+                service.close()
+                thread.join(timeout=5.0)
+
     def test_core_binds_bridge_actor_and_keeps_pending_recall_isolated(self) -> None:
         with TemporaryDirectory() as temporary:
             config = self.config(Path(temporary))

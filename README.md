@@ -381,8 +381,14 @@ visible optional/unavailable receipt while the baseline image capture succeeds.
 The short-lived native helper analyzes a derivative with a maximum edge of 2048
 pixels. Learned feature-print bytes remain owner-only in the node-local media
 cache; durable memory stores only the versioned provider/revision/type/count
-reference plus redacted OCR when requested. Neither thumbnail nor feature-print
-bytes is currently included in paired recovery or multi-Mac replication.
+reference plus redacted OCR when requested. Neither thumbnails nor feature-print
+bytes enter SQLite or the ordinary memory response surface. Referenced
+derivatives are, however, sealed into recovery bundle v3 and the matching
+offline-replication media artifact so an isolated restore or paired Mac can
+reconstruct the same private cache object. The archive is derived from the
+immutable database snapshot's exact reference set; missing or corrupt
+derivatives fail closed, valid unreferenced orphans are excluded, and
+full-resolution originals are never copied.
 
 The original file is decoded transiently, remains untouched at its source path,
 and is never copied into SYNAPSE-S2 or SQLite. CLI capture accepts an absolute
@@ -392,10 +398,44 @@ with a maximum edge of 320 pixels and a private integrity manifest; the durable
 typed memory receives the searchable
 description plus a bounded numeric RGB tensor, color histogram, edge histogram,
 and difference bits. Visual descriptors are kept separate from the deployed text
-embedding space. The thumbnail cache is local and non-authoritative: it is not yet
-included in paired recovery or multi-Mac replication, while the description and
-descriptor metadata are durable memory. Browser thumbnail reads require the same
-dual dashboard authorization as every other `/api/*` read.
+embedding space. The thumbnail cache is local and non-authoritative: it is not
+an independent source of memory truth, while the description and descriptor
+metadata remain authoritative in durable memory. Recovery bundle v3 and
+capability-negotiated offline replication carry only the exact referenced
+private derivatives and revalidate every restored object before it can be used.
+Browser thumbnail reads require the same dual dashboard authorization as every
+other `/api/*` read.
+
+Stored-image similarity is wired into the authenticated local dashboard: every
+cached thumbnail in the Image Memory gallery has a "Find similar" action that
+calls the read-only `GET /api/media-similar` route. The browser supplies only
+the query `media_id`, context, recall scope, and limits; the server resolves
+the candidate set from the authoritative scope-filtered reference listing and
+never trusts client-supplied candidate IDs. Results are compact ranked
+thumbnail cards with raw feature-print distances, an explicit
+uncalibrated-score warning, and visible truncation/exclusion notices; feature
+bytes and OCR text are never returned. The panel is keyboard-dismissable
+(Escape or the Close button) and stays single-column without horizontal
+overflow on 390-pixel viewports. Missing local cache derivatives for
+authoritative references fail closed as an integrity-drift conflict rather
+than a silently partial ranking.
+
+For LongMem-style lookups against an image that should never become a stored
+memory, `image-similar-transient` computes the query feature print through the
+same short-lived Apple Vision helper, compares it in memory against the same
+authoritative candidate set, and persists nothing: no query media object,
+manifest, feature vector, OCR, or content digest is written, the media-cache
+inventory is untouched even on failure, and the projection carries only a
+content-free compatibility descriptor plus transient provenance — never bytes,
+paths, or text. The query file must be an owner-only (0600) regular file, and
+the caller may delete it immediately after the call:
+
+```bash
+.venv/bin/python synapse_cli.py --json image-similar-transient \
+  --context default \
+  --source /absolute/path/to/private-query.png \
+  --limit 8
+```
 
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `$HOME/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, replication, or neural configuration. Authoritative exports, recovery paths, and the private replication inbox are published explicitly by the binding and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.

@@ -15,12 +15,20 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
+from image_capture import (
+    ImageCaptureError,
+    ImageCaptureNotFound,
+    MediaObjectReader,
+)
 from memory_store import DurableMemoryStore
 from recovery_manager import VerifiedRecoveryManager
 from replication_protocol import (
     ACK_SCHEMA,
+    BASE_NODE_CAPABILITIES,
     CHECKPOINT_SCHEMA,
     LINEAGE_ID_RE,
+    MEDIA_ARTIFACT_CAPABILITY,
+    NODE_CAPABILITIES,
     NODE_ID_RE,
     REPLICATION_PROTOCOL_VERSION,
     ReplicationProtocolError,
@@ -30,22 +38,27 @@ from replication_protocol import (
     read_private_bytes,
     read_private_json,
     sign_payload,
+    signed_descriptor_transition,
     signed_node_descriptor,
+    signed_node_descriptor_transition,
     validate_ack,
     validate_checkpoint,
+    validate_descriptor_transition,
     validate_digest,
     validate_node_descriptor,
+    validate_node_descriptor_transition,
     validate_private_directory,
     validate_safe_name,
     write_private_json_exclusive,
 )
-from replication_store import ReplicationLedger
+from replication_store import STATUS_PEER_PAGE_LIMIT, ReplicationLedger
 
 
 _ARTIFACT_ORDER = (
     "database",
     "database_receipt",
     "capture",
+    "media",
     "request_journal",
     "request_journal_binding",
     "runtime_state",
@@ -82,12 +95,14 @@ class ReplicationManager:
         self.staged_root = self.root / "staged"
         self.acks_root = self.root / "acks"
         self.quarantine_root = self.root / "quarantine"
+        self.peers_root = self.root / "peers"
         for path in (
             self.outgoing_root,
             self.incoming_root,
             self.staged_root,
             self.acks_root,
             self.quarantine_root,
+            self.peers_root,
         ):
             self._ensure_private_directory(path)
         self.descriptor_path = self.root / "node-descriptor.json"
@@ -254,6 +269,10 @@ class ReplicationManager:
             raise ReplicationProtocolError("peer direction must be send or receive")
         now = time.time()
         with self.ledger.manager_lock():
+            # Evidence is published (and fsynced) before the ledger pointer is
+            # written: a crash between the two leaves only an inert
+            # digest-addressed document that the retried pairing reuses.
+            self._publish_peer_descriptor_evidence(peer_id, validated)
             record = self.ledger.pair_peer(
                 peer_id=peer_id,
                 lineage_id=str(lineage_id),
@@ -265,6 +284,654 @@ class ReplicationManager:
                 audit=True,
             )
         return self._public_peer(record)
+
+    def _peer_descriptor_evidence_path(self, peer_id: str, digest: str) -> Path:
+        return self._derived_path(
+            self.peers_root, f"{peer_id}.descriptor.{digest}.json"
+        )
+
+    def _peer_transition_path(self, peer_id: str, digest: str) -> Path:
+        return self._derived_path(
+            self.peers_root, f"{peer_id}.transition.{digest}.json"
+        )
+
+    def _publish_peer_descriptor_evidence(
+        self, peer_id: str, validated: dict[str, Any]
+    ) -> None:
+        """Persist a signed peer descriptor as append-only, digest-addressed evidence."""
+
+        evidence = self._peer_descriptor_evidence_path(
+            peer_id, str(validated["receipt_digest"])
+        )
+        if evidence.exists() or evidence.is_symlink():
+            existing = validate_node_descriptor(
+                read_private_json(evidence),
+                expected_public_key=str(validated["signing_public_key"]),
+                expected_key_id=str(validated["auth_key_id"]),
+            )
+            if not secrets.compare_digest(
+                str(existing["receipt_digest"]), str(validated["receipt_digest"])
+            ) or str(existing["node_id"]) != peer_id:
+                raise ReplicationProtocolError(
+                    "peer descriptor evidence conflicts with its digest address"
+                )
+            return
+        write_private_json_exclusive(self.store, evidence, validated)
+        self.store._fsync_directory(self.peers_root)
+
+    def _peer_capabilities(self, peer: dict[str, Any]) -> list[str]:
+        """Return the pinned peer's signed capabilities, baseline if unknown.
+
+        The current evidence document is resolved through the ledger's pinned
+        descriptor digest, so a stale or replaced sidecar can never advertise
+        capabilities the ledger has not accepted.
+        """
+
+        evidence = self._peer_descriptor_evidence_path(
+            str(peer["peer_id"]), str(peer["descriptor_digest"])
+        )
+        if not evidence.exists() and not evidence.is_symlink():
+            # Peers pinned before capability negotiation retain no descriptor
+            # document; they are treated as baseline (no media capability)
+            # until the operator upgrades them with a reviewed descriptor.
+            return list(BASE_NODE_CAPABILITIES)
+        document = validate_node_descriptor(
+            read_private_json(evidence),
+            expected_public_key=str(peer["signing_public_key"]),
+            expected_key_id=str(peer["signing_key_id"]),
+        )
+        if (
+            not secrets.compare_digest(
+                str(document["receipt_digest"]), str(peer["descriptor_digest"])
+            )
+            or str(document["node_id"]) != str(peer["peer_id"])
+        ):
+            raise ReplicationProtocolError(
+                "pinned peer descriptor document conflicts with the ledger"
+            )
+        return [str(item) for item in document["capabilities"]]
+
+    def _active_node_descriptor(self) -> dict[str, Any]:
+        """Return the active on-disk node descriptor, re-validated.
+
+        The pointer file is re-validated on every use so a tampered or
+        partially written descriptor can never silently activate media.
+        """
+
+        document = validate_node_descriptor(
+            read_private_json(self.descriptor_path),
+            expected_key_id=str(self._descriptor["auth_key_id"]),
+        )
+        if str(document["node_id"]) != self.node_id:
+            raise ReplicationProtocolError(
+                "active node descriptor does not match this node's identity"
+            )
+        return document
+
+    def _local_capabilities(self) -> list[str]:
+        return [
+            str(item) for item in self._active_node_descriptor()["capabilities"]
+        ]
+
+    def _verified_peer_transition(
+        self,
+        peer: dict[str, Any],
+        *,
+        recorded_previous: str | None,
+    ) -> dict[str, Any]:
+        """Return the exactly cross-bound old->new receipt for an upgraded pin.
+
+        The receipt must be locally signed and bind the recorder, peer,
+        lineage, direction, signing key, and both descriptor digests; its
+        predecessor must equal the anchored audit record written by the
+        descriptor compare-and-swap, and when it claims the previous
+        descriptor document as evidence, that retired document must still
+        validate at its digest address.
+        """
+
+        transition_path = self._peer_transition_path(
+            str(peer["peer_id"]), str(peer["descriptor_digest"])
+        )
+        if not transition_path.exists() and not transition_path.is_symlink():
+            raise ReplicationProtocolError(
+                "upgraded peer descriptor lacks its signed transition receipt"
+            )
+        record = validate_descriptor_transition(
+            read_private_json(transition_path),
+            expected_key_id=str(self._descriptor["auth_key_id"]),
+        )
+        if (
+            str(record["recorder_node_id"]) != self.node_id
+            or str(record["peer_id"]) != str(peer["peer_id"])
+            or str(record["lineage_id"]) != str(peer["lineage_id"])
+            or str(record["direction"]) != str(peer["direction"])
+            or str(record["peer_signing_key_id"]) != str(peer["signing_key_id"])
+            or not secrets.compare_digest(
+                str(record["descriptor_digest"]), str(peer["descriptor_digest"])
+            )
+        ):
+            raise ReplicationProtocolError(
+                "peer descriptor transition receipt is not cross-bound to "
+                "the pinned peer"
+            )
+        if recorded_previous is None:
+            raise ReplicationProtocolError(
+                "peer descriptor transition receipt has no anchored "
+                "compare-and-swap predecessor record"
+            )
+        if not secrets.compare_digest(
+            str(record["previous_descriptor_digest"]), recorded_previous
+        ):
+            raise ReplicationProtocolError(
+                "peer descriptor transition receipt does not match the "
+                "ledger-recorded predecessor"
+            )
+        if str(record["previous_evidence"]) == "descriptor-document":
+            previous_digest = str(record["previous_descriptor_digest"])
+            previous = validate_node_descriptor(
+                read_private_json(
+                    self._peer_descriptor_evidence_path(
+                        str(peer["peer_id"]), previous_digest
+                    )
+                ),
+                expected_public_key=str(peer["signing_public_key"]),
+                expected_key_id=str(peer["signing_key_id"]),
+            )
+            if not secrets.compare_digest(
+                str(previous["receipt_digest"]), previous_digest
+            ) or str(previous["node_id"]) != str(peer["peer_id"]):
+                raise ReplicationProtocolError(
+                    "retired peer descriptor evidence conflicts with the "
+                    "transition receipt"
+                )
+        return record
+
+    def _peer_capability_report(
+        self,
+        peer: dict[str, Any],
+        *,
+        recorded_previous: str | None,
+    ) -> dict[str, Any]:
+        """Describe one peer's capability activation state for status surfaces.
+
+        Descriptor evidence is integrity, not display: a missing or tampered
+        pinned descriptor document, or a missing/non-cross-bound old->new
+        transition receipt for an upgraded pin, surfaces as an evidence
+        problem that empties the peer's capabilities and degrades the node's
+        global integrity verdict. Whether a pin was upgraded comes from the
+        anchored compare-and-swap audit record (recorded_previous), never
+        from mutable peer timestamps.
+        """
+
+        report: dict[str, Any] = {
+            "peer_id": str(peer["peer_id"]),
+            "lineage_id": str(peer["lineage_id"]),
+            "direction": str(peer["direction"]),
+            "revoked": bool(peer["revoked"]),
+            "descriptor_digest": str(peer["descriptor_digest"]),
+            "previous_descriptor_digest": None,
+            "evidence_problem": None,
+        }
+        evidence = self._peer_descriptor_evidence_path(
+            str(peer["peer_id"]), str(peer["descriptor_digest"])
+        )
+        transition = self._peer_transition_path(
+            str(peer["peer_id"]), str(peer["descriptor_digest"])
+        )
+        has_evidence = evidence.exists() or evidence.is_symlink()
+        # A transition receipt addressed by the pinned digest without an
+        # anchored predecessor record is itself inconsistent and must be
+        # examined, never silently ignored.
+        upgraded = (
+            recorded_previous is not None
+            or transition.exists()
+            or transition.is_symlink()
+        )
+        try:
+            if not has_evidence:
+                if upgraded:
+                    raise ReplicationProtocolError(
+                        "upgraded peer descriptor evidence is missing"
+                    )
+                # Peers pinned before capability negotiation retain no
+                # descriptor document; they stay visibly baseline.
+                report["capability_state"] = "legacy-no-descriptor"
+                report["capabilities"] = list(BASE_NODE_CAPABILITIES)
+                return report
+            capabilities = self._peer_capabilities(peer)
+            if upgraded:
+                record = self._verified_peer_transition(
+                    peer, recorded_previous=recorded_previous
+                )
+                report["previous_descriptor_digest"] = str(
+                    record["previous_descriptor_digest"]
+                )
+            report["capabilities"] = capabilities
+            report["capability_state"] = (
+                MEDIA_ARTIFACT_CAPABILITY
+                if MEDIA_ARTIFACT_CAPABILITY in capabilities
+                else "baseline"
+            )
+        except (OSError, ValueError, RuntimeError) as problem:
+            report["capability_state"] = "invalid-descriptor-evidence"
+            report["capabilities"] = []
+            report["evidence_problem"] = str(problem)
+        return report
+
+    def _verified_peer_capabilities(self, peer: dict[str, Any]) -> list[str]:
+        """Resolve a pinned peer's capabilities through full evidence integrity.
+
+        Media enforcement and status share one resolver
+        (_peer_capability_report): whether the pin was upgraded comes from
+        the anchored compare-and-swap audit predecessor, the pinned
+        descriptor document must validate at its digest address, and an
+        upgraded pin must carry its exact cross-bound old->new transition
+        receipt. Missing or tampered evidence fails closed here instead of
+        quietly resolving to baseline while status is degraded.
+        """
+
+        report = self._peer_capability_report(
+            peer,
+            recorded_previous=self.ledger.peer_descriptor_predecessor(
+                str(peer["peer_id"])
+            ),
+        )
+        if report["evidence_problem"] is not None:
+            raise ReplicationProtocolError(
+                "pinned peer descriptor evidence failed integrity "
+                f"verification: {report['evidence_problem']}"
+            )
+        return [str(item) for item in report["capabilities"]]
+
+    def _publish_node_descriptor_evidence(
+        self, digest: str, document: dict[str, Any]
+    ) -> None:
+        """Persist one node descriptor as append-only, digest-addressed evidence."""
+
+        evidence = self._derived_path(self.root, f"node-descriptor.{digest}.json")
+        if evidence.exists() or evidence.is_symlink():
+            existing = validate_node_descriptor(
+                read_private_json(evidence),
+                expected_key_id=str(self._descriptor["auth_key_id"]),
+            )
+            if not secrets.compare_digest(str(existing["receipt_digest"]), digest):
+                raise ReplicationProtocolError(
+                    "node descriptor evidence conflicts with its digest address"
+                )
+            return
+        write_private_json_exclusive(self.store, evidence, document)
+        self.store._fsync_directory(self.root)
+
+    def _node_transition_path(self, digest: str) -> Path:
+        return self._derived_path(
+            self.root, f"node-descriptor.transition.{digest}.json"
+        )
+
+    def _verified_node_transition(
+        self, active: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the self-signed swap receipt for the ACTIVE descriptor.
+
+        The receipt is addressed by the active digest, so candidate evidence
+        that was published but never activated is never consulted: only the
+        pointer swap that actually happened has a receipt at the active
+        address. Returns None when the active descriptor was never swapped
+        in (a natively full-capability node).
+        """
+
+        transition_path = self._node_transition_path(
+            str(active["receipt_digest"])
+        )
+        if not transition_path.exists() and not transition_path.is_symlink():
+            return None
+        record = validate_node_descriptor_transition(
+            read_private_json(transition_path),
+            expected_key_id=str(active["auth_key_id"]),
+        )
+        if str(record["node_id"]) != self.node_id or not secrets.compare_digest(
+            str(record["descriptor_digest"]), str(active["receipt_digest"])
+        ):
+            raise ReplicationProtocolError(
+                "node descriptor transition receipt is not cross-bound to "
+                "the active descriptor"
+            )
+        return record
+
+    def _publish_node_transition_evidence(
+        self, *, previous_digest: str, new_digest: str, now: float
+    ) -> None:
+        """Persist the signed local predecessor->new swap receipt, append-only."""
+
+        transition_path = self._node_transition_path(new_digest)
+        if transition_path.exists() or transition_path.is_symlink():
+            existing = validate_node_descriptor_transition(
+                read_private_json(transition_path),
+                expected_key_id=str(self._descriptor["auth_key_id"]),
+            )
+            if (
+                str(existing["node_id"]) != self.node_id
+                or not secrets.compare_digest(
+                    str(existing["previous_descriptor_digest"]), previous_digest
+                )
+                or not secrets.compare_digest(
+                    str(existing["descriptor_digest"]), new_digest
+                )
+            ):
+                raise ReplicationProtocolError(
+                    "node descriptor transition evidence conflicts with its "
+                    "digest address"
+                )
+            return
+        transition = signed_node_descriptor_transition(
+            self.store,
+            node_id=self.node_id,
+            previous_descriptor_digest=previous_digest,
+            descriptor_digest=new_digest,
+            created_at=float(now),
+        )
+        write_private_json_exclusive(self.store, transition_path, transition)
+        self.store._fsync_directory(self.root)
+
+    def upgrade_node_descriptor(
+        self,
+        *,
+        expected_current_digest: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Re-sign this node's descriptor with the full capability list.
+
+        Baseline nodes keep advertising only the original three capabilities
+        until an operator explicitly upgrades. The upgrade is a
+        compare-and-swap: the caller names the exact reviewed digest of the
+        currently active descriptor, so a descriptor that changed after the
+        operator's review can never be silently replaced. Both the previous
+        and the upgraded descriptor are preserved as immutable,
+        digest-addressed evidence and fsynced before the active pointer moves;
+        the pointer swap itself is a compare-and-swap under the manager lock,
+        and a lost response replays idempotently (the retried reviewed digest
+        may name either the already-upgraded descriptor or the preserved
+        pre-upgrade evidence it replaced). The upgraded descriptor must then
+        be independently reviewed and re-pinned on every peer before this
+        node may replicate media checkpoints.
+        """
+
+        expected_current = validate_digest(
+            expected_current_digest, "expected current node descriptor digest"
+        )
+        with self.ledger.manager_lock():
+            current = validate_node_descriptor(
+                read_private_json(self.descriptor_path),
+                expected_key_id=str(self._descriptor["auth_key_id"]),
+            )
+            if str(current["node_id"]) != self.node_id:
+                raise ReplicationProtocolError(
+                    "active node descriptor does not match this node's identity"
+                )
+            current_capabilities = [str(item) for item in current["capabilities"]]
+            digest_matches_active = secrets.compare_digest(
+                str(current["receipt_digest"]), expected_current
+            )
+            if current_capabilities == list(NODE_CAPABILITIES):
+                if not digest_matches_active:
+                    # Response-loss retry: the reviewed digest may only name
+                    # the exact predecessor recorded by the signed swap
+                    # receipt of the ACTIVE descriptor. Candidate evidence
+                    # published before a swap that never happened is
+                    # addressed by a digest that never became active, so a
+                    # staged-but-never-active candidate is always rejected.
+                    transition = self._verified_node_transition(current)
+                    if transition is None or not secrets.compare_digest(
+                        str(transition["previous_descriptor_digest"]),
+                        expected_current,
+                    ):
+                        raise ReplicationProtocolError(
+                            "node descriptor upgrade does not match the "
+                            "reviewed current descriptor digest"
+                        )
+                self._descriptor = current
+                return copy.deepcopy(current)
+            if not digest_matches_active:
+                raise ReplicationProtocolError(
+                    "node descriptor upgrade does not match the reviewed "
+                    "current descriptor digest"
+                )
+            if not confirm:
+                raise ValueError(
+                    "confirm=true is required to upgrade the node descriptor"
+                )
+            previous_digest = str(current["receipt_digest"])
+            upgraded = signed_node_descriptor(self.store, created_at=time.time())
+            if (
+                str(upgraded["node_id"]) != self.node_id
+                or str(upgraded["auth_key_id"]) != str(current["auth_key_id"])
+            ):
+                raise ReplicationProtocolError(
+                    "upgraded node descriptor changed the node identity"
+                )
+            upgraded_capabilities = [str(item) for item in upgraded["capabilities"]]
+            if not set(current_capabilities).issubset(upgraded_capabilities):
+                raise ReplicationProtocolError(
+                    "node descriptor upgrade must not drop capabilities"
+                )
+            new_digest = str(upgraded["receipt_digest"])
+            self._publish_node_descriptor_evidence(previous_digest, current)
+            self._publish_node_descriptor_evidence(new_digest, upgraded)
+            # The swap receipt is addressed by the candidate digest and only
+            # ever consulted once that digest is active, so publishing it
+            # before the pointer swap keeps response-loss retries idempotent
+            # without letting a never-activated candidate into history.
+            self._publish_node_transition_evidence(
+                previous_digest=previous_digest,
+                new_digest=new_digest,
+                now=time.time(),
+            )
+            pointer_swap = self._derived_path(
+                self.root, f"node-descriptor.next.{new_digest}.json"
+            )
+            if pointer_swap.exists() or pointer_swap.is_symlink():
+                staged = validate_node_descriptor(
+                    read_private_json(pointer_swap),
+                    expected_key_id=str(current["auth_key_id"]),
+                )
+                if not secrets.compare_digest(
+                    str(staged["receipt_digest"]), new_digest
+                ):
+                    raise ReplicationProtocolError(
+                        "staged node descriptor conflicts with its digest address"
+                    )
+                upgraded = staged
+            else:
+                write_private_json_exclusive(self.store, pointer_swap, upgraded)
+            self.store._fsync_directory(self.root)
+            active = validate_node_descriptor(
+                read_private_json(self.descriptor_path),
+                expected_key_id=str(current["auth_key_id"]),
+            )
+            if not secrets.compare_digest(
+                str(active["receipt_digest"]), previous_digest
+            ):
+                raise ReplicationProtocolError(
+                    "node descriptor pointer changed during the upgrade"
+                )
+            os.replace(pointer_swap, self.descriptor_path)
+            self.store._fsync_directory(self.root)
+            self._descriptor = upgraded
+            return copy.deepcopy(upgraded)
+
+    def upgrade_peer_descriptor(
+        self,
+        descriptor: dict[str, Any] | str | os.PathLike[str],
+        *,
+        expected_descriptor_digest: str,
+        expected_previous_descriptor_digest: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Governed re-pin of a peer's upgraded, independently reviewed descriptor.
+
+        The upgrade is a compare-and-swap: the caller names both the exact
+        currently pinned digest and the reviewed digest of the new signed
+        descriptor. The peer's identity, lineage, direction, and signing key
+        never change, prior descriptor evidence is retired rather than
+        deleted, and until this succeeds the peer remains baseline and media
+        checkpoints to it stay blocked.
+        """
+
+        if not confirm:
+            raise ValueError(
+                "confirm=true is required to upgrade a replication peer descriptor"
+            )
+        validated = validate_node_descriptor(self._document(descriptor))
+        new_capabilities = [str(item) for item in validated["capabilities"]]
+        if new_capabilities != list(NODE_CAPABILITIES):
+            raise ReplicationProtocolError(
+                "peer descriptor upgrade must advertise the full capability list"
+            )
+        expected_new = validate_digest(
+            expected_descriptor_digest, "expected peer descriptor digest"
+        )
+        expected_previous = validate_digest(
+            expected_previous_descriptor_digest,
+            "expected previous peer descriptor digest",
+        )
+        if not secrets.compare_digest(
+            str(validated["receipt_digest"]), expected_new
+        ):
+            raise ReplicationProtocolError(
+                "peer descriptor does not match the independently reviewed fingerprint"
+            )
+        peer_id = str(validated["node_id"])
+        now = time.time()
+        with self.ledger.manager_lock():
+            peer = self.ledger.peer(peer_id)
+            if peer is None:
+                raise ReplicationProtocolError("replication peer is unknown")
+            if bool(peer["revoked"]):
+                raise ReplicationProtocolError("replication peer is revoked")
+            if str(peer["signing_key_id"]) != str(validated["auth_key_id"]) or str(
+                peer["signing_public_key"]
+            ) != str(validated["signing_public_key"]):
+                raise ReplicationProtocolError(
+                    "peer descriptor upgrade changed the signing key"
+                )
+            previous_evidence_path = self._peer_descriptor_evidence_path(
+                peer_id, expected_previous
+            )
+            previous_evidence = (
+                "descriptor-document"
+                if previous_evidence_path.exists()
+                or previous_evidence_path.is_symlink()
+                else "ledger-digest-only"
+            )
+            if secrets.compare_digest(str(peer["descriptor_digest"]), expected_new):
+                # Idempotent replay after a lost response: the ledger
+                # compare-and-swap already completed. The caller's claimed
+                # predecessor must equal the anchored audit record written by
+                # that CAS, and the transition receipt published before it
+                # must still validate exactly — a replay never signs new
+                # history, so a deleted or tampered receipt stays failed.
+                recorded_previous = self.ledger.peer_descriptor_predecessor(
+                    peer_id
+                )
+                if recorded_previous is None or not secrets.compare_digest(
+                    recorded_previous, expected_previous
+                ):
+                    raise ReplicationProtocolError(
+                        "peer descriptor upgrade replay does not match the "
+                        "recorded predecessor"
+                    )
+                self._publish_peer_descriptor_evidence(peer_id, validated)
+                self._verified_peer_transition(
+                    peer, recorded_previous=recorded_previous
+                )
+                return self._public_peer(peer)
+            if not secrets.compare_digest(
+                str(peer["descriptor_digest"]), expected_previous
+            ):
+                raise ReplicationProtocolError(
+                    "peer descriptor upgrade does not match the pinned record"
+                )
+            previous_capabilities = self._peer_capabilities(peer)
+            if not set(previous_capabilities).issubset(new_capabilities):
+                raise ReplicationProtocolError(
+                    "peer descriptor upgrade must not drop capabilities"
+                )
+            # Evidence first: the new digest-addressed descriptor and the
+            # signed old->new transition receipt are written and fsynced
+            # before the anchored ledger pointer moves, so a crash between the
+            # two leaves only inert evidence that a retry reuses; the previous
+            # digest stays preserved in the ledger, the transition receipt,
+            # and (when present) its own descriptor document.
+            self._publish_peer_descriptor_evidence(peer_id, validated)
+            self._publish_peer_transition_evidence(
+                peer=peer,
+                previous_descriptor_digest=expected_previous,
+                new_descriptor_digest=expected_new,
+                previous_evidence=previous_evidence,
+                now=now,
+            )
+            record = self.ledger.update_peer_descriptor(
+                peer_id,
+                previous_descriptor_digest=expected_previous,
+                descriptor_digest=expected_new,
+                signing_key_id=str(validated["auth_key_id"]),
+                signing_public_key=str(validated["signing_public_key"]),
+                now=now,
+                audit=True,
+            )
+        return self._public_peer(record)
+
+    def _publish_peer_transition_evidence(
+        self,
+        *,
+        peer: dict[str, Any],
+        previous_descriptor_digest: str,
+        new_descriptor_digest: str,
+        previous_evidence: str,
+        now: float,
+    ) -> None:
+        """Persist the signed old->new transition receipt, append-only."""
+
+        transition_path = self._peer_transition_path(
+            str(peer["peer_id"]), new_descriptor_digest
+        )
+        if transition_path.exists() or transition_path.is_symlink():
+            existing = validate_descriptor_transition(
+                read_private_json(transition_path),
+                expected_key_id=str(self._descriptor["auth_key_id"]),
+            )
+            if (
+                str(existing["recorder_node_id"]) != self.node_id
+                or str(existing["peer_id"]) != str(peer["peer_id"])
+                or str(existing["lineage_id"]) != str(peer["lineage_id"])
+                or str(existing["direction"]) != str(peer["direction"])
+                or str(existing["peer_signing_key_id"])
+                != str(peer["signing_key_id"])
+                or not secrets.compare_digest(
+                    str(existing["previous_descriptor_digest"]),
+                    previous_descriptor_digest,
+                )
+                or not secrets.compare_digest(
+                    str(existing["descriptor_digest"]), new_descriptor_digest
+                )
+            ):
+                raise ReplicationProtocolError(
+                    "peer descriptor transition evidence conflicts with its digest address"
+                )
+            return
+        transition = signed_descriptor_transition(
+            self.store,
+            recorder_node_id=self.node_id,
+            peer_id=str(peer["peer_id"]),
+            lineage_id=str(peer["lineage_id"]),
+            direction=str(peer["direction"]),
+            peer_signing_key_id=str(peer["signing_key_id"]),
+            previous_descriptor_digest=previous_descriptor_digest,
+            descriptor_digest=new_descriptor_digest,
+            previous_evidence=previous_evidence,
+            created_at=float(now),
+        )
+        write_private_json_exclusive(self.store, transition_path, transition)
+        self.store._fsync_directory(self.peers_root)
 
     def revoke_peer(
         self,
@@ -360,6 +1027,11 @@ class ReplicationManager:
             ),
             "bundle_receipt": receipt_path.name,
         }
+        if bool(receipt.get("media_included")):
+            names["media"] = validate_safe_name(
+                receipt.get("media_artifact_name"),
+                "media artifact name",
+            )
         if bool(receipt.get("request_journal_required")):
             names["request_journal"] = validate_safe_name(
                 receipt.get("request_journal_artifact_name"),
@@ -383,6 +1055,7 @@ class ReplicationManager:
         expected_digests = {
             "database": str(receipt.get("database_sha256") or ""),
             "capture": str(receipt.get("capture_sha256") or ""),
+            "media": str(receipt.get("media_sha256") or ""),
             "request_journal": str(receipt.get("request_journal_sha256") or ""),
             "runtime_state": str(receipt.get("runtime_state_sha256") or ""),
         }
@@ -671,6 +1344,26 @@ class ReplicationManager:
                     receipt_path=receipt_path,
                     receipt=receipt,
                 )
+                if any(str(record["kind"]) == "media" for record in artifacts):
+                    # Bilateral activation: media replication requires the
+                    # capability on this node's active signed descriptor AND
+                    # on the pinned target descriptor. A one-sided upgrade
+                    # never publishes media.
+                    if MEDIA_ARTIFACT_CAPABILITY not in self._local_capabilities():
+                        raise ReplicationProtocolError(
+                            "this node's active descriptor does not advertise "
+                            "media-artifact-v1; upgrade the node descriptor "
+                            "before replicating media checkpoints"
+                        )
+                    if (
+                        MEDIA_ARTIFACT_CAPABILITY
+                        not in self._verified_peer_capabilities(peer)
+                    ):
+                        raise ReplicationProtocolError(
+                            "target peer does not advertise media-artifact-v1; "
+                            "upgrade its pinned descriptor before replicating "
+                            "media checkpoints"
+                        )
                 capture_binding = bundle.get("capture_ledger_binding")
                 if (
                     not isinstance(capture_binding, dict)
@@ -913,10 +1606,14 @@ class ReplicationManager:
                 if "runtime_state" in records
                 else None
             ),
+            expected_media_sha256=(
+                str(records["media"]["sha256"]) if "media" in records else None
+            ),
         )
         capture_binding = verified.get("capture_ledger_binding")
         if (
             verified.get("verified") is not True
+            or bool(verified.get("media_included")) != ("media" in records)
             or verified.get("cutover_ready") is not True
             or not secrets.compare_digest(
                 str(verified["bundle_receipt_digest"]),
@@ -952,6 +1649,14 @@ class ReplicationManager:
             or proof.get("bundle_receipt_name") != checkpoint["bundle_receipt_name"]
             or proof.get("database_sha256") != records["database"]["sha256"]
             or proof.get("capture_sha256") != records["capture"]["sha256"]
+            or bool(proof.get("media_included")) != ("media" in records)
+            or (
+                "media" in records
+                and (
+                    proof.get("media_sha256") != records["media"]["sha256"]
+                    or proof.get("media_recovery_complete") is not True
+                )
+            )
             or proof.get("database_logical_snapshot_sha256")
             != checkpoint["logical_snapshot_sha256"]
             or proof.get("store_identity") != checkpoint["source_store_identity"]
@@ -1004,6 +1709,8 @@ class ReplicationManager:
             "capture-root",
             "recovery-proof.receipt.json",
         }
+        if bool(proof.get("media_included")):
+            expected_top_level.add("media-cache")
         with self._private_directory_guard(
             restore_root,
             expected_names=expected_top_level,
@@ -1013,6 +1720,8 @@ class ReplicationManager:
             capture_root = restore_root / "capture-root"
             validate_private_directory(core_root)
             validate_private_directory(capture_root)
+            if bool(proof.get("media_included")):
+                validate_private_directory(restore_root / "media-cache")
             for artifact in (
                 restore_root / "memory.sqlite3",
                 restore_root / "memory.sqlite3.restore.receipt.json",
@@ -1075,6 +1784,23 @@ class ReplicationManager:
                 capture_root=capture_root,
                 manifest=dict(capture_snapshot["manifest"]),
             )
+            if bool(proof.get("media_included")):
+                media_verification = verified_bundle.get("media")
+                if not isinstance(media_verification, dict) or "media" not in records:
+                    raise ReplicationProtocolError(
+                        "checkpoint media verification is missing"
+                    )
+                media_snapshot = self.recovery._verify_media_archive(
+                    received_root / str(records["media"]["name"]),
+                    expected_sha256=str(records["media"]["sha256"]),
+                    expected_manifest_sha256=str(
+                        media_verification["manifest_sha256"]
+                    ),
+                )
+                self._verify_current_media_tree(
+                    media_root=restore_root / "media-cache",
+                    manifest=dict(media_snapshot["manifest"]),
+                )
             ledger_ids = set(ledger_bindings)
             receipt_ids: set[str] = set()
             processed_ids: set[str] = set()
@@ -1119,6 +1845,63 @@ class ReplicationManager:
         self.store._fsync_directory(restore_root)
         self.store._fsync_directory(restore_root.parent)
         return binding
+
+    def _verify_current_media_tree(
+        self,
+        *,
+        media_root: Path,
+        manifest: dict[str, Any],
+    ) -> None:
+        """Revalidate the complete restored media tree against its manifest.
+
+        Idempotent stage replay must never accept a media-cache directory on
+        the strength of its root alone: every restored object manifest,
+        thumbnail, and optional feature print is re-read through the same
+        digest-verifying reader the restore path uses, and symlinks, foreign
+        entries, mode drift, extra files, and missing or tampered artifacts
+        all fail closed.
+        """
+
+        objects = manifest.get("objects")
+        if not isinstance(objects, list):
+            raise ReplicationProtocolError("media manifest inventory is invalid")
+        with self._private_directory_guard(
+            media_root,
+            expected_names={"objects"},
+            maximum_entries=1,
+        ):
+            reader = MediaObjectReader(media_root)
+            try:
+                restored_ids = reader.object_ids()
+                expected_ids = sorted(
+                    str(record["media_id"]) for record in objects
+                )
+                if restored_ids != expected_ids:
+                    raise ReplicationProtocolError(
+                        "restored media objects do not match the checkpoint manifest"
+                    )
+                for record in objects:
+                    media_id = str(record["media_id"])
+                    _document, files = reader.read_object_artifacts(media_id)
+                    expected_files = {
+                        str(item["name"]): item for item in record["files"]
+                    }
+                    if set(files) != set(expected_files):
+                        raise ReplicationProtocolError(
+                            "restored media object inventory does not match the manifest"
+                        )
+                    for name, data in files.items():
+                        item = expected_files[name]
+                        if len(data) != int(item["size_bytes"]) or not secrets.compare_digest(
+                            hashlib.sha256(data).hexdigest(), str(item["sha256"])
+                        ):
+                            raise ReplicationProtocolError(
+                                "restored media artifact does not match its manifest digest"
+                            )
+            except (ImageCaptureError, ImageCaptureNotFound) as exc:
+                raise ReplicationProtocolError(
+                    "restored media tree failed validation"
+                ) from exc
 
     def _verify_current_capture_tree(
         self,
@@ -1266,6 +2049,9 @@ class ReplicationManager:
                 str(records["runtime_state"]["sha256"])
                 if "runtime_state" in records
                 else None
+            ),
+            expected_media_sha256=(
+                str(records["media"]["sha256"]) if "media" in records else None
             ),
             confirm=True,
         )
@@ -1511,6 +2297,31 @@ class ReplicationManager:
             if checkpoint["governance_mode"] != "authoritative-v6":
                 raise ReplicationProtocolError(
                     "replication staging requires authoritative-v6 evidence"
+                )
+            if any(
+                str(record["kind"]) == "media"
+                for record in checkpoint["artifacts"]
+            ) and (
+                MEDIA_ARTIFACT_CAPABILITY not in self._local_capabilities()
+                or MEDIA_ARTIFACT_CAPABILITY
+                not in self._verified_peer_capabilities(peer)
+            ):
+                # Bilateral activation on the receiver: a media checkpoint is
+                # rejected before any staging work unless this node's active
+                # descriptor AND the pinned SOURCE descriptor both advertise
+                # the capability, independent of what the sender enforced.
+                self.ledger.audit(
+                    action="stage-checkpoint",
+                    state="rejected",
+                    peer_id=str(peer["peer_id"]),
+                    lineage_id=lineage_id,
+                    checkpoint_digest=checkpoint_digest,
+                    detail_code="media-capability-not-activated",
+                )
+                raise ReplicationProtocolError(
+                    "media checkpoints require media-artifact-v1 on this "
+                    "node's active descriptor and on the pinned source peer "
+                    "descriptor"
                 )
             position = self.ledger.checkpoint_at(
                 lineage_id=lineage_id,
@@ -2055,10 +2866,21 @@ class ReplicationManager:
             "replication_promotion_ready": False,
             "node_id": self.node_id,
             "signing_key_id": str(self._descriptor["auth_key_id"]),
-            "descriptor_digest": str(self._descriptor["receipt_digest"]),
             "staging_policy": "verified-isolated-restore-only",
             "ack_policy": "receiver-signs-after-memory-recovery-ready-proof",
         }
+        try:
+            active = self._active_node_descriptor()
+            local_capabilities = [str(item) for item in active["capabilities"]]
+            base["descriptor_digest"] = str(active["receipt_digest"])
+            base["node_descriptor_state"] = "valid"
+        except (OSError, ValueError, RuntimeError, ReplicationProtocolError):
+            local_capabilities = []
+            base["descriptor_digest"] = str(self._descriptor["receipt_digest"])
+            base["node_descriptor_state"] = "invalid-descriptor-evidence"
+        base["capabilities"] = list(local_capabilities)
+        local_media = MEDIA_ARTIFACT_CAPABILITY in local_capabilities
+        base["media_artifact_capable"] = local_media
         try:
             with self.ledger.manager_lock():
                 snapshot = self.ledger.integrity_snapshot()
@@ -2072,12 +2894,92 @@ class ReplicationManager:
                     "state": "degraded",
                     "anchor_verified": False,
                     "semantic_paths_verified": False,
+                    "descriptor_evidence_problems": (
+                        []
+                        if str(base["node_descriptor_state"]) == "valid"
+                        else [
+                            "active node descriptor evidence is missing "
+                            "or tampered"
+                        ]
+                    ),
+                    "descriptor_evidence_problem_total": (
+                        0
+                        if str(base["node_descriptor_state"]) == "valid"
+                        else 1
+                    ),
+                    "descriptor_evidence_problems_truncated": False,
                 },
             }
         status.update(base)
+        # Descriptor evidence is integrity, not display: a missing or
+        # tampered active node descriptor, pinned peer descriptor document,
+        # or required old->new transition receipt degrades the global
+        # verdict while every per-peer surface stays visible with its exact
+        # evidence problem and media readiness.
+        evidence_problems: list[str] = []
+        if str(base["node_descriptor_state"]) != "valid":
+            evidence_problems.append(
+                "active node descriptor evidence is missing or tampered"
+            )
+        # Surface each pinned peer's capability activation: legacy peers with
+        # no descriptor evidence stay visibly baseline, and media readiness is
+        # bilateral (this node's active descriptor AND the pinned peer).
+        # Evidence integrity is computed over EVERY pinned peer in the
+        # authenticated snapshot; only the presentation page is capped.
+        predecessors = {
+            str(peer_id): str(previous)
+            for peer_id, previous in snapshot.get(
+                "descriptor_upgrade_predecessors", {}
+            ).items()
+        }
+        reports_by_id: dict[str, dict[str, Any]] = {}
+        for row in snapshot.get("peers", []):
+            report = self._peer_capability_report(
+                row,
+                recorded_previous=predecessors.get(str(row["peer_id"])),
+            )
+            reports_by_id[str(row["peer_id"])] = report
+            if report["evidence_problem"] is not None:
+                evidence_problems.append(
+                    f"peer {report['peer_id']}: {report['evidence_problem']}"
+                )
+        enriched_peers = []
+        for entry in status.get("peers", []):
+            merged = dict(entry)
+            report = reports_by_id.get(str(entry["peer_id"]))
+            if report is not None:
+                merged.update(
+                    {
+                        "descriptor_digest": report["descriptor_digest"],
+                        "capability_state": report["capability_state"],
+                        "capabilities": list(report["capabilities"]),
+                        "previous_descriptor_digest": report[
+                            "previous_descriptor_digest"
+                        ],
+                        "evidence_problem": report["evidence_problem"],
+                        "media_ready": (
+                            local_media
+                            and not report["revoked"]
+                            and MEDIA_ARTIFACT_CAPABILITY
+                            in report["capabilities"]
+                        ),
+                    }
+                )
+            enriched_peers.append(merged)
+        status["peers"] = enriched_peers
+        # The verdict is computed over every pinned peer, but the displayed
+        # problem list is bounded like the peer page: the exact total is
+        # always reported so truncation can never hide the degradation size.
         status["integrity"] = {
-            "state": "ready",
+            "state": "ready" if not evidence_problems else "degraded",
             "anchor_verified": True,
-            "semantic_paths_verified": True,
+            "semantic_paths_verified": not evidence_problems,
+            "descriptor_evidence_problems": list(
+                evidence_problems[:STATUS_PEER_PAGE_LIMIT]
+            ),
+            "descriptor_evidence_problem_total": len(evidence_problems),
+            "descriptor_evidence_problems_truncated": (
+                len(evidence_problems) > STATUS_PEER_PAGE_LIMIT
+            ),
         }
         return status

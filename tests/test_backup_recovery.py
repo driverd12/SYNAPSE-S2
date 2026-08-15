@@ -1,3 +1,6 @@
+import base64
+import binascii
+import gzip
 import hashlib
 import io
 import json
@@ -5,12 +8,15 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
+import struct
 import subprocess
 import sys
 import tarfile
 import threading
 import time
 import unittest
+import zlib
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,11 +30,13 @@ from capture_daemon import (
     write_capture_drop,
 )
 from core_authority import CoreAuthorityError, CoreAuthorityLease
+from core_client_binding import CoreClientBinding
 from core_request_journal import (
     JOURNAL_BINDING_SCHEMA,
     JOURNAL_SCHEMA_IDENTITY,
     CoreRequestJournal,
 )
+from image_capture import ConversionResult, ImageCaptureCache
 from memory_store import (
     BACKUP_RECEIPT_SCHEMA,
     BACKUP_RESTORE_RECEIPT_SCHEMA,
@@ -2166,6 +2174,10 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             capture_sha256 = bundle["capture_archive_sha256"]
             receipt = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
             runtime_sha256 = receipt["runtime_state_sha256"]
+            # The fixture snapshot has no image references, so its bundle is
+            # the media-absent form: no media pin exists to review.
+            self.assertIs(receipt["media_included"], False)
+            self.assertIsNone(receipt["media_sha256"])
 
             for supplied in (
                 {},
@@ -2202,9 +2214,19 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                     expected_capture_sha256=capture_sha256,
                     expected_runtime_state_sha256="f" * 64,
                 )
+            with self.assertRaisesRegex(ValueError, "does not contain"):
+                foreign_manager.verify_bundle(
+                    receipt_path,
+                    expected_database_sha256=database_sha256,
+                    expected_capture_sha256=capture_sha256,
+                    expected_runtime_state_sha256=runtime_sha256,
+                    expected_media_sha256="f" * 64,
+                )
             self.assertTrue(verified["verified"])
             self.assertFalse(verified["receipt_identity_trusted"])
             self.assertTrue(verified["reviewed_digests_verified"])
+            self.assertFalse(verified["media_included"])
+            self.assertTrue(verified["media_recovery_complete"])
             restored = foreign_manager.restore_bundle_isolated(
                 receipt_path,
                 foreign_root / "reviewed-restore",
@@ -2235,6 +2257,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                 DurableMemoryStore(foreign_root / "memory.sqlite3"),
                 capture_root=foreign_root / "capture-root",
             )
+            self.assertIs(receipt["media_included"], False)
             reviewed = {
                 "expected_database_sha256": str(receipt["database_sha256"]),
                 "expected_capture_sha256": str(receipt["capture_sha256"]),
@@ -2355,7 +2378,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                 receipt_path.write_bytes(original_receipt)
                 receipt_path.chmod(0o600)
 
-    def test_foreign_governed_bundle_requires_and_accepts_all_four_pins(self):
+    def test_foreign_governed_bundle_requires_and_accepts_all_reviewed_pins(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy_manager, _legacy_bundle, _capture_id = (
@@ -2387,6 +2410,7 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
                 DurableMemoryStore(foreign_root / "memory.sqlite3"),
                 capture_root=foreign_root / "capture-root",
             )
+            self.assertIs(receipt["media_included"], False)
             reviewed = {
                 "expected_database_sha256": str(receipt["database_sha256"]),
                 "expected_capture_sha256": str(receipt["capture_sha256"]),
@@ -3316,6 +3340,8 @@ class VerifiedBackupRecoveryTests(unittest.TestCase):
             retired_bundle = quarantine / candidate["bundle_id"]
 
             self.assertEqual(applied["retired_bundle_count"], 1)
+            # Zero-reference fixture bundles are media-absent: database,
+            # database receipt, capture archive, and bundle receipt.
             self.assertEqual(applied["retired_artifact_count"], 4)
             self.assertTrue(applied["recoverable"])
             self.assertTrue(applied["verified"])
@@ -4323,6 +4349,7 @@ manager.create_bundle(purpose="interrupted-publication")
                 if path.name.endswith(".sqlite3")
                 or path.name.endswith(".sqlite3.receipt.json")
                 or path.name.endswith(".sqlite3.capture.tar.gz")
+                or path.name.endswith(".sqlite3.media.tar.gz")
                 or path.name.endswith(".sqlite3.bundle.receipt.json")
             }
             self.assertEqual(recognized, claimed)
@@ -4663,6 +4690,815 @@ manager.create_bundle(purpose="interrupted-publication")
             self.assertFalse(holder_thread.is_alive())
             self.assertFalse(contender_thread.is_alive())
             self.assertEqual(failures, [])
+
+
+class MediaRecoveryBundleTests(unittest.TestCase):
+    """Recovery-bundle v3 media derivative binding, restore, and legacy reporting."""
+
+    @staticmethod
+    def _temporary_root() -> TemporaryDirectory:
+        parent = Path("/private/tmp")
+        return TemporaryDirectory(
+            prefix="s2-media-recovery-",
+            dir=str(parent) if parent.is_dir() else None,
+        )
+
+    @staticmethod
+    def _png_bytes(seed: int = 0) -> bytes:
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + kind
+                + data
+                + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+            )
+
+        width, height = 32, 16
+        rows = bytearray()
+        for y in range(height):
+            rows.append(0)
+            for x in range(width):
+                rows.extend(
+                    (
+                        (x * 7 + seed) % 256,
+                        (y * 13 + seed) % 256,
+                        ((x + y) * 11 + seed) % 256,
+                    )
+                )
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+            + chunk(b"IEND", b"")
+        )
+
+    @staticmethod
+    def _bmp_bytes() -> bytes:
+        width, height = 32, 16
+        row_stride = ((width * 24 + 31) // 32) * 4
+        pixel_bytes = bytearray()
+        for source_y in range(height - 1, -1, -1):
+            row = bytearray()
+            for x in range(width):
+                row.extend(
+                    ((x * 3) % 256, (source_y * 5) % 256, ((x + source_y) * 7) % 256)
+                )
+            row.extend(b"\x00" * (row_stride - len(row)))
+            pixel_bytes.extend(row)
+        pixel_offset = 14 + 40
+        return (
+            b"BM"
+            + struct.pack(
+                "<IHHI", pixel_offset + len(pixel_bytes), 0, 0, pixel_offset
+            )
+            + struct.pack(
+                "<IiiHHIIiiII",
+                40,
+                width,
+                height,
+                1,
+                24,
+                0,
+                len(pixel_bytes),
+                2835,
+                2835,
+                0,
+                0,
+            )
+            + bytes(pixel_bytes)
+        )
+
+    @classmethod
+    def _fake_converter(cls, source, work_root):
+        del source
+        bmp_path = work_root / "normalized.bmp"
+        thumbnail_path = work_root / "thumbnail.jpg"
+        bmp_path.write_bytes(cls._bmp_bytes())
+        thumbnail_path.write_bytes(b"\xff\xd8\xff\xe0media-recovery-thumb\xff\xd9")
+        bmp_path.chmod(0o600)
+        thumbnail_path.chmod(0o600)
+        return ConversionResult(
+            source_width=32,
+            source_height=16,
+            bmp_path=bmp_path,
+            thumbnail_path=thumbnail_path,
+        )
+
+    @staticmethod
+    def _vision_enricher(elements: tuple[float, ...]):
+        def enricher(_source, mode: str, derivative: str) -> dict:
+            feature_data = struct.pack(f"<{len(elements)}f", *elements)
+            return {
+                "schema": "synapse-s2.apple-vision-enrichment.v1",
+                "provider": "apple-vision",
+                "mode": mode,
+                "status": "ready",
+                "input_derivative": derivative,
+                "input_dimensions": {"width": 32, "height": 16},
+                "feature_print": {
+                    "status": "ready",
+                    "schema": "synapse-s2.apple-vision-feature-print.v1",
+                    "request_revision": 2,
+                    "element_type": "float32",
+                    "element_count": len(elements),
+                    "encoding": "base64-little-endian",
+                    "data": base64.b64encode(feature_data).decode("ascii"),
+                },
+            }
+
+        return enricher
+
+    @staticmethod
+    def _binding(repo_root: Path, data_root: Path) -> CoreClientBinding:
+        core_root = data_root / "core"
+        core_root.mkdir(mode=0o700, exist_ok=True)
+        return CoreClientBinding(
+            repo_root=repo_root,
+            data_root=data_root,
+            config_path=core_root / "service.json",
+            socket_path=core_root / "service.sock",
+            state_path=data_root / "runtime_state.json",
+            memory_path=data_root / "memory.sqlite3",
+            capture_root=data_root,
+            export_root=data_root / "exports",
+            backup_root=data_root / "backups",
+            recovery_root=data_root / "recovery",
+            replication_inbox_root=data_root / "replication" / "inbox",
+            core_label="media-recovery-test-core",
+            config_digest="a" * 64,
+            config_fingerprint="b" * 64,
+            embedding_space_identity="c" * 64,
+            layout="canonical",
+            authority_mode="authoritative-core-v6",
+        )
+
+    def _environment(
+        self,
+        tmp_root: Path,
+        *,
+        referenced_media: dict[str, tuple[float, ...] | None],
+        orphan_media: dict[str, tuple[float, ...] | None] | None = None,
+    ) -> tuple[DurableMemoryStore, VerifiedRecoveryManager, CoreClientBinding, Path]:
+        tmp_root.chmod(0o700)
+        repo_root = tmp_root / "repo"
+        root = repo_root / ".synapse_s2"
+        root.mkdir(parents=True, mode=0o700)
+        repo_root.chmod(0o700)
+        store = DurableMemoryStore(root / "memory.sqlite3")
+        store.upsert_entry(
+            tag="media-recovery-text-fixture",
+            context_id="media-recovery-tests",
+            source_text="A deterministic non-secret media recovery fixture.",
+            metadata={"classification": "synthetic"},
+            embedding_dimensions=8,
+            spike_indices=[1, 3],
+            neuron_indices=[2, 4],
+            registered_at=100.0,
+        )
+        binding = self._binding(repo_root, root)
+        for index, (media_id, elements) in enumerate(
+            sorted(referenced_media.items())
+        ):
+            store.upsert_entry(
+                tag=f"image-memory-{index}",
+                context_id="media-recovery-tests",
+                source_text=f"Image memory fixture {index}",
+                metadata={
+                    "context_memory_type": "image",
+                    "media_id": media_id,
+                    "display_label": f"fixture-{index}",
+                },
+                embedding_dimensions=8,
+                spike_indices=[5, 7],
+                neuron_indices=[6, 8],
+                registered_at=101.0 + index,
+            )
+            self._capture_media(binding, root, media_id, elements)
+        for media_id, elements in sorted((orphan_media or {}).items()):
+            self._capture_media(binding, root, media_id, elements)
+        manager = VerifiedRecoveryManager(store, capture_root=root)
+        manager.daemon.status()
+        return store, manager, binding, root
+
+    def _capture_media(
+        self,
+        binding: CoreClientBinding,
+        root: Path,
+        media_id: str,
+        elements: tuple[float, ...] | None,
+    ) -> None:
+        source = root / f"source-{media_id}.png"
+        source.write_bytes(self._png_bytes(seed=int(media_id[6:8], 16)))
+        source.chmod(0o600)
+        if elements is None:
+            ImageCaptureCache(
+                binding, converter=self._fake_converter
+            ).capture_image(source, media_id=media_id)
+        else:
+            ImageCaptureCache(
+                binding,
+                converter=self._fake_converter,
+                vision_enricher=self._vision_enricher(elements),
+            ).capture_image(
+                source,
+                media_id=media_id,
+                vision_mode="feature-print",
+                vision_required=True,
+            )
+        source.unlink()
+
+    def test_v3_bundle_binds_and_restores_referenced_media(self) -> None:
+        with self._temporary_root() as tmp:
+            plain_id = "s2img_" + "1" * 32
+            enriched_id = "s2img_" + "2" * 32
+            orphan_id = "s2img_" + "e" * 32
+            _store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={
+                    plain_id: None,
+                    enriched_id: (0.25, 0.5, 0.75, 1.0),
+                },
+                orphan_media={orphan_id: None},
+            )
+
+            bundle = manager.create_bundle(purpose="media-test", pinned=False)
+            self.assertTrue(bundle["bundle_verified"])
+            self.assertEqual(
+                bundle["bundle_schema"], "synapse-s2.recovery-bundle.v3"
+            )
+            self.assertEqual(bundle["media_object_count"], 2)
+            reconciliation = bundle["media_reconciliation"]
+            self.assertEqual(reconciliation["referenced_count"], 2)
+            self.assertEqual(reconciliation["missing_count"], 0)
+            self.assertEqual(reconciliation["orphan_count"], 1)
+            self.assertEqual(reconciliation["orphan_media_ids"], [orphan_id])
+
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertIs(receipt["media_included"], True)
+            self.assertEqual(receipt["media_object_count"], 2)
+            self.assertEqual(receipt["media_referenced_count"], 2)
+            self.assertEqual(receipt["media_orphan_count"], 1)
+
+            verified = manager.verify_bundle(receipt_path)
+            self.assertTrue(verified["media_included"])
+            self.assertTrue(verified["media_recovery_complete"])
+            self.assertTrue(verified["cutover_ready"])
+            self.assertEqual(verified["media"]["object_count"], 2)
+            self.assertEqual(verified["media_reference_count"], 2)
+
+            restored = manager.restore_bundle_isolated(
+                receipt_path,
+                root / "media-proof",
+                confirm=True,
+            )
+            self.assertTrue(restored["verified"])
+            self.assertTrue(restored["media_included"])
+            self.assertTrue(restored["media_recovery_complete"])
+            self.assertTrue(restored["cutover_ready"])
+            self.assertEqual(restored["media_object_count"], 2)
+            media_root = Path(str(restored["media_restore_path"]))
+            self.assertEqual(media_root, root / "media-proof" / "media-cache")
+            restored_ids = sorted(
+                path.name for path in (media_root / "objects").iterdir()
+            )
+            self.assertEqual(restored_ids, sorted([plain_id, enriched_id]))
+            self.assertEqual(
+                stat.S_IMODE(os.lstat(media_root).st_mode), 0o700
+            )
+            enriched_object = media_root / "objects" / enriched_id
+            self.assertTrue((enriched_object / "feature-print.bin").is_file())
+            self.assertEqual(
+                stat.S_IMODE(
+                    os.lstat(enriched_object / "feature-print.bin").st_mode
+                ),
+                0o600,
+            )
+            proof = json.loads(
+                Path(restored["recovery_proof_path"]).read_text(encoding="utf-8")
+            )
+            self.assertIs(proof["media_included"], True)
+            self.assertIs(proof["media_recovery_complete"], True)
+            self.assertEqual(proof["media_object_count"], 2)
+
+    def test_referenced_missing_or_corrupt_media_blocks_publication(self) -> None:
+        with self._temporary_root() as tmp:
+            present_id = "s2img_" + "3" * 32
+            missing_id = "s2img_" + "4" * 32
+            store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={present_id: None},
+            )
+            store.upsert_entry(
+                tag="image-memory-missing",
+                context_id="media-recovery-tests",
+                source_text="Image memory without a cached derivative",
+                metadata={
+                    "context_memory_type": "image",
+                    "media_id": missing_id,
+                },
+                embedding_dimensions=8,
+                spike_indices=[5],
+                neuron_indices=[6],
+                registered_at=105.0,
+            )
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                manager.create_bundle(purpose="media-test")
+
+            store.delete_entry(
+                context_id="media-recovery-tests",
+                tag="image-memory-missing",
+            )
+            thumbnail = (
+                root / "media-cache" / "objects" / present_id / "thumbnail.jpg"
+            )
+            original = thumbnail.read_bytes()
+            thumbnail.write_bytes(b"\xff\xd8\xff\xe0corrupted-bytes\xff\xd9")
+            thumbnail.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "failed verification"):
+                manager.create_bundle(purpose="media-test")
+            thumbnail.write_bytes(original)
+            thumbnail.chmod(0o600)
+            self.assertTrue(
+                manager.create_bundle(purpose="media-test")["bundle_verified"]
+            )
+
+    def test_media_archive_tamper_and_foreign_member_fail_closed(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "5" * 32
+            _store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: (1.0, 0.0, 0.0, 0.0)},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            media_path = Path(bundle["media_archive_path"])
+
+            original = media_path.read_bytes()
+            tampered = bytearray(original)
+            tampered[len(tampered) // 2] ^= 0x01
+            media_path.write_bytes(bytes(tampered))
+            media_path.chmod(0o600)
+            with self.assertRaises(RuntimeError):
+                manager.verify_bundle(receipt_path)
+            proof_root = root / "tampered-proof"
+            with self.assertRaises(RuntimeError):
+                manager.restore_bundle_isolated(
+                    receipt_path, proof_root, confirm=True
+                )
+            self.assertFalse(proof_root.exists())
+
+            with tarfile.open(media_path, mode="w:gz") as archive:
+                payload = b"escaped"
+                info = tarfile.TarInfo("../escape.bin")
+                info.size = len(payload)
+                info.mode = 0o600
+                info.mtime = 0
+                archive.addfile(info, io.BytesIO(payload))
+            media_path.chmod(0o600)
+            with self.assertRaises((RuntimeError, ValueError)):
+                manager.verify_bundle(receipt_path)
+            media_path.write_bytes(original)
+            media_path.chmod(0o600)
+            self.assertTrue(manager.verify_bundle(receipt_path)["verified"])
+
+    def test_prior_v2_receipt_reports_incomplete_media_but_stays_usable(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "6" * 32
+            _store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: None},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            media_archive = Path(bundle["media_archive_path"])
+
+            downgraded = {
+                key: value
+                for key, value in receipt.items()
+                if not key.startswith("media_")
+            }
+            downgraded["schema"] = "synapse-s2.recovery-bundle.v2"
+            manager.store._authenticate_receipt(downgraded)
+            receipt_path.write_text(
+                json.dumps(downgraded, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            receipt_path.chmod(0o600)
+            media_archive.unlink()
+
+            verified = manager.verify_bundle(receipt_path)
+            self.assertTrue(verified["verified"])
+            self.assertFalse(verified["media_included"])
+            self.assertFalse(verified["media_recovery_complete"])
+            # A legacy bundle whose database still references image memories
+            # stays inspectable but is never a cutover candidate.
+            self.assertFalse(verified["cutover_ready"])
+            self.assertEqual(
+                verified["media_recovery"], "legacy-media-not-present"
+            )
+            self.assertEqual(verified["media_reference_count"], 1)
+            self.assertIsNone(verified["media"])
+
+            with self.assertRaisesRegex(ValueError, "does not contain"):
+                manager.verify_bundle(
+                    receipt_path,
+                    expected_media_sha256="f" * 64,
+                )
+
+            restored = manager.restore_bundle_isolated(
+                receipt_path,
+                root / "legacy-proof",
+                confirm=True,
+            )
+            self.assertTrue(restored["verified"])
+            self.assertFalse(restored["media_included"])
+            self.assertFalse(restored["media_recovery_complete"])
+            self.assertFalse(restored["cutover_ready"])
+            self.assertIsNone(restored["media_restore_path"])
+            self.assertFalse((root / "legacy-proof" / "media-cache").exists())
+            proof = json.loads(
+                Path(restored["recovery_proof_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                proof["schema"], "synapse-s2.recovery-bundle-restore.v2"
+            )
+            self.assertIs(proof["media_included"], False)
+            self.assertIs(proof["media_recovery_complete"], False)
+            self.assertIs(proof["cutover_ready"], False)
+            self.assertEqual(
+                proof["media_recovery"], "legacy-media-not-present"
+            )
+
+    def test_zero_reference_snapshot_produces_verified_media_absent_bundle(
+        self,
+    ) -> None:
+        with self._temporary_root() as tmp:
+            _store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            self.assertTrue(bundle["bundle_verified"])
+            self.assertFalse(bundle["media_included"])
+            self.assertIsNone(bundle["media_archive_path"])
+            self.assertIsNone(bundle["media_archive_sha256"])
+            self.assertIsNone(bundle["media_manifest_sha256"])
+            self.assertEqual(bundle["media_object_count"], 0)
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertIs(receipt["media_included"], False)
+            self.assertIsNone(receipt["media_artifact_name"])
+            self.assertIsNone(receipt["media_sha256"])
+            self.assertEqual(receipt["media_object_count"], 0)
+            self.assertEqual(
+                [
+                    name
+                    for name in os.listdir(receipt_path.parent)
+                    if name.endswith(".media.tar.gz")
+                ],
+                [],
+            )
+            verified = manager.verify_bundle(receipt_path)
+            self.assertFalse(verified["media_included"])
+            self.assertTrue(verified["media_recovery_complete"])
+            self.assertEqual(verified["media_reference_count"], 0)
+            self.assertIsNone(verified["media"])
+            self.assertEqual(
+                verified["media_recovery"],
+                "media-not-required-zero-references",
+            )
+            restored = manager.restore_bundle_isolated(
+                receipt_path,
+                root / "empty-media-proof",
+                confirm=True,
+            )
+            self.assertTrue(restored["media_recovery_complete"])
+            self.assertEqual(restored["media_object_count"], 0)
+            self.assertFalse(
+                (root / "empty-media-proof" / "media-cache").exists()
+            )
+
+    def test_media_absent_receipt_with_references_fails_closed(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "b" * 32
+            _store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: None},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            # A re-signed current-schema receipt that claims media_included
+            # false while its database snapshot still references image
+            # memories must never verify or restore.
+            receipt["media_included"] = False
+            for field in (
+                "media_schema",
+                "media_artifact_name",
+                "media_sha256",
+                "media_size_bytes",
+                "media_manifest_sha256",
+            ):
+                receipt[field] = None
+            for field in (
+                "media_object_count",
+                "media_file_count",
+                "media_total_bytes",
+                "media_referenced_count",
+            ):
+                receipt[field] = 0
+            manager.store._authenticate_receipt(receipt)
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            receipt_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                RuntimeError, "references image memories"
+            ):
+                manager.verify_bundle(receipt_path)
+            proof_root = root / "dishonest-media-proof"
+            with self.assertRaisesRegex(
+                RuntimeError, "references image memories"
+            ):
+                manager.restore_bundle_isolated(
+                    receipt_path, proof_root, confirm=True
+                )
+            self.assertFalse(proof_root.exists())
+
+    def test_media_included_bundle_requires_the_reviewed_media_pin(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "c" * 32
+            _store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: None},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertIs(receipt["media_included"], True)
+            foreign_root = root / "foreign-media-review"
+            foreign_manager = VerifiedRecoveryManager(
+                DurableMemoryStore(foreign_root / "memory.sqlite3"),
+                capture_root=foreign_root / "capture-root",
+            )
+            reviewed = {
+                "expected_database_sha256": str(receipt["database_sha256"]),
+                "expected_capture_sha256": str(receipt["capture_sha256"]),
+            }
+            with self.assertRaises(ValueError):
+                foreign_manager.verify_bundle(receipt_path, **reviewed)
+            with self.assertRaisesRegex(ValueError, "media digest"):
+                foreign_manager.verify_bundle(
+                    receipt_path,
+                    expected_media_sha256="f" * 64,
+                    **reviewed,
+                )
+            verified = foreign_manager.verify_bundle(
+                receipt_path,
+                expected_media_sha256=str(receipt["media_sha256"]),
+                **reviewed,
+            )
+            self.assertTrue(verified["verified"])
+            self.assertTrue(verified["reviewed_digests_verified"])
+            self.assertTrue(verified["media_included"])
+
+    def _resign_media_receipt(
+        self,
+        manager: VerifiedRecoveryManager,
+        receipt_path: Path,
+        media_path: Path,
+        archive_bytes: bytes,
+        *,
+        manifest_sha256: str | None = None,
+    ) -> None:
+        media_path.write_bytes(archive_bytes)
+        media_path.chmod(0o600)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["media_sha256"] = hashlib.sha256(archive_bytes).hexdigest()
+        receipt["media_size_bytes"] = len(archive_bytes)
+        if manifest_sha256 is not None:
+            receipt["media_manifest_sha256"] = manifest_sha256
+        manager.store._authenticate_receipt(receipt)
+        receipt_path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        receipt_path.chmod(0o600)
+
+    def test_semantically_invalid_embedded_manifest_fails_verification(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "7" * 32
+            _store, manager, _binding, _root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: None},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            media_path = Path(bundle["media_archive_path"])
+
+            member_name = f"media/objects/{media_id}/manifest.json"
+            contents: dict[str, bytes] = {}
+            with tarfile.open(media_path, mode="r:gz") as archive:
+                for member in archive.getmembers():
+                    extracted = archive.extractfile(member)
+                    assert extracted is not None
+                    contents[member.name] = extracted.read()
+
+            corrupted = contents[member_name].replace(
+                b"synapse-s2.image-artifact.v1",
+                b"synapse-s2.image-artifact.v9",
+            )
+            self.assertNotEqual(corrupted, contents[member_name])
+            self.assertEqual(len(corrupted), len(contents[member_name]))
+            contents[member_name] = corrupted
+
+            archive_manifest = json.loads(
+                contents["media-manifest.json"].decode("utf-8")
+            )
+            for record in archive_manifest["objects"]:
+                if record["media_id"] != media_id:
+                    continue
+                for item in record["files"]:
+                    if item["name"] == "manifest.json":
+                        item["sha256"] = hashlib.sha256(corrupted).hexdigest()
+            manifest_seed = {
+                key: value
+                for key, value in archive_manifest.items()
+                if key != "manifest_sha256"
+            }
+            archive_manifest["manifest_sha256"] = hashlib.sha256(
+                _json_dumps(manifest_seed).encode("utf-8")
+            ).hexdigest()
+            # Plain serialization: _json_dumps would redact binding fields
+            # that must survive verbatim inside the stored manifest.
+            contents["media-manifest.json"] = json.dumps(
+                archive_manifest, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+
+            rebuilt = io.BytesIO()
+            with tarfile.open(fileobj=rebuilt, mode="w:gz") as archive:
+                for name, data in contents.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    info.mode = 0o600
+                    info.mtime = 0
+                    archive.addfile(info, io.BytesIO(data))
+            self._resign_media_receipt(
+                manager,
+                receipt_path,
+                media_path,
+                rebuilt.getvalue(),
+                manifest_sha256=str(archive_manifest["manifest_sha256"]),
+            )
+
+            with self.assertRaisesRegex(ValueError, "restore-parity"):
+                manager.verify_bundle(receipt_path)
+            proof_root = Path(tmp) / "parity-proof"
+            with self.assertRaisesRegex(ValueError, "restore-parity"):
+                manager.restore_bundle_isolated(
+                    receipt_path, proof_root, confirm=True
+                )
+            self.assertFalse(proof_root.exists())
+
+    def test_media_archive_trailing_and_smuggled_bytes_fail_verification(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "8" * 32
+            _store, manager, _binding, _root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: None},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            media_path = Path(bundle["media_archive_path"])
+            original = media_path.read_bytes()
+
+            # Reproduced attack: a small signed archive with 8 MiB appended
+            # after its gzip stream must never verify, even when re-signed.
+            self.assertLess(len(original), 64 * 1024)
+            self._resign_media_receipt(
+                manager,
+                receipt_path,
+                media_path,
+                original + b"\x00" * (8 * 1024 * 1024),
+            )
+            with self.assertRaisesRegex(ValueError, "trailing data"):
+                manager.verify_bundle(receipt_path)
+
+            # A concatenated second gzip member is trailing data as well.
+            self._resign_media_receipt(
+                manager,
+                receipt_path,
+                media_path,
+                original + gzip.compress(b"\x00" * 4096),
+            )
+            with self.assertRaisesRegex(ValueError, "trailing data"):
+                manager.verify_bundle(receipt_path)
+
+            # Bytes hidden inside the gzip stream after the canonical tar
+            # end-of-archive marker must exceed the declared-payload bound.
+            decompressed = gzip.decompress(original)
+            self._resign_media_receipt(
+                manager,
+                receipt_path,
+                media_path,
+                gzip.compress(decompressed + b"\x00" * (8 * 1024 * 1024)),
+            )
+            with self.assertRaisesRegex(ValueError, "declared payload"):
+                manager.verify_bundle(receipt_path)
+
+            self._resign_media_receipt(manager, receipt_path, media_path, original)
+            self.assertTrue(manager.verify_bundle(receipt_path)["verified"])
+
+    def test_media_archive_padding_regions_must_be_canonical_zero(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "a" * 32
+            _store, manager, _binding, _root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: None},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            media_path = Path(bundle["media_archive_path"])
+            original = media_path.read_bytes()
+            decompressed = gzip.decompress(original)
+            self.assertLess(len(original), 64 * 1024)
+
+            # Reproduced attack: a small (<64 KiB) payload hidden after the
+            # tar end-of-archive marker stays inside the historical slack
+            # allowance and must still fail the exact canonical extent.
+            self._resign_media_receipt(
+                manager,
+                receipt_path,
+                media_path,
+                gzip.compress(decompressed + b"\xaa" * (16 * 1024)),
+            )
+            with self.assertRaisesRegex(
+                ValueError, "after its tar end-of-archive marker"
+            ):
+                manager.verify_bundle(receipt_path)
+
+            # An all-zero extension parses identically but is still not the
+            # canonical padded extent.
+            self._resign_media_receipt(
+                manager,
+                receipt_path,
+                media_path,
+                gzip.compress(decompressed + b"\x00" * (16 * 1024)),
+            )
+            with self.assertRaisesRegex(ValueError, "not canonical"):
+                manager.verify_bundle(receipt_path)
+
+            # One nonzero byte inside a member's ignored 512-byte data
+            # padding must fail closed as well.
+            padding_offset = None
+            with tarfile.open(fileobj=io.BytesIO(decompressed)) as archive:
+                for member in archive.getmembers():
+                    if member.size % 512 != 0:
+                        padding_offset = member.offset_data + member.size
+                        break
+            self.assertIsNotNone(padding_offset)
+            assert padding_offset is not None
+            self.assertEqual(decompressed[padding_offset], 0)
+            mutated = bytearray(decompressed)
+            mutated[padding_offset] = 0xAA
+            self._resign_media_receipt(
+                manager,
+                receipt_path,
+                media_path,
+                gzip.compress(bytes(mutated)),
+            )
+            with self.assertRaisesRegex(
+                ValueError, "inside a member's padding"
+            ):
+                manager.verify_bundle(receipt_path)
+
+            self._resign_media_receipt(manager, receipt_path, media_path, original)
+            self.assertTrue(manager.verify_bundle(receipt_path)["verified"])
+
+    def test_oversized_media_envelope_fails_verification(self) -> None:
+        with self._temporary_root() as tmp:
+            media_id = "s2img_" + "9" * 32
+            _store, manager, _binding, _root = self._environment(
+                Path(tmp),
+                referenced_media={media_id: None},
+            )
+            bundle = manager.create_bundle(purpose="media-test")
+            receipt_path = Path(bundle["bundle_receipt_path"])
+
+            with mock.patch(
+                "recovery_manager.MAX_MEDIA_ARCHIVE_ENVELOPE_BYTES", 128
+            ):
+                with self.assertRaisesRegex(ValueError, "size ceiling"):
+                    manager.verify_bundle(receipt_path)
+            with mock.patch(
+                "recovery_manager.MAX_MEDIA_ARCHIVE_DECOMPRESSED_BYTES", 256
+            ):
+                with self.assertRaisesRegex(ValueError, "size ceiling"):
+                    manager.verify_bundle(receipt_path)
+            self.assertTrue(manager.verify_bundle(receipt_path)["verified"])
 
 
 if __name__ == "__main__":

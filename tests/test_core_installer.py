@@ -7,6 +7,7 @@ import os
 import plistlib
 import sqlite3
 import stat
+import struct
 import sys
 import tempfile
 import time
@@ -26,6 +27,7 @@ from scripts import core_cutover_preflight as preflight
 from memory_store import DurableMemoryStore
 from recovery_manager import VerifiedRecoveryManager
 from capture_daemon import CaptureInboxDaemon, write_capture_drop
+from core_client_binding import CoreClientBinding
 from core_authority import CoreAuthorityError, CoreAuthorityLease
 from core_protocol import canonical_json_bytes
 from core_request_journal import CoreRequestJournal
@@ -33,6 +35,7 @@ from core_service import (
     CUTOVER_PRECLAIM_MINIMUM_REMAINING_SECONDS,
     AuthoritativeCoreService,
 )
+from image_capture import ConversionResult, ImageCaptureCache
 from operator_readiness_contract import (
     OPERATOR_READINESS_REQUIRED_PROOF_IDS,
     quiescence_policy_contract,
@@ -4648,11 +4651,34 @@ class CoreCutoverPreflightTests(unittest.TestCase):
             encoding="utf-8",
         )
         proof_path.chmod(0o600)
+        parsed_media = verified.get("media")
         metrics = {
             "verified": True,
             "cutover_ready": True,
             "capture_ledger_binding": dict(verified["capture_ledger_binding"]),
             "reconciliation": dict(verified["reconciliation"]),
+            "recovery_bundle_schema": preflight._RESTORE_RECOVERY_SCHEMAS[
+                proof["schema"]
+            ],
+            "recovery_restore_schema": proof["schema"],
+            "media_included": verified["media_included"],
+            "media_recovery_complete": verified["media_recovery_complete"],
+            "media_sha256": (
+                parsed_media["sha256"]
+                if isinstance(parsed_media, dict)
+                else None
+            ),
+            "media_manifest_sha256": (
+                parsed_media["manifest_sha256"]
+                if isinstance(parsed_media, dict)
+                else None
+            ),
+            "media_object_count": (
+                parsed_media["object_count"]
+                if isinstance(parsed_media, dict)
+                else 0
+            ),
+            "media_reference_count": verified["media_reference_count"],
         }
         recovery_checks = [
             {
@@ -4745,6 +4771,16 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                 ),
                 "database_logical_snapshot_sha256": "e" * 64,
                 "capture_manifest_sha256": "f" * 64,
+                "recovery_bundle_schema": preflight.RECOVERY_BUNDLE_SCHEMA,
+                "recovery_restore_schema": (
+                    preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA
+                ),
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_sha256": None,
+                "media_manifest_sha256": None,
+                "media_object_count": 0,
+                "media_reference_count": 0,
                 "runtime_state_required": False,
                 "runtime_state_present": False,
                 "runtime_state_canonical_sha256": None,
@@ -4873,6 +4909,16 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                 ),
                 "database_logical_snapshot_sha256": "b" * 64,
                 "capture_manifest_sha256": "c" * 64,
+                "recovery_bundle_schema": preflight.RECOVERY_BUNDLE_SCHEMA,
+                "recovery_restore_schema": (
+                    preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA
+                ),
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_sha256": None,
+                "media_manifest_sha256": None,
+                "media_object_count": 0,
+                "media_reference_count": 0,
                 "runtime_state_required": False,
                 "runtime_state_present": False,
                 "runtime_state_canonical_sha256": None,
@@ -5516,6 +5562,10 @@ raise SystemExit(3)
                         "governance_mode": "pre-governed-v5",
                         "store_identity": "store-" + "a" * 24,
                         "store_generation": "legacy-v5",
+                        "media_included": False,
+                        "media_recovery_complete": True,
+                        "media_reference_count": 0,
+                        "media": None,
                         "capture_ledger_binding": {"verified": True},
                         "reconciliation": {
                             "missing_authoritative_ledger_count": 0,
@@ -5542,6 +5592,12 @@ raise SystemExit(3)
                         "verified": True,
                         "cutover_ready": True,
                         "missing_transport_ledger_count": 0,
+                        "media_included": False,
+                        "media_recovery_complete": True,
+                        "media_reference_count": 0,
+                        "media_sha256": None,
+                        "media_manifest_sha256": None,
+                        "media_object_count": None,
                         "capture_ledger_binding": {"verified": True},
                         "reconciliation": {
                             "missing_authoritative_ledger_count": 0,
@@ -5566,6 +5622,18 @@ raise SystemExit(3)
                     "identifierless_replay_file_count": 0,
                     "unclassified_file_count": 0,
                 },
+                "recovery_bundle_schema": (
+                    preflight.LEGACY_RECOVERY_BUNDLE_SCHEMA
+                ),
+                "recovery_restore_schema": (
+                    preflight.LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA
+                ),
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_sha256": None,
+                "media_manifest_sha256": None,
+                "media_object_count": 0,
+                "media_reference_count": 0,
             }
             recovery_checks = []
             for check_id in ("recovery_backup", "recovery_verify", "recovery_restore"):
@@ -5794,6 +5862,263 @@ raise SystemExit(3)
             self.assertTrue(result["database_digest_verified"])
             self.assertTrue(result["capture_digest_verified"])
             self.assertTrue(result["live_snapshot_matches"])
+
+    def test_recovery_binding_accepts_regenerated_zero_reference_v1_v2_v3(self) -> None:
+        schemas = (
+            (
+                preflight.LEGACY_RECOVERY_BUNDLE_SCHEMA,
+                preflight.LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+                "legacy",
+            ),
+            (
+                preflight.PRIOR_RECOVERY_BUNDLE_SCHEMA,
+                preflight.PRIOR_RECOVERY_BUNDLE_RESTORE_SCHEMA,
+                "prior",
+            ),
+            (
+                preflight.RECOVERY_BUNDLE_SCHEMA,
+                preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA,
+                "current",
+            ),
+        )
+        for bundle_schema, restore_schema, generation in schemas:
+            with self.subTest(bundle_schema=bundle_schema), tempfile.TemporaryDirectory(
+                prefix=f"synapse-preflight-{generation}-"
+            ) as temporary:
+                root = Path(temporary).resolve()
+                db = root / "memory.sqlite3"
+                store = DurableMemoryStore(db)
+                try:
+                    store.upsert_entry(
+                        tag="zero-media-cutover",
+                        context_id="installer-tests",
+                        source_text="Synthetic zero-reference compatibility proof.",
+                        metadata={"fixture": True},
+                        embedding_dimensions=8,
+                        spike_indices=[1],
+                        neuron_indices=[2],
+                        registered_at=100.0,
+                    )
+                    daemon = CaptureInboxDaemon(root=root)
+                    daemon._ensure_transport_dirs(daemon.paths())
+                    manager = VerifiedRecoveryManager(store, capture_root=root)
+                    bundle = manager.create_bundle(
+                        root / "cutover.sqlite3",
+                        purpose="zero-reference-schema-test",
+                        pinned=False,
+                    )
+                    receipt_path = Path(bundle["bundle_receipt_path"])
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    if bundle_schema == preflight.PRIOR_RECOVERY_BUNDLE_SCHEMA:
+                        receipt = {
+                            key: value
+                            for key, value in receipt.items()
+                            if key in manager._bundle_receipt_expected_keys()
+                        }
+                    elif bundle_schema == preflight.LEGACY_RECOVERY_BUNDLE_SCHEMA:
+                        receipt = {
+                            key: value
+                            for key, value in receipt.items()
+                            if key in manager._legacy_bundle_receipt_expected_keys()
+                        }
+                    receipt["schema"] = bundle_schema
+                    store._authenticate_receipt(receipt)
+                    receipt_path.write_text(
+                        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    receipt_path.chmod(0o600)
+                    verified = manager.verify_bundle(receipt_path)
+                    restored = manager.restore_bundle_isolated(
+                        receipt_path,
+                        root / "isolated-restore",
+                        confirm=True,
+                    )
+                finally:
+                    store.close()
+                proof_path = Path(restored["recovery_proof_path"])
+                proof = json.loads(proof_path.read_text(encoding="utf-8"))
+                self.assertEqual(proof["schema"], restore_schema)
+                self.assertTrue(verified["media_recovery_complete"])
+                self.assertEqual(verified["media_reference_count"], 0)
+                candidate_config = self._core_config(root, memory_path=db)
+                manifest, evidence_proof_path = self._write_cutover_evidence_pack(
+                    root=root,
+                    verified=verified,
+                    proof=proof,
+                    git_head="9" * 40,
+                    config=candidate_config,
+                )
+                validated = preflight.validate_evidence_contract(
+                    manifest,
+                    root=ROOT,
+                    maximum_age_seconds=7200.0,
+                    require_git_binding=False,
+                )
+                self.assertEqual(validated[2]["schema"], restore_schema)
+                result = preflight.verify_recovery_binding(
+                    parsed=verified,
+                    receipt_path=receipt_path,
+                    restore_proof=proof,
+                    restore_proof_path=evidence_proof_path,
+                    memory_db=db,
+                    capture_root=root,
+                )
+                self.assertEqual(result["recovery_bundle_schema"], bundle_schema)
+                self.assertEqual(result["recovery_restore_schema"], restore_schema)
+                self.assertTrue(result["media_recovery_complete"])
+                self.assertEqual(result["media_reference_count"], 0)
+
+    def test_recovery_binding_cross_binds_referenced_v3_media_and_live_cache(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="s2m-",
+            dir="/tmp",
+        ) as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            repo_root = root / "repo"
+            repo_root.mkdir(mode=0o700)
+            data_root = repo_root / ".synapse_s2"
+            data_root.mkdir(mode=0o700)
+            core_root = data_root / "core"
+            core_root.mkdir(mode=0o700)
+            db = data_root / "memory.sqlite3"
+            binding = CoreClientBinding(
+                repo_root=repo_root,
+                data_root=data_root,
+                config_path=core_root / "service.json",
+                socket_path=installer.canonical_core_socket_path(
+                    data_root,
+                    home=root,
+                ),
+                state_path=data_root / "runtime_state.json",
+                memory_path=db,
+                capture_root=data_root,
+                export_root=data_root / "exports",
+                backup_root=data_root / "backups",
+                recovery_root=data_root / "recovery",
+                replication_inbox_root=data_root / "replication" / "inbox",
+                core_label="media-cutover-test-core",
+                config_digest="a" * 64,
+                config_fingerprint="b" * 64,
+                embedding_space_identity="c" * 64,
+                layout="canonical",
+                authority_mode="authoritative-core-v6",
+            )
+
+            def converter(_source, work_root):
+                width = height = 2
+                row_stride = 8
+                pixels = (
+                    b"\x00\x00\xff\x00\xff\x00\x00\x00"
+                    b"\xff\x00\x00\xff\xff\xff\x00\x00"
+                )
+                pixel_offset = 54
+                bmp = (
+                    b"BM"
+                    + struct.pack(
+                        "<IHHI", pixel_offset + len(pixels), 0, 0, pixel_offset
+                    )
+                    + struct.pack(
+                        "<IiiHHIIiiII",
+                        40,
+                        width,
+                        height,
+                        1,
+                        24,
+                        0,
+                        len(pixels),
+                        2835,
+                        2835,
+                        0,
+                        0,
+                    )
+                    + pixels
+                )
+                bmp_path = work_root / "normalized.bmp"
+                thumbnail_path = work_root / "thumbnail.jpg"
+                bmp_path.write_bytes(bmp)
+                thumbnail_path.write_bytes(
+                    b"\xff\xd8\xff\xe0media-cutover-thumbnail\xff\xd9"
+                )
+                bmp_path.chmod(0o600)
+                thumbnail_path.chmod(0o600)
+                return ConversionResult(
+                    source_width=width,
+                    source_height=height,
+                    bmp_path=bmp_path,
+                    thumbnail_path=thumbnail_path,
+                )
+
+            media_id = "s2img_" + "7" * 32
+            source = data_root / "source.png"
+            source.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic-media-cutover")
+            source.chmod(0o600)
+            cache = ImageCaptureCache(binding, converter=converter)
+            cache.capture_image(source, media_id=media_id)
+            source.unlink()
+            store = DurableMemoryStore(db)
+            try:
+                store.upsert_entry(
+                    tag="referenced-media-cutover",
+                    context_id="installer-tests",
+                    source_text="Synthetic referenced-media compatibility proof.",
+                    metadata={
+                        "fixture": True,
+                        "context_memory_type": "image",
+                        "media_id": media_id,
+                    },
+                    embedding_dimensions=8,
+                    spike_indices=[1],
+                    neuron_indices=[2],
+                    registered_at=100.0,
+                )
+                daemon = CaptureInboxDaemon(root=data_root)
+                daemon._ensure_transport_dirs(daemon.paths())
+                manager = VerifiedRecoveryManager(store, capture_root=data_root)
+                bundle = manager.create_bundle(
+                    data_root / "cutover.sqlite3",
+                    purpose="referenced-media-schema-test",
+                    pinned=False,
+                )
+                verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+                restored = manager.restore_bundle_isolated(
+                    bundle["bundle_receipt_path"],
+                    data_root / "isolated-restore",
+                    confirm=True,
+                )
+            finally:
+                store.close()
+            proof_path = Path(restored["recovery_proof_path"])
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+            arguments = {
+                "parsed": verified,
+                "receipt_path": Path(bundle["bundle_receipt_path"]),
+                "restore_proof": proof,
+                "restore_proof_path": proof_path,
+                "memory_db": db,
+                "capture_root": data_root,
+            }
+            result = preflight.verify_recovery_binding(**arguments)
+            self.assertTrue(result["media_included"])
+            self.assertTrue(result["media_recovery_complete"])
+            self.assertEqual(result["media_object_count"], 1)
+            self.assertEqual(result["media_reference_count"], 1)
+            self.assertRegex(result["media_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(
+                result["media_manifest_sha256"], r"^[0-9a-f]{64}$"
+            )
+
+            thumbnail = (
+                data_root
+                / "media-cache"
+                / "objects"
+                / media_id
+                / "thumbnail.jpg"
+            )
+            thumbnail.write_bytes(thumbnail.read_bytes() + b"tamper")
+            with self.assertRaises(preflight.CutoverPreflightError):
+                preflight.verify_recovery_binding(**arguments)
 
     def test_v6_recovery_binding_attests_runtime_and_request_journal_exactly(self) -> None:
         with tempfile.TemporaryDirectory(

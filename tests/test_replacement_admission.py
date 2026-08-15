@@ -156,6 +156,16 @@ class ReplacementAdmissionTests(unittest.TestCase):
             "database_logical_snapshot_schema": LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
             "database_logical_snapshot_sha256": "8" * 64,
             "capture_manifest_sha256": "b" * 64,
+            "recovery_bundle_schema": preflight.RECOVERY_BUNDLE_SCHEMA,
+            "recovery_restore_schema": (
+                preflight.RECOVERY_BUNDLE_RESTORE_SCHEMA
+            ),
+            "media_included": False,
+            "media_recovery_complete": True,
+            "media_sha256": None,
+            "media_manifest_sha256": None,
+            "media_object_count": 0,
+            "media_reference_count": 0,
             "recovery_pending_file_count": 0,
             "recovery_replay_required_file_count": 0,
             "recovery_replay_required_capture_count": 0,

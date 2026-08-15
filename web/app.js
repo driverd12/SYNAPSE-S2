@@ -500,6 +500,9 @@ const state = {
     prepared: null,
     objectUrl: "",
     galleryObjectUrls: [],
+    similarObjectUrls: [],
+    similarOpen: false,
+    similarReturnFocus: null,
   },
   impact: {
     open: false,
@@ -643,6 +646,12 @@ const elements = collectElements([
   "imageVisionOcrConsent",
   "imageVisionOcrConsentRow",
   "imageGallery",
+  "imageSimilarClose",
+  "imageSimilarPanel",
+  "imageSimilarResults",
+  "imageSimilarState",
+  "imageSimilarTitle",
+  "imageSimilarWarnings",
   "impactCaveat",
   "impactCloseButton",
   "impactDrawer",
@@ -4887,7 +4896,18 @@ function renderImageGallery(payload = {}) {
     const detail = document.createElement("small");
     detail.textContent = `${formatNumber(item.thumbnail_width || 0)}×${formatNumber(item.thumbnail_height || 0)} · ${formatTimestamp(item.created_at)}`;
     text.append(label, detail);
-    card.append(image, text);
+    const similarButton = document.createElement("button");
+    similarButton.type = "button";
+    similarButton.className = "image-gallery-similar-button";
+    similarButton.textContent = "Find similar";
+    similarButton.setAttribute(
+      "aria-label",
+      `Find images similar to ${String(item.display_label || "this image memory")}`,
+    );
+    similarButton.addEventListener("click", () => {
+      void openImageSimilar(mediaId, String(item.display_label || "Image memory"), similarButton);
+    });
+    card.append(image, text, similarButton);
     elements.imageGallery.append(card);
     void loadImageGalleryThumbnail(image, mediaId);
   });
@@ -4902,6 +4922,129 @@ async function refreshImageGallery() {
   });
   renderImageGallery(payload);
   return payload;
+}
+
+function clearImageSimilarObjectUrls() {
+  state.imageCapture.similarObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+  state.imageCapture.similarObjectUrls = [];
+}
+
+function setImageSimilarState(headline, detail, mode = "") {
+  elements.imageSimilarState.className = `image-capture-state ${mode}`.trim();
+  elements.imageSimilarState.innerHTML = `
+    <strong>${escapeHtml(headline)}</strong>
+    <small>${escapeHtml(detail)}</small>
+  `;
+}
+
+async function loadImageSimilarThumbnail(image, mediaId) {
+  try {
+    const blob = await requestBlob("/api/media-thumbnail", { params: { media_id: mediaId } });
+    const url = URL.createObjectURL(blob);
+    state.imageCapture.similarObjectUrls.push(url);
+    image.src = url;
+  } catch (_error) {
+    image.alt = "Cached thumbnail unavailable";
+  }
+}
+
+function renderImageSimilarWarnings(payload) {
+  const warnings = [];
+  const confidence = payload.confidence || {};
+  if (!confidence.calibrated) {
+    warnings.push(String(confidence.warning || "Distances are uncalibrated; they are not truth probabilities."));
+  }
+  const candidate = payload.candidate || {};
+  if (payload.result_truncated || candidate.truncated) {
+    warnings.push("Ranking is truncated by the result or candidate bound; more compatible images may exist.");
+  }
+  if (Number(candidate.incompatible_count || 0) > 0 || Number(candidate.missing_feature_count || 0) > 0) {
+    warnings.push(
+      `${formatNumber(candidate.incompatible_count || 0)} incompatible and ${formatNumber(candidate.missing_feature_count || 0)} feature-less cached images were excluded, never coerced.`,
+    );
+  }
+  elements.imageSimilarWarnings.replaceChildren();
+  warnings.forEach((message) => {
+    const row = document.createElement("p");
+    row.className = "image-similar-warning";
+    row.setAttribute("role", "note");
+    row.textContent = message;
+    elements.imageSimilarWarnings.append(row);
+  });
+}
+
+function renderImageSimilarResults(payload) {
+  clearImageSimilarObjectUrls();
+  elements.imageSimilarResults.replaceChildren();
+  renderImageSimilarWarnings(payload);
+  const results = Array.isArray(payload.results) ? payload.results : [];
+  if (!results.length) {
+    setImageSimilarState(
+      "No similar images",
+      "No compatible cached image in this namespace matches the query lane.",
+      "",
+    );
+    return;
+  }
+  setImageSimilarState(
+    "Ranked by feature-print distance",
+    `${formatNumber(results.length)} of ${formatNumber((payload.candidate || {}).compatible_count || results.length)} compatible cached images; lower distance is more similar.`,
+    "ready",
+  );
+  results.forEach((item) => {
+    const mediaId = String(item.media_id || "");
+    if (!/^s2img_[0-9a-f]{32}$/.test(mediaId)) return;
+    const card = document.createElement("article");
+    card.className = "image-similar-card";
+    const image = document.createElement("img");
+    image.alt = `Similar image rank ${formatNumber(item.rank || 0)} cached thumbnail`;
+    image.loading = "lazy";
+    const text = document.createElement("span");
+    const label = document.createElement("strong");
+    label.textContent = `#${formatNumber(item.rank || 0)} · distance ${Number(item.distance || 0).toFixed(4)}`;
+    const detail = document.createElement("small");
+    detail.textContent = `uncalibrated score ${Number(item.score || 0).toFixed(4)} · ${String(item.mime_type || "image")}`;
+    text.append(label, detail);
+    card.append(image, text);
+    elements.imageSimilarResults.append(card);
+    void loadImageSimilarThumbnail(image, mediaId);
+  });
+}
+
+async function openImageSimilar(mediaId, displayLabel, returnFocus) {
+  state.imageCapture.similarOpen = true;
+  state.imageCapture.similarReturnFocus = returnFocus || null;
+  elements.imageSimilarPanel.hidden = false;
+  elements.imageSimilarTitle.textContent = `Similar to “${displayLabel}”`;
+  elements.imageSimilarWarnings.replaceChildren();
+  clearImageSimilarObjectUrls();
+  elements.imageSimilarResults.replaceChildren();
+  setImageSimilarState("Searching", "Comparing cached feature prints on this Mac only.", "");
+  elements.imageSimilarClose.focus({ preventScroll: true });
+  try {
+    const payload = await requestJson("/api/media-similar", {
+      params: { media_id: mediaId, context_id: state.context, limit: 8 },
+    });
+    if (!state.imageCapture.similarOpen) return;
+    renderImageSimilarResults(payload);
+  } catch (error) {
+    if (!state.imageCapture.similarOpen) return;
+    setImageSimilarState("Similarity search failed", error.message, "error");
+  }
+}
+
+function closeImageSimilar() {
+  if (!state.imageCapture.similarOpen && elements.imageSimilarPanel.hidden) return;
+  state.imageCapture.similarOpen = false;
+  clearImageSimilarObjectUrls();
+  elements.imageSimilarPanel.hidden = true;
+  elements.imageSimilarResults.replaceChildren();
+  elements.imageSimilarWarnings.replaceChildren();
+  const returnFocus = state.imageCapture.similarReturnFocus;
+  state.imageCapture.similarReturnFocus = null;
+  if (returnFocus && typeof returnFocus.focus === "function" && returnFocus.isConnected) {
+    returnFocus.focus({ preventScroll: true });
+  }
 }
 
 function setAppConnectState(headline, detail, mode = "") {
@@ -7942,6 +8085,13 @@ document.addEventListener("keydown", (event) => {
     setImpactDrawerOpen(false);
     elements.impactToggleButton.focus({ preventScroll: true });
   }
+  if (event.key === "Escape" && state.imageCapture.similarOpen) {
+    closeImageSimilar();
+  }
+});
+
+elements.imageSimilarClose.addEventListener("click", () => {
+  closeImageSimilar();
 });
 
 document.addEventListener("pointerdown", (event) => {

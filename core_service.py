@@ -159,6 +159,7 @@ REPLICATION_MAINTENANCE_LANE_SECONDS = RECOVERY_MAINTENANCE_LANE_SECONDS
 BACKEND_LANE_CLOSE_GRACE_SECONDS = 2.0
 CORE_STORE_SCHEMA_IDENTITY = "sqlite-53324442-v6"
 BUILD_SOURCE_MANIFEST = (
+    "apple_vision_enrichment.py",
     "backend_router.py",
     "bridge_governance.py",
     "capture_daemon.py",
@@ -173,8 +174,11 @@ BUILD_SOURCE_MANIFEST = (
     "embedding_providers.py",
     "event_segmenter.py",
     "harmonic_memory.py",
+    "image_capture.py",
+    "media_similarity.py",
     "memory_store.py",
     "mlx_backend.py",
+    "native/apple_vision_enrich.swift",
     "recovery_manager.py",
     "redaction.py",
     "replication_manager.py",
@@ -457,6 +461,11 @@ _CONTRACT_LIST = (
         retry_safe=True,
     ),
     _contract(
+        "list_media_references",
+        "context_id recall_scope limit",
+        retry_safe=True,
+    ),
+    _contract(
         "publish_context_event",
         "context_id source_surface event_type summary payload agent_targets",
         "source_surface event_type summary",
@@ -723,7 +732,8 @@ _CONTRACT_LIST = (
     _contract(
         "verify_recovery_bundle",
         "receipt_path expected_database_sha256 expected_capture_sha256 "
-        "expected_request_journal_sha256 expected_runtime_state_sha256",
+        "expected_request_journal_sha256 expected_runtime_state_sha256 "
+        "expected_media_sha256",
         "receipt_path",
         mutation=True,
     ),
@@ -731,7 +741,7 @@ _CONTRACT_LIST = (
         "restore_recovery_bundle_isolated",
         "receipt_path output_root expected_database_sha256 "
         "expected_capture_sha256 expected_request_journal_sha256 "
-        "expected_runtime_state_sha256 confirm",
+        "expected_runtime_state_sha256 expected_media_sha256 confirm",
         "receipt_path output_root",
         mutation=True,
     ),
@@ -759,6 +769,18 @@ _CONTRACT_LIST = (
         "replication_revoke_peer",
         "peer_id reason confirm",
         "peer_id reason confirm",
+        mutation=True,
+    ),
+    _contract(
+        "replication_upgrade_node_descriptor",
+        "expected_current_digest confirm",
+        "expected_current_digest confirm",
+        mutation=True,
+    ),
+    _contract(
+        "replication_upgrade_peer_descriptor",
+        "descriptor_path expected_descriptor_digest expected_previous_descriptor_digest confirm",
+        "descriptor_path expected_descriptor_digest expected_previous_descriptor_digest confirm",
         mutation=True,
     ),
     _contract(
@@ -796,6 +818,8 @@ REPLICATION_OPERATIONS = frozenset(
         "replication_status",
         "replication_pair_peer",
         "replication_revoke_peer",
+        "replication_upgrade_node_descriptor",
+        "replication_upgrade_peer_descriptor",
         "replication_create_checkpoint",
         "replication_stage_checkpoint",
         "replication_record_acknowledgement",
@@ -1392,6 +1416,7 @@ MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingPr
             expected_capture_sha256=_OPTIONAL_DIGEST,
             expected_request_journal_sha256=_OPTIONAL_DIGEST,
             expected_runtime_state_sha256=_OPTIONAL_DIGEST,
+            expected_media_sha256=_OPTIONAL_DIGEST,
         ),
         "restore_recovery_bundle_isolated": _schema(
             receipt_path=_PATH,
@@ -1400,6 +1425,7 @@ MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingPr
             expected_capture_sha256=_OPTIONAL_DIGEST,
             expected_request_journal_sha256=_OPTIONAL_DIGEST,
             expected_runtime_state_sha256=_OPTIONAL_DIGEST,
+            expected_media_sha256=_OPTIONAL_DIGEST,
             confirm=_TRUE,
         ),
         "plan_recovery_retention": _schema(
@@ -1424,6 +1450,16 @@ MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingPr
         "replication_revoke_peer": _schema(
             peer_id=_REPLICATION_NODE_ID,
             reason=_NONEMPTY_SHORT_STRING,
+            confirm=_TRUE,
+        ),
+        "replication_upgrade_node_descriptor": _schema(
+            expected_current_digest=_DIGEST,
+            confirm=_TRUE,
+        ),
+        "replication_upgrade_peer_descriptor": _schema(
+            descriptor_path=_PATH,
+            expected_descriptor_digest=_DIGEST,
+            expected_previous_descriptor_digest=_DIGEST,
             confirm=_TRUE,
         ),
         "replication_create_checkpoint": _schema(peer_id=_REPLICATION_NODE_ID),
@@ -1672,6 +1708,8 @@ def _validate_mutation_arguments(
         "restore_retired_recovery",
         "replication_pair_peer",
         "replication_revoke_peer",
+        "replication_upgrade_node_descriptor",
+        "replication_upgrade_peer_descriptor",
     } and arguments.get("confirm") is not True:
         raise CoreProtocolError()
     if operation in {"repair_semantic_indexes", "repair_capture_ledger"}:
@@ -2566,10 +2604,33 @@ def _bind_replication_handlers(manager: Any) -> dict[str, Callable[..., Any]]:
             confirm=confirm,
         )
 
+    def upgrade_peer_descriptor(
+        *,
+        descriptor_path: str,
+        expected_descriptor_digest: str,
+        expected_previous_descriptor_digest: str,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        return manager.upgrade_peer_descriptor(
+            descriptor_path,
+            expected_descriptor_digest=expected_descriptor_digest,
+            expected_previous_descriptor_digest=expected_previous_descriptor_digest,
+            confirm=confirm,
+        )
+
     return {
         "replication_identity": manager.node_descriptor,
         "replication_status": manager.status,
         "replication_pair_peer": pair_peer,
+        "replication_upgrade_node_descriptor": (
+            lambda *, expected_current_digest, confirm: (
+                manager.upgrade_node_descriptor(
+                    expected_current_digest=expected_current_digest,
+                    confirm=confirm,
+                )
+            )
+        ),
+        "replication_upgrade_peer_descriptor": upgrade_peer_descriptor,
         "replication_revoke_peer": (
             lambda *, peer_id, reason, confirm: manager.revoke_peer(
                 peer_id,
@@ -4357,7 +4418,10 @@ class AuthoritativeCoreService:
                 )
                 authorized["directory"] = str(backup_root.path)
                 tokens.append(backup_root)
-            elif operation == "replication_pair_peer":
+            elif operation in {
+                "replication_pair_peer",
+                "replication_upgrade_peer_descriptor",
+            }:
                 descriptor_token = existing("descriptor_path", "replication")
                 if descriptor_token is None:
                     raise CoreProtocolError("invalid_request")

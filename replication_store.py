@@ -1254,6 +1254,122 @@ class ReplicationLedger:
                 )
             return record
 
+    def update_peer_descriptor(
+        self,
+        peer_id: str,
+        *,
+        previous_descriptor_digest: str,
+        descriptor_digest: str,
+        signing_key_id: str,
+        signing_public_key: str,
+        now: float,
+        audit: bool = False,
+    ) -> dict[str, Any]:
+        """Compare-and-swap a peer's pinned descriptor digest, audited.
+
+        A capability upgrade re-pins a newer descriptor signed by the exact
+        same peer key. Identity, lineage, direction, and signing key remain
+        immutable; only the reviewed descriptor digest advances, and only
+        when the caller names the currently pinned digest.
+        """
+
+        if NODE_ID_RE.fullmatch(peer_id) is None:
+            raise ReplicationProtocolError("peer identity is invalid")
+        if (
+            DIGEST_RE.fullmatch(previous_descriptor_digest) is None
+            or DIGEST_RE.fullmatch(descriptor_digest) is None
+            or DIGEST_RE.fullmatch(signing_key_id) is None
+        ):
+            raise ReplicationProtocolError("peer descriptor digest is invalid")
+        if previous_descriptor_digest == descriptor_digest:
+            raise ReplicationProtocolError(
+                "peer descriptor upgrade requires a new descriptor digest"
+            )
+        with self._transaction() as conn:
+            existing = self._row(
+                conn.execute(
+                    "SELECT * FROM peers WHERE peer_id = ?", (peer_id,)
+                ).fetchone()
+            )
+            if existing is None:
+                raise ReplicationProtocolError("replication peer is unknown")
+            if bool(existing["revoked"]):
+                raise ReplicationProtocolError("replication peer is revoked")
+            if (
+                existing["descriptor_digest"] != previous_descriptor_digest
+                or existing["signing_key_id"] != signing_key_id
+                or existing["signing_public_key"] != signing_public_key
+            ):
+                raise ReplicationProtocolError(
+                    "peer descriptor upgrade does not match the pinned record"
+                )
+            updated = conn.execute(
+                """
+                UPDATE peers SET descriptor_digest = ?, updated_at = ?
+                WHERE peer_id = ? AND descriptor_digest = ? AND revoked = 0
+                """,
+                (descriptor_digest, float(now), peer_id, previous_descriptor_digest),
+            )
+            if updated.rowcount != 1:
+                raise ReplicationProtocolError(
+                    "peer descriptor upgrade lost its compare-and-swap race"
+                )
+            record = dict(
+                conn.execute(
+                    "SELECT * FROM peers WHERE peer_id = ?", (peer_id,)
+                ).fetchone()
+            )
+            if audit:
+                # Action-specific meaning: for upgrade-peer-descriptor audit
+                # rows the checkpoint_digest column records the reviewed
+                # PREVIOUS descriptor digest the compare-and-swap replaced.
+                # The row is written in the same transaction as the CAS and
+                # is covered by the anchored snapshot digest, so it is the
+                # authenticated predecessor record replays and integrity
+                # checks must bind to.
+                self._insert_audit_conn(
+                    conn,
+                    action="upgrade-peer-descriptor",
+                    state="accepted",
+                    peer_id=peer_id,
+                    lineage_id=str(existing["lineage_id"]),
+                    checkpoint_digest=previous_descriptor_digest,
+                    detail_code="capability-descriptor-upgraded",
+                    now=now,
+                )
+            return record
+
+    def peer_descriptor_predecessor(self, peer_id: str) -> str | None:
+        """Return the anchored predecessor digest of a peer's descriptor CAS.
+
+        The predecessor is recorded in the upgrade-peer-descriptor audit row
+        written in the same transaction as the compare-and-swap (see
+        update_peer_descriptor); None means the pinned descriptor was never
+        upgraded. The protocol upgrades a pin baseline->full at most once, so
+        the latest accepted row maps unambiguously to the current pin.
+        """
+
+        if NODE_ID_RE.fullmatch(peer_id) is None:
+            raise ReplicationProtocolError("peer identity is invalid")
+        with self._read_transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT checkpoint_digest FROM audit_events
+                WHERE action = 'upgrade-peer-descriptor'
+                    AND state = 'accepted' AND peer_id = ?
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                (peer_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        previous = str(row[0] or "")
+        if DIGEST_RE.fullmatch(previous) is None:
+            raise ReplicationProtocolError(
+                "peer descriptor upgrade audit predecessor is invalid"
+            )
+        return previous
+
     def revoke_peer(
         self,
         peer_id: str,
@@ -2016,6 +2132,25 @@ class ReplicationLedger:
                     "SELECT * FROM acknowledgements ORDER BY ack_digest"
                 )
             ]
+            # For upgrade-peer-descriptor audit rows the checkpoint_digest
+            # column carries the reviewed PREVIOUS descriptor digest the CAS
+            # replaced (see update_peer_descriptor). One pin upgrades
+            # baseline->full at most once, so the latest accepted row maps
+            # unambiguously to the current pin.
+            descriptor_upgrade_predecessors: dict[str, str] = {}
+            for peer_id, previous in conn.execute(
+                """
+                SELECT peer_id, checkpoint_digest FROM audit_events
+                WHERE action = 'upgrade-peer-descriptor'
+                    AND state = 'accepted' AND peer_id IS NOT NULL
+                ORDER BY event_id
+                """
+            ):
+                if DIGEST_RE.fullmatch(str(previous or "")) is None:
+                    raise ReplicationProtocolError(
+                        "peer descriptor upgrade audit predecessor is invalid"
+                    )
+                descriptor_upgrade_predecessors[str(peer_id)] = str(previous)
             checkpoints_by_digest = {
                 str(record["checkpoint_digest"]): record
                 for record in checkpoint_rows
@@ -2133,6 +2268,7 @@ class ReplicationLedger:
             "peers": peer_rows,
             "checkpoints": checkpoint_rows,
             "acknowledgements": acknowledgement_rows,
+            "descriptor_upgrade_predecessors": descriptor_upgrade_predecessors,
         }
 
     def status(self) -> dict[str, Any]:

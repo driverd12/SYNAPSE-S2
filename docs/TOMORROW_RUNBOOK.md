@@ -358,9 +358,11 @@ Image-cache post-upgrade check:
 Require `healthy: true` and `corrupt_count: 0`. This is an integrity-only check
 unless an authoritative reference set is supplied internally; it does not prove
 that every typed image memory has a local thumbnail. The thumbnail cache is
-node-local and is not yet part of paired recovery or replication. Pruning an
-image memory does not automatically remove its external thumbnail in this
-release, so do not promise complete derivative deletion until the governed
+node-local and non-authoritative, but recovery bundle v3 and
+capability-negotiated offline replication now carry and revalidate the exact
+derivatives referenced by their immutable database snapshot. Pruning an image
+memory does not automatically remove its external thumbnail in this release,
+so do not promise complete derivative deletion until the governed
 memory-and-media prune lane is implemented.
 
 Agent context hydration:
@@ -576,8 +578,12 @@ bundle, receipt, and isolated-restore paths must be absolute and remain confined
 to the configured backup or recovery roots.
 
 Recovery destinations are exclusive: existing files are never replaced. A
-successful result binds and verifies four artifacts—the SQLite snapshot, its
-signed receipt, the exactly-once capture archive, and the signed bundle receipt.
+successful result binds the exact returned inventory: the four core artifacts
+(the SQLite snapshot, its signed receipt, the exactly-once capture archive, and
+the signed bundle receipt), plus the governed request journal, runtime state,
+and sealed media archive whenever those artifacts are included. A referenced
+media recovery bundle uses schema v3 and must verify its fifth media archive,
+embedded manifest, object count, and database reference count as one contract.
 `cutover_ready: true` means the signed reconciliation found no replay-required
 transport debt and independent verification reproduced the processed-request
 ledger binding. Review `capture_ledger_binding.verified`,
@@ -605,13 +611,15 @@ When the bundle came from another Mac or signer, independently review and pass
 the digest for every included artifact. In addition to
 `--expected-database-sha256` and `--expected-capture-sha256`, governed bundles
 require `--expected-request-journal-sha256`, and any bundle carrying runtime
-state requires `--expected-runtime-state-sha256`. A foreign-signed bundle with
-even one missing pin is not verification- or restore-eligible. Verification
-binds the exact bundle receipt plus its dependent database, capture,
-journal-binding, and runtime receipt identities through materialization; a
-receipt or artifact swap fails before the output root is created. A fully
-pinned foreign governed bundle is supported and must reverify its restored
-journal binding and runtime state.
+state requires `--expected-runtime-state-sha256`. A v3 bundle carrying a media
+archive also requires `--expected-media-sha256`; obtain and compare that digest
+independently just like every other foreign artifact pin. A foreign-signed
+bundle with even one included-artifact pin missing is not verification- or
+restore-eligible. Verification binds the exact bundle receipt plus its
+dependent database, capture, journal-binding, runtime, and media identities
+through materialization; a receipt or artifact swap fails before the output
+root is created. A fully pinned foreign governed bundle is supported and must
+reverify its restored journal binding, runtime state, and media inventory.
 
 To retire old verified bundles, first persist a signed exact-inventory plan,
 review every protected/retiring disposition, and then apply that same plan with

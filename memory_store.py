@@ -1430,6 +1430,81 @@ def _decode_json(raw: str, fallback: Any) -> Any:
         return fallback
 
 
+MEDIA_REFERENCE_ROW_BOUND = 1_000_000
+MAX_MEDIA_REFERENCES = 10_000
+_MEDIA_ID_REFERENCE_RE = re.compile(r"^s2img_[0-9a-f]{32}$")
+
+
+def media_references_from_connection(
+    conn: sqlite3.Connection,
+    *,
+    context_ids: Iterable[str] | None = None,
+    limit: int = MAX_MEDIA_REFERENCES,
+) -> dict[str, Any]:
+    """Authoritative image media references from one SQLite connection.
+
+    This scans every durable ``memory_entries`` row (optionally filtered to an
+    explicit context set) instead of sampling a bounded listing, so backup
+    inventory and scope-gated recall share one reference source. A row typed
+    ``image`` with a malformed media reference fails closed.
+    """
+
+    if type(limit) is not int or not 1 <= limit <= MAX_MEDIA_REFERENCES:
+        raise ValueError(
+            f"media reference limit must be between 1 and {MAX_MEDIA_REFERENCES}"
+        )
+    filters: list[str] = []
+    arguments: list[Any] = []
+    if context_ids is not None:
+        contexts = sorted({str(context) for context in context_ids})
+        if not contexts:
+            raise ValueError("media reference context filter must not be empty")
+        placeholders = ",".join("?" for _ in contexts)
+        filters.append(f"context_id IN ({placeholders})")
+        arguments.extend(contexts)
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    cursor = conn.execute(
+        "SELECT context_id, metadata_json FROM memory_entries "
+        f"{where_clause} ORDER BY memory_id",
+        arguments,
+    )
+    references: set[str] = set()
+    image_entry_count = 0
+    scanned_row_count = 0
+    while True:
+        rows = cursor.fetchmany(1_000)
+        if not rows:
+            break
+        for row in rows:
+            scanned_row_count += 1
+            if scanned_row_count > MEDIA_REFERENCE_ROW_BOUND:
+                raise RuntimeError("media reference scan exceeded its row bound")
+            metadata = _decode_json(str(row[1] or "{}"), {})
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("context_memory_type") != "image"
+            ):
+                continue
+            image_entry_count += 1
+            media_id = metadata.get("media_id")
+            if (
+                type(media_id) is not str
+                or _MEDIA_ID_REFERENCE_RE.fullmatch(media_id) is None
+            ):
+                raise RuntimeError(
+                    "durable image memory carries a malformed media reference"
+                )
+            references.add(media_id)
+            if len(references) > limit:
+                raise RuntimeError("media reference inventory exceeded its bound")
+    return {
+        "media_ids": sorted(references),
+        "reference_count": len(references),
+        "image_entry_count": image_entry_count,
+        "scanned_row_count": scanned_row_count,
+    }
+
+
 class DurableMemoryStore:
     """SQLite-backed memory substrate shared by CLI and MCP launches."""
 
@@ -11727,6 +11802,38 @@ class DurableMemoryStore:
                 }
             )
         return records
+
+    def list_media_references(
+        self,
+        *,
+        context_id: str = "default",
+        recall_scope: str = "local",
+        limit: int = MAX_MEDIA_REFERENCES,
+    ) -> dict[str, Any]:
+        """List authoritative image media references inside one recall scope."""
+
+        resolved = self.resolve_recall_contexts(
+            context_id=context_id,
+            scope=recall_scope,
+        )
+        resolved_context_ids = [str(record["context_id"]) for record in resolved]
+        with closing(self._connect_read_only()) as conn:
+            references = media_references_from_connection(
+                conn,
+                context_ids=resolved_context_ids,
+                limit=limit,
+            )
+        return {
+            "action": "list-media-references",
+            "context_id": str(resolved[0]["context_id"]),
+            "recall_scope": str(resolved[0]["recall_scope"]),
+            "resolved_context_count": len(resolved_context_ids),
+            "resolved_context_ids": resolved_context_ids,
+            **references,
+            "reference_limit": int(limit),
+            "authoritative": True,
+            "raw_metadata_returned": False,
+        }
 
     def context_similarity(
         self,

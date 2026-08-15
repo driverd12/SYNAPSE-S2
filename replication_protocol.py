@@ -22,8 +22,24 @@ from memory_store import DurableMemoryStore, _json_dumps
 REPLICATION_PROTOCOL_VERSION = "synapse-s2.replication.v1"
 NODE_DESCRIPTOR_SCHEMA = "synapse-s2.replication-node.v1"
 CHECKPOINT_SCHEMA = "synapse-s2.replication-checkpoint.v1"
+DESCRIPTOR_TRANSITION_SCHEMA = "synapse-s2.replication-descriptor-transition.v1"
+NODE_DESCRIPTOR_TRANSITION_SCHEMA = (
+    "synapse-s2.replication-node-descriptor-transition.v1"
+)
 ACK_SCHEMA = "synapse-s2.replication-ack.v1"
 LEDGER_ANCHOR_SCHEMA = "synapse-s2.replication-ledger-anchor.v1"
+
+# Signed-capability negotiation: baseline peers advertise exactly the three
+# original capabilities; media-capable peers additionally advertise
+# ``media-artifact-v1``. A sender must never publish a checkpoint carrying a
+# media artifact to a peer whose pinned descriptor lacks that capability.
+MEDIA_ARTIFACT_CAPABILITY = "media-artifact-v1"
+BASE_NODE_CAPABILITIES = (
+    "target-bound-checkpoints",
+    "isolated-restore-proof",
+    "receiver-signed-ack",
+)
+NODE_CAPABILITIES = BASE_NODE_CAPABILITIES + (MEDIA_ARTIFACT_CAPABILITY,)
 
 AUTH_FIELDS = frozenset(
     {
@@ -41,6 +57,31 @@ NODE_DESCRIPTOR_FIELDS = frozenset(
         "node_id",
         "role",
         "capabilities",
+        "created_at",
+    }
+) | AUTH_FIELDS
+DESCRIPTOR_TRANSITION_FIELDS = frozenset(
+    {
+        "schema",
+        "protocol_version",
+        "recorder_node_id",
+        "peer_id",
+        "lineage_id",
+        "direction",
+        "peer_signing_key_id",
+        "previous_descriptor_digest",
+        "descriptor_digest",
+        "previous_evidence",
+        "created_at",
+    }
+) | AUTH_FIELDS
+NODE_DESCRIPTOR_TRANSITION_FIELDS = frozenset(
+    {
+        "schema",
+        "protocol_version",
+        "node_id",
+        "previous_descriptor_digest",
+        "descriptor_digest",
         "created_at",
     }
 ) | AUTH_FIELDS
@@ -112,6 +153,7 @@ ALLOWED_ARTIFACT_KINDS = frozenset(
         "database",
         "database_receipt",
         "capture",
+        "media",
         "bundle_receipt",
         "request_journal",
         "request_journal_binding",
@@ -220,11 +262,7 @@ def signed_node_descriptor(
             "protocol_version": REPLICATION_PROTOCOL_VERSION,
             "node_id": node_id_for_key_id(key_id),
             "role": "offline-checkpoint-peer",
-            "capabilities": [
-                "target-bound-checkpoints",
-                "isolated-restore-proof",
-                "receiver-signed-ack",
-            ],
+            "capabilities": list(NODE_CAPABILITIES),
             "created_at": float(created_at),
         },
     )
@@ -298,12 +336,10 @@ def validate_node_descriptor(
         descriptor["schema"] != NODE_DESCRIPTOR_SCHEMA
         or descriptor["protocol_version"] != REPLICATION_PROTOCOL_VERSION
         or descriptor["role"] != "offline-checkpoint-peer"
+        # Accept exactly the baseline capability list or the media-capable
+        # list, in canonical order; anything else is an unknown contract.
         or descriptor["capabilities"]
-        != [
-            "target-bound-checkpoints",
-            "isolated-restore-proof",
-            "receiver-signed-ack",
-        ]
+        not in (list(BASE_NODE_CAPABILITIES), list(NODE_CAPABILITIES))
     ):
         raise ReplicationProtocolError("node descriptor contract is unsupported")
     node_id = _require_string(descriptor["node_id"], "node identifier", maximum=40)
@@ -318,6 +354,166 @@ def validate_node_descriptor(
     if not secrets.compare_digest(node_id, node_id_for_key_id(key_id)):
         raise ReplicationProtocolError("node identifier does not match its signing key")
     return copy.deepcopy(descriptor)
+
+
+def signed_descriptor_transition(
+    store: DurableMemoryStore,
+    *,
+    recorder_node_id: str,
+    peer_id: str,
+    lineage_id: str,
+    direction: str,
+    peer_signing_key_id: str,
+    previous_descriptor_digest: str,
+    descriptor_digest: str,
+    previous_evidence: str,
+    created_at: float,
+) -> dict[str, Any]:
+    """Sign an immutable receipt binding a peer descriptor upgrade old->new.
+
+    The receipt is recorded by the local node before its ledger pointer moves,
+    so a crash between evidence publication and the compare-and-swap always
+    leaves an auditable, replayable record of the intended transition.
+    """
+
+    transition = sign_payload(
+        store,
+        {
+            "schema": DESCRIPTOR_TRANSITION_SCHEMA,
+            "protocol_version": REPLICATION_PROTOCOL_VERSION,
+            "recorder_node_id": recorder_node_id,
+            "peer_id": peer_id,
+            "lineage_id": lineage_id,
+            "direction": direction,
+            "peer_signing_key_id": peer_signing_key_id,
+            "previous_descriptor_digest": previous_descriptor_digest,
+            "descriptor_digest": descriptor_digest,
+            "previous_evidence": previous_evidence,
+            "created_at": float(created_at),
+        },
+    )
+    validate_descriptor_transition(transition)
+    return transition
+
+
+def validate_descriptor_transition(
+    payload: Any,
+    *,
+    expected_public_key: str | None = None,
+    expected_key_id: str | None = None,
+) -> dict[str, Any]:
+    transition = _require_exact_fields(
+        payload, DESCRIPTOR_TRANSITION_FIELDS, "descriptor transition"
+    )
+    if (
+        transition["schema"] != DESCRIPTOR_TRANSITION_SCHEMA
+        or transition["protocol_version"] != REPLICATION_PROTOCOL_VERSION
+        or transition["direction"] not in ("send", "receive")
+        or transition["previous_evidence"]
+        not in ("descriptor-document", "ledger-digest-only")
+    ):
+        raise ReplicationProtocolError("descriptor transition contract is unsupported")
+    recorder_id = _require_string(
+        transition["recorder_node_id"], "recorder node identifier", maximum=40
+    )
+    peer_id = _require_string(transition["peer_id"], "peer identifier", maximum=40)
+    if (
+        NODE_ID_RE.fullmatch(recorder_id) is None
+        or NODE_ID_RE.fullmatch(peer_id) is None
+        or LINEAGE_ID_RE.fullmatch(str(transition["lineage_id"])) is None
+        or recorder_id == peer_id
+    ):
+        raise ReplicationProtocolError("descriptor transition identity is invalid")
+    validate_digest(transition["peer_signing_key_id"], "peer signing key identifier")
+    previous_digest = validate_digest(
+        transition["previous_descriptor_digest"], "previous descriptor digest"
+    )
+    new_digest = validate_digest(transition["descriptor_digest"], "descriptor digest")
+    if previous_digest == new_digest:
+        raise ReplicationProtocolError("descriptor transition must change the digest")
+    _require_time(transition["created_at"], "transition creation time")
+    key_id, _encoded = _verify_authentication(
+        transition,
+        expected_public_key=expected_public_key,
+        expected_key_id=expected_key_id,
+    )
+    if not secrets.compare_digest(recorder_id, node_id_for_key_id(key_id)):
+        raise ReplicationProtocolError(
+            "descriptor transition recorder does not match its signing key"
+        )
+    return copy.deepcopy(transition)
+
+
+def signed_node_descriptor_transition(
+    store: DurableMemoryStore,
+    *,
+    node_id: str,
+    previous_descriptor_digest: str,
+    descriptor_digest: str,
+    created_at: float,
+) -> dict[str, Any]:
+    """Sign an immutable receipt binding this node's own descriptor swap.
+
+    The receipt names the exact active predecessor a pointer swap replaces,
+    so a candidate descriptor whose evidence was published but that never
+    became active can never be laundered into upgrade history.
+    """
+
+    transition = sign_payload(
+        store,
+        {
+            "schema": NODE_DESCRIPTOR_TRANSITION_SCHEMA,
+            "protocol_version": REPLICATION_PROTOCOL_VERSION,
+            "node_id": node_id,
+            "previous_descriptor_digest": previous_descriptor_digest,
+            "descriptor_digest": descriptor_digest,
+            "created_at": float(created_at),
+        },
+    )
+    validate_node_descriptor_transition(transition)
+    return transition
+
+
+def validate_node_descriptor_transition(
+    payload: Any,
+    *,
+    expected_public_key: str | None = None,
+    expected_key_id: str | None = None,
+) -> dict[str, Any]:
+    transition = _require_exact_fields(
+        payload, NODE_DESCRIPTOR_TRANSITION_FIELDS, "node descriptor transition"
+    )
+    if (
+        transition["schema"] != NODE_DESCRIPTOR_TRANSITION_SCHEMA
+        or transition["protocol_version"] != REPLICATION_PROTOCOL_VERSION
+    ):
+        raise ReplicationProtocolError(
+            "node descriptor transition contract is unsupported"
+        )
+    node_id = _require_string(transition["node_id"], "node identifier", maximum=40)
+    if NODE_ID_RE.fullmatch(node_id) is None:
+        raise ReplicationProtocolError(
+            "node descriptor transition identity is invalid"
+        )
+    previous_digest = validate_digest(
+        transition["previous_descriptor_digest"], "previous descriptor digest"
+    )
+    new_digest = validate_digest(transition["descriptor_digest"], "descriptor digest")
+    if previous_digest == new_digest:
+        raise ReplicationProtocolError(
+            "node descriptor transition must change the digest"
+        )
+    _require_time(transition["created_at"], "transition creation time")
+    key_id, _encoded = _verify_authentication(
+        transition,
+        expected_public_key=expected_public_key,
+        expected_key_id=expected_key_id,
+    )
+    if not secrets.compare_digest(node_id, node_id_for_key_id(key_id)):
+        raise ReplicationProtocolError(
+            "node descriptor transition is not signed by its own node"
+        )
+    return copy.deepcopy(transition)
 
 
 def validate_ledger_anchor(

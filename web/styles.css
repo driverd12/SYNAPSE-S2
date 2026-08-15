@@ -3824,6 +3824,126 @@ textarea {
   font-size: 10px;
 }
 
+.image-gallery-similar-button {
+  grid-column: 1 / -1;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: 5px;
+  background: var(--input);
+  color: var(--text);
+  font-size: 11px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.image-gallery-similar-button:hover,
+.image-gallery-similar-button:focus-visible {
+  border-color: var(--accent, currentColor);
+}
+
+.image-similar-panel {
+  margin-top: 10px;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+.image-similar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.image-similar-header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.image-similar-note {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 6px 0 0;
+}
+
+.image-similar-warning {
+  color: var(--muted);
+  border-left: 3px solid var(--row);
+  padding-left: 8px;
+  font-size: 11px;
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.image-similar-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.image-similar-card {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 7px;
+}
+
+.image-similar-card img {
+  width: 58px;
+  height: 44px;
+  border-radius: 5px;
+  background: var(--input);
+  object-fit: contain;
+}
+
+.image-similar-card span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.image-similar-card strong,
+.image-similar-card small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-similar-card strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.image-similar-card small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+@media (max-width: 430px) {
+  .image-gallery,
+  .image-similar-results {
+    grid-template-columns: 1fr;
+  }
+
+  .image-similar-header {
+    flex-wrap: wrap;
+  }
+}
+
 .context-bus-state {
   display: flex;
   align-items: center;

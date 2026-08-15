@@ -668,6 +668,229 @@ def _validate_public_metadata(value: Any, *, media_id: str | None = None) -> dic
     return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
 
 
+class MediaObjectReader:
+    """Read-only, digest-verifying view over one private media-cache tree.
+
+    The reader never creates cache state and refuses symlinks, foreign
+    owners, group/other access, and oversized artifacts exactly like the
+    owning cache. It exists so recovery inventory and bounded similarity
+    recall can consume validated derivatives without a capture-capable
+    binding.
+    """
+
+    def __init__(self, media_root: str | os.PathLike[str]) -> None:
+        raw = os.fspath(media_root)
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            raise ImageCaptureError("media cache root must be a normal absolute path")
+        root = Path(raw)
+        if not root.is_absolute() or ".." in root.parts:
+            raise ImageCaptureError("media cache root must be a normal absolute path")
+        self.root = root
+        self.objects_root = root / "objects"
+
+    def cache_present(self) -> bool:
+        return self.root.exists() or self.root.is_symlink()
+
+    def object_ids(self) -> list[str]:
+        """Return every stored media ID, failing closed on foreign entries."""
+
+        if not self.cache_present():
+            return []
+        _private_directory(self.root, create=False)
+        _private_directory(self.objects_root, create=False)
+        names = sorted(path.name for path in self.objects_root.iterdir())
+        if len(names) > MAX_OBJECTS:
+            raise ImageCaptureError("image cache object bound exceeded")
+        for name in names:
+            if MEDIA_ID_RE.fullmatch(name) is None:
+                raise ImageCaptureError("image cache contains a foreign object entry")
+        return names
+
+    def _object_path(self, media_id: str) -> Path:
+        return self.objects_root / validate_media_id(media_id)
+
+    def read_object(self, media_id: str) -> tuple[dict[str, Any], bytes]:
+        manifest, thumbnail, _feature_print = self.read_object_with_feature(media_id)
+        return manifest, thumbnail
+
+    def read_object_with_feature(
+        self,
+        media_id: str,
+    ) -> tuple[dict[str, Any], bytes, bytes | None]:
+        manifest, files = self.read_object_artifacts(media_id)
+        return manifest, files["thumbnail.jpg"], files.get("feature-print.bin")
+
+    def read_object_artifacts(
+        self,
+        media_id: str,
+    ) -> tuple[dict[str, Any], dict[str, bytes]]:
+        """Validated manifest plus the exact private file bytes of one object."""
+
+        canonical_media_id = validate_media_id(media_id)
+        if not self.root.exists() or not self.objects_root.exists():
+            raise ImageCaptureNotFound("image cache object is unavailable")
+        _private_directory(self.root, create=False)
+        _private_directory(self.objects_root, create=False)
+        object_root = self._object_path(canonical_media_id)
+        try:
+            _private_directory(object_root, create=False)
+        except ImageCaptureError as exc:
+            try:
+                object_root.lstat()
+            except FileNotFoundError:
+                raise ImageCaptureNotFound(
+                    "image cache object is unavailable"
+                ) from exc
+            except OSError:
+                pass
+            raise
+        names = sorted(path.name for path in object_root.iterdir())
+        if names not in (
+            ["manifest.json", "thumbnail.jpg"],
+            ["feature-print.bin", "manifest.json", "thumbnail.jpg"],
+        ):
+            raise ImageCaptureError("image cache object inventory is invalid")
+        manifest_bytes = _read_private_regular(
+            object_root / "manifest.json",
+            maximum_bytes=64 * 1024,
+        )
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ImageCaptureError("image cache manifest is malformed") from exc
+        thumbnail = _read_private_regular(
+            object_root / "thumbnail.jpg",
+            maximum_bytes=MAX_THUMBNAIL_BYTES,
+        )
+        feature_print = (
+            _read_private_regular(
+                object_root / "feature-print.bin",
+                maximum_bytes=MAX_FEATURE_PRINT_BYTES,
+            )
+            if "feature-print.bin" in names
+            else None
+        )
+        self.validate_manifest(
+            manifest,
+            media_id=canonical_media_id,
+            thumbnail=thumbnail,
+            feature_print=feature_print,
+        )
+        files = {
+            "manifest.json": manifest_bytes,
+            "thumbnail.jpg": thumbnail,
+        }
+        if feature_print is not None:
+            files["feature-print.bin"] = feature_print
+        return manifest, files
+
+    @staticmethod
+    def validate_manifest(
+        value: Any,
+        *,
+        media_id: str,
+        thumbnail: bytes,
+        feature_print: bytes | None,
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ImageCaptureError("image cache manifest contract is invalid")
+        schema = value.get("schema")
+        observed_fields = frozenset(value)
+        valid_fields = (
+            observed_fields in {
+                _BASE_MANIFEST_FIELDS,
+                _OPTIONAL_VISION_MANIFEST_FIELDS,
+            }
+            if schema == IMAGE_ARTIFACT_SCHEMA
+            else observed_fields == _ENRICHED_MANIFEST_FIELDS
+            if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA
+            else False
+        )
+        if not valid_fields:
+            raise ImageCaptureError("image cache manifest contract is invalid")
+        if (
+            value.get("schema") not in IMAGE_ARTIFACT_SCHEMAS
+            or value.get("media_id") != media_id
+            or value.get("source_mime_type") not in {"image/png", "image/jpeg", "image/heic"}
+            or type(value.get("source_size_bytes")) is not int
+            or not 0 < int(value["source_size_bytes"]) <= MAX_SOURCE_BYTES
+            or SHA256_RE.fullmatch(str(value.get("source_sha256") or "")) is None
+            or SHA256_RE.fullmatch(str(value.get("thumbnail_sha256") or "")) is None
+            or type(value.get("thumbnail_size_bytes")) is not int
+            or int(value["thumbnail_size_bytes"]) != len(thumbnail)
+            or not isinstance(value.get("created_at"), (int, float))
+            or isinstance(value.get("created_at"), bool)
+            or not math.isfinite(float(value["created_at"]))
+            or hashlib.sha256(thumbnail).hexdigest() != value["thumbnail_sha256"]
+            or not thumbnail.startswith(_JPEG_MAGIC)
+        ):
+            raise ImageCaptureError("image cache manifest verification failed")
+        if schema == IMAGE_ARTIFACT_SCHEMA and feature_print is not None:
+            raise ImageCaptureError("legacy image cache object has an unexpected feature print")
+        if observed_fields == _OPTIONAL_VISION_MANIFEST_FIELDS:
+            try:
+                optional_receipt = validate_optional_enrichment_status(
+                    value.get("optional_vision_receipt")
+                )
+                requested_mode = validate_vision_mode(
+                    value.get("requested_vision_mode")
+                )
+            except (AppleVisionError, ValueError) as exc:
+                raise ImageCaptureError(
+                    "image optional Vision receipt is invalid"
+                ) from exc
+            if (
+                requested_mode == "off"
+                or optional_receipt.get("mode") != requested_mode
+            ):
+                raise ImageCaptureError(
+                    "image optional Vision receipt is inconsistent"
+                )
+        public_metadata = _validate_public_metadata(
+            value.get("public_metadata"),
+            media_id=media_id,
+        )
+        if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA:
+            expected_size = value.get("feature_print_size_bytes")
+            expected_digest = str(value.get("feature_print_sha256") or "")
+            enrichment = public_metadata.get("vision_enrichment")
+            public_feature = (
+                enrichment.get("feature_print")
+                if isinstance(enrichment, dict)
+                else None
+            )
+            feature_is_ready = (
+                isinstance(public_feature, dict)
+                and public_feature.get("status") == "ready"
+            )
+            if feature_is_ready:
+                if (
+                    feature_print is None
+                    or type(expected_size) is not int
+                    or expected_size != len(feature_print)
+                    or public_feature.get("byte_count") != expected_size
+                    or not 0 < expected_size <= MAX_FEATURE_PRINT_BYTES
+                    or SHA256_RE.fullmatch(expected_digest) is None
+                    or hashlib.sha256(feature_print).hexdigest() != expected_digest
+                ):
+                    raise ImageCaptureError(
+                        "image feature-print cache verification failed"
+                    )
+            elif (
+                feature_print is not None
+                or expected_size != 0
+                or expected_digest != ""
+            ):
+                raise ImageCaptureError(
+                    "image cache has an unexpected feature print"
+                )
+        if public_metadata.get("schema") != value.get("schema"):
+            raise ImageCaptureError("image cache manifest schema binding changed")
+        if public_metadata.get("mime_type") != value.get("source_mime_type"):
+            raise ImageCaptureError("image cache manifest MIME binding changed")
+        return dict(value)
+
+
 class ImageCaptureCache:
     """Private thumbnail cache plus durable-safe visual metadata builder.
 
@@ -688,8 +911,9 @@ class ImageCaptureCache:
         except Exception as exc:
             raise ImageCaptureError("verified core binding is required") from exc
         self.binding = canonical
-        self.root = canonical.data_root / "media-cache"
-        self.objects_root = self.root / "objects"
+        self.reader = MediaObjectReader(canonical.data_root / "media-cache")
+        self.root = self.reader.root
+        self.objects_root = self.reader.objects_root
         self.lock_path = self.root / ".media-cache.lock"
         self.converter = converter or _sips_converter
         self.vision_enricher = vision_enricher
@@ -1190,163 +1414,7 @@ class ImageCaptureCache:
                     pass
 
     def _read_object(self, media_id: str) -> tuple[dict[str, Any], bytes]:
-        canonical_media_id = validate_media_id(media_id)
-        if not self.root.exists() or not self.objects_root.exists():
-            raise ImageCaptureNotFound("image cache object is unavailable")
-        _private_directory(self.root, create=False)
-        _private_directory(self.objects_root, create=False)
-        object_root = self._object_path(canonical_media_id)
-        try:
-            _private_directory(object_root, create=False)
-        except ImageCaptureError as exc:
-            try:
-                object_root.lstat()
-            except FileNotFoundError:
-                raise ImageCaptureNotFound(
-                    "image cache object is unavailable"
-                ) from exc
-            except OSError:
-                pass
-            raise
-        names = sorted(path.name for path in object_root.iterdir())
-        if names not in (
-            ["manifest.json", "thumbnail.jpg"],
-            ["feature-print.bin", "manifest.json", "thumbnail.jpg"],
-        ):
-            raise ImageCaptureError("image cache object inventory is invalid")
-        manifest_bytes = _read_private_regular(
-            object_root / "manifest.json",
-            maximum_bytes=64 * 1024,
-        )
-        try:
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ImageCaptureError("image cache manifest is malformed") from exc
-        thumbnail = _read_private_regular(
-            object_root / "thumbnail.jpg",
-            maximum_bytes=MAX_THUMBNAIL_BYTES,
-        )
-        feature_print = (
-            _read_private_regular(
-                object_root / "feature-print.bin",
-                maximum_bytes=MAX_FEATURE_PRINT_BYTES,
-            )
-            if "feature-print.bin" in names
-            else None
-        )
-        self._validate_manifest(
-            manifest,
-            media_id=canonical_media_id,
-            thumbnail=thumbnail,
-            feature_print=feature_print,
-        )
-        return manifest, thumbnail
-
-    @staticmethod
-    def _validate_manifest(
-        value: Any,
-        *,
-        media_id: str,
-        thumbnail: bytes,
-        feature_print: bytes | None,
-    ) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            raise ImageCaptureError("image cache manifest contract is invalid")
-        schema = value.get("schema")
-        observed_fields = frozenset(value)
-        valid_fields = (
-            observed_fields in {
-                _BASE_MANIFEST_FIELDS,
-                _OPTIONAL_VISION_MANIFEST_FIELDS,
-            }
-            if schema == IMAGE_ARTIFACT_SCHEMA
-            else observed_fields == _ENRICHED_MANIFEST_FIELDS
-            if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA
-            else False
-        )
-        if not valid_fields:
-            raise ImageCaptureError("image cache manifest contract is invalid")
-        if (
-            value.get("schema") not in IMAGE_ARTIFACT_SCHEMAS
-            or value.get("media_id") != media_id
-            or value.get("source_mime_type") not in {"image/png", "image/jpeg", "image/heic"}
-            or type(value.get("source_size_bytes")) is not int
-            or not 0 < int(value["source_size_bytes"]) <= MAX_SOURCE_BYTES
-            or SHA256_RE.fullmatch(str(value.get("source_sha256") or "")) is None
-            or SHA256_RE.fullmatch(str(value.get("thumbnail_sha256") or "")) is None
-            or type(value.get("thumbnail_size_bytes")) is not int
-            or int(value["thumbnail_size_bytes"]) != len(thumbnail)
-            or not isinstance(value.get("created_at"), (int, float))
-            or isinstance(value.get("created_at"), bool)
-            or not math.isfinite(float(value["created_at"]))
-            or hashlib.sha256(thumbnail).hexdigest() != value["thumbnail_sha256"]
-            or not thumbnail.startswith(_JPEG_MAGIC)
-        ):
-            raise ImageCaptureError("image cache manifest verification failed")
-        if schema == IMAGE_ARTIFACT_SCHEMA and feature_print is not None:
-            raise ImageCaptureError("legacy image cache object has an unexpected feature print")
-        if observed_fields == _OPTIONAL_VISION_MANIFEST_FIELDS:
-            try:
-                optional_receipt = validate_optional_enrichment_status(
-                    value.get("optional_vision_receipt")
-                )
-                requested_mode = validate_vision_mode(
-                    value.get("requested_vision_mode")
-                )
-            except (AppleVisionError, ValueError) as exc:
-                raise ImageCaptureError(
-                    "image optional Vision receipt is invalid"
-                ) from exc
-            if (
-                requested_mode == "off"
-                or optional_receipt.get("mode") != requested_mode
-            ):
-                raise ImageCaptureError(
-                    "image optional Vision receipt is inconsistent"
-                )
-        public_metadata = _validate_public_metadata(
-            value.get("public_metadata"),
-            media_id=media_id,
-        )
-        if schema == IMAGE_ARTIFACT_ENRICHED_SCHEMA:
-            expected_size = value.get("feature_print_size_bytes")
-            expected_digest = str(value.get("feature_print_sha256") or "")
-            enrichment = public_metadata.get("vision_enrichment")
-            public_feature = (
-                enrichment.get("feature_print")
-                if isinstance(enrichment, dict)
-                else None
-            )
-            feature_is_ready = (
-                isinstance(public_feature, dict)
-                and public_feature.get("status") == "ready"
-            )
-            if feature_is_ready:
-                if (
-                    feature_print is None
-                    or type(expected_size) is not int
-                    or expected_size != len(feature_print)
-                    or public_feature.get("byte_count") != expected_size
-                    or not 0 < expected_size <= MAX_FEATURE_PRINT_BYTES
-                    or SHA256_RE.fullmatch(expected_digest) is None
-                    or hashlib.sha256(feature_print).hexdigest() != expected_digest
-                ):
-                    raise ImageCaptureError(
-                        "image feature-print cache verification failed"
-                    )
-            elif (
-                feature_print is not None
-                or expected_size != 0
-                or expected_digest != ""
-            ):
-                raise ImageCaptureError(
-                    "image cache has an unexpected feature print"
-                )
-        if public_metadata.get("schema") != value.get("schema"):
-            raise ImageCaptureError("image cache manifest schema binding changed")
-        if public_metadata.get("mime_type") != value.get("source_mime_type"):
-            raise ImageCaptureError("image cache manifest MIME binding changed")
-        return dict(value)
+        return self.reader.read_object(media_id)
 
     def get_thumbnail(self, media_id: str) -> ThumbnailResult:
         _manifest, thumbnail = self._read_object(media_id)
@@ -1510,8 +1578,11 @@ __all__ = [
     "ImageCaptureCache",
     "ImageCaptureError",
     "ImageCaptureNotFound",
+    "MAX_FEATURE_PRINT_BYTES",
+    "MAX_OBJECTS",
     "MAX_SOURCE_BYTES",
     "MAX_THUMBNAIL_EDGE",
+    "MediaObjectReader",
     "ThumbnailResult",
     "VISUAL_DESCRIPTOR_SCHEMA",
     "new_media_id",

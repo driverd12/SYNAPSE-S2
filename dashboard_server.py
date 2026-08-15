@@ -47,6 +47,7 @@ from core_client import (  # noqa: E402
     outcome_unknown_projection,
 )
 import mlx_backend  # noqa: E402
+import media_similarity  # noqa: E402
 from image_capture import (  # noqa: E402
     ImageCaptureCache,
     ImageCaptureError,
@@ -557,6 +558,44 @@ class DashboardRuntime:
             return self._binary_response(
                 thumbnail.data,
                 content_type=thumbnail.content_type,
+            )
+        if method == "GET" and path == "/api/media-similar":
+            media_id = validate_media_id(
+                str(params.get("media_id", [""])[0] or "").strip()
+            )
+            context = self._context_from_params(params)
+            recall_scope = str(
+                params.get("recall_scope", ["local"])[0] or "local"
+            ).strip().lower()
+            if recall_scope == "broad":
+                recall_scope = "all"
+            if recall_scope not in {"local", "connected", "all"}:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "recall_scope must be local, connected, or all",
+                )
+            limit = self._int_param(
+                params,
+                "limit",
+                8,
+                minimum=1,
+                maximum=media_similarity.MAX_RESULT_LIMIT,
+            )
+            candidate_limit = self._int_param(
+                params,
+                "candidate_limit",
+                media_similarity.DEFAULT_CANDIDATE_LIMIT,
+                minimum=1,
+                maximum=media_similarity.MAX_CANDIDATE_LIMIT,
+            )
+            return self._json_response(
+                self.media_similarity_recall(
+                    media_id=media_id,
+                    context_id=context,
+                    recall_scope=recall_scope,
+                    result_limit=limit,
+                    candidate_limit=candidate_limit,
+                )
             )
         if method == "GET" and path == "/api/replication/identity":
             return self._json_response(
@@ -3229,6 +3268,68 @@ class DashboardRuntime:
             "item_count": len(items),
             "scan_limit": 200,
             "thumbnail_cache_authoritative": False,
+        }
+
+    def media_similarity_recall(
+        self,
+        *,
+        media_id: str,
+        context_id: str,
+        recall_scope: str,
+        result_limit: int,
+        candidate_limit: int,
+    ) -> dict[str, Any]:
+        """Read-only ranked image similarity over the authoritative scope.
+
+        The browser only names the query media_id, context, scope, and limits;
+        the candidate set always comes from the authoritative reference
+        listing, never from client-supplied IDs, and the projection carries no
+        feature bytes, OCR text, or filesystem paths.
+        """
+
+        if self._binding is None:
+            raise DashboardError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "image similarity requires a verified core binding",
+            )
+        references = self.backend.list_media_references(
+            context_id=context_id,
+            recall_scope=recall_scope,
+        )
+        try:
+            result = media_similarity.query_similar_media(
+                self._binding,
+                media_id,
+                scope_media_ids=references["media_ids"],
+                result_limit=result_limit,
+                candidate_limit=candidate_limit,
+            )
+        except media_similarity.MediaSimilarityNotReferenced as exc:
+            raise DashboardError(
+                HTTPStatus.NOT_FOUND,
+                "query image is not referenced inside this recall scope",
+            ) from exc
+        except media_similarity.MediaSimilarityIncompatible as exc:
+            raise DashboardError(
+                HTTPStatus.CONFLICT,
+                "query image has no comparable vision feature print",
+            ) from exc
+        except media_similarity.MediaSimilarityIntegrityDrift as exc:
+            raise DashboardError(
+                HTTPStatus.CONFLICT,
+                "an authoritative media reference is missing its local cache "
+                "derivative on this Mac",
+            ) from exc
+        except media_similarity.MediaSimilarityError as exc:
+            raise DashboardError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "image similarity is unavailable right now",
+            ) from exc
+        return {
+            **result,
+            "context_id": str(references["context_id"]),
+            "recall_scope": str(references["recall_scope"]),
+            "resolved_context_count": int(references["resolved_context_count"]),
         }
 
     def _decode_image_thumbnail(self, value: Any) -> bytes:
