@@ -1,0 +1,573 @@
+{
+  "schema": "synapse-s2.longmem-v2-fixture.v1",
+  "version": 1,
+  "notes": "Version-controlled synapse-derived LongMemEval-V2 corpus. Fully offline and synthetic; embedding_prompt is a fixture device that pins the semantic-hash spike channel so grading is deterministic. Passing this fixture is not an official LongMemEval-V2 score.",
+  "random_seed": 20260814,
+  "fixed_epoch": 1784600000.0,
+  "backend": {
+    "dimension": 32,
+    "num_neurons": 24,
+    "default_top_k": 6,
+    "recall_count": 12,
+    "embedding_provider": "semantic-hash"
+  },
+  "thresholds": {
+    "minimum_graded_macro_recall_at_k": 0.75,
+    "minimum_graded_macro_ndcg_at_k": 0.7,
+    "minimum_graded_macro_mrr": 0.7,
+    "minimum_per_question_graded_recall_at_k": 0.5,
+    "maximum_namespace_leakage_count": 0,
+    "maximum_scope_provenance_violation_count": 0,
+    "maximum_false_premise_qualified_support_count": 0,
+    "maximum_abstention_violation_count": 0,
+    "maximum_current_over_retired_violation_count": 0,
+    "maximum_temporal_evidence_violation_count": 0,
+    "maximum_result_contract_violation_count": 0,
+    "maximum_answer_decision_violation_count": 0,
+    "maximum_deleted_evidence_count": 0,
+    "maximum_duplicate_memory_id_count": 0,
+    "maximum_duplicate_content_rate": 0.0,
+    "maximum_provenance_violation_count": 0,
+    "maximum_confidence_violation_count": 0,
+    "maximum_tie_ordering_violation_count": 0,
+    "maximum_logical_deletion_residue_count": 0,
+    "maximum_surface_deletion_residue_count": 0,
+    "maximum_media_residue_count": 0,
+    "maximum_recovery_residue_count": 0,
+    "maximum_replication_residue_count": 0,
+    "minimum_image_evidence_hits": 1
+  },
+  "corpus": {
+    "schema": "synapse-s2.longmem-v2.corpus.v1",
+    "trajectories": [
+      {
+        "trajectory_id": "traj-ops-onboarding",
+        "context_id": "mission-ops",
+        "sessions": [
+          {
+            "session_id": "s-onboarding",
+            "turns": [
+              {
+                "turn_id": "t-001",
+                "tag": "telemetry-relay",
+                "label": "Primary telemetry relay",
+                "text": "The primary telemetry relay for Overture missions is groundstation Kestrel-7 in Mojave.",
+                "embedding_prompt": "primary telemetry relay groundstation Overture",
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["static-state"]
+              },
+              {
+                "turn_id": "t-002",
+                "tag": "zephyr-checklist",
+                "label": "Zephyr envelope export workflow",
+                "text": "Workflow zephyr-checklist: export the flight envelope with envelope export strict mode, then validate with envelope-lint before archiving.",
+                "embedding_prompt": "zephyr checklist flight envelope export workflow",
+                "role": "assistant",
+                "memory_type": "text",
+                "categories": ["workflow-note"]
+              },
+              {
+                "turn_id": "t-003",
+                "tag": "simulator-scratch-gotcha",
+                "label": "Simulator scratch mount gotcha",
+                "text": "Environment gotcha: the simulator container mounts /var/synapse read-only, so scratch output must go to /workspace/scratch.",
+                "embedding_prompt": "simulator container scratch mount gotcha",
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["environment-gotcha"]
+              },
+              {
+                "turn_id": "t-004",
+                "tag": "hydraulic-rig-event",
+                "label": "Hydraulic rig pressure event",
+                "text": "Observed event: the hydraulic rig pressure test in bay three completed at nominal three thousand psi.",
+                "embedding_prompt": "hydraulic rig pressure test event bay three",
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["event-observation"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trajectory_id": "traj-fuel-and-tunnel",
+        "context_id": "mission-ops",
+        "sessions": [
+          {
+            "session_id": "s-fuel-initial",
+            "turns": [
+              {
+                "turn_id": "t-010",
+                "tag": "fuel-margin-status",
+                "label": "Fuel margin status",
+                "text": "Fuel margin status: the demo route reserve is eight percent under the baseline climb profile.",
+                "embedding_prompt": "fuel margin status demo route reserve",
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["state-update"]
+              },
+              {
+                "turn_id": "t-011",
+                "tag": "tunnel-session-start",
+                "label": "Wind tunnel session start",
+                "text": "Event kilo-alpha: the wind tunnel session for model WT-11 started.",
+                "embedding_prompt": "wind tunnel model WT-11 order of events",
+                "event_time": 1784700200.0,
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["event-observation", "temporal"]
+              }
+            ]
+          },
+          {
+            "session_id": "s-fuel-revision",
+            "turns": [
+              {
+                "turn_id": "t-012",
+                "tag": "fuel-margin-status",
+                "supersedes_turn_ref": "t-010",
+                "label": "Fuel margin status",
+                "text": "Fuel margin status update: the demo route reserve is now eleven percent after the revised climb profile.",
+                "embedding_prompt": "fuel margin status demo route reserve",
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["state-update"]
+              },
+              {
+                "turn_id": "t-013",
+                "tag": "tunnel-install-late",
+                "label": "Wind tunnel installation late note",
+                "text": "Event kilo-zulu: the wind tunnel installation of model WT-11 was completed before the session started.",
+                "embedding_prompt": "wind tunnel model WT-11 order of events",
+                "event_time": 1784700100.0,
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["event-observation", "temporal", "late-arrival"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trajectory_id": "traj-flight-test",
+        "context_id": "flight-test",
+        "sessions": [
+          {
+            "session_id": "s-chase",
+            "turns": [
+              {
+                "turn_id": "t-020",
+                "tag": "chase-frequency",
+                "label": "Chase aircraft frequency",
+                "text": "Flight test brief: the chase aircraft frequency for the Kestrel-7 relay rehearsal is one two three point four megahertz.",
+                "embedding_prompt": "chase aircraft frequency relay rehearsal",
+                "role": "observation",
+                "memory_type": "text",
+                "categories": ["approved-connected"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trajectory_id": "traj-vendor-quarantine",
+        "context_id": "vendor-quarantine",
+        "sessions": [
+          {
+            "session_id": "s-vendor",
+            "turns": [
+              {
+                "turn_id": "t-030",
+                "tag": "chase-frequency-draft",
+                "label": "Quarantined frequency draft",
+                "text": "Vendor quarantine draft: a chase aircraft frequency for the relay rehearsal appears here only as an unapproved leakage trap.",
+                "embedding_prompt": "chase aircraft frequency relay rehearsal",
+                "role": "system",
+                "memory_type": "text",
+                "categories": ["leak-trap"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trajectory_id": "traj-media-and-dedup",
+        "context_id": "mission-ops",
+        "sessions": [
+          {
+            "session_id": "s-media",
+            "turns": [
+              {
+                "turn_id": "t-040",
+                "tag": "tail-livery-photo",
+                "label": "Tail livery photograph",
+                "text": "Tail livery photograph: the demonstrator shows a teal chevron across the rudder.",
+                "embedding_prompt": "tail livery photograph demonstrator rudder",
+                "role": "observation",
+                "memory_type": "image",
+                "media_id": "s2img_a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "categories": ["image-memory"]
+              },
+              {
+                "turn_id": "t-041",
+                "tag": "falcon-mural-photo",
+                "label": "Falcon mural photograph",
+                "text": "Falcon mural photograph: hangar two wall art captured before repainting.",
+                "embedding_prompt": "falcon mural photograph hangar wall",
+                "role": "observation",
+                "memory_type": "image",
+                "media_id": "s2img_b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+                "categories": ["image-memory", "deletion-case"]
+              },
+              {
+                "turn_id": "t-042",
+                "tag": "badge-printer-bulletin",
+                "label": "Badge printer bulletin",
+                "text": "Duplicate ops bulletin: the badge printer in hangar two is back online.",
+                "embedding_prompt": "badge printer hangar bulletin online",
+                "role": "assistant",
+                "memory_type": "text",
+                "duplicate_group": "badge-bulletin",
+                "categories": ["duplicate"]
+              },
+              {
+                "turn_id": "t-043",
+                "tag": "badge-printer-bulletin-copy",
+                "label": "Badge printer bulletin",
+                "text": "Duplicate ops bulletin: the badge printer in hangar two is back online.",
+                "embedding_prompt": "badge printer hangar bulletin online",
+                "role": "assistant",
+                "memory_type": "text",
+                "duplicate_group": "badge-bulletin",
+                "categories": ["duplicate"]
+              },
+              {
+                "turn_id": "t-044",
+                "tag": "preflight-lint-note",
+                "label": "Preflight lint note",
+                "text": "Near duplicate note: run the preflight lint at gate bravo four before towing.",
+                "embedding_prompt": "preflight lint gate towing",
+                "role": "assistant",
+                "memory_type": "text",
+                "near_duplicate_group": "preflight-lint",
+                "categories": ["near-duplicate"]
+              },
+              {
+                "turn_id": "t-045",
+                "tag": "preflight-lint-note-variant",
+                "label": "Preflight lint variant",
+                "text": "Near duplicate note: run the preflight lint at gate bravo four after towing.",
+                "embedding_prompt": "preflight lint gate towing",
+                "role": "assistant",
+                "memory_type": "text",
+                "near_duplicate_group": "preflight-lint",
+                "categories": ["near-duplicate"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trajectory_id": "traj-drills",
+        "context_id": "drill-lab",
+        "sessions": [
+          {
+            "session_id": "s-drills",
+            "turns": [
+              {
+                "turn_id": "t-050",
+                "tag": "drill-tie-alpha",
+                "label": "Deterministic drill candidate 01",
+                "text": "Deterministic drill sequence evidence unit01.",
+                "embedding_prompt": "deterministic drill sequence evidence",
+                "role": "observation",
+                "memory_type": "text",
+                "tie_group": "drill-tie",
+                "fixed_time_group": "drill-tie",
+                "categories": ["tie"]
+              },
+              {
+                "turn_id": "t-051",
+                "tag": "drill-tie-bravo",
+                "label": "Deterministic drill candidate 02",
+                "text": "Deterministic drill sequence evidence unit02.",
+                "embedding_prompt": "deterministic drill sequence evidence",
+                "role": "observation",
+                "memory_type": "text",
+                "tie_group": "drill-tie",
+                "fixed_time_group": "drill-tie",
+                "categories": ["tie"]
+              },
+              {
+                "turn_id": "t-052",
+                "tag": "drill-tie-charlie",
+                "label": "Deterministic drill candidate 03",
+                "text": "Deterministic drill sequence evidence unit03.",
+                "embedding_prompt": "deterministic drill sequence evidence",
+                "role": "observation",
+                "memory_type": "text",
+                "tie_group": "drill-tie",
+                "fixed_time_group": "drill-tie",
+                "categories": ["tie"]
+              },
+              {
+                "turn_id": "t-053",
+                "tag": "drill-tie-delta",
+                "label": "Deterministic drill candidate 04",
+                "text": "Deterministic drill sequence evidence unit04.",
+                "embedding_prompt": "deterministic drill sequence evidence",
+                "role": "observation",
+                "memory_type": "text",
+                "tie_group": "drill-tie",
+                "fixed_time_group": "drill-tie",
+                "categories": ["tie"]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "context_links": [
+      {
+        "source_context_id": "mission-ops",
+        "target_context_id": "flight-test",
+        "relation_type": "approved-operational-overlap",
+        "direction": "bidirectional",
+        "confidence": 0.9,
+        "approved_by": "longmem-v2-fixture-governance",
+        "enabled": true
+      }
+    ],
+    "relationships": [
+      {
+        "context_id": "mission-ops",
+        "source_turn_ref": "t-013",
+        "target_turn_ref": "t-011",
+        "relation_type": "temporal_next",
+        "weight": 1.0
+      }
+    ],
+    "deletions": [
+      {
+        "turn_ref": "t-041",
+        "reason": "Media deletion fidelity case: the falcon mural photograph must leave no logical, surface, media, recovery, or replication residue."
+      }
+    ],
+    "questions": [
+      {
+        "question_id": "q-static-relay",
+        "ability": "static_state",
+        "horizon": "single-session",
+        "prompt": "primary telemetry relay groundstation Overture",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-001": 3}
+      },
+      {
+        "question_id": "q-workflow-zephyr",
+        "ability": "workflow",
+        "horizon": "single-session",
+        "prompt": "zephyr checklist flight envelope export workflow",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-002": 3}
+      },
+      {
+        "question_id": "q-gotcha-simulator",
+        "ability": "environment_gotchas",
+        "horizon": "single-session",
+        "prompt": "simulator container scratch mount gotcha",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-003": 3}
+      },
+      {
+        "question_id": "q-event-rig",
+        "ability": "static_state",
+        "horizon": "cross-session",
+        "prompt": "hydraulic rig pressure test event bay three",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-004": 3}
+      },
+      {
+        "question_id": "q-dynamic-fuel",
+        "ability": "dynamic_state",
+        "horizon": "cross-session",
+        "prompt": "fuel margin status demo route reserve",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-012": 3},
+        "expected_markers": {
+          "current_turn_ref": "t-012",
+          "retired_turn_ref": "t-010",
+          "required_current": "eleven percent",
+          "forbidden_retired": "eight percent"
+        }
+      },
+      {
+        "question_id": "q-temporal-tunnel",
+        "ability": "dynamic_state",
+        "horizon": "cross-session",
+        "prompt": "wind tunnel model WT-11 order of events",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 6,
+        "candidate_limit": 32,
+        "include_graph_neighbors": true,
+        "judgments": {"t-011": 2, "t-013": 2},
+        "temporal_expectation": {
+          "before_turn_ref": "t-013",
+          "after_turn_ref": "t-011",
+          "relation_type": "temporal_next"
+        }
+      },
+      {
+        "question_id": "q-premise-bluejay",
+        "ability": "premise_awareness",
+        "horizon": "long-horizon",
+        "prompt": "Why was the Overture demo rerouted through groundstation Bluejay-9?",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {},
+        "false_premise_marker": "Bluejay-9"
+      },
+      {
+        "question_id": "q-abstain-cryopump",
+        "ability": "premise_awareness",
+        "horizon": "long-horizon",
+        "prompt": "What is the maintenance interval for the cryogenic pump on stand nine?",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {},
+        "expects_abstention": true,
+        "absent_marker": "cryogenic pump"
+      },
+      {
+        "question_id": "q-connected-chase",
+        "ability": "static_state",
+        "horizon": "long-horizon",
+        "prompt": "chase aircraft frequency relay rehearsal",
+        "context_id": "mission-ops",
+        "recall_scope": "connected",
+        "allowed_contexts": ["mission-ops", "flight-test"],
+        "result_limit": 6,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-020": 3}
+      },
+      {
+        "question_id": "q-local-chase-isolation",
+        "ability": "environment_gotchas",
+        "horizon": "long-horizon",
+        "prompt": "chase aircraft frequency relay rehearsal",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {},
+        "purpose": "Bridge-isolation probe: the quarantined vendor draft shares the query channel and must never leak into local mission-ops results."
+      },
+      {
+        "question_id": "q-image-livery",
+        "ability": "static_state",
+        "horizon": "cross-session",
+        "prompt": "tail livery photograph demonstrator rudder",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-040": 3},
+        "expected_image_turn_ref": "t-040"
+      },
+      {
+        "question_id": "q-deleted-falcon",
+        "ability": "dynamic_state",
+        "horizon": "long-horizon",
+        "prompt": "falcon mural photograph hangar wall",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {},
+        "deleted_probe": {"turn_ref": "t-041", "marker": "falcon mural"}
+      },
+      {
+        "question_id": "q-duplicate-badge",
+        "ability": "static_state",
+        "horizon": "single-session",
+        "prompt": "badge printer hangar bulletin online",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 6,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-042": 2, "t-043": 2}
+      },
+      {
+        "question_id": "q-near-dup-lint",
+        "ability": "workflow",
+        "horizon": "cross-session",
+        "prompt": "preflight lint gate towing",
+        "context_id": "mission-ops",
+        "recall_scope": "local",
+        "allowed_contexts": ["mission-ops"],
+        "result_limit": 6,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-044": 2, "t-045": 1}
+      },
+      {
+        "question_id": "q-tie-drill",
+        "ability": "workflow",
+        "horizon": "single-session",
+        "prompt": "deterministic drill sequence evidence",
+        "context_id": "drill-lab",
+        "recall_scope": "local",
+        "allowed_contexts": ["drill-lab"],
+        "result_limit": 4,
+        "candidate_limit": 32,
+        "include_graph_neighbors": false,
+        "judgments": {"t-050": 1, "t-051": 1, "t-052": 1, "t-053": 1}
+      }
+    ]
+  }
+}
