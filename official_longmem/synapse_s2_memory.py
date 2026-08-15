@@ -19,15 +19,18 @@ Implements the pinned official ``Memory`` contract with ``memory_type``
 * ``query(query, query_image=None)`` returns official
   ``{"type": "text"|"image", "value": ...}`` context items; image values are
   existing bounded thumbnail derivative files produced by the SYNAPSE image
-  capture path (raw originals are never retained).  A query image never
-  drives feature-print similarity on this build — stored Apple Vision
-  feature prints are private node-local artifacts with no public read API —
-  so the adapter falls back to text-only retrieval and reports that fallback
-  visibly through ``post_query_hook`` metadata.
+  capture path (raw originals are never retained).  When a query image is
+  supplied, an owner-private scratch copy is compared transiently against the
+  exact authoritative media references in this adapter namespace.  Apple
+  Vision feature bytes stay inside the private node-local cache boundary and
+  the query scratch is removed in ``finally``; unavailable/incompatible Vision
+  degrades honestly to text retrieval rather than manufacturing a durable
+  query image.
 * ``save_memory``/``_load_backend`` produce and verify a sealed, portable
-  benchmark artifact (logical store + media derivatives + insert ledger +
-  digest manifest + executable source manifest + persisted public memory
-  config).  Loading performs an exact lstat tree verification (no symlinks,
+  benchmark artifact (logical store + media derivatives + the exact referenced
+  private media-cache objects needed for transient image similarity + insert
+  ledger + digest manifest + executable source manifest + persisted public
+  memory config).  Loading performs an exact lstat tree verification (no symlinks,
   devices, hardlinks, or unlisted entries; exact modes and owner), validates
   the SQLite payload (quick/integrity/schema/namespace), and binds every
   ledger row to its exact store row (memory id, tag, state index,
@@ -71,8 +74,8 @@ from official_longmem import bootstrap as _bootstrap
 from redaction import redact_capture_text
 
 MEMORY_TYPE = "synapse_s2"
-ARTIFACT_SCHEMA = "synapse-s2.longmem-v2-official-memory-artifact.v2"
-ARTIFACT_VERSION = 2
+ARTIFACT_SCHEMA = "synapse-s2.longmem-v2-official-memory-artifact.v3"
+ARTIFACT_VERSION = 3
 FINGERPRINT_SCHEMA = "synapse-s2.longmem-v2-insert-fingerprint.v2"
 SOURCE_BUILD_SCHEMA = "synapse-s2.longmem-v2-executable-source-build.v1"
 MANIFEST_NAME = "artifact_manifest.json"
@@ -81,6 +84,8 @@ LEDGER_NAME = "insert_ledger.json"
 STORE_DIR_NAME = "synapse_store"
 STORE_FILE_RELATIVE = f"{STORE_DIR_NAME}/memory.sqlite3"
 DERIVATIVES_DIR_NAME = "derivatives"
+MEDIA_CACHE_DIR_NAME = "media-cache"
+MEDIA_CACHE_OBJECTS_RELATIVE = f"{MEDIA_CACHE_DIR_NAME}/objects"
 BENCHMARK_NAMESPACE_DEFAULT = "longmem-v2-official"
 FIXED_EPOCH = 1_700_000_000.0
 
@@ -91,6 +96,10 @@ MAX_STATE_TEXT_BYTES_CEILING = 16_384
 MAX_QUERY_BYTES = 4_096
 MAX_SCREENSHOT_SOURCE_BYTES = 33_554_432
 MAX_THUMBNAIL_FILE_BYTES = 1_048_576
+MAX_MEDIA_CACHE_THUMBNAIL_BYTES = 512 * 1024
+MAX_MEDIA_CACHE_FEATURE_PRINT_BYTES = 64 * 1024
+MAX_MEDIA_CACHE_MANIFEST_BYTES = 64 * 1024
+MAX_MEDIA_CACHE_OBJECTS = 10_000
 MAX_LEDGER_FILE_BYTES = 67_108_864
 MAX_MANIFEST_FILE_BYTES = 16_777_216
 MAX_MEMORY_CONFIG_FILE_BYTES = 65_536
@@ -104,6 +113,11 @@ MAX_MEMORY_ID_CHARS = 200
 MAX_URL_METADATA_BYTES = 512
 MAX_SANITIZE_INPUT_CHARS = 1_048_576
 MAX_SQLITE_SCHEMA_OBJECTS = 4_096
+QUERY_IMAGE_RESULT_LIMIT_CEILING = 50
+QUERY_IMAGE_CANDIDATE_LIMIT_CEILING = 512
+QUERY_IMAGE_TIME_BUDGET_SECONDS = 2.0
+QUERY_IMAGE_INPUT_DERIVATIVE = "source-transient-downsampled"
+QUERY_IMAGE_META_SCHEMA = "synapse-s2.longmem-v2-query-image.v1"
 
 _STREAM_CHUNK_BYTES = 1 << 20
 _HEX64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -117,16 +131,12 @@ _CONTEXT_COLUMNS = frozenset({"context_id", "source_context_id", "target_context
 # partial writer; production always uses os.write.
 _OS_WRITE = os.write
 
-QUERY_IMAGE_FALLBACK_REASON = (
-    "stored Apple Vision feature prints are private node-local media-cache "
-    "artifacts with no public read API on this build, so query-image "
-    "feature-print similarity is not available; retrieval used the query "
-    "text only"
-)
 ARTIFACT_NOTES = (
-    "sealed portable LongMemEval-V2 benchmark artifact: logical store, media "
-    "derivatives, and insert ledger only; neural runtime state is derived and "
-    "machine-local, and no authority or binding credential is ever copied"
+    "sealed portable LongMemEval-V2 benchmark artifact: logical store, bounded "
+    "media derivatives, exact referenced private media-cache objects, and insert "
+    "ledger only; raw originals and unreferenced cache objects are excluded, "
+    "neural runtime state is derived and machine-local, and no authority or "
+    "binding credential is ever copied"
 )
 
 # Executable sources bound into (and verified against) every sealed artifact.
@@ -150,6 +160,7 @@ EXECUTABLE_SOURCE_MODULES = (
     "event_segmenter",
     "harmonic_memory",
     "image_capture",
+    "media_similarity",
     "redaction",
     "retrieval_cursor",
     "embedding_providers",
@@ -206,7 +217,13 @@ _LEDGER_RECORD_KEYS = frozenset(
     {"fingerprint", "state_count", "ordinal_start", "memory_ids", "media"}
 )
 _LEDGER_MEDIA_KEYS = frozenset(
-    {"media_id", "state_index", "thumbnail_sha256", "thumbnail_bytes"}
+    {
+        "media_id",
+        "state_index",
+        "thumbnail_sha256",
+        "thumbnail_bytes",
+        "media_object_sha256",
+    }
 )
 _MANIFEST_KEYS = frozenset(
     {
@@ -319,6 +336,7 @@ def _synapse() -> dict[str, Any]:
         "mlx_backend": importlib.import_module("mlx_backend"),
         "core_client_binding": importlib.import_module("core_client_binding"),
         "image_capture": importlib.import_module("image_capture"),
+        "media_similarity": importlib.import_module("media_similarity"),
     }
 
 
@@ -337,7 +355,15 @@ def _sha256_hex(data: bytes) -> str:
 
 
 def _open_regular_readonly(path: Path, *, owner: str) -> int:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    # O_NONBLOCK must be present on the *initial* nofollow open.  Checking the
+    # file type only after a blocking open can hang forever on a FIFO and may
+    # have device-specific side effects.  Regular-file reads are unaffected.
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         return os.open(path, flags)
     except OSError as exc:
@@ -597,7 +623,114 @@ def _artifact_file_limit(relative: str) -> int:
         return MAX_STORE_FILE_BYTES
     if relative.startswith(f"{DERIVATIVES_DIR_NAME}/") and relative.endswith(".jpg"):
         return MAX_THUMBNAIL_FILE_BYTES
+    media_match = re.fullmatch(
+        rf"{re.escape(MEDIA_CACHE_OBJECTS_RELATIVE)}/"
+        rf"{_MEDIA_ID_PATTERN.pattern[1:-1]}/"
+        r"(manifest\.json|thumbnail\.jpg|feature-print\.bin)",
+        relative,
+    )
+    if media_match is not None:
+        filename = media_match.group(1)
+        if filename == "manifest.json":
+            return MAX_MEDIA_CACHE_MANIFEST_BYTES
+        if filename == "thumbnail.jpg":
+            return MAX_MEDIA_CACHE_THUMBNAIL_BYTES
+        return MAX_MEDIA_CACHE_FEATURE_PRINT_BYTES
     return 0
+
+
+def _media_cache_relative(media_id: str, filename: str) -> str:
+    require(
+        _MEDIA_ID_PATTERN.fullmatch(media_id) is not None,
+        "media cache object id is invalid",
+    )
+    require(
+        filename in {"manifest.json", "thumbnail.jpg", "feature-print.bin"},
+        "media cache object filename is invalid",
+    )
+    return f"{MEDIA_CACHE_OBJECTS_RELATIVE}/{media_id}/{filename}"
+
+
+def _media_object_binding_sha256(
+    media_id: str,
+    artifacts: dict[str, bytes],
+) -> str:
+    """Bind the exact validated private object bytes without exposing them."""
+
+    require(
+        _MEDIA_ID_PATTERN.fullmatch(media_id) is not None,
+        "media cache object id is invalid",
+    )
+    require(
+        set(artifacts) in (
+            {"manifest.json", "thumbnail.jpg"},
+            {"feature-print.bin", "manifest.json", "thumbnail.jpg"},
+        )
+        and all(isinstance(value, bytes) and value for value in artifacts.values()),
+        "media cache object inventory is invalid",
+    )
+    inventory = {
+        filename: {
+            "sha256": _sha256_hex(artifacts[filename]),
+            "bytes": len(artifacts[filename]),
+        }
+        for filename in sorted(artifacts)
+    }
+    return _sha256_hex(
+        _canonical_json_bytes(
+            {
+                "schema": "synapse-s2.longmem-v2-media-object-binding.v1",
+                "media_id": media_id,
+                "files": inventory,
+            }
+        )
+    )
+
+
+def _require_media_object_binding(
+    *,
+    manifest: dict[str, Any],
+    artifacts: dict[str, bytes],
+    media: dict[str, Any],
+) -> str:
+    """Bind a MediaObjectReader-validated object to its ledger projection."""
+
+    media_id = str(media.get("media_id") or "")
+    thumbnail = artifacts.get("thumbnail.jpg")
+    public_metadata = manifest.get("public_metadata")
+    require(
+        isinstance(thumbnail, bytes)
+        and manifest.get("media_id") == media_id
+        and manifest.get("thumbnail_sha256") == media.get("thumbnail_sha256")
+        and manifest.get("thumbnail_size_bytes") == media.get("thumbnail_bytes")
+        and len(thumbnail) == media.get("thumbnail_bytes")
+        and secrets.compare_digest(
+            _sha256_hex(thumbnail), str(media.get("thumbnail_sha256") or "")
+        )
+        and isinstance(public_metadata, dict)
+        and public_metadata.get("media_id") == media_id
+        and public_metadata.get("context_memory_type") == "image",
+        "media cache object does not bind to the sealed ledger",
+    )
+    if "feature-print.bin" in artifacts:
+        enrichment = public_metadata.get("vision_enrichment")
+        feature = enrichment.get("feature_print") if isinstance(enrichment, dict) else None
+        require(
+            isinstance(enrichment, dict)
+            and enrichment.get("status") == "ready"
+            and enrichment.get("input_derivative") == QUERY_IMAGE_INPUT_DERIVATIVE
+            and isinstance(feature, dict)
+            and feature.get("status") == "ready",
+            "media cache feature print is not compatible with transient query input",
+        )
+    binding = _media_object_binding_sha256(media_id, artifacts)
+    require(
+        secrets.compare_digest(
+            binding, str(media.get("media_object_sha256") or "")
+        ),
+        "media cache object bytes do not bind to the sealed ledger",
+    )
+    return binding
 
 
 def _require_identity(value: Any, *, field: str) -> str:
@@ -781,6 +914,7 @@ class _Runtime:
         backend: Any,
         adapter: Any,
         cache: Any,
+        binding: Any,
         derivatives_dir: Path,
         ledger_path: Path,
     ) -> None:
@@ -791,6 +925,7 @@ class _Runtime:
         self.backend = backend
         self.adapter = adapter
         self.cache = cache
+        self.binding = binding
         self.derivatives_dir = derivatives_dir
         self.ledger_path = ledger_path
 
@@ -949,7 +1084,10 @@ class SynapseS2Memory(Memory):
         self._runtime: _Runtime | None = None
         self._ledger: dict[str, Any] = {"next_ordinal": 0, "trajectories": {}}
         self._content_identities: dict[str, str] = {}
+        self._media_reference_index: dict[str, dict[str, Any]] = {}
         self._image_converter: Callable[..., Any] | None = None
+        self._vision_enricher: Callable[..., Any] | None = None
+        self._query_vision_enricher: Callable[..., Any] | None = None
         self._vision_status: dict[str, Any] = {
             "requested_mode": self._image["vision_mode"],
             "effective_mode": self._image["vision_mode"],
@@ -989,6 +1127,24 @@ class SynapseS2Memory(Memory):
             )
             require(callable(converter), "image_converter must be callable")
             self._image_converter = converter  # type: ignore[assignment]
+        vision_enricher = kwargs.pop("vision_enricher", None)
+        if vision_enricher is not None:
+            require(
+                self._runtime is None,
+                "vision_enricher must be configured before the store is built",
+            )
+            require(callable(vision_enricher), "vision_enricher must be callable")
+            self._vision_enricher = vision_enricher  # type: ignore[assignment]
+        query_vision_enricher = kwargs.pop("query_vision_enricher", None)
+        if query_vision_enricher is not None:
+            require(not self._closed, "memory instance is closed")
+            require(
+                callable(query_vision_enricher),
+                "query_vision_enricher must be callable",
+            )
+            # Query enrichment is transient and cannot mutate capture state, so
+            # a pinned artifact may install this process-local seam after load.
+            self._query_vision_enricher = query_vision_enricher  # type: ignore[assignment]
         # Any other runtime kwargs from the harness are accepted and ignored.
         return None
 
@@ -1129,19 +1285,24 @@ class SynapseS2Memory(Memory):
             except Exception as exc:
                 raise RuntimeError("backend construction failed") from exc
             adapter = longmem_eval.LongMemInsertQueryAdapter(backend)
-            vision_enricher = None
+            vision_enricher = self._vision_enricher
             if self._image["vision_mode"] != "off":
-                try:
-                    vision_module = importlib.import_module("apple_vision_enrichment")
-                    vision_enricher = vision_module.AppleVisionEnricher()
-                except Exception as exc:
-                    # Visible degradation: captures proceed with vision off and
-                    # the reason is carried into post-query metadata.
-                    self._vision_status = {
-                        "requested_mode": self._image["vision_mode"],
-                        "effective_mode": "off",
-                        "reason": "apple vision enrichment unavailable",
-                    }
+                if vision_enricher is None:
+                    try:
+                        vision_module = importlib.import_module(
+                            "apple_vision_enrichment"
+                        )
+                        vision_enricher = vision_module.AppleVisionEnricher(
+                            binding
+                        ).enrich
+                    except Exception:
+                        # Visible degradation: captures proceed with vision off
+                        # and the reason is carried into post-query metadata.
+                        self._vision_status = {
+                            "requested_mode": self._image["vision_mode"],
+                            "effective_mode": "off",
+                            "reason": "apple vision enrichment unavailable",
+                        }
             cache_kwargs: dict[str, Any] = {}
             if self._image_converter is not None:
                 cache_kwargs["converter"] = self._image_converter
@@ -1174,6 +1335,7 @@ class SynapseS2Memory(Memory):
             backend=backend,
             adapter=adapter,
             cache=cache,
+            binding=binding,
             derivatives_dir=derivatives_dir,
             ledger_path=ledger_path,
         )
@@ -1203,6 +1365,7 @@ class SynapseS2Memory(Memory):
         )
         spans: list[tuple[int, int]] = []
         seen_memory_ids: set[str] = set()
+        seen_media_ids: set[str] = set()
         for trajectory_id, record in trajectories.items():
             require(
                 _normalize_trajectory_id(trajectory_id) == trajectory_id,
@@ -1263,10 +1426,12 @@ class SynapseS2Memory(Memory):
                 require(
                     isinstance(media_id, str)
                     and _MEDIA_ID_PATTERN.fullmatch(media_id)
-                    and media_id == self._media_id(trajectory_id, state_index),
+                    and media_id == self._media_id(trajectory_id, state_index)
+                    and media_id not in seen_media_ids,
                     f"insert ledger media id does not bind to {trajectory_id} "
                     f"state {state_index}",
                 )
+                seen_media_ids.add(media_id)
                 thumbnail_sha256 = entry["thumbnail_sha256"]
                 require(
                     isinstance(thumbnail_sha256, str)
@@ -1278,7 +1443,16 @@ class SynapseS2Memory(Memory):
                     and 1 <= entry["thumbnail_bytes"] <= self._image["max_thumbnail_bytes"],
                     f"insert ledger thumbnail byte count invalid for {trajectory_id}",
                 )
+                require(
+                    isinstance(entry["media_object_sha256"], str)
+                    and _HEX64_PATTERN.fullmatch(entry["media_object_sha256"]),
+                    f"insert ledger media object binding malformed for {trajectory_id}",
+                )
             spans.append((ordinal_start, state_count))
+        require(
+            len(seen_media_ids) <= MAX_MEDIA_CACHE_OBJECTS,
+            "insert ledger media count exceeds the fixed cache object bound",
+        )
         spans.sort()
         expected_start = 0
         for start, count in spans:
@@ -1449,9 +1623,16 @@ class SynapseS2Memory(Memory):
             "image capture must never store the raw original",
         )
         thumbnail = runtime.cache.get_thumbnail(media_id)
+        _cache_manifest, cache_artifacts = (
+            runtime.cache.reader.read_object_artifacts(media_id)
+        )
         require(
             len(thumbnail.data) <= self._image["max_thumbnail_bytes"],
             "thumbnail derivative exceeds the fixed byte bound",
+        )
+        require(
+            cache_artifacts["thumbnail.jpg"] == thumbnail.data,
+            "thumbnail derivative does not match the private media object",
         )
         derivative = runtime.derivatives_dir / f"{media_id}.jpg"
         digest = _sha256_hex(thumbnail.data)
@@ -1472,12 +1653,14 @@ class SynapseS2Memory(Memory):
             "state_index": state_index,
             "thumbnail_sha256": digest,
             "thumbnail_bytes": len(thumbnail.data),
+            "media_object_sha256": _media_object_binding_sha256(
+                media_id, cache_artifacts
+            ),
         }
 
     def insert(self, trajectory: dict[str, object]) -> None:
         require(isinstance(trajectory, dict), "trajectory must be an object")
         trajectory_id = _normalize_trajectory_id(trajectory.get("id"))
-        runtime = self._build_runtime()
         prepared = self._prepared_states(trajectory, trajectory_id)
         content_identity = self._trajectory_fingerprint(
             trajectory, trajectory_id, prepared
@@ -1491,10 +1674,29 @@ class SynapseS2Memory(Memory):
                 f"trajectory {trajectory_id} was already inserted with different content",
             )
             return  # idempotent re-insert of identical content
+        # Preflight the complete media delta before constructing a runtime or
+        # touching the store/cache. ImageCaptureCache deliberately owns only
+        # per-object validation; this adapter owns the official-run inventory
+        # ceiling and therefore must enforce existing + incoming atomically.
+        # The index is populated only after a trajectory finishes and is
+        # rebuilt from a fully validated ledger on restore, making its length
+        # the constant-time authoritative in-process media count. Full ledger
+        # validation remains at seal/load boundaries to avoid quadratic
+        # insertion cost across an official stream.
+        existing_media_count = len(self._media_reference_index)
+        incoming_media_count = sum(
+            row["screenshot"] is not None for row in prepared
+        )
+        require(
+            existing_media_count + incoming_media_count
+            <= MAX_MEDIA_CACHE_OBJECTS,
+            "trajectory media count exceeds the fixed cache object bound",
+        )
         require(
             len(self._ledger["trajectories"]) < MAX_TRAJECTORIES,
             "trajectory count exceeds the fixed adapter bound",
         )
+        runtime = self._build_runtime()
         ordinal_start = int(self._ledger["next_ordinal"])
         trajectory_binding = secrets.token_hex(32)
         memory_ids: list[str] = []
@@ -1529,6 +1731,9 @@ class SynapseS2Memory(Memory):
                 media_records.append(media)
                 metadata["memory_type"] = "image"
                 metadata["media_id"] = media["media_id"]
+                metadata["media_object_sha256"] = media[
+                    "media_object_sha256"
+                ]
             memory_id = runtime.adapter.insert_turn(
                 tag=f"lmv2:{trajectory_id}:{state_index:04d}",
                 context_id=self._namespace,
@@ -1549,10 +1754,370 @@ class SynapseS2Memory(Memory):
             "media": media_records,
         }
         self._ledger["next_ordinal"] = ordinal
+        for media in media_records:
+            media_id = str(media["media_id"])
+            state_index = int(media["state_index"])
+            require(
+                media_id not in self._media_reference_index,
+                "media reference identity is duplicated",
+            )
+            self._media_reference_index[media_id] = {
+                "trajectory_id": trajectory_id,
+                "state_index": state_index,
+                "memory_id": memory_ids[state_index],
+                "thumbnail_sha256": str(media["thumbnail_sha256"]),
+                "thumbnail_bytes": int(media["thumbnail_bytes"]),
+                "media_object_sha256": str(media["media_object_sha256"]),
+            }
         self._content_identities[trajectory_id] = content_identity
         self._persist_ledger(runtime)
 
     # -- query -----------------------------------------------------------------
+
+    def _authoritative_media_scope(
+        self,
+        runtime: _Runtime,
+        *,
+        maximum_references: int,
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Resolve exact in-namespace ledger references back to stored rows.
+
+        The private media cache is deliberately not enumerated: orphaned or
+        cross-namespace cache objects can therefore never enter the query
+        scope.  Query-time row reads stop exactly at ``maximum_references``;
+        only fixed-size trajectory headers are examined beyond that prefix so
+        the receipt can state whether the deterministic scope was truncated.
+        Every selected ID is jointly witnessed by the insert ledger, the
+        in-process index built during insert/restore validation, and its exact
+        logical store row.
+        """
+
+        require(
+            type(maximum_references) is int
+            and 1 <= maximum_references <= QUERY_IMAGE_CANDIDATE_LIMIT_CEILING,
+            "query image scope bound is invalid",
+        )
+        scope: list[str] = []
+        seen: set[str] = set()
+        trajectories = self._ledger.get("trajectories")
+        require(isinstance(trajectories, dict), "insert ledger is unavailable")
+        require(
+            len(trajectories) <= MAX_TRAJECTORIES,
+            "insert ledger trajectory count exceeds the fixed bound",
+        )
+        total_references = 0
+        for trajectory_id in sorted(trajectories):
+            record = trajectories[trajectory_id]
+            require(isinstance(record, dict), "insert ledger record is invalid")
+            memory_ids = record.get("memory_ids")
+            media = record.get("media")
+            require(
+                isinstance(memory_ids, list) and isinstance(media, list),
+                "insert ledger media binding is invalid",
+            )
+            total_references += len(media)
+            if len(scope) >= maximum_references:
+                continue
+            for reference in media:
+                if len(scope) >= maximum_references:
+                    break
+                require(
+                    isinstance(reference, dict),
+                    "insert ledger media reference is invalid",
+                )
+                media_id = str(reference.get("media_id") or "")
+                state_index = int(reference.get("state_index"))
+                require(
+                    _MEDIA_ID_PATTERN.fullmatch(media_id) is not None
+                    and 0 <= state_index < len(memory_ids)
+                    and media_id not in seen,
+                    "insert ledger media reference is invalid",
+                )
+                indexed = self._media_reference_index.get(media_id)
+                require(
+                    isinstance(indexed, dict)
+                    and indexed.get("trajectory_id") == trajectory_id
+                    and indexed.get("state_index") == state_index
+                    and indexed.get("memory_id") == str(memory_ids[state_index])
+                    and indexed.get("thumbnail_sha256")
+                    == reference.get("thumbnail_sha256")
+                    and indexed.get("thumbnail_bytes")
+                    == reference.get("thumbnail_bytes")
+                    and indexed.get("media_object_sha256")
+                    == reference.get("media_object_sha256"),
+                    "indexed media reference does not bind to the insert ledger",
+                )
+                entry = runtime.adapter.get_entry(str(memory_ids[state_index]))
+                metadata = (entry or {}).get("metadata")
+                require(
+                    isinstance(metadata, dict)
+                    and metadata.get("benchmark_namespace") == self._namespace
+                    and metadata.get("trajectory_id") == trajectory_id
+                    and metadata.get("state_index") == state_index
+                    and metadata.get("media_id") == media_id
+                    and metadata.get("memory_type") == "image"
+                    and metadata.get("media_object_sha256")
+                    == reference.get("media_object_sha256"),
+                    "authoritative media reference does not bind to its store row",
+                )
+                seen.add(media_id)
+                scope.append(media_id)
+        require(
+            total_references == len(self._media_reference_index),
+            "media reference index count does not match the insert ledger",
+        )
+        return scope, {
+            "total_reference_count": total_references,
+            "selected_reference_count": len(scope),
+            "truncated_reference_count": max(0, total_references - len(scope)),
+            "complete": total_references <= maximum_references,
+            "selection_policy": "sorted-trajectory-ledger-prefix-v1",
+            "trajectory_headers_examined": len(trajectories),
+        }
+
+    def _media_reference_for_entry(
+        self,
+        *,
+        memory_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        media_id = str(metadata.get("media_id") or "")
+        trajectory_id = str(metadata.get("trajectory_id") or "")
+        state_index = metadata.get("state_index")
+        indexed = self._media_reference_index.get(media_id)
+        trajectories = self._ledger.get("trajectories")
+        record = (
+            trajectories.get(trajectory_id)
+            if isinstance(trajectories, dict)
+            else None
+        )
+        memory_ids = record.get("memory_ids") if isinstance(record, dict) else None
+        require(
+            _MEDIA_ID_PATTERN.fullmatch(media_id) is not None
+            and type(state_index) is int
+            and isinstance(memory_ids, list)
+            and 0 <= state_index < len(memory_ids)
+            and str(memory_ids[state_index]) == memory_id
+            and media_id == self._media_id(trajectory_id, state_index)
+            and isinstance(indexed, dict)
+            and indexed.get("trajectory_id") == trajectory_id
+            and indexed.get("state_index") == state_index
+            and indexed.get("memory_id") == memory_id,
+            "retrieval media reference does not bind to the insert ledger",
+        )
+        assert isinstance(indexed, dict)
+        return indexed
+
+    def _thumbnail_path(self, runtime: _Runtime, media_id: str) -> Path:
+        require(
+            _MEDIA_ID_PATTERN.fullmatch(media_id) is not None,
+            "thumbnail media reference is invalid",
+        )
+        derivative = runtime.derivatives_dir / f"{media_id}.jpg"
+        try:
+            observed = os.lstat(derivative)
+        except OSError as exc:
+            raise RuntimeError("thumbnail derivative is unavailable") from exc
+        require(
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_uid == os.getuid()
+            and observed.st_nlink == 1
+            and stat.S_IMODE(observed.st_mode) == 0o600
+            and 0 < observed.st_size <= self._image["max_thumbnail_bytes"],
+            "thumbnail derivative is not an owner-private bounded regular file",
+        )
+        # Re-open with O_NOFOLLOW and re-check the fixed byte ceiling so a
+        # pathname replacement cannot be returned unchecked.
+        digest, size = _stream_regular_file(
+            derivative,
+            owner="thumbnail derivative",
+            maximum_bytes=self._image["max_thumbnail_bytes"],
+        )
+        indexed = self._media_reference_index.get(media_id)
+        require(
+            isinstance(indexed, dict)
+            and type(indexed.get("thumbnail_bytes")) is int
+            and size == indexed["thumbnail_bytes"]
+            and isinstance(indexed.get("thumbnail_sha256"), str)
+            and secrets.compare_digest(digest, indexed["thumbnail_sha256"]),
+            "thumbnail derivative does not match its sealed ledger binding",
+        )
+        return derivative
+
+    def _query_image_similarity(
+        self,
+        runtime: _Runtime,
+        query_image: str,
+        *,
+        scope_media_ids: list[str],
+        scope_summary: dict[str, Any],
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Run the optional transient visual lane with a content-free receipt."""
+
+        result_limit = min(
+            int(self._retrieval["result_limit"]), QUERY_IMAGE_RESULT_LIMIT_CEILING
+        )
+        candidate_limit = min(
+            int(self._retrieval["candidate_limit"]),
+            QUERY_IMAGE_CANDIDATE_LIMIT_CEILING,
+        )
+        metadata: dict[str, Any] = {
+            "schema": QUERY_IMAGE_META_SCHEMA,
+            "provided": True,
+            "status": "failure",
+            "reason_code": "query-image-rejected",
+            "result_count": 0,
+            "scope_reference_count": len(scope_media_ids),
+            "scope_total_reference_count": int(
+                scope_summary["total_reference_count"]
+            ),
+            "scope_truncated_reference_count": int(
+                scope_summary["truncated_reference_count"]
+            ),
+            "scope_complete": bool(scope_summary["complete"]),
+            "scope_selection_policy": str(scope_summary["selection_policy"]),
+            "scope_trajectory_headers_examined": int(
+                scope_summary["trajectory_headers_examined"]
+            ),
+            "compatible_candidate_count": 0,
+            "result_limit": result_limit,
+            "candidate_limit": candidate_limit,
+            "time_budget_seconds": QUERY_IMAGE_TIME_BUDGET_SECONDS,
+            "query_persisted": False,
+            "media_cache_written": False,
+            "raw_path_returned": False,
+            "feature_print_bytes_returned": False,
+            "scratch_removed": False,
+        }
+        scratch_root: Path | None = None
+        safe_root = runtime.safe_root
+        try:
+            try:
+                source = _bootstrap.require_no_symlink_components(
+                    Path(query_image), owner="query image source"
+                )
+                source = _bootstrap.require_outside_live_store(
+                    source, owner="query image source"
+                )
+                scratch_root, safe_root = _mkdtemp_private(
+                    parent=runtime.runtime_root,
+                    prefix=".query-image-",
+                    owner="query image scratch",
+                )
+                suffix = source.suffix.lower()
+                if suffix not in {".png", ".jpg", ".jpeg", ".heic"}:
+                    suffix = ".image"
+                scratch = scratch_root / f"query{suffix}"
+                copied = _stream_copy_private(
+                    source,
+                    scratch,
+                    owner="query image source",
+                    maximum_bytes=self._image["max_source_bytes"],
+                )
+                require(
+                    int(copied["bytes"]) > 0,
+                    "query image source must not be empty",
+                )
+                modules = _synapse()
+                media_similarity = modules["media_similarity"]
+                projection = media_similarity.query_similar_media_transient(
+                    runtime.binding,
+                    scratch,
+                    scope_media_ids=scope_media_ids,
+                    result_limit=result_limit,
+                    candidate_limit=candidate_limit,
+                    time_budget_seconds=QUERY_IMAGE_TIME_BUDGET_SECONDS,
+                    vision_enricher=(
+                        self._query_vision_enricher or self._vision_enricher
+                    ),
+                    vision_input_derivative=QUERY_IMAGE_INPUT_DERIVATIVE,
+                )
+                candidate = projection.get("candidate")
+                results = projection.get("results")
+                require(
+                    isinstance(candidate, dict) and isinstance(results, list),
+                    "transient image similarity returned an invalid projection",
+                )
+                compatible_count = int(candidate.get("compatible_count") or 0)
+                require(
+                    0 <= compatible_count <= candidate_limit
+                    and len(results) <= result_limit,
+                    "transient image similarity exceeded its fixed bounds",
+                )
+                selected: list[str] = []
+                seen: set[str] = set()
+                authorized = set(scope_media_ids)
+                for item in results:
+                    media_id = str((item or {}).get("media_id") or "")
+                    require(
+                        media_id in authorized and media_id not in seen,
+                        "transient image similarity returned an unauthorized result",
+                    )
+                    seen.add(media_id)
+                    selected.append(media_id)
+                scope_complete = bool(scope_summary["complete"])
+                metadata.update(
+                    {
+                        "status": "applied"
+                        if compatible_count and scope_complete
+                        else "degraded",
+                        "reason_code": (
+                            None
+                            if compatible_count and scope_complete
+                            else "authoritative-scope-truncated"
+                            if compatible_count
+                            else "no-compatible-feature-prints"
+                        ),
+                        "result_count": len(selected),
+                        "compatible_candidate_count": compatible_count,
+                    }
+                )
+                return selected, metadata
+            except Exception as exc:
+                media_similarity = _synapse()["media_similarity"]
+                if isinstance(exc, media_similarity.MediaSimilarityIncompatible):
+                    metadata.update(
+                        status="degraded",
+                        reason_code="query-feature-print-incompatible",
+                    )
+                elif isinstance(
+                    exc, media_similarity.MediaSimilarityIntegrityDrift
+                ):
+                    metadata.update(
+                        status="failure",
+                        reason_code="authoritative-media-integrity-drift",
+                    )
+                elif isinstance(exc, media_similarity.MediaSimilarityError):
+                    metadata.update(
+                        status="degraded",
+                        reason_code="vision-or-similarity-unavailable",
+                    )
+                elif isinstance(
+                    exc,
+                    (
+                        RuntimeError,
+                        ValueError,
+                        OSError,
+                        _bootstrap.BootstrapError,
+                    ),
+                ):
+                    metadata.update(
+                        status="failure",
+                        reason_code="query-image-rejected",
+                    )
+                else:
+                    raise
+                return [], metadata
+        finally:
+            if scratch_root is not None and os.path.lexists(scratch_root):
+                _remove_disposable_tree(
+                    scratch_root,
+                    safe_root=safe_root,
+                    owner="query image scratch cleanup",
+                )
+            metadata["scratch_removed"] = scratch_root is None or not os.path.lexists(
+                scratch_root
+            )
 
     def query(
         self,
@@ -1568,18 +2133,11 @@ class SynapseS2Memory(Memory):
         bounded_query, query_truncated = _sanitize_bounded(
             query.strip(), MAX_QUERY_BYTES
         )
-        query_image_meta: dict[str, Any] | None = None
         if query_image is not None:
             require(
-                isinstance(query_image, str) and query_image.strip(),
+                isinstance(query_image, str) and bool(query_image.strip()),
                 "query_image must be null or a non-empty path string",
             )
-            query_image_meta = {
-                "provided": True,
-                "mode": "text-only-fallback",
-                "reason": QUERY_IMAGE_FALLBACK_REASON,
-                "query_image_exists": Path(query_image).is_file(),
-            }
         with self._query_lock:
             try:
                 envelope = runtime.adapter.query(
@@ -1594,25 +2152,76 @@ class SynapseS2Memory(Memory):
                 )
             except ValueError as exc:
                 raise RuntimeError("retrieval rejected the query") from exc
-        items: list[MemoryContextItem] = []
-        seen_images: set[str] = set()
+        envelope_items = envelope.get("items")
+        require(
+            isinstance(envelope_items, list)
+            and len(envelope_items) <= int(self._retrieval["result_limit"]),
+            "retrieval returned an invalid result envelope",
+        )
+
+        similar_media_ids: list[str] = []
+        query_image_meta: dict[str, Any] | None = None
+        if query_image is not None:
+            image_candidate_limit = min(
+                int(self._retrieval["candidate_limit"]),
+                QUERY_IMAGE_CANDIDATE_LIMIT_CEILING,
+            )
+            authoritative_media, scope_summary = self._authoritative_media_scope(
+                runtime,
+                maximum_references=image_candidate_limit,
+            )
+            similar_media_ids, query_image_meta = self._query_image_similarity(
+                runtime,
+                query_image,
+                scope_media_ids=authoritative_media,
+                scope_summary=scope_summary,
+            )
+
+        text_rows: list[tuple[MemoryContextItem, str]] = []
+        seen_memory_ids: set[str] = set()
         max_item_bytes = int(self._retrieval["max_text_item_bytes"])
-        for entry in envelope.get("items", []):
+        for entry in envelope_items:
+            require(isinstance(entry, dict), "retrieval result item is invalid")
             memory_id = str(entry.get("memory_id") or "")
+            require(
+                bool(memory_id) and memory_id not in seen_memory_ids,
+                "retrieval returned a missing or duplicate memory identity",
+            )
+            seen_memory_ids.add(memory_id)
             header = f"[{entry.get('tag')}]"
             body = str(entry.get("excerpt") or entry.get("summary") or entry.get("label") or "")
             text_value, _ = _truncate_utf8(f"{header} {body}".strip(), max_item_bytes)
-            items.append({"type": "text", "value": text_value})
             stored = runtime.adapter.get_entry(memory_id) if memory_id else None
             metadata = (stored or {}).get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
             media_id = str(metadata.get("media_id") or "")
-            if media_id and media_id not in seen_images:
-                derivative = runtime.derivatives_dir / f"{media_id}.jpg"
-                require(
-                    derivative.is_file(),
-                    f"thumbnail derivative missing for media {media_id}",
+            if media_id:
+                self._media_reference_for_entry(
+                    memory_id=memory_id,
+                    metadata=metadata,
                 )
+            text_rows.append(({"type": "text", "value": text_value}, media_id))
+
+        # Visual matches lead in their deterministic similarity order; text
+        # evidence retains the backend order.  A stored image may be selected
+        # by both signals but its thumbnail is returned once only.
+        items: list[MemoryContextItem] = []
+        seen_images: set[str] = set()
+        image_limit = int(self._retrieval["result_limit"])
+        for media_id in similar_media_ids:
+            if media_id in seen_images or len(seen_images) >= image_limit:
+                continue
+            derivative = self._thumbnail_path(runtime, media_id)
+            seen_images.add(media_id)
+            items.append({"type": "image", "value": str(derivative)})
+        for text_item, media_id in text_rows:
+            items.append(text_item)
+            if (
+                media_id
+                and media_id not in seen_images
+                and len(seen_images) < image_limit
+            ):
+                derivative = self._thumbnail_path(runtime, media_id)
                 seen_images.add(media_id)
                 items.append({"type": "image", "value": str(derivative)})
         self._last_query_meta_local.value = {
@@ -1624,7 +2233,11 @@ class SynapseS2Memory(Memory):
             "query_invocation_id": self.get_query_context().get("query_invocation_id"),
             "vision": dict(self._vision_status),
             "query_image": query_image_meta,
-            "released_after_query": self._release_after_query,
+            "release_after_query": self._release_after_query,
+            "released_after_query": False,
+            "release_state": "pending-post-query-hook"
+            if self._release_after_query
+            else "not-requested",
             "official_score_claimed": False,
         }
         return items
@@ -1644,12 +2257,18 @@ class SynapseS2Memory(Memory):
                     isinstance(item, dict) and item.get("type") == "image"
                     for item in memory_context
                 )
-                self.close()
-                require(
-                    not has_image_context,
-                    "per-question image context requires the transient image "
-                    "integration tranche",
-                )
+                if has_image_context:
+                    # The pinned harness consumes image paths only *after*
+                    # this hook.  Its wrapper-owned per-question finally guard
+                    # closes this instance after prompt construction, keeping
+                    # the derivatives available for tokenization/data-URL
+                    # conversion and still guaranteeing deterministic cleanup.
+                    result["released_after_query"] = False
+                    result["release_state"] = "deferred-for-image-consumption"
+                else:
+                    self.close()
+                    result["released_after_query"] = True
+                    result["release_state"] = "closed-by-post-query-hook"
             return result
         return None
 
@@ -1841,14 +2460,39 @@ class SynapseS2Memory(Memory):
         )
         files[STORE_FILE_RELATIVE] = {"sha256": store_digest, "bytes": store_size}
 
-        referenced_media = sorted(
-            {
-                media["media_id"]
-                for record in self._ledger["trajectories"].values()
-                for media in record["media"]
-            }
+        media_entries = {
+            str(media["media_id"]): media
+            for record in self._ledger["trajectories"].values()
+            for media in record["media"]
+        }
+        referenced_media = sorted(media_entries)
+        require(
+            len(referenced_media) <= MAX_MEDIA_CACHE_OBJECTS,
+            "artifact media count exceeds the fixed cache object bound",
+        )
+        media_reader_type = _synapse()["image_capture"].MediaObjectReader
+        if referenced_media:
+            _create_private_directory(
+                output_dir / MEDIA_CACHE_DIR_NAME,
+                owner="sealed private media cache",
+            )
+            _create_private_directory(
+                output_dir / MEDIA_CACHE_OBJECTS_RELATIVE,
+                owner="sealed private media object inventory",
+            )
+        artifact_media_reader = media_reader_type(
+            output_dir / MEDIA_CACHE_DIR_NAME
         )
         for media_id in referenced_media:
+            media = media_entries[media_id]
+            cache_manifest, cache_artifacts = (
+                runtime.cache.reader.read_object_artifacts(media_id)
+            )
+            _require_media_object_binding(
+                manifest=cache_manifest,
+                artifacts=cache_artifacts,
+                media=media,
+            )
             source = runtime.derivatives_dir / f"{media_id}.jpg"
             relative = f"{DERIVATIVES_DIR_NAME}/{media_id}.jpg"
             files[relative] = _stream_copy_private(
@@ -1856,6 +2500,42 @@ class SynapseS2Memory(Memory):
                 output_dir / relative,
                 owner="thumbnail derivative",
                 maximum_bytes=self._image["max_thumbnail_bytes"],
+            )
+            require(
+                files[relative]["sha256"] == media["thumbnail_sha256"]
+                and files[relative]["bytes"] == media["thumbnail_bytes"]
+                and cache_artifacts["thumbnail.jpg"]
+                == _read_regular_file_bytes(
+                    output_dir / relative,
+                    owner="sealed thumbnail derivative",
+                    maximum_bytes=self._image["max_thumbnail_bytes"],
+                ),
+                "thumbnail derivative does not bind to its private media object",
+            )
+            for filename in sorted(cache_artifacts):
+                cache_relative = _media_cache_relative(media_id, filename)
+                payload = cache_artifacts[filename]
+                require(
+                    0 < len(payload) <= _artifact_file_limit(cache_relative),
+                    "private media object file exceeds its fixed byte bound",
+                )
+                _write_private_file(output_dir / cache_relative, payload)
+                files[cache_relative] = {
+                    "sha256": _sha256_hex(payload),
+                    "bytes": len(payload),
+                }
+            sealed_manifest, sealed_artifacts = (
+                artifact_media_reader.read_object_artifacts(media_id)
+            )
+            require(
+                sealed_manifest == cache_manifest
+                and sealed_artifacts == cache_artifacts,
+                "private media object changed while being sealed",
+            )
+            _require_media_object_binding(
+                manifest=sealed_manifest,
+                artifacts=sealed_artifacts,
+                media=media,
             )
 
         ledger_bytes = _canonical_json_bytes(self._ledger)
@@ -2110,7 +2790,9 @@ class SynapseS2Memory(Memory):
                 assert isinstance(metadata, dict)
                 expected_metadata_keys = set(_STORE_METADATA_KEYS)
                 if state_index in media_by_state:
-                    expected_metadata_keys.add("media_id")
+                    expected_metadata_keys.update(
+                        {"media_id", "media_object_sha256"}
+                    )
                 require(
                     set(metadata) == expected_metadata_keys,
                     "restored store metadata does not match the fixed schema",
@@ -2147,7 +2829,9 @@ class SynapseS2Memory(Memory):
                     require(
                         metadata.get("memory_type") == "image"
                         and metadata.get("media_id")
-                        == media_by_state[state_index]["media_id"],
+                        == media_by_state[state_index]["media_id"]
+                        and metadata.get("media_object_sha256")
+                        == media_by_state[state_index]["media_object_sha256"],
                         "restored store media binding is inconsistent",
                     )
                 else:
@@ -2457,19 +3141,61 @@ class SynapseS2Memory(Memory):
             "artifact manifest counts do not match the insert ledger",
         )
         media_entries: dict[str, dict[str, Any]] = {}
-        for record in ledger["trajectories"].values():
+        loaded_media_index: dict[str, dict[str, Any]] = {}
+        for trajectory_id, record in ledger["trajectories"].items():
             for media in record["media"]:
-                media_entries[str(media["media_id"])] = media
+                media_id = str(media["media_id"])
+                state_index = int(media["state_index"])
+                media_entries[media_id] = media
+                loaded_media_index[media_id] = {
+                    "trajectory_id": trajectory_id,
+                    "state_index": state_index,
+                    "memory_id": str(record["memory_ids"][state_index]),
+                    "thumbnail_sha256": str(media["thumbnail_sha256"]),
+                    "thumbnail_bytes": int(media["thumbnail_bytes"]),
+                    "media_object_sha256": str(media["media_object_sha256"]),
+                }
         require(
             manifest.get("media_count") == len(media_entries),
             "artifact manifest media count does not match the insert ledger",
         )
-        expected_from_ledger = {MEMORY_CONFIG_NAME, LEDGER_NAME, STORE_FILE_RELATIVE} | {
-            f"{DERIVATIVES_DIR_NAME}/{media_id}.jpg" for media_id in media_entries
-        }
+        require(
+            len(media_entries) <= MAX_MEDIA_CACHE_OBJECTS,
+            "artifact media count exceeds the fixed cache object bound",
+        )
+        media_reader_type = _synapse()["image_capture"].MediaObjectReader
+        artifact_media_reader = media_reader_type(
+            input_dir / MEDIA_CACHE_DIR_NAME
+        )
+        require(
+            artifact_media_reader.object_ids() == sorted(media_entries),
+            "artifact private media object inventory does not match the ledger",
+        )
+        cache_object_files: set[str] = set()
+        for media_id, media in media_entries.items():
+            cache_manifest, cache_artifacts = (
+                artifact_media_reader.read_object_artifacts(media_id)
+            )
+            _require_media_object_binding(
+                manifest=cache_manifest,
+                artifacts=cache_artifacts,
+                media=media,
+            )
+            cache_object_files.update(
+                _media_cache_relative(media_id, filename)
+                for filename in cache_artifacts
+            )
+        expected_from_ledger = (
+            {MEMORY_CONFIG_NAME, LEDGER_NAME, STORE_FILE_RELATIVE}
+            | {
+                f"{DERIVATIVES_DIR_NAME}/{media_id}.jpg"
+                for media_id in media_entries
+            }
+            | cache_object_files
+        )
         require(
             set(files) == expected_from_ledger,
-            "artifact manifest file list does not match the insert ledger media",
+            "artifact manifest file list does not match the exact ledger media inventory",
         )
         for media_id, media in media_entries.items():
             listed = files[f"{DERIVATIVES_DIR_NAME}/{media_id}.jpg"]
@@ -2521,13 +3247,68 @@ class SynapseS2Memory(Memory):
             runtime.adapter = modules["longmem_eval"].LongMemInsertQueryAdapter(backend)
             for media_id in media_entries:
                 relative = f"{DERIVATIVES_DIR_NAME}/{media_id}.jpg"
-                _stream_copy_private(
+                copied_derivative = _stream_copy_private(
                     input_dir / relative,
                     runtime.derivatives_dir / f"{media_id}.jpg",
                     owner=f"artifact media derivative {media_id}",
                     maximum_bytes=self._image["max_thumbnail_bytes"],
                 )
+                require(
+                    copied_derivative == files[relative],
+                    "artifact media derivative changed during restore",
+                )
+            if media_entries:
+                runtime.cache._prepare_cache()
+            for media_id, media in media_entries.items():
+                cache_manifest, cache_artifacts = (
+                    artifact_media_reader.read_object_artifacts(media_id)
+                )
+                _require_media_object_binding(
+                    manifest=cache_manifest,
+                    artifacts=cache_artifacts,
+                    media=media,
+                )
+                object_root = runtime.cache.objects_root / media_id
+                require(
+                    object_root.parent == runtime.cache.objects_root
+                    and not os.path.lexists(object_root),
+                    "restored private media object is not a fresh canonical child",
+                )
+                _require_owner_private_directory(
+                    runtime.cache.objects_root,
+                    owner="restored private media object parent",
+                )
+                os.mkdir(object_root, mode=0o700)
+                os.chmod(object_root, 0o700)
+                _require_owner_private_directory(
+                    object_root,
+                    owner="restored private media object",
+                )
+                for filename in sorted(cache_artifacts):
+                    _write_private_file(
+                        object_root / filename,
+                        cache_artifacts[filename],
+                    )
+                restored_manifest, restored_artifacts = (
+                    runtime.cache.reader.read_object_artifacts(media_id)
+                )
+                require(
+                    restored_manifest == cache_manifest
+                    and restored_artifacts == cache_artifacts,
+                    "private media object changed during restore",
+                )
+                _require_media_object_binding(
+                    manifest=restored_manifest,
+                    artifacts=restored_artifacts,
+                    media=media,
+                )
+            if media_entries:
+                require(
+                    runtime.cache.reader.object_ids() == sorted(media_entries),
+                    "restored private media object inventory changed",
+                )
             self._ledger = ledger
+            self._media_reference_index = loaded_media_index
             self._content_identities.clear()
             self._persist_ledger(runtime)
         except BaseException:
@@ -2543,6 +3324,7 @@ class SynapseS2Memory(Memory):
         if runtime is None:
             self._closed = True
             self._content_identities.clear()
+            self._media_reference_index.clear()
             self.clear_query_context()
             return
         failures: list[BaseException] = []
@@ -2571,6 +3353,7 @@ class SynapseS2Memory(Memory):
             self._runtime = None
             self._closed = True
             self._content_identities.clear()
+            self._media_reference_index.clear()
             self.clear_query_context()
             if hasattr(self._last_query_meta_local, "value"):
                 delattr(self._last_query_meta_local, "value")

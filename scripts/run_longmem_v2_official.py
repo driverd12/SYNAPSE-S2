@@ -186,7 +186,15 @@ def _open_bounded_regular(
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow == 0:
         _fail(f"{owner} cannot be opened safely on this platform")
-    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    # The type check happens only after open. O_NONBLOCK must therefore be on
+    # the initial nofollow open so a caller-supplied FIFO/device cannot stall
+    # the wrapper before fstat rejects it as non-regular.
+    flags = (
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     parent_fd, _parent, _parent_stat = _open_directory_nofollow(
         path.parent, owner=f"{owner} parent"
     )

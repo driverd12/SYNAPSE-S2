@@ -23,7 +23,10 @@ LONGMEM_V2_OFFICIAL_DEPS=/absolute/path/to/operator-staged/dependencies \
 For a full run, the questions, haystack, and trajectories JSON files are
 streamed into bounded owner-private copies. The trajectories tree must contain
 only regular files/directories; prepare screenshot data in official copy mode,
-not symlink mode. The output parent must already exist and the final output
+not symlink mode. Every caller-file lane (questions, haystack, trajectories,
+memory config, and API-key files) uses a nonblocking no-follow open before
+type validation, so FIFOs/devices fail as content-free errors instead of
+stalling the wrapper. The output parent must already exist and the final output
 name must not exist—the wrapper stages under its private run root, validates
 the result tree, and publishes it once with an atomic no-clobber rename.
 
@@ -33,6 +36,37 @@ copied into the private run root and removed at completion. Per-question
 SYNAPSE memories are closed in a `finally` guard (including failed queries),
 while shared memories remain available for the full question stream and are
 closed before teardown.
+
+The `synapse_s2` adapter also implements the official optional `query_image`
+lane without inserting the question image into memory. It streams the source
+through a no-follow byte bound into a fresh owner-`0600` scratch file beneath
+the wrapper-created disposable runtime, compares that file transiently with
+only the ledger-and-store-witnessed media IDs in the question namespace, and
+removes the scratch in `finally`. Results expose only already-existing bounded
+thumbnail derivatives; feature-print bytes, OCR, raw paths, and query digests
+never enter the context or hook receipt. The visual scan is fixed at no more than
+50 results, 512 candidates, and 2 seconds, further reduced by the configured
+text retrieval limits. If more than 512 authoritative media references exist,
+the deterministic sorted-trajectory ledger prefix is scanned and the hook
+receipt reports exact selected/total/truncated counts plus
+`scope_complete: false`; an incomplete scope is reported as degraded. Missing
+compatible feature prints or unavailable Apple Vision is likewise a visible,
+content-free degradation to text retrieval, not a score claim and not a
+fabricated durable query image. Every returned thumbnail is re-opened with
+`O_NOFOLLOW` and must match its sealed ledger byte count and SHA-256 binding;
+the digest itself is never returned.
+
+Before inserting a new trajectory, the adapter counts its complete screenshot
+delta against the fixed 10,000-object media ceiling using the validated
+in-process reference index. An over-limit trajectory is rejected before its
+first store, derivative, or cache mutation; this check remains constant-time
+in prior media volume rather than rescanning the full ledger on every insert.
+
+For per-question memories that return image context, `post_query_hook` leaves
+the thumbnail paths live because the pinned harness tokenizes and converts
+them only after the hook. The wrapper's existing per-question `finally` guard
+then closes the memory after prompt construction. Text-only per-question
+queries retain the earlier immediate post-hook release.
 
 Loading a saved memory requires independent operator provenance:
 
@@ -50,6 +84,16 @@ Loading a saved memory requires independent operator provenance:
 
 The expected manifest digest is supplied out of band, never trusted from the
 artifact, and is runtime-only—it is not written into a saved memory config.
+Artifact schema v3 carries the exact owner-private `media-cache/objects` files
+referenced by the insert ledger (validated manifests, bounded thumbnails, and
+compatible bounded feature prints when present). Raw originals, cache locks,
+and unreferenced/orphan objects are excluded. Each object's exact byte
+inventory is bound into both its ledger record and authoritative store row;
+save, pre-restore, and post-copy validation reuse the production
+`MediaObjectReader` contract. Consequently, a caller-SHA-pinned loaded memory
+retains transient image-similarity recall, while re-signed inner manifests,
+vectors, missing/extra files, coherent thumbnail tampering, and foreign object
+directories fail closed.
 Verification and wrapper completion records always carry
 `official_score_claimed: false`; only a separately reviewed complete official
 reader/evaluator run can support a benchmark-score claim.

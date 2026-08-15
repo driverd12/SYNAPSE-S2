@@ -24,7 +24,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ADAPTER_VERSION = "2.0.0"
+ADAPTER_VERSION = "3.0.0"
 OFFICIAL_COMMIT_PIN = "2cc8c540bdb87fe6761629b585e727e1c4704520"
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]

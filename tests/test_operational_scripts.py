@@ -49,6 +49,29 @@ def _write_test_core_config(data_root: Path) -> CoreConfig:
 
 class OperationalScriptTests(unittest.TestCase):
     @staticmethod
+    def _memora_audit() -> dict:
+        return {
+            "schema": "synapse-s2.memora-recovery-audit.v1",
+            "audit_revision": "9" * 64,
+            "catalog_count": 0,
+            "binding_projection_count": 0,
+            "governance_event_receipt_count": 0,
+            "source_witness_count": 0,
+            "cue_count": 0,
+            "promoted_binding_count": 0,
+            "effective_binding_count": 0,
+            "ineffective_promoted_binding_count": 0,
+            "provider_drift_binding_count": 0,
+            "source_drift_binding_count": 0,
+            "active_provider_revision": "absent",
+            "integrity_valid": True,
+            "effective_bindings_valid": True,
+            "raw_cue_terms_included": False,
+            "raw_source_text_included": False,
+            "vectors_included": False,
+        }
+
+    @staticmethod
     def _capture_ledger_binding(*, revision: str = "a" * 64) -> dict:
         return {
             "schema": "synapse-s2.capture-ledger-binding-proof.v1",
@@ -97,17 +120,30 @@ class OperationalScriptTests(unittest.TestCase):
             "repairable_capture_count": 0,
             "blocked_capture_count": 0,
         }
+        memora = self._memora_audit()
         proof_path = temp_root / "isolated-proof.json"
         proof_path.write_text(
             json.dumps(
                 {
-                    "schema": "synapse-s2.recovery-bundle-restore.v1",
+                    "schema": "synapse-s2.recovery-bundle-restore.v3",
                     "mode": "isolated-recovery-proof",
                     "verified": True,
                     "cutover_ready": True,
+                    "auth_algorithm": "ed25519",
+                    "auth_key_id": "unit-test-public-key-id",
+                    "signing_public_key": "unit-test-public-key-material",
+                    "receipt_digest": "c" * 64,
+                    "receipt_signature": "unit-test-signature",
                     "missing_transport_ledger_count": 0,
                     "capture_ledger_binding": restore_binding,
                     "reconciliation": reconciliation,
+                    "media_included": False,
+                    "media_recovery_complete": True,
+                    "media_reference_count": 0,
+                    "media_sha256": None,
+                    "media_manifest_sha256": None,
+                    "media_object_count": 0,
+                    "memora_integrity": memora,
                 },
                 sort_keys=True,
             ),
@@ -117,18 +153,33 @@ class OperationalScriptTests(unittest.TestCase):
         evidence = {
             "verified": True,
             "bundle": {
+                "bundle_schema": "synapse-s2.recovery-bundle.v3",
                 "bundle_verified": True,
                 "cutover_ready": True,
                 "capture_file_count": 7,
                 "capture_ledger_binding": backup_binding,
                 "reconciliation": reconciliation,
+                "media_included": False,
+                "media_archive_sha256": None,
+                "media_manifest_sha256": None,
+                "media_object_count": 0,
+                "media_reconciliation": {"referenced_count": 0},
+                "memora_integrity": memora,
             },
             "verification": {
                 "verified": True,
                 "cutover_ready": True,
                 "receipt_identity_trusted": True,
+                "capture_database_binding": {
+                    "auth_key_id": "unit-test-public-key-id",
+                },
                 "capture_ledger_binding": verify_binding,
                 "reconciliation": reconciliation,
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_reference_count": 0,
+                "media": None,
+                "memora_integrity": memora,
             },
             "restore": {
                 "verified": True,
@@ -137,6 +188,11 @@ class OperationalScriptTests(unittest.TestCase):
                 "missing_transport_ledger_count": 0,
                 "capture_ledger_binding": restore_binding,
                 "reconciliation": reconciliation,
+                "media_included": False,
+                "media_recovery_complete": True,
+                "media_reference_count": 0,
+                "media_object_count": 0,
+                "memora_integrity": memora,
                 "recovery_proof_path": str(proof_path),
             },
             "capture_ledger_before": dict(audit),
@@ -347,6 +403,20 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             "xcrun --sdk macosx swiftc -parse native/apple_vision_enrich.swift",
             script,
         )
+
+    def test_prep_tomorrow_compiles_both_longmem_lanes(self):
+        script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text(encoding="utf-8")
+
+        for path in (
+            "longmem_eval.py",
+            "official_longmem/__init__.py",
+            "official_longmem/bootstrap.py",
+            "official_longmem/synapse_s2_memory.py",
+            "scripts/measure_longmem_v2.py",
+            "scripts/run_longmem_v2_official.py",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, script)
 
     def test_prep_tomorrow_certifies_immutably_before_explicit_apply(self):
         script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text(encoding="utf-8")
@@ -773,7 +843,15 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
 
     def test_local_launcher_installs_atomically_and_syntax_checks_result(self):
         with TemporaryDirectory() as tmp:
-            home = Path(tmp) / "home"
+            root = Path(tmp)
+            repo = root / "repo"
+            scripts = repo / "scripts"
+            runtime_bin = repo / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            runtime_bin.mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "install_local_launcher.sh", scripts)
+            (runtime_bin / "python").symlink_to(Path(sys.executable).resolve())
+            home = root / "home"
             launcher_dir = home / ".local" / "bin"
             launcher_dir.mkdir(parents=True, mode=0o755)
             launcher_dir.chmod(0o755)
@@ -781,8 +859,8 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
             environment["HOME"] = str(home)
 
             result = subprocess.run(
-                ["/bin/sh", str(ROOT / "scripts" / "install_local_launcher.sh")],
-                cwd=ROOT,
+                ["/bin/sh", str(scripts / "install_local_launcher.sh")],
+                cwd=repo,
                 env=environment,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -919,6 +997,13 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
     def test_local_launcher_refuses_symlink_target_without_following(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            repo = root / "repo"
+            scripts = repo / "scripts"
+            runtime_bin = repo / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            runtime_bin.mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "install_local_launcher.sh", scripts)
+            (runtime_bin / "python").symlink_to(Path(sys.executable).resolve())
             home = root / "home"
             launcher_dir = home / ".local" / "bin"
             launcher_dir.mkdir(parents=True)
@@ -930,8 +1015,8 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
             environment["HOME"] = str(home)
 
             result = subprocess.run(
-                ["/bin/sh", str(ROOT / "scripts" / "install_local_launcher.sh")],
-                cwd=ROOT,
+                ["/bin/sh", str(scripts / "install_local_launcher.sh")],
+                cwd=repo,
                 env=environment,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -946,7 +1031,15 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
 
     def test_local_launcher_does_not_remove_another_installers_lock(self):
         with TemporaryDirectory() as tmp:
-            home = Path(tmp) / "home"
+            root = Path(tmp)
+            repo = root / "repo"
+            scripts = repo / "scripts"
+            runtime_bin = repo / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            runtime_bin.mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "install_local_launcher.sh", scripts)
+            (runtime_bin / "python").symlink_to(Path(sys.executable).resolve())
+            home = root / "home"
             launcher_dir = home / ".local" / "bin"
             launcher_dir.mkdir(parents=True)
             lock = launcher_dir / ".synapse-s2-mcp.install.lock"
@@ -955,8 +1048,8 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
             environment["HOME"] = str(home)
 
             result = subprocess.run(
-                ["/bin/sh", str(ROOT / "scripts" / "install_local_launcher.sh")],
-                cwd=ROOT,
+                ["/bin/sh", str(scripts / "install_local_launcher.sh")],
+                cwd=repo,
                 env=environment,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -1334,8 +1427,20 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
                         self.assertEqual(results["recovery_backup"].status, "ready")
                         self.assertEqual(results["recovery_restore"].status, "blocked")
                     else:
-                        self.assertEqual(results["recovery_backup"].status, "ready")
-                        self.assertEqual(results["recovery_verify"].status, "ready")
+                        # All three current recovery checks are bound to the
+                        # same isolated proof. A missing restore binding makes
+                        # that shared proof incomplete and must revoke earlier
+                        # backup/verify readiness too; a present but malformed
+                        # binding remains attributable to the restore stage.
+                        expected_prior = (
+                            "blocked" if proof_name == "missing" else "ready"
+                        )
+                        self.assertEqual(
+                            results["recovery_backup"].status, expected_prior
+                        )
+                        self.assertEqual(
+                            results["recovery_verify"].status, expected_prior
+                        )
 
     def test_readiness_recovery_rejects_binding_drift_between_stages(self):
         original = self._capture_ledger_binding(revision="a" * 64)

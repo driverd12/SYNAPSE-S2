@@ -437,6 +437,15 @@ the caller may delete it immediately after the call:
   --limit 8
 ```
 
+The isolated [LongMemEval-V2 evaluation lane](docs/LONGMEM_V2_EVALUATION.md)
+uses that same transient comparator for the official harness's optional
+`query_image` argument. Its adapter inserts trajectories into a disposable
+namespace, returns bounded text and already-sealed thumbnail evidence, and can
+save/load a caller-digest-pinned portable memory artifact without opening the
+live SYNAPSE-S2 store. The deterministic local fixture gate and the pinned
+official-harness runner are separate: neither claims an official score unless
+the released corpus, reader, and judge complete under independent review.
+
 Real memory is stored locally in `.synapse_s2/memory.sqlite3`, and governed runtime toggles and session state live in the version-3 `.synapse_s2/runtime_state.json`. Installed MCP definitions and `$HOME/.codex/config.toml` carry only `SYNAPSE_S2_CORE_BINDING`; the owner-only binding loads and verifies the exact canonical core config before a candidate-v5 maintenance process starts or an authoritative-v6 client connects. It does not grant adapters an independent database, state, export, backup, capture, replication, or neural configuration. Authoritative exports, recovery paths, and the private replication inbox are published explicitly by the binding and constrained by the reviewed server layout; explicit local paths remain available only on the pre-governed offline maintenance lane.
 Each text memory stores `metadata.embedding_provider` provenance including provider id, provider type, model id, local-only status, semantic flag, dimensions, vector hash, and neural runtime fields when applicable (`native_mlx`, `pooling`, `source_dimensions`). Set `--embedding-provider semantic-hash` for the deterministic no-model fallback, `--embedding-provider lexical-hash` for exact legacy behavior, or `--embedding-provider python:/absolute/path/encoder.py:embed` to use a local callable that returns a vector or `{ "vector": [...], "model_id": "...", "semantic": true }`.
 Each event memory also stores `metadata.surprise_model`, `metadata.surprise_mode`, `metadata.semantic_surprise_score`, and `metadata.lexical_surprise_score`, so operators can tell whether a boundary was cut by semantic embedding distance or by lexical fallback.

@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -235,6 +236,70 @@ class OfficialRunnerStage1ATests(unittest.TestCase):
             with self.assertRaises(RUNNER._bootstrap.BootstrapError):
                 RUNNER._validate_run_request(args)
 
+    def test_all_caller_file_lanes_reject_fifo_fast_without_residue(self) -> None:
+        marker = "FIFO-PRIVATE-MARKER"
+        roots_before = {path.name for path in Path("/private/tmp").glob("s2lm-*")}
+        for label, attribute in (
+            ("questions", "questions_path"),
+            ("haystack", "haystack_path"),
+            ("trajectories", "trajectories_path"),
+        ):
+            with self.subTest(lane=label):
+                fifo = self.base / f"{marker}-{label}.fifo"
+                os.mkfifo(fifo, 0o600)
+                args = self._full_args()
+                setattr(args, attribute, str(fifo))
+                started = time.monotonic()
+                with self.assertRaises(RUNNER._bootstrap.BootstrapError) as caught:
+                    RUNNER._validate_run_request(args)
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertNotIn(marker, str(caught.exception))
+                self.assertFalse(Path(args.output_dir).exists())
+
+        config_fifo = self.base / f"{marker}-config.fifo"
+        os.mkfifo(config_fifo, 0o600)
+        _questions, _haystack, trajectories = self._inputs()
+        config_root = RUNNER._bootstrap.DisposableRunRoot()
+        config_root_path = config_root.base
+        try:
+            started = time.monotonic()
+            with self.assertRaises(RUNNER._bootstrap.BootstrapError) as caught:
+                RUNNER._generate_memory_config(
+                    argparse.Namespace(memory_config_path=str(config_fifo)),
+                    config_root,
+                    trajectories,
+                )
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertNotIn(marker, str(caught.exception))
+            self.assertFalse(
+                (config_root.trace_parent / "memory_config.json").exists()
+            )
+        finally:
+            config_root.close()
+        self.assertFalse(config_root_path.exists())
+
+        key_fifo = self.base / f"{marker}-api-key.fifo"
+        os.mkfifo(key_fifo, 0o600)
+        key_root = RUNNER._bootstrap.DisposableRunRoot()
+        key_root_path = key_root.base
+        try:
+            started = time.monotonic()
+            with self.assertRaises(RUNNER._bootstrap.BootstrapError) as caught:
+                RUNNER._stage_extra_harness_args(
+                    argparse.Namespace(
+                        harness_args=["--", "--api-key-file", str(key_fifo)]
+                    ),
+                    key_root,
+                )
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertNotIn(marker, str(caught.exception))
+            self.assertEqual(list(key_root.trace_parent.glob("api-key-*")), [])
+        finally:
+            key_root.close()
+        self.assertFalse(key_root_path.exists())
+        roots_after = {path.name for path in Path("/private/tmp").glob("s2lm-*")}
+        self.assertEqual(roots_after, roots_before)
+
     def test_official_inputs_are_staged_as_private_regular_files(self) -> None:
         args = self._full_args()
         paths = RUNNER._validate_run_request(args)
@@ -385,9 +450,20 @@ class OfficialRunnerStage1ATests(unittest.TestCase):
             def __init__(self, config):
                 self.config = config
                 self.close_count = 0
+                self.image_path = None
+                self.hook_saw_image = False
+                self.image_consumed = False
+
+            def post_query_hook(self):
+                self.hook_saw_image = bool(
+                    self.image_path is not None and self.image_path.is_file()
+                )
+                return {"release_state": "deferred-for-image-consumption"}
 
             def close(self):
                 self.close_count += 1
+                if self.image_path is not None:
+                    self.image_path.unlink(missing_ok=True)
 
         module = types.SimpleNamespace()
 
@@ -413,6 +489,12 @@ class OfficialRunnerStage1ATests(unittest.TestCase):
             memory = module.build_memory(config)
             if kwargs.get("fail"):
                 raise RuntimeError("synthetic query failure")
+            image_path = kwargs.get("image_path")
+            if isinstance(image_path, Path):
+                image_path.write_bytes(b"bounded-thumbnail")
+                memory.image_path = image_path
+                memory.post_query_hook()
+                memory.image_consumed = image_path.read_bytes() == b"bounded-thumbnail"
             return memory
 
         module.inject_runtime_memory_params = inject
@@ -428,6 +510,16 @@ class OfficialRunnerStage1ATests(unittest.TestCase):
             returned.config["memory_params"]["release_after_query"]
         )
         self.assertEqual(returned.close_count, 1)
+
+        image_path = self.base / "returned-thumbnail.jpg"
+        image_returned = module.build_prompt_row_with_per_question_memory(
+            workspace_dir=self.base / "image-question",
+            image_path=image_path,
+        )
+        self.assertTrue(image_returned.hook_saw_image)
+        self.assertTrue(image_returned.image_consumed)
+        self.assertEqual(image_returned.close_count, 1)
+        self.assertFalse(image_path.exists())
 
         with self.assertRaisesRegex(RuntimeError, "synthetic query failure"):
             module.build_prompt_row_with_per_question_memory(
