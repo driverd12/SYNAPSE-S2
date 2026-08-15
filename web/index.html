@@ -1231,8 +1231,8 @@
         <button id="impactToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="impactDrawer" title="Show approximate SYNAPSE-S2 impact">
           <strong>≈ Impact</strong><small id="footerImpact">hidden</small>
         </button>
-        <button id="memoraShadowToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="memoraShadowDrawer" title="Show shadow-only Memora consolidation proposals (never applied)">
-          <strong>◇ Shadow</strong><small id="footerMemoraShadow">hidden</small>
+        <button id="memoraShadowToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="memoraShadowDrawer" title="Review governed Memora cue bindings">
+          <strong>◇ Cues</strong><small id="footerMemoraShadow">hidden</small>
         </button>
       </footer>
       <aside id="impactDrawer" class="impact-drawer" hidden aria-labelledby="impactTitle">
@@ -1257,24 +1257,77 @@
         </div>
         <p id="impactCaveat" class="panel-note">Illustrative equivalent only. This is not a provider bill or a proven counterfactual saving; edit the assumptions to match your workflow.</p>
       </aside>
-      <aside id="memoraShadowDrawer" class="impact-drawer" hidden aria-labelledby="memoraShadowTitle">
+      <aside id="memoraShadowDrawer" class="impact-drawer memora-governance-drawer" hidden aria-labelledby="memoraShadowTitle">
         <div class="impact-drawer-header">
           <div>
-            <p class="section-label">Memora shadow (proposals only)</p>
-            <h2 id="memoraShadowTitle">Shadow consolidation proposals</h2>
+            <p class="section-label">Governed cue lifecycle</p>
+            <h2 id="memoraShadowTitle">Review and control Memora cues</h2>
           </div>
-          <button id="memoraShadowCloseButton" class="icon-button compact" type="button" aria-label="Hide Memora shadow panel">
+          <button id="memoraShadowCloseButton" class="icon-button compact" type="button" aria-label="Hide Memora governance panel">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
           </button>
         </div>
+        <p class="memora-authority-note">This local dashboard is session-gated and every mutation is sent to the authoritative Core. Workflow roles separate duties under the same authenticated Mac owner; they are not independently authenticated people.</p>
+        <div id="memoraGovernanceStatus" class="memora-governance-status" role="status" aria-live="polite" tabindex="-1">Loading governed cue state…</div>
         <div id="memoraShadowSummary" class="impact-metrics" aria-live="polite">
-          <div><span>Clusters proposed</span><strong>--</strong><small>shadow only; never applied</small></div>
-          <div><span>Entries embedded</span><strong>--</strong><small>bounded snapshot</small></div>
-          <div><span>Provider</span><strong>--</strong><small>pretrained inference</small></div>
-          <div><span>Learned</span><strong>--</strong><small>false = hash fallback</small></div>
+          <div><span>Shadow clusters</span><strong>--</strong><small>inspect before proposing</small></div>
+          <div><span>Governed bindings</span><strong>--</strong><small>current namespace</small></div>
+          <div><span>Effective cues</span><strong>--</strong><small>promoted and valid</small></div>
+          <div><span>Provider</span><strong>--</strong><small>pinned local model</small></div>
         </div>
-        <div id="memoraShadowClusters" class="impact-metrics" aria-live="polite"></div>
-        <p id="memoraShadowCaveat" class="panel-note">Shadow proposals from pretrained embedding inference over already-redacted durable text. Nothing is applied or persisted, retrieval results are unchanged, and every source memory stays independently deletable.</p>
+        <div class="memora-workflow-controls" aria-label="Memora workflow roles and mutation guard">
+          <label for="memoraProposerRole">Proposer workflow role<input id="memoraProposerRole" autocomplete="off" maxlength="128" value="dashboard-proposer" /></label>
+          <label for="memoraReviewerRole">Reviewer / revoker workflow role<input id="memoraReviewerRole" autocomplete="off" maxlength="128" value="dashboard-reviewer" /></label>
+          <label class="memora-reason-field" for="memoraDecisionReason">Reviewed reason<textarea id="memoraDecisionReason" rows="2" maxlength="1024" placeholder="Evidence reviewed and why this lifecycle action is appropriate"></textarea></label>
+          <div class="memora-confirm-row">
+            <label><input id="memoraDecisionConfirm" type="checkbox" /> I reviewed the selected binding’s current state and exact revision.</label>
+            <button id="memoraUnlockButton" class="guard-button unlock-button" type="button" aria-pressed="false">Unlock</button>
+          </div>
+          <p id="memoraGuardHint" class="guard-hint">Locked. Unlock for one confirmed lifecycle action.</p>
+        </div>
+        <div class="memora-governance-layout">
+          <section class="memora-governance-section" aria-labelledby="memoraShadowClustersTitle">
+            <div class="memora-section-header">
+              <div><p class="section-label">Shadow planner</p><h3 id="memoraShadowClustersTitle">Candidate clusters</h3></div>
+              <button id="memoraShadowRefreshButton" class="secondary-button" type="button">Refresh</button>
+            </div>
+            <p class="panel-note">A proposal persists reviewed routing evidence but never promotes automatically.</p>
+            <div id="memoraShadowClusters" class="memora-shadow-clusters" aria-live="polite"></div>
+          </section>
+          <section class="memora-governance-section" aria-labelledby="memoraCatalogTitle">
+            <div class="memora-section-header">
+              <div><p class="section-label">Authoritative catalog</p><h3 id="memoraCatalogTitle">Governed bindings</h3></div>
+              <button id="memoraCatalogRefreshButton" class="secondary-button" type="button">Refresh</button>
+            </div>
+            <label class="memora-state-filter" for="memoraStateFilter">State
+              <select id="memoraStateFilter">
+                <option value="">All states</option>
+                <option value="proposed">Proposed</option>
+                <option value="promoted">Promoted</option>
+                <option value="rejected">Rejected</option>
+                <option value="revoked">Revoked</option>
+                <option value="superseded">Superseded</option>
+              </select>
+            </label>
+            <div id="memoraCatalog" class="memora-catalog" role="list" aria-live="polite"></div>
+          </section>
+          <section class="memora-governance-section memora-detail-section" aria-labelledby="memoraBindingTitle">
+            <div class="memora-section-header">
+              <div><p class="section-label">Selected binding</p><h3 id="memoraBindingTitle" tabindex="-1">Choose a governed binding</h3></div>
+              <span id="memoraBindingState" class="memora-state-badge">—</span>
+            </div>
+            <div id="memoraBindingFacts" class="memora-binding-facts"><p class="empty-result">Select a binding to inspect its safe projection, receipt history, and audit.</p></div>
+            <div id="memoraBindingCues" class="memora-binding-cues" aria-label="Derived cue terms"></div>
+            <div id="memoraBindingActions" class="memora-binding-actions" aria-label="Governed lifecycle controls">
+              <button id="memoraPromoteButton" class="primary-button" type="button" disabled>Promote</button>
+              <button id="memoraRejectButton" class="secondary-button" type="button" disabled>Reject</button>
+              <button id="memoraRevokeButton" class="danger-button" type="button" disabled>Revoke</button>
+            </div>
+            <div id="memoraAudit" class="memora-audit" aria-live="polite"><strong>Audit</strong><span>Choose a binding</span></div>
+            <div><p class="section-label">Validated receipt history</p><div id="memoraHistory" class="memora-history" role="list"></div></div>
+          </section>
+        </div>
+        <p id="memoraShadowCaveat" class="panel-note">Learned cues are untrusted relevance routing only. Source memories remain independently deletable; no raw text, vectors, or witness internals are shown here.</p>
       </aside>
       <aside id="recipeDrawer" class="recipe-drawer" hidden aria-label="Operator recipes">
         <div class="recipe-drawer-header">

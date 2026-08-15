@@ -25,7 +25,7 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from core_client_binding import CoreClientBinding, apply_binding_environment
@@ -44,10 +44,16 @@ from capture_daemon import CaptureInboxDaemon  # noqa: E402
 from core_client import (  # noqa: E402
     CoreClient,
     CoreOutcomeUnknown,
+    CoreRemoteError,
     outcome_unknown_projection,
 )
 import mlx_backend  # noqa: E402
 import media_similarity  # noqa: E402
+from memora_governance import (  # noqa: E402
+    MemoraGovernanceError,
+    MemoraGovernanceIntegrityError,
+    MemoraGovernanceNotFound,
+)
 from image_capture import (  # noqa: E402
     ImageCaptureCache,
     ImageCaptureError,
@@ -62,10 +68,15 @@ from redaction import (  # noqa: E402
     redact_capture_text,
     redact_sensitive_value,
     safe_public_error,
+    reject_sensitive_identifier,
     strip_untrusted_raw_digest_fields,
 )
 from transcript_capture import TranscriptCaptureManager  # noqa: E402
-from token_contracts import COMPACT_SOURCE_LIMITS  # noqa: E402
+from token_contracts import (  # noqa: E402
+    COMPACT_SOURCE_LIMITS,
+    ResponseContractError,
+    project_response,
+)
 
 
 LOGGER = logging.getLogger("synapse_s2.dashboard")
@@ -113,6 +124,15 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
 }
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+MEMORA_DASHBOARD_RESPONSE_BYTES = 24 * 1024
+MEMORA_DASHBOARD_SHADOW_SOURCE_BYTES = 256 * 1024
+MEMORA_DASHBOARD_LIST_LIMIT = 16
+MEMORA_BINDING_ID_RE = re.compile(r"s2mb_[0-9a-f]{32}\Z")
+MEMORA_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+MEMORA_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,160}\Z")
+MEMORA_STATES = frozenset(
+    {"proposed", "promoted", "rejected", "revoked", "superseded"}
+)
 
 
 def _normal_dashboard_auth_path(path: Path) -> Path:
@@ -549,6 +569,83 @@ class DashboardRuntime:
                     entry_limit=entry_limit,
                     max_clusters=max_clusters,
                     max_cues=max_cues,
+                )
+            )
+        if method == "GET" and path == "/api/memora-bindings":
+            context = self._context_from_params(params)
+            state = str(params.get("state", [""])[0] or "").strip().lower()
+            if state and state not in MEMORA_STATES:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "state must be proposed, promoted, rejected, revoked, or superseded",
+                )
+            limit = self._int_param(
+                params,
+                "limit",
+                MEMORA_DASHBOARD_LIST_LIMIT,
+                minimum=1,
+                maximum=MEMORA_DASHBOARD_LIST_LIMIT,
+            )
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.list_memora_bindings(
+                        context_id=context,
+                        state=state or None,
+                        limit=limit,
+                    ),
+                    mutation=False,
+                )
+            )
+        if method == "GET" and path == "/api/memora-binding":
+            binding_id = self._memora_binding_id(
+                str(params.get("binding_id", [""])[0] or "")
+            )
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.get_memora_binding(binding_id=binding_id),
+                    mutation=False,
+                )
+            )
+        if method == "GET" and path == "/api/memora-history":
+            binding_id = self._memora_binding_id(
+                str(params.get("binding_id", [""])[0] or "")
+            )
+            limit = self._int_param(
+                params,
+                "limit",
+                MEMORA_DASHBOARD_LIST_LIMIT,
+                minimum=1,
+                maximum=MEMORA_DASHBOARD_LIST_LIMIT,
+            )
+            before_sequence = None
+            if "before_sequence" in params:
+                before_sequence = self._int_param(
+                    params,
+                    "before_sequence",
+                    2,
+                    minimum=2,
+                    maximum=64,
+                )
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.memora_binding_history(
+                        binding_id=binding_id,
+                        limit=limit,
+                        before_sequence=before_sequence,
+                    ),
+                    mutation=False,
+                )
+            )
+        if method == "GET" and path == "/api/memora-audit":
+            binding_id = self._memora_binding_id(
+                str(params.get("binding_id", [""])[0] or "")
+            )
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.audit_memora_binding(
+                        binding_id=binding_id
+                    ),
+                    mutation=False,
                 )
             )
         if method == "GET" and path == "/api/media-cache":
@@ -1192,6 +1289,87 @@ class DashboardRuntime:
                 response_payload=response_payload,
             )
             return self._json_response(response_payload)
+        if method == "POST" and path == "/api/memora-proposals":
+            payload = self._parse_json_body(body)
+            self._memora_require_confirmation(payload)
+            context = self._context_from_payload(payload)
+            plan_digest = self._memora_digest(payload, "plan_digest")
+            cluster_ordinal = self._memora_cluster_ordinal(payload)
+            proposed_by = self._memora_workflow_role(payload, "proposed_by")
+            reason = self._memora_reason(payload)
+            request_id = self._memora_request_id(payload)
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.propose_memora_binding(
+                        context_id=context,
+                        plan_digest=plan_digest,
+                        cluster_ordinal=cluster_ordinal,
+                        proposed_by=proposed_by,
+                        reason=reason,
+                        governance_request_id=request_id,
+                    ),
+                    mutation=True,
+                )
+            )
+        if method == "POST" and path == "/api/memora-promotions":
+            payload = self._parse_json_body(body)
+            self._memora_require_confirmation(payload)
+            binding_id, revision, reason, request_id = (
+                self._memora_transition_payload(payload)
+            )
+            reviewed_by = self._memora_workflow_role(payload, "reviewed_by")
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.promote_memora_binding(
+                        binding_id=binding_id,
+                        expected_revision=revision,
+                        reviewed_by=reviewed_by,
+                        reason=reason,
+                        confirm=True,
+                        governance_request_id=request_id,
+                    ),
+                    mutation=True,
+                )
+            )
+        if method == "POST" and path == "/api/memora-rejections":
+            payload = self._parse_json_body(body)
+            self._memora_require_confirmation(payload)
+            binding_id, revision, reason, request_id = (
+                self._memora_transition_payload(payload)
+            )
+            reviewed_by = self._memora_workflow_role(payload, "reviewed_by")
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.reject_memora_binding(
+                        binding_id=binding_id,
+                        expected_revision=revision,
+                        reviewed_by=reviewed_by,
+                        reason=reason,
+                        governance_request_id=request_id,
+                    ),
+                    mutation=True,
+                )
+            )
+        if method == "POST" and path == "/api/memora-revocations":
+            payload = self._parse_json_body(body)
+            self._memora_require_confirmation(payload)
+            binding_id, revision, reason, request_id = (
+                self._memora_transition_payload(payload)
+            )
+            revoked_by = self._memora_workflow_role(payload, "revoked_by")
+            return self._json_response(
+                self._memora_dashboard_call(
+                    lambda: self.backend.revoke_memora_binding(
+                        binding_id=binding_id,
+                        expected_revision=revision,
+                        revoked_by=revoked_by,
+                        reason=reason,
+                        confirm=True,
+                        governance_request_id=request_id,
+                    ),
+                    mutation=True,
+                )
+            )
         if method == "POST" and path == "/api/namespace-link-proposals":
             payload = self._parse_json_body(body)
             evidence = payload.get("evidence", {})
@@ -3246,16 +3424,186 @@ class DashboardRuntime:
             max_clusters=max_clusters,
             max_cues=max_cues,
         )
+        try:
+            if not isinstance(plan, dict):
+                raise ResponseContractError("memora shadow plan must be an object")
+            encoded_source = json.dumps(
+                plan,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded_source) > MEMORA_DASHBOARD_SHADOW_SOURCE_BYTES:
+                raise ResponseContractError("memora shadow plan exceeds dashboard source bound")
+            raw_clusters = plan.get("clusters")
+            if not isinstance(raw_clusters, list) or len(raw_clusters) > 16:
+                raise ResponseContractError("memora shadow cluster set is invalid")
+            for ordinal, cluster in enumerate(raw_clusters):
+                if not isinstance(cluster, dict) or type(cluster.get("cluster_ordinal")) is not int:
+                    raise ResponseContractError("memora shadow cluster coordinate is invalid")
+                if cluster["cluster_ordinal"] != ordinal:
+                    raise ResponseContractError("memora shadow cluster coordinates are not canonical")
+                cues = cluster.get("proposed_cues")
+                if not isinstance(cues, list) or len(cues) > 8:
+                    raise ResponseContractError("memora shadow cue set is invalid")
+
+            validated = project_response(
+                "memora-shadow",
+                plan,
+                mode="compact",
+                max_response_bytes=MAX_JSON_BODY_BYTES,
+            )
+            data = validated.get("data")
+            projected_clusters = data.get("clusters") if isinstance(data, dict) else None
+            if not isinstance(projected_clusters, list) or len(projected_clusters) != len(raw_clusters):
+                raise ResponseContractError("memora shadow projection omitted required clusters")
+            plan_digest = str(plan.get("plan_digest") or "")
+            if MEMORA_DIGEST_RE.fullmatch(plan_digest) is None:
+                raise ResponseContractError("memora shadow plan digest is invalid")
+            projected_context = str(data.get("context_id") or "")
+            if projected_context != context_id:
+                raise ResponseContractError("memora shadow plan escaped its requested context")
+
+            safe_clusters = []
+            for ordinal, projected in enumerate(projected_clusters):
+                if not isinstance(projected, dict):
+                    raise ResponseContractError("memora shadow projected cluster is invalid")
+                similarity = projected.get("similarity")
+                cues = projected.get("proposed_cues")
+                if not isinstance(similarity, dict) or not isinstance(cues, list):
+                    raise ResponseContractError("memora shadow projected detail is invalid")
+                if len(cues) != len(raw_clusters[ordinal]["proposed_cues"]):
+                    raise ResponseContractError("memora shadow projection omitted required cues")
+                safe_clusters.append(
+                    {
+                        "cluster_ordinal": ordinal,
+                        "member_count": int(projected.get("member_count") or 0),
+                        "similarity": {"mean": similarity.get("mean")},
+                        "proposed_cues": [
+                            {"label": str(cue.get("label") or "")}
+                            for cue in cues
+                            if isinstance(cue, dict)
+                        ],
+                    }
+                )
+            provider = data.get("provider") if isinstance(data.get("provider"), dict) else {}
+            safe_plan = {
+                "schema": "synapse-s2.dashboard-memora-shadow-plan.v1",
+                "context_id": projected_context,
+                "plan_digest": plan_digest,
+                "learned": data.get("learned") is True,
+                "provider": {
+                    "provider_type": str(provider.get("provider_type") or ""),
+                    "model_id": str(provider.get("model_id") or ""),
+                },
+                "clusters": safe_clusters,
+            }
+            response = {
+                "schema": "synapse-s2.dashboard-memora-shadow.v2",
+                "requested_context_id": context_id,
+                "plan": safe_plan,
+                "caveat": (
+                    "Shadow proposals from pretrained embedding inference over "
+                    "already-redacted durable text. Nothing is applied or "
+                    "persisted, retrieval results are unchanged, and every "
+                    "source memory remains independently deletable."
+                ),
+            }
+            encoded_response = json.dumps(
+                response,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded_response) > MEMORA_DASHBOARD_RESPONSE_BYTES:
+                raise ResponseContractError("memora shadow dashboard response exceeds its bound")
+            return response
+        except (ResponseContractError, TypeError, ValueError, OverflowError) as exc:
+            raise DashboardError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Authoritative Memora shadow plan failed safe dashboard projection",
+            ) from exc
+
+    def _memora_dashboard_call(
+        self,
+        call: Callable[[], dict[str, Any]],
+        *,
+        mutation: bool,
+    ) -> dict[str, Any]:
+        """Execute one authoritative lifecycle call and publish only its allowlist.
+
+        The Core intentionally returns content-free error codes.  Keep that
+        property here while giving an operator a useful fail-closed next step:
+        deterministic mutation rejections require a fresh binding revision;
+        integrity or authority failures lock every control.
+        """
+
+        try:
+            raw = call()
+        except MemoraGovernanceNotFound as exc:
+            raise DashboardError(
+                HTTPStatus.NOT_FOUND,
+                "Memora binding was not found or is no longer available",
+            ) from exc
+        except MemoraGovernanceIntegrityError as exc:
+            raise DashboardError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Authoritative Memora data failed integrity validation; controls remain locked",
+            ) from exc
+        except MemoraGovernanceError as exc:
+            raise DashboardError(
+                HTTPStatus.CONFLICT if mutation else HTTPStatus.NOT_FOUND,
+                (
+                    "Memora transition rejected; refresh the binding because its "
+                    "state, exact revision, or workflow-role separation may have changed"
+                    if mutation
+                    else "Memora binding was not found or is no longer valid"
+                ),
+            ) from exc
+        except CoreRemoteError as exc:
+            if exc.code == "invalid_request":
+                raise DashboardError(
+                    HTTPStatus.CONFLICT if mutation else HTTPStatus.NOT_FOUND,
+                    (
+                        "Memora transition rejected; refresh the binding because its "
+                        "state, exact revision, or workflow-role separation may have changed"
+                        if mutation
+                        else "Memora binding was not found or is no longer valid"
+                    ),
+                ) from exc
+            if exc.code in {"service_unavailable", "operation_failed"}:
+                raise DashboardError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Authoritative Memora data is unavailable or failed integrity validation; controls remain locked",
+                ) from exc
+            raise
+
+        try:
+            contract = project_response(
+                "memora-governance",
+                raw,
+                mode="compact",
+                max_response_bytes=MEMORA_DASHBOARD_RESPONSE_BYTES,
+            )
+        except ResponseContractError as exc:
+            raise DashboardError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Authoritative Memora response failed safe projection; controls remain locked",
+            ) from exc
         return {
-            "schema": "synapse-s2.dashboard-memora-shadow.v1",
-            "requested_context_id": context_id,
-            "plan": plan,
-            "caveat": (
-                "Shadow proposals from pretrained embedding inference over "
-                "already-redacted durable text. Nothing is applied or "
-                "persisted, retrieval results are unchanged, and every "
-                "source memory remains independently deletable."
-            ),
+            "schema": "synapse-s2.dashboard-memora-governance.v1",
+            "governance": contract["data"],
+            "pagination": contract["pagination"],
+            "completeness": contract["completeness"],
+            "warnings": contract["warnings"],
+            "request_id_replay": bool(raw.get("idempotent_replay")),
+            "authority": {
+                "source": "authoritative-core",
+                "automatic_promotion": False,
+                "workflow_roles_are_authenticated_people": False,
+            },
         }
 
     def list_image_memories(
@@ -4813,6 +5161,118 @@ class DashboardRuntime:
         if not isinstance(payload[key], bool):
             raise DashboardError(HTTPStatus.BAD_REQUEST, f"{key} must be a boolean")
         return bool(payload[key])
+
+    def _memora_require_confirmation(self, payload: dict[str, Any]) -> None:
+        if self._required_bool(payload, "confirm") is not True:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "confirm must be true after unlocking the Memora governance controls",
+            )
+
+    def _memora_binding_id(self, value: Any) -> str:
+        try:
+            binding_id = reject_sensitive_identifier(
+                value,
+                field="binding_id",
+            ).strip()
+        except ValueError as exc:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "binding_id is invalid",
+            ) from exc
+        if MEMORA_BINDING_ID_RE.fullmatch(binding_id) is None:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "binding_id must be a canonical Memora binding identifier",
+            )
+        return binding_id
+
+    def _memora_digest(self, payload: dict[str, Any], key: str) -> str:
+        try:
+            digest = reject_sensitive_identifier(
+                self._text_payload(payload, key, max_bytes=64),
+                field=key,
+            ).strip()
+        except ValueError as exc:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                f"{key} is invalid",
+            ) from exc
+        if MEMORA_DIGEST_RE.fullmatch(digest) is None:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                f"{key} must be exactly 64 lowercase hex characters",
+            )
+        return digest
+
+    def _memora_cluster_ordinal(self, payload: dict[str, Any]) -> int:
+        value = payload.get("cluster_ordinal")
+        if type(value) is not int or not 0 <= value <= 15:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "cluster_ordinal must be an integer between 0 and 15",
+            )
+        return value
+
+    def _memora_workflow_role(
+        self,
+        payload: dict[str, Any],
+        key: str,
+    ) -> str:
+        raw = self._text_payload(payload, key, max_bytes=128)
+        try:
+            clean = reject_sensitive_identifier(raw, field=key).strip()
+        except ValueError as exc:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                f"{key} is invalid",
+            ) from exc
+        role = mlx_backend.sanitize_agent_id(clean)
+        if role == "unknown-agent":
+            raise DashboardError(HTTPStatus.BAD_REQUEST, f"{key} is required")
+        return role
+
+    def _memora_reason(self, payload: dict[str, Any]) -> str:
+        raw = self._text_payload(payload, "reason", max_bytes=1_024)
+        reason, _ = redact_capture_text(raw)
+        reason = reason.strip()
+        if not reason:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, "reason is required")
+        return reason
+
+    def _memora_request_id(self, payload: dict[str, Any]) -> str:
+        raw = self._text_payload(
+            payload,
+            "governance_request_id",
+            max_bytes=160,
+        )
+        try:
+            request_id = reject_sensitive_identifier(
+                raw,
+                field="governance_request_id",
+            ).strip()
+        except ValueError as exc:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "governance_request_id is invalid",
+            ) from exc
+        if MEMORA_REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "governance_request_id must be a canonical 1-160 character identifier",
+            )
+        return request_id
+
+    def _memora_transition_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[str, str, str, str]:
+        return (
+            self._memora_binding_id(payload.get("binding_id")),
+            self._memora_digest(payload, "expected_revision"),
+            self._memora_reason(payload),
+            self._memora_request_id(payload),
+        )
 
     def _text_payload(
         self,

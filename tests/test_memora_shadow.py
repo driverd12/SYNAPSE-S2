@@ -942,7 +942,7 @@ class MemoraShadowSurfaceContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     synapse_cli.command_memora_shadow(args)
 
-    def test_dashboard_projection_is_read_only_passthrough(self) -> None:
+    def test_dashboard_projection_is_a_bounded_identifier_free_allowlist(self) -> None:
         owner = next(
             candidate
             for candidate in vars(dashboard_server).values()
@@ -951,11 +951,28 @@ class MemoraShadowSurfaceContractTests(unittest.TestCase):
         )
         method = vars(owner)["memora_shadow_projection"]
         recorded = {}
+        source_memory_id = "s2_dashboard_source_memory_never_publish"
+        private_witness_marker = "private-dashboard-witness-never-publish"
+        raw_plan = _plan(
+            [
+                _entry(
+                    source_memory_id,
+                    text="Reviewed Project Citadel deployment evidence.",
+                    metadata={"semantic_facets": ["project citadel"]},
+                )
+            ],
+            witnesses={
+                source_memory_id: {
+                    "event_count": 1,
+                    "private_witness_marker": private_witness_marker,
+                }
+            },
+        )
 
         class _StubBackend:
             def memora_shadow_plan(self, **kwargs):
                 recorded.update(kwargs)
-                return {"schema": "synapse-s2.memora-shadow.v1", "mode": "shadow"}
+                return raw_plan
 
         stub = type("_Stub", (), {})()
         stub.backend = _StubBackend()
@@ -974,11 +991,113 @@ class MemoraShadowSurfaceContractTests(unittest.TestCase):
                 kwargs[name] = 2
         response = method(stub, **kwargs)
         self.assertEqual(
-            response["schema"], "synapse-s2.dashboard-memora-shadow.v1"
+            response["schema"], "synapse-s2.dashboard-memora-shadow.v2"
         )
-        self.assertEqual(response["plan"]["mode"], "shadow")
-        self.assertIn("never", response["caveat"].lower() + " never")
+        self.assertEqual(
+            set(response),
+            {"schema", "requested_context_id", "plan", "caveat"},
+        )
+        self.assertEqual(
+            set(response["plan"]),
+            {
+                "schema",
+                "context_id",
+                "plan_digest",
+                "learned",
+                "provider",
+                "clusters",
+            },
+        )
+        self.assertEqual(
+            set(response["plan"]["provider"]),
+            {"provider_type", "model_id"},
+        )
+        self.assertTrue(response["plan"]["clusters"])
+        for ordinal, cluster in enumerate(response["plan"]["clusters"]):
+            self.assertEqual(
+                set(cluster),
+                {"cluster_ordinal", "member_count", "similarity", "proposed_cues"},
+            )
+            self.assertEqual(cluster["cluster_ordinal"], ordinal)
+            self.assertEqual(set(cluster["similarity"]), {"mean"})
+            for cue in cluster["proposed_cues"]:
+                self.assertEqual(set(cue), {"label"})
+
+        rendered = json.dumps(response, sort_keys=True, allow_nan=False)
+        for forbidden in (
+            "source_witnesses",
+            "member_memory_ids",
+            "source_memory_ids",
+            "supporting_memory_ids",
+            "medoid_memory_id",
+            "unclustered_memory_ids",
+            "cluster_id",
+            source_memory_id,
+            private_witness_marker,
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertLessEqual(
+            len(rendered.encode("utf-8")),
+            dashboard_server.MEMORA_DASHBOARD_RESPONSE_BYTES,
+        )
+        # Dashboard projection must not mutate the authoritative Core plan.
+        self.assertIn(source_memory_id, raw_plan["source_witnesses"])
+        self.assertIn(
+            source_memory_id,
+            raw_plan["clusters"][0]["member_memory_ids"],
+        )
         self.assertEqual(recorded.get("context_id"), "ops")
+
+    def test_dashboard_projection_rejects_malformed_oversized_or_non_json_plans(
+        self,
+    ) -> None:
+        method = dashboard_server.DashboardRuntime.memora_shadow_projection
+        baseline = _plan(
+            [_entry("s2_dashboard_projection_validation")],
+            witnesses={
+                "s2_dashboard_projection_validation": {"event_count": 1}
+            },
+        )
+
+        malformed = json.loads(json.dumps(baseline))
+        malformed["clusters"][0]["cluster_ordinal"] = 1
+        oversized = json.loads(json.dumps(baseline))
+        oversized["source_witnesses"]["oversized"] = {
+            "padding": "x"
+            * (dashboard_server.MEMORA_DASHBOARD_SHADOW_SOURCE_BYTES + 1)
+        }
+        non_json = json.loads(json.dumps(baseline))
+        non_json["source_witnesses"]["non-finite"] = {"score": math.nan}
+
+        for label, plan in (
+            ("non-canonical-coordinate", malformed),
+            ("oversized-source", oversized),
+            ("non-json-number", non_json),
+        ):
+            with self.subTest(label=label):
+                stub = type("_Stub", (), {})()
+                stub.backend = type(
+                    "_StubBackend",
+                    (),
+                    {"memora_shadow_plan": lambda _self, **_kwargs: plan},
+                )()
+                with self.assertRaises(dashboard_server.DashboardError) as raised:
+                    method(
+                        stub,
+                        context_id="ops",
+                        entry_limit=8,
+                        max_clusters=4,
+                        max_cues=2,
+                    )
+                self.assertEqual(
+                    raised.exception.status,
+                    dashboard_server.HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.assertEqual(
+                    raised.exception.message,
+                    "Authoritative Memora shadow plan failed safe dashboard projection",
+                )
+                self.assertNotIn("padding", raised.exception.message)
 
 
 if __name__ == "__main__":

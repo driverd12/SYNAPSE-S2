@@ -18,6 +18,7 @@ const NAMESPACE_DETAIL_NEURON_ZOOM = 1.42;
 const NAMESPACE_GALAXY_CONTEXT_PARAM = "galaxy_context";
 const NAMESPACE_GALAXY_CLUSTER_PARAM = "galaxy_cluster";
 const CORE_TOGGLE_UNLOCK_WINDOW_MS = 10000;
+const MEMORA_GOVERNANCE_UNLOCK_WINDOW_MS = 15000;
 const READ_REQUEST_TIMEOUT_MS = 10000;
 const NAMESPACE_DETAIL_REQUEST_TIMEOUT_MS = 30000;
 const DOCTOR_REQUEST_TIMEOUT_MS = 20000;
@@ -509,6 +510,18 @@ const state = {
   },
   memoraShadow: {
     open: false,
+    plan: null,
+    catalog: [],
+    selectedBindingId: "",
+    selected: null,
+    history: [],
+    audit: null,
+    guardTarget: null,
+    unlockedScope: null,
+    unlockedUntilMs: 0,
+    lockTimer: null,
+    requestToken: 0,
+    requestIds: new Map(),
   },
   captureRetries: new Map(),
   operator: {
@@ -669,6 +682,27 @@ const elements = collectElements([
   "memoraShadowDrawer",
   "memoraShadowSummary",
   "memoraShadowToggleButton",
+  "memoraAudit",
+  "memoraBindingActions",
+  "memoraBindingCues",
+  "memoraBindingFacts",
+  "memoraBindingState",
+  "memoraBindingTitle",
+  "memoraCatalog",
+  "memoraCatalogRefreshButton",
+  "memoraDecisionConfirm",
+  "memoraDecisionReason",
+  "memoraGovernanceStatus",
+  "memoraGuardHint",
+  "memoraHistory",
+  "memoraPromoteButton",
+  "memoraProposerRole",
+  "memoraRejectButton",
+  "memoraReviewerRole",
+  "memoraRevokeButton",
+  "memoraShadowRefreshButton",
+  "memoraStateFilter",
+  "memoraUnlockButton",
   "ingestForm",
   "ingestMinSentences",
   "ingestTag",
@@ -1330,6 +1364,10 @@ function formatContextOption(row) {
 async function applySelectedContext(context, busyElement = elements.contextApply) {
   const nextContext = String(context || "").trim() || DEFAULT_CONTEXT;
   const contextChanged = nextContext !== state.context;
+  if (contextChanged) {
+    state.memoraShadow.guardTarget = null;
+    lockMemoraGovernanceGuard();
+  }
   const galaxy = state.namespaceGalaxy;
   const switchingOpenNamespace = galaxy.view === "namespace"
     && Boolean(galaxy.detailContextId)
@@ -1366,6 +1404,13 @@ async function applySelectedContext(context, busyElement = elements.contextApply
   await withBusy(busyElement, "Context", refreshSnapshot, { refresh: false });
   if (switchingOpenNamespace && galaxy.view === "namespace" && galaxy.detailContextId === nextContext) {
     await refreshNamespaceDetail({ contextId: nextContext });
+  }
+  if (state.memoraShadow.open) {
+    state.memoraShadow.selectedBindingId = "";
+    await refreshMemoraGovernance().catch((error) => {
+      lockMemoraGovernanceGuard();
+      setMemoraGovernanceStatus(`Governed Memora state unavailable: ${error.message}`, "error");
+    });
   }
 }
 
@@ -7020,50 +7065,563 @@ function setImpactDrawerOpen(open) {
   }
 }
 
+function memoraGovernanceData(payload) {
+  return payload && typeof payload.governance === "object" && payload.governance !== null
+    ? payload.governance
+    : {};
+}
+
+function setMemoraGovernanceStatus(message, tone = "") {
+  elements.memoraGovernanceStatus.className = `memora-governance-status${tone ? ` ${tone}` : ""}`;
+  elements.memoraGovernanceStatus.textContent = String(message || "");
+}
+
+function renderMemoraGovernanceSummary() {
+  const plan = state.memoraShadow.plan || {};
+  const clusters = Array.isArray(plan.clusters) ? plan.clusters : [];
+  const provider = plan.provider || {};
+  const catalog = Array.isArray(state.memoraShadow.catalog) ? state.memoraShadow.catalog : [];
+  const effective = catalog.filter((row) => row?.effectiveness?.effective === true).length;
+  elements.memoraShadowSummary.innerHTML = [
+    impactMetric("Shadow clusters", formatNumber(clusters.length), "inspect before proposing"),
+    impactMetric("Governed bindings", formatNumber(catalog.length), `namespace ${state.context}`),
+    impactMetric("Effective cues", formatNumber(effective), "promoted and source-valid"),
+    impactMetric("Provider", String(provider.provider_type || "--"), String(provider.model_id || "pinned local model")),
+  ].join("");
+  elements.footerMemoraShadow.textContent = `${formatNumber(catalog.length)} governed`;
+}
+
 function renderMemoraShadow(payload) {
   const plan = payload && typeof payload.plan === "object" && payload.plan !== null
     ? payload.plan
     : {};
-  const provider = plan.provider || {};
-  const input = plan.input || {};
-  const clusters = Array.isArray(plan.clusters) ? plan.clusters : [];
-  elements.memoraShadowSummary.innerHTML = [
-    impactMetric("Clusters proposed", formatNumber(clusters.length), "shadow only; never applied"),
-    impactMetric("Entries embedded", formatNumber(input.entries_embedded || 0), `of ${formatNumber(input.entries_considered || 0)} snapshot entries`),
-    impactMetric("Provider", String(provider.provider_type || "--"), String(provider.model_id || "pinned local model")),
-    impactMetric("Learned", plan.learned === true ? "true" : "false", plan.learned === true ? "pretrained inference only" : "deterministic hash fallback"),
-  ].join("");
+  const previousPlanDigest = String(state.memoraShadow.plan?.plan_digest || "");
+  const nextPlanDigest = String(plan.plan_digest || "");
+  if (previousPlanDigest && previousPlanDigest !== nextPlanDigest) {
+    state.memoraShadow.guardTarget = null;
+    lockMemoraGovernanceGuard();
+  }
+  state.memoraShadow.plan = plan;
+  const clusters = Array.isArray(plan.clusters) ? plan.clusters.slice(0, 16) : [];
   elements.memoraShadowClusters.innerHTML = clusters.length
-    ? clusters.slice(0, 16).map((cluster) => {
+    ? clusters.map((cluster) => {
       const cues = Array.isArray(cluster.proposed_cues)
         ? cluster.proposed_cues.slice(0, 4).map((cue) => String(cue.label || "")).filter(Boolean)
         : [];
       const similarity = cluster.similarity || {};
-      return impactMetric(
-        `Cluster ${compactMemoryId(String(cluster.cluster_id || ""))}`,
-        `${formatNumber(cluster.member_count || 0)} members`,
-        [
-          similarity.mean === null || similarity.mean === undefined
-            ? "singleton"
-            : `mean cosine ${formatNumber(similarity.mean, 3)}`,
-          cues.length ? `cues: ${cues.join(", ")}` : "no cue proposals",
-        ].join(" · "),
-      );
+      const ordinal = Math.max(0, Math.trunc(Number(cluster.cluster_ordinal) || 0));
+      return [
+        '<article class="memora-shadow-card">',
+        `<strong>Cluster ${escapeHtml(formatNumber(ordinal + 1))}</strong>`,
+        `<small>${escapeHtml(formatNumber(cluster.member_count || 0))} members · ${escapeHtml(similarity.mean === null || similarity.mean === undefined ? "singleton" : `mean cosine ${formatNumber(similarity.mean, 3)}`)}</small>`,
+        `<small>${escapeHtml(cues.length ? `cues: ${cues.join(", ")}` : "no cue proposals")}</small>`,
+        `<button class="secondary-button" type="button" data-memora-propose-ordinal="${ordinal}" ${plan.learned === true ? "" : "disabled"}>Propose for review</button>`,
+        "</article>",
+      ].join("");
     }).join("")
     : '<div class="empty-result">No shadow clusters proposed for this namespace snapshot.</div>';
-  elements.footerMemoraShadow.textContent = `${formatNumber(clusters.length)} proposals`;
-  elements.memoraShadowCaveat.textContent = String(
-    payload.caveat
-    || "Shadow proposals only. Nothing is applied or persisted and retrieval results are unchanged.",
-  );
+  elements.memoraShadowCaveat.textContent = "Learned cues remain untrusted relevance routing only. Source memories stay independently deletable; this panel never returns raw source text, vectors, supporting IDs, or witness internals.";
+  renderMemoraGovernanceSummary();
+  updateMemoraGovernanceGuard();
 }
 
 async function refreshMemoraShadow() {
+  const contextId = state.context;
   const payload = await requestJson("/api/memora-shadow", {
-    params: { context_id: state.context },
+    params: { context_id: contextId },
+    timeoutMs: 30000,
   });
-  renderMemoraShadow(payload);
+  if (contextId === state.context) renderMemoraShadow(payload);
   return payload;
+}
+
+function renderMemoraCatalog(payload) {
+  const data = memoraGovernanceData(payload);
+  const rows = Array.isArray(data.bindings) ? data.bindings : [];
+  const selectedBefore = memoraBindingGuardScope();
+  const selectedAfter = rows.find(
+    (row) => row?.binding?.binding_id === state.memoraShadow.selectedBindingId,
+  )?.binding;
+  if (
+    selectedBefore
+    && (
+      String(selectedAfter?.context_id || "") !== selectedBefore.context_id
+      || String(selectedAfter?.binding_id || "") !== selectedBefore.binding_id
+      || String(selectedAfter?.revision || "") !== selectedBefore.revision
+    )
+  ) {
+    state.memoraShadow.guardTarget = null;
+    lockMemoraGovernanceGuard();
+  }
+  state.memoraShadow.catalog = rows;
+  elements.memoraCatalog.innerHTML = rows.length
+    ? rows.map((row) => {
+      const binding = row?.binding || {};
+      const bindingId = String(binding.binding_id || "");
+      const selected = bindingId === state.memoraShadow.selectedBindingId;
+      const effective = row?.effectiveness?.effective === true;
+      const detail = [
+        String(binding.state || "unknown"),
+        `${formatNumber(binding.cue_count || 0)} cues`,
+        effective ? "effective" : "isolated",
+      ].join(" · ");
+      return [
+        '<div role="listitem">',
+        `<button type="button" data-memora-binding-id="${escapeHtml(bindingId)}" aria-current="${selected}">`,
+        `<strong>${escapeHtml(String(binding.abstraction?.display_term || compactMemoryId(bindingId) || "Memora binding"))}</strong>`,
+        `<small>${escapeHtml(detail)}</small>`,
+        "</button>",
+        "</div>",
+      ].join("");
+    }).join("")
+    : '<div class="empty-result">No governed bindings match this namespace and state filter.</div>';
+  renderMemoraGovernanceSummary();
+}
+
+async function refreshMemoraCatalog() {
+  const contextId = state.context;
+  const payload = await requestJson("/api/memora-bindings", {
+    params: {
+      context_id: contextId,
+      state: elements.memoraStateFilter.value,
+      limit: 16,
+    },
+  });
+  if (contextId === state.context) renderMemoraCatalog(payload);
+  return payload;
+}
+
+function memoraBindingGuardScope(binding = state.memoraShadow.selected?.binding) {
+  if (!binding || typeof binding !== "object") return null;
+  const scope = {
+    kind: "binding",
+    context_id: String(binding.context_id || ""),
+    binding_id: String(binding.binding_id || ""),
+    revision: String(binding.revision || ""),
+  };
+  if (
+    !scope.context_id
+    || !/^s2mb_[0-9a-f]{32}$/.test(scope.binding_id)
+    || !/^[0-9a-f]{64}$/.test(scope.revision)
+    || scope.context_id !== state.context
+  ) {
+    return null;
+  }
+  return scope;
+}
+
+function memoraProposalGuardScope(plan, clusterOrdinal) {
+  const ordinal = Number(clusterOrdinal);
+  const planDigest = String(plan?.plan_digest || "");
+  const clusters = Array.isArray(plan?.clusters) ? plan.clusters : [];
+  const clusterExists = clusters.some(
+    (cluster) => Number(cluster?.cluster_ordinal) === ordinal,
+  );
+  if (
+    plan?.learned !== true
+    || !/^[0-9a-f]{64}$/.test(planDigest)
+    || !Number.isInteger(ordinal)
+    || ordinal < 0
+    || ordinal > 15
+    || !clusterExists
+  ) {
+    return null;
+  }
+  return {
+    kind: "proposal",
+    context_id: state.context,
+    plan_digest: planDigest,
+    cluster_ordinal: ordinal,
+  };
+}
+
+function memoraGuardScopesMatch(left, right) {
+  if (
+    !left
+    || !right
+    || !["binding", "proposal"].includes(left.kind)
+    || left.kind !== right.kind
+    || left.context_id !== right.context_id
+  ) {
+    return false;
+  }
+  return left.kind === "binding"
+    ? left.binding_id === right.binding_id && left.revision === right.revision
+    : left.plan_digest === right.plan_digest && left.cluster_ordinal === right.cluster_ordinal;
+}
+
+function memoraAuditIsValid() {
+  const audit = state.memoraShadow.audit || {};
+  return audit.chain_valid === true && audit.catalog_cross_checked === true;
+}
+
+function renderMemoraBindingDetail() {
+  const row = state.memoraShadow.selected;
+  const binding = row?.binding || null;
+  if (!binding) {
+    elements.memoraBindingTitle.textContent = "Choose a governed binding";
+    elements.memoraBindingState.textContent = "—";
+    delete elements.memoraBindingState.dataset.state;
+    elements.memoraBindingFacts.innerHTML = '<p class="empty-result">Select a binding to inspect its safe projection, receipt history, and audit.</p>';
+    elements.memoraBindingCues.replaceChildren();
+    elements.memoraHistory.replaceChildren();
+    elements.memoraAudit.className = "memora-audit";
+    elements.memoraAudit.innerHTML = "<strong>Audit</strong><span>Choose a binding</span>";
+    updateMemoraGovernanceGuard();
+    return;
+  }
+
+  const stateName = String(binding.state || "unknown");
+  const effectiveness = row.effectiveness || {};
+  const provider = binding.provider || {};
+  elements.memoraBindingTitle.textContent = String(binding.abstraction?.display_term || compactMemoryId(binding.binding_id));
+  elements.memoraBindingState.textContent = stateName;
+  elements.memoraBindingState.dataset.state = stateName;
+  const facts = [
+    ["Binding", String(binding.binding_id || "")],
+    ["Context", String(binding.context_id || "")],
+    ["Current revision", String(binding.revision || "")],
+    ["Routing", effectiveness.effective === true ? "effective" : "isolated"],
+    ["Members", formatNumber(binding.abstraction?.member_count || 0)],
+    ["Cues", formatNumber(binding.cue_count || 0)],
+    ["Provider", `${String(provider.provider_type || "unknown")} · ${formatNumber(provider.dimensions || 0)}d`],
+    ["Proposer authority", compactMemoryId(String(binding.proposed_by || "not reported"))],
+    ["Reviewer authority", compactMemoryId(String(binding.reviewed_by || "not reviewed"))],
+    ["Updated", formatNamespaceUpdatedAt(binding.updated_at)],
+  ];
+  elements.memoraBindingFacts.innerHTML = facts
+    .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`)
+    .join("");
+  const cues = Array.isArray(binding.cues) ? binding.cues.slice(0, 8) : [];
+  elements.memoraBindingCues.innerHTML = cues.length
+    ? cues.map((cue) => `<span class="memora-cue-chip">${escapeHtml(String(cue.term || "cue"))}</span>`).join("")
+    : '<span class="panel-note">No derived cue terms in the safe projection.</span>';
+
+  const history = Array.isArray(state.memoraShadow.history) ? state.memoraShadow.history : [];
+  elements.memoraHistory.innerHTML = history.length
+    ? history.map((event) => [
+      '<div class="memora-history-row" role="listitem">',
+      `<strong>${escapeHtml(String(event.action || "event"))}: ${escapeHtml(String(event.before_state || "none"))} → ${escapeHtml(String(event.after_state || "unknown"))}</strong>`,
+      `<small>${escapeHtml(formatNamespaceUpdatedAt(event.created_at))} · ${escapeHtml(String(event.reason || "No reason reported"))}</small>`,
+      "</div>",
+    ].join("")).join("")
+    : '<div class="empty-result">No validated lifecycle receipts returned.</div>';
+  const valid = memoraAuditIsValid();
+  elements.memoraAudit.className = `memora-audit ${valid ? "good" : "error"}`;
+  elements.memoraAudit.innerHTML = valid
+    ? "<strong>Audit verified</strong><span>Projection, catalog, and receipt chain agree</span>"
+    : "<strong>Controls locked</strong><span>Integrity audit is unavailable or invalid</span>";
+  updateMemoraGovernanceGuard();
+}
+
+async function selectMemoraBinding(bindingId, { focus = true } = {}) {
+  const cleanId = String(bindingId || "");
+  if (!cleanId) return null;
+  state.memoraShadow.guardTarget = null;
+  lockMemoraGovernanceGuard();
+  state.memoraShadow.selected = null;
+  state.memoraShadow.history = [];
+  state.memoraShadow.audit = null;
+  const token = ++state.memoraShadow.requestToken;
+  state.memoraShadow.selectedBindingId = cleanId;
+  renderMemoraCatalog({ governance: { bindings: state.memoraShadow.catalog } });
+  renderMemoraBindingDetail();
+  setMemoraGovernanceStatus("Loading the current binding revision, validated history, and integrity audit…");
+  try {
+    const [detailPayload, historyPayload, auditPayload] = await Promise.all([
+      requestJson("/api/memora-binding", { params: { binding_id: cleanId } }),
+      requestJson("/api/memora-history", { params: { binding_id: cleanId, limit: 16 } }),
+      requestJson("/api/memora-audit", { params: { binding_id: cleanId } }),
+    ]);
+    if (token !== state.memoraShadow.requestToken) return null;
+    const detail = memoraGovernanceData(detailPayload);
+    const history = memoraGovernanceData(historyPayload);
+    const audit = memoraGovernanceData(auditPayload);
+    const selected = Array.isArray(detail.bindings) ? detail.bindings[0] || null : null;
+    const selectedScope = memoraBindingGuardScope(selected?.binding);
+    if (
+      !selectedScope
+      || selectedScope.binding_id !== cleanId
+      || String(history.binding_id || "") !== cleanId
+      || String(audit.binding_id || "") !== cleanId
+      || String(audit.revision || "") !== selectedScope.revision
+    ) {
+      throw new Error("Memora binding detail, history, and audit did not agree on one exact revision");
+    }
+    state.memoraShadow.selected = selected;
+    state.memoraShadow.history = Array.isArray(history.events) ? history.events : [];
+    state.memoraShadow.audit = audit;
+    state.memoraShadow.guardTarget = selectedScope;
+    renderMemoraBindingDetail();
+    if (!memoraAuditIsValid()) throw new Error("Memora integrity audit did not validate the binding");
+    setMemoraGovernanceStatus("Current revision and receipt chain verified. Unlock permits one confirmed action.", "good");
+    if (focus) elements.memoraBindingTitle.focus({ preventScroll: true });
+    return state.memoraShadow.selected;
+  } catch (error) {
+    if (token !== state.memoraShadow.requestToken) return null;
+    state.memoraShadow.audit = null;
+    state.memoraShadow.guardTarget = null;
+    lockMemoraGovernanceGuard();
+    renderMemoraBindingDetail();
+    setMemoraGovernanceStatus(error.message || "Memora binding validation failed; controls remain locked.", "error");
+    throw error;
+  }
+}
+
+async function refreshMemoraGovernance({ focusSelected = false } = {}) {
+  state.memoraShadow.guardTarget = null;
+  lockMemoraGovernanceGuard();
+  setMemoraGovernanceStatus("Refreshing the shadow plan and authoritative binding catalog…");
+  await Promise.all([refreshMemoraShadow(), refreshMemoraCatalog()]);
+  const catalog = state.memoraShadow.catalog;
+  const current = catalog.find((row) => row?.binding?.binding_id === state.memoraShadow.selectedBindingId);
+  const nextId = String(current?.binding?.binding_id || catalog[0]?.binding?.binding_id || "");
+  if (!nextId) {
+    state.memoraShadow.selectedBindingId = "";
+    state.memoraShadow.selected = null;
+    state.memoraShadow.history = [];
+    state.memoraShadow.audit = null;
+    renderMemoraBindingDetail();
+    setMemoraGovernanceStatus("No governed bindings in this namespace. Review a learned shadow cluster before proposing one.", "good");
+    return null;
+  }
+  return selectMemoraBinding(nextId, { focus: focusSelected });
+}
+
+function isMemoraGovernanceUnlocked(scope = state.memoraShadow.guardTarget) {
+  return (
+    Date.now() < state.memoraShadow.unlockedUntilMs
+    && memoraGuardScopesMatch(state.memoraShadow.unlockedScope, scope)
+  );
+}
+
+function memoraWorkflowInputs() {
+  return {
+    proposer: elements.memoraProposerRole.value.trim(),
+    reviewer: elements.memoraReviewerRole.value.trim(),
+    reason: elements.memoraDecisionReason.value.trim(),
+  };
+}
+
+function updateMemoraGovernanceGuard() {
+  const confirmed = elements.memoraDecisionConfirm.checked;
+  const workflow = memoraWorkflowInputs();
+  const separated = Boolean(workflow.proposer && workflow.reviewer && workflow.proposer !== workflow.reviewer);
+  const hasReason = Boolean(workflow.reason);
+  const auditValid = memoraAuditIsValid();
+  const guardTarget = state.memoraShadow.guardTarget;
+  const unlocked = isMemoraGovernanceUnlocked(guardTarget);
+  const bindingScope = memoraBindingGuardScope();
+  const bindingUnlocked = isMemoraGovernanceUnlocked(bindingScope);
+  const selectedState = String(state.memoraShadow.selected?.binding?.state || "");
+  const actionReady = bindingUnlocked && confirmed && separated && hasReason && auditValid;
+  elements.memoraUnlockButton.disabled = !guardTarget || unlocked;
+  elements.memoraUnlockButton.textContent = unlocked ? "Unlocked" : "Unlock";
+  elements.memoraUnlockButton.setAttribute("aria-pressed", String(unlocked));
+  elements.memoraGuardHint.textContent = !guardTarget
+    ? "Select one audited binding or one learned shadow cluster before unlocking."
+    : !separated
+    ? "Use different proposer and reviewer workflow roles. These labels are not separate authenticated people."
+    : unlocked
+      ? "Unlocked for this exact binding revision or proposal coordinate only."
+      : "Locked. Unlock for one confirmed lifecycle action.";
+  elements.memoraPromoteButton.disabled = !(actionReady && selectedState === "proposed");
+  elements.memoraRejectButton.disabled = !(actionReady && selectedState === "proposed");
+  elements.memoraRevokeButton.disabled = !(actionReady && selectedState === "promoted");
+  elements.memoraShadowClusters.querySelectorAll("[data-memora-propose-ordinal]").forEach((button) => {
+    const proposalScope = memoraProposalGuardScope(
+      state.memoraShadow.plan,
+      Number(button.dataset.memoraProposeOrdinal),
+    );
+    const selected = memoraGuardScopesMatch(guardTarget, proposalScope);
+    const ready = selected
+      && isMemoraGovernanceUnlocked(proposalScope)
+      && confirmed
+      && separated
+      && hasReason;
+    button.disabled = proposalScope === null;
+    button.setAttribute("aria-pressed", String(selected));
+    button.textContent = ready
+      ? "Propose for review"
+      : selected
+        ? "Selected — unlock to propose"
+        : "Select for proposal";
+  });
+}
+
+function lockMemoraGovernanceGuard() {
+  state.memoraShadow.unlockedScope = null;
+  state.memoraShadow.unlockedUntilMs = 0;
+  if (state.memoraShadow.lockTimer !== null) {
+    window.clearTimeout(state.memoraShadow.lockTimer);
+    state.memoraShadow.lockTimer = null;
+  }
+  elements.memoraDecisionConfirm.checked = false;
+  updateMemoraGovernanceGuard();
+}
+
+function unlockMemoraGovernanceGuard() {
+  const target = state.memoraShadow.guardTarget;
+  const currentScope = target?.kind === "proposal"
+    ? memoraProposalGuardScope(state.memoraShadow.plan, target.cluster_ordinal)
+    : memoraBindingGuardScope();
+  if (!memoraGuardScopesMatch(target, currentScope)) {
+    state.memoraShadow.guardTarget = null;
+    lockMemoraGovernanceGuard();
+    setMemoraGovernanceStatus("Select and verify one current binding revision or proposal coordinate before unlocking.", "error");
+    return;
+  }
+  state.memoraShadow.unlockedScope = { ...target };
+  state.memoraShadow.unlockedUntilMs = Date.now() + MEMORA_GOVERNANCE_UNLOCK_WINDOW_MS;
+  if (state.memoraShadow.lockTimer !== null) window.clearTimeout(state.memoraShadow.lockTimer);
+  state.memoraShadow.lockTimer = window.setTimeout(
+    lockMemoraGovernanceGuard,
+    MEMORA_GOVERNANCE_UNLOCK_WINDOW_MS + 50,
+  );
+  updateMemoraGovernanceGuard();
+  setMemoraGovernanceStatus("Governance controls unlocked for one action. Review the exact revision, confirm, then act.", "warn");
+}
+
+function newMemoraGovernanceRequestId() {
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return `s2mgr_dashboard_${Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function retryableMemoraGovernanceRequest(action, intent) {
+  const signature = JSON.stringify([action, intent]);
+  const existing = state.memoraShadow.requestIds.get(signature);
+  if (existing) return { signature, requestId: existing };
+  if (state.memoraShadow.requestIds.size >= 32) {
+    const oldest = state.memoraShadow.requestIds.keys().next().value;
+    state.memoraShadow.requestIds.delete(oldest);
+  }
+  const requestId = newMemoraGovernanceRequestId();
+  state.memoraShadow.requestIds.set(signature, requestId);
+  return { signature, requestId };
+}
+
+function finishMemoraGovernanceRequest(signature, requestId) {
+  if (state.memoraShadow.requestIds.get(signature) === requestId) {
+    state.memoraShadow.requestIds.delete(signature);
+  }
+}
+
+async function proposeMemoraCluster(button) {
+  const plan = state.memoraShadow.plan || {};
+  const ordinal = Math.trunc(Number(button.dataset.memoraProposeOrdinal));
+  const proposalScope = memoraProposalGuardScope(plan, ordinal);
+  if (!proposalScope) {
+    state.memoraShadow.guardTarget = null;
+    lockMemoraGovernanceGuard();
+    setMemoraGovernanceStatus("This shadow proposal is no longer current; refresh before selecting it.", "error");
+    return null;
+  }
+  if (!memoraGuardScopesMatch(state.memoraShadow.guardTarget, proposalScope)) {
+    lockMemoraGovernanceGuard();
+    state.memoraShadow.guardTarget = proposalScope;
+    updateMemoraGovernanceGuard();
+    setMemoraGovernanceStatus("Proposal coordinate selected. Review it, unlock, confirm, then click Propose for review again.", "warn");
+    return null;
+  }
+  const workflow = memoraWorkflowInputs();
+  const separated = Boolean(workflow.proposer && workflow.reviewer && workflow.proposer !== workflow.reviewer);
+  if (
+    !isMemoraGovernanceUnlocked(proposalScope)
+    || !elements.memoraDecisionConfirm.checked
+    || !separated
+    || !workflow.reason
+  ) {
+    updateMemoraGovernanceGuard();
+    setMemoraGovernanceStatus("The selected proposal coordinate is locked or its confirmed workflow fields are incomplete.", "error");
+    return null;
+  }
+  const intent = {
+    context_id: proposalScope.context_id,
+    plan_digest: proposalScope.plan_digest,
+    cluster_ordinal: proposalScope.cluster_ordinal,
+    proposed_by: workflow.proposer,
+    reason: workflow.reason,
+  };
+  if (!confirmPreflight("Create a governed Memora cue proposal?", [
+    `Namespace: ${proposalScope.context_id}`,
+    `Cluster ordinal: ${proposalScope.cluster_ordinal}`,
+    "This persists a review record but does not expand recall until a separate promotion.",
+  ])) return null;
+  const retry = retryableMemoraGovernanceRequest("propose", intent);
+  lockMemoraGovernanceGuard();
+  try {
+    const payload = await withBusy(button, "Propose Memora cue", () => requestJson("/api/memora-proposals", {
+      method: "POST",
+      body: { ...intent, confirm: true, governance_request_id: retry.requestId },
+      timeoutMs: 120000,
+    }), { refresh: false });
+    finishMemoraGovernanceRequest(retry.signature, retry.requestId);
+    const bindingId = String(memoraGovernanceData(payload).bindings?.[0]?.binding?.binding_id || "");
+    state.memoraShadow.selectedBindingId = bindingId;
+    await refreshMemoraGovernance({ focusSelected: true });
+    setMemoraGovernanceStatus(payload.request_id_replay ? "Proposal replay reconciled; authoritative state refreshed." : "Proposal recorded for separate review; retrieval remains unchanged.", "good");
+    return payload;
+  } catch (error) {
+    setMemoraGovernanceStatus(error.reconciliation ? "Proposal outcome is unknown; its request ID is retained for reconciliation and no blind replay was attempted." : error.message, "error");
+    return null;
+  }
+}
+
+async function transitionMemoraBinding(action, button) {
+  const binding = state.memoraShadow.selected?.binding;
+  const bindingScope = memoraBindingGuardScope(binding);
+  const workflow = memoraWorkflowInputs();
+  const separated = Boolean(workflow.proposer && workflow.reviewer && workflow.proposer !== workflow.reviewer);
+  if (
+    !binding
+    || !bindingScope
+    || !memoraGuardScopesMatch(state.memoraShadow.guardTarget, bindingScope)
+    || !memoraAuditIsValid()
+    || !isMemoraGovernanceUnlocked(bindingScope)
+    || !elements.memoraDecisionConfirm.checked
+    || !separated
+    || !workflow.reason
+  ) {
+    updateMemoraGovernanceGuard();
+    setMemoraGovernanceStatus("The selected binding revision is locked, changed, or its confirmed workflow fields are incomplete.", "error");
+    return null;
+  }
+  const intent = {
+    binding_id: bindingScope.binding_id,
+    expected_revision: bindingScope.revision,
+    reason: workflow.reason,
+    ...(action === "revoke" ? { revoked_by: workflow.reviewer } : { reviewed_by: workflow.reviewer }),
+  };
+  if (!confirmPreflight(`${action[0].toUpperCase()}${action.slice(1)} this Memora binding?`, [
+    `Binding: ${intent.binding_id}`,
+    `Exact revision: ${intent.expected_revision}`,
+    action === "promote" ? "Promotion may add these reviewed cues to bounded retrieval routing." : action === "revoke" ? "Revocation stops cue routing without deleting source memory." : "Rejection leaves retrieval unchanged.",
+  ])) return null;
+  const retry = retryableMemoraGovernanceRequest(action, intent);
+  const endpoint = {
+    promote: "/api/memora-promotions",
+    reject: "/api/memora-rejections",
+    revoke: "/api/memora-revocations",
+  }[action];
+  lockMemoraGovernanceGuard();
+  try {
+    const payload = await withBusy(button, `${action} Memora cue`, () => requestJson(endpoint, {
+      method: "POST",
+      body: { ...intent, confirm: true, governance_request_id: retry.requestId },
+    }), { refresh: false });
+    finishMemoraGovernanceRequest(retry.signature, retry.requestId);
+    await refreshMemoraGovernance({ focusSelected: true });
+    setMemoraGovernanceStatus(payload.request_id_replay ? "Idempotent lifecycle replay reconciled; authoritative state refreshed." : `Binding ${action} completed and the current revision was re-audited.`, "good");
+    return payload;
+  } catch (error) {
+    if (!error.reconciliation && error.status === 409) {
+      finishMemoraGovernanceRequest(retry.signature, retry.requestId);
+      await refreshMemoraGovernance({ focusSelected: true }).catch(() => null);
+    }
+    setMemoraGovernanceStatus(error.reconciliation ? "Lifecycle outcome is unknown; the request ID is retained for reconciliation and no blind replay was attempted." : error.message, "error");
+    return null;
+  }
 }
 
 function setMemoraShadowDrawerOpen(open) {
@@ -7071,10 +7629,13 @@ function setMemoraShadowDrawerOpen(open) {
   elements.memoraShadowDrawer.hidden = !state.memoraShadow.open;
   elements.memoraShadowToggleButton.setAttribute("aria-expanded", String(state.memoraShadow.open));
   if (state.memoraShadow.open) {
-    void refreshMemoraShadow().catch((error) => {
-      elements.memoraShadowCaveat.textContent = `Shadow proposals unavailable: ${error.message}`;
+    void refreshMemoraGovernance().catch((error) => {
+      lockMemoraGovernanceGuard();
+      setMemoraGovernanceStatus(`Governed Memora state unavailable: ${error.message}`, "error");
     });
     elements.memoraShadowCloseButton.focus({ preventScroll: true });
+  } else {
+    lockMemoraGovernanceGuard();
   }
 }
 
@@ -8179,6 +8740,67 @@ elements.memoraShadowToggleButton.addEventListener("click", () => {
 elements.memoraShadowCloseButton.addEventListener("click", () => {
   setMemoraShadowDrawerOpen(false);
   elements.memoraShadowToggleButton.focus({ preventScroll: true });
+});
+
+elements.memoraShadowRefreshButton.addEventListener("click", () => {
+  state.memoraShadow.guardTarget = null;
+  lockMemoraGovernanceGuard();
+  void withBusy(
+    elements.memoraShadowRefreshButton,
+    "Refresh Memora shadow plan",
+    refreshMemoraShadow,
+    { refresh: false },
+  ).catch((error) => setMemoraGovernanceStatus(error.message, "error"));
+});
+
+elements.memoraCatalogRefreshButton.addEventListener("click", () => {
+  state.memoraShadow.guardTarget = null;
+  lockMemoraGovernanceGuard();
+  void withBusy(
+    elements.memoraCatalogRefreshButton,
+    "Refresh Memora governance",
+    () => refreshMemoraGovernance({ focusSelected: false }),
+    { refresh: false },
+  ).catch((error) => setMemoraGovernanceStatus(error.message, "error"));
+});
+
+elements.memoraStateFilter.addEventListener("change", () => {
+  state.memoraShadow.guardTarget = null;
+  lockMemoraGovernanceGuard();
+  state.memoraShadow.selectedBindingId = "";
+  void refreshMemoraGovernance().catch((error) => {
+    lockMemoraGovernanceGuard();
+    setMemoraGovernanceStatus(error.message, "error");
+  });
+});
+
+elements.memoraCatalog.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-memora-binding-id]");
+  if (!button) return;
+  event.preventDefault();
+  void selectMemoraBinding(button.dataset.memoraBindingId, { focus: true }).catch(() => null);
+});
+
+elements.memoraShadowClusters.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-memora-propose-ordinal]");
+  if (!button) return;
+  event.preventDefault();
+  void proposeMemoraCluster(button);
+});
+
+elements.memoraUnlockButton.addEventListener("click", unlockMemoraGovernanceGuard);
+[elements.memoraProposerRole, elements.memoraReviewerRole, elements.memoraDecisionReason].forEach((input) => {
+  input.addEventListener("input", updateMemoraGovernanceGuard);
+});
+elements.memoraDecisionConfirm.addEventListener("change", updateMemoraGovernanceGuard);
+elements.memoraPromoteButton.addEventListener("click", () => {
+  void transitionMemoraBinding("promote", elements.memoraPromoteButton);
+});
+elements.memoraRejectButton.addEventListener("click", () => {
+  void transitionMemoraBinding("reject", elements.memoraRejectButton);
+});
+elements.memoraRevokeButton.addEventListener("click", () => {
+  void transitionMemoraBinding("revoke", elements.memoraRevokeButton);
 });
 
 document.addEventListener("keydown", (event) => {

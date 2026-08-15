@@ -4064,6 +4064,7 @@ textarea {
     minmax(140px, 0.72fr)
     minmax(130px, 0.62fr)
     minmax(140px, 0.72fr)
+    minmax(86px, 0.42fr)
     minmax(86px, 0.42fr);
   align-items: center;
   border-top: 1px solid var(--border);
@@ -4197,6 +4198,304 @@ textarea {
   font-size: 11px;
 }
 
+.memora-governance-drawer {
+  width: min(1120px, calc(100vw - 24px));
+  max-height: min(780px, calc(100vh - 90px));
+}
+
+.memora-authority-note {
+  margin: 8px 0 0;
+  border-left: 3px solid var(--amber);
+  background: color-mix(in srgb, var(--amber) 8%, var(--panel-soft));
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.memora-governance-status {
+  min-height: 34px;
+  margin-top: 10px;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  background: var(--panel-soft);
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.memora-governance-status.good {
+  border-color: color-mix(in srgb, var(--green) 48%, var(--row));
+  color: var(--green);
+}
+
+.memora-governance-status.warn {
+  border-color: color-mix(in srgb, var(--amber) 48%, var(--row));
+  color: var(--amber);
+}
+
+.memora-governance-status.error {
+  border-color: color-mix(in srgb, var(--red) 48%, var(--row));
+  color: var(--red);
+}
+
+.memora-workflow-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 10px;
+  margin: 12px 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.memora-workflow-controls > label,
+.memora-state-filter {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.memora-reason-field,
+.memora-confirm-row,
+.memora-workflow-controls .guard-hint {
+  grid-column: 1 / -1;
+}
+
+.memora-confirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memora-confirm-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.memora-confirm-row input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  accent-color: var(--teal);
+}
+
+.memora-workflow-controls .guard-hint {
+  margin: 0;
+}
+
+.memora-governance-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.9fr) minmax(240px, 0.9fr) minmax(330px, 1.25fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.memora-governance-section {
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px;
+}
+
+.memora-section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.memora-section-header h3 {
+  margin-top: 2px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.memora-section-header .secondary-button {
+  min-height: 30px;
+  padding-inline: 9px;
+  font-size: 11px;
+}
+
+.memora-shadow-clusters,
+.memora-catalog,
+.memora-history {
+  display: grid;
+  gap: 6px;
+  max-height: 310px;
+  overflow: auto;
+}
+
+.memora-shadow-card,
+.memora-catalog button,
+.memora-history-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  background: var(--panel);
+  padding: 8px;
+  text-align: left;
+}
+
+.memora-shadow-card strong,
+.memora-catalog button strong,
+.memora-history-row strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memora-shadow-card small,
+.memora-catalog button small,
+.memora-history-row small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.memora-shadow-card button {
+  justify-self: start;
+  min-height: 30px;
+  margin-top: 3px;
+  padding-inline: 9px;
+  font-size: 11px;
+}
+
+.memora-catalog button:hover,
+.memora-catalog button:focus-visible,
+.memora-catalog button[aria-current="true"] {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.memora-state-filter {
+  margin-bottom: 8px;
+}
+
+.memora-state-badge {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  border: 1px solid var(--row);
+  border-radius: 999px;
+  padding: 0 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.memora-state-badge[data-state="promoted"] {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.memora-state-badge[data-state="proposed"] {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.memora-state-badge[data-state="rejected"],
+.memora-state-badge[data-state="revoked"] {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.memora-binding-facts {
+  display: grid;
+  gap: 1px;
+  margin-bottom: 8px;
+}
+
+.memora-binding-facts div {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.8fr) minmax(0, 1.2fr);
+  gap: 8px;
+  border-bottom: 1px solid var(--row);
+  padding: 5px 0;
+  font-size: 10px;
+}
+
+.memora-binding-facts dt {
+  color: var(--muted);
+}
+
+.memora-binding-facts dd {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  text-align: right;
+}
+
+.memora-binding-cues {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.memora-cue-chip {
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--teal-soft);
+  padding: 3px 7px;
+  color: var(--teal-strong);
+  font-size: 10px;
+}
+
+.memora-binding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 8px 0;
+}
+
+.memora-binding-actions button {
+  min-height: 32px;
+  padding-inline: 10px;
+  font-size: 11px;
+}
+
+.memora-audit {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  background: var(--panel);
+  padding: 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.memora-audit.good {
+  border-color: color-mix(in srgb, var(--green) 48%, var(--row));
+  color: var(--green);
+}
+
+.memora-audit.error {
+  border-color: color-mix(in srgb, var(--red) 48%, var(--row));
+  color: var(--red);
+}
+
 .bottom-bar strong {
   color: var(--text);
   font-size: 12px;
@@ -4244,6 +4543,16 @@ textarea {
   font-size: 12px;
   font-weight: 720;
   white-space: nowrap;
+}
+
+@media (max-width: 1000px) {
+  .memora-governance-layout {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .memora-detail-section {
+    grid-column: 1 / -1;
+  }
 }
 
 @media (max-width: 1280px) {
@@ -4368,8 +4677,26 @@ textarea {
   .field-row,
   .action-group-grid,
   .app-connect-actions,
+  .memora-governance-layout,
+  .memora-workflow-controls,
   .bottom-bar {
     grid-template-columns: 1fr;
+  }
+
+  .memora-detail-section,
+  .memora-reason-field,
+  .memora-confirm-row,
+  .memora-workflow-controls .guard-hint {
+    grid-column: auto;
+  }
+
+  .memora-confirm-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .memora-confirm-row .guard-button {
+    width: 100%;
   }
 
   .top-readout {
