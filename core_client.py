@@ -473,6 +473,44 @@ class CoreClient:
     def retrieve_text_v2(self, prompt: str, **arguments: Any) -> dict[str, Any]:
         return self.call("retrieve_text_v2", {"prompt": prompt, **arguments})
 
+    def memora_shadow_plan(self, **arguments: Any) -> dict[str, Any]:
+        # Shadow planning re-embeds a bounded page through the neural
+        # provider; give it the neural lane deadline, not the control-plane
+        # default.
+        return self.call(
+            "memora_shadow_plan",
+            arguments,
+            timeout_seconds=NEURAL_OPERATION_TIMEOUT_SECONDS,
+        )
+
+    def list_memora_bindings(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("list_memora_bindings", arguments)
+
+    def get_memora_binding(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("get_memora_binding", arguments)
+
+    def propose_memora_binding(self, **arguments: Any) -> dict[str, Any]:
+        return self.call(
+            "propose_memora_binding",
+            arguments,
+            timeout_seconds=NEURAL_OPERATION_TIMEOUT_SECONDS,
+        )
+
+    def promote_memora_binding(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("promote_memora_binding", arguments)
+
+    def reject_memora_binding(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("reject_memora_binding", arguments)
+
+    def revoke_memora_binding(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("revoke_memora_binding", arguments)
+
+    def memora_binding_history(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("memora_binding_history", arguments)
+
+    def audit_memora_binding(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("audit_memora_binding", arguments)
+
     def query(self, embedding: Any, **arguments: Any) -> str:
         return self.call("query", {"embedding": embedding, **arguments})
 

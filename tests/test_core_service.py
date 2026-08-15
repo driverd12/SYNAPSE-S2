@@ -1788,6 +1788,7 @@ class CoreServiceTests(unittest.TestCase):
             "register_trace",
             "query_text",
             "retrieve_text_v2",
+            "memora_shadow_plan",
             "query",
             "enter_spiking_cortex",
             "cortex_tick",
@@ -1802,6 +1803,7 @@ class CoreServiceTests(unittest.TestCase):
             "run_quick_pruning",
             "run_idle_maintenance",
             "run_deep_sleep_consolidation",
+            "propose_memora_binding",
         }
         self.assertEqual(LONG_NEURAL_OPERATIONS, expected_operations)
         self.assertEqual(NEURAL_OPERATION_LANE_SECONDS, 120.0)
@@ -3109,7 +3111,7 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 self.assertEqual(result["query"]["recall_scope"], "local")
                 self.assertFalse(result["query"]["raw_input_stored"])
                 self.assertFalse(result["raw_input_stored"])
-                self.assertEqual(result["ranker"]["version"], "2.0.0")
+                self.assertEqual(result["ranker"]["version"], "2.1.0")
                 self.assertEqual(result["result_count"], 1)
                 self.assertEqual(len(result["items"]), 1)
                 self.assertEqual(result["items"][0]["context_id"], "ops")

@@ -161,7 +161,7 @@ class RetrievalV2Tests(unittest.TestCase):
             candidate_limit=16,
         )
         self.assertEqual(first, replay)
-        self.assertEqual(first["ranker"]["version"], "2.0.0")
+        self.assertEqual(first["ranker"]["version"], "2.1.0")
         self.assertFalse(first["query"]["raw_input_stored"])
 
     def test_randomized_insertion_order_and_exact_ties_use_memory_id_tiebreak(self) -> None:

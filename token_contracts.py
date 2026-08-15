@@ -32,6 +32,8 @@ DEFAULT_RESPONSE_BYTES = {
     "memory-graph": 48 * 1024,
     "cortex-state": 16 * 1024,
     "media-similarity": 16 * 1024,
+    "memora-shadow": 16 * 1024,
+    "memora-governance": 24 * 1024,
 }
 COMPACT_SOURCE_LIMITS = {
     "agent-events": 8,
@@ -41,6 +43,8 @@ COMPACT_SOURCE_LIMITS = {
     "memory-graph": 30,
     "cortex-state": 20,
     "media-similarity": 10,
+    "memora-shadow": 16,
+    "memora-governance": 16,
 }
 COMPACT_RETRIEVAL_ITEM_BYTES = {
     "memory-list": 1_024,
@@ -52,6 +56,10 @@ RETRIEVAL_PAGE_SCHEMA = "synapse-s2.retrieval-page.v2"
 RETRIEVAL_CURSOR_STRATEGY = "authenticated-keyset-v2"
 _RETRIEVAL_CURSOR_RE = re.compile(r"\As2rc2\.[A-Za-z0-9_-]{1,4000}\.[A-Za-z0-9_-]{43}\Z")
 _RETRIEVAL_REVISION_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+RETRIEVAL_CUE_TRUST_MARKER = "untrusted-derived-routing-evidence"
+RETRIEVAL_CUE_LIST_LIMIT = 4
+RETRIEVAL_CUE_CONTEXT_LIMIT = 16
+_RETRIEVAL_CUE_REVISION_SENTINELS = frozenset({"absent", "integrity-error"})
 _RETRIEVAL_ORIGIN_RE = re.compile(r"\As2origin_[0-9a-f]{32}\Z")
 SURFACE_ALIASES = {
     "agent-context-hydrate": "agent-hydration",
@@ -68,6 +76,11 @@ SURFACE_ALIASES = {
     "cortex-state": "cortex-state",
     "image-similar": "media-similarity",
     "media-similarity": "media-similarity",
+    "memora-shadow": "memora-shadow",
+    "memora-shadow-plan": "memora-shadow",
+    "memora-governance": "memora-governance",
+    "memora-bindings": "memora-governance",
+    "memora-binding": "memora-governance",
 }
 _SAFE_CODE_RE = re.compile(r"[^a-z0-9_.:-]+")
 _CONTEXT_DELIVERY_ID_RE = re.compile(r"[A-Za-z0-9_.:@-]+")
@@ -404,7 +417,7 @@ def project_response(
         max_response_bytes,
         default_bytes=DEFAULT_RESPONSE_BYTES[normalized_surface],
     )
-    if normalized_mode == "full":
+    if normalized_mode == "full" and normalized_surface != "memora-governance":
         return full_response(
             normalized_surface,
             payload,
@@ -417,6 +430,8 @@ def project_response(
         "memory-graph": project_memory_graph,
         "cortex-state": project_cortex_state,
         "media-similarity": project_media_similarity,
+        "memora-shadow": project_memora_shadow,
+        "memora-governance": project_memora_governance,
     }[normalized_surface]
     return projector(payload, max_response_bytes=budget)
 
@@ -586,6 +601,13 @@ def full_response(
             "result_set_truncated": _strict_boolean(
                 raw_completeness.get("result_set_truncated"),
                 field="completeness.result_set_truncated",
+            ),
+            "cue_routing_complete": _strict_boolean(
+                raw_completeness.get("cue_routing_complete"),
+                field="completeness.cue_routing_complete",
+            ),
+            "cue_integrity_failure_contexts": _retrieval_cue_integrity_contexts(
+                raw_completeness.get("cue_integrity_failure_contexts")
             ),
             "reason": (
                 "bounded-result-set-has-more"
@@ -1032,6 +1054,9 @@ def project_memory_retrieval(
             "graph_revision": _digest_identifier(
                 snapshot.get("graph_revision"), field="graph_revision"
             ),
+            "cue_revisions": _retrieval_cue_revisions(
+                snapshot.get("cue_revisions")
+            ),
         },
         "scope": {
             "origin_context_id": _atomic_identifier(
@@ -1105,6 +1130,13 @@ def project_memory_retrieval(
             "result_set_truncated": _strict_boolean(
                 raw_completeness.get("result_set_truncated"),
                 field="completeness.result_set_truncated",
+            ),
+            "cue_routing_complete": _strict_boolean(
+                raw_completeness.get("cue_routing_complete"),
+                field="completeness.cue_routing_complete",
+            ),
+            "cue_integrity_failure_contexts": _retrieval_cue_integrity_contexts(
+                raw_completeness.get("cue_integrity_failure_contexts")
             ),
             "reason": (
                 "bounded-result-set-has-more" if has_more else "bounded-result-set-complete"
@@ -1238,6 +1270,653 @@ def project_memory_list(
         shrinkers.insert(0, lambda: _drop_last(entries, envelope, "memory_entries"))
     shrinkers.append(lambda: _drop_noncritical_warning(envelope))
     return _finalize(envelope, budget=budget, shrinkers=shrinkers)
+
+
+def _shadow_similarity_stat(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        stat = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(stat):
+        return None
+    return round(stat, 6)
+
+
+def _project_shadow_cluster(item: dict[str, Any]) -> dict[str, Any]:
+    member_ids = [
+        _atomic_identifier(memory_id, field="member_memory_id", max_chars=128)
+        for memory_id in (
+            item.get("member_memory_ids")
+            if isinstance(item.get("member_memory_ids"), list)
+            else []
+        )
+    ][:64]
+    similarity = (
+        item.get("similarity") if isinstance(item.get("similarity"), dict) else {}
+    )
+    cues = []
+    for cue in _strict_object_list(
+        item.get("proposed_cues"), field="proposed_cues", allow_missing=True
+    )[:8]:
+        cues.append(
+            {
+                "cue_id": _atomic_identifier(
+                    cue.get("cue_id"), field="cue_id", max_chars=64
+                ),
+                "aspect": _clean_text(cue.get("aspect"), 24),
+                "label": _clean_text(cue.get("label"), 64),
+                "member_support": _safe_int(cue.get("member_support")),
+                "applied": False,
+            }
+        )
+    return {
+        "cluster_id": _atomic_identifier(
+            item.get("cluster_id"), field="cluster_id", max_chars=64
+        ),
+        "medoid_memory_id": _atomic_identifier(
+            item.get("medoid_memory_id"), field="medoid_memory_id", max_chars=128
+        ),
+        "member_count": _safe_int(item.get("member_count")),
+        "member_memory_ids": member_ids,
+        "similarity": {
+            "metric": _clean_text(similarity.get("metric"), 16),
+            "pair_count": _safe_int(similarity.get("pair_count")),
+            "min": _shadow_similarity_stat(similarity.get("min")),
+            "mean": _shadow_similarity_stat(similarity.get("mean")),
+            "max": _shadow_similarity_stat(similarity.get("max")),
+        },
+        "proposed_cues": cues,
+    }
+
+
+@_audited_projection
+def project_memora_shadow(
+    payload: dict[str, Any],
+    *,
+    max_response_bytes: Any = None,
+) -> dict[str, Any]:
+    budget = normalize_response_budget(
+        max_response_bytes,
+        default_bytes=DEFAULT_RESPONSE_BYTES["memora-shadow"],
+    )
+    _validate_surface_identities("memora-shadow", payload)
+    source_clusters = _strict_object_list(
+        payload.get("clusters"), field="clusters", allow_missing=True
+    )
+    cluster_limit = COMPACT_SOURCE_LIMITS["memora-shadow"]
+    clusters = [
+        _project_shadow_cluster(item) for item in source_clusters[:cluster_limit]
+    ]
+    provider = (
+        payload.get("provider") if isinstance(payload.get("provider"), dict) else {}
+    )
+    planner = (
+        payload.get("planner") if isinstance(payload.get("planner"), dict) else {}
+    )
+    snapshot = (
+        payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    )
+    namespace = (
+        payload.get("namespace") if isinstance(payload.get("namespace"), dict) else {}
+    )
+    limits = (
+        payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+    )
+    input_stats = (
+        payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    )
+    excluded_rows = _strict_object_list(
+        input_stats.get("excluded"), field="excluded", allow_missing=True
+    )
+    excluded = [
+        {
+            "memory_id": _atomic_identifier(
+                row.get("memory_id") or "unknown", field="memory_id", max_chars=128
+            ),
+            "reason": _clean_text(row.get("reason"), 64),
+        }
+        for row in excluded_rows[:16]
+    ]
+    unclustered_source = (
+        payload.get("unclustered_memory_ids")
+        if isinstance(payload.get("unclustered_memory_ids"), list)
+        else []
+    )
+    unclustered = [
+        _atomic_identifier(memory_id, field="memory_id", max_chars=128)
+        for memory_id in unclustered_source
+    ][:64]
+    warnings = [*_trusted_warnings(payload.get("warnings"))]
+    context_id = _atomic_identifier(
+        namespace.get("context_id"), field="context_id", max_chars=128
+    )
+    learned = bool(payload.get("learned"))
+    envelope = _base_envelope(
+        surface="memora-shadow",
+        mode="compact",
+        budget=budget,
+        data={
+            "plan_schema": str(payload.get("schema") or ""),
+            "mode": "shadow",
+            "applied": False,
+            "retrieval_effect": False,
+            "learned": learned,
+            "context_id": context_id,
+            "planner": {
+                "name": _clean_text(planner.get("name"), 64),
+                "generation_mode": _clean_text(planner.get("generation_mode"), 64),
+                "training_effect": _clean_text(planner.get("training_effect"), 32),
+                "promotion": _clean_text(planner.get("promotion"), 32),
+            },
+            "provider": {
+                "provider": _clean_text(provider.get("provider"), 64),
+                "provider_type": _clean_text(provider.get("provider_type"), 32),
+                "model_id": _clean_text(provider.get("model_id"), 128),
+                "revision": _clean_text(provider.get("revision"), 64),
+                "learned": learned,
+            },
+            "limits": {
+                "max_entries": _safe_int(limits.get("max_entries")),
+                "max_input_bytes": _safe_int(limits.get("max_input_bytes")),
+                "max_clusters": _safe_int(limits.get("max_clusters")),
+                "max_cues_per_cluster": _safe_int(limits.get("max_cues_per_cluster")),
+            },
+            "input": {
+                "entries_considered": _safe_int(input_stats.get("entries_considered")),
+                "entries_embedded": _safe_int(input_stats.get("entries_embedded")),
+                "embedded_input_bytes": _safe_int(
+                    input_stats.get("embedded_input_bytes")
+                ),
+                "entry_truncated_count": _safe_int(
+                    input_stats.get("entry_truncated_count")
+                ),
+                "redaction_dropped_fragments": _safe_int(
+                    input_stats.get("redaction_dropped_fragments")
+                ),
+                "redaction_rewrites": _safe_int(input_stats.get("redaction_rewrites")),
+                "excluded_count": len(excluded_rows),
+                "excluded": excluded,
+            },
+            "cluster_count": len(source_clusters),
+            "returned_clusters": len(clusters),
+            "clusters": clusters,
+            "unclustered_memory_ids": unclustered,
+        },
+        provenance={
+            "source": "sqlite-memory-store",
+            "context_id": context_id,
+            "read_only": True,
+            "source_revision": _clean_text(snapshot.get("revision"), 64),
+        },
+        pagination={
+            "supported": False,
+            "strategy": "single-snapshot-plan",
+            "requested_limit": _safe_int(limits.get("entry_limit"))
+            if limits.get("entry_limit") is not None
+            else None,
+            "effective_limit": _safe_int(limits.get("max_entries")),
+            "returned": len(clusters),
+            "has_more": None,
+            "next_cursor": None,
+        },
+        completeness={
+            "complete": len(clusters) == len(source_clusters),
+            "reason": None
+            if len(clusters) == len(source_clusters)
+            else "cluster-proposals-omitted",
+        },
+        continuation={
+            "strategy": "re-plan-with-fresh-snapshot",
+            "cursor": None,
+        },
+        warnings=warnings,
+    )
+    if len(source_clusters) > cluster_limit:
+        _record_omission(
+            envelope, "shadow_clusters", len(source_clusters) - cluster_limit
+        )
+        envelope["response_contract"]["truncated"] = True
+        _ensure_warning(
+            envelope,
+            _warning(
+                "output-truncated",
+                "warning",
+                "Shadow clusters beyond the compact source limit were omitted.",
+            ),
+        )
+
+    def _drop_cluster_cues() -> bool:
+        for cluster in reversed(clusters):
+            if cluster["proposed_cues"]:
+                _record_omission(
+                    envelope, "shadow_cues", len(cluster["proposed_cues"])
+                )
+                cluster["proposed_cues"] = []
+                return True
+        return False
+
+    def _drop_exclusion_detail() -> bool:
+        input_section = envelope["data"]["input"]
+        if input_section["excluded"]:
+            _record_omission(
+                envelope, "shadow_exclusions", len(input_section["excluded"])
+            )
+            input_section["excluded"] = []
+            return True
+        return False
+
+    shrinkers = [
+        _drop_cluster_cues,
+        _drop_exclusion_detail,
+        lambda: _drop_last(clusters, envelope, "shadow_clusters"),
+        lambda: _drop_noncritical_warning(envelope),
+    ]
+    return _finalize(envelope, budget=budget, shrinkers=shrinkers)
+
+
+_MEMORA_BINDING_STATES = frozenset(
+    {"proposed", "promoted", "rejected", "revoked", "superseded"}
+)
+_MEMORA_RESULT_OPERATIONS = frozenset(
+    {
+        "propose-memora-binding",
+        "promote-memora-binding",
+        "reject-memora-binding",
+        "revoke-memora-binding",
+    }
+)
+
+
+def _memora_governance_payload_kind(payload: dict[str, Any]) -> str:
+    schema = payload.get("schema")
+    if schema == "synapse-s2.memora-binding.v1":
+        if not isinstance(payload.get("binding"), dict):
+            raise ResponseContractError("memora binding response is invalid")
+        return "binding"
+    if schema == "synapse-s2.memora-catalog.v1":
+        if not isinstance(payload.get("bindings"), list):
+            raise ResponseContractError("memora catalog response is invalid")
+        return "catalog"
+    if schema == "synapse-s2.memora-governance-event.v1":
+        if not isinstance(payload.get("events"), list):
+            raise ResponseContractError("memora history response is invalid")
+        return "history"
+    if schema == "synapse-s2.memora-audit.v1":
+        if not isinstance(payload.get("events"), list):
+            raise ResponseContractError("memora audit response is invalid")
+        return "audit"
+    if payload.get("operation") in _MEMORA_RESULT_OPERATIONS and isinstance(
+        payload.get("binding"), dict
+    ):
+        if payload.get("automatic_promotion") is not False:
+            raise ResponseContractError(
+                "memora transition must explicitly disable automatic promotion"
+            )
+        return "transition"
+    raise ResponseContractError("memora governance response schema is unsupported")
+
+
+def _project_memora_effectiveness(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or type(value.get("effective")) is not bool:
+        raise ResponseContractError("memora effectiveness is invalid")
+    reasons = [
+        _clean_text(reason, 96)
+        for reason in _strict_string_list(
+            value.get("reasons"), field="memora effectiveness reasons", allow_missing=True
+        )[:16]
+    ]
+    return {"effective": bool(value["effective"]), "reasons": reasons}
+
+
+def _project_memora_binding(binding: Any) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        raise ResponseContractError("memora binding must be an object")
+    if (
+        binding.get("schema") != "synapse-s2.memora-binding.v1"
+        or binding.get("schema_version") != 1
+        or binding.get("automatic_promotion") is not False
+        or binding.get("raw_source_text_stored") is not False
+        or binding.get("vectors_stored") is not False
+    ):
+        raise ResponseContractError("memora binding authority flags are invalid")
+    state = str(binding.get("state") or "")
+    if state not in _MEMORA_BINDING_STATES:
+        raise ResponseContractError("memora binding state is invalid")
+    plan = binding.get("plan") if isinstance(binding.get("plan"), dict) else {}
+    abstraction = (
+        binding.get("abstraction")
+        if isinstance(binding.get("abstraction"), dict)
+        else {}
+    )
+    if abstraction.get("trust") != RETRIEVAL_CUE_TRUST_MARKER:
+        raise ResponseContractError("memora abstraction trust marker is invalid")
+    sources = _strict_object_list(binding.get("sources"), field="memora sources")
+    cues = []
+    for cue in _strict_object_list(binding.get("cues"), field="memora cues")[:8]:
+        if cue.get("trust") != RETRIEVAL_CUE_TRUST_MARKER:
+            raise ResponseContractError("memora cue trust marker is invalid")
+        supporting = _strict_string_list(
+            cue.get("supporting_memory_ids"),
+            field="memora cue supporting ids",
+        )
+        member_support = _safe_int(cue.get("member_support"))
+        if member_support != len(supporting):
+            raise ResponseContractError("memora cue support count is inconsistent")
+        cues.append(
+            {
+                "cue_id": _atomic_identifier(
+                    cue.get("cue_id"), field="cue_id", max_chars=96
+                ),
+                "term": _clean_text(cue.get("term"), 64),
+                "aspect": _clean_text(cue.get("aspect"), 32),
+                "member_support": member_support,
+                "trust": RETRIEVAL_CUE_TRUST_MARKER,
+            }
+        )
+    provider = (
+        binding.get("provider") if isinstance(binding.get("provider"), dict) else {}
+    )
+    result = {
+        "binding_id": _atomic_identifier(
+            binding.get("binding_id"), field="binding_id", max_chars=64
+        ),
+        "context_id": _atomic_identifier(
+            binding.get("context_id"), field="context_id", max_chars=128
+        ),
+        "state": state,
+        "revision": _digest_identifier(
+            binding.get("revision"), field="binding revision"
+        ),
+        "previous_revision": (
+            None
+            if binding.get("previous_revision") is None
+            else _digest_identifier(
+                binding.get("previous_revision"), field="previous binding revision"
+            )
+        ),
+        "created_at": _safe_number(binding.get("created_at")),
+        "updated_at": _safe_number(binding.get("updated_at")),
+        "proposed_by": _clean_text(binding.get("proposed_by"), 128),
+        "proposed_at": _safe_number(binding.get("proposed_at")),
+        "reviewed_by": _clean_text(binding.get("reviewed_by"), 128),
+        "reviewed_at": (
+            None
+            if binding.get("reviewed_at") is None
+            else _safe_number(binding.get("reviewed_at"))
+        ),
+        "revoked_by": _clean_text(binding.get("revoked_by"), 128),
+        "revoked_at": (
+            None
+            if binding.get("revoked_at") is None
+            else _safe_number(binding.get("revoked_at"))
+        ),
+        "proposal_reason": _clean_text(binding.get("proposal_reason"), 240),
+        "decision_reason": _clean_text(binding.get("decision_reason"), 240),
+        "plan": {
+            "plan_digest": _digest_identifier(
+                plan.get("plan_digest"), field="plan_digest"
+            ),
+            "cluster_ordinal": _safe_int(plan.get("cluster_ordinal")),
+            "cluster_id": _atomic_identifier(
+                plan.get("cluster_id"), field="cluster_id", max_chars=96
+            ),
+            "planner_version": _clean_text(plan.get("planner_version"), 96),
+            "learned": _strict_boolean(plan.get("learned"), field="plan.learned"),
+        },
+        "provider": {
+            "provider": _clean_text(provider.get("provider"), 96),
+            "provider_type": _clean_text(provider.get("provider_type"), 32),
+            "model_id": _clean_text(provider.get("model_id"), 160),
+            "revision": _clean_text(provider.get("revision"), 96),
+            "dimensions": _safe_int(provider.get("dimensions")),
+            "semantic": _strict_boolean(
+                provider.get("semantic"), field="provider.semantic"
+            ),
+            "local_only": _strict_boolean(
+                provider.get("local_only"), field="provider.local_only"
+            ),
+            "ready": _strict_boolean(provider.get("ready"), field="provider.ready"),
+        },
+        "abstraction": {
+            "display_term": _clean_text(abstraction.get("display_term"), 64),
+            "member_count": _safe_int(abstraction.get("member_count")),
+            "trust": RETRIEVAL_CUE_TRUST_MARKER,
+        },
+        "cues": cues,
+        "cue_count": len(cues),
+        "source_count": len(sources),
+        "event_count": _safe_int(binding.get("event_count")),
+        "automatic_promotion": False,
+        "raw_source_text_stored": False,
+        "vectors_stored": False,
+    }
+    return result
+
+
+def _project_memora_event(event: Any) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        raise ResponseContractError("memora governance event must be an object")
+    before_revision = str(event.get("before_revision") or "")
+    return {
+        "action": _clean_text(event.get("action"), 32),
+        "actor": _clean_text(event.get("actor"), 128),
+        "reason": _clean_text(event.get("reason"), 240),
+        "before_state": _clean_text(event.get("before_state"), 16),
+        "after_state": _clean_text(event.get("after_state"), 16),
+        "before_revision": (
+            ""
+            if not before_revision
+            else _digest_identifier(before_revision, field="event before_revision")
+        ),
+        "after_revision": _digest_identifier(
+            event.get("after_revision"), field="event after_revision"
+        ),
+        "event_sequence": _safe_int(event.get("event_sequence")),
+        "created_at": _safe_number(event.get("created_at")),
+    }
+
+
+@_audited_projection
+def project_memora_governance(
+    payload: dict[str, Any],
+    *,
+    max_response_bytes: Any = None,
+) -> dict[str, Any]:
+    budget = normalize_response_budget(
+        max_response_bytes,
+        default_bytes=DEFAULT_RESPONSE_BYTES["memora-governance"],
+    )
+    kind = _memora_governance_payload_kind(payload)
+    binding_rows: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    source_total = 0
+    source_truncated = False
+    context_id = str(payload.get("context_id") or "")
+
+    if kind == "catalog":
+        raw_rows = _strict_object_list(payload.get("bindings"), field="bindings")
+        source_total = _safe_int(payload.get("total"))
+        if _safe_int(payload.get("returned")) != len(raw_rows):
+            raise ResponseContractError("memora catalog returned count is inconsistent")
+        if source_total < len(raw_rows):
+            raise ResponseContractError("memora catalog total is inconsistent")
+        source_truncated = bool(payload.get("truncated")) or len(raw_rows) > 16
+        for row in raw_rows[:16]:
+            projected_binding = _project_memora_binding(row.get("binding"))
+            if projected_binding["context_id"] != context_id:
+                raise ResponseContractError(
+                    "memora catalog binding escaped its namespace"
+                )
+            binding_rows.append(
+                {
+                    "binding": projected_binding,
+                    "effectiveness": _project_memora_effectiveness(
+                        row.get("effectiveness")
+                    ),
+                }
+            )
+    elif kind in {"binding", "transition"}:
+        projected_binding = _project_memora_binding(payload.get("binding"))
+        if (
+            payload.get("state") != projected_binding["state"]
+            or payload.get("revision") != projected_binding["revision"]
+        ):
+            raise ResponseContractError(
+                "memora binding envelope does not match its projection"
+            )
+        context_id = projected_binding["context_id"]
+        binding_rows = [
+            {
+                "binding": projected_binding,
+                "effectiveness": _project_memora_effectiveness(
+                    payload.get("effectiveness")
+                ),
+            }
+        ]
+        source_total = 1
+    else:
+        raw_events = _strict_object_list(payload.get("events"), field="events")
+        events = [_project_memora_event(event) for event in raw_events[:16]]
+        source_total = (
+            _safe_int(payload.get("total_events"))
+            if kind == "history"
+            else _safe_int(payload.get("event_count"))
+        )
+        source_truncated = bool(payload.get("truncated")) or len(raw_events) > 16
+        if source_total < len(raw_events):
+            raise ResponseContractError("memora event total is inconsistent")
+        if kind == "audit" and (
+            payload.get("chain_valid") is not True
+            or payload.get("catalog_cross_checked") is not True
+            or _safe_int(payload.get("events_validated")) != len(raw_events)
+        ):
+            raise ResponseContractError("memora audit evidence is inconsistent")
+
+    if context_id:
+        context_id = _atomic_identifier(
+            context_id, field="context_id", max_chars=128
+        )
+    binding_id = str(payload.get("binding_id") or "")
+    if not binding_id and binding_rows:
+        binding_id = str(binding_rows[0]["binding"]["binding_id"])
+    if binding_id:
+        binding_id = _atomic_identifier(
+            binding_id, field="binding_id", max_chars=64
+        )
+    raw_catalog_revision = str(payload.get("catalog_revision") or "")
+    catalog_revision = raw_catalog_revision
+    if raw_catalog_revision and raw_catalog_revision != "absent":
+        catalog_revision = _digest_identifier(
+            raw_catalog_revision, field="catalog_revision"
+        )
+    raw_revision = str(
+        payload.get("revision", payload.get("current_revision")) or ""
+    )
+    revision = (
+        ""
+        if not raw_revision
+        else _digest_identifier(raw_revision, field="memora response revision")
+    )
+    data = {
+        "kind": kind,
+        "source_operation": _clean_text(payload.get("operation"), 64),
+        "context_id": context_id,
+        "binding_id": binding_id,
+        "catalog_revision": catalog_revision,
+        "bindings": binding_rows,
+        "events": events,
+        "state": _clean_text(
+            payload.get("state", payload.get("current_state")), 16
+        ),
+        "revision": revision,
+        "chain_valid": (
+            _strict_boolean(payload.get("chain_valid"), field="chain_valid")
+            if kind == "audit"
+            else None
+        ),
+        "catalog_cross_checked": (
+            _strict_boolean(
+                payload.get("catalog_cross_checked"),
+                field="catalog_cross_checked",
+            )
+            if kind == "audit"
+            else None
+        ),
+        "automatic_promotion": False,
+    }
+    returned = len(binding_rows) if kind in {"catalog", "binding", "transition"} else len(events)
+    envelope = _base_envelope(
+        surface="memora-governance",
+        mode="compact",
+        budget=budget,
+        data=data,
+        provenance={
+            "source": "authoritative-memora-governance",
+            "context_id": context_id,
+            "binding_id": binding_id,
+            "automatic_promotion": False,
+        },
+        pagination={
+            "supported": kind == "history",
+            "strategy": "validated-receipt-chain" if kind == "history" else "bounded-list",
+            "requested_limit": None,
+            "effective_limit": 16,
+            "returned": returned,
+            "has_more": source_truncated,
+            "next_cursor": (
+                payload.get("next_before_sequence") if kind == "history" else None
+            ),
+        },
+        completeness={
+            "complete": not source_truncated,
+            "integrity_validated": True,
+            "automatic_promotion": False,
+            "reason": None if not source_truncated else "bounded-governance-detail",
+        },
+        continuation={
+            "strategy": (
+                "request-next-history-page"
+                if kind == "history" and source_truncated
+                else "refine-list-filter"
+                if kind == "catalog" and source_truncated
+                else "none"
+            ),
+            "cursor": (
+                payload.get("next_before_sequence") if kind == "history" else None
+            ),
+        },
+        warnings=[],
+    )
+    if source_total > returned or source_truncated:
+        _record_omission(
+            envelope,
+            "memora_governance_records",
+            max(1, source_total - returned),
+        )
+        envelope["response_contract"]["truncated"] = True
+        _ensure_warning(
+            envelope,
+            _warning(
+                "output-truncated",
+                "warning",
+                "Additional governed lifecycle records exist outside this bounded response.",
+            ),
+        )
+    return _finalize(
+        envelope,
+        budget=budget,
+        shrinkers=[
+            lambda: _drop_last(events, envelope, "memora_governance_events"),
+            lambda: _drop_last(
+                binding_rows, envelope, "memora_governance_bindings"
+            ),
+            lambda: _drop_noncritical_warning(envelope),
+        ],
+    )
 
 
 @_audited_projection
@@ -1941,6 +2620,21 @@ def _refresh_dynamic_counts(envelope: dict[str, Any]) -> None:
         completeness = envelope.get("completeness")
         if isinstance(completeness, dict):
             completeness["all_returned_edge_endpoints_resolved"] = unresolved == 0
+    elif operation == "memora-shadow":
+        clusters = (
+            data.get("clusters", [])
+            if isinstance(data.get("clusters"), list)
+            else []
+        )
+        data["returned_clusters"] = len(clusters)
+        pagination["returned"] = len(clusters)
+        completeness = envelope.get("completeness")
+        if isinstance(completeness, dict):
+            complete = len(clusters) == _safe_int(data.get("cluster_count"))
+            completeness["complete"] = complete
+            completeness["reason"] = (
+                None if complete else "cluster-proposals-omitted"
+            )
     elif operation == "cortex-state":
         keys = {
             "sessions": "active_sessions",
@@ -2307,6 +3001,42 @@ def _retrieval_revision_summary(value: Any) -> dict[str, Any]:
     }
 
 
+def _retrieval_cue_revisions(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ResponseContractError("snapshot cue_revisions must be an object")
+    projected: dict[str, str] = {}
+    for raw_context in sorted(str(key) for key in value)[
+        :RETRIEVAL_CUE_CONTEXT_LIMIT
+    ]:
+        context_id = _atomic_identifier(
+            raw_context, field="cue revision context", max_chars=128
+        )
+        revision = value.get(raw_context)
+        if revision in _RETRIEVAL_CUE_REVISION_SENTINELS:
+            projected[context_id] = str(revision)
+            continue
+        if _RETRIEVAL_REVISION_RE.fullmatch(str(revision or "")) is None:
+            raise ResponseContractError("cue catalog revision is invalid")
+        projected[context_id] = str(revision)
+    return projected
+
+
+def _retrieval_cue_integrity_contexts(value: Any) -> list[str]:
+    contexts = _strict_string_list(
+        value,
+        field="cue_integrity_failure_contexts",
+        allow_missing=True,
+    )
+    return [
+        _atomic_identifier(item, field="cue integrity context", max_chars=128)
+        for item in sorted({str(item) for item in contexts})[
+            :RETRIEVAL_CUE_CONTEXT_LIMIT
+        ]
+    ]
+
+
 def _unit_number(value: Any, *, field: str) -> int | float:
     number = _safe_number(value)
     if float(number) < 0.0 or float(number) > 1.0:
@@ -2388,6 +3118,30 @@ def _project_retrieval_relationship(value: Any) -> dict[str, Any]:
     }
 
 
+def _project_retrieval_cue(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ResponseContractError("retrieval cue must be an object")
+    if value.get("trust") != RETRIEVAL_CUE_TRUST_MARKER:
+        raise ResponseContractError(
+            "retrieval cue evidence must carry the untrusted routing marker"
+        )
+    return {
+        "binding_id": _atomic_identifier(
+            value.get("binding_id"), field="cue binding_id", max_chars=96
+        ),
+        "cue_id": _atomic_identifier(
+            value.get("cue_id"), field="cue_id", max_chars=96
+        ),
+        "context_id": _atomic_identifier(
+            value.get("context_id"), field="cue context_id", max_chars=128
+        ),
+        "term": _clean_text(value.get("term"), 64),
+        "aspect": _clean_text(value.get("aspect"), 64),
+        "member_support": _safe_int(value.get("member_support")),
+        "trust": RETRIEVAL_CUE_TRUST_MARKER,
+    }
+
+
 def _project_retrieval_reason(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ResponseContractError("retrieval match reason must be an object")
@@ -2441,6 +3195,23 @@ def _project_retrieval_reason(value: Any) -> dict[str, Any]:
             "type": reason_type,
             "relationship_count": _safe_int(value.get("relationship_count")),
             "relationships": relationships,
+        }
+    if reason_type == "governed-cue-term-match":
+        if value.get("trust") != RETRIEVAL_CUE_TRUST_MARKER:
+            raise ResponseContractError(
+                "governed cue reason must carry the untrusted routing marker"
+            )
+        cues = [
+            _project_retrieval_cue(item)
+            for item in _strict_object_list(
+                value.get("cues"), field="reason cues", allow_missing=True
+            )[:RETRIEVAL_CUE_LIST_LIMIT]
+        ]
+        return {
+            "type": reason_type,
+            "cue_count": _safe_int(value.get("cue_count")),
+            "cues": cues,
+            "trust": RETRIEVAL_CUE_TRUST_MARKER,
         }
     raise ResponseContractError("retrieval match reason type is unsupported")
 
@@ -2506,13 +3277,23 @@ def _project_retrieval_item(item: dict[str, Any]) -> dict[str, Any]:
         "score_breakdown": {
             "signals": {
                 key: _unit_number(signals.get(key), field=f"signal {key}")
-                for key in ("spike_index", "surface_index", "same_context_graph")
+                for key in (
+                    "spike_index",
+                    "surface_index",
+                    "same_context_graph",
+                    "governed_cue",
+                )
             },
             "contributions": {
                 key: _unit_number(
                     contributions.get(key), field=f"contribution {key}"
                 )
-                for key in ("spike_index", "surface_index", "same_context_graph")
+                for key in (
+                    "spike_index",
+                    "surface_index",
+                    "same_context_graph",
+                    "governed_cue",
+                )
             },
             "relevance_score": _unit_number(
                 score_breakdown.get("relevance_score"),
@@ -2542,13 +3323,16 @@ def _project_retrieval_item(item: dict[str, Any]) -> dict[str, Any]:
             ),
             "warning": "Do not interpret this ranking signal as a truth probability.",
         },
+        # One slot per authoritative signal family (spike, surface, graph,
+        # governed cue): the cue reason arrives fourth and must survive a
+        # four-signal result instead of being silently truncated.
         "match_reasons": [
             _project_retrieval_reason(reason)
             for reason in _strict_object_list(
                 item.get("match_reasons"),
                 field="match_reasons",
                 allow_missing=True,
-            )[:3]
+            )[:4]
         ],
         "scope_provenance": {
             "origin_context_id": _atomic_identifier(
@@ -3723,6 +4507,20 @@ def _validate_surface_identities(surface: str, payload: dict[str, Any]) -> None:
                 "media similarity confidence is not uncalibrated"
             )
         return
+    if surface == "memora-governance":
+        kind = _memora_governance_payload_kind(payload)
+        if kind == "catalog":
+            for row in _strict_object_list(
+                payload.get("bindings"), field="bindings"
+            ):
+                _project_memora_binding(row.get("binding"))
+                _project_memora_effectiveness(row.get("effectiveness"))
+        elif kind in {"binding", "transition"}:
+            _project_memora_binding(payload.get("binding"))
+        else:
+            for event in _strict_object_list(payload.get("events"), field="events"):
+                _project_memora_event(event)
+        return
     if surface == "memory-retrieval":
         if payload.get("schema") != "synapse-retrieval.v2":
             raise ResponseContractError("retrieval schema is unsupported")
@@ -3895,11 +4693,19 @@ def _validate_surface_identities(surface: str, payload: dict[str, Any]) -> None:
             completeness.get("has_more"), field="completeness.has_more"
         ) != expected_has_more:
             raise ResponseContractError("retrieval has_more is inconsistent")
+        cue_routing_complete = _strict_boolean(
+            completeness.get("cue_routing_complete"),
+            field="completeness.cue_routing_complete",
+        )
+        _retrieval_cue_integrity_contexts(
+            completeness.get("cue_integrity_failure_contexts")
+        )
         expected_complete = bool(
             scope_complete
             and not query_terms_truncated
             and not candidate_scan_truncated
             and not result_set_truncated
+            and cue_routing_complete
         )
         if _strict_boolean(
             completeness.get("complete"), field="completeness.complete"
@@ -4087,6 +4893,62 @@ def _validate_surface_identities(surface: str, payload: dict[str, Any]) -> None:
                 raise ResponseContractError(
                     "memory graph by_type counts must match returned relationships"
                 )
+    elif surface == "memora-shadow":
+        memory_rows = []
+        relationship_rows = []
+        if payload.get("schema") != "synapse-s2.memora-shadow.v1":
+            raise ResponseContractError("memora shadow schema is unsupported")
+        if payload.get("schema_version") != 1:
+            raise ResponseContractError("memora shadow schema_version is unsupported")
+        if payload.get("mode") != "shadow":
+            raise ResponseContractError("memora shadow payload must declare shadow mode")
+        if payload.get("applied") is not False:
+            raise ResponseContractError("memora shadow proposals must never be applied")
+        if payload.get("retrieval_effect") is not False:
+            raise ResponseContractError("memora shadow must never affect retrieval")
+        if payload.get("raw_input_stored") is not False:
+            raise ResponseContractError("memora shadow must not store raw input")
+        learned_flag = payload.get("learned")
+        if not isinstance(learned_flag, bool):
+            raise ResponseContractError("memora shadow learned flag must be boolean")
+        provider = payload.get("provider")
+        if not isinstance(provider, dict):
+            raise ResponseContractError("memora shadow provider identity is invalid")
+        provider_learned = (
+            provider.get("provider_type") == "mlx-neural"
+            and bool(provider.get("semantic"))
+        )
+        if learned_flag != provider_learned:
+            raise ResponseContractError(
+                "memora shadow learned flag must match the pinned neural provider"
+            )
+        namespace = payload.get("namespace")
+        if not isinstance(namespace, dict):
+            raise ResponseContractError("memora shadow namespace metadata is invalid")
+        if namespace.get("include_global") is not False or namespace.get(
+            "connected_scope_used"
+        ) is not False:
+            raise ResponseContractError(
+                "memora shadow must use exactly one namespace"
+            )
+        namespace_context_id = _atomic_identifier(
+            namespace.get("context_id"), field="context_id", max_chars=128
+        )
+        if payload.get("context_id") != namespace_context_id:
+            raise ResponseContractError(
+                "memora shadow context_id must match its namespace"
+            )
+        for cluster in _strict_object_list(
+            payload.get("clusters"), field="clusters", allow_missing=True
+        ):
+            for forbidden in ("vector", "vectors", "embedding", "embeddings"):
+                if forbidden in cluster:
+                    raise ResponseContractError(
+                        "memora shadow clusters must not carry raw embeddings"
+                    )
+            _atomic_identifier(
+                cluster.get("cluster_id"), field="cluster_id", max_chars=64
+            )
     else:
         root_agent_id = _optional_atomic_identifier(
             payload.get("agent_id"), field="agent_id", max_chars=128

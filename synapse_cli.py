@@ -49,6 +49,15 @@ _CONTRACT_COMMAND_SURFACES = {
     "list-memory": "memory-list",
     "graph": "memory-graph",
     "cortex-state": "cortex-state",
+    "memora-shadow": "memora-shadow",
+    "memora-bindings": "memora-governance",
+    "memora-binding": "memora-governance",
+    "memora-propose": "memora-governance",
+    "memora-promote": "memora-governance",
+    "memora-reject": "memora-governance",
+    "memora-revoke": "memora-governance",
+    "memora-history": "memora-governance",
+    "memora-audit": "memora-governance",
 }
 try:
     # A reviewed binding must be loaded, canonicalized, and matched to its
@@ -527,6 +536,149 @@ def command_retrieve_v2(args: argparse.Namespace) -> dict[str, Any]:
         mode=mode,
         max_response_bytes=budget,
     )
+
+
+def command_memora_shadow(args: argparse.Namespace) -> dict[str, Any]:
+    mode, budget = _cli_response_options(args, surface="memora-shadow")
+    entry_limit = _strict_cli_bounded_integer(
+        args.entry_limit,
+        field_name="entry_limit",
+        minimum=1,
+        maximum=64,
+    )
+    max_clusters = _strict_cli_bounded_integer(
+        args.max_clusters,
+        field_name="max_clusters",
+        minimum=1,
+        maximum=16,
+    )
+    max_cues = _strict_cli_bounded_integer(
+        args.max_cues,
+        field_name="max_cues",
+        minimum=0,
+        maximum=8,
+    )
+    if args.memory_db is None and binding_from_environment() is None:
+        raise ValueError(
+            "memora-shadow requires the reviewed core binding or an explicit "
+            "--memory-db path; refusing to create an implicit local database"
+        )
+    backend = build_backend(args)
+    payload = backend.memora_shadow_plan(
+        context_id=args.context,
+        entry_limit=entry_limit,
+        max_clusters=max_clusters,
+        max_cues=max_cues,
+        similarity_threshold=float(args.similarity_threshold),
+    )
+    if mode == "legacy":
+        return payload
+    return project_response(
+        "memora-shadow",
+        payload,
+        mode=mode,
+        max_response_bytes=budget,
+    )
+
+
+def _memora_governance_cli_response(
+    args: argparse.Namespace,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    mode, budget = _cli_response_options(args, surface="memora-governance")
+    if mode == "legacy":
+        return payload
+    return project_response(
+        "memora-governance",
+        payload,
+        mode=mode,
+        max_response_bytes=budget,
+    )
+
+
+def command_memora_bindings(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).list_memora_bindings(
+        context_id=args.context,
+        state=args.state,
+        limit=_strict_cli_bounded_integer(
+            args.limit, field_name="limit", minimum=1, maximum=256
+        ),
+    )
+    return _memora_governance_cli_response(args, payload)
+
+
+def command_memora_binding(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).get_memora_binding(binding_id=args.binding_id)
+    return _memora_governance_cli_response(args, payload)
+
+
+def command_memora_propose(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).propose_memora_binding(
+        context_id=args.context,
+        plan_digest=args.plan_digest,
+        cluster_ordinal=_strict_cli_bounded_integer(
+            args.cluster_ordinal,
+            field_name="cluster_ordinal",
+            minimum=0,
+            maximum=15,
+        ),
+        proposed_by=args.proposed_by,
+        reason=args.reason,
+        governance_request_id=args.governance_request_id,
+    )
+    return _memora_governance_cli_response(args, payload)
+
+
+def command_memora_promote(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).promote_memora_binding(
+        binding_id=args.binding_id,
+        expected_revision=args.expected_revision,
+        reviewed_by=args.reviewed_by,
+        reason=args.reason,
+        confirm=bool(args.confirm),
+        supersedes_binding_id=args.supersedes_binding_id,
+        governance_request_id=args.governance_request_id,
+    )
+    return _memora_governance_cli_response(args, payload)
+
+
+def command_memora_reject(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).reject_memora_binding(
+        binding_id=args.binding_id,
+        expected_revision=args.expected_revision,
+        reviewed_by=args.reviewed_by,
+        reason=args.reason,
+        governance_request_id=args.governance_request_id,
+    )
+    return _memora_governance_cli_response(args, payload)
+
+
+def command_memora_revoke(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).revoke_memora_binding(
+        binding_id=args.binding_id,
+        expected_revision=args.expected_revision,
+        revoked_by=args.revoked_by,
+        reason=args.reason,
+        confirm=bool(args.confirm),
+        governance_request_id=args.governance_request_id,
+    )
+    return _memora_governance_cli_response(args, payload)
+
+
+def command_memora_history(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).memora_binding_history(
+        binding_id=args.binding_id,
+        limit=_strict_cli_bounded_integer(
+            args.limit, field_name="limit", minimum=1, maximum=256
+        ),
+        before_sequence=args.before_sequence,
+    )
+    return _memora_governance_cli_response(args, payload)
+
+
+def command_memora_audit(args: argparse.Namespace) -> dict[str, Any]:
+    payload = build_backend(args).audit_memora_binding(binding_id=args.binding_id)
+    return _memora_governance_cli_response(args, payload)
 
 
 def command_query_vector(args: argparse.Namespace) -> dict[str, Any]:
@@ -2374,6 +2526,116 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_response_contract_args(retrieve_v2)
     retrieve_v2.set_defaults(func=command_retrieve_v2)
+
+    memora_shadow = subparsers.add_parser(
+        "memora-shadow",
+        help="Shadow-only Memora consolidation proposals (read-only, never applied).",
+        description=(
+            "Propose bounded consolidation clusters and cue bindings for one "
+            "exact namespace using pretrained embedding inference over "
+            "already-redacted durable text. Nothing is persisted or applied "
+            "and retrieval results are unchanged."
+        ),
+    )
+    add_context(memora_shadow)
+    memora_shadow.add_argument("--entry-limit", type=int, default=64)
+    memora_shadow.add_argument("--max-clusters", type=int, default=16)
+    memora_shadow.add_argument("--max-cues", type=int, default=8)
+    memora_shadow.add_argument("--similarity-threshold", type=float, default=0.55)
+    _add_response_contract_args(memora_shadow)
+    memora_shadow.set_defaults(func=command_memora_shadow)
+
+    memora_bindings = subparsers.add_parser(
+        "memora-bindings",
+        help="List integrity-checked governed Memora cue bindings.",
+    )
+    add_context(memora_bindings)
+    memora_bindings.add_argument(
+        "--state",
+        choices=("proposed", "promoted", "rejected", "revoked", "superseded"),
+        default=None,
+    )
+    memora_bindings.add_argument("--limit", type=int, default=50)
+    _add_response_contract_args(memora_bindings)
+    memora_bindings.set_defaults(func=command_memora_bindings)
+
+    memora_binding = subparsers.add_parser(
+        "memora-binding",
+        help="Read one integrity-checked governed Memora cue binding.",
+    )
+    memora_binding.add_argument("--binding-id", required=True)
+    _add_response_contract_args(memora_binding)
+    memora_binding.set_defaults(func=command_memora_binding)
+
+    memora_propose = subparsers.add_parser(
+        "memora-propose",
+        help="Propose one reviewed learned shadow-plan cluster; never auto-promotes.",
+    )
+    add_context(memora_propose)
+    memora_propose.add_argument("--plan-digest", required=True)
+    memora_propose.add_argument("--cluster-ordinal", type=int, required=True)
+    memora_propose.add_argument("--proposed-by", default="operator-proposer")
+    memora_propose.add_argument("--reason", required=True)
+    memora_propose.add_argument("--governance-request-id")
+    _add_response_contract_args(memora_propose)
+    memora_propose.set_defaults(func=command_memora_propose)
+
+    memora_promote = subparsers.add_parser(
+        "memora-promote",
+        help="Promote one proposal with exact revision, distinct workflow role, and confirm.",
+    )
+    memora_promote.add_argument("--binding-id", required=True)
+    memora_promote.add_argument("--expected-revision", required=True)
+    memora_promote.add_argument("--reviewed-by", default="operator-reviewer")
+    memora_promote.add_argument("--reason", required=True)
+    memora_promote.add_argument("--supersedes-binding-id")
+    memora_promote.add_argument("--governance-request-id")
+    memora_promote.add_argument("--confirm", action="store_true")
+    _add_response_contract_args(memora_promote)
+    memora_promote.set_defaults(func=command_memora_promote)
+
+    memora_reject = subparsers.add_parser(
+        "memora-reject",
+        help="Reject one proposal using its exact current revision.",
+    )
+    memora_reject.add_argument("--binding-id", required=True)
+    memora_reject.add_argument("--expected-revision", required=True)
+    memora_reject.add_argument("--reviewed-by", default="operator-reviewer")
+    memora_reject.add_argument("--reason", required=True)
+    memora_reject.add_argument("--governance-request-id")
+    _add_response_contract_args(memora_reject)
+    memora_reject.set_defaults(func=command_memora_reject)
+
+    memora_revoke = subparsers.add_parser(
+        "memora-revoke",
+        help="Revoke promoted cue routing without deleting source memories.",
+    )
+    memora_revoke.add_argument("--binding-id", required=True)
+    memora_revoke.add_argument("--expected-revision", required=True)
+    memora_revoke.add_argument("--revoked-by", default="operator-revoker")
+    memora_revoke.add_argument("--reason", required=True)
+    memora_revoke.add_argument("--governance-request-id")
+    memora_revoke.add_argument("--confirm", action="store_true")
+    _add_response_contract_args(memora_revoke)
+    memora_revoke.set_defaults(func=command_memora_revoke)
+
+    memora_history = subparsers.add_parser(
+        "memora-history",
+        help="Read a bounded, validated Memora lifecycle receipt chain.",
+    )
+    memora_history.add_argument("--binding-id", required=True)
+    memora_history.add_argument("--limit", type=int, default=50)
+    memora_history.add_argument("--before-sequence", type=int)
+    _add_response_contract_args(memora_history)
+    memora_history.set_defaults(func=command_memora_history)
+
+    memora_audit = subparsers.add_parser(
+        "memora-audit",
+        help="Validate one binding projection, catalog entry, and receipt chain.",
+    )
+    memora_audit.add_argument("--binding-id", required=True)
+    _add_response_contract_args(memora_audit)
+    memora_audit.set_defaults(func=command_memora_audit)
 
     query_vector = subparsers.add_parser(
         "query-vector",

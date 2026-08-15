@@ -49,6 +49,21 @@ from core_authority import (
     CoreAuthorityError,
     CoreAuthorityLease,
 )
+from memora_governance import (
+    CUE_TRUST_MARKER,
+    MemoraGovernance,
+    MemoraGovernanceIntegrityError,
+)
+from memora_shadow import (
+    MEMORA_SHADOW_MAX_CLUSTERS,
+    MEMORA_SHADOW_MAX_CUES_PER_CLUSTER,
+    MEMORA_SHADOW_MAX_ENTRIES,
+    MEMORA_SHADOW_MAX_METADATA_BYTES,
+    MEMORA_SHADOW_MAX_SOURCE_TEXT_BYTES,
+    MEMORA_SHADOW_DEFAULT_SIMILARITY_THRESHOLD,
+    build_shadow_plan,
+    provider_identity,
+)
 from memory_store import (
     CAPTURE_ID_RE,
     CAPTURE_PROTOCOL_VERSION,
@@ -214,7 +229,7 @@ SURFACE_RECALL_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]{1,63}")
 # SQLite-placeholder, graph, or quadratic-diversity work.
 RETRIEVAL_V2_SCHEMA = "synapse-retrieval.v2"
 RETRIEVAL_V2_RANKER_ID = "synapse-hybrid-mmr"
-RETRIEVAL_V2_RANKER_VERSION = "2.0.0"
+RETRIEVAL_V2_RANKER_VERSION = "2.1.0"
 RETRIEVAL_V2_MAX_PROMPT_BYTES = 16_384
 RETRIEVAL_V2_MAX_QUERY_TERMS = 64
 RETRIEVAL_V2_MAX_QUERY_SPIKES = 256
@@ -228,11 +243,30 @@ RETRIEVAL_V2_MAX_GRAPH_EDGES = 64
 RETRIEVAL_V2_MAX_ITEM_TERMS = 128
 RETRIEVAL_V2_MAX_DIVERSITY_TERMS = 32
 RETRIEVAL_V2_MMR_LAMBDA = 0.82
+# Ranker 2.1.0: the governed-cue routing signal joined the fusion, so the
+# documented weights were rebalanced (spike 0.55->0.52, surface 0.40->0.38)
+# to keep the total at 1.0.  The cue weight is deliberately equal to the
+# graph-neighbor weight: both are untrusted relevance evidence, never truth.
 RETRIEVAL_V2_RANK_WEIGHTS = {
-    "spike_index": 0.55,
-    "surface_index": 0.40,
+    "spike_index": 0.52,
+    "surface_index": 0.38,
     "same_context_graph": 0.05,
+    "governed_cue": 0.05,
 }
+# Governed cue routing is globally capped so a namespace full of promoted
+# bindings can never turn one retrieval into unbounded governance reads.
+RETRIEVAL_V2_MAX_CUE_CONTEXTS = 16
+RETRIEVAL_V2_MAX_CUE_BINDINGS = 64
+RETRIEVAL_V2_MAX_CUE_CUES = 256
+RETRIEVAL_V2_MAX_CUE_MATCHES = 32
+RETRIEVAL_V2_MAX_CUE_SOURCE_LOADS = 64
+# Cue terms are matched under one deterministic normalization policy: the
+# same extractor that produced the query tokens tokenizes the stored term,
+# and every normalized cue token must be present in the bounded query token
+# set.  Terms exceeding these caps fail closed (no match, never truncated
+# matching).
+RETRIEVAL_V2_MAX_CUE_TERM_BYTES = 64
+RETRIEVAL_V2_MAX_CUE_TERM_TOKENS = 8
 RETRIEVAL_PAGE_SCHEMA = "synapse-s2.retrieval-page.v2"
 NAMESPACE_DETAIL_LEVELS = {"cortex", "ganglion", "neurons"}
 NAMESPACE_DETAIL_ENTRY_SCAN_LIMIT = 10_000
@@ -655,6 +689,14 @@ class SpikingAttentionBackend:
             self.memory_store,
             require_distinct_reviewer=False,
             allow_compatibility_approval=True,
+        )
+        # Governed Memora cue-binding lifecycle.  The recomputer rebuilds the
+        # canonical first-page/default shadow plan so proposal digests are
+        # always verified against server-recomputed content, never against
+        # caller-supplied cue or source payloads.
+        self.memora_governance = MemoraGovernance(
+            self.memory_store,
+            plan_recomputer=self._memora_plan_recompute,
         )
         self._core_preclaim_bootstrap = bool(
             authority_lease is not None
@@ -1871,10 +1913,25 @@ class SpikingAttentionBackend:
             "raw_input_stored": False,
         }
 
-    def embedding_provider_info(self) -> dict[str, Any]:
+    def _embedding_provider_info_for_dimensions(
+        self,
+        dimensions: int,
+    ) -> dict[str, Any]:
+        """Return private provider identity for an exact projection dimension.
+
+        Learned artifacts use this helper so a dimension change invalidates
+        them like any other provider-identity drift, without broadening the
+        closed public backend operation contract.
+        """
+
+        resolved_dimensions = int(dimensions)
+        if resolved_dimensions < 1 or resolved_dimensions > MAX_EMBEDDING_DIMS:
+            raise ValueError(
+                f"dimensions must be between 1 and {MAX_EMBEDDING_DIMS}"
+            )
         try:
             return self._json_safe_metadata(
-                self.embedding_provider.info(dimensions=min(8, self.dimension))
+                self.embedding_provider.info(dimensions=resolved_dimensions)
             )
         except Exception as exc:
             return {
@@ -1887,6 +1944,13 @@ class SpikingAttentionBackend:
                     fallback="embedding provider unavailable",
                 ),
             }
+
+    def embedding_provider_info(self) -> dict[str, Any]:
+        """Return bounded provider status for the public Core surface."""
+
+        return self._embedding_provider_info_for_dimensions(
+            min(8, self.dimension)
+        )
 
     def benchmark_embedding_provider(
         self,
@@ -1985,6 +2049,261 @@ class SpikingAttentionBackend:
         registration["embedding_provider"] = payload["provenance"]
         return registration
 
+    def memora_shadow_plan(
+        self,
+        *,
+        context_id: str = "default",
+        entry_limit: int = MEMORA_SHADOW_MAX_ENTRIES,
+        max_clusters: int = MEMORA_SHADOW_MAX_CLUSTERS,
+        max_cues: int = MEMORA_SHADOW_MAX_CUES_PER_CLUSTER,
+        similarity_threshold: float = MEMORA_SHADOW_DEFAULT_SIMILARITY_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Build a shadow-only Memora consolidation plan for one exact namespace.
+
+        Read-only end to end: it snapshots durable entries from a single
+        namespace (never global or connected scope) through one
+        transaction-coupled :meth:`DurableMemoryStore.memora_source_page`
+        read -- deterministic tied-row ordering, SQL byte gates enforced
+        before any whole row materializes, and lifecycle witnesses derived in
+        the same transaction -- re-embeds their already redacted whitelisted
+        text through the pinned embedding provider (pure pretrained inference
+        -- no STDP, no spikes, no runtime state, no caches), and returns
+        bounded cluster/cue proposals that are never persisted or applied.
+        """
+
+        self._require_neural_substrate()
+        context = sanitize_context_id(context_id)
+        bounded_entry_limit = min(
+            max(int(entry_limit), 1), MEMORA_SHADOW_MAX_ENTRIES
+        )
+        plan = self._memora_shadow_plan_build(
+            context=context,
+            entry_limit=bounded_entry_limit,
+            max_clusters=max_clusters,
+            max_cues=max_cues,
+            similarity_threshold=similarity_threshold,
+        )
+        # Reported after the digest on purpose: the digest covers the plan
+        # body governance recomputes under canonical defaults, while the
+        # clamped request knob is caller-facing telemetry only.
+        plan["limits"]["entry_limit"] = bounded_entry_limit
+        return self._json_safe_metadata(plan)
+
+    def list_memora_bindings(
+        self,
+        *,
+        context_id: str = "default",
+        state: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List bounded governed cue bindings with current effectiveness."""
+
+        return self._json_safe_metadata(
+            self.memora_governance.list_bindings(
+                context_id=sanitize_context_id(context_id),
+                state=state,
+                limit=limit,
+                active_provider_identity=provider_identity(
+                    self._embedding_provider_info_for_dimensions(self.dimension)
+                ),
+            )
+        )
+
+    def get_memora_binding(self, *, binding_id: str) -> dict[str, Any]:
+        """Read one integrity-checked governed cue binding."""
+
+        return self._json_safe_metadata(
+            self.memora_governance.get_binding(
+                binding_id,
+                active_provider_identity=provider_identity(
+                    self._embedding_provider_info_for_dimensions(self.dimension)
+                ),
+            )
+        )
+
+    def propose_memora_binding(
+        self,
+        *,
+        context_id: str,
+        plan_digest: str,
+        cluster_ordinal: int,
+        proposed_by: str,
+        reason: str,
+        governance_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a proposal derived from a server-recomputed learned plan."""
+
+        self._require_neural_substrate()
+        return self._json_safe_metadata(
+            self.memora_governance.propose_binding(
+                context_id=sanitize_context_id(context_id),
+                plan_digest=plan_digest,
+                cluster_ordinal=cluster_ordinal,
+                proposed_by=proposed_by,
+                reason=reason,
+                governance_request_id=governance_request_id,
+            )
+        )
+
+    def promote_memora_binding(
+        self,
+        *,
+        binding_id: str,
+        expected_revision: str,
+        reviewed_by: str,
+        reason: str,
+        confirm: bool,
+        supersedes_binding_id: str | None = None,
+        governance_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Promote one proposal after explicit confirmation and exact CAS."""
+
+        return self._json_safe_metadata(
+            self.memora_governance.promote_binding(
+                binding_id=binding_id,
+                expected_revision=expected_revision,
+                reviewed_by=reviewed_by,
+                reason=reason,
+                confirm=confirm,
+                active_provider_identity=provider_identity(
+                    self._embedding_provider_info_for_dimensions(self.dimension)
+                ),
+                supersedes_binding_id=supersedes_binding_id,
+                governance_request_id=governance_request_id,
+            )
+        )
+
+    def reject_memora_binding(
+        self,
+        *,
+        binding_id: str,
+        expected_revision: str,
+        reviewed_by: str,
+        reason: str,
+        governance_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Reject one proposal using an exact optimistic revision."""
+
+        return self._json_safe_metadata(
+            self.memora_governance.reject_binding(
+                binding_id=binding_id,
+                expected_revision=expected_revision,
+                reviewed_by=reviewed_by,
+                reason=reason,
+                governance_request_id=governance_request_id,
+            )
+        )
+
+    def revoke_memora_binding(
+        self,
+        *,
+        binding_id: str,
+        expected_revision: str,
+        revoked_by: str,
+        reason: str,
+        confirm: bool,
+        governance_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Revoke routing without deleting any source memory."""
+
+        return self._json_safe_metadata(
+            self.memora_governance.revoke_binding(
+                binding_id=binding_id,
+                expected_revision=expected_revision,
+                revoked_by=revoked_by,
+                reason=reason,
+                confirm=confirm,
+                governance_request_id=governance_request_id,
+            )
+        )
+
+    def memora_binding_history(
+        self,
+        *,
+        binding_id: str,
+        limit: int = 50,
+        before_sequence: int | None = None,
+    ) -> dict[str, Any]:
+        """Return the bounded, integrity-validated lifecycle receipt chain."""
+
+        return self._json_safe_metadata(
+            self.memora_governance.binding_history(
+                binding_id,
+                limit=limit,
+                before_sequence=before_sequence,
+            )
+        )
+
+    def audit_memora_binding(self, *, binding_id: str) -> dict[str, Any]:
+        """Run a full projection/catalog/receipt-chain integrity audit."""
+
+        return self._json_safe_metadata(
+            self.memora_governance.audit_integrity(binding_id)
+        )
+
+    def _memora_shadow_plan_build(
+        self,
+        *,
+        context: str,
+        entry_limit: int,
+        max_clusters: int,
+        max_cues: int,
+        similarity_threshold: float,
+    ) -> dict[str, Any]:
+        """Shared planner core for the public surface and the governance recomputer."""
+
+        def _embed(text: str) -> list[float]:
+            result = self.embedding_provider.embed(text, dimensions=self.dimension)
+            vector = result.vector
+            try:
+                return [float(value) for value in vector.tolist()]
+            except AttributeError:
+                return [float(value) for value in vector]
+
+        page = self.memory_store.memora_source_page(
+            context_id=context,
+            limit=entry_limit,
+            max_source_text_bytes=MEMORA_SHADOW_MAX_SOURCE_TEXT_BYTES,
+            max_metadata_bytes=MEMORA_SHADOW_MAX_METADATA_BYTES,
+        )
+        snapshot = {
+            "revision": page["snapshot_revision"],
+            "entry_count": page["total"],
+            "sampling_truncated": page["has_more"],
+        }
+        return build_shadow_plan(
+            context_id=context,
+            entries=page["entries"],
+            revision_before=snapshot,
+            revision_after=snapshot,
+            provider_info=self._embedding_provider_info_for_dimensions(
+                self.dimension
+            ),
+            embed=_embed,
+            max_clusters=max_clusters,
+            max_cues=max_cues,
+            similarity_threshold=similarity_threshold,
+            witnesses=page["witnesses"],
+        )
+
+    def _memora_plan_recompute(self, context_id: str) -> dict[str, Any]:
+        """Authoritative plan recomputer installed into MemoraGovernance.
+
+        Recomputes under canonical first-page defaults only, so a reviewed
+        plan digest can be verified against server-owned content.  Returns
+        the raw plan body -- no post-digest mutation -- because governance
+        verifies the digest over exactly what this returns.
+        """
+
+        self._require_neural_substrate()
+        return self._memora_shadow_plan_build(
+            context=sanitize_context_id(context_id),
+            entry_limit=MEMORA_SHADOW_MAX_ENTRIES,
+            max_clusters=MEMORA_SHADOW_MAX_CLUSTERS,
+            max_cues=MEMORA_SHADOW_MAX_CUES_PER_CLUSTER,
+            similarity_threshold=MEMORA_SHADOW_DEFAULT_SIMILARITY_THRESHOLD,
+        )
+
     def retrieve_text_v2(
         self,
         prompt: str,
@@ -2066,6 +2385,10 @@ class SpikingAttentionBackend:
             entries_before = self._retrieval_v2_entries_snapshot(
                 scope_context_ids
             )
+            cue_phase = self._retrieval_v2_cue_phase(
+                scope_records=scope_before["records"],
+                query_terms=query_terms,
+            )
             collected = self._retrieval_v2_collect_candidates(
                 query_spikes=query_spikes,
                 query_terms=query_terms,
@@ -2073,6 +2396,7 @@ class SpikingAttentionBackend:
                 result_limit=bounded_result_limit,
                 candidate_limit=bounded_candidate_limit,
                 include_graph_neighbors=include_graph_neighbors,
+                cue_routes=cue_phase["routes"],
             )
             graph_after = self._retrieval_v2_graph_edges(
                 collected["graph_anchors"],
@@ -2080,6 +2404,9 @@ class SpikingAttentionBackend:
             )
             entries_after = self._retrieval_v2_entries_snapshot(
                 scope_context_ids
+            )
+            cue_revisions_after = self._retrieval_v2_cue_revisions(
+                cue_phase["contexts"]
             )
             scope_after = self._retrieval_v2_scope_snapshot(
                 context=context,
@@ -2090,11 +2417,13 @@ class SpikingAttentionBackend:
                 and scope_before["revision"] == scope_after["revision"]
                 and collected["graph_snapshot"]["revision"]
                 == graph_after["revision"]
+                and cue_phase["revisions"] == cue_revisions_after
             ):
                 stable_read = {
                     "scope": scope_before,
                     "entries_revision": entries_before,
                     "collected": collected,
+                    "cue_phase": cue_phase,
                 }
                 break
         if stable_read is None:
@@ -2103,14 +2432,21 @@ class SpikingAttentionBackend:
         scope_snapshot = stable_read["scope"]
         collected = stable_read["collected"]
         entries_revision = stable_read["entries_revision"]
+        cue_phase = stable_read["cue_phase"]
+        cue_revisions = {
+            context_id: cue_phase["revisions"][context_id]
+            for context_id in sorted(cue_phase["revisions"])
+        }
         snapshot_seed = {
             "schema": RETRIEVAL_V2_SCHEMA,
             "ranker_id": RETRIEVAL_V2_RANKER_ID,
             "ranker_version": RETRIEVAL_V2_RANKER_VERSION,
+            "ranker_weights": dict(RETRIEVAL_V2_RANK_WEIGHTS),
             "query_fingerprint": query_fingerprint,
             "entries_revision": entries_revision,
             "scope_revision": scope_snapshot["revision"],
             "graph_revision": collected["graph_snapshot"]["revision"],
+            "cue_revisions": cue_revisions,
             "embedding_identity": embedding_identity,
         }
         snapshot_id = "s2snap_" + self._retrieval_v2_digest(snapshot_seed)[:24]
@@ -2132,6 +2468,11 @@ class SpikingAttentionBackend:
         )
         result_truncated = bool(collected["result_truncated"])
         scope_complete = not bool(scope_snapshot["truncated"])
+        cue_integrity_contexts = list(cue_phase["integrity_failure_contexts"])
+        cue_routing_truncated = bool(cue_phase["truncated"])
+        cue_routing_complete = bool(
+            not cue_routing_truncated and not cue_integrity_contexts
+        )
         warnings: list[dict[str, str]] = []
         if terms_truncated:
             warnings.append(
@@ -2161,6 +2502,27 @@ class SpikingAttentionBackend:
                     "message": "More fused candidates existed than the requested result limit.",
                 }
             )
+        if cue_integrity_contexts:
+            warnings.append(
+                {
+                    "code": "cue-governance-integrity",
+                    "message": (
+                        f"{len(cue_integrity_contexts)} context(s) failed cue "
+                        "catalog/binding integrity checks and contributed no "
+                        "governed cues; base recall is unaffected."
+                    ),
+                }
+            )
+        if cue_routing_truncated:
+            warnings.append(
+                {
+                    "code": "cue-routing-truncated",
+                    "message": (
+                        "A governed-cue routing ceiling was reached; some "
+                        "promoted cues may not have been considered."
+                    ),
+                }
+            )
 
         work = {
             **prompt_metrics,
@@ -2173,10 +2535,15 @@ class SpikingAttentionBackend:
             "candidate_limit": bounded_candidate_limit,
             "scope_context_limit": RETRIEVAL_V2_MAX_SCOPE_CONTEXTS,
             **collected["work"],
+            **cue_phase["work"],
             "snapshot_attempts": attempts,
         }
         response = {
             "schema": RETRIEVAL_V2_SCHEMA,
+            # Governed-cue fields are an additive extension of the established
+            # retrieval-v2 envelope.  The ranker version carries the scoring
+            # change; keeping schema_version=2 preserves every existing CLI/MCP
+            # response-contract consumer.
             "schema_version": 2,
             "retrieval_id": retrieval_id,
             "query": {
@@ -2214,6 +2581,7 @@ class SpikingAttentionBackend:
                 "entries_revision": entries_revision,
                 "scope_revision": scope_snapshot["revision"],
                 "graph_revision": collected["graph_snapshot"]["revision"],
+                "cue_revisions": cue_revisions,
                 "embedding": embedding_identity,
             },
             "scope": scope_snapshot["public"],
@@ -2225,11 +2593,14 @@ class SpikingAttentionBackend:
                     and not terms_truncated
                     and not candidate_scan_truncated
                     and not result_truncated
+                    and cue_routing_complete
                 ),
                 "scope_complete": scope_complete,
                 "query_terms_truncated": terms_truncated,
                 "candidate_scan_truncated": candidate_scan_truncated,
                 "result_set_truncated": result_truncated,
+                "cue_routing_complete": cue_routing_complete,
+                "cue_integrity_failure_contexts": cue_integrity_contexts,
                 "has_more": bool(candidate_scan_truncated or result_truncated),
                 "pagination_supported": False,
                 "next_cursor": None,
@@ -2578,6 +2949,302 @@ class SpikingAttentionBackend:
             "context_link": record.get("context_link"),
         }
 
+    def _retrieval_v2_cue_revisions(
+        self,
+        context_ids: Iterable[str],
+    ) -> dict[str, str]:
+        """Per-context cue-governance revision samples for snapshot stability.
+
+        Sampled per context so one namespace with a corrupted catalog cannot
+        poison the revision read for every other authorized context: the
+        failing context reports the sentinel ``integrity-error`` and the rest
+        report their real catalog revisions (or ``absent``).
+        """
+
+        revisions: dict[str, str] = {}
+        for context_id in sorted({str(value) for value in context_ids if str(value)}):
+            try:
+                sample = self.memora_governance.cue_governance_revisions(
+                    [context_id]
+                )
+                revisions[context_id] = str(sample.get(context_id) or "absent")
+            except MemoraGovernanceIntegrityError:
+                revisions[context_id] = "integrity-error"
+        return revisions
+
+    def _retrieval_v2_cue_term_tokens(self, term: str) -> tuple[str, ...]:
+        """Normalize one stored cue term for matching -- bounded, fail closed.
+
+        Uses the exact extractor that produced the query tokens, so a
+        multi-word promoted term such as ``project citadel`` matches a prompt
+        that tokenized to ``project`` and ``citadel``, while a prompt carrying
+        only one of the tokens never matches.  Oversized or unextractable
+        terms yield no tokens and therefore never match (fail closed, never
+        truncated matching).
+        """
+
+        text = str(term or "")
+        if not text or len(text.encode("utf-8")) > RETRIEVAL_V2_MAX_CUE_TERM_BYTES:
+            return ()
+        tokens = tuple(
+            sorted(
+                {
+                    str(token).strip().lower()
+                    for token in self._surface_recall_terms(text)
+                    if str(token).strip()
+                }
+            )
+        )
+        if not tokens or len(tokens) > RETRIEVAL_V2_MAX_CUE_TERM_TOKENS:
+            return ()
+        return tokens
+
+    def _retrieval_v2_cue_phase(
+        self,
+        *,
+        scope_records: list[dict[str, Any]],
+        query_terms: list[str],
+    ) -> dict[str, Any]:
+        """Resolve governed cue routes for the already-authorized scope.
+
+        Reuses only MemoraGovernance's effective promoted bindings for
+        contexts the scope snapshot already authorized -- no new scope
+        expansion, no caller payloads, no more than one cue hop.  A matched
+        cue routes only its exact ``supporting_memory_ids``; every routed
+        source is re-loaded through a context-constrained bounded batch read
+        and re-checked against the binding's stored lifecycle witness before
+        it may contribute.  Cue evidence is untrusted relevance routing only:
+        it never changes an entry's truth posture and is never a confidence.
+        """
+
+        active_identity = provider_identity(
+            self._embedding_provider_info_for_dimensions(self.dimension)
+        )
+        query_term_set = {str(term) for term in query_terms}
+        ordered_contexts: list[str] = []
+        seen_contexts: set[str] = set()
+        for record in scope_records:
+            resolved = str(record.get("context_id") or "")
+            if resolved and resolved not in seen_contexts:
+                seen_contexts.add(resolved)
+                ordered_contexts.append(resolved)
+        contexts_truncated = len(ordered_contexts) > RETRIEVAL_V2_MAX_CUE_CONTEXTS
+        contexts = ordered_contexts[:RETRIEVAL_V2_MAX_CUE_CONTEXTS]
+
+        revisions: dict[str, str] = {}
+        routes: dict[str, dict[str, Any]] = {}
+        integrity_contexts: list[str] = []
+        # Counts deep governance validations, including bindings that are later
+        # invalidated.  This is deliberately distinct from the number of
+        # effective bindings whose cues are inspected: otherwise an all-invalid
+        # catalog could reset the apparent budget in every namespace.
+        bindings_considered = 0
+        cues_considered = 0
+        cue_matches = 0
+        source_loads = 0
+        route_rejections = 0
+        bindings_truncated = False
+        cues_truncated = False
+        matches_truncated = False
+        loads_truncated = False
+
+        for context_id in contexts:
+            # Push the remaining global budget into governance so deep
+            # binding validation (witness reads included) never exceeds the
+            # retrieval ceiling; a zero budget still samples the catalog
+            # revision for the snapshot gate without validating bindings.
+            remaining_binding_budget = max(
+                0, RETRIEVAL_V2_MAX_CUE_BINDINGS - bindings_considered
+            )
+            try:
+                effective = self.memora_governance.effective_bindings(
+                    context_id=context_id,
+                    active_provider_identity=active_identity,
+                    max_bindings=remaining_binding_budget,
+                )
+            except MemoraGovernanceIntegrityError:
+                revisions[context_id] = "integrity-error"
+                integrity_contexts.append(context_id)
+                continue
+            reported_considered = effective.get("considered", 0)
+            if (
+                type(reported_considered) is not int
+                or reported_considered < 0
+                or reported_considered > remaining_binding_budget
+            ):
+                revisions[context_id] = str(
+                    effective.get("catalog_revision") or "integrity-error"
+                )
+                integrity_contexts.append(context_id)
+                continue
+            bindings_considered += reported_considered
+            if effective.get("truncated"):
+                bindings_truncated = True
+            catalog_revision = str(effective.get("catalog_revision") or "absent")
+            revisions[context_id] = catalog_revision
+            if catalog_revision == "integrity-error" or effective.get(
+                "integrity_failures"
+            ):
+                # Fail closed per context: a namespace whose cue catalog or
+                # any promoted binding projection fails integrity checks
+                # contributes zero cues.  Base recall is untouched; the
+                # failure is surfaced as an explicit completeness warning.
+                integrity_contexts.append(context_id)
+                continue
+
+            matched_provenance: dict[str, list[dict[str, Any]]] = {}
+            stored_witness_by_id: dict[str, dict[str, Any]] = {}
+            for binding in effective.get("bindings") or []:
+                if not isinstance(binding, dict):
+                    continue
+                binding_id = str(binding.get("binding_id") or "")
+                binding_witnesses = {
+                    str(witness.get("memory_id") or ""): dict(witness)
+                    for witness in (binding.get("sources") or [])
+                    if isinstance(witness, dict)
+                }
+                cues = sorted(
+                    (
+                        cue
+                        for cue in (binding.get("cues") or [])
+                        if isinstance(cue, dict)
+                    ),
+                    key=lambda cue: (
+                        str(cue.get("term") or ""),
+                        str(cue.get("cue_id") or ""),
+                    ),
+                )
+                for cue in cues:
+                    if cues_considered >= RETRIEVAL_V2_MAX_CUE_CUES:
+                        cues_truncated = True
+                        break
+                    cues_considered += 1
+                    term = str(cue.get("term") or "")
+                    term_tokens = self._retrieval_v2_cue_term_tokens(term)
+                    if not term_tokens or not all(
+                        token in query_term_set for token in term_tokens
+                    ):
+                        continue
+                    if cue.get("trust") != CUE_TRUST_MARKER:
+                        route_rejections += 1
+                        continue
+                    if cue_matches >= RETRIEVAL_V2_MAX_CUE_MATCHES:
+                        matches_truncated = True
+                        break
+                    cue_matches += 1
+                    supporting = cue.get("supporting_memory_ids")
+                    for raw_memory_id in (
+                        supporting if isinstance(supporting, list) else []
+                    ):
+                        memory_id = str(raw_memory_id)
+                        stored_witness = binding_witnesses.get(memory_id)
+                        if stored_witness is None:
+                            route_rejections += 1
+                            continue
+                        matched_provenance.setdefault(memory_id, []).append(
+                            {
+                                "binding_id": binding_id,
+                                "cue_id": str(cue.get("cue_id") or ""),
+                                "term": term,
+                                "matched_tokens": list(term_tokens),
+                                "aspect": str(cue.get("aspect") or ""),
+                                "member_support": int(
+                                    cue.get("member_support") or 0
+                                ),
+                                "context_id": context_id,
+                                "trust": CUE_TRUST_MARKER,
+                            }
+                        )
+                        stored_witness_by_id[memory_id] = stored_witness
+
+            load_ids = sorted(matched_provenance)
+            if not load_ids:
+                continue
+            remaining_loads = RETRIEVAL_V2_MAX_CUE_SOURCE_LOADS - source_loads
+            if remaining_loads <= 0:
+                loads_truncated = True
+                continue
+            if len(load_ids) > remaining_loads:
+                loads_truncated = True
+                load_ids = load_ids[:remaining_loads]
+            source_loads += len(load_ids)
+            loaded = self.memory_store.memora_route_sources(
+                context_id=context_id,
+                memory_ids=load_ids,
+                max_source_text_bytes=MEMORA_SHADOW_MAX_SOURCE_TEXT_BYTES,
+                max_metadata_bytes=MEMORA_SHADOW_MAX_METADATA_BYTES,
+            )
+            entries_by_id = {
+                str(entry.get("memory_id") or ""): entry
+                for entry in loaded["entries"]
+            }
+            live_witnesses = loaded["witnesses"]
+            for memory_id in load_ids:
+                entry = entries_by_id.get(memory_id)
+                live_witness = live_witnesses.get(memory_id)
+                stored_witness = stored_witness_by_id.get(memory_id)
+                if (
+                    entry is None
+                    or live_witness is None
+                    or stored_witness is None
+                    or str(entry.get("context_id") or "") != context_id
+                    or dict(live_witness) != dict(stored_witness)
+                ):
+                    # The source moved, changed, or vanished since promotion:
+                    # its lifecycle witness no longer verifies, so the route
+                    # is dropped without affecting base recall.
+                    route_rejections += 1
+                    continue
+                route = routes.setdefault(
+                    memory_id,
+                    {"entry": entry, "context_id": context_id, "provenance": []},
+                )
+                route["provenance"].extend(matched_provenance[memory_id])
+
+        for route in routes.values():
+            route["provenance"] = sorted(
+                route["provenance"],
+                key=lambda item: (
+                    str(item["binding_id"]),
+                    str(item["cue_id"]),
+                    str(item["term"]),
+                ),
+            )
+        truncated = bool(
+            contexts_truncated
+            or bindings_truncated
+            or cues_truncated
+            or matches_truncated
+            or loads_truncated
+        )
+        return {
+            "contexts": contexts,
+            "revisions": revisions,
+            "routes": routes,
+            "integrity_failure_contexts": sorted(integrity_contexts),
+            "truncated": truncated,
+            "work": {
+                "cue_contexts_considered": len(contexts),
+                "cue_context_limit": RETRIEVAL_V2_MAX_CUE_CONTEXTS,
+                "cue_bindings_considered": bindings_considered,
+                "cue_binding_limit": RETRIEVAL_V2_MAX_CUE_BINDINGS,
+                "cue_cues_considered": cues_considered,
+                "cue_cue_limit": RETRIEVAL_V2_MAX_CUE_CUES,
+                "cue_term_matches": cue_matches,
+                "cue_match_limit": RETRIEVAL_V2_MAX_CUE_MATCHES,
+                "cue_source_loads": source_loads,
+                "cue_source_load_limit": RETRIEVAL_V2_MAX_CUE_SOURCE_LOADS,
+                "cue_route_rejections": route_rejections,
+                "cue_routed_memory_ids": len(routes),
+                "cue_contexts_truncated": contexts_truncated,
+                "cue_bindings_truncated": bindings_truncated,
+                "cue_cues_truncated": cues_truncated,
+                "cue_matches_truncated": matches_truncated,
+                "cue_source_loads_truncated": loads_truncated,
+                "cue_integrity_failure_count": len(integrity_contexts),
+            },
+        }
+
     def _retrieval_v2_collect_candidates(
         self,
         *,
@@ -2587,7 +3254,9 @@ class SpikingAttentionBackend:
         result_limit: int,
         candidate_limit: int,
         include_graph_neighbors: bool,
+        cue_routes: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        cue_routes = cue_routes or {}
         if not scope_records:
             empty_graph = self._retrieval_v2_graph_edges([], enabled=False)
             return {
@@ -2607,6 +3276,8 @@ class SpikingAttentionBackend:
                     "graph_relationship_rows_examined": 0,
                     "graph_neighbor_loads": 0,
                     "graph_cross_context_rejections": 0,
+                    "cue_route_admissions": 0,
+                    "cue_route_scope_rejections": 0,
                     "mmr_candidate_evaluations": 0,
                 },
             }
@@ -2669,9 +3340,11 @@ class SpikingAttentionBackend:
                 "spike_signal": 0.0,
                 "surface_signal": 0.0,
                 "graph_signal": 0.0,
+                "cue_signal": 0.0,
                 "spike_reason": None,
                 "surface_reason": None,
                 "graph_provenance": [],
+                "cue_provenance": [],
             }
             pool[memory_id] = current
             return current
@@ -2780,6 +3453,26 @@ class SpikingAttentionBackend:
             }
             candidate["graph_provenance"].append(provenance)
 
+        # Governed cue routes are admitted only after the graph anchors were
+        # chosen from the base pool, so a cue-only candidate can never become
+        # a graph anchor: cue routing stays strictly one hop, with no
+        # cue-then-graph chaining.  The routed entries were already
+        # context-verified and witness-verified in the cue phase; the pool
+        # membership check here re-enforces the authorized scope.
+        cue_route_admissions = 0
+        cue_route_scope_rejections = 0
+        for memory_id in sorted(cue_routes):
+            route = cue_routes[memory_id]
+            candidate = candidate_for(route["entry"])
+            if candidate is None:
+                cue_route_scope_rejections += 1
+                continue
+            cue_route_admissions += 1
+            candidate["cue_signal"] = max(float(candidate["cue_signal"]), 1.0)
+            candidate["cue_provenance"] = [
+                dict(item) for item in route["provenance"]
+            ]
+
         for candidate in pool.values():
             self._retrieval_v2_score_candidate(candidate)
             candidate["graph_provenance"] = sorted(
@@ -2856,6 +3549,8 @@ class SpikingAttentionBackend:
                 "graph_relationship_row_limit": RETRIEVAL_V2_MAX_GRAPH_EDGES,
                 "graph_neighbor_loads": graph_neighbor_loads,
                 "graph_cross_context_rejections": graph_cross_context_rejections,
+                "cue_route_admissions": cue_route_admissions,
+                "cue_route_scope_rejections": cue_route_scope_rejections,
                 "mmr_candidate_evaluations": mmr_evaluations,
                 "mmr_candidate_evaluation_ceiling": (
                     candidate_limit * result_limit
@@ -2943,12 +3638,14 @@ class SpikingAttentionBackend:
         spike_signal = self._retrieval_v2_unit_float(candidate.get("spike_signal"))
         surface_signal = self._retrieval_v2_unit_float(candidate.get("surface_signal"))
         graph_signal = self._retrieval_v2_unit_float(candidate.get("graph_signal"))
+        cue_signal = self._retrieval_v2_unit_float(candidate.get("cue_signal"))
         contributions = {
             "spike_index": RETRIEVAL_V2_RANK_WEIGHTS["spike_index"] * spike_signal,
             "surface_index": RETRIEVAL_V2_RANK_WEIGHTS["surface_index"] * surface_signal,
             "same_context_graph": (
                 RETRIEVAL_V2_RANK_WEIGHTS["same_context_graph"] * graph_signal
             ),
+            "governed_cue": RETRIEVAL_V2_RANK_WEIGHTS["governed_cue"] * cue_signal,
         }
         candidate["score_contributions"] = contributions
         candidate["relevance_score"] = self._retrieval_v2_unit_float(
@@ -3218,6 +3915,21 @@ class SpikingAttentionBackend:
                     "relationships": graph_provenance,
                 }
             )
+        cue_provenance_all = [
+            dict(item) for item in candidate.get("cue_provenance") or []
+        ]
+        if cue_provenance_all:
+            # Governed cue evidence is bounded, untrusted routing relevance:
+            # it explains *why* this source surfaced, and must never be read
+            # as truth or confidence about the source's content.
+            reasons.append(
+                {
+                    "type": "governed-cue-term-match",
+                    "cue_count": len(cue_provenance_all),
+                    "cues": cue_provenance_all[:4],
+                    "trust": CUE_TRUST_MARKER,
+                }
+            )
         source_provenance: dict[str, Any] = {
             "created_at": self._retrieval_v2_finite_float(entry.get("created_at")),
             "updated_at": self._retrieval_v2_finite_float(entry.get("updated_at")),
@@ -3269,6 +3981,10 @@ class SpikingAttentionBackend:
                     "same_context_graph": round(
                         self._retrieval_v2_unit_float(candidate["graph_signal"]), 8
                     ),
+                    "governed_cue": round(
+                        self._retrieval_v2_unit_float(candidate.get("cue_signal")),
+                        8,
+                    ),
                 },
                 "weights": dict(RETRIEVAL_V2_RANK_WEIGHTS),
                 "contributions": {
@@ -3312,6 +4028,7 @@ class SpikingAttentionBackend:
                 origin_context=str(scope_record.get("origin_context_id") or ""),
             ),
             "graph_provenance": graph_provenance,
+            "cue_provenance": cue_provenance_all[:4],
             "source_provenance": source_provenance,
             "ranker_id": RETRIEVAL_V2_RANKER_ID,
             "ranker_version": RETRIEVAL_V2_RANKER_VERSION,

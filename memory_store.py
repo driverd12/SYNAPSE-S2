@@ -20,7 +20,7 @@ import unicodedata
 import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -135,6 +135,15 @@ CORE_STORE_IDENTITY_RE = re.compile(r"^store-[0-9a-f]{24}$")
 CORE_REQUEST_JOURNAL_ID_RE = re.compile(r"^journal-[0-9a-f]{24}$")
 CORE_ROOT_GENERATION_ID_RE = re.compile(r"^generation-[0-9a-f]{24}$")
 BACKUP_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Non-content lifecycle witness for governed memora cue bindings.  The
+# witness stores only store-owned lifecycle facts (row identity, version
+# times, byte counts, oversized flags, and the per-memory memory_events
+# frontier) -- never content, content digests, or signatures over content,
+# any of which would be a durable offline equality oracle.  Out-of-band
+# SQLite tamper that bypasses the mutation API is outside this witness's
+# scope and is handled by store/recovery integrity auditing.
+MEMORA_WITNESS_SCHEMA = "synapse-s2.memora-lifecycle-witness.v1"
 RUNTIME_STATE_AUTHORITY_BINDING_SCHEMA = (
     "synapse-s2.runtime-authority-binding.v1"
 )
@@ -10556,6 +10565,451 @@ class DurableMemoryStore:
             "entries": entries,
             "read_only": True,
         }
+
+    def memora_source_page(
+        self,
+        *,
+        context_id: str,
+        limit: int = 64,
+        position: dict[str, Any] | None = None,
+        expected_revision: str | None = None,
+        max_source_text_bytes: int = 16_384,
+        max_metadata_bytes: int = 65_536,
+    ) -> dict[str, Any]:
+        """Return one stable, SQL-bounded keyset page for the Memora planner.
+
+        Same stable total order and transaction-coupled snapshot revision as
+        :meth:`retrieval_memory_page` (``updated_at DESC, memory_id DESC``),
+        but Memora-specific byte gates are applied inside SQL before any whole
+        row materializes: an oversized ``source_text`` or ``metadata_json``
+        column is never loaded into Python, only its byte length is.  The
+        planner's advertised input bounds are therefore real bounds on what
+        this process reads, not post-hoc trims.
+        """
+
+        selected = self._canonical_retrieval_context_ids([context_id])
+        bounded_limit = self._retrieval_page_limit(limit, field="limit")
+        text_gate = self._memora_byte_gate(
+            max_source_text_bytes, field="max_source_text_bytes"
+        )
+        metadata_gate = self._memora_byte_gate(
+            max_metadata_bytes, field="max_metadata_bytes"
+        )
+        page_position = self._retrieval_position(
+            position,
+            id_field="memory_id",
+        )
+        expected = self._retrieval_expected_revision(expected_revision)
+        self._require_retrieval_continuation_revision(
+            position=page_position,
+            expected_revision=expected,
+            field="position",
+        )
+        placeholders = ",".join("?" for _ in selected)
+
+        with closing(self._connect_read_only()) as conn:
+            with self._transaction(conn):
+                total = int(
+                    conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM memory_entries
+                        WHERE context_id IN ({placeholders})
+                        """,
+                        selected,
+                    ).fetchone()[0]
+                )
+                counts = {"entries": total}
+                revision = self._retrieval_generation_snapshot_revision(
+                    conn=conn,
+                    kind="memora-source-page",
+                    context_ids=selected,
+                    channels=("memory",),
+                    counts=counts,
+                )
+                self._assert_retrieval_revision(
+                    expected_revision=expected,
+                    actual_revision=revision,
+                )
+
+                params: list[Any] = [text_gate, metadata_gate]
+                params.extend(selected)
+                keyset_sql = ""
+                if page_position is not None:
+                    keyset_sql = (
+                        "AND (updated_at < ? OR "
+                        "(updated_at = ? AND memory_id < ?))"
+                    )
+                    params.extend(
+                        (
+                            page_position["updated_at"],
+                            page_position["updated_at"],
+                            page_position["memory_id"],
+                        )
+                    )
+                params.append(bounded_limit + 1)
+                rows = conn.execute(
+                    f"""
+                    SELECT memory_id, tag, context_id,
+                           created_at, updated_at,
+                           length(CAST(source_text AS BLOB)) AS source_text_bytes,
+                           CASE WHEN length(CAST(source_text AS BLOB)) <= ?
+                                THEN source_text ELSE NULL END AS source_text,
+                           length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+                           CASE WHEN length(CAST(metadata_json AS BLOB)) <= ?
+                                THEN metadata_json ELSE NULL END AS bounded_metadata_json
+                    FROM memory_entries
+                    WHERE context_id IN ({placeholders})
+                    {keyset_sql}
+                    ORDER BY updated_at DESC, memory_id DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+
+                has_more = len(rows) > bounded_limit
+                page_rows = rows[:bounded_limit]
+                # Witnesses are derived in the same read transaction as the
+                # planner inputs: whatever plan is built from this page
+                # carries lifecycle witnesses that cannot diverge from the
+                # sampled snapshot (closes the plan/witness TOCTOU window).
+                witnesses = self.memora_lifecycle_witnesses_conn(
+                    conn,
+                    [str(row["memory_id"]) for row in page_rows],
+                    text_gate=text_gate,
+                    metadata_gate=metadata_gate,
+                )
+
+        entries = [self._memora_row_to_entry(row) for row in page_rows]
+        return {
+            "schema": "synapse-s2.memora-source-page.v1",
+            "context_ids": list(selected),
+            "snapshot_revision": revision,
+            "total": counts["entries"],
+            "returned": len(entries),
+            "has_more": has_more,
+            "next_position": (
+                self._retrieval_keyset_position(page_rows[-1], id_field="memory_id")
+                if has_more and page_rows
+                else None
+            ),
+            "entries": entries,
+            "witnesses": witnesses,
+            "read_only": True,
+        }
+
+    def memora_route_sources(
+        self,
+        *,
+        context_id: str,
+        memory_ids: Iterable[str],
+        max_source_text_bytes: int = 16_384,
+        max_metadata_bytes: int = 65_536,
+    ) -> dict[str, Any]:
+        """Load exact cue-routed sources plus lifecycle witnesses in one read.
+
+        Context-constrained batch reader for governed cue retrieval: only rows
+        whose ``context_id`` exactly matches are ever materialized, so a
+        binding that (through any defect) references a foreign-namespace
+        memory id loads nothing.  The same SQL byte gates as
+        :meth:`memora_source_page` apply before any whole row is read, and the
+        lifecycle witnesses are computed in the same read transaction as the
+        entries so callers can re-verify binding witnesses against a snapshot
+        that cannot diverge from the loaded content.
+        """
+
+        selected = self._canonical_retrieval_context_ids([context_id])
+        context = selected[0]
+        requested: list[str] = []
+        seen: set[str] = set()
+        for raw in memory_ids:
+            memory_id = validate_public_identifier(
+                raw, field="memory_id", max_chars=200
+            )
+            if memory_id in seen:
+                continue
+            seen.add(memory_id)
+            requested.append(memory_id)
+            if len(requested) > 64:
+                raise ValueError("memory_ids may contain at most 64 identifiers")
+        text_gate = self._memora_byte_gate(
+            max_source_text_bytes, field="max_source_text_bytes"
+        )
+        metadata_gate = self._memora_byte_gate(
+            max_metadata_bytes, field="max_metadata_bytes"
+        )
+        requested.sort()
+        entries: list[dict[str, Any]] = []
+        witnesses: dict[str, dict[str, Any]] = {}
+        if requested:
+            placeholders = ",".join("?" for _ in requested)
+            with closing(self._connect_read_only()) as conn:
+                with self._transaction(conn):
+                    rows = conn.execute(
+                        f"""
+                        SELECT memory_id, tag, context_id,
+                               created_at, updated_at,
+                               length(CAST(source_text AS BLOB)) AS source_text_bytes,
+                               CASE WHEN length(CAST(source_text AS BLOB)) <= ?
+                                    THEN source_text ELSE NULL END AS source_text,
+                               length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+                               CASE WHEN length(CAST(metadata_json AS BLOB)) <= ?
+                                    THEN metadata_json ELSE NULL END AS bounded_metadata_json
+                        FROM memory_entries
+                        WHERE context_id = ?
+                          AND memory_id IN ({placeholders})
+                        ORDER BY memory_id ASC
+                        """,
+                        (text_gate, metadata_gate, context, *requested),
+                    ).fetchall()
+                    witnesses = self.memora_lifecycle_witnesses_conn(
+                        conn,
+                        [str(row["memory_id"]) for row in rows],
+                        text_gate=text_gate,
+                        metadata_gate=metadata_gate,
+                    )
+            entries = [self._memora_row_to_entry(row) for row in rows]
+        return {
+            "schema": "synapse-s2.memora-route-sources.v1",
+            "context_id": context,
+            "requested": len(requested),
+            "returned": len(entries),
+            "entries": entries,
+            "witnesses": witnesses,
+            "read_only": True,
+        }
+
+    @staticmethod
+    def _memora_byte_gate(value: Any, *, field: str) -> int:
+        if type(value) is not int or value < 1 or value > 1_048_576:
+            raise ValueError(
+                f"{field} must be an exact integer between 1 and 1048576"
+            )
+        return value
+
+    def _memora_row_to_entry(self, row: sqlite3.Row) -> dict[str, Any]:
+        """Convert one SQL-gated Memora page row without touching gated columns."""
+
+        source_text_bytes = int(row["source_text_bytes"] or 0)
+        metadata_bytes = int(row["metadata_bytes"] or 0)
+        raw_source_text = row["source_text"]
+        raw_metadata_json = row["bounded_metadata_json"]
+        metadata_oversized = raw_metadata_json is None and metadata_bytes > 0
+        # Malformed metadata is flagged, never silently coerced to {}: a row
+        # whose stored JSON does not decode to an object is evidence of an
+        # out-of-band write, and downstream planners must be able to exclude
+        # it explicitly instead of treating it as a clean empty mapping.
+        metadata_malformed = False
+        safe_metadata: Any = {}
+        if raw_metadata_json is not None:
+            decoded = _decode_json(str(raw_metadata_json), None)
+            if isinstance(decoded, dict):
+                safe_metadata = _json_safe(decoded, {})
+            else:
+                metadata_malformed = True
+        return {
+            # Identities stay exact: redacting a store-generated identifier
+            # could rewrite it into a sentinel and silently break identity
+            # joins downstream. Free-text columns are still redacted.
+            "memory_id": str(row["memory_id"]),
+            "tag": redact_capture_text(str(row["tag"]))[0],
+            "context_id": str(row["context_id"]),
+            "source_text": (
+                redact_capture_text(str(raw_source_text))[0]
+                if raw_source_text is not None
+                else None
+            ),
+            "source_text_bytes": source_text_bytes,
+            "source_text_oversized": raw_source_text is None
+            and source_text_bytes > 0,
+            "metadata": safe_metadata if isinstance(safe_metadata, dict) else {},
+            "metadata_bytes": metadata_bytes,
+            "metadata_oversized": metadata_oversized,
+            "metadata_malformed": metadata_malformed,
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def memora_lifecycle_witnesses(
+        self,
+        memory_ids: Iterable[str],
+        *,
+        max_source_text_bytes: int = 16_384,
+        max_metadata_bytes: int = 65_536,
+    ) -> dict[str, dict[str, Any]]:
+        """Return non-content per-source lifecycle witnesses for cue bindings.
+
+        Each witness is derived, in one read transaction, purely from
+        store-owned lifecycle facts: the row's exact identity and version
+        times, its column byte counts and gate-relative oversized flags, and
+        the authoritative per-memory ``memory_events`` frontier (event
+        count, upsert count, MAX event id, MAX event time).  Every supported
+        mutation appends a memory event and advances ``updated_at``, and
+        deletion removes the row (cascading its events), so a changed,
+        replaced -- including same-length replacement through the
+        MemoryStore API -- or deleted source invalidates the witness.
+
+        No tag/text/metadata content, no content digest, and no signature
+        or key material is ever derived from or persisted for row content:
+        a stored digest or public signature over untrusted content would be
+        a durable offline equality oracle against which guesses could be
+        verified.  Out-of-band SQLite writes that bypass the mutation API
+        are explicitly outside this witness's scope; they are the domain of
+        store/recovery integrity auditing, not of a content witness.
+        """
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        for raw in memory_ids:
+            memory_id = validate_public_identifier(
+                raw, field="memory_id", max_chars=200
+            )
+            if memory_id in seen:
+                continue
+            seen.add(memory_id)
+            selected.append(memory_id)
+            if len(selected) > 64:
+                raise ValueError("memory_ids may contain at most 64 identifiers")
+        if not selected:
+            return {}
+        text_gate = self._memora_byte_gate(
+            max_source_text_bytes, field="max_source_text_bytes"
+        )
+        metadata_gate = self._memora_byte_gate(
+            max_metadata_bytes, field="max_metadata_bytes"
+        )
+        with closing(self._connect_read_only()) as conn:
+            with self._transaction(conn):
+                return self.memora_lifecycle_witnesses_conn(
+                    conn,
+                    selected,
+                    text_gate=text_gate,
+                    metadata_gate=metadata_gate,
+                )
+
+    def _memora_witness_rows_conn(
+        self,
+        conn: sqlite3.Connection,
+        memory_ids: Sequence[str],
+    ) -> list[sqlite3.Row]:
+        if not memory_ids:
+            return []
+        placeholders = ",".join("?" for _ in memory_ids)
+        # The event aggregation must stay restricted to the requested ids:
+        # an unpredicated GROUP BY over memory_events would rescan the whole
+        # event log on every witness read.
+        return conn.execute(
+            f"""
+            SELECT m.memory_id, m.context_id, m.created_at, m.updated_at,
+                   length(CAST(m.source_text AS BLOB)) AS source_text_bytes,
+                   length(CAST(m.metadata_json AS BLOB)) AS metadata_bytes,
+                   COALESCE(e.event_count, 0) AS event_count,
+                   COALESCE(e.upsert_event_count, 0) AS upsert_event_count,
+                   COALESCE(e.last_event_id, 0) AS last_event_id,
+                   COALESCE(e.last_event_at, 0.0) AS last_event_at
+            FROM memory_entries AS m
+            LEFT JOIN (
+                SELECT memory_id,
+                       COUNT(*) AS event_count,
+                       SUM(CASE WHEN event_type = 'upsert' THEN 1 ELSE 0 END)
+                           AS upsert_event_count,
+                       MAX(event_id) AS last_event_id,
+                       MAX(created_at) AS last_event_at
+                FROM memory_events
+                WHERE memory_id IN ({placeholders})
+                GROUP BY memory_id
+            ) AS e ON e.memory_id = m.memory_id
+            WHERE m.memory_id IN ({placeholders})
+            """,
+            tuple(memory_ids) + tuple(memory_ids),
+        ).fetchall()
+
+    @staticmethod
+    def _memora_lifecycle_row_witness(
+        row: sqlite3.Row, *, text_gate: int, metadata_gate: int
+    ) -> dict[str, Any]:
+        source_text_bytes = int(row["source_text_bytes"] or 0)
+        metadata_bytes = int(row["metadata_bytes"] or 0)
+        return {
+            "schema": MEMORA_WITNESS_SCHEMA,
+            "memory_id": str(row["memory_id"]),
+            "context_id": str(row["context_id"]),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+            "source_text_bytes": source_text_bytes,
+            "source_text_oversized": source_text_bytes > text_gate,
+            "metadata_bytes": metadata_bytes,
+            "metadata_oversized": metadata_bytes > metadata_gate,
+            "event_count": int(row["event_count"] or 0),
+            "upsert_event_count": int(row["upsert_event_count"] or 0),
+            "last_event_id": int(row["last_event_id"] or 0),
+            "last_event_at": float(row["last_event_at"] or 0.0),
+        }
+
+    def memora_lifecycle_witnesses_conn(
+        self,
+        conn: sqlite3.Connection,
+        memory_ids: Sequence[str],
+        *,
+        text_gate: int,
+        metadata_gate: int,
+    ) -> dict[str, dict[str, Any]]:
+        """Lifecycle witness read over an existing connection (governed txns)."""
+
+        witnesses: dict[str, dict[str, Any]] = {}
+        for row in self._memora_witness_rows_conn(conn, memory_ids):
+            witnesses[str(row["memory_id"])] = self._memora_lifecycle_row_witness(
+                row, text_gate=text_gate, metadata_gate=metadata_gate
+            )
+        return witnesses
+
+    def memora_verify_witnesses_conn(
+        self,
+        conn: sqlite3.Connection,
+        witnesses: Mapping[str, Mapping[str, Any]],
+        *,
+        text_gate: int,
+        metadata_gate: int,
+    ) -> dict[str, list[str]]:
+        """Verify stored lifecycle witnesses against the live rows.
+
+        Returns content-free mismatch reasons per memory id (empty list =
+        the witness still verifies).  Fails closed: a missing row or any
+        changed lifecycle fact (version times, byte counts, oversized
+        flags, memory-event frontier) invalidates the witness.  Because the
+        witness holds no key material, a restored or replicated database
+        verifies with no extra trust configuration.  Out-of-band SQLite
+        writes that leave every lifecycle fact intact are outside this
+        witness's scope and are handled by store/recovery integrity
+        auditing instead.
+        """
+
+        selected = [str(memory_id) for memory_id in sorted(witnesses)]
+        rows = {
+            str(row["memory_id"]): row
+            for row in self._memora_witness_rows_conn(conn, selected)
+        }
+        results: dict[str, list[str]] = {}
+        for memory_id in selected:
+            witness = witnesses[memory_id]
+            reasons: list[str] = []
+            results[memory_id] = reasons
+            if not isinstance(witness, Mapping) or (
+                witness.get("schema") != MEMORA_WITNESS_SCHEMA
+            ):
+                reasons.append("witness-shape-invalid")
+                continue
+            row = rows.get(memory_id)
+            if row is None:
+                reasons.append("source-missing")
+                continue
+            live = self._memora_lifecycle_row_witness(
+                row, text_gate=text_gate, metadata_gate=metadata_gate
+            )
+            for field, expected in live.items():
+                if witness.get(field) != expected:
+                    reasons.append(f"lifecycle-mismatch:{field}")
+        return results
 
     def retrieval_graph_page(
         self,

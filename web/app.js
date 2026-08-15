@@ -507,6 +507,9 @@ const state = {
   impact: {
     open: false,
   },
+  memoraShadow: {
+    open: false,
+  },
   captureRetries: new Map(),
   operator: {
     receipts: [],
@@ -659,6 +662,13 @@ const elements = collectElements([
   "impactTokenRate",
   "impactTokensPerAssist",
   "impactToggleButton",
+  "footerMemoraShadow",
+  "memoraShadowCaveat",
+  "memoraShadowCloseButton",
+  "memoraShadowClusters",
+  "memoraShadowDrawer",
+  "memoraShadowSummary",
+  "memoraShadowToggleButton",
   "ingestForm",
   "ingestMinSentences",
   "ingestTag",
@@ -7010,6 +7020,64 @@ function setImpactDrawerOpen(open) {
   }
 }
 
+function renderMemoraShadow(payload) {
+  const plan = payload && typeof payload.plan === "object" && payload.plan !== null
+    ? payload.plan
+    : {};
+  const provider = plan.provider || {};
+  const input = plan.input || {};
+  const clusters = Array.isArray(plan.clusters) ? plan.clusters : [];
+  elements.memoraShadowSummary.innerHTML = [
+    impactMetric("Clusters proposed", formatNumber(clusters.length), "shadow only; never applied"),
+    impactMetric("Entries embedded", formatNumber(input.entries_embedded || 0), `of ${formatNumber(input.entries_considered || 0)} snapshot entries`),
+    impactMetric("Provider", String(provider.provider_type || "--"), String(provider.model_id || "pinned local model")),
+    impactMetric("Learned", plan.learned === true ? "true" : "false", plan.learned === true ? "pretrained inference only" : "deterministic hash fallback"),
+  ].join("");
+  elements.memoraShadowClusters.innerHTML = clusters.length
+    ? clusters.slice(0, 16).map((cluster) => {
+      const cues = Array.isArray(cluster.proposed_cues)
+        ? cluster.proposed_cues.slice(0, 4).map((cue) => String(cue.label || "")).filter(Boolean)
+        : [];
+      const similarity = cluster.similarity || {};
+      return impactMetric(
+        `Cluster ${compactMemoryId(String(cluster.cluster_id || ""))}`,
+        `${formatNumber(cluster.member_count || 0)} members`,
+        [
+          similarity.mean === null || similarity.mean === undefined
+            ? "singleton"
+            : `mean cosine ${formatNumber(similarity.mean, 3)}`,
+          cues.length ? `cues: ${cues.join(", ")}` : "no cue proposals",
+        ].join(" · "),
+      );
+    }).join("")
+    : '<div class="empty-result">No shadow clusters proposed for this namespace snapshot.</div>';
+  elements.footerMemoraShadow.textContent = `${formatNumber(clusters.length)} proposals`;
+  elements.memoraShadowCaveat.textContent = String(
+    payload.caveat
+    || "Shadow proposals only. Nothing is applied or persisted and retrieval results are unchanged.",
+  );
+}
+
+async function refreshMemoraShadow() {
+  const payload = await requestJson("/api/memora-shadow", {
+    params: { context_id: state.context },
+  });
+  renderMemoraShadow(payload);
+  return payload;
+}
+
+function setMemoraShadowDrawerOpen(open) {
+  state.memoraShadow.open = Boolean(open);
+  elements.memoraShadowDrawer.hidden = !state.memoraShadow.open;
+  elements.memoraShadowToggleButton.setAttribute("aria-expanded", String(state.memoraShadow.open));
+  if (state.memoraShadow.open) {
+    void refreshMemoraShadow().catch((error) => {
+      elements.memoraShadowCaveat.textContent = `Shadow proposals unavailable: ${error.message}`;
+    });
+    elements.memoraShadowCloseButton.focus({ preventScroll: true });
+  }
+}
+
 function renderQueryResult(payload) {
   const items = Array.isArray(payload.results)
     ? payload.results
@@ -8101,6 +8169,32 @@ document.addEventListener("pointerdown", (event) => {
     && !elements.impactToggleButton.contains(event.target)
   ) {
     setImpactDrawerOpen(false);
+  }
+});
+
+elements.memoraShadowToggleButton.addEventListener("click", () => {
+  setMemoraShadowDrawerOpen(!state.memoraShadow.open);
+});
+
+elements.memoraShadowCloseButton.addEventListener("click", () => {
+  setMemoraShadowDrawerOpen(false);
+  elements.memoraShadowToggleButton.focus({ preventScroll: true });
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.memoraShadow.open) {
+    setMemoraShadowDrawerOpen(false);
+    elements.memoraShadowToggleButton.focus({ preventScroll: true });
+  }
+});
+
+document.addEventListener("pointerdown", (event) => {
+  if (
+    state.memoraShadow.open
+    && !elements.memoraShadowDrawer.contains(event.target)
+    && !elements.memoraShadowToggleButton.contains(event.target)
+  ) {
+    setMemoraShadowDrawerOpen(false);
   }
 });
 

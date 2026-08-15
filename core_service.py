@@ -33,6 +33,10 @@ from bridge_governance import (
     BridgeGovernanceError,
     BridgeGovernanceIntegrityError,
 )
+from memora_governance import (
+    MemoraGovernanceError,
+    MemoraGovernanceIntegrityError,
+)
 from core_protocol import (
     CORE_CONFIG_VERSION,
     DEFAULT_MAX_FRAME_BYTES,
@@ -176,6 +180,8 @@ BUILD_SOURCE_MANIFEST = (
     "harmonic_memory.py",
     "image_capture.py",
     "media_similarity.py",
+    "memora_governance.py",
+    "memora_shadow.py",
     "memory_store.py",
     "mlx_backend.py",
     "native/apple_vision_enrich.swift",
@@ -449,6 +455,51 @@ _CONTRACT_LIST = (
         "prompt",
         retry_safe=True,
     ),
+    _contract(
+        "memora_shadow_plan",
+        "context_id entry_limit max_clusters max_cues similarity_threshold",
+        retry_safe=True,
+    ),
+    _contract(
+        "list_memora_bindings",
+        "context_id state limit",
+        retry_safe=True,
+    ),
+    _contract("get_memora_binding", "binding_id", "binding_id", retry_safe=True),
+    _contract(
+        "propose_memora_binding",
+        "context_id plan_digest cluster_ordinal proposed_by reason "
+        "governance_request_id",
+        "context_id plan_digest cluster_ordinal proposed_by reason",
+        mutation=True,
+    ),
+    _contract(
+        "promote_memora_binding",
+        "binding_id expected_revision reviewed_by reason confirm "
+        "supersedes_binding_id governance_request_id",
+        "binding_id expected_revision reviewed_by reason confirm",
+        mutation=True,
+    ),
+    _contract(
+        "reject_memora_binding",
+        "binding_id expected_revision reviewed_by reason governance_request_id",
+        "binding_id expected_revision reviewed_by reason",
+        mutation=True,
+    ),
+    _contract(
+        "revoke_memora_binding",
+        "binding_id expected_revision revoked_by reason confirm "
+        "governance_request_id",
+        "binding_id expected_revision revoked_by reason confirm",
+        mutation=True,
+    ),
+    _contract(
+        "memora_binding_history",
+        "binding_id limit before_sequence",
+        "binding_id",
+        retry_safe=True,
+    ),
+    _contract("audit_memora_binding", "binding_id", "binding_id", retry_safe=True),
     _contract(
         "query",
         "embedding context_id steps prompt_text recall_scope",
@@ -845,6 +896,8 @@ LONG_NEURAL_OPERATIONS = frozenset(
         "register_trace",
         "query_text",
         "retrieve_text_v2",
+        "memora_shadow_plan",
+        "propose_memora_binding",
         "query",
         "enter_spiking_cortex",
         "cortex_tick",
@@ -877,6 +930,10 @@ DETERMINISTIC_GOVERNANCE_REJECTION_OPERATIONS = frozenset(
         "revoke_namespace_link",
         "delete_namespace_link",
         "expire_namespace_links",
+        "propose_memora_binding",
+        "promote_memora_binding",
+        "reject_memora_binding",
+        "revoke_memora_binding",
     }
 )
 
@@ -991,6 +1048,35 @@ _OPTIONAL_DIGEST = _rule(
     min_bytes=64,
     max_bytes=64,
     pattern=re.compile(r"[0-9a-f]{64}"),
+)
+_MEMORA_BINDING_ID = _rule(
+    "string",
+    min_bytes=37,
+    max_bytes=37,
+    pattern=re.compile(r"s2mb_[0-9a-f]{32}"),
+)
+_OPTIONAL_MEMORA_BINDING_ID = _rule(
+    "string",
+    nullable=True,
+    min_bytes=37,
+    max_bytes=37,
+    pattern=re.compile(r"s2mb_[0-9a-f]{32}"),
+)
+_MEMORA_CLUSTER_ORDINAL = _rule("int", minimum=0, maximum=15)
+_MEMORA_LIST_LIMIT = _rule("int", minimum=1, maximum=256)
+_OPTIONAL_MEMORA_SEQUENCE = _rule(
+    "int",
+    nullable=True,
+    minimum=2,
+    maximum=64,
+)
+_OPTIONAL_MEMORA_STATE = _rule(
+    "string",
+    nullable=True,
+    max_bytes=16,
+    allowed_values=frozenset(
+        {"proposed", "promoted", "rejected", "revoked", "superseded"}
+    ),
 )
 _CAPTURE_ID = _rule(
     "string",
@@ -1140,6 +1226,38 @@ MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingPr
             steps=_STEPS,
             prompt_text=_TEXT,
             recall_scope=_RECALL_SCOPE,
+        ),
+        "propose_memora_binding": _schema(
+            context_id=_NONEMPTY_IDENTIFIER,
+            plan_digest=_DIGEST,
+            cluster_ordinal=_MEMORA_CLUSTER_ORDINAL,
+            proposed_by=_NONEMPTY_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
+        ),
+        "promote_memora_binding": _schema(
+            binding_id=_MEMORA_BINDING_ID,
+            expected_revision=_DIGEST,
+            reviewed_by=_NONEMPTY_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            confirm=_TRUE,
+            supersedes_binding_id=_OPTIONAL_MEMORA_BINDING_ID,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
+        ),
+        "reject_memora_binding": _schema(
+            binding_id=_MEMORA_BINDING_ID,
+            expected_revision=_DIGEST,
+            reviewed_by=_NONEMPTY_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
+        ),
+        "revoke_memora_binding": _schema(
+            binding_id=_MEMORA_BINDING_ID,
+            expected_revision=_DIGEST,
+            revoked_by=_NONEMPTY_IDENTIFIER,
+            reason=_NONEMPTY_SHORT_STRING,
+            confirm=_TRUE,
+            governance_request_id=_OPTIONAL_IDENTIFIER,
         ),
         "publish_context_event": _schema(
             context_id=_IDENTIFIER,
@@ -1701,6 +1819,8 @@ def _validate_mutation_arguments(
         "disable_namespace_link",
         "revoke_namespace_link",
         "delete_namespace_link",
+        "promote_memora_binding",
+        "revoke_memora_binding",
         "repair_semantic_indexes",
         "repair_capture_ledger",
         "restore_recovery_bundle_isolated",
@@ -1783,6 +1903,18 @@ _GOVERNANCE_ACTOR_FIELDS: Mapping[str, str] = MappingProxyType(
         "disable_namespace_link": "disabled_by",
         "revoke_namespace_link": "revoked_by",
         "delete_namespace_link": "revoked_by",
+        "propose_memora_binding": "proposed_by",
+        "promote_memora_binding": "reviewed_by",
+        "reject_memora_binding": "reviewed_by",
+        "revoke_memora_binding": "revoked_by",
+    }
+)
+_MEMORA_GOVERNANCE_ACTOR_OPERATIONS = frozenset(
+    {
+        "propose_memora_binding",
+        "promote_memora_binding",
+        "reject_memora_binding",
+        "revoke_memora_binding",
     }
 )
 
@@ -1793,7 +1925,14 @@ def _bind_authenticated_governance_actor(
     *,
     authenticated_principal: str,
 ) -> dict[str, Any]:
-    """Bind bridge actors to OS-verified local ownership, never caller labels."""
+    """Bind governance actors to the OS-verified local owner.
+
+    Bridge governance keeps one owner identity.  Memora additionally binds a
+    digest of the caller's workflow-role label so its distinct-reviewer check
+    remains meaningful within a single-user installation without claiming two
+    independently authenticated humans.  The raw role label is never trusted
+    as an identity and is not persisted.
+    """
 
     field = _GOVERNANCE_ACTOR_FIELDS.get(operation)
     if field is None:
@@ -1809,6 +1948,18 @@ def _bind_authenticated_governance_actor(
         raise CoreProtocolError()
     digest = hashlib.sha256(clean_principal.encode("utf-8")).hexdigest()[:24]
     actor = f"core:local-owner:{digest}"
+    if operation in _MEMORA_GOVERNANCE_ACTOR_OPERATIONS:
+        try:
+            workflow_role = reject_sensitive_identifier(
+                arguments.get(field),
+                field="governance_workflow_role",
+            ).strip()
+        except ValueError as exc:
+            raise CoreProtocolError() from exc
+        if not workflow_role:
+            raise CoreProtocolError()
+        role_digest = hashlib.sha256(workflow_role.encode("utf-8")).hexdigest()[:16]
+        actor = f"{actor}:workflow:{role_digest}"
     bound = dict(arguments)
     bound[field] = actor
     return bound
@@ -5198,7 +5349,10 @@ class AuthoritativeCoreService:
                             "path authorization failure could not be finalized"
                         )
                     return self._cache_mutation_response(request, response)
-                except BridgeGovernanceIntegrityError:
+                except (
+                    BridgeGovernanceIntegrityError,
+                    MemoraGovernanceIntegrityError,
+                ):
                     LOGGER.error(
                         "bridge governance integrity failure operation=%s",
                         contract.name,
@@ -5214,7 +5368,7 @@ class AuthoritativeCoreService:
                             "governance integrity failure could not be finalized"
                         )
                     return self._cache_mutation_response(request, response)
-                except BridgeGovernanceError:
+                except (BridgeGovernanceError, MemoraGovernanceError):
                     if contract.name not in DETERMINISTIC_GOVERNANCE_REJECTION_OPERATIONS:
                         response = self._response(
                             request,
@@ -5309,6 +5463,20 @@ class AuthoritativeCoreService:
                             "service_unavailable",
                             retryable=contract.retry_safe,
                         ),
+                    )
+                except MemoraGovernanceIntegrityError:
+                    LOGGER.error(
+                        "memora governance integrity failure operation=%s",
+                        contract.name,
+                    )
+                    response = self._response(
+                        request,
+                        error=safe_error("service_unavailable"),
+                    )
+                except MemoraGovernanceError:
+                    response = self._response(
+                        request,
+                        error=safe_error("invalid_request"),
                     )
                 except Exception:
                     LOGGER.error("backend operation failed operation=%s", contract.name)

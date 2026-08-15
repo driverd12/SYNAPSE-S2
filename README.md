@@ -827,6 +827,7 @@ The MCP server exposes these tools:
 | `list_spiking_app_connections` | List App Connect attachments. |
 | `capture_spiking_app_snapshot` | Capture a confirmed redacted local app Accessibility snapshot into memory. |
 | `list_spiking_memory_graph` | List compact memory nodes and relationship edges with endpoint resolution, provenance, completeness, and omission metadata. |
+| `plan_spiking_memora_shadow` | Propose shadow-only Memora consolidation clusters and cue bindings for one namespace via pretrained embedding inference; read-only, never applied, never persisted, retrieval unchanged. See [docs/MEMORA_SHADOW.md](docs/MEMORA_SHADOW.md). |
 | `list_spiking_namespace_map` | List the bounded namespace catalog, active governed links, pending proposals, and read-only bridge suggestions for the Neural Galaxy. |
 | `propose_spiking_namespace_link` | Create an isolated pending bridge proposal with evidence and expiry; it does not expand recall. |
 | `reject_spiking_namespace_link` | CAS-reject the exact pending proposal revision; the MCP surface cannot approve a bridge or expand recall. |

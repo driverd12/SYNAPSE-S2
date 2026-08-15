@@ -179,6 +179,31 @@ ToolNumberInput = Annotated[
     BeforeValidator(_schema_safe_number),
     WithJsonSchema({"type": "number", "exclusiveMinimum": 0, "maximum": 10}),
 ]
+MemoraBindingIdInput = Annotated[
+    str,
+    BeforeValidator(_schema_safe_string),
+    WithJsonSchema({"type": "string", "pattern": "^s2mb_[0-9a-f]{32}$"}),
+]
+MemoraDigestInput = Annotated[
+    str,
+    BeforeValidator(_schema_safe_string),
+    WithJsonSchema({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+]
+MemoraClusterOrdinalInput = Annotated[
+    int | str,
+    BeforeValidator(_schema_safe_integer),
+    WithJsonSchema({"type": "integer", "minimum": 0, "maximum": 15}),
+]
+MemoraLimitInput = Annotated[
+    int | str,
+    BeforeValidator(_schema_safe_integer),
+    WithJsonSchema({"type": "integer", "minimum": 1, "maximum": 256}),
+]
+MemoraSequenceInput = Annotated[
+    int | str,
+    BeforeValidator(_schema_safe_integer),
+    WithJsonSchema({"type": "integer", "minimum": 0, "maximum": 64}),
+]
 RetrievalResultLimitInput = Annotated[
     int | str,
     BeforeValidator(_schema_safe_integer),
@@ -281,6 +306,40 @@ _CONTRACT_TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
             "max_response_bytes",
         }
     ),
+    "plan_spiking_memora_shadow": frozenset(
+        {
+            "context_id",
+            "entry_limit",
+            "max_clusters",
+            "max_cues",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
+    "list_spiking_memora_bindings": frozenset(
+        {"context_id", "state", "limit", "response_mode", "max_response_bytes"}
+    ),
+    "get_spiking_memora_binding": frozenset(
+        {"binding_id", "response_mode", "max_response_bytes"}
+    ),
+    "propose_spiking_memora_binding": frozenset(
+        {
+            "context_id",
+            "plan_digest",
+            "cluster_ordinal",
+            "reason",
+            "proposed_by",
+            "governance_request_id",
+            "response_mode",
+            "max_response_bytes",
+        }
+    ),
+    "list_spiking_memora_binding_history": frozenset(
+        {"binding_id", "limit", "before_sequence", "response_mode", "max_response_bytes"}
+    ),
+    "audit_spiking_memora_binding": frozenset(
+        {"binding_id", "response_mode", "max_response_bytes"}
+    ),
 }
 _CONTRACT_TOOL_SURFACES = {
     "retrieve_spiking_memory_v2": "memory-retrieval",
@@ -289,6 +348,12 @@ _CONTRACT_TOOL_SURFACES = {
     "hydrate_spiking_agent_context": "agent-hydration",
     "get_spiking_cortex_state": "cortex-state",
     "query_spiking_media_similarity": "media-similarity",
+    "plan_spiking_memora_shadow": "memora-shadow",
+    "list_spiking_memora_bindings": "memora-governance",
+    "get_spiking_memora_binding": "memora-governance",
+    "propose_spiking_memora_binding": "memora-governance",
+    "list_spiking_memora_binding_history": "memora-governance",
+    "audit_spiking_memora_binding": "memora-governance",
 }
 
 
@@ -874,6 +939,20 @@ def _validate_tool_string(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str) or value == _SCHEMA_INVALID_STRING:
         raise ValueError(f"{field_name} must be a string")
     return value
+
+
+def _validate_memora_digest(value: Any, *, field_name: str) -> str:
+    text = _validate_tool_string(value, field_name=field_name).strip()
+    if re.fullmatch(r"[0-9a-f]{64}", text) is None:
+        raise ValueError(f"{field_name} must be a lowercase sha256 digest")
+    return text
+
+
+def _validate_memora_binding_id(value: Any) -> str:
+    text = _validate_tool_string(value, field_name="binding_id").strip()
+    if re.fullmatch(r"s2mb_[0-9a-f]{32}", text) is None:
+        raise ValueError("binding_id must be canonical s2mb_ plus 32 lowercase hex")
+    return text
 
 
 def _validate_tool_boolean(value: Any, *, field_name: str) -> bool:
@@ -1901,6 +1980,367 @@ def list_spiking_memory(
         LOGGER.exception("memory list failed for context_id=%s", context)
         return _contract_tool_result(
             _contract_error("memory-list", exc, max_response_bytes=budget)
+        )
+
+
+@mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    annotations={
+        "title": "Plan Shadow Memory Consolidation (Proposals Only)",
+        "readOnlyHint": True,
+    }
+)
+def plan_spiking_memora_shadow(
+    context_id: ToolStringInput = "default",
+    entry_limit: ToolIntegerInput = 64,
+    max_clusters: ToolIntegerInput = 16,
+    max_cues: ToolIntegerInput = 8,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Propose shadow-only Memora consolidation clusters for one namespace.
+
+    Read-only pretrained-embedding inference over already-redacted durable
+    memory text.  Nothing is persisted or applied and retrieval results are
+    unchanged; proposals exist for manual review only.
+    """
+
+    context = "unknown"
+    budget: int | None = _token_error_budget(surface="memora-shadow")
+    try:
+        budget = _token_response_budget(
+            surface="memora-shadow",
+            max_response_bytes=max_response_bytes,
+        )
+        configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+        mode = normalize_response_mode(response_mode, default=configured_mode)
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
+        bounded_entry_limit = _validate_bounded_integer(
+            entry_limit,
+            field_name="entry_limit",
+            minimum=1,
+            maximum=64,
+        )
+        bounded_max_clusters = _validate_bounded_integer(
+            max_clusters,
+            field_name="max_clusters",
+            minimum=1,
+            maximum=16,
+        )
+        bounded_max_cues = _validate_bounded_integer(
+            max_cues,
+            field_name="max_cues",
+            minimum=0,
+            maximum=8,
+        )
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_backend().memora_shadow_plan(
+            context_id=context,
+            entry_limit=bounded_entry_limit,
+            max_clusters=bounded_max_clusters,
+            max_cues=bounded_max_cues,
+        )
+        return _contract_tool_result(
+            project_response(
+                "memora-shadow",
+                payload,
+                mode=mode,
+                max_response_bytes=budget,
+            )
+        )
+    except ValueError as exc:
+        LOGGER.warning(
+            "invalid memora shadow plan request for context_id=%s: %s", context, exc
+        )
+        return _contract_tool_result(
+            _contract_error("memora-shadow", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("memora shadow plan failed for context_id=%s", context)
+        return _contract_tool_result(
+            _contract_error("memora-shadow", exc, max_response_bytes=budget)
+        )
+
+
+def _memora_governance_tool_result(
+    payload: dict[str, Any],
+    *,
+    response_mode: Any,
+    budget: int,
+) -> Any:
+    configured_mode = os.getenv("SYNAPSE_S2_DEFAULT_RESPONSE_MODE", "compact")
+    mode = normalize_response_mode(response_mode, default=configured_mode)
+    return _contract_tool_result(
+        project_response(
+            "memora-governance",
+            payload,
+            mode=mode,
+            max_response_bytes=budget,
+        )
+    )
+
+
+@mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    annotations={
+        "title": "List Governed Memora Cue Bindings",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    },
+)
+def list_spiking_memora_bindings(
+    context_id: ToolStringInput = "default",
+    state: ToolStringInput = "",
+    limit: MemoraLimitInput = 50,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Read bounded proposal/promotion state; this tool cannot change routing."""
+
+    budget: int | None = _token_error_budget(surface="memora-governance")
+    try:
+        budget = _token_response_budget(
+            surface="memora-governance",
+            max_response_bytes=max_response_bytes,
+        )
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
+        state_value = _validate_tool_string(state, field_name="state").strip()
+        if state_value and state_value not in {
+            "proposed",
+            "promoted",
+            "rejected",
+            "revoked",
+            "superseded",
+        }:
+            raise ValueError("state is invalid")
+        bounded_limit = _validate_bounded_integer(
+            limit, field_name="limit", minimum=1, maximum=256
+        )
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_backend().list_memora_bindings(
+            context_id=context,
+            state=state_value or None,
+            limit=bounded_limit,
+        )
+        return _memora_governance_tool_result(
+            payload, response_mode=response_mode, budget=budget
+        )
+    except ValueError as exc:
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("memora binding list failed")
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+
+
+@mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    annotations={
+        "title": "Read Governed Memora Cue Binding",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    },
+)
+def get_spiking_memora_binding(
+    binding_id: MemoraBindingIdInput,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Read one integrity-checked binding; this tool cannot change routing."""
+
+    budget: int | None = _token_error_budget(surface="memora-governance")
+    try:
+        budget = _token_response_budget(
+            surface="memora-governance",
+            max_response_bytes=max_response_bytes,
+        )
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_backend().get_memora_binding(
+            binding_id=_validate_memora_binding_id(binding_id)
+        )
+        return _memora_governance_tool_result(
+            payload, response_mode=response_mode, budget=budget
+        )
+    except ValueError as exc:
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("memora binding read failed")
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+
+
+@mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    annotations={
+        "title": "Propose Governed Memora Cue Binding",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    },
+)
+def propose_spiking_memora_binding(
+    context_id: ToolStringInput,
+    plan_digest: MemoraDigestInput,
+    cluster_ordinal: MemoraClusterOrdinalInput,
+    reason: ToolStringInput,
+    proposed_by: ToolStringInput = "mcp-proposer",
+    governance_request_id: ToolStringInput = "",
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Persist a review proposal only; MCP cannot promote, reject, or revoke it."""
+
+    budget: int | None = _token_error_budget(surface="memora-governance")
+    try:
+        budget = _token_response_budget(
+            surface="memora-governance",
+            max_response_bytes=max_response_bytes,
+        )
+        context = _sanitize_context_id(
+            _validate_tool_string(context_id, field_name="context_id")
+        )
+        safe_reason = _validate_text(
+            _validate_tool_string(reason, field_name="reason"),
+            field_name="reason",
+        )
+        request_id = _validate_tool_string(
+            governance_request_id, field_name="governance_request_id"
+        ).strip()
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_backend().propose_memora_binding(
+            context_id=context,
+            plan_digest=_validate_memora_digest(
+                plan_digest, field_name="plan_digest"
+            ),
+            cluster_ordinal=_validate_bounded_integer(
+                cluster_ordinal,
+                field_name="cluster_ordinal",
+                minimum=0,
+                maximum=15,
+            ),
+            proposed_by=_sanitize_agent_id(
+                _validate_tool_string(proposed_by, field_name="proposed_by")
+            ),
+            reason=safe_reason,
+            governance_request_id=request_id or None,
+        )
+        return _memora_governance_tool_result(
+            payload, response_mode=response_mode, budget=budget
+        )
+    except ValueError as exc:
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("memora binding proposal failed")
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+
+
+@mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    annotations={
+        "title": "Read Governed Memora Binding History",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    },
+)
+def list_spiking_memora_binding_history(
+    binding_id: MemoraBindingIdInput,
+    limit: MemoraLimitInput = 50,
+    before_sequence: MemoraSequenceInput = 0,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Read the bounded validated receipt chain; this tool cannot mutate it."""
+
+    budget: int | None = _token_error_budget(surface="memora-governance")
+    try:
+        budget = _token_response_budget(
+            surface="memora-governance",
+            max_response_bytes=max_response_bytes,
+        )
+        sequence = _validate_bounded_integer(
+            before_sequence,
+            field_name="before_sequence",
+            minimum=0,
+            maximum=64,
+        )
+        if sequence == 1:
+            raise ValueError("before_sequence must be zero or at least 2")
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_backend().memora_binding_history(
+            binding_id=_validate_memora_binding_id(binding_id),
+            limit=_validate_bounded_integer(
+                limit, field_name="limit", minimum=1, maximum=256
+            ),
+            before_sequence=sequence or None,
+        )
+        return _memora_governance_tool_result(
+            payload, response_mode=response_mode, budget=budget
+        )
+    except ValueError as exc:
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("memora binding history failed")
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+
+
+@mcp.tool(
+    output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
+    annotations={
+        "title": "Audit Governed Memora Cue Binding",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    },
+)
+def audit_spiking_memora_binding(
+    binding_id: MemoraBindingIdInput,
+    response_mode: ResponseModeInput = "",
+    max_response_bytes: ResponseBudgetInput = "",
+) -> Any:
+    """Validate one binding projection, catalog entry, and receipt chain."""
+
+    budget: int | None = _token_error_budget(surface="memora-governance")
+    try:
+        budget = _token_response_budget(
+            surface="memora-governance",
+            max_response_bytes=max_response_bytes,
+        )
+        _, mlx_backend = _load_backend()
+        payload = mlx_backend.get_backend().audit_memora_binding(
+            binding_id=_validate_memora_binding_id(binding_id)
+        )
+        return _memora_governance_tool_result(
+            payload, response_mode=response_mode, budget=budget
+        )
+    except ValueError as exc:
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
+        )
+    except Exception as exc:
+        LOGGER.exception("memora binding audit failed")
+        return _contract_tool_result(
+            _contract_error("memora-governance", exc, max_response_bytes=budget)
         )
 
 

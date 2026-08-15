@@ -1231,6 +1231,9 @@
         <button id="impactToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="impactDrawer" title="Show approximate SYNAPSE-S2 impact">
           <strong>≈ Impact</strong><small id="footerImpact">hidden</small>
         </button>
+        <button id="memoraShadowToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="memoraShadowDrawer" title="Show shadow-only Memora consolidation proposals (never applied)">
+          <strong>◇ Shadow</strong><small id="footerMemoraShadow">hidden</small>
+        </button>
       </footer>
       <aside id="impactDrawer" class="impact-drawer" hidden aria-labelledby="impactTitle">
         <div class="impact-drawer-header">
@@ -1253,6 +1256,25 @@
           <label>Assumed tokens displaced / assist<input id="impactTokensPerAssist" type="number" min="0" max="1000000" step="100" value="1500" /></label>
         </div>
         <p id="impactCaveat" class="panel-note">Illustrative equivalent only. This is not a provider bill or a proven counterfactual saving; edit the assumptions to match your workflow.</p>
+      </aside>
+      <aside id="memoraShadowDrawer" class="impact-drawer" hidden aria-labelledby="memoraShadowTitle">
+        <div class="impact-drawer-header">
+          <div>
+            <p class="section-label">Memora shadow (proposals only)</p>
+            <h2 id="memoraShadowTitle">Shadow consolidation proposals</h2>
+          </div>
+          <button id="memoraShadowCloseButton" class="icon-button compact" type="button" aria-label="Hide Memora shadow panel">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
+          </button>
+        </div>
+        <div id="memoraShadowSummary" class="impact-metrics" aria-live="polite">
+          <div><span>Clusters proposed</span><strong>--</strong><small>shadow only; never applied</small></div>
+          <div><span>Entries embedded</span><strong>--</strong><small>bounded snapshot</small></div>
+          <div><span>Provider</span><strong>--</strong><small>pretrained inference</small></div>
+          <div><span>Learned</span><strong>--</strong><small>false = hash fallback</small></div>
+        </div>
+        <div id="memoraShadowClusters" class="impact-metrics" aria-live="polite"></div>
+        <p id="memoraShadowCaveat" class="panel-note">Shadow proposals from pretrained embedding inference over already-redacted durable text. Nothing is applied or persisted, retrieval results are unchanged, and every source memory stays independently deletable.</p>
       </aside>
       <aside id="recipeDrawer" class="recipe-drawer" hidden aria-label="Operator recipes">
         <div class="recipe-drawer-header">

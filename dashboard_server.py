@@ -538,6 +538,19 @@ class DashboardRuntime:
                     assumed_tokens_per_assist=assumed_tokens,
                 )
             )
+        if method == "GET" and path == "/api/memora-shadow":
+            context = self._context_from_params(params)
+            entry_limit = self._int_param(params, "entry_limit", 64, minimum=1, maximum=64)
+            max_clusters = self._int_param(params, "max_clusters", 16, minimum=1, maximum=16)
+            max_cues = self._int_param(params, "max_cues", 8, minimum=0, maximum=8)
+            return self._json_response(
+                self.memora_shadow_projection(
+                    context_id=context,
+                    entry_limit=entry_limit,
+                    max_clusters=max_clusters,
+                    max_cues=max_cues,
+                )
+            )
         if method == "GET" and path == "/api/media-cache":
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 12, minimum=1, maximum=50)
@@ -3216,6 +3229,32 @@ class DashboardRuntime:
                 "The dollar range is an editable what-if, not provider billing or "
                 "a measured no-SYNAPSE counterfactual. Yield is not correctness; "
                 "warm coverage is occupancy, not a cache hit rate."
+            ),
+        }
+
+    def memora_shadow_projection(
+        self,
+        *,
+        context_id: str,
+        entry_limit: int,
+        max_clusters: int,
+        max_cues: int,
+    ) -> dict[str, Any]:
+        plan = self.backend.memora_shadow_plan(
+            context_id=context_id,
+            entry_limit=entry_limit,
+            max_clusters=max_clusters,
+            max_cues=max_cues,
+        )
+        return {
+            "schema": "synapse-s2.dashboard-memora-shadow.v1",
+            "requested_context_id": context_id,
+            "plan": plan,
+            "caveat": (
+                "Shadow proposals from pretrained embedding inference over "
+                "already-redacted durable text. Nothing is applied or "
+                "persisted, retrieval results are unchanged, and every "
+                "source memory remains independently deletable."
             ),
         }
 
