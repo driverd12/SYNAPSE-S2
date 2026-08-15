@@ -1945,6 +1945,14 @@ class SpikingAttentionBackend:
                 ),
             }
 
+    def _memora_recovery_provider_identity(self) -> dict[str, Any] | None:
+        """Return only an identity capable of governing promoted cue bindings."""
+
+        identity = provider_identity(
+            self._embedding_provider_info_for_dimensions(self.dimension)
+        )
+        return identity if identity.get("learned") is True else None
+
     def embedding_provider_info(self) -> dict[str, Any]:
         """Return bounded provider status for the public Core surface."""
 
@@ -11942,6 +11950,7 @@ class SpikingAttentionBackend:
             self.memory_store,
             capture_root=capture_root,
             allow_noncanonical_capture_root=allow_noncanonical_capture_root,
+            memora_provider_identity=self._memora_recovery_provider_identity(),
         ).create_bundle(path, purpose=purpose, pinned=pinned)
 
     def audit_capture_ledger(
@@ -12002,6 +12011,7 @@ class SpikingAttentionBackend:
         return VerifiedRecoveryManager(
             self.memory_store,
             capture_root=capture_root,
+            memora_provider_identity=self._memora_recovery_provider_identity(),
         ).verify_bundle(
             receipt_path,
             expected_database_sha256=expected_database_sha256,
@@ -12029,6 +12039,7 @@ class SpikingAttentionBackend:
         return VerifiedRecoveryManager(
             self.memory_store,
             capture_root=capture_root,
+            memora_provider_identity=self._memora_recovery_provider_identity(),
         ).restore_bundle_isolated(
             receipt_path,
             output_root,
@@ -12049,7 +12060,10 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         from recovery_manager import VerifiedRecoveryManager
 
-        return VerifiedRecoveryManager(self.memory_store).plan_retention(
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            memora_provider_identity=self._memora_recovery_provider_identity(),
+        ).plan_retention(
             directory,
             keep_latest=keep_latest,
             max_age_days=max_age_days,
@@ -12067,7 +12081,10 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         from recovery_manager import VerifiedRecoveryManager
 
-        return VerifiedRecoveryManager(self.memory_store).apply_retention(
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            memora_provider_identity=self._memora_recovery_provider_identity(),
+        ).apply_retention(
             plan_token=plan_token,
             cutoff_created_at=cutoff_created_at,
             directory=directory,
@@ -12084,7 +12101,10 @@ class SpikingAttentionBackend:
     ) -> dict[str, Any]:
         from recovery_manager import VerifiedRecoveryManager
 
-        return VerifiedRecoveryManager(self.memory_store).restore_retired(
+        return VerifiedRecoveryManager(
+            self.memory_store,
+            memora_provider_identity=self._memora_recovery_provider_identity(),
+        ).restore_retired(
             plan_token=plan_token,
             confirm=confirm,
         )

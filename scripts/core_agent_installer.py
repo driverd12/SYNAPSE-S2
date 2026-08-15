@@ -1912,6 +1912,82 @@ def _validate_recovery_runtime_state(
     return hashlib.sha256(raw).hexdigest()
 
 
+def _memora_provider_identity_for_config(
+    config: CoreConfig,
+) -> dict[str, Any] | None:
+    """Resolve the exact candidate provider for governed recovery publication.
+
+    Non-neural configurations cannot have effective promoted Memora bindings,
+    so they intentionally supply no identity and the aggregate audit fails
+    closed if such state is present.  A neural replacement performs one short,
+    local-only readiness probe from the closed CoreConfig before its identity
+    may authorize a signed recovery point.
+    """
+
+    normalized = config.embedding_provider_name.strip().lower()
+    if normalized not in {"mlx-neural", "mlx-neural-v1"}:
+        return None
+    from embedding_providers import (
+        EmbeddingProviderConfig,
+        MLXNeuralEmbeddingConfig,
+        resolve_embedding_provider_config,
+    )
+    from memora_shadow import provider_identity
+
+    neural_values = (
+        config.embedding_neural_model_id,
+        config.embedding_neural_revision,
+        config.embedding_neural_cache_dir,
+        config.embedding_neural_pooling,
+        config.embedding_neural_max_tokens,
+        config.embedding_neural_normalize,
+        config.embedding_neural_local_files_only,
+    )
+    if any(value is None for value in neural_values):
+        raise CoreInstallerError(
+            "replacement Memora provider configuration is incomplete"
+        )
+    try:
+        provider = resolve_embedding_provider_config(
+            EmbeddingProviderConfig(
+                provider=config.embedding_provider_name,
+                neural=MLXNeuralEmbeddingConfig(
+                    model_id=str(config.embedding_neural_model_id),
+                    revision=str(config.embedding_neural_revision),
+                    cache_dir=str(config.embedding_neural_cache_dir),
+                    pooling=str(config.embedding_neural_pooling),
+                    max_tokens=int(config.embedding_neural_max_tokens),
+                    normalize=bool(config.embedding_neural_normalize),
+                    local_files_only=bool(
+                        config.embedding_neural_local_files_only
+                    ),
+                ),
+            )
+        )
+        probe = provider.embed(
+            "synapse-s2 replacement memora provider readiness",
+            dimensions=min(8, int(config.dimension)),
+        )
+        if len(probe.vector) != min(8, int(config.dimension)):
+            raise CoreInstallerError(
+                "replacement Memora provider readiness is invalid"
+            )
+        identity = provider_identity(
+            provider.info(dimensions=int(config.dimension))
+        )
+    except CoreInstallerError:
+        raise
+    except Exception as exc:
+        raise CoreInstallerError(
+            "replacement Memora provider readiness is unavailable"
+        ) from exc
+    if identity.get("learned") is not True:
+        raise CoreInstallerError(
+            "replacement Memora provider identity is not learned and ready"
+        )
+    return identity
+
+
 def _verify_recovery_admission(
     *,
     paths: InstallPaths,
@@ -3176,6 +3252,9 @@ def _stage_replacement_frozen(
                 store,
                 capture_root=paths.capture_root,
                 runtime_state_path=paths.state,
+                memora_provider_identity=_memora_provider_identity_for_config(
+                    config
+                ),
             )
             capture = manager.daemon.status()
             admitted_pending_file_count = validate_replacement_capture_transport(

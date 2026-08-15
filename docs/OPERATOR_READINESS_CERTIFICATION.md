@@ -83,9 +83,9 @@ be treated as operator-ready or used for cutover.
 | App Connect preview | A real running app is attached and previewed without writing memory. Quality and capability badges must be present even if Accessibility is blocked. |
 | Wrap Session | A factual handoff is persisted as durable session memory. |
 | Capture ledger audit | Every processed `capture.v2` record has an exact authoritative SQLite ledger binding; missing, ambiguous, or mismatched evidence blocks backup. |
-| Paired recovery backup | SQLite and exactly-once capture transport are bound by signed receipts with no replay debt. |
-| Recovery verification | The database, schema contract, capture archive, provenance, reconciliation, and canonical processed-request ledger-binding proof reverify from durable artifacts. |
-| Isolated recovery drill | A paired restore materializes outside live state and independently reproduces the same content-free capture-ledger binding count and revision. |
+| Paired recovery backup | SQLite and exactly-once capture transport are bound by signed receipts with no replay debt; recovery bundle v3 also signs the bounded content-free Memora catalog/projection/event aggregate. |
+| Recovery verification | The database, schema contract, capture archive, provenance, reconciliation, canonical processed-request ledger binding, and exact Memora aggregate reverify from durable artifacts. Every promoted binding must remain effective with zero provider/source drift. |
+| Isolated recovery drill | A paired restore materializes outside live state and independently reproduces both content-free capture-ledger and Memora integrity proofs. Cue terms, source text, and vectors are absent from readiness evidence. |
 | Dashboard smoke | Page/assets and the protected snapshot API load through the same rotating bootstrap, port-specific cookie, and `X-Synapse-Dashboard-Session` contract used by the installer; no bare URL or unauthenticated API success qualifies. |
 
 ## Interpreting Results
@@ -156,9 +156,9 @@ post-header I/O, and uses bounded shutdown.
 | `app_preview` | Open a visible app, grant macOS Accessibility/Automation where appropriate, or use selected-text capture when preview reports low signal. |
 | `wrap_session` | Run `wrap-session --preview`, confirm text is non-empty, then rerun certification. |
 | `capture_ledger_audit` | Review `finding_samples` and `audit_revision`. Only when `repairable: true`, run `capture-ledger-integrity --repair --confirm --expected-revision '<audit_revision>'`, then rerun the read-only audit and certification. Never replay captures or synthesize receipts. |
-| `recovery_backup` | Resolve disk space, SQLite integrity, capture errors, signing-key permissions, or replay-required transport files. On the authoritative lane, omit capture-root and noncanonical-root overrides; the service owns those paths. |
-| `recovery_verify` | Inspect the four bundle artifacts and signed receipt; never substitute a database-only copy. |
-| `recovery_restore` | Inspect the isolated restore proof and capture-ledger reconciliation before any cutover planning. |
+| `recovery_backup` | Resolve disk space, SQLite integrity, capture errors, signing-key permissions, replay-required transport files, or Memora integrity/effectiveness drift. On the authoritative lane, omit capture-root and noncanonical-root overrides; the service owns those paths. |
+| `recovery_verify` | Inspect the complete bundle and signed receipt, including the exact content-free Memora revision/count/drift aggregate; never substitute a database-only copy. |
+| `recovery_restore` | Inspect the isolated restore proof, capture-ledger reconciliation, and exact restored Memora aggregate before any cutover planning. |
 | `dashboard` | Run `.venv/bin/python scripts/smoke_dashboard.py default`. For operator review, install/refresh with `scripts/install_dashboard_agent.sh` and use `.venv/bin/python scripts/open_dashboard.py`; never open a bare loopback URL. Verify the auth file is `0600` inside its `0700` directory. |
 
 ## Why This Exists

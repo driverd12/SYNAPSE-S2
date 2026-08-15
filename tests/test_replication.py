@@ -24,6 +24,8 @@ from core_authority import CoreAuthorityLease
 from core_client_binding import CoreClientBinding
 from core_request_journal import CoreRequestJournal
 from image_capture import ConversionResult, ImageCaptureCache
+from memora_governance import MemoraGovernance
+from memora_shadow import build_shadow_plan
 from memory_store import DurableMemoryStore
 from recovery_manager import VerifiedRecoveryManager
 from replication_manager import ReplicationManager
@@ -75,7 +77,12 @@ class ReplicationManagerTests(unittest.TestCase):
         self.environment.stop()
         self.temporary.cleanup()
 
-    def manager(self, name: str) -> ReplicationManager:
+    def manager(
+        self,
+        name: str,
+        *,
+        memora_provider_identity: dict[str, object] | None = None,
+    ) -> ReplicationManager:
         root = self.root / name
         root.mkdir(mode=0o700)
         db_path = root / "memory.sqlite3"
@@ -140,8 +147,98 @@ class ReplicationManagerTests(unittest.TestCase):
         self.authorities.append(authority)
         self.stores.append(store)
         self.journals.append(journal)
-        recovery = VerifiedRecoveryManager(store, capture_root=root)
-        return ReplicationManager(store, recovery_manager=recovery)
+        return ReplicationManager(
+            store,
+            memora_provider_identity=memora_provider_identity,
+        )
+
+    @staticmethod
+    def _memora_identity() -> dict[str, object]:
+        return {
+            "provider": "mlx-embeddings",
+            "provider_type": "mlx-neural",
+            "model_id": "replication-test-model",
+            "revision": "revision-1",
+            "config_fingerprint": "e" * 64,
+            "dimensions": 8,
+            "semantic": True,
+            "local_only": True,
+            "ready": True,
+            "learned": True,
+        }
+
+    @classmethod
+    def _attach_promoted_memora(
+        cls,
+        store: DurableMemoryStore,
+    ) -> dict[str, object]:
+        context = "memora-replication-tests"
+        for index in range(4):
+            store.upsert_entry(
+                tag=f"memora-replication-{index}",
+                context_id=context,
+                source_text=f"synthetic replication cue evidence alpha {index}",
+                metadata={"sequence": index},
+                embedding_dimensions=8,
+                spike_indices=[1],
+                neuron_indices=[2],
+                registered_at=150.0 + index,
+            )
+        provider_info = {
+            **cls._memora_identity(),
+            "configuration_sha256": "e" * 64,
+        }
+        provider_info.pop("config_fingerprint")
+        provider_info.pop("learned")
+
+        def embed(text: str) -> list[float]:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            return [
+                struct.unpack(">I", digest[offset : offset + 4])[0] / 2**32
+                for offset in range(0, 32, 4)
+            ]
+
+        def recompute(context_id: str) -> dict:
+            page = store.memora_source_page(context_id=context_id)
+            revision = {
+                "revision": page["snapshot_revision"],
+                "entry_count": page["total"],
+                "sampling_truncated": page["has_more"],
+            }
+            return build_shadow_plan(
+                context_id=context_id,
+                entries=page["entries"],
+                revision_before=revision,
+                revision_after=revision,
+                provider_info=provider_info,
+                embed=embed,
+                similarity_threshold=0.0,
+                witnesses=page["witnesses"],
+            )
+
+        governance = MemoraGovernance(
+            store,
+            plan_recomputer=recompute,
+            allow_test_time=True,
+        )
+        plan = recompute(context)
+        proposed = governance.propose_binding(
+            context_id=context,
+            plan_digest=plan["plan_digest"],
+            cluster_ordinal=plan["clusters"][0]["cluster_ordinal"],
+            proposed_by="replication-operator-a",
+            reason="replication recovery proof fixture",
+            now=200.0,
+        )["binding"]
+        return governance.promote_binding(
+            binding_id=proposed["binding_id"],
+            expected_revision=proposed["revision"],
+            reviewed_by="replication-operator-b",
+            reason="replication recovery proof reviewed",
+            confirm=True,
+            active_provider_identity=cls._memora_identity(),
+            now=201.0,
+        )
 
     @staticmethod
     def pair(
@@ -295,6 +392,62 @@ class ReplicationManagerTests(unittest.TestCase):
                 status["ack_policy"],
                 "receiver-signs-after-memory-recovery-ready-proof",
             )
+
+    def test_memora_governance_survives_stage_and_is_revalidated_on_replay(self):
+        identity = self._memora_identity()
+        source = self.manager("memora-source", memora_provider_identity=identity)
+        binding = self._attach_promoted_memora(source.store)
+        receiver = self.manager(
+            "memora-receiver",
+            memora_provider_identity=identity,
+        )
+        self.pair(source, receiver)
+
+        exported = source.create_checkpoint(receiver.node_id)
+        staged = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(staged["verified"])
+        audit = staged["memora_integrity"]
+        self.assertEqual(audit["binding_projection_count"], 1)
+        self.assertEqual(audit["governance_event_receipt_count"], 2)
+        self.assertEqual(audit["effective_binding_count"], 1)
+        restore_root = Path(staged["restore_root"])
+        proof = read_private_json(restore_root / "recovery-proof.receipt.json")
+        self.assertEqual(proof["memora_integrity"], audit)
+
+        restored_store = DurableMemoryStore.open_existing_for_audit(
+            restore_root / "memory.sqlite3",
+            immutable=True,
+        )
+        try:
+            governance = MemoraGovernance(restored_store)
+            self.assertTrue(
+                governance.audit_integrity(binding["binding_id"])["chain_valid"]
+            )
+            self.assertEqual(
+                len(
+                    governance.effective_bindings(
+                        context_id=binding["context_id"],
+                        active_provider_identity=identity,
+                    )["bindings"]
+                ),
+                1,
+            )
+        finally:
+            restored_store.close()
+
+        replay = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["memora_integrity"], audit)
+
+        with closing(sqlite3.connect(restore_root / "memory.sqlite3")) as conn:
+            conn.execute(
+                "UPDATE store_metadata SET value_json = '{}' "
+                "WHERE key LIKE 'memora_governance.binding.v1.%'"
+            )
+            conn.commit()
+        with self.assertRaises((RuntimeError, ReplicationProtocolError)):
+            receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertEqual(receiver.status()["integrity"]["state"], "degraded")
 
     def test_checkpoint_contract_rejects_bool_counts_reserved_manifest_and_v5(self):
         source = self.manager("source")
@@ -1419,7 +1572,7 @@ class ReplicationManagerTests(unittest.TestCase):
         downgraded = {
             key: value
             for key, value in receipt.items()
-            if not key.startswith("media_")
+            if not key.startswith("media_") and key != "memora_integrity"
         }
         downgraded["schema"] = "synapse-s2.recovery-bundle.v2"
         source.store._authenticate_receipt(downgraded)
@@ -1612,7 +1765,7 @@ class ReplicationManagerTests(unittest.TestCase):
         legacy_receipt = {
             key: value
             for key, value in receipt.items()
-            if not key.startswith("media_")
+            if not key.startswith("media_") and key != "memora_integrity"
         }
         legacy_receipt["schema"] = "synapse-s2.recovery-bundle.v2"
         source.store._authenticate_receipt(legacy_receipt)

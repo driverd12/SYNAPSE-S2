@@ -37,6 +37,8 @@ from core_service import (  # noqa: E402
     AuthoritativeCoreService,
     CoreConfig,
 )
+from memora_governance import MemoraGovernance  # noqa: E402
+from memora_shadow import build_shadow_plan  # noqa: E402
 from recovery_manager import VerifiedRecoveryManager  # noqa: E402
 from scripts import core_cutover_preflight as preflight  # noqa: E402
 
@@ -45,6 +47,116 @@ class ReplacementAdmissionTests(unittest.TestCase):
     candidate_build_id = "source-" + "2" * 24
     predecessor_build_id = "source-" + "1" * 24
     config_fingerprint = "3" * 64
+
+    @staticmethod
+    def _memora_audit() -> dict[str, object]:
+        return {
+            "schema": "synapse-s2.memora-recovery-audit.v1",
+            "audit_revision": "4" * 64,
+            "catalog_count": 0,
+            "binding_projection_count": 0,
+            "governance_event_receipt_count": 0,
+            "source_witness_count": 0,
+            "cue_count": 0,
+            "promoted_binding_count": 0,
+            "effective_binding_count": 0,
+            "ineffective_promoted_binding_count": 0,
+            "provider_drift_binding_count": 0,
+            "source_drift_binding_count": 0,
+            "active_provider_revision": "absent",
+            "integrity_valid": True,
+            "effective_bindings_valid": True,
+            "raw_cue_terms_included": False,
+            "raw_source_text_included": False,
+            "vectors_included": False,
+        }
+
+    @staticmethod
+    def _attach_promoted_memora(
+        store: DurableMemoryStore,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        context_id = "replacement-promoted-memora"
+        for index in range(4):
+            store.upsert_entry(
+                tag=f"replacement-memora-{index}",
+                context_id=context_id,
+                source_text=f"synthetic replacement evidence alpha {index}",
+                metadata={"sequence": index},
+                embedding_dimensions=8,
+                spike_indices=[1],
+                neuron_indices=[2],
+                registered_at=1_100.0 + index,
+            )
+        provider_info = {
+            "provider": "mlx-embeddings",
+            "provider_type": "mlx-neural",
+            "model_id": "replacement-test-model",
+            "revision": "replacement-revision-1",
+            "configuration_sha256": "c" * 64,
+            "dimensions": 8,
+            "semantic": True,
+            "local_only": True,
+            "ready": True,
+        }
+        active_identity: dict[str, object] = {
+            "provider": "mlx-embeddings",
+            "provider_type": "mlx-neural",
+            "model_id": "replacement-test-model",
+            "revision": "replacement-revision-1",
+            "config_fingerprint": "c" * 64,
+            "dimensions": 8,
+            "semantic": True,
+            "local_only": True,
+            "ready": True,
+            "learned": True,
+        }
+
+        def embed(text: str) -> list[float]:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            return [value / 255.0 for value in digest[:8]]
+
+        def recompute(selected_context: str) -> dict:
+            page = store.memora_source_page(context_id=selected_context)
+            revision = {
+                "revision": page["snapshot_revision"],
+                "entry_count": page["total"],
+                "sampling_truncated": page["has_more"],
+            }
+            return build_shadow_plan(
+                context_id=selected_context,
+                entries=page["entries"],
+                revision_before=revision,
+                revision_after=revision,
+                provider_info=provider_info,
+                embed=embed,
+                similarity_threshold=0.0,
+                witnesses=page["witnesses"],
+            )
+
+        governance = MemoraGovernance(
+            store,
+            plan_recomputer=recompute,
+            allow_test_time=True,
+        )
+        plan = recompute(context_id)
+        proposed = governance.propose_binding(
+            context_id=context_id,
+            plan_digest=plan["plan_digest"],
+            cluster_ordinal=plan["clusters"][0]["cluster_ordinal"],
+            proposed_by="replacement-operator-a",
+            reason="replacement recovery proof fixture",
+            now=1_200.0,
+        )["binding"]
+        promoted = governance.promote_binding(
+            binding_id=proposed["binding_id"],
+            expected_revision=proposed["revision"],
+            reviewed_by="replacement-operator-b",
+            reason="replacement recovery proof reviewed",
+            confirm=True,
+            active_provider_identity=active_identity,
+            now=1_201.0,
+        )
+        return active_identity, promoted
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
@@ -166,6 +278,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
             "media_manifest_sha256": None,
             "media_object_count": 0,
             "media_reference_count": 0,
+            "memora_integrity": self._memora_audit(),
             "recovery_pending_file_count": 0,
             "recovery_replay_required_file_count": 0,
             "recovery_replay_required_capture_count": 0,
@@ -273,6 +386,37 @@ class ReplacementAdmissionTests(unittest.TestCase):
         self.assertIsNone(
             content["lock_generation_transition_birthtime_ns"]
         )
+
+        omitted_memora = copy.deepcopy(content)
+        omitted_memora.pop("memora_integrity")
+        stale_schema = copy.deepcopy(content)
+        stale_schema["schema"] = "synapse-s2.replacement-admission.v4"
+        tampered_memora = copy.deepcopy(content)
+        tampered_memora["memora_integrity"]["audit_revision"] = "0" * 64
+        for changed_content in (
+            omitted_memora,
+            stale_schema,
+            tampered_memora,
+        ):
+            changed_payload = self._signed(changed_content)
+            store = DurableMemoryStore.open_existing_for_audit(self.memory_db)
+            try:
+                with self.subTest(
+                    memora_schema=changed_content.get("schema"),
+                    memora_present="memora_integrity" in changed_content,
+                ):
+                    with self.assertRaises(
+                        preflight.CutoverPreflightError
+                    ):
+                        preflight._validate_replacement_admission(
+                            changed_payload,
+                            store=store,
+                            expected_content=content,
+                            expected_auth_key_id=self.auth_key_id,
+                            now_unix_ms=now,
+                        )
+            finally:
+                store.close()
 
     def test_contract_accepts_only_exact_legacy_v1_to_stable_v2_transition(
         self,
@@ -918,6 +1062,9 @@ class ReplacementAdmissionTests(unittest.TestCase):
         )
         first = AuthoritativeCoreService(config)
         first.start()
+        active_provider_identity, promoted_binding = self._attach_promoted_memora(
+            first._backend.memory_store
+        )
         daemon = CaptureInboxDaemon(root=state_root)
         transport_paths = daemon.paths()
         daemon._ensure_transport_dirs(transport_paths)
@@ -1012,6 +1159,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 store,
                 capture_root=state_root,
                 runtime_state_path=config.state_path,
+                memora_provider_identity=active_provider_identity,
             )
             cleanup_receipt.write_bytes(cleanup_receipt_bytes)
             cleanup_receipt.chmod(0o600)
@@ -1070,6 +1218,35 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 self.assertFalse(publication.evidence["cutover_ready"])
                 self.assertTrue(
                     publication.evidence["replacement_stage_ready"]
+                )
+                memora_integrity = publication.evidence["verification"][
+                    "memora_integrity"
+                ]
+                self.assertEqual(memora_integrity["promoted_binding_count"], 1)
+                self.assertEqual(memora_integrity["effective_binding_count"], 1)
+                self.assertEqual(
+                    memora_integrity["active_provider_revision"],
+                    hashlib.sha256(
+                        json.dumps(
+                            active_provider_identity,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                )
+                self.assertTrue(memora_integrity["integrity_valid"])
+                self.assertTrue(memora_integrity["effective_bindings_valid"])
+                self.assertFalse(memora_integrity["raw_cue_terms_included"])
+                self.assertFalse(memora_integrity["raw_source_text_included"])
+                self.assertFalse(memora_integrity["vectors_included"])
+                self.assertEqual(
+                    publication.evidence["restore"]["memora_integrity"],
+                    memora_integrity,
+                )
+                self.assertEqual(
+                    publication.evidence["bundle"]["memora_integrity"],
+                    memora_integrity,
                 )
                 self.assertEqual(
                     publication.evidence["pending_file_count"],
@@ -1137,6 +1314,13 @@ class ReplacementAdmissionTests(unittest.TestCase):
                     ),
                 ):
                     published = publication.publish(publish)
+                published_admission = json.loads(
+                    admission_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    published_admission["memora_integrity"],
+                    memora_integrity,
+                )
         finally:
             store.close()
             authority.close()
@@ -1190,6 +1374,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
             if successor is not None:
                 successor.close()
         self.assertTrue(published["verified"])
+        self.assertEqual(promoted_binding["state"], "promoted")
         self.assertEqual(published["recovery_pending_file_count"], 2)
         self.assertEqual(published["recovery_replay_required_file_count"], 1)
         self.assertEqual(published["recovery_replay_required_capture_count"], 1)
@@ -1302,6 +1487,7 @@ class ReplacementAdmissionTests(unittest.TestCase):
                 resume_store,
                 capture_root=state_root,
                 runtime_state_path=config.state_path,
+                memora_provider_identity=active_provider_identity,
             )
             with resume_manager.guarded_recovery_transaction(
                 state_root / "replacement-resume-restore",

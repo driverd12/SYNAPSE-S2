@@ -83,6 +83,37 @@ MAX_LIST_LIMIT = 256
 MAX_BINDING_EVENTS = 64
 MAX_EFFECTIVE_BINDINGS = 32
 
+# Recovery/readiness walks are deliberately finite.  These ceilings cover
+# many fully populated namespace catalogs while preventing a malformed store
+# from turning a certification read into an unbounded receipt-chain scan.
+MAX_RECOVERY_CATALOGS = 64
+MAX_RECOVERY_BINDINGS = 2_048
+MAX_RECOVERY_EVENTS = 32_768
+
+MEMORA_RECOVERY_AUDIT_SCHEMA = "synapse-s2.memora-recovery-audit.v1"
+MEMORA_RECOVERY_AUDIT_KEYS = frozenset(
+    {
+        "schema",
+        "audit_revision",
+        "catalog_count",
+        "binding_projection_count",
+        "governance_event_receipt_count",
+        "source_witness_count",
+        "cue_count",
+        "promoted_binding_count",
+        "effective_binding_count",
+        "ineffective_promoted_binding_count",
+        "provider_drift_binding_count",
+        "source_drift_binding_count",
+        "active_provider_revision",
+        "integrity_valid",
+        "effective_bindings_valid",
+        "raw_cue_terms_included",
+        "raw_source_text_included",
+        "vectors_included",
+    }
+)
+
 BINDING_STATES = frozenset(
     {"proposed", "promoted", "rejected", "revoked", "superseded"}
 )
@@ -201,6 +232,63 @@ def _is_finite_positive(value: Any) -> bool:
 
 def _is_exact_nonneg_int(value: Any) -> bool:
     return type(value) is int and value >= 0
+
+
+def validate_memora_recovery_audit(value: Any) -> dict[str, Any]:
+    """Validate the closed, content-free Memora recovery proof contract."""
+
+    if not isinstance(value, Mapping) or set(value) != MEMORA_RECOVERY_AUDIT_KEYS:
+        raise MemoraGovernanceIntegrityError(
+            "memora recovery audit contract is invalid"
+        )
+    payload = dict(value)
+    count_fields = (
+        "catalog_count",
+        "binding_projection_count",
+        "governance_event_receipt_count",
+        "source_witness_count",
+        "cue_count",
+        "promoted_binding_count",
+        "effective_binding_count",
+        "ineffective_promoted_binding_count",
+        "provider_drift_binding_count",
+        "source_drift_binding_count",
+    )
+    if (
+        payload.get("schema") != MEMORA_RECOVERY_AUDIT_SCHEMA
+        or not _is_hex64(payload.get("audit_revision"))
+        or payload.get("active_provider_revision") != "absent"
+        and not _is_hex64(payload.get("active_provider_revision"))
+        or any(not _is_exact_nonneg_int(payload.get(field)) for field in count_fields)
+        or payload.get("integrity_valid") is not True
+        or type(payload.get("effective_bindings_valid")) is not bool
+        or payload.get("raw_cue_terms_included") is not False
+        or payload.get("raw_source_text_included") is not False
+        or payload.get("vectors_included") is not False
+    ):
+        raise MemoraGovernanceIntegrityError(
+            "memora recovery audit contract is invalid"
+        )
+    promoted = int(payload["promoted_binding_count"])
+    effective = int(payload["effective_binding_count"])
+    ineffective = int(payload["ineffective_promoted_binding_count"])
+    provider_drift = int(payload["provider_drift_binding_count"])
+    source_drift = int(payload["source_drift_binding_count"])
+    if (
+        promoted > int(payload["binding_projection_count"])
+        or effective + ineffective != promoted
+        or provider_drift > ineffective
+        or source_drift > ineffective
+        or bool(payload["effective_bindings_valid"]) != (ineffective == 0)
+        or (promoted == 0) != (payload["active_provider_revision"] == "absent")
+        or int(payload["catalog_count"]) > MAX_RECOVERY_CATALOGS
+        or int(payload["binding_projection_count"]) > MAX_RECOVERY_BINDINGS
+        or int(payload["governance_event_receipt_count"]) > MAX_RECOVERY_EVENTS
+    ):
+        raise MemoraGovernanceIntegrityError(
+            "memora recovery audit counts are inconsistent"
+        )
+    return payload
 
 
 def _finite_time(value: Any, *, field: str) -> float:
@@ -1326,6 +1414,274 @@ class MemoraGovernance:
             "automatic_promotion": False,
             "events": chain,
         }
+
+    def audit_recovery_integrity(
+        self,
+        *,
+        active_provider_identity: Mapping[str, Any] | None = None,
+        expected_provider_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Audit every governed projection and receipt without exposing cues.
+
+        Recovery and readiness need an aggregate assertion, not a page of
+        individual bindings.  This walk validates every namespace catalog,
+        every cataloged projection, every event in each projection's receipt
+        chain, and the absence of orphan projections or governance receipts.
+        It returns only counts and deterministic revisions; cue terms, source
+        identifiers, source text, vectors, and event payloads never leave the
+        read transaction.
+
+        A promoted binding is considered effective only against the exact
+        active learned-provider identity supplied by the caller.  Read-only
+        downstream verifiers that deliberately do not construct the neural
+        backend may instead supply the already signed provider revision; the
+        audit then proves every promoted projection carries that exact
+        identity before evaluating its witnesses.
+        """
+
+        catalog_upper = CATALOG_KEY_PREFIX + "\uffff"
+        binding_upper = BINDING_KEY_PREFIX + "\uffff"
+        with closing(self.store._connect_read_only()) as conn:
+            with self.store._transaction(conn):
+                catalog_total = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM store_metadata
+                        WHERE key >= ? AND key < ?
+                        """,
+                        (CATALOG_KEY_PREFIX, catalog_upper),
+                    ).fetchone()[0]
+                )
+                binding_total = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM store_metadata
+                        WHERE key >= ? AND key < ?
+                        """,
+                        (BINDING_KEY_PREFIX, binding_upper),
+                    ).fetchone()[0]
+                )
+                receipt_total = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM store_maintenance_receipts
+                        WHERE operation_type LIKE ?
+                        """,
+                        (EVENT_OPERATION_PREFIX + "%",),
+                    ).fetchone()[0]
+                )
+                if (
+                    catalog_total > MAX_RECOVERY_CATALOGS
+                    or binding_total > MAX_RECOVERY_BINDINGS
+                    or receipt_total > MAX_RECOVERY_EVENTS
+                ):
+                    raise MemoraGovernanceIntegrityError(
+                        "memora recovery audit exceeds its finite bounds"
+                    )
+                catalog_rows = conn.execute(
+                    """
+                    SELECT key
+                    FROM store_metadata
+                    WHERE key >= ? AND key < ?
+                    ORDER BY key ASC
+                    LIMIT ?
+                    """,
+                    (CATALOG_KEY_PREFIX, catalog_upper, MAX_RECOVERY_CATALOGS + 1),
+                ).fetchall()
+                binding_rows = conn.execute(
+                    """
+                    SELECT key
+                    FROM store_metadata
+                    WHERE key >= ? AND key < ?
+                    ORDER BY key ASC
+                    LIMIT ?
+                    """,
+                    (BINDING_KEY_PREFIX, binding_upper, MAX_RECOVERY_BINDINGS + 1),
+                ).fetchall()
+                if len(catalog_rows) != catalog_total or len(binding_rows) != binding_total:
+                    raise MemoraGovernanceIntegrityError(
+                        "memora recovery inventory changed during audit"
+                    )
+
+                inventory: list[dict[str, Any]] = []
+                bindings: list[dict[str, Any]] = []
+                expected_binding_keys: set[str] = set()
+                seen_binding_ids: set[str] = set()
+                source_witness_count = 0
+                cue_count = 0
+                validated_event_count = 0
+                for row in catalog_rows:
+                    key = str(row["key"])
+                    context = _clean_context(key[len(CATALOG_KEY_PREFIX) :])
+                    catalog = self._validated_catalog_conn(conn, context)
+                    if catalog is None:
+                        raise MemoraGovernanceIntegrityError(
+                            "memora catalog disappeared during recovery audit"
+                        )
+                    catalog_event_count = catalog.get("event_count")
+                    if (
+                        not _is_exact_nonneg_int(catalog_event_count)
+                        or not _is_finite_positive(catalog.get("updated_at"))
+                    ):
+                        raise MemoraGovernanceIntegrityError(
+                            "memora catalog lifecycle counters are invalid"
+                        )
+                    namespace_events = 0
+                    inventory_bindings: list[dict[str, Any]] = []
+                    for entry in catalog["bindings"]:
+                        binding_id = str(entry["binding_id"])
+                        if binding_id in seen_binding_ids:
+                            raise MemoraGovernanceIntegrityError(
+                                "memora binding appears in multiple catalogs"
+                            )
+                        seen_binding_ids.add(binding_id)
+                        expected_binding_keys.add(self._binding_key(binding_id))
+                        binding = self._validated_binding_conn(conn, binding_id)
+                        self._catalog_cross_check(
+                            requested_context=context,
+                            catalog_entry=entry,
+                            binding=binding,
+                        )
+                        chain = self._binding_events_conn(conn, binding)
+                        event_count = int(binding["event_count"])
+                        if len(chain) != event_count:
+                            raise MemoraGovernanceIntegrityError(
+                                "memora receipt chain count is inconsistent"
+                            )
+                        namespace_events += event_count
+                        validated_event_count += event_count
+                        if validated_event_count > MAX_RECOVERY_EVENTS:
+                            raise MemoraGovernanceIntegrityError(
+                                "memora recovery receipt audit exceeds its bound"
+                            )
+                        source_witness_count += len(binding["sources"])
+                        cue_count += len(binding["cues"])
+                        bindings.append(binding)
+                        inventory_bindings.append(
+                            {
+                                "binding_id": binding_id,
+                                "revision": str(binding["revision"]),
+                                "state": str(binding["state"]),
+                                "event_count": event_count,
+                                "last_event_id": str(binding["last_event_id"]),
+                            }
+                        )
+                    if int(catalog_event_count) != namespace_events:
+                        raise MemoraGovernanceIntegrityError(
+                            "memora catalog event count is inconsistent"
+                        )
+                    inventory.append(
+                        {
+                            "context_id": context,
+                            "catalog_revision": str(catalog["revision"]),
+                            "bindings": inventory_bindings,
+                        }
+                    )
+
+                actual_binding_keys = {str(row["key"]) for row in binding_rows}
+                if actual_binding_keys != expected_binding_keys:
+                    raise MemoraGovernanceIntegrityError(
+                        "memora recovery audit found an orphan or missing projection"
+                    )
+                if validated_event_count != receipt_total:
+                    raise MemoraGovernanceIntegrityError(
+                        "memora recovery audit found an orphan or missing receipt"
+                    )
+
+                promoted = [
+                    binding
+                    for binding in bindings
+                    if binding.get("state") == EFFECTIVE_STATE
+                ]
+                provider_revision = "absent"
+                validated_provider: dict[str, Any] | None = None
+                if promoted:
+                    if active_provider_identity is not None:
+                        validated_provider = validate_provider_identity(
+                            active_provider_identity,
+                            source="active",
+                        )
+                        provider_revision = _digest(validated_provider)
+                        if (
+                            expected_provider_revision is not None
+                            and expected_provider_revision != provider_revision
+                        ):
+                            raise MemoraGovernanceIntegrityError(
+                                "active Memora provider revision does not match evidence"
+                            )
+                    elif not _is_hex64(expected_provider_revision):
+                        raise MemoraGovernanceIntegrityError(
+                            "promoted memora bindings require an active provider identity or signed revision"
+                        )
+                    else:
+                        provider_revision = str(expected_provider_revision)
+                elif expected_provider_revision not in (None, "absent"):
+                    raise MemoraGovernanceIntegrityError(
+                        "empty Memora governance cannot claim an active provider revision"
+                    )
+
+                effective_count = 0
+                provider_drift_count = 0
+                source_drift_count = 0
+                for binding in promoted:
+                    effective_provider = validated_provider
+                    if effective_provider is None:
+                        effective_provider = validate_provider_identity(
+                            binding.get("provider"),
+                            source="stored",
+                        )
+                        if _digest(effective_provider) != provider_revision:
+                            provider_drift_count += 1
+                            continue
+                    verdict = self.binding_effectiveness_conn(
+                        conn,
+                        binding,
+                        active_provider_identity=effective_provider,
+                    )
+                    reasons = [str(reason) for reason in verdict["reasons"]]
+                    if verdict["effective"]:
+                        effective_count += 1
+                    else:
+                        if any(reason.startswith("provider-drift:") for reason in reasons):
+                            provider_drift_count += 1
+                        if any(
+                            not reason.startswith("provider-drift:")
+                            for reason in reasons
+                        ):
+                            source_drift_count += 1
+
+        promoted_count = len(promoted)
+        ineffective_count = promoted_count - effective_count
+        return validate_memora_recovery_audit(
+            {
+                "schema": MEMORA_RECOVERY_AUDIT_SCHEMA,
+                "audit_revision": _digest(
+                    {
+                        "schema": MEMORA_RECOVERY_AUDIT_SCHEMA,
+                        "catalogs": inventory,
+                    }
+                ),
+                "catalog_count": catalog_total,
+                "binding_projection_count": binding_total,
+                "governance_event_receipt_count": receipt_total,
+                "source_witness_count": source_witness_count,
+                "cue_count": cue_count,
+                "promoted_binding_count": promoted_count,
+                "effective_binding_count": effective_count,
+                "ineffective_promoted_binding_count": ineffective_count,
+                "provider_drift_binding_count": provider_drift_count,
+                "source_drift_binding_count": source_drift_count,
+                "active_provider_revision": provider_revision,
+                "integrity_valid": True,
+                "effective_bindings_valid": ineffective_count == 0,
+                "raw_cue_terms_included": False,
+                "raw_source_text_included": False,
+                "vectors_included": False,
+            }
+        )
 
     def _insert_event(
         self,

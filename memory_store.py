@@ -1529,6 +1529,7 @@ class DurableMemoryStore:
         self._initializing_authority_store = True
         self._database_created_for_initialization = False
         self._claimed_core_authority_marker_sha256: str | None = None
+        self._immutable_read_only = False
         self._ensure_directory(self.db_path.parent, owned=False)
         self._owns_authority_lease = authority_lease is None
         self._authority_lease = authority_lease or CoreAuthorityLease.acquire_local(
@@ -1549,6 +1550,8 @@ class DurableMemoryStore:
     def open_existing_for_audit(
         cls,
         db_path: str | os.PathLike[str] | None = None,
+        *,
+        immutable: bool = False,
     ) -> "DurableMemoryStore":
         """Open an existing store without schema creation, migration, or chmod writes."""
 
@@ -1559,6 +1562,7 @@ class DurableMemoryStore:
         store._initializing_authority_store = False
         store._database_created_for_initialization = False
         store._claimed_core_authority_marker_sha256 = None
+        store._immutable_read_only = bool(immutable)
         store._authority_lease = None
         store._owns_authority_lease = False
         if not store.db_path.is_file():
@@ -1599,6 +1603,7 @@ class DurableMemoryStore:
         store._initializing_authority_store = False
         store._database_created_for_initialization = False
         store._claimed_core_authority_marker_sha256 = None
+        store._immutable_read_only = False
         store._authority_lease = authority_lease
         store._owns_authority_lease = False
         if not store.db_path.is_file():
@@ -3522,7 +3527,10 @@ class DurableMemoryStore:
                 f"SYNAPSE-S2 memory store does not exist: {self.db_path}"
             )
         self._assert_private_database_identity()
-        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        immutable = bool(getattr(self, "_immutable_read_only", False))
+        uri = self.db_path.resolve().as_uri() + (
+            "?mode=ro&immutable=1" if immutable else "?mode=ro"
+        )
         conn = sqlite3.connect(
             uri,
             timeout=10.0,

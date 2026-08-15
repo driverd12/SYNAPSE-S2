@@ -612,7 +612,7 @@ else:
         ), mock.patch(
             "recovery_manager.VerifiedRecoveryManager",
             return_value=manager,
-        ), mock.patch.object(
+        ) as recovery_factory, mock.patch.object(
             installer,
             "publish_replacement_admission",
             return_value=admission,
@@ -668,6 +668,9 @@ else:
         self.assertEqual(result["backup_inspection_timeout_seconds"], 600.0)
         self.assertFalse(
             installer.default_binding_path(self.home).exists()
+        )
+        self.assertIsNone(
+            recovery_factory.call_args.kwargs["memora_provider_identity"]
         )
         publisher.assert_called_once()
         self.assertEqual(
@@ -938,6 +941,54 @@ else:
         )
         self.assertEqual(result["drained_pending_file_count"], 4)
         self.assertEqual(result["drained_late_arrival_file_count"], 1)
+
+    def test_replacement_memora_identity_uses_exact_closed_neural_config(self) -> None:
+        environment = {
+            "SYNAPSE_S2_DIMENSION": "8",
+            "SYNAPSE_S2_NEURONS": "16",
+            "SYNAPSE_S2_TOP_K": "4",
+            "SYNAPSE_S2_CORE_REQUIRE_NATIVE": "false",
+            "SYNAPSE_S2_EMBEDDING_PROVIDER": "mlx-neural",
+            "SYNAPSE_S2_NEURAL_MODEL": "unit-test/model",
+            "SYNAPSE_S2_NEURAL_REVISION": "1" * 40,
+            "SYNAPSE_S2_NEURAL_POOLING": "mean",
+            "SYNAPSE_S2_NEURAL_MAX_TOKENS": "128",
+            "SYNAPSE_S2_NEURAL_NORMALIZE": "true",
+            "SYNAPSE_S2_NEURAL_LOCAL_FILES_ONLY": "true",
+            "SYNAPSE_S2_TRANSCRIPT_POLL": "false",
+            "MLX_DEVICE": "cpu",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = installer.build_config(self.paths)
+
+        provider = mock.Mock()
+        provider.embed.return_value = mock.Mock(vector=[0.0] * 8)
+        provider.info.return_value = {
+            "provider": "mlx-neural-v1",
+            "provider_type": "mlx-neural",
+            "model_id": "unit-test/model",
+            "revision": "1" * 40,
+            "configuration_sha256": "f" * 64,
+            "dimensions": 8,
+            "semantic": True,
+            "local_only": True,
+            "ready": True,
+        }
+        with mock.patch(
+            "embedding_providers.resolve_embedding_provider_config",
+            return_value=provider,
+        ) as resolver:
+            identity = installer._memora_provider_identity_for_config(config)
+
+        self.assertIsNotNone(identity)
+        self.assertTrue(identity["learned"])
+        self.assertEqual(identity["dimensions"], config.dimension)
+        resolver.assert_called_once()
+        provider.embed.assert_called_once_with(
+            "synapse-s2 replacement memora provider readiness",
+            dimensions=8,
+        )
+        provider.info.assert_called_once_with(dimensions=config.dimension)
 
     def test_stage_replacement_refuses_unreviewed_or_enabled_service(self) -> None:
         with self.assertRaisesRegex(installer.CoreInstallerError, "--confirm"):
@@ -4197,6 +4248,29 @@ else:
 
 class CoreCutoverPreflightTests(unittest.TestCase):
     @staticmethod
+    def _memora_audit() -> dict[str, object]:
+        return {
+            "schema": "synapse-s2.memora-recovery-audit.v1",
+            "audit_revision": "3" * 64,
+            "catalog_count": 0,
+            "binding_projection_count": 0,
+            "governance_event_receipt_count": 0,
+            "source_witness_count": 0,
+            "cue_count": 0,
+            "promoted_binding_count": 0,
+            "effective_binding_count": 0,
+            "ineffective_promoted_binding_count": 0,
+            "provider_drift_binding_count": 0,
+            "source_drift_binding_count": 0,
+            "active_provider_revision": "absent",
+            "integrity_valid": True,
+            "effective_bindings_valid": True,
+            "raw_cue_terms_included": False,
+            "raw_source_text_included": False,
+            "vectors_included": False,
+        }
+
+    @staticmethod
     def _core_config(root: Path, *, memory_path: Path | None = None) -> installer.CoreConfig:
         selected_memory = memory_path or (root / "memory.sqlite3")
         return installer.CoreConfig(
@@ -4679,6 +4753,7 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                 else 0
             ),
             "media_reference_count": verified["media_reference_count"],
+            "memora_integrity": dict(verified["memora_integrity"]),
         }
         recovery_checks = [
             {
@@ -4781,6 +4856,7 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                 "media_manifest_sha256": None,
                 "media_object_count": 0,
                 "media_reference_count": 0,
+                "memora_integrity": self._memora_audit(),
                 "runtime_state_required": False,
                 "runtime_state_present": False,
                 "runtime_state_canonical_sha256": None,
@@ -4812,6 +4888,40 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                     ),
                     valid["receipt_digest"],
                 )
+                memora_contract_mutations = []
+                omitted_memora = dict(content)
+                omitted_memora.pop("memora_integrity")
+                memora_contract_mutations.append(omitted_memora)
+                memora_contract_mutations.append(
+                    {
+                        **content,
+                        "schema": "synapse-s2.core-cutover-attestation.v2",
+                    }
+                )
+                memora_contract_mutations.append(
+                    {
+                        **content,
+                        "memora_integrity": {
+                            **content["memora_integrity"],
+                            "audit_revision": "0" * 64,
+                        },
+                    }
+                )
+                for changed_content in memora_contract_mutations:
+                    store._authenticate_receipt(changed_content)
+                    with self.subTest(
+                        memora_schema=changed_content.get("schema"),
+                        memora_present="memora_integrity" in changed_content,
+                    ):
+                        with self.assertRaises(
+                            preflight.CutoverPreflightError
+                        ):
+                            preflight._validate_cutover_attestation(
+                                changed_content,
+                                store=store,
+                                expected_content=content,
+                                now_unix_ms=now,
+                            )
                 for overrides, message in (
                     ({"build_id": "3" * 64}, "values"),
                     (
@@ -4919,6 +5029,7 @@ class CoreCutoverPreflightTests(unittest.TestCase):
                 "media_manifest_sha256": None,
                 "media_object_count": 0,
                 "media_reference_count": 0,
+                "memora_integrity": self._memora_audit(),
                 "runtime_state_required": False,
                 "runtime_state_present": False,
                 "runtime_state_canonical_sha256": None,
@@ -5565,6 +5676,7 @@ raise SystemExit(3)
                         "media_included": False,
                         "media_recovery_complete": True,
                         "media_reference_count": 0,
+                        "memora_integrity": self._memora_audit(),
                         "media": None,
                         "capture_ledger_binding": {"verified": True},
                         "reconciliation": {
@@ -5595,6 +5707,7 @@ raise SystemExit(3)
                         "media_included": False,
                         "media_recovery_complete": True,
                         "media_reference_count": 0,
+                        "memora_integrity": self._memora_audit(),
                         "media_sha256": None,
                         "media_manifest_sha256": None,
                         "media_object_count": None,
@@ -5634,6 +5747,7 @@ raise SystemExit(3)
                 "media_manifest_sha256": None,
                 "media_object_count": 0,
                 "media_reference_count": 0,
+                "memora_integrity": self._memora_audit(),
             }
             recovery_checks = []
             for check_id in ("recovery_backup", "recovery_verify", "recovery_restore"):

@@ -53,6 +53,7 @@ from scripts.operator_readiness_certify import (
     sanitize_evidence_text,
     write_private_text,
     _guarded_media_recovery_contract,
+    _guarded_memora_recovery_contract,
 )
 
 
@@ -67,6 +68,29 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
         )
         self._default_binding_patch.start()
         self.addCleanup(self._default_binding_patch.stop)
+
+    @staticmethod
+    def _memora_audit(*, promoted: int = 0) -> dict[str, object]:
+        return {
+            "schema": "synapse-s2.memora-recovery-audit.v1",
+            "audit_revision": "9" * 64,
+            "catalog_count": promoted,
+            "binding_projection_count": promoted,
+            "governance_event_receipt_count": promoted * 2,
+            "source_witness_count": promoted * 4,
+            "cue_count": promoted * 2,
+            "promoted_binding_count": promoted,
+            "effective_binding_count": promoted,
+            "ineffective_promoted_binding_count": 0,
+            "provider_drift_binding_count": 0,
+            "source_drift_binding_count": 0,
+            "active_provider_revision": "8" * 64 if promoted else "absent",
+            "integrity_valid": True,
+            "effective_bindings_valid": True,
+            "raw_cue_terms_included": False,
+            "raw_source_text_included": False,
+            "vectors_included": False,
+        }
 
     @staticmethod
     def _set_canonical_contract_size(structured):
@@ -360,6 +384,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
             "repairable_capture_count": 0,
             "blocked_capture_count": 0,
         }
+        memora = OperatorReadinessCertifierTests._memora_audit(promoted=1)
         recovery_proof_path.write_text(
             json.dumps(
                 {
@@ -381,6 +406,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                     "media_sha256": None,
                     "media_manifest_sha256": None,
                     "media_object_count": 0,
+                    "memora_integrity": memora,
                 },
                 indent=2,
                 sort_keys=True,
@@ -408,6 +434,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 "media_manifest_sha256": None,
                 "media_object_count": 0,
                 "media_reconciliation": {"referenced_count": 0},
+                "memora_integrity": memora,
             },
             "verification": {
                 "verified": True,
@@ -422,6 +449,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 "media_recovery_complete": True,
                 "media_reference_count": 0,
                 "media": None,
+                "memora_integrity": memora,
             },
             "restore": {
                 "verified": True,
@@ -434,6 +462,7 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 "media_recovery_complete": True,
                 "media_reference_count": 0,
                 "media_object_count": 0,
+                "memora_integrity": memora,
                 "recovery_proof_path": str(recovery_proof_path),
             },
         }
@@ -586,6 +615,37 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                 verification=phases[1],
                 restore=phases[2],
                 proof=phases[3],
+            )
+            self.assertFalse(ready)
+
+    def test_memora_recovery_contract_requires_exact_ready_cross_phase_audit(self):
+        audit = self._memora_audit(promoted=1)
+        phases = [{"memora_integrity": copy.deepcopy(audit)} for _ in range(4)]
+        ready, metrics = _guarded_memora_recovery_contract(
+            bundle=phases[0],
+            verification=phases[1],
+            restore=phases[2],
+            proof=phases[3],
+        )
+        self.assertTrue(ready)
+        self.assertEqual(metrics, audit)
+
+        for mutate in (
+            lambda rows: rows[0].pop("memora_integrity"),
+            lambda rows: rows[2]["memora_integrity"].__setitem__(
+                "audit_revision", "7" * 64
+            ),
+            lambda rows: rows[3]["memora_integrity"].__setitem__(
+                "provider_drift_binding_count", 1
+            ),
+        ):
+            changed = copy.deepcopy(phases)
+            mutate(changed)
+            ready, _metrics = _guarded_memora_recovery_contract(
+                bundle=changed[0],
+                verification=changed[1],
+                restore=changed[2],
+                proof=changed[3],
             )
             self.assertFalse(ready)
 

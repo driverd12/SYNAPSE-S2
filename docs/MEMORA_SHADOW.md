@@ -1,9 +1,11 @@
-# Memora Shadow v1
+# Memora Shadow and governed cue bindings
 
-Memora Shadow is a bounded, deterministic, **shadow-only** consolidation
-planner inspired by the Memora paper's abstraction/cue/consolidation ideas.
-It proposes clusters of related durable memories and candidate cue bindings
-for **manual review only**. Schema: `synapse-s2.memora-shadow.v1`.
+Memora Shadow remains a bounded, deterministic proposal planner inspired by
+the Memora paper's abstraction/cue/consolidation ideas. Its plan is read-only,
+but reviewed learned proposals now have a separate governed lifecycle:
+propose, independently review and promote, audit, revoke, or supersede. A
+valid promoted binding contributes bounded cue routing to Retrieval v2 without
+rewriting its source memories. Planner schema: `synapse-s2.memora-shadow.v1`.
 
 ## What it is, honestly
 
@@ -14,11 +16,12 @@ for **manual review only**. Schema: `synapse-s2.memora-shadow.v1`.
   **not** automatic promotion. With the deterministic `semantic-hash`
   fallback provider the plan reports `learned: false` and its clusters are
   hash projections, not learned semantics.
-- **Nothing is applied.** Every response carries `mode: "shadow"`,
+- **A plan never applies itself.** Every planner response carries `mode: "shadow"`,
   `applied: false`, and `retrieval_effect: false`, and the token-contract
-  projector refuses to serialize a payload that claims otherwise. No plan
-  output is persisted anywhere; retrieval results are byte-identical with
-  or without a shadow plan having run.
+  projector refuses to serialize a payload that claims otherwise. Running a
+  plan alone persists nothing and changes no retrieval result. Only a distinct
+  governed proposal followed by an explicit, confirmed promotion can affect
+  routing.
 - **Source rows stay immutable and independently deletable.** The planner
   only reads existing rows; it never rewrites, merges, or links them.
   Deleting any source memory simply removes it from future snapshots.
@@ -63,7 +66,7 @@ every excluded entry with a reason, and for each cluster the medoid, member
 memory ids, cosine similarity statistics, and all contributing source ids
 (the content-addressed `s2_…` stable memory ids).
 
-## Surfaces (all read-only)
+## Planner surfaces (all read-only)
 
 - Core operation `memora_shadow_plan` (`retry_safe`, non-mutating, never
   journaled) plus `CoreClient.memora_shadow_plan(...)`.
@@ -75,8 +78,52 @@ memory ids, cosine similarity statistics, and all contributing source ids
 - Dashboard `GET /api/memora-shadow` and the small footer "Shadow" drawer,
   which render proposals with the same never-applied caveat.
 
-## Promotion path
+## Governed lifecycle
 
-There is none, deliberately. A human reads the proposals and, if convinced,
-acts through the existing governed write surfaces. Nothing in Memora Shadow
-can apply, persist, or schedule its own output.
+`memora-propose` recomputes the reviewed plan server-side and persists only a
+bounded projection: source lifecycle witnesses and short redacted cue terms
+marked `untrusted-derived-routing-evidence`. It stores no source text, vectors,
+content digest, signature, or public equality oracle. Promotion requires an
+exact binding revision, `--confirm`, an independently named reviewer, and the
+same ready pinned local neural provider identity. There is no automatic
+promotion.
+
+```bash
+.venv/bin/python synapse_cli.py --json memora-propose \
+  --context default \
+  --plan-digest '<reviewed plan_digest>' \
+  --cluster-ordinal 0 \
+  --reason 'reviewed cue proposal'
+
+.venv/bin/python synapse_cli.py --json memora-promote \
+  --binding-id '<binding_id>' \
+  --expected-revision '<revision>' \
+  --reviewed-by '<independent reviewer>' \
+  --reason 'approved bounded routing cue' \
+  --confirm
+```
+
+List/get/history/audit surfaces are bounded and integrity-checked. Reject,
+revoke, and supersede use exact revision compare-and-swap. Every lifecycle
+transition is written with its catalog projection and append-only governance
+receipt in one SQLite transaction. Retrieval revalidates the catalog,
+projection, last receipt, provider identity, and every source witness; any
+drift makes the binding ineffective without deleting its sources.
+
+## Recovery, replication, and readiness
+
+Recovery bundle v3 signs a content-free `memora_integrity` aggregate covering
+every catalog, binding projection, and governance-event receipt. It records
+only revisions and counts, including effective/promoted/provider-drift/source-
+drift totals; raw cue terms, source text, and vectors are explicitly absent.
+The aggregate is recomputed from the immutable backup, the isolated restore,
+and each replication-stage replay. Any omission, tamper, broken chain, provider
+drift, or source drift blocks recovery readiness. Legacy v1/v2 bundles remain
+inspectable and restorable, but are cutover-ready only when immutable inspection
+proves they contain zero Memora catalogs, projections, and receipts.
+
+Operator readiness, cutover attestation v3, and replacement admission v5 bind
+the exact same aggregate. Neural replacement staging performs a bounded local
+provider readiness check from the closed CoreConfig before it can publish a
+recovery point. The staged replica remains isolated; this proof does not grant
+replication permission to overwrite live memory.

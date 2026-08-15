@@ -23,6 +23,29 @@ from operator_readiness_contract import (
 
 class CoreCutoverPreflightFiniteTests(unittest.TestCase):
     @staticmethod
+    def _memora_audit(*, promoted: int = 0) -> dict[str, object]:
+        return {
+            "schema": "synapse-s2.memora-recovery-audit.v1",
+            "audit_revision": "9" * 64,
+            "catalog_count": promoted,
+            "binding_projection_count": promoted,
+            "governance_event_receipt_count": promoted * 2,
+            "source_witness_count": promoted * 4,
+            "cue_count": promoted * 2,
+            "promoted_binding_count": promoted,
+            "effective_binding_count": promoted,
+            "ineffective_promoted_binding_count": 0,
+            "provider_drift_binding_count": 0,
+            "source_drift_binding_count": 0,
+            "active_provider_revision": "8" * 64 if promoted else "absent",
+            "integrity_valid": True,
+            "effective_bindings_valid": True,
+            "raw_cue_terms_included": False,
+            "raw_source_text_included": False,
+            "vectors_included": False,
+        }
+
+    @staticmethod
     def _media_summary(*, bundle_schema: str, restore_schema: str, references: int = 0):
         included = references > 0
         return {
@@ -142,6 +165,27 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                     restore_proof=changed,
                 )
 
+    def test_memora_summary_rejects_omission_tamper_and_provider_drift(self) -> None:
+        audit = self._memora_audit(promoted=1)
+        self.assertEqual(
+            preflight._validate_memora_recovery_summary(audit),
+            audit,
+        )
+        invalid = (
+            None,
+            {key: value for key, value in audit.items() if key != "audit_revision"},
+            {
+                **audit,
+                "effective_binding_count": 0,
+                "ineffective_promoted_binding_count": 1,
+                "provider_drift_binding_count": 1,
+                "effective_bindings_valid": False,
+            },
+        )
+        for value in invalid:
+            with self.assertRaises(preflight.CutoverPreflightError):
+                preflight._validate_memora_recovery_summary(value)
+
     def test_cli_rejects_non_finite_maximum_evidence_age_with_json_failure(self) -> None:
         for value in ("nan", "inf", "-inf"):
             with self.subTest(value=value):
@@ -253,6 +297,7 @@ class CoreCutoverPreflightFiniteTests(unittest.TestCase):
                 "media_manifest_sha256": None,
                 "media_object_count": 0,
                 "media_reference_count": 0,
+                "memora_integrity": self._memora_audit(),
             }
             recovery_checks = {
                 check_id: {

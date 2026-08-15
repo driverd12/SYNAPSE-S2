@@ -13,7 +13,7 @@ import time
 import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from image_capture import (
     ImageCaptureError,
@@ -80,11 +80,17 @@ class ReplicationManager:
         store: DurableMemoryStore,
         *,
         recovery_manager: VerifiedRecoveryManager | None = None,
+        memora_provider_identity: Mapping[str, Any] | None = None,
     ) -> None:
+        if recovery_manager is not None and memora_provider_identity is not None:
+            raise ValueError(
+                "memora provider identity belongs to the default recovery manager"
+            )
         self.store = store
         self.recovery = recovery_manager or VerifiedRecoveryManager(
             store,
             capture_root=store.db_path.parent,
+            memora_provider_identity=memora_provider_identity,
         )
         if self.recovery.store is not store:
             raise ValueError("replication and recovery managers must share one memory store")
@@ -1667,6 +1673,9 @@ class ReplicationManager:
             or proof.get("request_journal_binding_verified") is not True
             or proof.get("runtime_state_required") is not True
             or proof.get("runtime_state_present") is not True
+            or not self.recovery._memora_recovery_ready(
+                proof.get("memora_integrity")
+            )
             or not isinstance(proof.get("capture_ledger_binding"), dict)
             or proof["capture_ledger_binding"].get("revision")
             != checkpoint["capture_ledger_revision"]
@@ -1754,6 +1763,20 @@ class ReplicationManager:
                 )
             memory_path = restore_root / "memory.sqlite3"
             self._private_regular_metadata(memory_path)
+            proof_memora = proof.get("memora_integrity")
+            current_memora = self.recovery._audit_memora_database(
+                memory_path,
+                expected_provider_revision=str(
+                    (proof_memora or {}).get("active_provider_revision") or ""
+                ),
+            )
+            if (
+                current_memora != proof.get("memora_integrity")
+                or current_memora != verified_bundle.get("memora_integrity")
+            ):
+                raise ReplicationProtocolError(
+                    "current restored Memora governance is not bound to the checkpoint"
+                )
             uri = memory_path.resolve().as_uri() + "?mode=ro&immutable=1"
             with closing(sqlite3.connect(uri, uri=True)) as conn:
                 ledger_bindings = self.recovery._snapshot_capture_ledger_bindings(conn)
@@ -2244,6 +2267,7 @@ class ReplicationManager:
             "restore_root": str(restore_root),
             "ack_path": str(ack_path),
             "ack_digest": str(ack["receipt_digest"]),
+            "memora_integrity": dict(proof["memora_integrity"]),
             "memory_recovery_cutover_ready": True,
             "replication_promotion_ready": False,
             "promotion_supported": False,
@@ -2446,6 +2470,7 @@ class ReplicationManager:
                     "restore_root": str(restore_root),
                     "ack_path": str(ack_path),
                     "ack_digest": str(ack["receipt_digest"]),
+                    "memora_integrity": dict(proof["memora_integrity"]),
                     "memory_recovery_cutover_ready": True,
                     "replication_promotion_ready": False,
                     "promotion_supported": False,

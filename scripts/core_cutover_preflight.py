@@ -46,6 +46,7 @@ from memory_store import (  # noqa: E402
     DurableMemoryStore,
     media_references_from_connection,
 )
+from memora_governance import validate_memora_recovery_audit  # noqa: E402
 from core_authority import (  # noqa: E402
     CORE_AUTHORITY_INSTANCE_RE,
     CORE_AUTHORITY_LOCK_GENERATION_RE,
@@ -122,8 +123,8 @@ _MEDIA_RECOVERY_METRIC_KEYS = (
     "media_object_count",
     "media_reference_count",
 )
-CUTOVER_ATTESTATION_SCHEMA = "synapse-s2.core-cutover-attestation.v2"
-CUTOVER_VERIFICATION_SCHEMA = "synapse-s2.core-cutover-verification.v2"
+CUTOVER_ATTESTATION_SCHEMA = "synapse-s2.core-cutover-attestation.v3"
+CUTOVER_VERIFICATION_SCHEMA = "synapse-s2.core-cutover-verification.v3"
 CUTOVER_ATTESTATION_NAME = "cutover-attestation.json"
 CUTOVER_ATTESTATION_PRESERVATION_SCHEMA = (
     "synapse-s2.core-cutover-attestation-preservation.v1"
@@ -134,9 +135,9 @@ CUTOVER_ATTESTATION_MAX_TTL_SECONDS = 600.0
 # 150-second preclaim floor; an attestation produced at the exact consumer
 # boundary would already be ineligible by the time the service reads it.
 CUTOVER_ATTESTATION_MIN_VALIDITY_SECONDS = 180.0
-REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v4"
+REPLACEMENT_ADMISSION_SCHEMA = "synapse-s2.replacement-admission.v5"
 REPLACEMENT_ADMISSION_VERIFICATION_SCHEMA = (
-    "synapse-s2.replacement-admission-verification.v4"
+    "synapse-s2.replacement-admission-verification.v5"
 )
 REPLACEMENT_ADMISSION_NAME = "replacement-admission.json"
 REPLACEMENT_ADMISSION_MAX_BYTES = 64 * 1024
@@ -187,6 +188,7 @@ _CUTOVER_ATTESTATION_CONTENT_KEYS = {
     "media_manifest_sha256",
     "media_object_count",
     "media_reference_count",
+    "memora_integrity",
     "runtime_state_required",
     "runtime_state_present",
     "runtime_state_canonical_sha256",
@@ -231,6 +233,7 @@ _REPLACEMENT_ADMISSION_CONTENT_KEYS = {
     "media_manifest_sha256",
     "media_object_count",
     "media_reference_count",
+    "memora_integrity",
     "recovery_pending_file_count",
     "recovery_replay_required_file_count",
     "recovery_replay_required_capture_count",
@@ -1039,6 +1042,7 @@ def _validate_cutover_attestation(
     ):
         raise CutoverPreflightError("cutover attestation values are invalid")
     _validate_media_recovery_summary(_media_recovery_content(payload))
+    _validate_memora_recovery_summary(payload.get("memora_integrity"))
     _normal_absolute(
         str(payload.get("evidence_manifest_path") or ""),
         name="attested evidence manifest",
@@ -1433,6 +1437,7 @@ def _validate_replacement_inspection(
         raise CutoverPreflightError(
             "verified recovery does not match the replacement predecessor"
         )
+    _validate_memora_recovery_summary(recovery.get("memora_integrity"))
     return {
         "predecessor_marker_sha256": marker_sha256,
         "predecessor_marker_schema_version": int(marker["schema_version"]),
@@ -1850,6 +1855,9 @@ def _replacement_admission_content(
         ),
         "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
         **_media_recovery_content(recovery),
+        "memora_integrity": _validate_memora_recovery_summary(
+            recovery.get("memora_integrity")
+        ),
         "recovery_pending_file_count": recovery.get(
             "recovery_pending_file_count"
         ),
@@ -2125,6 +2133,7 @@ def _validate_replacement_admission(
     ):
         raise CutoverPreflightError("replacement admission values are invalid")
     _validate_media_recovery_summary(_media_recovery_content(payload))
+    _validate_memora_recovery_summary(payload.get("memora_integrity"))
     lock_generation = _replacement_lock_generation_binding(
         predecessor_lock_generation_id=payload.get(
             "predecessor_lock_generation_id"
@@ -2244,6 +2253,9 @@ def publish_cutover_attestation(
         ),
         "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
         **_media_recovery_content(recovery),
+        "memora_integrity": _validate_memora_recovery_summary(
+            recovery.get("memora_integrity")
+        ),
         "runtime_state_required": recovery.get("runtime_state_required"),
         "runtime_state_present": recovery.get("runtime_state_present"),
         "runtime_state_canonical_sha256": recovery.get(
@@ -2464,6 +2476,9 @@ def verify_cutover_attestation_for_core(
         ),
         "capture_manifest_sha256": recovery.get("capture_manifest_sha256"),
         **_media_recovery_content(recovery),
+        "memora_integrity": _validate_memora_recovery_summary(
+            recovery.get("memora_integrity")
+        ),
         "runtime_state_required": recovery.get("runtime_state_required"),
         "runtime_state_present": recovery.get("runtime_state_present"),
         "runtime_state_canonical_sha256": recovery.get(
@@ -2529,6 +2544,9 @@ def verify_cutover_attestation_for_core(
         ],
         "capture_manifest_sha256": recovery["capture_manifest_sha256"],
         **_media_recovery_content(recovery),
+        "memora_integrity": _validate_memora_recovery_summary(
+            recovery.get("memora_integrity")
+        ),
         "runtime_state_required": recovery["runtime_state_required"],
         "runtime_state_present": recovery["runtime_state_present"],
         "runtime_state_canonical_sha256": recovery[
@@ -3673,6 +3691,25 @@ def _media_recovery_content(recovery: Mapping[str, Any]) -> dict[str, Any]:
     return {key: recovery.get(key) for key in _MEDIA_RECOVERY_METRIC_KEYS}
 
 
+def _validate_memora_recovery_summary(value: Any) -> dict[str, Any]:
+    try:
+        audit = validate_memora_recovery_audit(value)
+    except Exception as exc:
+        raise CutoverPreflightError(
+            "recovery Memora integrity evidence is incomplete"
+        ) from exc
+    if (
+        audit["integrity_valid"] is not True
+        or audit["effective_bindings_valid"] is not True
+        or int(audit["provider_drift_binding_count"]) != 0
+        or int(audit["source_drift_binding_count"]) != 0
+    ):
+        raise CutoverPreflightError(
+            "recovery Memora integrity evidence is not ready"
+        )
+    return audit
+
+
 def _validate_recovery_metrics(
     check: Mapping[str, Any],
     *,
@@ -3692,6 +3729,7 @@ def _validate_recovery_metrics(
         metrics.get("reconciliation"),
         name="recovery reconciliation",
     )
+    _validate_memora_recovery_summary(metrics.get("memora_integrity"))
     return _validate_media_recovery_summary(
         {key: metrics.get(key) for key in _MEDIA_RECOVERY_METRIC_KEYS}
     )
@@ -3984,6 +4022,25 @@ def validate_evidence_contract(
         raise CutoverPreflightError(
             "operator-readiness recovery media evidence is not cross-bound"
         )
+    backup_memora = _validate_memora_recovery_summary(
+        backup.get("metrics", {}).get("memora_integrity")
+        if isinstance(backup.get("metrics"), dict)
+        else None
+    )
+    verify_memora = _validate_memora_recovery_summary(
+        verify.get("metrics", {}).get("memora_integrity")
+        if isinstance(verify.get("metrics"), dict)
+        else None
+    )
+    restore_memora = _validate_memora_recovery_summary(
+        restore.get("metrics", {}).get("memora_integrity")
+        if isinstance(restore.get("metrics"), dict)
+        else None
+    )
+    if backup_memora != verify_memora or backup_memora != restore_memora:
+        raise CutoverPreflightError(
+            "operator-readiness Memora evidence is not cross-bound"
+        )
     verify_metrics = verify.get("metrics")
     if not isinstance(verify_metrics, dict) or verify_metrics.get("verified") is not True:
         raise CutoverPreflightError("signed recovery verification is not ready")
@@ -4036,6 +4093,17 @@ def validate_evidence_contract(
         parsed=parsed,
         restore_proof=restore_proof,
     )
+    if (
+        _validate_memora_recovery_summary(parsed.get("memora_integrity"))
+        != backup_memora
+        or _validate_memora_recovery_summary(
+            restore_proof.get("memora_integrity")
+        )
+        != backup_memora
+    ):
+        raise CutoverPreflightError(
+            "verified recovery Memora evidence does not match isolated restore"
+        )
     restore_binding = restore_proof.get("capture_ledger_binding")
     if (
         restore_proof.get("mode") != "isolated-recovery-proof"
@@ -4500,6 +4568,31 @@ def verify_recovery_binding(
             )
         inspection = _inspect_database_contract_wal_aware(store)
         live_database = store.recompute_logical_snapshot_digest()
+        expected_memora = _validate_memora_recovery_summary(
+            parsed.get("memora_integrity")
+        )
+        live_memora = manager._audit_memora_database(
+            memory_db,
+            expected_provider_revision=str(
+                expected_memora["active_provider_revision"]
+            ),
+        )
+        memora_receipt_bound = (
+            receipt.get("memora_integrity") == expected_memora
+            if bundle_schema == RECOVERY_BUNDLE_SCHEMA
+            else (
+                "memora_integrity" not in receipt
+                and manager._legacy_memora_absent(expected_memora)
+            )
+        )
+        if (
+            live_memora != expected_memora
+            or restore_proof.get("memora_integrity") != expected_memora
+            or not memora_receipt_bound
+        ):
+            raise CutoverPreflightError(
+                "verified recovery Memora integrity is stale or not cross-bound"
+            )
         live_authority = inspection.get("authority_binding")
         if (
             not inspection.get("restore_eligible")
@@ -4972,6 +5065,7 @@ def verify_recovery_binding(
             "database_logical_snapshot_sha256": str(live_database["sha256"]),
             "capture_manifest_sha256": str(live_capture["manifest_sha256"]),
             **media_summary,
+            "memora_integrity": expected_memora,
             "runtime_state_required": runtime_required,
             "runtime_state_present": bool(live_runtime["present"]),
             "runtime_state_canonical_sha256": runtime_canonical_sha256,

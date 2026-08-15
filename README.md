@@ -460,7 +460,14 @@ exactly-once capture transport and expose signed replay reconciliation plus a
 separate `cutover_ready` decision. Verification re-canonicalizes every archived
 processed v2 request against the snapshot ledger and returns a content-free
 `capture_ledger_binding` count/revision proof; an isolated restore derives the
-same proof again from the restored files and database. `backup-memory` is retained as a segregated
+same proof again from the restored files and database. Recovery bundle v3 also
+signs a content-free `memora_integrity` aggregate over every governed cue
+catalog, projection, and lifecycle receipt. Verification, isolated restore,
+replication staging, and replay recompute that exact aggregate and require all
+promoted bindings to remain effective under the bound learned-provider identity;
+raw cue terms, source text, and vectors never enter the proof. Legacy v1/v2
+bundles remain inspectable and restorable, but cannot be cutover-ready unless an
+immutable audit proves they contain zero Memora governance state. `backup-memory` is retained as a segregated
 database-only diagnostic; it is not sufficient for recovery.
 
 Before creating a paired recovery point, prove that every processed
@@ -827,7 +834,12 @@ The MCP server exposes these tools:
 | `list_spiking_app_connections` | List App Connect attachments. |
 | `capture_spiking_app_snapshot` | Capture a confirmed redacted local app Accessibility snapshot into memory. |
 | `list_spiking_memory_graph` | List compact memory nodes and relationship edges with endpoint resolution, provenance, completeness, and omission metadata. |
-| `plan_spiking_memora_shadow` | Propose shadow-only Memora consolidation clusters and cue bindings for one namespace via pretrained embedding inference; read-only, never applied, never persisted, retrieval unchanged. See [docs/MEMORA_SHADOW.md](docs/MEMORA_SHADOW.md). |
+| `plan_spiking_memora_shadow` | Compute a read-only Memora proposal for one namespace. The plan is never applied or persisted by this call; only the separate governed lifecycle can affect routing. See [docs/MEMORA_SHADOW.md](docs/MEMORA_SHADOW.md). |
+| `list_spiking_memora_bindings` | List bounded integrity-checked governed cue-binding state; read-only. |
+| `get_spiking_memora_binding` | Read one governed binding projection after catalog and receipt cross-checks; read-only. |
+| `propose_spiking_memora_binding` | Recompute an exact learned shadow plan server-side and persist one isolated proposal; it does not affect retrieval until a separate confirmed CLI/Core promotion. |
+| `list_spiking_memora_binding_history` | Walk the bounded append-only lifecycle receipt chain for one binding; read-only. |
+| `audit_spiking_memora_binding` | Fail-closed integrity audit of a binding projection, catalog entry, and complete lifecycle chain; read-only. |
 | `list_spiking_namespace_map` | List the bounded namespace catalog, active governed links, pending proposals, and read-only bridge suggestions for the Neural Galaxy. |
 | `propose_spiking_namespace_link` | Create an isolated pending bridge proposal with evidence and expiry; it does not expand recall. |
 | `reject_spiking_namespace_link` | CAS-reject the exact pending proposal revision; the MCP surface cannot approve a bridge or expand recall. |

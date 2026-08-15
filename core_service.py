@@ -37,6 +37,7 @@ from memora_governance import (
     MemoraGovernanceError,
     MemoraGovernanceIntegrityError,
 )
+from memora_shadow import provider_identity as memora_provider_identity
 from core_protocol import (
     CORE_CONFIG_VERSION,
     DEFAULT_MAX_FRAME_BYTES,
@@ -4442,9 +4443,17 @@ class AuthoritativeCoreService:
                     from recovery_manager import VerifiedRecoveryManager
                     from replication_manager import ReplicationManager
 
+                    provider = memora_provider_identity(
+                        self._backend._embedding_provider_info_for_dimensions(
+                            self.config.dimension
+                        )
+                    )
                     recovery = VerifiedRecoveryManager(
                         store,
                         capture_root=self.config.capture_root or data_root,
+                        memora_provider_identity=(
+                            provider if provider.get("learned") is True else None
+                        ),
                     )
                     self._replication_manager = ReplicationManager(
                         store,

@@ -142,11 +142,16 @@ its backup receipt, the capture archive, the sealed media archive (thumbnails,
 private Apple Vision feature prints, and per-object manifests for every image
 memory referenced by the bundled database; `synapse-s2.recovery-bundle.v3`),
 optional request-journal and runtime-state artifacts, and the signed bundle
-receipt. Full-resolution originals are never copied, and media bytes travel
+receipt. The v3 receipt also binds the content-free `memora_integrity`
+aggregate for every governed cue catalog, projection, and lifecycle receipt.
+Full-resolution originals are never copied, and media bytes travel
 only inside the digest-bound sealed archive. Older media-absent v2/v1 bundle
 receipts stay verifiable; their staging proofs report
 `media_recovery_complete: false` whenever the bundled database still
 references image memories, so incompleteness is visible rather than silent.
+Those legacy receipts are also cutover-ineligible when immutable database
+inspection finds any Memora governance state, because they cannot have signed
+its aggregate.
 
 Copy the entire returned `checkpoint_directory`, without changing its internal
 names or modes, into the receiver's replication inbox. Then stage its manifest:
@@ -166,6 +171,13 @@ readiness contract:
   this replication protocol cannot promote the staged copy to the live store.
 - `live_overwrite_performed: false` confirms that the operation did not modify
   the receiver's live memory database.
+
+The stage result also returns the same content-free `memora_integrity` object
+bound by the bundle and isolated restore proof. Staging and idempotent replay
+re-audit the restored database; catalog/projection/receipt tamper, provider
+drift, source drift, or an ineffective promoted binding rejects the stage.
+Cue terms remain untrusted routing evidence inside the private store and are
+never emitted by this aggregate proof.
 
 The receiver-signed ACK carries `memory_recovery_cutover_ready`, not a generic
 promotion or cutover assertion. Copy that ACK file into the sender's

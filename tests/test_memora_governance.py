@@ -205,6 +205,55 @@ class MemoraGovernanceTests(unittest.TestCase):
         self.assertTrue(audit["catalog_cross_checked"])
         self.assertEqual(audit["events_validated"], 2)
 
+    def test_recovery_audit_is_content_free_and_replays_from_signed_provider_revision(self):
+        store, gov, ctx, recompute = self._make_env()
+        promoted = self._promote(gov, self._propose(gov, ctx, recompute))
+
+        audit = gov.audit_recovery_integrity(
+            active_provider_identity=self._active_identity()
+        )
+        self.assertEqual(audit["catalog_count"], 1)
+        self.assertEqual(audit["binding_projection_count"], 1)
+        self.assertEqual(audit["governance_event_receipt_count"], 2)
+        self.assertEqual(audit["promoted_binding_count"], 1)
+        self.assertEqual(audit["effective_binding_count"], 1)
+        self.assertTrue(audit["effective_bindings_valid"])
+        self.assertFalse(audit["raw_cue_terms_included"])
+        self.assertFalse(audit["raw_source_text_included"])
+        self.assertFalse(audit["vectors_included"])
+        serialized = json.dumps(audit, sort_keys=True)
+        self.assertNotIn(RAW_SENTENCE, serialized)
+        for cue in promoted["binding"]["cues"]:
+            self.assertNotIn(cue["term"], serialized)
+
+        replay = gov.audit_recovery_integrity(
+            expected_provider_revision=audit["active_provider_revision"]
+        )
+        self.assertEqual(replay, audit)
+
+    def test_recovery_audit_surfaces_provider_drift_and_catalog_tamper(self):
+        store, gov, ctx, recompute = self._make_env()
+        self._promote(gov, self._propose(gov, ctx, recompute))
+        drifted = {**self._active_identity(), "revision": "rev-drifted"}
+        audit = gov.audit_recovery_integrity(
+            active_provider_identity=drifted
+        )
+        self.assertEqual(audit["promoted_binding_count"], 1)
+        self.assertEqual(audit["effective_binding_count"], 0)
+        self.assertEqual(audit["provider_drift_binding_count"], 1)
+        self.assertFalse(audit["effective_bindings_valid"])
+
+        with closing(store._connect()) as conn:
+            with store._transaction(conn, immediate=True):
+                conn.execute(
+                    "DELETE FROM store_metadata WHERE key = ?",
+                    ("memora_governance.catalog.v1." + ctx,),
+                )
+        with self.assertRaises(MemoraGovernanceIntegrityError):
+            gov.audit_recovery_integrity(
+                active_provider_identity=self._active_identity()
+            )
+
     def test_mutation_between_plan_and_propose_fails_closed(self):
         store, gov, ctx, recompute = self._make_env()
         plan = recompute(ctx)

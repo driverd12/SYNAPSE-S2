@@ -19,7 +19,7 @@ import uuid
 import zlib
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import fcntl
 
@@ -62,6 +62,11 @@ from memory_store import (
     _matching_backup_schema_contract_versions,
     capture_request_fingerprint,
     media_references_from_connection,
+)
+from memora_governance import (
+    MemoraGovernance,
+    validate_memora_recovery_audit,
+    validate_provider_identity as validate_memora_provider_identity,
 )
 from redaction import redact_capture_text, reject_sensitive_identifier, strip_untrusted_raw_digest_text
 
@@ -323,6 +328,7 @@ class VerifiedRecoveryManager:
         capture_root: str | os.PathLike[str] | None = None,
         runtime_state_path: str | os.PathLike[str] | None = None,
         allow_noncanonical_capture_root: bool = False,
+        memora_provider_identity: Mapping[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.capture_root = resolve_capture_root(capture_root)
@@ -338,6 +344,14 @@ class VerifiedRecoveryManager:
         )
         self.runtime_state_path = Path(configured_runtime_state).expanduser().absolute()
         self.allow_noncanonical_capture_root = bool(allow_noncanonical_capture_root)
+        self.memora_provider_identity = (
+            None
+            if memora_provider_identity is None
+            else validate_memora_provider_identity(
+                memora_provider_identity,
+                source="active",
+            )
+        )
         self.daemon = CaptureInboxDaemon(root=self.capture_root)
         self._repository_thread_lock = threading.RLock()
         self._repository_lock_owner: int | None = None
@@ -346,6 +360,75 @@ class VerifiedRecoveryManager:
         self._capture_maintenance_thread_lock = threading.RLock()
         self._capture_maintenance_lock_owner: int | None = None
         self._capture_maintenance_lock_token: object | None = None
+
+    def _audit_memora_store(
+        self,
+        store: DurableMemoryStore,
+        *,
+        expected_provider_revision: str | None = None,
+    ) -> dict[str, Any]:
+        audit = MemoraGovernance(store).audit_recovery_integrity(
+            active_provider_identity=self.memora_provider_identity,
+            expected_provider_revision=expected_provider_revision,
+        )
+        return validate_memora_recovery_audit(audit)
+
+    def _audit_memora_database(
+        self,
+        path: Path,
+        *,
+        expected_provider_revision: str | None = None,
+    ) -> dict[str, Any]:
+        # Recovery artifacts are complete, checkpointed SQLite snapshots.  An
+        # immutable connection is both the correct trust model and prevents a
+        # read-only WAL-mode open from leaving ``-shm``/``-wal`` sidecars next
+        # to the signed artifact before its normal verifier runs.
+        audit_store = DurableMemoryStore.open_existing_for_audit(
+            path,
+            immutable=True,
+        )
+        try:
+            return self._audit_memora_store(
+                audit_store,
+                expected_provider_revision=expected_provider_revision,
+            )
+        finally:
+            audit_store.close()
+
+    @staticmethod
+    def _memora_recovery_ready(value: Any) -> bool:
+        try:
+            audit = validate_memora_recovery_audit(value)
+        except Exception:
+            return False
+        return bool(
+            audit["integrity_valid"] is True
+            and audit["effective_bindings_valid"] is True
+            and int(audit["provider_drift_binding_count"]) == 0
+            and int(audit["source_drift_binding_count"]) == 0
+        )
+
+    @staticmethod
+    def _legacy_memora_absent(value: Any) -> bool:
+        """Legacy receipts are promotable only when the snapshot has no Memora state.
+
+        A v1/v2 receipt predates the signed aggregate binding.  We may still
+        inspect and restore it, but a local immutable audit must prove that
+        there are no catalogs, projections, or governance receipts before it
+        can be considered for cutover.
+        """
+
+        try:
+            audit = validate_memora_recovery_audit(value)
+        except Exception:
+            return False
+        return bool(
+            int(audit["catalog_count"]) == 0
+            and int(audit["binding_projection_count"]) == 0
+            and int(audit["governance_event_receipt_count"]) == 0
+            and int(audit["promoted_binding_count"]) == 0
+            and audit["active_provider_revision"] == "absent"
+        )
 
     @contextmanager
     def _repository_lock(self) -> Iterable[None]:
@@ -6077,6 +6160,10 @@ class VerifiedRecoveryManager:
             "media_orphan_count",
         }
 
+    @staticmethod
+    def _memora_receipt_expected_keys() -> set[str]:
+        return {"memora_integrity"}
+
     def _read_bundle_receipt(self, path: Path) -> tuple[dict[str, Any], bool]:
         data, metadata = self._read_private_regular(path, max_bytes=1024 * 1024)
         if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
@@ -6091,6 +6178,7 @@ class VerifiedRecoveryManager:
         expected_keys = (
             self._bundle_receipt_expected_keys()
             | self._media_receipt_expected_keys()
+            | self._memora_receipt_expected_keys()
             if schema_name == RECOVERY_BUNDLE_SCHEMA
             else self._bundle_receipt_expected_keys()
             if schema_name == PRIOR_RECOVERY_BUNDLE_SCHEMA
@@ -6101,6 +6189,12 @@ class VerifiedRecoveryManager:
         if not expected_keys or set(payload) != expected_keys:
             raise ValueError("recovery bundle receipt contract is unsupported")
         if schema_name == RECOVERY_BUNDLE_SCHEMA:
+            try:
+                validate_memora_recovery_audit(payload.get("memora_integrity"))
+            except Exception as exc:
+                raise ValueError(
+                    "recovery bundle Memora integrity binding is invalid"
+                ) from exc
             if payload.get("media_included") is True:
                 if (
                     payload.get("media_schema") != MEDIA_ARCHIVE_MANIFEST_SCHEMA
@@ -7038,6 +7132,11 @@ class VerifiedRecoveryManager:
                     f"(missing={ledger_preflight['missing_authoritative_ledger_count']}, "
                     f"mismatch={ledger_preflight['ledger_binding_mismatch_count']})"
                 )
+            memora_preflight = self._audit_memora_store(self.store)
+            if not self._memora_recovery_ready(memora_preflight):
+                raise RuntimeError(
+                    "Memora governance integrity or effective bindings are not ready"
+                )
             try:
                 bundle_database_path = path
                 if bundle_database_path is None:
@@ -7161,6 +7260,11 @@ class VerifiedRecoveryManager:
                     artifact=database_path,
                 )
                 database_uri = database_path.resolve().as_uri() + "?mode=ro&immutable=1"
+                memora_snapshot = self._audit_memora_database(database_path)
+                if memora_snapshot != memora_preflight:
+                    raise RuntimeError(
+                        "Memora governance changed during recovery snapshot"
+                    )
                 with closing(sqlite3.connect(database_uri, uri=True)) as snapshot:
                     ledger_bindings = self._snapshot_capture_ledger_bindings(
                         snapshot
@@ -7409,6 +7513,11 @@ class VerifiedRecoveryManager:
                     raise RuntimeError(
                         "capture ledger binding changed during paired backup"
                     )
+                memora_postflight = self._audit_memora_store(self.store)
+                if memora_postflight != memora_snapshot:
+                    raise RuntimeError(
+                        "Memora governance changed during paired backup"
+                    )
                 created_at = time.time()
                 receipt = {
                     "schema": RECOVERY_BUNDLE_SCHEMA,
@@ -7479,6 +7588,7 @@ class VerifiedRecoveryManager:
                     "media_orphan_count": int(
                         media_manifest["reconciliation"]["orphan_count"]
                     ),
+                    "memora_integrity": dict(memora_snapshot),
                     "governance_mode": str(live_governance["governance_mode"]),
                     "store_identity": self._store_identity(),
                     "store_generation": str(live_governance["store_generation"]),
@@ -7681,6 +7791,7 @@ class VerifiedRecoveryManager:
                     ),
                     "media_object_count": int(media_manifest["object_count"]),
                     "media_reconciliation": dict(media_manifest["reconciliation"]),
+                    "memora_integrity": dict(memora_snapshot),
                     "reconciliation": dict(manifest["reconciliation"]),
                     "capture_ledger_binding": dict(
                         verified["capture_ledger_binding"]
@@ -7818,6 +7929,31 @@ class VerifiedRecoveryManager:
             artifact=database_path,
         )
         bundle_schema = str(receipt["schema"])
+        memora_integrity: dict[str, Any] | None = None
+        if bundle_schema == RECOVERY_BUNDLE_SCHEMA:
+            signed_memora = validate_memora_recovery_audit(
+                receipt.get("memora_integrity")
+            )
+            memora_integrity = self._audit_memora_database(
+                database_path,
+                expected_provider_revision=str(
+                    signed_memora["active_provider_revision"]
+                ),
+            )
+            if memora_integrity != receipt.get("memora_integrity"):
+                raise RuntimeError(
+                    "Memora governance does not match its signed bundle binding"
+                )
+        else:
+            # Legacy receipts have no signed Memora field.  A best-effort
+            # immutable aggregate keeps them inspectable; only an exact empty
+            # inventory is later eligible for cutover.  Corrupt or promoted
+            # legacy state therefore fails closed for readiness without
+            # preventing isolated forensic restore.
+            try:
+                memora_integrity = self._audit_memora_database(database_path)
+            except Exception:
+                memora_integrity = None
         governance_mode = str(database["governance_mode"])
         store_generation = str(database["store_generation"])
         authority_epoch_number = database["authority_epoch_number"]
@@ -8196,6 +8332,11 @@ class VerifiedRecoveryManager:
             # never be promoted to an authoritative cutover candidate.
             and media_recovery_complete
             and (
+                self._memora_recovery_ready(memora_integrity)
+                if bundle_schema == RECOVERY_BUNDLE_SCHEMA
+                else self._legacy_memora_absent(memora_integrity)
+            )
+            and (
                 governance_mode == "pre-governed-v5"
                 or (
                     request_journal is not None
@@ -8340,6 +8481,7 @@ class VerifiedRecoveryManager:
                 if bundle_schema == RECOVERY_BUNDLE_SCHEMA
                 else "legacy-media-not-present"
             ),
+            "memora_integrity": memora_integrity,
             "cutover_ready": cutover_ready,
             "receipt_identity_trusted": identity_trusted,
             "reviewed_digests_verified": required_reviewed_digests,
@@ -8620,6 +8762,35 @@ class VerifiedRecoveryManager:
                     else None
                 ),
             )
+            restored_memora_integrity: dict[str, Any] | None = None
+            if receipt.get("schema") == RECOVERY_BUNDLE_SCHEMA:
+                restored_memora_integrity = self._audit_memora_database(
+                    database_target,
+                    expected_provider_revision=str(
+                        verified["memora_integrity"]["active_provider_revision"]
+                    ),
+                )
+                if (
+                    restored_memora_integrity != verified.get("memora_integrity")
+                    or restored_memora_integrity != receipt.get("memora_integrity")
+                ):
+                    raise RuntimeError(
+                        "restored Memora governance does not match the verified bundle"
+                    )
+            else:
+                try:
+                    restored_memora_integrity = self._audit_memora_database(
+                        database_target
+                    )
+                except Exception:
+                    restored_memora_integrity = None
+                if (
+                    self._legacy_memora_absent(restored_memora_integrity)
+                    != self._legacy_memora_absent(verified.get("memora_integrity"))
+                ):
+                    raise RuntimeError(
+                        "restored legacy Memora inventory does not match verification"
+                    )
             request_journal_restore: dict[str, Any] | None = None
             request_journal_binding_restore: dict[str, Any] | None = None
             request_journal_restore_binding: dict[str, Any] | None = None
@@ -8905,6 +9076,11 @@ class VerifiedRecoveryManager:
                 # recovery keeps the proof inspectable but never cutover-ready.
                 and media_recovery_complete
                 and (
+                    self._memora_recovery_ready(restored_memora_integrity)
+                    if receipt.get("schema") == RECOVERY_BUNDLE_SCHEMA
+                    else self._legacy_memora_absent(restored_memora_integrity)
+                )
+                and (
                     verified["governance_mode"] == "pre-governed-v5"
                     or (
                         request_journal_restore is not None
@@ -9020,6 +9196,7 @@ class VerifiedRecoveryManager:
                     if media_absent_verified
                     else None
                 ),
+                "memora_integrity": restored_memora_integrity,
                 "runtime_state_required": bool(
                     receipt.get("runtime_state_required")
                 ),
@@ -9083,6 +9260,7 @@ class VerifiedRecoveryManager:
                 "media_reference_count": int(
                     restored_media_references["reference_count"]
                 ),
+                "memora_integrity": restored_memora_integrity,
                 "request_journal_restore_path": (
                     None
                     if request_journal_restore is None

@@ -47,6 +47,8 @@ from memory_store import (
     capture_request_fingerprint,
 )
 from mlx_backend import SpikingAttentionBackend
+from memora_governance import MemoraGovernance
+from memora_shadow import build_shadow_plan
 from recovery_manager import (
     CAPTURE_ARCHIVE_MANIFEST_SCHEMA,
     GUARDED_RECOVERY_TRANSACTION_SCHEMA,
@@ -4880,6 +4882,96 @@ class MediaRecoveryBundleTests(unittest.TestCase):
         manager.daemon.status()
         return store, manager, binding, root
 
+    @staticmethod
+    def _attach_promoted_memora(
+        store: DurableMemoryStore,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        context = "memora-recovery-tests"
+        for index in range(4):
+            store.upsert_entry(
+                tag=f"memora-recovery-{index}",
+                context_id=context,
+                source_text=f"synthetic clustered recovery evidence alpha {index}",
+                metadata={"sequence": index},
+                embedding_dimensions=8,
+                spike_indices=[1],
+                neuron_indices=[2],
+                registered_at=150.0 + index,
+            )
+        provider_info = {
+            "provider": "mlx-embeddings",
+            "provider_type": "mlx-neural",
+            "model_id": "recovery-test-model",
+            "revision": "revision-1",
+            "configuration_sha256": "c" * 64,
+            "dimensions": 8,
+            "semantic": True,
+            "local_only": True,
+            "ready": True,
+        }
+        active_identity: dict[str, object] = {
+            "provider": "mlx-embeddings",
+            "provider_type": "mlx-neural",
+            "model_id": "recovery-test-model",
+            "revision": "revision-1",
+            "config_fingerprint": "c" * 64,
+            "dimensions": 8,
+            "semantic": True,
+            "local_only": True,
+            "ready": True,
+            "learned": True,
+        }
+
+        def embed(text: str) -> list[float]:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            return [
+                struct.unpack(">I", digest[offset : offset + 4])[0] / 2**32
+                for offset in range(0, 32, 4)
+            ]
+
+        def recompute(context_id: str) -> dict:
+            page = store.memora_source_page(context_id=context_id)
+            revision = {
+                "revision": page["snapshot_revision"],
+                "entry_count": page["total"],
+                "sampling_truncated": page["has_more"],
+            }
+            return build_shadow_plan(
+                context_id=context_id,
+                entries=page["entries"],
+                revision_before=revision,
+                revision_after=revision,
+                provider_info=provider_info,
+                embed=embed,
+                similarity_threshold=0.0,
+                witnesses=page["witnesses"],
+            )
+
+        governance = MemoraGovernance(
+            store,
+            plan_recomputer=recompute,
+            allow_test_time=True,
+        )
+        plan = recompute(context)
+        proposed = governance.propose_binding(
+            context_id=context,
+            plan_digest=plan["plan_digest"],
+            cluster_ordinal=plan["clusters"][0]["cluster_ordinal"],
+            proposed_by="backup-operator-a",
+            reason="recovery proof fixture",
+            now=200.0,
+        )["binding"]
+        promoted = governance.promote_binding(
+            binding_id=proposed["binding_id"],
+            expected_revision=proposed["revision"],
+            reviewed_by="backup-operator-b",
+            reason="recovery proof reviewed",
+            confirm=True,
+            active_provider_identity=active_identity,
+            now=201.0,
+        )
+        return active_identity, promoted
+
     def _capture_media(
         self,
         binding: CoreClientBinding,
@@ -4981,6 +5073,132 @@ class MediaRecoveryBundleTests(unittest.TestCase):
             self.assertIs(proof["media_recovery_complete"], True)
             self.assertEqual(proof["media_object_count"], 2)
 
+    def test_v3_bundle_binds_effective_memora_through_isolated_restore(self) -> None:
+        with self._temporary_root() as tmp:
+            store, _manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={},
+            )
+            identity, binding = self._attach_promoted_memora(store)
+            manager = VerifiedRecoveryManager(
+                store,
+                capture_root=root,
+                memora_provider_identity=identity,
+            )
+            manager.daemon.status()
+
+            bundle = manager.create_bundle(
+                root / "memora-paired.sqlite3",
+                purpose="memora-recovery-test",
+            )
+            verified = manager.verify_bundle(bundle["bundle_receipt_path"])
+            restored = manager.restore_bundle_isolated(
+                bundle["bundle_receipt_path"],
+                root / "memora-proof",
+                confirm=True,
+            )
+            proof = json.loads(
+                Path(restored["recovery_proof_path"]).read_text(encoding="utf-8")
+            )
+            audit = bundle["memora_integrity"]
+            self.assertEqual(verified["memora_integrity"], audit)
+            self.assertEqual(restored["memora_integrity"], audit)
+            self.assertEqual(proof["memora_integrity"], audit)
+            self.assertEqual(audit["binding_projection_count"], 1)
+            self.assertEqual(audit["governance_event_receipt_count"], 2)
+            self.assertEqual(audit["effective_binding_count"], 1)
+            self.assertTrue(verified["cutover_ready"])
+            self.assertTrue(restored["cutover_ready"])
+
+            restored_store = DurableMemoryStore.open_existing_for_audit(
+                Path(restored["restore_root"]) / "memory.sqlite3",
+                immutable=True,
+            )
+            try:
+                restored_governance = MemoraGovernance(restored_store)
+                self.assertTrue(
+                    restored_governance.audit_integrity(binding["binding_id"])[
+                        "chain_valid"
+                    ]
+                )
+                effective = restored_governance.effective_bindings(
+                    context_id=binding["context_id"],
+                    active_provider_identity=identity,
+                )
+                self.assertEqual(len(effective["bindings"]), 1)
+            finally:
+                restored_store.close()
+
+    def test_v3_memora_receipt_omission_and_resigned_tamper_fail_closed(self) -> None:
+        with self._temporary_root() as tmp:
+            store, _manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={},
+            )
+            identity, _binding_record = self._attach_promoted_memora(store)
+            manager = VerifiedRecoveryManager(
+                store,
+                capture_root=root,
+                memora_provider_identity=identity,
+            )
+            manager.daemon.status()
+
+            omitted = manager.create_bundle(
+                root / "memora-omitted.sqlite3",
+                purpose="memora-omission-test",
+            )
+            omitted_path = Path(omitted["bundle_receipt_path"])
+            omitted_receipt = json.loads(omitted_path.read_text(encoding="utf-8"))
+            omitted_receipt.pop("memora_integrity")
+            manager.store._authenticate_receipt(omitted_receipt)
+            omitted_path.write_text(
+                json.dumps(omitted_receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            omitted_path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "contract is unsupported"):
+                manager.verify_bundle(omitted_path)
+
+            tampered = manager.create_bundle(
+                root / "memora-tampered.sqlite3",
+                purpose="memora-tamper-test",
+            )
+            tampered_path = Path(tampered["bundle_receipt_path"])
+            tampered_receipt = json.loads(tampered_path.read_text(encoding="utf-8"))
+            tampered_receipt["memora_integrity"]["cue_count"] += 1
+            manager.store._authenticate_receipt(tampered_receipt)
+            tampered_path.write_text(
+                json.dumps(tampered_receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            tampered_path.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "Memora governance"):
+                manager.verify_bundle(tampered_path)
+
+    def test_promoted_memora_provider_drift_blocks_recovery_certification(self) -> None:
+        with self._temporary_root() as tmp:
+            store, _manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={},
+            )
+            identity, _binding_record = self._attach_promoted_memora(store)
+            drifted = {**identity, "revision": "revision-drifted"}
+            manager = VerifiedRecoveryManager(
+                store,
+                capture_root=root,
+                memora_provider_identity=drifted,
+            )
+            manager.daemon.status()
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Memora governance integrity or effective bindings are not ready",
+            ):
+                manager.create_bundle(
+                    root / "memora-provider-drift.sqlite3",
+                    purpose="memora-provider-drift-test",
+                )
+            self.assertFalse((root / "memora-provider-drift.sqlite3").exists())
+
     def test_referenced_missing_or_corrupt_media_blocks_publication(self) -> None:
         with self._temporary_root() as tmp:
             present_id = "s2img_" + "3" * 32
@@ -5077,7 +5295,7 @@ class MediaRecoveryBundleTests(unittest.TestCase):
             downgraded = {
                 key: value
                 for key, value in receipt.items()
-                if not key.startswith("media_")
+                if not key.startswith("media_") and key != "memora_integrity"
             }
             downgraded["schema"] = "synapse-s2.recovery-bundle.v2"
             manager.store._authenticate_receipt(downgraded)
@@ -5129,6 +5347,113 @@ class MediaRecoveryBundleTests(unittest.TestCase):
             self.assertIs(proof["cutover_ready"], False)
             self.assertEqual(
                 proof["media_recovery"], "legacy-media-not-present"
+            )
+
+    def test_prior_v2_with_unsigned_memora_state_is_never_cutover_ready(self) -> None:
+        with self._temporary_root() as tmp:
+            store, manager, _binding, root = self._environment(
+                Path(tmp),
+                referenced_media={},
+            )
+            context = "legacy-unsigned-memora"
+            for index in range(4):
+                store.upsert_entry(
+                    tag=f"legacy-memora-{index}",
+                    context_id=context,
+                    source_text=f"legacy unsigned memora fixture alpha {index}",
+                    metadata={"sequence": index},
+                    embedding_dimensions=8,
+                    spike_indices=[1],
+                    neuron_indices=[2],
+                    registered_at=300.0 + index,
+                )
+
+            provider_info = {
+                "provider": "mlx-embeddings",
+                "provider_type": "mlx-neural",
+                "model_id": "legacy-test-model",
+                "revision": "revision-1",
+                "configuration_sha256": "d" * 64,
+                "dimensions": 8,
+                "semantic": True,
+                "local_only": True,
+                "ready": True,
+            }
+
+            def embed(text: str) -> list[float]:
+                digest = hashlib.sha256(text.encode("utf-8")).digest()
+                return [
+                    struct.unpack(">I", digest[offset : offset + 4])[0] / 2**32
+                    for offset in range(0, 32, 4)
+                ]
+
+            def recompute(context_id: str) -> dict:
+                page = store.memora_source_page(context_id=context_id)
+                revision = {
+                    "revision": page["snapshot_revision"],
+                    "entry_count": page["total"],
+                    "sampling_truncated": page["has_more"],
+                }
+                return build_shadow_plan(
+                    context_id=context_id,
+                    entries=page["entries"],
+                    revision_before=revision,
+                    revision_after=revision,
+                    provider_info=provider_info,
+                    embed=embed,
+                    similarity_threshold=0.0,
+                    witnesses=page["witnesses"],
+                )
+
+            governance = MemoraGovernance(
+                store,
+                plan_recomputer=recompute,
+                allow_test_time=True,
+            )
+            plan = recompute(context)
+            governance.propose_binding(
+                context_id=context,
+                plan_digest=plan["plan_digest"],
+                cluster_ordinal=plan["clusters"][0]["cluster_ordinal"],
+                proposed_by="legacy-operator-a",
+                reason="legacy unsigned recovery fixture",
+                now=400.0,
+            )
+
+            bundle = manager.create_bundle(
+                root / "legacy-memora.sqlite3",
+                purpose="legacy-memora-test",
+            )
+            receipt_path = Path(bundle["bundle_receipt_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            downgraded = {
+                key: value
+                for key, value in receipt.items()
+                if not key.startswith("media_") and key != "memora_integrity"
+            }
+            downgraded["schema"] = "synapse-s2.recovery-bundle.v2"
+            manager.store._authenticate_receipt(downgraded)
+            receipt_path.write_text(
+                json.dumps(downgraded, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            receipt_path.chmod(0o600)
+
+            verified = manager.verify_bundle(receipt_path)
+            self.assertTrue(verified["verified"])
+            self.assertFalse(verified["cutover_ready"])
+            self.assertEqual(
+                verified["memora_integrity"]["binding_projection_count"], 1
+            )
+            restored = manager.restore_bundle_isolated(
+                receipt_path,
+                root / "legacy-memora-proof",
+                confirm=True,
+            )
+            self.assertTrue(restored["verified"])
+            self.assertFalse(restored["cutover_ready"])
+            self.assertEqual(
+                restored["memora_integrity"], verified["memora_integrity"]
             )
 
     def test_zero_reference_snapshot_produces_verified_media_absent_bundle(

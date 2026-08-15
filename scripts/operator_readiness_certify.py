@@ -53,6 +53,8 @@ from scripts.core_agent_installer import (
     resolve_paths as resolve_candidate_core_paths,
 )
 from memory_store import DurableMemoryStore
+from memora_governance import validate_memora_recovery_audit
+from memora_shadow import provider_identity as memora_provider_identity
 from recovery_manager import (
     LEGACY_RECOVERY_BUNDLE_SCHEMA,
     LEGACY_RECOVERY_BUNDLE_RESTORE_SCHEMA,
@@ -287,6 +289,33 @@ def _guarded_media_recovery_contract(
         "media_object_count": object_count,
         "media_reference_count": references,
     }
+
+
+def _guarded_memora_recovery_contract(
+    *,
+    bundle: dict[str, Any],
+    verification: dict[str, Any],
+    restore: dict[str, Any],
+    proof: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Cross-bind one content-free Memora audit through all recovery phases."""
+
+    try:
+        audits = [
+            validate_memora_recovery_audit(phase.get("memora_integrity"))
+            for phase in (bundle, verification, restore, proof)
+        ]
+    except Exception:
+        return False, {}
+    audit = audits[0]
+    ready = bool(
+        all(candidate == audit for candidate in audits[1:])
+        and audit["integrity_valid"] is True
+        and audit["effective_bindings_valid"] is True
+        and int(audit["provider_drift_binding_count"]) == 0
+        and int(audit["source_drift_binding_count"]) == 0
+    )
+    return ready, audit
 
 
 @dataclasses.dataclass
@@ -4168,9 +4197,16 @@ class OperatorReadinessCertifier:
             restore=restore,
             proof=proof,
         )
+        memora_ready, memora_metrics = _guarded_memora_recovery_contract(
+            bundle=bundle,
+            verification=verification,
+            restore=restore,
+            proof=proof,
+        )
         backup_ready = (
             proof_contract_ready
             and media_ready
+            and memora_ready
             and bundle.get("bundle_verified") is True
             and bundle.get("cutover_ready") is True
             and self._capture_binding_ready(bundle_binding)
@@ -4198,6 +4234,7 @@ class OperatorReadinessCertifier:
                 "capture_ledger_binding": bundle_binding,
                 "reconciliation": bundle_reconciliation,
                 "guarded": True,
+                "memora_integrity": memora_metrics,
                 **media_metrics,
             },
             duration_ms=duration_ms,
@@ -4236,13 +4273,14 @@ class OperatorReadinessCertifier:
                 "capture_ledger_binding": verify_binding,
                 "reconciliation": verify_reconciliation,
                 "guarded": True,
+                "memora_integrity": memora_metrics,
                 **media_metrics,
             },
             duration_ms=duration_ms,
             preserve_crypto_fields=True,
         )
 
-        proof_ready = proof_contract_ready and media_ready
+        proof_ready = proof_contract_ready and media_ready and memora_ready
         extra_artifacts: dict[str, str] = {}
         if proof_ready:
             durable_proof = (
@@ -4293,6 +4331,7 @@ class OperatorReadinessCertifier:
                 "capture_ledger_binding": restore_binding,
                 "reconciliation": restore_reconciliation,
                 "guarded": True,
+                "memora_integrity": memora_metrics,
                 **media_metrics,
             },
             duration_ms=duration_ms,
@@ -4408,10 +4447,28 @@ class OperatorReadinessCertifier:
                     repair="Stop exact writers and rerun a completely new evidence pack.",
                 )
             else:
+                neural_checks = [
+                    result
+                    for result in self.results
+                    if result.check_id == "neural_embedding"
+                    and result.required
+                    and result.status == "ready"
+                ]
+                active_memora_provider: dict[str, Any] | None = None
+                if len(neural_checks) == 1 and isinstance(
+                    neural_checks[0].parsed, dict
+                ):
+                    provider = neural_checks[0].parsed.get("embedding_provider")
+                    identity = memora_provider_identity(
+                        provider if isinstance(provider, dict) else None
+                    )
+                    if identity.get("learned") is True:
+                        active_memora_provider = identity
                 manager = VerifiedRecoveryManager(
                     store,
                     capture_root=self.candidate_config.capture_root,
                     runtime_state_path=self.candidate_config.state_path,
+                    memora_provider_identity=active_memora_provider,
                 )
                 callback_started = False
                 transaction_started = time.perf_counter()
