@@ -384,14 +384,48 @@ class RetrievalV2Tests(unittest.TestCase):
             weight=1.0,
         )
 
-        result = backend.retrieve_text_v2(
-            prompt,
-            context_id="alpha",
-            recall_scope="local",
-            result_limit=10,
-            candidate_limit=32,
-            include_graph_neighbors=True,
+        batch_calls: list[dict[str, object]] = []
+        real_list_entries_by_ids = backend.memory_store.list_entries_by_ids
+
+        def recording_list_entries_by_ids(memory_ids, **kwargs):
+            requested = [str(memory_id) for memory_id in memory_ids]
+            batch_calls.append({"memory_ids": requested, "kwargs": dict(kwargs)})
+            return real_list_entries_by_ids(requested, **kwargs)
+
+        def forbidden_get_entry(*args, **kwargs):
+            raise AssertionError(
+                "get_entry must never run on the Retrieval-v2 "
+                "graph-neighbor path"
+            )
+
+        with patch.object(
+            backend.memory_store,
+            "list_entries_by_ids",
+            side_effect=recording_list_entries_by_ids,
+        ), patch.object(
+            backend.memory_store,
+            "get_entry",
+            side_effect=forbidden_get_entry,
+        ):
+            result = backend.retrieve_text_v2(
+                prompt,
+                context_id="alpha",
+                recall_scope="local",
+                result_limit=10,
+                candidate_limit=32,
+                include_graph_neighbors=True,
+            )
+
+        self.assertEqual(len(batch_calls), 1)
+        batch_call = batch_calls[0]
+        self.assertIn(local_neighbor["memory_id"], batch_call["memory_ids"])
+        self.assertIn(outside_neighbor["memory_id"], batch_call["memory_ids"])
+        self.assertEqual(
+            batch_call["kwargs"].get("limit"),
+            mlx_backend.RETRIEVAL_V2_MAX_GRAPH_EDGES,
         )
+        self.assertNotIn("context_id", batch_call["kwargs"])
+
         ids = {item["memory_id"] for item in result["items"]}
         self.assertIn(local_neighbor["memory_id"], ids)
         self.assertNotIn(outside_neighbor["memory_id"], ids)
@@ -404,6 +438,11 @@ class RetrievalV2Tests(unittest.TestCase):
         )
         self.assertEqual(graph_item["scope_provenance"]["resolved_context_id"], "alpha")
         self.assertGreaterEqual(result["work"]["graph_cross_context_rejections"], 1)
+        self.assertEqual(
+            result["work"]["graph_neighbor_loads"],
+            result["work"]["graph_relationship_rows_examined"],
+        )
+        self.assertGreaterEqual(result["work"]["graph_neighbor_loads"], 2)
 
     def test_prompt_terms_and_candidate_work_are_strictly_bounded(self) -> None:
         backend = self._backend()

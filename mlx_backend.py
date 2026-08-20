@@ -3421,13 +3421,30 @@ class SpikingAttentionBackend:
         anchor_by_id = {
             str(anchor["memory_id"]): anchor for anchor in graph_anchors
         }
+        # Batch-load every referenced neighbor once (no context filter):
+        # cross-context rows must still load so they are counted and
+        # rejected by the per-edge validation below.
+        neighbor_ids = [
+            str(edge["neighbor_memory_id"])
+            for edge in graph_snapshot["edges"]
+            if str(edge["anchor_memory_id"]) in anchor_by_id
+        ]
+        neighbor_by_id: dict[str, dict[str, Any]] = {}
+        if neighbor_ids:
+            neighbor_rows = self.memory_store.list_entries_by_ids(
+                neighbor_ids,
+                limit=RETRIEVAL_V2_MAX_GRAPH_EDGES,
+            )
+            neighbor_by_id = {
+                str(row.get("memory_id") or ""): row for row in neighbor_rows
+            }
         for edge in graph_snapshot["edges"]:
             anchor_id = str(edge["anchor_memory_id"])
             anchor = anchor_by_id.get(anchor_id)
             if anchor is None:
                 continue
             neighbor_id = str(edge["neighbor_memory_id"])
-            neighbor = self.memory_store.get_entry(neighbor_id)
+            neighbor = neighbor_by_id.get(neighbor_id)
             graph_neighbor_loads += 1
             if neighbor is None:
                 continue
