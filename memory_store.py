@@ -11469,6 +11469,7 @@ class DurableMemoryStore:
         limit: int,
         recall_scope: str = "local",
         recall_contexts: Iterable[dict[str, Any]] | None = None,
+        _conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         if not query_spikes:
             return []
@@ -11499,7 +11500,7 @@ class DurableMemoryStore:
         ]
         candidates: list[dict[str, Any]] = []
         try:
-            with closing(self._connect()) as conn:
+            with self._read_connection_scope(_conn) as conn:
                 rows = conn.execute(
                     f"""
                     SELECT
@@ -11564,6 +11565,7 @@ class DurableMemoryStore:
         limit: int,
         recall_scope: str = "local",
         recall_contexts: Iterable[dict[str, Any]] | None = None,
+        _conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         clean_terms: list[str] = []
         seen_terms: set[str] = set()
@@ -11595,7 +11597,7 @@ class DurableMemoryStore:
         context_placeholders = ",".join("?" for _ in scope_by_context)
         params: list[Any] = [*scope_by_context.keys(), *clean_terms, bounded_limit]
         try:
-            with closing(self._connect()) as conn:
+            with self._read_connection_scope(_conn) as conn:
                 rows = conn.execute(
                     f"""
                     WITH matched AS (
@@ -11640,6 +11642,54 @@ class DurableMemoryStore:
         except Exception:
             LOGGER.exception("failed to query surface recall candidates")
             raise
+
+    def retrieval_v2_candidate_sources(
+        self,
+        *,
+        context_id: str,
+        query_spikes: set[int],
+        query_terms: Iterable[str],
+        firing_values: list[float],
+        limit: int,
+        recall_scope: str = "local",
+        recall_contexts: Iterable[dict[str, Any]] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Load both Retrieval-v2 candidate sources on one shared reader.
+
+        The spike and surface helpers keep their own SQL, scoring, limits,
+        and row order; this wrapper only lets them share a single autocommit
+        read connection instead of opening one each. Surface lookup is
+        skipped outright when ``query_terms`` is empty, mirroring the
+        caller-side check it replaces. No transaction is started: both
+        statements remain independent autocommit reads.
+        """
+        clean_query_terms = list(query_terms)
+        scope_records = (
+            list(recall_contexts) if recall_contexts is not None else None
+        )
+        with self._read_connection_scope() as conn:
+            spike_rows = self.recall_candidates(
+                context_id=context_id,
+                query_spikes=query_spikes,
+                firing_values=firing_values,
+                limit=limit,
+                recall_scope=recall_scope,
+                recall_contexts=scope_records,
+                _conn=conn,
+            )
+            surface_rows = (
+                self.surface_recall_candidates(
+                    context_id=context_id,
+                    query_terms=clean_query_terms,
+                    limit=limit,
+                    recall_scope=recall_scope,
+                    recall_contexts=scope_records,
+                    _conn=conn,
+                )
+                if clean_query_terms
+                else []
+            )
+        return {"spike": spike_rows, "surface": surface_rows}
 
     def _surface_term_rows(
         self,

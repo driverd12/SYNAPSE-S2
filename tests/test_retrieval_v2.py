@@ -590,6 +590,194 @@ class RetrievalV2Tests(unittest.TestCase):
         self.assertEqual(empty_snapshot["edges"], [])
         self.assertEqual(len(batch_calls), 1)
 
+    def test_collect_candidates_coalesces_sources_onto_one_connection(self) -> None:
+        backend = self._backend()
+        store = backend.memory_store
+        prompt = "shared candidate coalescing retrieval signal"
+        for context in ("alpha", "beta"):
+            self._register_with_query_embedding(
+                backend,
+                prompt=prompt,
+                context_id=context,
+                tag=f"{context}-candidate",
+                text=f"Shared candidate coalescing retrieval signal for {context}.",
+                label=f"{context.title()} candidate",
+            )
+        backend.approve_namespace_link(
+            source_context_id="alpha",
+            target_context_id="beta",
+            relation_type="camera-control",
+            direction="bidirectional",
+            weight=0.9,
+            approved_by="unit-test",
+            confirm=True,
+        )
+
+        embedding = backend.embed_text(prompt)
+        sensory = backend.encode_to_spikes_top_k(
+            embedding,
+            k=min(
+                backend.default_top_k,
+                mlx_backend.RETRIEVAL_V2_MAX_QUERY_SPIKES,
+            ),
+        )
+        query_spikes = set(backend._active_indices_from_spikes(sensory))
+        query_terms = backend._retrieval_v2_select_terms(
+            backend._surface_recall_terms(prompt),
+            limit=mlx_backend.RETRIEVAL_V2_MAX_QUERY_TERMS,
+        )
+        scope_records = [
+            dict(record)
+            for record in store.resolve_recall_contexts(
+                context_id="alpha",
+                scope="connected",
+            )
+        ]
+        collect_kwargs = dict(
+            query_spikes=query_spikes,
+            query_terms=query_terms,
+            scope_records=scope_records,
+            result_limit=6,
+            candidate_limit=24,
+            include_graph_neighbors=False,
+        )
+
+        def legacy_split_sources(
+            *,
+            context_id,
+            query_spikes,
+            query_terms,
+            firing_values,
+            limit,
+            recall_scope="local",
+            recall_contexts=None,
+        ):
+            contexts = (
+                list(recall_contexts) if recall_contexts is not None else None
+            )
+            return {
+                "spike": store.recall_candidates(
+                    context_id=context_id,
+                    query_spikes=query_spikes,
+                    firing_values=firing_values,
+                    limit=limit,
+                    recall_scope=recall_scope,
+                    recall_contexts=contexts,
+                ),
+                "surface": (
+                    store.surface_recall_candidates(
+                        context_id=context_id,
+                        query_terms=query_terms,
+                        limit=limit,
+                        recall_scope=recall_scope,
+                        recall_contexts=contexts,
+                    )
+                    if query_terms
+                    else []
+                ),
+            }
+
+        with patch.object(
+            store,
+            "retrieval_v2_candidate_sources",
+            side_effect=legacy_split_sources,
+        ):
+            expected = backend._retrieval_v2_collect_candidates(**collect_kwargs)
+            expected_public = backend.retrieve_text_v2(
+                prompt,
+                context_id="alpha",
+                recall_scope="connected",
+                result_limit=6,
+                candidate_limit=24,
+                include_graph_neighbors=False,
+            )
+
+        wrapper_calls: list[dict[str, object]] = []
+        real_wrapper = store.retrieval_v2_candidate_sources
+
+        def recording_wrapper(**kwargs):
+            wrapper_calls.append(dict(kwargs))
+            return real_wrapper(**kwargs)
+
+        connect_calls: list[int] = []
+        real_connect = store._connect
+
+        def counting_connect():
+            connect_calls.append(1)
+            return real_connect()
+
+        with patch.object(
+            store,
+            "retrieval_v2_candidate_sources",
+            side_effect=recording_wrapper,
+        ):
+            with patch.object(store, "_connect", side_effect=counting_connect):
+                collected = backend._retrieval_v2_collect_candidates(
+                    **collect_kwargs
+                )
+            public = backend.retrieve_text_v2(
+                prompt,
+                context_id="alpha",
+                recall_scope="connected",
+                result_limit=6,
+                candidate_limit=24,
+                include_graph_neighbors=False,
+            )
+
+        # The direct collect call ran exactly one wrapper invocation on
+        # exactly one shared read connection; the public single-snapshot
+        # retrieval added exactly one more wrapper invocation.
+        self.assertEqual(len(connect_calls), 1)
+        self.assertEqual(len(wrapper_calls), 2)
+        call = wrapper_calls[0]
+        self.assertEqual(call["context_id"], "alpha")
+        self.assertEqual(call["query_spikes"], query_spikes)
+        self.assertEqual(list(call["query_terms"]), list(query_terms))
+        self.assertEqual(call["firing_values"], [])
+        # source_limit = min(candidate_limit, max(result_limit, 25 // 2))
+        self.assertEqual(call["limit"], 12)
+        self.assertEqual(call["recall_scope"], "connected")
+        self.assertEqual(list(call["recall_contexts"]), scope_records)
+
+        self.assertEqual(collected, expected)
+        self.assertEqual(public, expected_public)
+        self.assertTrue(collected["items"])
+        self.assertEqual(
+            {item["context_id"] for item in collected["items"]},
+            {"alpha", "beta"},
+        )
+        self.assertGreater(
+            collected["work"]["surface_candidates_returned"], 0
+        )
+
+        # Empty query terms must skip the surface source entirely while the
+        # spike source still runs on the single shared connection.
+        def forbidden_surface(*args, **kwargs):
+            raise AssertionError(
+                "surface_recall_candidates must not run for empty query terms"
+            )
+
+        with patch.object(
+            store,
+            "surface_recall_candidates",
+            side_effect=forbidden_surface,
+        ):
+            no_term_collected = backend._retrieval_v2_collect_candidates(
+                **{**collect_kwargs, "query_terms": []}
+            )
+        with patch.object(
+            store,
+            "retrieval_v2_candidate_sources",
+            side_effect=legacy_split_sources,
+        ):
+            no_term_expected = backend._retrieval_v2_collect_candidates(
+                **{**collect_kwargs, "query_terms": []}
+            )
+        self.assertEqual(no_term_collected, no_term_expected)
+        self.assertEqual(
+            no_term_collected["work"]["surface_candidates_returned"], 0
+        )
+
     def test_prompt_terms_and_candidate_work_are_strictly_bounded(self) -> None:
         backend = self._backend()
         with self.assertRaisesRegex(ValueError, "UTF-8 bytes"):

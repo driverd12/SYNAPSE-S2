@@ -3307,25 +3307,19 @@ class SpikingAttentionBackend:
             candidate_limit,
             max(result_limit, (candidate_limit + 1) // 2),
         )
-        spike_rows = self.memory_store.recall_candidates(
+        # One shared read connection serves both candidate sources; the store
+        # wrapper skips the surface lookup when the term list is empty.
+        candidate_sources = self.memory_store.retrieval_v2_candidate_sources(
             context_id=origin_context,
             query_spikes=query_spikes,
+            query_terms=query_terms,
             firing_values=[],
             limit=source_limit,
             recall_scope=recall_scope,
             recall_contexts=scope_records,
         )
-        surface_rows = (
-            self.memory_store.surface_recall_candidates(
-                context_id=origin_context,
-                query_terms=query_terms,
-                limit=source_limit,
-                recall_scope=recall_scope,
-                recall_contexts=scope_records,
-            )
-            if query_terms
-            else []
-        )
+        spike_rows = candidate_sources["spike"]
+        surface_rows = candidate_sources["surface"]
 
         pool: dict[str, dict[str, Any]] = {}
         memory_id_deduplications = 0

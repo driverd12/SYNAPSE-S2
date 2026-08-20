@@ -527,6 +527,158 @@ class DurableMemoryStoreTests(unittest.TestCase):
                 [],
             )
 
+    def test_retrieval_v2_candidate_sources_matches_split_helpers(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+
+            def entry(tag: str, context_id: str, spikes: list[int]) -> dict:
+                return store.upsert_entry(
+                    tag=tag,
+                    context_id=context_id,
+                    source_text=f"{tag} shared candidate connection fixture.",
+                    metadata={"display_label": f"{tag} label"},
+                    embedding_dimensions=8,
+                    spike_indices=spikes,
+                    neuron_indices=[1, 2],
+                )
+
+            # Tie group: identical updated_at plus identical spike overlap
+            # and surface terms so ordering ties are decided by memory_id.
+            with patch("memory_store.time.time", return_value=1_756_000_000.0):
+                entry("alpha-tie-b", "alpha", [1, 2])
+                entry("alpha-tie-a", "alpha", [1, 2])
+            entry("alpha-solo", "alpha", [1, 4])
+            entry("beta-connected", "beta", [2, 3])
+            entry("gamma-outside", "gamma", [1, 2, 3])
+            store.upsert_context_link(
+                source_context_id="alpha",
+                target_context_id="beta",
+                relation_type="shares_fixture",
+                confidence=0.9,
+                approved_by="unit-test",
+            )
+
+            query_spikes = {1, 2, 3}
+            query_terms = ["shared", "candidate", "fixture", "label"]
+            firing_values = [0.0, 0.4, 0.8]
+            # limit=1 forces truncation inside a tie group; limit=0 exercises
+            # the max(int(limit), 1) lower bound both helpers apply.
+            for recall_scope in ("local", "connected"):
+                scope_records = store.resolve_recall_contexts(
+                    context_id="alpha",
+                    scope=recall_scope,
+                )
+                for limit in (0, 1, 10):
+                    expected_spike = store.recall_candidates(
+                        context_id="alpha",
+                        query_spikes=query_spikes,
+                        firing_values=firing_values,
+                        limit=limit,
+                        recall_scope=recall_scope,
+                        recall_contexts=scope_records,
+                    )
+                    expected_surface = store.surface_recall_candidates(
+                        context_id="alpha",
+                        query_terms=query_terms,
+                        limit=limit,
+                        recall_scope=recall_scope,
+                        recall_contexts=scope_records,
+                    )
+
+                    connect_calls: list[int] = []
+                    real_connect = store._connect
+
+                    def counting_connect():
+                        connect_calls.append(1)
+                        return real_connect()
+
+                    with patch.object(
+                        store, "_connect", side_effect=counting_connect
+                    ):
+                        combined = store.retrieval_v2_candidate_sources(
+                            context_id="alpha",
+                            query_spikes=query_spikes,
+                            query_terms=query_terms,
+                            firing_values=firing_values,
+                            limit=limit,
+                            recall_scope=recall_scope,
+                            recall_contexts=scope_records,
+                        )
+
+                    self.assertEqual(len(connect_calls), 1)
+                    self.assertEqual(
+                        combined,
+                        {"spike": expected_spike, "surface": expected_surface},
+                    )
+                    self.assertTrue(combined["spike"])
+                    self.assertTrue(combined["surface"])
+
+            # The connected scope must admit beta rows and never gamma rows.
+            connected_records = store.resolve_recall_contexts(
+                context_id="alpha",
+                scope="connected",
+            )
+            connected = store.retrieval_v2_candidate_sources(
+                context_id="alpha",
+                query_spikes=query_spikes,
+                query_terms=query_terms,
+                firing_values=firing_values,
+                limit=10,
+                recall_scope="connected",
+                recall_contexts=connected_records,
+            )
+            connected_contexts = {
+                str(item["context_id"])
+                for item in connected["spike"] + connected["surface"]
+            }
+            self.assertIn("beta", connected_contexts)
+            self.assertNotIn("gamma", connected_contexts)
+            # The tie group stays deterministically ordered by memory_id.
+            tie_tags = [
+                item["tag"]
+                for item in connected["spike"]
+                if item["tag"].startswith("alpha-tie-")
+            ]
+            self.assertEqual(sorted(tie_tags), ["alpha-tie-a", "alpha-tie-b"])
+            self.assertEqual(
+                tie_tags,
+                sorted(
+                    tie_tags,
+                    key=lambda tag: store.stable_memory_id(
+                        context_id="alpha", tag=tag
+                    ),
+                ),
+            )
+
+            # Empty terms skip the surface helper entirely, exactly like the
+            # backend-side check the wrapper replaced, still on one connection.
+            def forbidden_surface(*args, **kwargs):
+                raise AssertionError(
+                    "surface_recall_candidates must not run for empty terms"
+                )
+
+            connect_calls = []
+            with patch.object(
+                store, "_connect", side_effect=counting_connect
+            ), patch.object(
+                store,
+                "surface_recall_candidates",
+                side_effect=forbidden_surface,
+            ):
+                empty_terms = store.retrieval_v2_candidate_sources(
+                    context_id="alpha",
+                    query_spikes=query_spikes,
+                    query_terms=[],
+                    firing_values=firing_values,
+                    limit=10,
+                    recall_scope="connected",
+                    recall_contexts=connected_records,
+                )
+            self.assertEqual(len(connect_calls), 1)
+            self.assertEqual(empty_terms["surface"], [])
+            self.assertEqual(empty_terms["spike"], connected["spike"])
+
     def test_relationships_are_upserted_listed_and_exported(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "synapse-memory.sqlite3"
