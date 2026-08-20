@@ -27,7 +27,7 @@ from scripts import release_update_plan as planner
 
 # Build id of the trusted manifest at the pinned working-tree revision.  This
 # test suite deliberately certifies the real repository root.
-REAL_ROOT_BUILD_ID = "source-a1a182919c89d7d4fd06d713"
+REAL_ROOT_BUILD_ID = "source-4a48c7cff2e3c240c227351a"
 
 PLAN_KEYS = {
     "schema",
@@ -136,6 +136,38 @@ class ReleaseUpdatePlanTests(unittest.TestCase):
         self.assertEqual(
             plan["current"]["source_build_id"], _manifest_build_id(ROOT)
         )
+
+    def test_manifest_python_imports_transitively_closed(self) -> None:
+        # Every repo-local top-level module reachable by import from a
+        # manifested Python file must itself be manifested, or the build id
+        # silently excludes code that ships with the release.
+        manifested = set(BUILD_SOURCE_MANIFEST)
+        pending = sorted(
+            name for name in manifested if name.endswith(".py")
+        )
+        visited: set[str] = set(pending)
+        unmanifested: set[str] = set()
+        while pending:
+            filename = pending.pop()
+            tree = ast.parse((ROOT / filename).read_text())
+            roots: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        roots.add(alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level == 0 and node.module is not None:
+                        roots.add(node.module.split(".")[0])
+            for root_name in roots:
+                local = f"{root_name}.py"
+                if not (ROOT / local).is_file():
+                    continue
+                if local not in manifested:
+                    unmanifested.add(local)
+                if local not in visited:
+                    visited.add(local)
+                    pending.append(local)
+        self.assertEqual(sorted(unmanifested), [])
 
     def test_identical_copied_roots_are_no_op(self) -> None:
         current = self.make_root("current")
@@ -1198,6 +1230,934 @@ class ReleaseUpdatePlanTests(unittest.TestCase):
             "importlib",
         }
         self.assertFalse(modules & forbidden)
+
+
+GATE_KEYS = {
+    "schema",
+    "mode",
+    "status",
+    "relation",
+    "apply_supported",
+    "apply_performed",
+    "provenance_verified",
+    "current",
+    "candidate",
+    "required_surfaces",
+    "changed_surfaces",
+    "missing_surfaces",
+    "unknown_surfaces",
+    "requirements",
+}
+
+EXPECTED_SURFACE_IDS = [
+    "authority-runtime-identity.v1",
+    "capture-protocol.v1",
+    "durable-store-schema.v1",
+    "readiness-quiescence.v1",
+    "recovery.v1",
+    "replication-protocol.v1",
+    "request-journal.v1",
+]
+
+CONTRACT_SOURCE_FILES = {
+    "capture_daemon.py",
+    "core_authority.py",
+    "core_request_journal.py",
+    "core_service.py",
+    "memory_store.py",
+    "operator_readiness_contract.py",
+    "recovery_manager.py",
+    "replication_protocol.py",
+    "scripts/core_agent_installer.py",
+}
+
+CONTRACT_DIGEST_PATTERN = r"\Acontract-[0-9a-f]{64}\Z"
+
+GATE_INVALID_ARGUMENTS_LINE = (
+    planner.render_plan(
+        planner._build_gate_result(
+            "unsupported:invalid-arguments",
+            None,
+            None,
+            [],
+            [],
+            planner._required_surface_ids(),
+        )
+    )
+    + "\n"
+)
+
+
+class ReleasePreservationGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.class_temporary = tempfile.TemporaryDirectory(
+            prefix="s2rpg-", dir="/tmp"
+        )
+        cls.class_base = Path(cls.class_temporary.name).resolve()
+        cls.template = cls.class_base / "template"
+        # The gate's contract sources are the manifest plus the installer
+        # script, which is deliberately outside the build manifest.
+        for name in tuple(BUILD_SOURCE_MANIFEST) + (
+            "scripts/core_agent_installer.py",
+        ):
+            destination = cls.template / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((ROOT / name).read_bytes())
+        for directory, _, files in os.walk(cls.template):
+            os.chmod(directory, 0o755)
+            for filename in files:
+                os.chmod(Path(directory) / filename, 0o644)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.class_temporary.cleanup()
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="s2rpg-", dir="/tmp")
+        self.base = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+
+    def make_root(self, name: str) -> Path:
+        destination = self.base / name
+        shutil.copytree(self.template, destination)
+        return destination
+
+    def firing_os_open(self, trigger_leaf: str, action):
+        real_open = os.open
+        state = {"fired": False}
+
+        def wrapper(path, flags, *args, **kwargs):
+            if not state["fired"] and str(path) == trigger_leaf:
+                state["fired"] = True
+                action()
+            return real_open(path, flags, *args, **kwargs)
+
+        return wrapper, state
+
+    def rewrite(self, root: Path, filename: str, old: str, new: str) -> None:
+        path = root / filename
+        text = path.read_text()
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1))
+
+    def append_bytes(self, root: Path, filename: str, suffix: bytes) -> None:
+        path = root / filename
+        path.write_bytes(path.read_bytes() + suffix)
+
+    def assert_gate_shape(self, result: dict) -> None:
+        self.assertEqual(set(result), GATE_KEYS)
+        self.assertEqual(
+            result["schema"], "synapse-s2.release-preservation-gate.v1"
+        )
+        self.assertEqual(result["mode"], "read-only-preservation-gate")
+        self.assertEqual(result["relation"], "selected-node-ast-equality.v1")
+        self.assertIs(result["apply_supported"], False)
+        self.assertIs(result["apply_performed"], False)
+        self.assertIs(result["provenance_verified"], False)
+        self.assertEqual(set(result["current"]), {"contract_digest"})
+        self.assertEqual(set(result["candidate"]), {"contract_digest"})
+        self.assertEqual(result["required_surfaces"], EXPECTED_SURFACE_IDS)
+        for key in ("changed_surfaces", "missing_surfaces", "unknown_surfaces"):
+            self.assertIsInstance(result[key], list)
+        self.assertIsInstance(result["requirements"], list)
+
+    def assert_proven_equal(self, result: dict) -> None:
+        self.assert_gate_shape(result)
+        self.assertEqual(result["status"], "proven-equal")
+        self.assertEqual(result["changed_surfaces"], [])
+        self.assertEqual(result["missing_surfaces"], [])
+        self.assertEqual(result["unknown_surfaces"], [])
+        self.assertRegex(
+            result["current"]["contract_digest"], CONTRACT_DIGEST_PATTERN
+        )
+        self.assertEqual(
+            result["current"]["contract_digest"],
+            result["candidate"]["contract_digest"],
+        )
+        self.assertEqual(planner.preservation_exit_code(result), 0)
+
+    def assert_gate_unsupported(self, result: dict, token: str) -> None:
+        self.assert_gate_shape(result)
+        self.assertEqual(result["status"], f"unsupported:{token}")
+        self.assertEqual(planner.preservation_exit_code(result), 2)
+
+    def test_surface_spec_is_stable_and_valid(self) -> None:
+        planner._validate_semantic_surfaces()
+        self.assertEqual(
+            sorted(entry[0] for entry in planner.SEMANTIC_SURFACES),
+            EXPECTED_SURFACE_IDS,
+        )
+        self.assertEqual(
+            set(planner._surface_file_items()), CONTRACT_SOURCE_FILES
+        )
+        selected = {
+            (filename, name)
+            for _, items in planner.SEMANTIC_SURFACES
+            for filename, name in items
+        }
+        for required_item in (
+            ("memory_store.py", "SQLITE_APPLICATION_ID"),
+            ("memory_store.py", "SQLITE_USER_VERSION"),
+            ("memory_store.py", "BACKUP_SCHEMA_COMPATIBILITY_REGISTRY"),
+            ("memory_store.py", "SCHEMA_SQL"),
+            ("memory_store.py", "BACKUP_CRITICAL_TABLES"),
+            ("memory_store.py", "DurableMemoryStore._run_migrations"),
+            ("core_request_journal.py", "JOURNAL_SCHEMA_IDENTITY"),
+            ("core_request_journal.py", "_REQUEST_JOURNAL_TABLE_SQL"),
+            ("core_request_journal.py", "_assert_exact_current_schema"),
+            ("core_authority.py", "CORE_AUTHORITY_SCHEMA_VERSION"),
+            ("memory_store.py", "CORE_AUTHORITY_MARKER_FIELDS"),
+            ("recovery_manager.py", "RECOVERY_BUNDLE_SCHEMA"),
+            ("recovery_manager.py", "LEGACY_RECOVERY_BUNDLE_SCHEMA"),
+            ("recovery_manager.py", "REQUEST_JOURNAL_RESTORE_BINDING_SCHEMA"),
+            ("replication_protocol.py", "REPLICATION_PROTOCOL_VERSION"),
+            ("replication_protocol.py", "NODE_DESCRIPTOR_FIELDS"),
+            ("replication_protocol.py", "ALLOWED_ARTIFACT_KINDS"),
+            (
+                "operator_readiness_contract.py",
+                "OPERATOR_READINESS_REQUIRED_PROOF_IDS",
+            ),
+            ("operator_readiness_contract.py", "QUIESCENCE_LAUNCH_AGENT_RULES"),
+            ("operator_readiness_contract.py", "REPLAY_DEBT_COUNTERS"),
+            ("core_service.py", "CORE_STORE_SCHEMA_IDENTITY"),
+            ("core_service.py", "STORE_GENERATION_SCHEMA"),
+            ("core_service.py", "STORE_GENERATION_ID_RE"),
+            ("scripts/core_agent_installer.py", "EXPECTED_SCHEMA_IDENTITY"),
+            ("recovery_manager.py", "CAPTURE_TRANSPORT_DIR_KEYS"),
+            ("memory_store.py", "CAPTURE_PROTOCOL_VERSION"),
+            ("memory_store.py", "CAPTURE_OPERATION_RESULT_KEYS"),
+            ("capture_daemon.py", "CAPTURE_SUFFIXES"),
+            ("capture_daemon.py", "CAPTURE_REPLACEMENT_FREEZE_MAX_SECONDS"),
+            ("capture_daemon.py", "CAPTURE_DEFERRED_DIR_NAME"),
+        ):
+            self.assertIn(required_item, selected)
+
+    def test_real_root_self_gate_is_proven_equal(self) -> None:
+        result = planner.run_preservation_gate(ROOT, ROOT)
+        self.assert_proven_equal(result)
+
+    def test_copied_roots_gate_is_proven_equal(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_proven_equal(result)
+        self.assertEqual(
+            result["requirements"], ["operator-review", "source-delta-review"]
+        )
+
+    def test_non_contract_change_passes_gate_but_source_plan_blocks(
+        self,
+    ) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.append_bytes(
+            candidate,
+            "memory_store.py",
+            b'\n_PRESERVATION_TUNING_HINT = "non-contract"\n',
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_proven_equal(result)
+        plan = planner.plan_release_update(current, candidate)
+        self.assertEqual(plan["classification"], "changed-unclassified")
+        self.assertEqual(plan["status"], "blocked-changed-unclassified")
+        self.assertEqual(plan["changes"], ["memory_store.py"])
+        self.assertEqual(planner.plan_exit_code(plan), 3)
+
+    def test_gate_never_executes_candidate_top_level_code(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        sentinel = self.base / "gate-sentinel-executed"
+        self.append_bytes(
+            candidate,
+            "operator_readiness_contract.py",
+            (
+                "\nimport pathlib as _gate_probe\n"
+                f"_gate_probe.Path({str(sentinel)!r}).write_text(\"executed\")\n"
+            ).encode("utf-8"),
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertFalse(sentinel.exists())
+        # The malicious statements are outside every selected node, so the
+        # accepted relation deliberately still holds; the v1 source plan is
+        # what blocks the byte delta (for manifest files) plus provenance
+        # remains unclaimed either way.
+        self.assert_proven_equal(result)
+
+    def test_selected_constant_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "memory_store.py",
+            "SQLITE_USER_VERSION = 6",
+            "SQLITE_USER_VERSION = 7",
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_gate_shape(result)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(result["changed_surfaces"], ["durable-store-schema.v1"])
+        self.assertEqual(result["missing_surfaces"], [])
+        self.assertEqual(result["unknown_surfaces"], [])
+        self.assertRegex(
+            result["current"]["contract_digest"], CONTRACT_DIGEST_PATTERN
+        )
+        self.assertRegex(
+            result["candidate"]["contract_digest"], CONTRACT_DIGEST_PATTERN
+        )
+        self.assertNotEqual(
+            result["current"]["contract_digest"],
+            result["candidate"]["contract_digest"],
+        )
+        self.assertIn("contract-review", result["requirements"])
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_selected_function_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "operator_readiness_contract.py",
+            "ensure_ascii=True",
+            "ensure_ascii=False",
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(
+            result["changed_surfaces"], ["readiness-quiescence.v1"]
+        )
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_journal_ddl_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        # First occurrence of this fragment is inside the selected
+        # _REQUEST_JOURNAL_TABLE_SQL literal.
+        self.rewrite(
+            candidate,
+            "core_request_journal.py",
+            "length(caller) BETWEEN 1 AND 128",
+            "length(caller) BETWEEN 1 AND 256",
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(result["changed_surfaces"], ["request-journal.v1"])
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_migration_method_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        # Unique statement inside DurableMemoryStore._run_migrations.
+        self.rewrite(
+            candidate,
+            "memory_store.py",
+            "core_migration_required = bool(",
+            "core_migration_required = not bool(",
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(result["changed_surfaces"], ["durable-store-schema.v1"])
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_store_generation_schema_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "core_service.py",
+            '"synapse-s2.root-generation.v1"',
+            '"synapse-s2.root-generation.v2"',
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(
+            result["changed_surfaces"], ["authority-runtime-identity.v1"]
+        )
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_installer_schema_identity_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "scripts/core_agent_installer.py",
+            '"sqlite-53324442-v6"',
+            '"sqlite-53324442-v7"',
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(result["changed_surfaces"], ["durable-store-schema.v1"])
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_capture_transport_dir_keys_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "recovery_manager.py",
+            'CAPTURE_TRANSPORT_DIR_KEYS = (\n    "inbox_dir",',
+            'CAPTURE_TRANSPORT_DIR_KEYS = (\n    "inbox_dir_v2",',
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(result["changed_surfaces"], ["recovery.v1"])
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_capture_operation_result_limit_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "memory_store.py",
+            "CAPTURE_OPERATION_RESULT_JSON_MAX_BYTES = 2048",
+            "CAPTURE_OPERATION_RESULT_JSON_MAX_BYTES = 4096",
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(result["changed_surfaces"], ["capture-protocol.v1"])
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_capture_daemon_freeze_window_change_blocks(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "capture_daemon.py",
+            "CAPTURE_REPLACEMENT_FREEZE_MAX_SECONDS = 7_200.0",
+            "CAPTURE_REPLACEMENT_FREEZE_MAX_SECONDS = 9_600.0",
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(result["changed_surfaces"], ["capture-protocol.v1"])
+        self.assertEqual(planner.preservation_exit_code(result), 3)
+
+    def test_missing_selected_names_fail_closed(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        (candidate / "operator_readiness_contract.py").write_bytes(
+            b"VALUE = 1\n"
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_gate_unsupported(result, "contract-missing")
+        self.assertEqual(result["missing_surfaces"], ["readiness-quiescence.v1"])
+        self.assertEqual(result["changed_surfaces"], [])
+        self.assertEqual(result["unknown_surfaces"], [])
+        self.assertRegex(
+            result["current"]["contract_digest"], CONTRACT_DIGEST_PATTERN
+        )
+        self.assertIsNone(result["candidate"]["contract_digest"])
+
+    def test_absent_contract_source_file_fails_closed(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        (candidate / "operator_readiness_contract.py").unlink()
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_gate_unsupported(result, "contract-missing")
+        self.assertEqual(result["missing_surfaces"], ["readiness-quiescence.v1"])
+        self.assertIsNone(result["candidate"]["contract_digest"])
+
+    def test_duplicate_selected_binding_fails_closed(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.append_bytes(
+            candidate,
+            "operator_readiness_contract.py",
+            b'\ndef quiescence_policy_digest():\n    return ""\n',
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_gate_unsupported(result, "contract-unverifiable")
+        self.assertEqual(result["unknown_surfaces"], ["readiness-quiescence.v1"])
+        self.assertIsNone(result["candidate"]["contract_digest"])
+
+    def test_unparsable_contract_source_fails_closed(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        (candidate / "operator_readiness_contract.py").write_bytes(
+            b"def broken(:\n    pass\n"
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_gate_unsupported(result, "contract-unverifiable")
+        self.assertEqual(result["unknown_surfaces"], ["readiness-quiescence.v1"])
+        self.assertIsNone(result["candidate"]["contract_digest"])
+
+    def test_rebound_selected_binding_fails_closed(self) -> None:
+        current = self.make_root("current")
+        suffixes = (
+            b"\nQUIESCENCE_POLICY_VERSION = QUIESCENCE_POLICY_VERSION\n",
+            b"\ndel REPLAY_DEBT_COUNTERS\n",
+            b"\nREPLAY_DEBT_COUNTERS += ()\n",
+            b"\ndef _shadow():\n    QUIESCENCE_POLICY_SCHEMA = None\n",
+            b"\nclass REPLAY_DEBT_COUNTERS:\n    pass\n",
+            b"\nfrom attacker import *\n",
+        )
+        for index, suffix in enumerate(suffixes):
+            candidate = self.make_root(f"candidate-rebind-{index}")
+            self.append_bytes(
+                candidate, "operator_readiness_contract.py", suffix
+            )
+            result = planner.run_preservation_gate(current, candidate)
+            self.assert_gate_unsupported(result, "contract-unverifiable")
+            self.assertEqual(
+                result["unknown_surfaces"], ["readiness-quiescence.v1"]
+            )
+
+    def test_dynamic_namespace_mutation_fails_closed(self) -> None:
+        current = self.make_root("current")
+        cases = (
+            (
+                "operator_readiness_contract.py",
+                b'\nglobals()["REPLAY_DEBT_COUNTERS"] = ()\n',
+            ),
+            (
+                "operator_readiness_contract.py",
+                b'\nvars()["QUIESCENCE_POLICY_VERSION"] = 2\n',
+            ),
+            (
+                "operator_readiness_contract.py",
+                b'\nsetattr(object(), "unrelated", 1)\n',
+            ),
+            (
+                "operator_readiness_contract.py",
+                b'\nlocals()["REPLAY_DEBT_COUNTERS"] = ()\n',
+            ),
+            (
+                "operator_readiness_contract.py",
+                b"\nclass _Probe:\n    _namespace = locals()\n",
+            ),
+            (
+                "operator_readiness_contract.py",
+                b'\n_d = {}\n_d["REPLAY_DEBT_COUNTERS"] = ()\n',
+            ),
+            (
+                "operator_readiness_contract.py",
+                b"\nimport sys as _sys\n_ns = _sys.modules[__name__].__dict__\n",
+            ),
+            (
+                "memory_store.py",
+                b"\nDurableMemoryStore._run_migrations = None\n",
+            ),
+        )
+        for index, (filename, suffix) in enumerate(cases):
+            candidate = self.make_root(f"candidate-dynamic-{index}")
+            self.append_bytes(candidate, filename, suffix)
+            result = planner.run_preservation_gate(current, candidate)
+            self.assert_gate_unsupported(result, "contract-unverifiable")
+            if filename == "operator_readiness_contract.py":
+                self.assertEqual(
+                    result["unknown_surfaces"], ["readiness-quiescence.v1"]
+                )
+            else:
+                self.assertIn(
+                    "durable-store-schema.v1", result["unknown_surfaces"]
+                )
+            self.assertIsNone(result["candidate"]["contract_digest"])
+
+    def test_imported_alias_dynamic_builtin_poc_fails_closed(self) -> None:
+        current = self.make_root("current")
+        # The exact evasion this remediation closes: a builtins re-import
+        # binds ``globals`` under a fresh name, and a non-constant subscript
+        # key (the BinOp form) defeats the watched-name Store screen.  The
+        # constant-key variant stays here as a defense-in-depth regression.
+        payloads = (
+            b"\nfrom builtins import globals as _ns\n"
+            b'_ns()["QUIESCENCE_POLICY_" + "VERSION"] = 999\n',
+            b"\nfrom builtins import globals as _ns\n"
+            b'_ns()["QUIESCENCE_POLICY_VERSION"] = 999\n',
+        )
+        for index, payload in enumerate(payloads):
+            candidate = self.make_root(f"candidate-poc-{index}")
+            self.append_bytes(
+                candidate, "operator_readiness_contract.py", payload
+            )
+            result = planner.run_preservation_gate(current, candidate)
+            self.assert_gate_unsupported(result, "contract-unverifiable")
+            self.assertEqual(
+                result["unknown_surfaces"], ["readiness-quiescence.v1"]
+            )
+            self.assertIsNone(result["candidate"]["contract_digest"])
+
+    def test_dynamic_builtin_import_denylist_matrix_unverifiable(self) -> None:
+        base = "SELECTED = 1\n"
+        names = frozenset({"SELECTED"})
+        denied = (
+            "exec",
+            "eval",
+            "globals",
+            "vars",
+            "setattr",
+            "delattr",
+            "__import__",
+            "locals",
+        )
+        payloads = []
+        for name in denied:
+            payloads.append(f"from builtins import {name}\n")
+            payloads.append(f"from builtins import {name} as _borrowed\n")
+            payloads.append(f"from json import {name}\n")
+            payloads.append(f"from json import dumps as {name}\n")
+            payloads.append(f"import json as {name}\n")
+            payloads.append(f"_probe = _module.{name}\n")
+        payloads.extend(
+            (
+                "import builtins\n",
+                "import builtins as _b\n",
+                "import importlib\n",
+                "import importlib.util\n",
+                "from importlib import import_module\n",
+                "from json import dumps as builtins\n",
+                "import json as builtins\n",
+                "_b = __builtins__\n",
+                "_alias = _module.__dict__\n",
+                "_view = _module.__dict__.keys()\n",
+            )
+        )
+        for payload in payloads:
+            source = (base + payload).encode("utf-8")
+            self.assertIsNone(
+                planner._analyze_contract_source(source, names), payload
+            )
+        # Negative controls: function-body ``locals()`` and read-only
+        # ``__dict__.items()`` iteration stay verifiable.
+        legit = (
+            base
+            + "def _probe(obj):\n"
+            + "    _snapshot = locals()\n"
+            + "    return sorted(obj.__dict__.items()) + sorted(_snapshot)\n"
+        ).encode("utf-8")
+        analysis = planner._analyze_contract_source(legit, names)
+        self.assertIsNotNone(analysis)
+        self.assertEqual(set(analysis), {"SELECTED"})
+
+    def test_function_body_locals_and_dict_items_stay_proven_equal(
+        self,
+    ) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.append_bytes(
+            candidate,
+            "operator_readiness_contract.py",
+            b"\ndef _legit_probe(obj):\n"
+            b"    _snapshot = locals()\n"
+            b"    return sorted(obj.__dict__.items()) + sorted(_snapshot)\n",
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_proven_equal(result)
+
+    def test_unverifiable_takes_precedence_over_missing(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        (candidate / "operator_readiness_contract.py").write_bytes(
+            b"VALUE = 1\n"
+        )
+        self.append_bytes(
+            candidate, "core_authority.py", b'\nglobals()["x"] = 1\n'
+        )
+        result = planner.run_preservation_gate(current, candidate)
+        self.assert_gate_unsupported(result, "contract-unverifiable")
+        self.assertEqual(
+            result["unknown_surfaces"], ["authority-runtime-identity.v1"]
+        )
+        self.assertEqual(result["missing_surfaces"], ["readiness-quiescence.v1"])
+
+    def test_contract_complexity_bounded_before_parse(self) -> None:
+        # Headroom: the largest trusted contract source stays well inside a
+        # quarter of both analysis ceilings.
+        trusted = (ROOT / "memory_store.py").read_bytes()
+        self.assertLessEqual(
+            len(trusted), planner.MAX_CONTRACT_SOURCE_BYTES // 4
+        )
+        trusted_tokens = sum(
+            1 for _ in tokenize.tokenize(io.BytesIO(trusted).readline)
+        )
+        self.assertLessEqual(
+            trusted_tokens, planner.MAX_CONTRACT_SOURCE_TOKENS // 4
+        )
+        dense = b"a=1;" * (planner.MAX_CONTRACT_SOURCE_TOKENS // 4 + 64) + b"\n"
+        oversize = b"#" + b"x" * planner.MAX_CONTRACT_SOURCE_BYTES
+        real_parse = planner.ast.parse
+
+        def guarded_parse(source, *args, **kwargs):
+            text = (
+                source.decode("utf-8", "replace")
+                if isinstance(source, (bytes, bytearray))
+                else source
+            )
+            if text.startswith(("a=1;", "#x")):
+                raise AssertionError("ast.parse reached for complexity payload")
+            return real_parse(source, *args, **kwargs)
+
+        current = self.make_root("current")
+        for index, payload in enumerate((dense, oversize)):
+            candidate = self.make_root(f"candidate-{index}")
+            (candidate / "operator_readiness_contract.py").write_bytes(payload)
+            with mock.patch.object(planner.ast, "parse", new=guarded_parse):
+                result = planner.run_preservation_gate(current, candidate)
+            self.assert_gate_unsupported(result, "contract-unverifiable")
+            self.assertEqual(
+                result["unknown_surfaces"], ["readiness-quiescence.v1"]
+            )
+
+    def test_contract_read_race_fails_closed(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        victim = current / "core_authority.py"
+
+        def append_to_victim() -> None:
+            with open(victim, "ab") as handle:
+                handle.write(b"#")
+
+        wrapper, state = self.firing_os_open(
+            "core_authority.py", append_to_victim
+        )
+        with mock.patch.object(planner.os, "open", new=wrapper):
+            result = planner.run_preservation_gate(current, candidate)
+        self.assertTrue(state["fired"])
+        self.assert_gate_unsupported(result, "validation-race")
+        self.assertEqual(result["unknown_surfaces"], EXPECTED_SURFACE_IDS)
+        self.assertIsNone(result["current"]["contract_digest"])
+        self.assertIsNone(result["candidate"]["contract_digest"])
+
+    def test_symlink_hardlink_and_fifo_contract_sources_fail_closed(
+        self,
+    ) -> None:
+        current = self.make_root("current")
+        symlinked = self.make_root("candidate-symlink")
+        victim = symlinked / "operator_readiness_contract.py"
+        victim.unlink()
+        victim.symlink_to(symlinked / "replication_protocol.py")
+        result = planner.run_preservation_gate(current, symlinked)
+        self.assert_gate_unsupported(result, "file-unsafe")
+        self.assertEqual(result["unknown_surfaces"], EXPECTED_SURFACE_IDS)
+
+        hardlinked = self.make_root("candidate-hardlink")
+        os.link(
+            hardlinked / "operator_readiness_contract.py",
+            self.base / "outside-hardlink",
+        )
+        result = planner.run_preservation_gate(current, hardlinked)
+        self.assert_gate_unsupported(result, "file-unsafe")
+
+        fifo_root = self.make_root("candidate-fifo")
+        fifo_victim = fifo_root / "operator_readiness_contract.py"
+        fifo_victim.unlink()
+        os.mkfifo(fifo_victim)
+        result_holder: dict[str, dict] = {}
+
+        def run_gate() -> None:
+            result_holder["result"] = planner.run_preservation_gate(
+                current, fifo_root
+            )
+
+        worker = threading.Thread(target=run_gate, daemon=True)
+        worker.start()
+        worker.join(timeout=60)
+        self.assertFalse(worker.is_alive(), "gate blocked on FIFO")
+        self.assert_gate_unsupported(result_holder["result"], "file-unsafe")
+
+    def test_gate_descriptors_closed_after_success_and_failure(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        missing_candidate = self.make_root("missing-candidate")
+        (missing_candidate / "operator_readiness_contract.py").unlink()
+        unsafe_candidate = self.make_root("unsafe-candidate")
+        unsafe_victim = unsafe_candidate / "core_authority.py"
+        unsafe_victim.unlink()
+        unsafe_victim.symlink_to(unsafe_candidate / "memory_store.py")
+        real_open, real_close = os.open, os.close
+        opened: set = set()
+
+        def tracking_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.add(fd)
+            return fd
+
+        def tracking_close(fd):
+            real_close(fd)
+            opened.discard(fd)
+
+        with mock.patch.object(os, "open", new=tracking_open), mock.patch.object(
+            os, "close", new=tracking_close
+        ):
+            result = planner.run_preservation_gate(current, candidate)
+            self.assertEqual(result["status"], "proven-equal")
+            self.assertEqual(opened, set(), "descriptor leaked on success")
+            result = planner.run_preservation_gate(current, missing_candidate)
+            self.assert_gate_unsupported(result, "contract-missing")
+            self.assertEqual(opened, set(), "descriptor leaked on missing")
+            result = planner.run_preservation_gate(current, unsafe_candidate)
+            self.assert_gate_unsupported(result, "file-unsafe")
+            self.assertEqual(opened, set(), "descriptor leaked on abort")
+
+    def test_gate_tripwires_no_mutation_spawn_network_or_sqlite(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        real_os_open = os.open
+
+        def read_only_os_open(path, flags, *args, **kwargs):
+            forbidden = (
+                os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+            )
+            if flags & forbidden:
+                raise AssertionError("gate attempted a writable os.open")
+            return real_os_open(path, flags, *args, **kwargs)
+
+        tripwire = AssertionError("forbidden side channel invoked")
+        targets = [
+            (os, "rename"),
+            (os, "replace"),
+            (os, "unlink"),
+            (os, "remove"),
+            (os, "rmdir"),
+            (os, "mkdir"),
+            (os, "chmod"),
+            (os, "link"),
+            (os, "symlink"),
+            (os, "utime"),
+            (os, "truncate"),
+            (os, "system"),
+            (os, "posix_spawn"),
+            (os, "posix_spawnp"),
+            (subprocess, "Popen"),
+            (subprocess, "run"),
+            (socket, "socket"),
+            (socket, "create_connection"),
+            (sqlite3, "connect"),
+        ]
+        with contextlib.ExitStack() as stack:
+            for target, attribute in targets:
+                stack.enter_context(
+                    mock.patch.object(target, attribute, side_effect=tripwire)
+                )
+            stack.enter_context(mock.patch("builtins.open", side_effect=tripwire))
+            stack.enter_context(
+                mock.patch.object(io, "open", side_effect=tripwire)
+            )
+            for attribute in (
+                "write_text",
+                "write_bytes",
+                "touch",
+                "mkdir",
+                "rmdir",
+                "unlink",
+                "rename",
+                "replace",
+                "symlink_to",
+                "hardlink_to",
+                "chmod",
+                "open",
+            ):
+                stack.enter_context(
+                    mock.patch.object(
+                        pathlib.Path, attribute, side_effect=tripwire
+                    )
+                )
+            stack.enter_context(
+                mock.patch.object(planner.os, "open", new=read_only_os_open)
+            )
+            result = planner.run_preservation_gate(current, candidate)
+        self.assert_proven_equal(result)
+
+    def test_gate_cli_output_is_deterministic_single_line_and_redacted(
+        self,
+    ) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        self.rewrite(
+            candidate,
+            "memory_store.py",
+            "SQLITE_USER_VERSION = 6",
+            "SQLITE_USER_VERSION = 7",
+        )
+        argv = [
+            "--preservation-gate",
+            "--current-root",
+            str(current),
+            "--candidate-root",
+            str(candidate),
+        ]
+        outputs = []
+        codes = []
+        for _ in range(2):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                codes.append(planner.main(argv))
+            outputs.append(stdout.getvalue())
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(codes, [3, 3])
+        line = outputs[0]
+        self.assertTrue(line.endswith("\n"))
+        self.assertEqual(line.count("\n"), 1)
+        body = line[:-1]
+        self.assertNotIn(str(self.base), body)
+        self.assertNotIn(str(ROOT), body)
+        self.assertNotIn("Traceback", body)
+        result = json.loads(body)
+        self.assert_gate_shape(result)
+        self.assertEqual(result["status"], "blocked-contract-change")
+        self.assertEqual(
+            body, json.dumps(result, sort_keys=True, separators=(",", ":"))
+        )
+
+    def test_gate_cli_rejects_expected_build_id_combination(self) -> None:
+        current = self.make_root("current")
+        candidate = self.make_root("candidate")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = planner.main(
+                [
+                    "--preservation-gate",
+                    "--current-root",
+                    str(current),
+                    "--candidate-root",
+                    str(candidate),
+                    "--expected-candidate-build-id",
+                    "source-" + "0" * 24,
+                ]
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), GATE_INVALID_ARGUMENTS_LINE)
+
+    def test_gate_cli_argument_errors_emit_gate_shaped_json(self) -> None:
+        current = self.make_root("current")
+        argv_cases = [
+            ["--preservation-gate"],
+            ["--preservation-gate", "--current-root", str(current)],
+            ["--preservation-gate", "--unknown"],
+        ]
+        for argv in argv_cases:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = planner.main(argv)
+            self.assertEqual(code, 2)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(stdout.getvalue(), GATE_INVALID_ARGUMENTS_LINE)
+
+    def test_gate_cli_subprocess_isolated_mode_proven_equal(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(ROOT / "scripts" / "release_update_plan.py"),
+                "--preservation-gate",
+                "--current-root",
+                str(ROOT),
+                "--candidate-root",
+                str(ROOT),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(self.base),
+            timeout=300,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(completed.stdout.count("\n"), 1)
+        result = json.loads(completed.stdout)
+        self.assert_proven_equal(result)
 
 
 if __name__ == "__main__":
