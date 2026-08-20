@@ -3708,17 +3708,23 @@ class SpikingAttentionBackend:
         edges: list[dict[str, Any]] = []
         truncated = False
         fetch_limit = RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR + 1
+        # One bounded store call loads both directions for every anchor;
+        # per-anchor buckets keep the legacy two-query row semantics.
+        incident_buckets = self.memory_store.list_incident_relationships_for_anchors(
+            normalized_anchors,
+            limit_per_direction=fetch_limit,
+        )
+        incident_by_anchor = {
+            (str(bucket["memory_id"]), str(bucket["context_id"])): bucket
+            for bucket in incident_buckets
+        }
         for anchor in normalized_anchors:
-            outgoing = self.memory_store.list_relationships(
-                context_id=anchor["context_id"],
-                source_memory_id=anchor["memory_id"],
-                limit=fetch_limit,
+            bucket = incident_by_anchor.get(
+                (anchor["memory_id"], anchor["context_id"]),
+                {"outgoing": [], "incoming": []},
             )
-            incoming = self.memory_store.list_relationships(
-                context_id=anchor["context_id"],
-                target_memory_id=anchor["memory_id"],
-                limit=fetch_limit,
-            )
+            outgoing = bucket["outgoing"]
+            incoming = bucket["incoming"]
             if len(outgoing) > RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR:
                 truncated = True
             if len(incoming) > RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR:

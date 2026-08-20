@@ -444,6 +444,152 @@ class RetrievalV2Tests(unittest.TestCase):
         )
         self.assertGreaterEqual(result["work"]["graph_neighbor_loads"], 2)
 
+    def test_graph_snapshot_batches_relationship_reads_into_single_call(self) -> None:
+        backend = self._backend()
+        store = backend.memory_store
+        anchor_alpha = backend.register_text_trace(
+            tag="alpha-anchor",
+            text="Alpha anchor calibration note.",
+            context_id="alpha",
+        )
+        anchor_beta = backend.register_text_trace(
+            tag="beta-anchor",
+            text="Beta anchor calibration note.",
+            context_id="beta",
+        )
+        alpha_neighbor = backend.register_text_trace(
+            tag="alpha-neighbor",
+            text="Alpha neighbor detail.",
+            context_id="alpha",
+        )
+        beta_neighbor = backend.register_text_trace(
+            tag="beta-neighbor",
+            text="Beta neighbor detail.",
+            context_id="beta",
+        )
+        store.upsert_relationship(
+            context_id="alpha",
+            source_memory_id=anchor_alpha["memory_id"],
+            target_memory_id=alpha_neighbor["memory_id"],
+            relation_type="supports",
+            weight=0.9,
+        )
+        store.upsert_relationship(
+            context_id="alpha",
+            source_memory_id=anchor_alpha["memory_id"],
+            target_memory_id=anchor_alpha["memory_id"],
+            relation_type="self-loop",
+            weight=0.8,
+        )
+        store.upsert_relationship(
+            context_id="alpha",
+            source_memory_id=beta_neighbor["memory_id"],
+            target_memory_id=anchor_alpha["memory_id"],
+            relation_type="invalid-cross-context",
+            weight=1.0,
+        )
+        store.upsert_relationship(
+            context_id="beta",
+            source_memory_id=anchor_beta["memory_id"],
+            target_memory_id=beta_neighbor["memory_id"],
+            relation_type="supports",
+            weight=0.7,
+        )
+
+        anchors = [
+            {"memory_id": anchor_beta["memory_id"], "context_id": "beta"},
+            {"memory_id": anchor_alpha["memory_id"], "context_id": "alpha"},
+        ]
+        expected_anchors = sorted(
+            (dict(anchor) for anchor in anchors),
+            key=lambda anchor: (anchor["memory_id"], anchor["context_id"]),
+        )
+
+        def legacy_shim(anchor_list, *, limit_per_direction, _conn=None):
+            return [
+                {
+                    "memory_id": anchor["memory_id"],
+                    "context_id": anchor["context_id"],
+                    "outgoing": store.list_relationships(
+                        context_id=anchor["context_id"],
+                        source_memory_id=anchor["memory_id"],
+                        limit=limit_per_direction,
+                    ),
+                    "incoming": store.list_relationships(
+                        context_id=anchor["context_id"],
+                        target_memory_id=anchor["memory_id"],
+                        limit=limit_per_direction,
+                    ),
+                }
+                for anchor in anchor_list
+            ]
+
+        with patch.object(
+            store,
+            "list_incident_relationships_for_anchors",
+            side_effect=legacy_shim,
+        ):
+            expected = backend._retrieval_v2_graph_edges(anchors, enabled=True)
+
+        batch_calls: list[dict[str, object]] = []
+        real_batch = store.list_incident_relationships_for_anchors
+
+        def recording_batch(anchor_list, **kwargs):
+            batch_calls.append(
+                {
+                    "anchors": [dict(anchor) for anchor in anchor_list],
+                    "kwargs": dict(kwargs),
+                }
+            )
+            return real_batch(anchor_list, **kwargs)
+
+        def forbidden_list_relationships(*args, **kwargs):
+            raise AssertionError(
+                "list_relationships must never run on the Retrieval-v2 "
+                "graph-snapshot path"
+            )
+
+        with patch.object(
+            store,
+            "list_incident_relationships_for_anchors",
+            side_effect=recording_batch,
+        ), patch.object(
+            store,
+            "list_relationships",
+            side_effect=forbidden_list_relationships,
+        ):
+            snapshot = backend._retrieval_v2_graph_edges(anchors, enabled=True)
+            empty_snapshot = backend._retrieval_v2_graph_edges([], enabled=True)
+
+        self.assertEqual(len(batch_calls), 1)
+        batch_call = batch_calls[0]
+        self.assertEqual(batch_call["anchors"], expected_anchors)
+        self.assertEqual(batch_call["kwargs"].get("limit_per_direction"), 17)
+        self.assertEqual(
+            batch_call["kwargs"].get("limit_per_direction"),
+            mlx_backend.RETRIEVAL_V2_MAX_GRAPH_EDGES_PER_ANCHOR + 1,
+        )
+
+        self.assertEqual(snapshot["edges"], expected["edges"])
+        self.assertEqual(snapshot["revision"], expected["revision"])
+        self.assertEqual(snapshot["truncated"], expected["truncated"])
+        self.assertEqual(snapshot, expected)
+
+        relation_types = {edge["relation_type"] for edge in snapshot["edges"]}
+        self.assertIn("invalid-cross-context", relation_types)
+        self_loop_edges = [
+            edge
+            for edge in snapshot["edges"]
+            if edge["source_memory_id"] == edge["target_memory_id"]
+        ]
+        self.assertEqual(len(self_loop_edges), 1)
+        self.assertEqual(
+            self_loop_edges[0]["anchor_memory_id"], anchor_alpha["memory_id"]
+        )
+
+        self.assertEqual(empty_snapshot["edges"], [])
+        self.assertEqual(len(batch_calls), 1)
+
     def test_prompt_terms_and_candidate_work_are_strictly_bounded(self) -> None:
         backend = self._backend()
         with self.assertRaisesRegex(ValueError, "UTF-8 bytes"):

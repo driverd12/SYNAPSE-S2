@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from memory_store import (
+    INCIDENT_RELATIONSHIP_MAX_ANCHORS,
     LEGACY_OPTIONAL_SECRET_IDENTIFIER_COLUMNS,
     LEGACY_SECRET_CONTENT_COLUMNS,
     LEGACY_SECRET_IDENTIFIER_COLUMNS,
@@ -568,6 +569,193 @@ class DurableMemoryStoreTests(unittest.TestCase):
         self.assertEqual(relationships[0]["evidence"]["surprise_score"], 0.71)
         self.assertEqual(stats["relationship_count"], 1)
         self.assertEqual(exported["relationships"][0]["weight"], 0.87)
+
+    def test_incident_relationship_batches_match_legacy_direction_queries(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "synapse-memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+
+            def entry(tag: str, context_id: str) -> dict:
+                return store.upsert_entry(
+                    tag=tag,
+                    context_id=context_id,
+                    source_text=f"{tag} incident batch fixture text.",
+                    metadata={},
+                    embedding_dimensions=8,
+                    spike_indices=[1],
+                    neuron_indices=[2],
+                )
+
+            anchor_one = entry("anchor-one", "demo")
+            anchor_two = entry("anchor-two", "demo")
+            neighbor_one = entry("neighbor-one", "demo")
+            neighbor_two = entry("neighbor-two", "demo")
+            beta_anchor = entry("beta-anchor", "beta")
+            beta_neighbor = entry("beta-neighbor", "beta")
+            beta_outsider = entry("beta-outsider", "beta")
+
+            def relate(context_id, source, target, weight, relation_type="supports"):
+                return store.upsert_relationship(
+                    context_id=context_id,
+                    source_memory_id=source["memory_id"],
+                    target_memory_id=target["memory_id"],
+                    relation_type=relation_type,
+                    weight=weight,
+                )
+
+            relate("demo", anchor_one, neighbor_one, 0.9)
+            relate("demo", neighbor_two, anchor_one, 0.8)
+            self_loop = relate(
+                "demo", anchor_one, anchor_one, 0.7, relation_type="self-loop"
+            )
+            relate("demo", anchor_one, anchor_two, 0.6, relation_type="anchor-link")
+            # Invalid cross-context endpoint: must remain visible so the
+            # retrieval caller can count and reject it.
+            relate(
+                "demo", anchor_one, beta_outsider, 1.0, relation_type="cross-context"
+            )
+            relate("beta", beta_anchor, beta_neighbor, 0.5)
+            # Over-limit tie group: identical weight and updated_at so the
+            # cutoff lands inside a tie for anchor-two's outgoing bucket.
+            with patch("memory_store.time.time", return_value=1_755_000_000.0):
+                for target in (
+                    neighbor_one,
+                    neighbor_two,
+                    anchor_one,
+                    beta_neighbor,
+                    beta_outsider,
+                ):
+                    relate("demo", anchor_two, target, 0.4, relation_type="tie")
+
+            limit = 3
+            anchors = [
+                {"memory_id": anchor_one["memory_id"], "context_id": "demo"},
+                {"memory_id": anchor_one["memory_id"], "context_id": "demo"},
+                {"memory_id": anchor_two["memory_id"], "context_id": "demo"},
+                {"memory_id": beta_anchor["memory_id"], "context_id": "beta"},
+                {"memory_id": "", "context_id": "demo"},
+                {"memory_id": anchor_one["memory_id"], "context_id": ""},
+            ]
+
+            executed_sql: list[str] = []
+            real_connect = store._connect
+
+            def tracing_connect():
+                conn = real_connect()
+                conn.set_trace_callback(executed_sql.append)
+                return conn
+
+            with patch.object(store, "_connect", side_effect=tracing_connect):
+                buckets = store.list_incident_relationships_for_anchors(
+                    anchors,
+                    limit_per_direction=limit,
+                )
+
+            relationship_selects = [
+                sql
+                for sql in executed_sql
+                if sql.lstrip().upper().startswith("SELECT")
+                and "FROM memory_relationships" in sql
+            ]
+            self.assertEqual(len(relationship_selects), 1)
+
+            self.assertEqual(
+                [(bucket["memory_id"], bucket["context_id"]) for bucket in buckets],
+                [
+                    (anchor_one["memory_id"], "demo"),
+                    (anchor_two["memory_id"], "demo"),
+                    (beta_anchor["memory_id"], "beta"),
+                ],
+            )
+            for bucket in buckets:
+                self.assertEqual(
+                    bucket["outgoing"],
+                    store.list_relationships(
+                        context_id=bucket["context_id"],
+                        source_memory_id=bucket["memory_id"],
+                        limit=limit,
+                    ),
+                )
+                self.assertEqual(
+                    bucket["incoming"],
+                    store.list_relationships(
+                        context_id=bucket["context_id"],
+                        target_memory_id=bucket["memory_id"],
+                        limit=limit,
+                    ),
+                )
+
+            total_rows = sum(
+                len(bucket["outgoing"]) + len(bucket["incoming"])
+                for bucket in buckets
+            )
+            self.assertLessEqual(total_rows, len(buckets) * 2 * limit)
+
+            anchor_one_bucket = buckets[0]
+            self.assertEqual(
+                [row["relation_type"] for row in anchor_one_bucket["outgoing"]],
+                ["cross-context", "supports", "self-loop"],
+            )
+            self.assertIn(
+                self_loop["relationship_id"],
+                [row["relationship_id"] for row in anchor_one_bucket["outgoing"]],
+            )
+            self.assertIn(
+                self_loop["relationship_id"],
+                [row["relationship_id"] for row in anchor_one_bucket["incoming"]],
+            )
+            anchor_two_bucket = buckets[1]
+            self.assertEqual(len(anchor_two_bucket["outgoing"]), limit)
+            self.assertEqual(
+                {row["relation_type"] for row in anchor_two_bucket["outgoing"]},
+                {"tie"},
+            )
+            self.assertEqual(
+                [row["relation_type"] for row in anchor_two_bucket["incoming"]],
+                ["anchor-link"],
+            )
+            self.assertEqual(
+                [row["relation_type"] for row in buckets[2]["outgoing"]],
+                ["supports"],
+            )
+            self.assertEqual(buckets[2]["incoming"], [])
+
+            with patch.object(
+                store,
+                "_connect",
+                side_effect=AssertionError(
+                    "empty anchors must not read the database"
+                ),
+            ):
+                self.assertEqual(
+                    store.list_incident_relationships_for_anchors(
+                        [],
+                        limit_per_direction=limit,
+                    ),
+                    [],
+                )
+                self.assertEqual(
+                    store.list_incident_relationships_for_anchors(
+                        [{"memory_id": "", "context_id": "demo"}],
+                        limit_per_direction=limit,
+                    ),
+                    [],
+                )
+
+            overflow_anchors = [
+                {
+                    "memory_id": anchor_one["memory_id"],
+                    "context_id": f"overflow-context-{index}",
+                }
+                for index in range(INCIDENT_RELATIONSHIP_MAX_ANCHORS + 2)
+            ]
+            overflow_buckets = store.list_incident_relationships_for_anchors(
+                overflow_anchors,
+                limit_per_direction=limit,
+            )
+            self.assertEqual(
+                len(overflow_buckets), INCIDENT_RELATIONSHIP_MAX_ANCHORS
+            )
 
     def test_context_link_suggestions_are_density_normalized_and_read_only(self):
         with TemporaryDirectory() as tmp:

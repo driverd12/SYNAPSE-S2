@@ -78,6 +78,7 @@ _RETRIEVAL_MAX_CONTEXTS = 64
 _RETRIEVAL_SNAPSHOT_REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _RETRIEVAL_GENERATION_KEY_PREFIX = "retrieval_snapshot_generation.v1"
 _RETRIEVAL_GENERATION_MAX = 9_223_372_036_854_775_807
+INCIDENT_RELATIONSHIP_MAX_ANCHORS = 8
 NAMESPACE_CATALOG_SCHEMA = "synapse-s2.namespace-catalog.v1"
 NAMESPACE_CATALOG_METADATA_PREFIX = "namespace_catalog.v1:"
 _NAMESPACE_GRAPH_CLUSTER_METADATA_KEYS = frozenset(
@@ -12736,6 +12737,109 @@ class DurableMemoryStore:
         except Exception:
             LOGGER.exception("failed to list memory relationships")
             raise
+
+    def list_incident_relationships_for_anchors(
+        self,
+        anchors: Iterable[dict[str, Any]],
+        *,
+        limit_per_direction: int,
+        _conn: sqlite3.Connection | None = None,
+    ) -> list[dict[str, Any]]:
+        """Batch-load outgoing+incoming relationships for bounded anchors.
+
+        One SQL statement covers every anchor/direction pair; each UNION ALL
+        branch reproduces the ``list_relationships`` context+endpoint filter,
+        ORDER BY, and LIMIT so per-bucket rows stay identical to two legacy
+        calls. Endpoint entries are deliberately not context-filtered:
+        cross-context rows must stay visible for caller-side rejection.
+        """
+        normalized: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for anchor in anchors:
+            memory_id = str((anchor or {}).get("memory_id") or "")
+            context_id = str((anchor or {}).get("context_id") or "")
+            if not memory_id or not context_id:
+                continue
+            key = (memory_id, context_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"memory_id": memory_id, "context_id": context_id})
+            if len(normalized) >= INCIDENT_RELATIONSHIP_MAX_ANCHORS:
+                break
+        buckets: list[dict[str, Any]] = [
+            {
+                "memory_id": anchor["memory_id"],
+                "context_id": anchor["context_id"],
+                "outgoing": [],
+                "incoming": [],
+            }
+            for anchor in normalized
+        ]
+        if not normalized:
+            return buckets
+        bounded_limit = min(max(int(limit_per_direction), 1), 10_000)
+        branches: list[str] = []
+        params: list[Any] = []
+        for anchor_index, anchor in enumerate(normalized):
+            for direction_index, endpoint_column in enumerate(
+                ("source_memory_id", "target_memory_id")
+            ):
+                branches.append(
+                    f"""
+                    SELECT * FROM (
+                        SELECT
+                            ? AS incident_bucket,
+                            r.*,
+                            source.tag AS source_tag,
+                            target.tag AS target_tag
+                        FROM memory_relationships AS r
+                        JOIN memory_entries AS source
+                            ON source.memory_id = r.source_memory_id
+                        JOIN memory_entries AS target
+                            ON target.memory_id = r.target_memory_id
+                        WHERE r.context_id = ? AND r.{endpoint_column} = ?
+                        ORDER BY r.weight DESC, r.updated_at DESC
+                        LIMIT ?
+                    )
+                    """
+                )
+                params.extend(
+                    (
+                        anchor_index * 2 + direction_index,
+                        anchor["context_id"],
+                        anchor["memory_id"],
+                        bounded_limit,
+                    )
+                )
+        try:
+            with self._read_connection_scope(_conn) as conn:
+                rows = conn.execute(
+                    "\nUNION ALL\n".join(branches),
+                    tuple(params),
+                ).fetchall()
+        except Exception:
+            LOGGER.exception("failed to batch-list incident memory relationships")
+            raise
+        bucket_rows: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            bucket_rows.setdefault(int(row["incident_bucket"]), []).append(row)
+        for bucket_index, branch_rows in bucket_rows.items():
+            anchor_index, direction_index = divmod(bucket_index, 2)
+            # Stable re-sort on the raw SQL sort key: a no-op when the
+            # engine already emitted branch rows in ORDER BY order, and it
+            # preserves in-tie emission order either way.
+            branch_rows.sort(
+                key=lambda row: (
+                    -float(row["weight"]),
+                    -float(row["updated_at"]),
+                )
+            )
+            direction = "outgoing" if direction_index == 0 else "incoming"
+            buckets[anchor_index][direction] = [
+                self._row_to_relationship(row) for row in branch_rows
+            ]
+        return buckets
 
     def delete_entry(
         self,
