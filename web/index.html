@@ -1228,51 +1228,61 @@
         <div><strong>Compute</strong><small id="footerGpu">MLX --</small></div>
         <div><strong>Contexts</strong><small id="footerContexts">--</small></div>
         <div><strong>Time</strong><small id="footerTime">--</small></div>
-        <button id="impactToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="impactDrawer" title="Show approximate SYNAPSE-S2 impact">
-          <strong>≈ Impact</strong><small id="footerImpact">hidden</small>
+        <button id="impactToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="impactDrawer" title="Show the observed SYNAPSE-S2 scorecard">
+          <strong>▣ Observed</strong><small id="footerImpact">loading</small>
         </button>
-        <button id="memoraShadowToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="memoraShadowDrawer" title="Review governed Memora cue bindings">
-          <strong>◇ Cues</strong><small id="footerMemoraShadow">hidden</small>
+        <button id="memoraShadowToggleButton" class="impact-toggle" type="button" aria-expanded="false" aria-controls="memoraShadowDrawer" title="Review governed retrieval associations">
+          <strong>◇ Associations</strong><small id="footerMemoraShadow">open to inspect</small>
         </button>
       </footer>
       <aside id="impactDrawer" class="impact-drawer" hidden aria-labelledby="impactTitle">
         <div class="impact-drawer-header">
           <div>
-            <p class="section-label">Approximate impact</p>
-            <h2 id="impactTitle">What SYNAPSE-S2 is doing for you</h2>
+            <p class="section-label">Observed scorecard</p>
+            <h2 id="impactTitle">What SYNAPSE-S2 has measured</h2>
           </div>
           <button id="impactCloseButton" class="icon-button compact" type="button" aria-label="Hide impact panel">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
           </button>
         </div>
+        <p class="panel-note" id="impactScope">Observed, content-free telemetry from dashboard recalls only. It describes retrieval activity and latency; it does not prove relevance, correctness, time saved, money saved, or avoided operator work.</p>
         <div id="impactMetrics" class="impact-metrics" aria-live="polite">
-          <div><span>Recall assists</span><strong>--</strong><small>dashboard coverage</small></div>
-          <div><span>Bridge assists</span><strong>--</strong><small>approved one-hop evidence</small></div>
-          <div><span>Recall p95</span><strong>--</strong><small>milliseconds</small></div>
-          <div><span>Equivalent estimate</span><strong>--</strong><small>not billing</small></div>
+          <div><span>Non-empty dashboard recalls</span><strong>--</strong><small>observed retrieval yield</small></div>
+          <div><span>Approved bridge paths</span><strong>--</strong><small>observed one-hop routing</small></div>
+          <div><span>Recall p95</span><strong>--</strong><small>observed backend milliseconds</small></div>
+          <div><span>Observed response estimate</span><strong>--</strong><small>bytes ÷ 4; not billing</small></div>
+        </div>
+        <div class="impact-assumptions" aria-labelledby="impactCalculatorTitle">
+          <strong id="impactCalculatorTitle">Hypothetical what-if calculator</strong>
+          <p class="panel-note">Use these editable assumptions to explore a model-input equivalent. This is separate from observed impact and is not a savings claim.</p>
         </div>
         <div class="impact-assumptions">
-          <label>Example input rate ($ / 1M tokens)<input id="impactTokenRate" type="number" min="0" max="1000" step="0.01" value="5" /></label>
-          <label>Assumed tokens displaced / assist<input id="impactTokensPerAssist" type="number" min="0" max="1000000" step="100" value="1500" /></label>
+          <label>What-if input rate ($ / 1M tokens)<input id="impactTokenRate" type="number" min="0" max="1000" step="0.01" value="5" /></label>
+          <label>What-if tokens / non-empty recall<input id="impactTokensPerAssist" type="number" min="0" max="1000000" step="100" value="1500" /></label>
         </div>
-        <p id="impactCaveat" class="panel-note">Illustrative equivalent only. This is not a provider bill or a proven counterfactual saving; edit the assumptions to match your workflow.</p>
+        <p id="impactCaveat" class="panel-note">Illustrative equivalent only. This is not a provider bill or a proven counterfactual saving; edit the assumptions to match your workflow. Coverage is dashboard-only and spans all namespaces.</p>
+        <div class="impact-assumptions" aria-labelledby="impactPolicyTitle">
+          <strong id="impactPolicyTitle">Productization doctrine</strong>
+          <p class="panel-note">The agent owns observation, classification, measurement, planning, and reversible policy-governed actions. Human approval remains for destructive or irreversible work, credential-sensitive changes, cross-namespace changes, and authority changes. When evidence or confidence is insufficient, the agent recommends and waits.</p>
+        </div>
       </aside>
       <aside id="memoraShadowDrawer" class="impact-drawer memora-governance-drawer" hidden aria-labelledby="memoraShadowTitle">
         <div class="impact-drawer-header">
           <div>
-            <p class="section-label">Governed cue lifecycle</p>
-            <h2 id="memoraShadowTitle">Review and control Memora cues</h2>
+            <p class="section-label">Retrieval-association lifecycle</p>
+            <h2 id="memoraShadowTitle">Review and control retrieval associations</h2>
           </div>
           <button id="memoraShadowCloseButton" class="icon-button compact" type="button" aria-label="Hide Memora governance panel">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
           </button>
         </div>
-        <p class="memora-authority-note">This local dashboard is session-gated and every mutation is sent to the authoritative Core. Workflow roles separate duties under the same authenticated Mac owner; they are not independently authenticated people.</p>
-        <div id="memoraGovernanceStatus" class="memora-governance-status" role="status" aria-live="polite" tabindex="-1">Loading governed cue state…</div>
+        <p class="memora-authority-note">Associations help a query find existing memory. They are not tasks, approvals, follow-ups, or execution authority. This local dashboard is session-gated and every mutation is sent to the authoritative Core. Workflow roles separate duties under the same authenticated Mac owner; they are not independently authenticated people.</p>
+        <div id="memoraGovernanceStatus" class="memora-governance-status" role="status" aria-live="polite" tabindex="-1">Loading governed association state…</div>
         <div id="memoraShadowSummary" class="impact-metrics" aria-live="polite">
           <div><span>Shadow clusters</span><strong>--</strong><small>inspect before proposing</small></div>
           <div><span>Governed bindings</span><strong>--</strong><small>current namespace</small></div>
-          <div><span>Effective cues</span><strong>--</strong><small>promoted and valid</small></div>
+          <div><span>Effective bindings</span><strong>--</strong><small>promoted and source-valid</small></div>
+          <div><span>Association terms</span><strong>--</strong><small>terms on bindings shown</small></div>
           <div><span>Provider</span><strong>--</strong><small>pinned local model</small></div>
         </div>
         <div class="memora-workflow-controls" aria-label="Memora workflow roles and mutation guard">
@@ -1296,7 +1306,7 @@
           </section>
           <section class="memora-governance-section" aria-labelledby="memoraCatalogTitle">
             <div class="memora-section-header">
-              <div><p class="section-label">Authoritative catalog</p><h3 id="memoraCatalogTitle">Governed bindings</h3></div>
+              <div><p class="section-label">Authoritative catalog</p><h3 id="memoraCatalogTitle">Governed bindings shown</h3></div>
               <button id="memoraCatalogRefreshButton" class="secondary-button" type="button">Refresh</button>
             </div>
             <label class="memora-state-filter" for="memoraStateFilter">State
@@ -1317,7 +1327,7 @@
               <span id="memoraBindingState" class="memora-state-badge">—</span>
             </div>
             <div id="memoraBindingFacts" class="memora-binding-facts"><p class="empty-result">Select a binding to inspect its safe projection, receipt history, and audit.</p></div>
-            <div id="memoraBindingCues" class="memora-binding-cues" aria-label="Derived cue terms"></div>
+            <div id="memoraBindingCues" class="memora-binding-cues" aria-label="Derived retrieval-association terms"></div>
             <div id="memoraBindingActions" class="memora-binding-actions" aria-label="Governed lifecycle controls">
               <button id="memoraPromoteButton" class="primary-button" type="button" disabled>Promote</button>
               <button id="memoraRejectButton" class="secondary-button" type="button" disabled>Reject</button>
@@ -1327,7 +1337,7 @@
             <div><p class="section-label">Validated receipt history</p><div id="memoraHistory" class="memora-history" role="list"></div></div>
           </section>
         </div>
-        <p id="memoraShadowCaveat" class="panel-note">Learned cues are untrusted relevance routing only. Source memories remain independently deletable; no raw text, vectors, or witness internals are shown here.</p>
+        <p id="memoraShadowCaveat" class="panel-note">Learned associations are untrusted relevance routing only. They do not create tasks, approvals, follow-ups, or execution authority. Source memories remain independently deletable; no raw text, vectors, or witness internals are shown here.</p>
       </aside>
       <aside id="recipeDrawer" class="recipe-drawer" hidden aria-label="Operator recipes">
         <div class="recipe-drawer-header">

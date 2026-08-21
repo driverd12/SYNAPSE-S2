@@ -2512,6 +2512,33 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertNotIn("durable real memory local SQLite substrate", index)
         self.assertNotIn('dispatchEvent(new Event("submit"', app)
 
+    def test_dashboard_exposes_honest_observed_scorecard_and_association_doctrine(self):
+        index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("Observed scorecard", index)
+        self.assertIn("Non-empty dashboard recalls", index)
+        self.assertIn("Hypothetical what-if calculator", index)
+        self.assertIn("does not prove relevance, correctness, time saved, money saved", index)
+        self.assertIn("destructive or irreversible work", index)
+        self.assertIn("credential-sensitive changes", index)
+        self.assertIn("cross-namespace changes", index)
+        self.assertIn("authority changes", index)
+        self.assertIn("evidence or confidence is insufficient", index)
+        self.assertIn("retrieval associations", index)
+        self.assertIn("not tasks, approvals, follow-ups, or execution authority", index)
+        self.assertIn("Effective bindings", index)
+        self.assertIn("Association terms", index)
+        self.assertIn('id="footerMemoraShadow">open to inspect</small>', index)
+        self.assertIn("shown for", app)
+        self.assertIn("association terms", app)
+        self.assertIn("renderImpactUnavailable", app)
+        self.assertIn("dashboard recalls across all namespaces", app)
+        self.assertIn("void refreshImpact().catch", app)
+        self.assertIn("`${formatNumber(yielded)}/${formatNumber(completed)} non-empty · ${p95Label}`", app)
+        self.assertIn("rawP95 === null || rawP95 === undefined", app)
+        self.assertIn("p95Label = Number.isFinite(p95)", app)
+
     def test_recall_console_is_context_safe_and_describes_retrieval_v2(self):
         root = Path(__file__).resolve().parents[1]
         index = (root / "web" / "index.html").read_text(encoding="utf-8")

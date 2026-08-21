@@ -7019,24 +7019,36 @@ function renderImpact(payload = {}) {
   const completed = Number(metrics.recall_completed || 0);
   const yielded = Number(metrics.recall_with_results || 0);
   const yieldRate = completed > 0 ? yielded / completed : 0;
+  const rawP95 = performance.recall_p95_ms;
+  const p95 = rawP95 === null || rawP95 === undefined
+    ? Number.NaN
+    : Number(rawP95);
+  const p95Label = Number.isFinite(p95)
+    ? `p95 ${formatNumber(p95, Number.isInteger(p95) ? 0 : 1)} ms`
+    : "p95 --";
   const estimateMaxUsd = Number(estimate.range_max_usd || 0);
   const estimateLabel = `$0–$${formatNumber(estimateMaxUsd, estimateMaxUsd < 1 ? 3 : 2)}`;
   elements.impactMetrics.innerHTML = [
-    impactMetric("Recall assists", formatNumber(yielded), `${formatNumber(yieldRate * 100, 1)}% non-empty yield`),
-    impactMetric("Bridge assists", formatNumber(metrics.connected_assists || 0), "approved one-hop evidence"),
-    impactMetric("Graph assists", formatNumber(metrics.graph_assists || 0), "same-context neighbors"),
-    impactMetric("Recall p50 / p95", `${formatNumber(performance.recall_p50_ms, 1)} / ${formatNumber(performance.recall_p95_ms, 1)} ms`, "backend retrieval only"),
-    impactMetric("Approx output", formatNumber(metrics.response_estimated_tokens || 0), "bytes ÷ 4; not tokenizer billing"),
+    impactMetric("Non-empty dashboard recalls", formatNumber(yielded), `${formatNumber(yieldRate * 100, 1)}% of completed recalls; not relevance`),
+    impactMetric("Approved bridge paths", formatNumber(metrics.connected_assists || 0), "observed one-hop routing"),
+    impactMetric("Graph-neighbor results", formatNumber(metrics.graph_assists || 0), "observed same-context routing"),
+    impactMetric("Recall p50 / p95", `${formatNumber(performance.recall_p50_ms, 1)} / ${formatNumber(performance.recall_p95_ms, 1)} ms`, "observed backend retrieval latency"),
+    impactMetric("Observed response estimate", formatNumber(metrics.response_estimated_tokens || 0), "UTF-8 bytes ÷ 4; not tokenizer billing"),
     impactMetric("Warm coverage", resources.trace_cache_coverage === null ? "--" : `${formatNumber(resources.trace_cache_coverage * 100, 1)}%`, "occupancy, not hit rate"),
     impactMetric("Delivery ACK", reliability.delivery_ack_ratio === null ? "--" : `${formatNumber(reliability.delivery_ack_ratio * 100, 1)}%`, "current cumulative counters"),
-    impactMetric("Illustrative input equivalent", estimateLabel, "editable upper bound; not billing"),
+    impactMetric("What-if input equivalent", estimateLabel, "editable assumption; not observed savings"),
   ].join("");
   elements.footerImpact.textContent = completed > 0
-    ? (estimateMaxUsd > 0 ? `what-if ≤$${formatNumber(estimateMaxUsd, estimateMaxUsd < 1 ? 3 : 2)}` : `${formatNumber(completed)} recalls`)
+    ? `${formatNumber(yielded)}/${formatNumber(completed)} non-empty · ${p95Label}`
     : "ready";
   const coverage = payload.coverage || {};
   const started = coverage.started_at ? formatTimestamp(coverage.started_at) : "no dashboard recalls recorded yet";
-  elements.impactCaveat.textContent = `${String(payload.caveat || "Illustrative equivalent only; not provider billing or a proven counterfactual saving.")} Coverage: all dashboard namespaces since ${started}.`;
+  elements.impactCaveat.textContent = `${String(payload.caveat || "Illustrative equivalent only; not provider billing or a proven counterfactual saving.")} Observed coverage: dashboard recalls across all namespaces since ${started}. No relevance, correctness, time-saved, money-saved, or avoided-work claim is made.`;
+}
+
+function renderImpactUnavailable(error) {
+  elements.footerImpact.textContent = "unavailable";
+  elements.impactCaveat.textContent = "Observed scorecard unavailable. The dashboard remains usable; retry by opening the scorecard or refreshing the page.";
 }
 
 async function refreshImpact() {
@@ -7059,7 +7071,7 @@ function setImpactDrawerOpen(open) {
   elements.impactToggleButton.setAttribute("aria-expanded", String(state.impact.open));
   if (state.impact.open) {
     void refreshImpact().catch((error) => {
-      elements.impactCaveat.textContent = `Impact metrics unavailable: ${error.message}`;
+      renderImpactUnavailable(error);
     });
     elements.impactCloseButton.focus({ preventScroll: true });
   }
@@ -7082,13 +7094,18 @@ function renderMemoraGovernanceSummary() {
   const provider = plan.provider || {};
   const catalog = Array.isArray(state.memoraShadow.catalog) ? state.memoraShadow.catalog : [];
   const effective = catalog.filter((row) => row?.effectiveness?.effective === true).length;
+  const associationTerms = catalog.reduce(
+    (total, row) => total + Math.max(0, Math.trunc(Number(row?.binding?.cue_count) || 0)),
+    0,
+  );
   elements.memoraShadowSummary.innerHTML = [
     impactMetric("Shadow clusters", formatNumber(clusters.length), "inspect before proposing"),
-    impactMetric("Governed bindings", formatNumber(catalog.length), `namespace ${state.context}`),
-    impactMetric("Effective cues", formatNumber(effective), "promoted and source-valid"),
+    impactMetric("Governed bindings", formatNumber(catalog.length), `shown for ${state.context}`),
+    impactMetric("Effective bindings", formatNumber(effective), "promoted and source-valid"),
+    impactMetric("Association terms", formatNumber(associationTerms), "terms on bindings shown"),
     impactMetric("Provider", String(provider.provider_type || "--"), String(provider.model_id || "pinned local model")),
   ].join("");
-  elements.footerMemoraShadow.textContent = `${formatNumber(catalog.length)} governed`;
+  elements.footerMemoraShadow.textContent = `${formatNumber(effective)} bindings · ${formatNumber(associationTerms)} terms`;
 }
 
 function renderMemoraShadow(payload) {
@@ -7114,13 +7131,13 @@ function renderMemoraShadow(payload) {
         '<article class="memora-shadow-card">',
         `<strong>Cluster ${escapeHtml(formatNumber(ordinal + 1))}</strong>`,
         `<small>${escapeHtml(formatNumber(cluster.member_count || 0))} members · ${escapeHtml(similarity.mean === null || similarity.mean === undefined ? "singleton" : `mean cosine ${formatNumber(similarity.mean, 3)}`)}</small>`,
-        `<small>${escapeHtml(cues.length ? `cues: ${cues.join(", ")}` : "no cue proposals")}</small>`,
-        `<button class="secondary-button" type="button" data-memora-propose-ordinal="${ordinal}" ${plan.learned === true ? "" : "disabled"}>Propose for review</button>`,
+        `<small>${escapeHtml(cues.length ? `association terms: ${cues.join(", ")}` : "no association proposals")}</small>`,
+        `<button class="secondary-button" type="button" data-memora-propose-ordinal="${ordinal}" ${plan.learned === true ? "" : "disabled"}>Propose association for review</button>`,
         "</article>",
       ].join("");
     }).join("")
     : '<div class="empty-result">No shadow clusters proposed for this namespace snapshot.</div>';
-  elements.memoraShadowCaveat.textContent = "Learned cues remain untrusted relevance routing only. Source memories stay independently deletable; this panel never returns raw source text, vectors, supporting IDs, or witness internals.";
+  elements.memoraShadowCaveat.textContent = "Learned associations remain untrusted relevance routing only. They are not tasks, approvals, follow-ups, or execution authority. Source memories stay independently deletable; this panel never returns raw source text, vectors, supporting IDs, or witness internals.";
   renderMemoraGovernanceSummary();
   updateMemoraGovernanceGuard();
 }
@@ -7162,7 +7179,7 @@ function renderMemoraCatalog(payload) {
       const effective = row?.effectiveness?.effective === true;
       const detail = [
         String(binding.state || "unknown"),
-        `${formatNumber(binding.cue_count || 0)} cues`,
+        `${formatNumber(binding.cue_count || 0)} association terms`,
         effective ? "effective" : "isolated",
       ].join(" · ");
       return [
@@ -7283,7 +7300,7 @@ function renderMemoraBindingDetail() {
     ["Current revision", String(binding.revision || "")],
     ["Routing", effectiveness.effective === true ? "effective" : "isolated"],
     ["Members", formatNumber(binding.abstraction?.member_count || 0)],
-    ["Cues", formatNumber(binding.cue_count || 0)],
+    ["Association terms", formatNumber(binding.cue_count || 0)],
     ["Provider", `${String(provider.provider_type || "unknown")} · ${formatNumber(provider.dimensions || 0)}d`],
     ["Proposer authority", compactMemoryId(String(binding.proposed_by || "not reported"))],
     ["Reviewer authority", compactMemoryId(String(binding.reviewed_by || "not reviewed"))],
@@ -7294,8 +7311,8 @@ function renderMemoraBindingDetail() {
     .join("");
   const cues = Array.isArray(binding.cues) ? binding.cues.slice(0, 8) : [];
   elements.memoraBindingCues.innerHTML = cues.length
-    ? cues.map((cue) => `<span class="memora-cue-chip">${escapeHtml(String(cue.term || "cue"))}</span>`).join("")
-    : '<span class="panel-note">No derived cue terms in the safe projection.</span>';
+    ? cues.map((cue) => `<span class="memora-cue-chip">${escapeHtml(String(cue.term || "association"))}</span>`).join("")
+    : '<span class="panel-note">No derived association terms in the safe projection.</span>';
 
   const history = Array.isArray(state.memoraShadow.history) ? state.memoraShadow.history : [];
   elements.memoraHistory.innerHTML = history.length
@@ -9219,6 +9236,10 @@ elements.queryForm.addEventListener("submit", async (event) => {
     }
     state.lastQueryPayload = payload;
     renderQueryResult(payload);
+    // Keep the observed scorecard current even when its drawer is closed; telemetry is fail-soft.
+    void refreshImpact().catch((error) => {
+      renderImpactUnavailable(error);
+    });
     return payload;
   }, { refresh: false });
 });
@@ -9367,6 +9388,10 @@ refreshSnapshot()
     logOperation("Initial load failed", error.message);
   })
   .finally(() => {
+    // Startup scorecard refresh is read-only and must never block dashboard readiness.
+    void refreshImpact().catch((error) => {
+      renderImpactUnavailable(error);
+    });
     scheduleNamespaceGalaxyRefresh();
     scheduleCoreHealthRefresh({ immediate: true });
   });
