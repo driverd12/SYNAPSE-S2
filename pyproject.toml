@@ -5,7 +5,7 @@ description = "Apple Silicon optimized spiking STDP attention MCP server."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "cryptography>=49.0.0",
+    "cryptography==49.0.0",
     "fastmcp>=2.0.0",
     "mlx>=0.25.0",
     "numpy>=2.0.0",

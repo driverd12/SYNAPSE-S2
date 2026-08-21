@@ -77,6 +77,38 @@ non-executable sequence, and evidence validation, provenance, staging,
 cutover, rollback, live-store safety, and memory equivalence remain explicit
 nonclaims.
 
+A fourth, equally read-only *whole-product inventory* mode
+(``--product-release-plan``) compares an embedded, reviewed,
+component-tagged inventory that explicitly binds every tracked product path
+at the release base — code, web assets, native source, operator and install
+scripts, dependency locks, configuration templates, docs, manual output,
+tests, and evaluation fixtures — between two pre-extracted local roots
+using the same held-descriptor snapshot reader; runtime never invokes git.
+Every inventoried directory is recursively *closed*: any unknown file or
+directory (package directories, ``.pth`` droppers, ``__pycache__`` and
+bytecode, extra web assets), symlink, hardlink, special file, unsafe
+owner/mode, non-ASCII or casefold-colliding entry name, bounds overrun, or
+capture race fails unsupported.  Beyond the inventory the candidate root
+may contain only exact ``.git`` metadata (after no-follow type screening);
+the current root may additionally hold exact root-local live-state
+directories (virtualenv, ``.synapse_s2``, caches), exact root-local host
+configuration files (``.mcp.json``, its lock, ``.DS_Store``, and a strict
+bounded timestamped ``.mcp.json.bak-`` rotation pattern) screened as safe
+regular files and never opened, and an exact relative-path allowlist of
+nested bytecode caches — every other nested name still fails closed, and
+the candidate rejects them all.  Every ignored entry is registered and
+re-verified after capture: regular ignored files must match their full
+scan-time fingerprint, ignored directories may drift in content but must
+keep the same device, inode, and type and stay safely owned and writable
+by no one else.
+Identities are full SHA-256 digests over a domain-separated canonical
+payload binding the inventory schema and each record's component, role,
+path, exact permission mode, size, and content digest.  Candidate code is
+never imported or executed, no write, socket, database, or subprocess is
+ever attempted, and ``update-available`` is an observation, never an apply
+authorization — apply, provenance, signature verification, and inventory
+policy transitions remain explicit nonclaims.
+
 Import hardening: before any non-builtin import, ``sys.path`` is rebuilt
 using builtins only — PYTHONPATH, cwd, and other untrusted entries are
 dropped, and only interpreter-owned entries are retained for stdlib loading.
@@ -750,6 +782,12 @@ class _RootSnapshot:
         return descriptor
 
     def read_file(self, name: str, budget: dict[str, int]) -> bytes:
+        payload, _ = self.read_file_with_stat(name, budget)
+        return payload
+
+    def read_file_with_stat(
+        self, name: str, budget: dict[str, int]
+    ) -> tuple[bytes, os.stat_result]:
         components = tuple(name.split("/"))
         directory_key = components[:-1]
         leaf = components[-1]
@@ -801,7 +839,7 @@ class _RootSnapshot:
         payload = b"".join(chunks)
         budget["remaining"] -= len(payload)
         self._files.append((directory_key, leaf, _fingerprint(before)))
-        return payload
+        return payload, before
 
     def recheck(self) -> None:
         try:
@@ -1929,6 +1967,1014 @@ def preservation_exit_code(result: dict) -> int:
     return GATE_EXIT_CODES.get(str(result.get("status")), 2)
 
 
+PRODUCT_SCHEMA = "synapse-s2.product-release-plan.v1"
+PRODUCT_MODE = "read-only-product-inventory"
+
+PRODUCT_STATUS_NO_UPDATE = "no-update"
+PRODUCT_STATUS_UPDATE_AVAILABLE = "update-available"
+
+PRODUCT_EXIT_CODES = {
+    PRODUCT_STATUS_NO_UPDATE: 0,
+    PRODUCT_STATUS_UPDATE_AVAILABLE: 3,
+}
+
+_PRODUCT_ID_RE = re.compile(r"product-[0-9a-f]{64}")
+
+# Identity digests are domain-separated so the same record set can never
+# yield interchangeable product and component identifiers.
+_PRODUCT_ID_DOMAIN = "synapse-s2.product-identity.v1"
+_PRODUCT_COMPONENT_ID_DOMAIN = "synapse-s2.component-identity.v1"
+
+# The inventory policy identifier binds the complete closed inventory
+# contract -- policy schema, product schema, record fields, candidate
+# layout, and every component/role/path entry -- so external provenance
+# records can name exactly which inventory a product identity was
+# computed under.
+INVENTORY_POLICY_SCHEMA = "synapse-s2.product-inventory-policy.v1"
+INVENTORY_POLICY_CANDIDATE_LAYOUT = "closed-exact-v1"
+INVENTORY_POLICY_RECORD_FIELDS = (
+    "component",
+    "role",
+    "path",
+    "mode",
+    "size",
+    "sha256",
+)
+_INVENTORY_POLICY_ID_DOMAIN = "SYNAPSE-S2\x00PRODUCT-INVENTORY-POLICY\x00v1\x00"
+
+# Hard resource bounds, all enforced before the offending byte or entry is
+# consumed: aggregate content bytes across both roots, inventory size,
+# per-directory entry count, per-name and per-path bytes, aggregate scanned
+# name bytes across both roots, reported changed paths (the full count is
+# still emitted), and the rendered JSON result line.
+MAX_PRODUCT_TOTAL_BYTES = 2 * MAX_TOTAL_MANIFEST_BYTES
+MAX_PRODUCT_INVENTORY_ENTRIES = 512
+MAX_PRODUCT_DIRECTORY_ENTRIES = 512
+MAX_PRODUCT_NAME_BYTES = 255
+MAX_PRODUCT_PATH_BYTES = 512
+MAX_PRODUCT_SCANNED_NAME_BYTES = 512 * 1024
+MAX_PRODUCT_CHANGED_PATHS = 128
+MAX_PRODUCT_RESULT_BYTES = 128 * 1024
+
+# Fixed component vocabulary: every inventory entry must use one of these
+# and every component must appear in the inventory.
+PRODUCT_COMPONENTS = frozenset(
+    (
+        "cli",
+        "config-template",
+        "core",
+        "dashboard",
+        "dependencies",
+        "mcp",
+        "native",
+        "official-longmem",
+        "operator-docs",
+        "operator-manual",
+        "operator-scripts",
+        "repo-config",
+        "support-tools",
+        "tests",
+    )
+)
+
+# Fixed role vocabulary, closed under the same rule as the components.
+PRODUCT_ROLES = frozenset(
+    (
+        "agent-doc",
+        "code",
+        "config-template",
+        "dependency-lock",
+        "doc",
+        "eval-adapter",
+        "evidence",
+        "fixture",
+        "manual-asset",
+        "native-source",
+        "operator-script",
+        "packaging",
+        "policy-doc",
+        "support-tool",
+        "test",
+        "vcs-config",
+        "web-asset",
+    )
+)
+
+# Reviewed, component-tagged inventory explicitly binding every tracked
+# product path at the release base; nothing is derived at runtime and git
+# is never invoked.  Like TRUSTED_MANIFEST this is a deliberately embedded
+# copy: adding, moving, or removing any product file without updating this
+# tuple in the same release fails closed (unexpected-entry or
+# file-missing) until the planner itself is updated.
+PRODUCT_INVENTORY = (
+    ("repo-config", "vcs-config", ".gitattributes"),
+    ("repo-config", "vcs-config", ".gitignore"),
+    ("config-template", "config-template", ".mcp.json.example"),
+    ("repo-config", "agent-doc", "AGENTS.md"),
+    ("operator-docs", "policy-doc", "README.md"),
+    ("core", "code", "apple_vision_enrichment.py"),
+    ("core", "code", "backend_router.py"),
+    ("core", "code", "bridge_governance.py"),
+    ("core", "code", "capture_daemon.py"),
+    ("core", "code", "client_config.py"),
+    ("mcp", "code", "client_session_bridge.py"),
+    ("core", "code", "core_authority.py"),
+    ("core", "code", "core_client.py"),
+    ("core", "code", "core_client_binding.py"),
+    ("core", "code", "core_path_policy.py"),
+    ("core", "code", "core_protocol.py"),
+    ("core", "code", "core_request_journal.py"),
+    ("core", "code", "core_runtime_paths.py"),
+    ("core", "code", "core_service.py"),
+    ("core", "code", "cortex_contract.py"),
+    ("dashboard", "code", "dashboard_server.py"),
+    ("operator-docs", "policy-doc", "docs/AUTHORITATIVE_CORE_OPERATIONS.md"),
+    ("operator-docs", "policy-doc", "docs/BRIDGE_GOVERNANCE.md"),
+    ("operator-docs", "doc", "docs/CURRENT_STATUS.md"),
+    ("operator-docs", "policy-doc", "docs/EXACTLY_ONCE_CAPTURE.md"),
+    ("operator-docs", "doc", "docs/FRONTIER_ENHANCEMENTS.md"),
+    ("operator-docs", "doc", "docs/HARMONIC_MEMORY.md"),
+    ("operator-docs", "doc", "docs/LONGMEM_V2_EVALUATION.md"),
+    ("operator-docs", "doc", "docs/MEMORA_SHADOW.md"),
+    ("operator-docs", "doc", "docs/MEMORY_CONFIDENCE_GATE.md"),
+    ("operator-docs", "policy-doc", "docs/MULTI_MAC_REPLICATION.md"),
+    (
+        "operator-docs",
+        "doc",
+        "docs/Neuromorphic-Attention-Plugin-Development-Plan.md",
+    ),
+    (
+        "operator-docs",
+        "doc",
+        "docs/Neuromorphic-Attention-Plugin-Development-Plan.pdf",
+    ),
+    (
+        "operator-docs",
+        "policy-doc",
+        "docs/OPERATOR_READINESS_CERTIFICATION.md",
+    ),
+    ("operator-docs", "doc", "docs/PRODUCTION_GAP_AUDIT.md"),
+    ("operator-docs", "doc", "docs/PROPOSAL_COMPLIANCE.md"),
+    ("operator-docs", "doc", "docs/RETRIEVAL_V2_VALIDATION.md"),
+    ("operator-docs", "doc", "docs/TOKEN_CONTRACTS.md"),
+    ("operator-docs", "doc", "docs/TOMORROW_RUNBOOK.md"),
+    (
+        "operator-docs",
+        "evidence",
+        "docs/evidence/phase6-token-contract-acceptance.json",
+    ),
+    (
+        "operator-docs",
+        "evidence",
+        "docs/evidence/phase8-retrieval-v2-acceptance.json",
+    ),
+    (
+        "operator-docs",
+        "evidence",
+        "docs/evidence/phase9-replication-acceptance.json",
+    ),
+    ("operator-docs", "doc", "docs/source-prompt-and-plan.txt"),
+    (
+        "operator-docs",
+        "doc",
+        "docs/superpowers/plans/2026-06-26-large-neural-embedding-provider.md",
+    ),
+    (
+        "operator-docs",
+        "doc",
+        "docs/superpowers/plans/2026-06-27-synapse-s2-reliability-usability.md",
+    ),
+    (
+        "operator-docs",
+        "doc",
+        "docs/superpowers/plans/2026-06-29-operator-readiness-certification.md",
+    ),
+    ("core", "code", "embedding_providers.py"),
+    ("core", "code", "event_segmenter.py"),
+    ("core", "code", "harmonic_memory.py"),
+    ("core", "code", "image_capture.py"),
+    ("core", "code", "impact_metrics.py"),
+    ("support-tools", "support-tool", "longmem_eval.py"),
+    ("mcp", "code", "mcp_client_wrapper.py"),
+    ("mcp", "code", "mcp_server.py"),
+    ("core", "code", "media_similarity.py"),
+    ("core", "code", "memora_governance.py"),
+    ("core", "code", "memora_shadow.py"),
+    ("core", "code", "memory_store.py"),
+    ("core", "code", "mlx_backend.py"),
+    ("native", "native-source", "native/apple_vision_enrich.swift"),
+    ("official-longmem", "eval-adapter", "official_longmem/__init__.py"),
+    ("official-longmem", "eval-adapter", "official_longmem/bootstrap.py"),
+    (
+        "official-longmem",
+        "eval-adapter",
+        "official_longmem/synapse_s2_memory.py",
+    ),
+    ("core", "code", "operator_readiness_contract.py"),
+    (
+        "operator-manual",
+        "manual-asset",
+        "output/manual/SYNAPSE-S2_Quick_Reference.png",
+    ),
+    (
+        "operator-manual",
+        "manual-asset",
+        "output/manual/SYNAPSE-S2_Visual_User_Manual.md",
+    ),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-01.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-02.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-03.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-04.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-05.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-06.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-07.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-08.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-09.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-10.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-11.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-12.png"),
+    ("operator-manual", "manual-asset", "output/manual/plates/manual-13.png"),
+    (
+        "operator-manual",
+        "manual-asset",
+        "output/pdf/SYNAPSE-S2_Quick_Reference.pdf",
+    ),
+    (
+        "operator-manual",
+        "manual-asset",
+        "output/pdf/SYNAPSE-S2_Visual_User_Manual.pdf",
+    ),
+    ("dependencies", "packaging", "pyproject.toml"),
+    ("core", "code", "recovery_manager.py"),
+    ("core", "code", "redaction.py"),
+    ("core", "code", "replacement_policy.py"),
+    ("core", "code", "replication_manager.py"),
+    ("core", "code", "replication_protocol.py"),
+    ("core", "code", "replication_store.py"),
+    ("core", "code", "retrieval_cursor.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/capture_frontmost_selection.sh",
+    ),
+    ("operator-scripts", "operator-script", "scripts/core_agent_installer.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/core_cutover_preflight.py",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/core_cutover_preflight.sh",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/install_capture_daemon.sh",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/install_client_configs.py",
+    ),
+    ("operator-scripts", "operator-script", "scripts/install_core_agent.sh"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/install_dashboard_agent.sh",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/install_local_launcher.sh",
+    ),
+    ("support-tools", "support-tool", "scripts/measure_longmem_v2.py"),
+    ("support-tools", "support-tool", "scripts/measure_memory_confidence.py"),
+    ("support-tools", "support-tool", "scripts/measure_retrieval_v2.py"),
+    ("support-tools", "support-tool", "scripts/measure_token_contracts.py"),
+    ("operator-scripts", "operator-script", "scripts/open_dashboard.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/operator_readiness_certify.py",
+    ),
+    ("operator-scripts", "operator-script", "scripts/prep_tomorrow.sh"),
+    ("operator-scripts", "operator-script", "scripts/purge_namespaces.py"),
+    ("operator-scripts", "operator-script", "scripts/release_provenance.py"),
+    ("operator-scripts", "operator-script", "scripts/release_stage.py"),
+    ("operator-scripts", "operator-script", "scripts/release_update_plan.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/repair_torn_core_adoption.py",
+    ),
+    ("support-tools", "support-tool", "scripts/run_longmem_v2_official.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/secure_installer_support.py",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/sign_release_provenance.py",
+    ),
+    ("operator-scripts", "operator-script", "scripts/smoke_dashboard.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/synapse_status_report.py",
+    ),
+    ("cli", "code", "synapse_cli.py"),
+    ("tests", "fixture", "tests/fixtures/longmem_v2/benchmark_v1.json"),
+    ("tests", "fixture", "tests/fixtures/memory_confidence/benchmark_v1.json"),
+    ("tests", "fixture", "tests/fixtures/retrieval_v2/benchmark_v1.json"),
+    ("tests", "test", "tests/test_apple_vision_enrichment.py"),
+    ("tests", "test", "tests/test_argparse_security.py"),
+    ("tests", "test", "tests/test_backend.py"),
+    ("tests", "test", "tests/test_backend_routing.py"),
+    ("tests", "test", "tests/test_backup_recovery.py"),
+    ("tests", "test", "tests/test_bridge_governance.py"),
+    ("tests", "test", "tests/test_capture_daemon.py"),
+    ("tests", "test", "tests/test_capture_ledger_reconciliation.py"),
+    ("tests", "test", "tests/test_cli.py"),
+    ("tests", "test", "tests/test_client_config.py"),
+    ("tests", "test", "tests/test_client_session_bridge.py"),
+    ("tests", "test", "tests/test_context_event_delivery.py"),
+    ("tests", "test", "tests/test_core_adoption_repair.py"),
+    ("tests", "test", "tests/test_core_authority.py"),
+    ("tests", "test", "tests/test_core_client_binding.py"),
+    ("tests", "test", "tests/test_core_cutover_preflight_finite.py"),
+    ("tests", "test", "tests/test_core_installer.py"),
+    ("tests", "test", "tests/test_core_operational_routes.py"),
+    ("tests", "test", "tests/test_core_path_policy.py"),
+    ("tests", "test", "tests/test_core_protocol.py"),
+    ("tests", "test", "tests/test_core_recovery_routes.py"),
+    ("tests", "test", "tests/test_core_request_journal.py"),
+    ("tests", "test", "tests/test_core_service.py"),
+    ("tests", "test", "tests/test_dashboard_memora.py"),
+    ("tests", "test", "tests/test_dashboard_open.py"),
+    ("tests", "test", "tests/test_dashboard_server.py"),
+    ("tests", "test", "tests/test_dashboard_smoke.py"),
+    ("tests", "test", "tests/test_documentation.py"),
+    ("tests", "test", "tests/test_embedding_providers.py"),
+    ("tests", "test", "tests/test_event_segmenter.py"),
+    ("tests", "test", "tests/test_harmonic_memory.py"),
+    ("tests", "test", "tests/test_image_capture.py"),
+    ("tests", "test", "tests/test_impact_metrics.py"),
+    ("tests", "test", "tests/test_launch_agent_installers.py"),
+    ("tests", "test", "tests/test_longmem_eval.py"),
+    ("tests", "test", "tests/test_longmem_v2_measurement.py"),
+    ("tests", "test", "tests/test_mcp_client_wrapper.py"),
+    ("tests", "test", "tests/test_mcp_server.py"),
+    ("tests", "test", "tests/test_measure_token_contracts.py"),
+    ("tests", "test", "tests/test_media_similarity.py"),
+    ("tests", "test", "tests/test_memora_governance.py"),
+    ("tests", "test", "tests/test_memora_retrieval.py"),
+    ("tests", "test", "tests/test_memora_shadow.py"),
+    ("tests", "test", "tests/test_memora_surfaces.py"),
+    ("tests", "test", "tests/test_memory_confidence_measurement.py"),
+    ("tests", "test", "tests/test_memory_store.py"),
+    ("tests", "test", "tests/test_memory_store_atomicity.py"),
+    ("tests", "test", "tests/test_official_longmem_adapter.py"),
+    ("tests", "test", "tests/test_official_longmem_runner_stage1a.py"),
+    ("tests", "test", "tests/test_operational_scripts.py"),
+    ("tests", "test", "tests/test_operator_readiness_certifier.py"),
+    ("tests", "test", "tests/test_purge_namespaces.py"),
+    ("tests", "test", "tests/test_recovery_route_surfaces.py"),
+    ("tests", "test", "tests/test_redaction.py"),
+    ("tests", "test", "tests/test_release_provenance.py"),
+    ("tests", "test", "tests/test_release_stage.py"),
+    ("tests", "test", "tests/test_release_update_orchestrator.py"),
+    ("tests", "test", "tests/test_release_update_plan.py"),
+    ("tests", "test", "tests/test_replacement_admission.py"),
+    ("tests", "test", "tests/test_replication.py"),
+    ("tests", "test", "tests/test_response_contract.py"),
+    ("tests", "test", "tests/test_retrieval_cursor.py"),
+    ("tests", "test", "tests/test_retrieval_pages.py"),
+    ("tests", "test", "tests/test_retrieval_pagination_integration.py"),
+    ("tests", "test", "tests/test_retrieval_v2.py"),
+    ("tests", "test", "tests/test_retrieval_v2_contract.py"),
+    ("tests", "test", "tests/test_retrieval_v2_measurement.py"),
+    ("tests", "test", "tests/test_retrieval_v2_surfaces.py"),
+    ("tests", "test", "tests/test_status_report.py"),
+    ("tests", "test", "tests/test_transcript_capture.py"),
+    ("core", "code", "token_contracts.py"),
+    ("core", "code", "transcript_capture.py"),
+    ("dependencies", "dependency-lock", "uv.lock"),
+    ("dashboard", "web-asset", "web/app.js"),
+    ("dashboard", "web-asset", "web/index.html"),
+    ("dashboard", "web-asset", "web/styles.css"),
+)
+
+# Root-local live-state directories the *current* (incumbent) root may
+# contain without failing the plan.  They are exempted only at the root,
+# only by exact name, and only when they are real directories after
+# no-follow screening; there are no nested or basename exemptions, and the
+# candidate root gets no exemption at all.
+PRODUCT_CURRENT_ROOT_IGNORED_DIRS = frozenset(
+    (
+        ".cache",
+        ".claude",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".synapse_s2",
+        ".uv-cache",
+        ".venv",
+        "__pycache__",
+    )
+)
+
+# Host configuration artifacts the *current* (incumbent) root may carry at
+# its top level: exact regular-file names plus a strict, bounded, ASCII
+# rotation pattern for timestamped ``.mcp.json`` backups.  Each is
+# type-screened with a no-follow stat, checked for safe ownership, link
+# count, and mode, and never opened; the candidate root gets no such
+# exemption and rejects every one of these names.
+PRODUCT_CURRENT_ROOT_IGNORED_FILES = frozenset(
+    (
+        ".DS_Store",
+        ".mcp.json",
+        "..mcp.json.synapse-config.lock",
+    )
+)
+_PRODUCT_CURRENT_BACKUP_RE = re.compile(
+    r"\.mcp\.json\.bak-[0-9]{8}-[0-9]{6}(?:-[0-9a-f]{8,32})?"
+)
+
+# Bytecode cache directories tolerated (never opened) inside the *current*
+# root, by exact inventory-relative path only — the caches a live incumbent
+# host genuinely produces.  There is no basename-wide exemption: every
+# other nested cache (``docs/__pycache__``, ``tests/.pytest_cache``, ...)
+# fails closed, and the candidate root rejects these paths too.  Root-level
+# caches are separately root-scoped via the root-state directory set.
+PRODUCT_CURRENT_CACHE_DIR_PATHS = frozenset(
+    (
+        "official_longmem/__pycache__",
+        "scripts/__pycache__",
+        "tests/__pycache__",
+    )
+)
+
+# Basenames that can never legitimately appear anywhere in the inventory.
+_PRODUCT_CACHE_BASENAMES = frozenset(("__pycache__", ".pytest_cache"))
+
+# VCS metadata tolerated (never read) in either root after no-follow type
+# screening: a directory in a primary checkout, a regular file in a linked
+# worktree; anything else (symlink, special file) fails closed.
+_PRODUCT_VCS_METADATA_NAMES = frozenset((".git",))
+
+PRODUCT_REVIEW_REQUIREMENTS = (
+    "operator-review",
+    "provenance-verification",
+    "signature-verification",
+    "source-delta-review",
+)
+
+PRODUCT_NONCLAIMS = (
+    "no-apply-authorization",
+    "no-inventory-policy-transition",
+    "no-live-store-safety",
+    "no-provenance-proof",
+    "no-runtime-equivalence-verification",
+    "no-signature-verification",
+    "stable-inventory-only",
+    "update-available-never-authorizes-apply",
+)
+
+
+def _product_components() -> list[str]:
+    try:
+        return sorted(PRODUCT_COMPONENTS)
+    except Exception:
+        return []
+
+
+def _product_directory_map() -> dict[
+    tuple[str, ...], tuple[frozenset[str], frozenset[str]]
+]:
+    """Recursive closure of every inventoried directory: for each directory
+    key, the exact expected file leaves and expected subdirectory names.
+    Any other entry found there is an anomaly, whatever its suffix."""
+    files: dict[tuple[str, ...], set[str]] = {(): set()}
+    subdirs: dict[tuple[str, ...], set[str]] = {(): set()}
+    for _, _, path in PRODUCT_INVENTORY:
+        parts = tuple(path.split("/"))
+        for depth in range(len(parts) - 1):
+            parent = parts[:depth]
+            files.setdefault(parent, set())
+            subdirs.setdefault(parent, set()).add(parts[depth])
+            child = parts[: depth + 1]
+            files.setdefault(child, set())
+            subdirs.setdefault(child, set())
+        files.setdefault(parts[:-1], set()).add(parts[-1])
+        subdirs.setdefault(parts[:-1], set())
+    return {
+        key: (frozenset(files[key]), frozenset(subdirs[key]))
+        for key in files
+    }
+
+
+def _validate_product_inventory() -> None:
+    token = "product-inventory-invalid"
+    if (
+        not isinstance(PRODUCT_INVENTORY, tuple)
+        or not PRODUCT_INVENTORY
+        or len(PRODUCT_INVENTORY) > MAX_PRODUCT_INVENTORY_ENTRIES
+    ):
+        raise _Unsupported(token)
+    seen_paths: set[str] = set()
+    used_components: set[str] = set()
+    used_roles: set[str] = set()
+    for entry in PRODUCT_INVENTORY:
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) != 3
+            or not all(
+                isinstance(field, str) and field and field.isascii()
+                for field in entry
+            )
+        ):
+            raise _Unsupported(token)
+        component, role, path = entry
+        for field in entry:
+            if "\x00" in field or "\\" in field:
+                raise _Unsupported(token)
+        if component not in PRODUCT_COMPONENTS or role not in PRODUCT_ROLES:
+            raise _Unsupported(token)
+        if len(path.encode("ascii")) > MAX_PRODUCT_PATH_BYTES:
+            raise _Unsupported(token)
+        parts = tuple(path.split("/"))
+        if any(part in ("", ".", "..") for part in parts):
+            raise _Unsupported(token)
+        if any(
+            len(part.encode("ascii")) > MAX_PRODUCT_NAME_BYTES
+            for part in parts
+        ):
+            raise _Unsupported(token)
+        if (
+            parts[0] in PRODUCT_CURRENT_ROOT_IGNORED_DIRS
+            or parts[0] in _PRODUCT_VCS_METADATA_NAMES
+            or parts[0] in PRODUCT_CURRENT_ROOT_IGNORED_FILES
+            or _PRODUCT_CURRENT_BACKUP_RE.fullmatch(parts[0]) is not None
+        ):
+            raise _Unsupported(token)
+        if any(part in _PRODUCT_CACHE_BASENAMES for part in parts):
+            raise _Unsupported(token)
+        if any(
+            path == cache or path.startswith(cache + "/")
+            for cache in PRODUCT_CURRENT_CACHE_DIR_PATHS
+        ):
+            raise _Unsupported(token)
+        if path in seen_paths:
+            raise _Unsupported(token)
+        seen_paths.add(path)
+        used_components.add(component)
+        used_roles.add(role)
+    if used_components != PRODUCT_COMPONENTS or used_roles != PRODUCT_ROLES:
+        raise _Unsupported(token)
+    for files, subdirs in _product_directory_map().values():
+        if files & subdirs:
+            raise _Unsupported(token)
+        folded: set[str] = set()
+        for name in list(files) + list(subdirs):
+            fold = name.casefold()
+            if fold in folded:
+                raise _Unsupported(token)
+            folded.add(fold)
+    required = frozenset(
+        (
+            "core_service.py",
+            "synapse_cli.py",
+            "mcp_server.py",
+            "dashboard_server.py",
+            "web/index.html",
+            "web/app.js",
+            "web/styles.css",
+            "native/apple_vision_enrich.swift",
+            "pyproject.toml",
+            "uv.lock",
+            ".mcp.json.example",
+        )
+    )
+    if not required <= seen_paths:
+        raise _Unsupported(token)
+
+
+def _scan_product_directory(
+    snapshot: _RootSnapshot,
+    key: tuple[str, ...],
+    expected_files: frozenset[str],
+    expected_subdirs: frozenset[str],
+    allow_root_state: bool,
+    name_budget: dict[str, int],
+    ignored_registry: list[tuple[tuple[str, ...], str, str, tuple]],
+) -> None:
+    descriptor = snapshot._directory_fd(key)
+    names: list[str] = []
+    folded: set[str] = set()
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                # Incremental bounds: the entry count, per-name bytes, and
+                # aggregate scanned-name budget are all enforced before the
+                # name is kept, so a hostile directory cannot balloon memory.
+                if len(names) >= MAX_PRODUCT_DIRECTORY_ENTRIES:
+                    raise _Unsupported("directory-oversize")
+                name = entry.name
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or "\x00" in name
+                    or not name.isascii()
+                ):
+                    # Only ASCII entry names are supported: Unicode
+                    # normalization collisions cannot exist within ASCII and
+                    # the remaining aliasing risk (case) is rejected below.
+                    raise _Unsupported("name-unsafe")
+                encoded_length = len(name.encode("ascii"))
+                if encoded_length > MAX_PRODUCT_NAME_BYTES:
+                    raise _Unsupported("name-oversize")
+                if encoded_length > name_budget["remaining"]:
+                    raise _Unsupported("scan-oversize")
+                name_budget["remaining"] -= encoded_length
+                fold = name.casefold()
+                if fold in folded:
+                    raise _Unsupported("name-collision")
+                folded.add(fold)
+                names.append(name)
+    except OSError:
+        raise _Unsupported("validation-race") from None
+    listing = frozenset(names)
+    if not expected_files <= listing or not expected_subdirs <= listing:
+        raise _Unsupported("file-missing")
+    # Expected files are fully screened by the read phase and expected
+    # subdirectories by the held-descriptor open; only the residue is
+    # classified here, and everything unknown fails closed.
+    for name in sorted(listing - expected_files - expected_subdirs):
+        try:
+            observed = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError:
+            raise _Unsupported("validation-race") from None
+        mode = observed.st_mode
+        if not key and name in _PRODUCT_VCS_METADATA_NAMES:
+            if stat.S_ISDIR(mode):
+                if (
+                    observed.st_uid != os.geteuid()
+                    or mode & _GROUP_OR_WORLD_WRITE
+                ):
+                    raise _Unsupported("root-unsafe")
+                ignored_registry.append((key, name, "dir", _identity(observed)))
+                continue
+            if stat.S_ISREG(mode):
+                if (
+                    observed.st_nlink != 1
+                    or observed.st_uid != os.geteuid()
+                    or mode & _GROUP_OR_WORLD_WRITE
+                ):
+                    raise _Unsupported("file-unsafe")
+                ignored_registry.append(
+                    (key, name, "file", _fingerprint(observed))
+                )
+                continue
+            raise _Unsupported("special-file")
+        if (
+            allow_root_state
+            and not key
+            and name in PRODUCT_CURRENT_ROOT_IGNORED_DIRS
+            and stat.S_ISDIR(mode)
+        ):
+            # Root-local live-state directories: tolerated only as safe real
+            # directories owned by the invoking user, never descended into.
+            if observed.st_uid != os.geteuid() or mode & _GROUP_OR_WORLD_WRITE:
+                raise _Unsupported("root-unsafe")
+            ignored_registry.append((key, name, "dir", _identity(observed)))
+            continue
+        if (
+            allow_root_state
+            and not key
+            and (
+                name in PRODUCT_CURRENT_ROOT_IGNORED_FILES
+                or _PRODUCT_CURRENT_BACKUP_RE.fullmatch(name) is not None
+            )
+        ):
+            # Host configuration artifacts: tolerated only as safe regular
+            # files owned by the invoking user, and never opened.
+            if stat.S_ISREG(mode):
+                if (
+                    observed.st_nlink != 1
+                    or observed.st_uid != os.geteuid()
+                    or mode & _GROUP_OR_WORLD_WRITE
+                ):
+                    raise _Unsupported("file-unsafe")
+                ignored_registry.append(
+                    (key, name, "file", _fingerprint(observed))
+                )
+                continue
+            if stat.S_ISDIR(mode):
+                raise _Unsupported("unexpected-entry")
+            raise _Unsupported("special-file")
+        if (
+            allow_root_state
+            and key
+            and "/".join(key + (name,)) in PRODUCT_CURRENT_CACHE_DIR_PATHS
+            and stat.S_ISDIR(mode)
+        ):
+            # Nested bytecode caches: exact inventory-relative paths, safe
+            # real directories only, never descended into.
+            if observed.st_uid != os.geteuid() or mode & _GROUP_OR_WORLD_WRITE:
+                raise _Unsupported("root-unsafe")
+            ignored_registry.append((key, name, "dir", _identity(observed)))
+            continue
+        if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+            raise _Unsupported("special-file")
+        raise _Unsupported("unexpected-entry")
+
+
+def _capture_product_state(
+    snapshot: _RootSnapshot,
+    budget: dict[str, int],
+    name_budget: dict[str, int],
+    allow_root_state: bool,
+    ignored_registry: list[tuple[tuple[str, ...], str, str, tuple]],
+) -> list[tuple[str, str, str, str, int, str]]:
+    snapshot.open_root()
+    records: list[tuple[str, str, str, str, int, str]] = []
+    for component, role, path in PRODUCT_INVENTORY:
+        payload, observed = snapshot.read_file_with_stat(path, budget)
+        records.append(
+            (
+                component,
+                role,
+                path,
+                format(stat.S_IMODE(observed.st_mode), "04o"),
+                observed.st_size,
+                hashlib.sha256(payload).hexdigest(),
+            )
+        )
+    directory_map = _product_directory_map()
+    for key in sorted(directory_map):
+        expected_files, expected_subdirs = directory_map[key]
+        _scan_product_directory(
+            snapshot,
+            key,
+            expected_files,
+            expected_subdirs,
+            allow_root_state,
+            name_budget,
+            ignored_registry,
+        )
+    return records
+
+
+def _recheck_ignored_entries(
+    snapshot: _RootSnapshot,
+    ignored_registry: list[tuple[tuple[str, ...], str, str, tuple]],
+) -> None:
+    """Final held-descriptor recheck of every entry the scan ignored.
+
+    Regular ignored files must still match their full scan-time fingerprint
+    (device, inode, owner, link count, mode, size, times).  Ignored
+    directories may drift in content and times — live state keeps moving —
+    but must keep the same device, inode, and type and must still be owned
+    by the invoking user with no group/world write."""
+    for key, name, kind, recorded in ignored_registry:
+        descriptor = snapshot._directory_fd(key)
+        try:
+            observed = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError:
+            raise _Unsupported("validation-race") from None
+        if kind == "file":
+            if _fingerprint(observed) != recorded:
+                raise _Unsupported("validation-race")
+            continue
+        if _identity(observed) != recorded:
+            raise _Unsupported("validation-race")
+        if (
+            observed.st_uid != os.geteuid()
+            or observed.st_mode & _GROUP_OR_WORLD_WRITE
+        ):
+            raise _Unsupported("root-unsafe")
+
+
+def _product_digest(
+    domain: str, records: list[tuple[str, str, str, str, int, str]]
+) -> str:
+    """Full SHA-256 over a domain-separated canonical payload binding the
+    inventory schema and, per record, component, role, path, the exact
+    permission mode, size, and content digest."""
+    hasher = hashlib.sha256()
+    hasher.update(
+        "\x00".join((domain, PRODUCT_SCHEMA, str(len(records)))).encode(
+            "ascii"
+        )
+        + b"\n"
+    )
+    for component, role, path, mode, size, digest in sorted(records):
+        hasher.update(
+            "\x00".join(
+                (component, role, path, mode, str(size), digest)
+            ).encode("ascii")
+            + b"\n"
+        )
+    return hasher.hexdigest()
+
+
+def _inventory_policy_id() -> str:
+    """Domain-separated SHA-256 over the canonical (sorted-key, compact,
+    ASCII) JSON encoding of the closed inventory policy: policy schema,
+    product schema, record fields, candidate layout, and the sorted
+    component/role/path entries."""
+    payload = json.dumps(
+        {
+            "schema": INVENTORY_POLICY_SCHEMA,
+            "product_schema": PRODUCT_SCHEMA,
+            "record_fields": list(INVENTORY_POLICY_RECORD_FIELDS),
+            "candidate_layout": INVENTORY_POLICY_CANDIDATE_LAYOUT,
+            "entries": [list(entry) for entry in sorted(PRODUCT_INVENTORY)],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    hasher = hashlib.sha256()
+    hasher.update(_INVENTORY_POLICY_ID_DOMAIN.encode("ascii"))
+    hasher.update(payload.encode("ascii"))
+    return "inventory-policy-" + hasher.hexdigest()
+
+
+def _product_inventory_policy_id() -> str | None:
+    """The policy identifier whenever the embedded inventory is valid,
+    None otherwise; never raises."""
+    try:
+        _validate_product_inventory()
+        return _inventory_policy_id()
+    except Exception:
+        return None
+
+
+def _product_identity(
+    records: list[tuple[str, str, str, str, int, str]],
+) -> dict:
+    component_ids = {}
+    for component in _product_components():
+        rows = [record for record in records if record[0] == component]
+        component_ids[component] = "component-" + _product_digest(
+            _PRODUCT_COMPONENT_ID_DOMAIN, rows
+        )
+    return {
+        "component_ids": component_ids,
+        "product_id": "product-"
+        + _product_digest(_PRODUCT_ID_DOMAIN, records),
+    }
+
+
+def _compare_product_states(
+    current_records: list[tuple[str, str, str, str, int, str]],
+    candidate_records: list[tuple[str, str, str, str, int, str]],
+) -> tuple[list[str], list[str]]:
+    current_by_path = {record[2]: record for record in current_records}
+    candidate_by_path = {record[2]: record for record in candidate_records}
+    changed_paths = sorted(
+        path
+        for path, record in current_by_path.items()
+        if candidate_by_path[path] != record
+    )
+    changed_components = sorted(
+        {current_by_path[path][0] for path in changed_paths}
+    )
+    return changed_paths, changed_components
+
+
+def _build_product_result(
+    status: str,
+    current_identity: dict | None,
+    candidate_identity: dict | None,
+    changed_paths: list[str],
+    changed_components: list[str],
+) -> dict:
+    if status == PRODUCT_STATUS_NO_UPDATE:
+        requirements: list[str] = []
+    elif status == PRODUCT_STATUS_UPDATE_AVAILABLE:
+        requirements = list(PRODUCT_REVIEW_REQUIREMENTS)
+    else:
+        requirements = ["operator-review"]
+    if current_identity is None:
+        current_identity = {"component_ids": None, "product_id": None}
+    if candidate_identity is None:
+        candidate_identity = {"component_ids": None, "product_id": None}
+    changed_path_count = len(changed_paths)
+    return {
+        "schema": PRODUCT_SCHEMA,
+        "mode": PRODUCT_MODE,
+        "status": status,
+        "apply_supported": False,
+        "apply_performed": False,
+        "provenance_verified": False,
+        "signature_verified": False,
+        "inventory_policy_id": _product_inventory_policy_id(),
+        "current": current_identity,
+        "candidate": candidate_identity,
+        "components": _product_components(),
+        "changed_paths": list(changed_paths[:MAX_PRODUCT_CHANGED_PATHS]),
+        "changed_path_count": changed_path_count,
+        "changed_paths_truncated": changed_path_count
+        > MAX_PRODUCT_CHANGED_PATHS,
+        "changed_components": list(changed_components),
+        "requirements": requirements,
+        "nonclaims": list(PRODUCT_NONCLAIMS),
+    }
+
+
+def plan_product_release(
+    current_root: Path,
+    candidate_root: Path,
+    expected_candidate_product_id: str | None = None,
+) -> dict:
+    current_identity: dict | None = None
+    candidate_identity: dict | None = None
+    snapshots: list[_RootSnapshot] = []
+    try:
+        try:
+            if expected_candidate_product_id is not None and (
+                not isinstance(expected_candidate_product_id, str)
+                or _PRODUCT_ID_RE.fullmatch(expected_candidate_product_id)
+                is None
+            ):
+                raise _Unsupported("invalid-arguments")
+            if not _PLATFORM_SUPPORTED:
+                raise _Unsupported("platform-unsupported")
+            _validate_product_inventory()
+            current_root = _validate_root_argument(current_root)
+            candidate_root = _validate_root_argument(candidate_root)
+            budget = {"remaining": MAX_PRODUCT_TOTAL_BYTES}
+            name_budget = {"remaining": MAX_PRODUCT_SCANNED_NAME_BYTES}
+            current_ignored: list = []
+            candidate_ignored: list = []
+            current_snapshot = _RootSnapshot(current_root)
+            snapshots.append(current_snapshot)
+            current_records = _capture_product_state(
+                current_snapshot, budget, name_budget, True, current_ignored
+            )
+            candidate_snapshot = _RootSnapshot(candidate_root)
+            snapshots.append(candidate_snapshot)
+            candidate_records = _capture_product_state(
+                candidate_snapshot, budget, name_budget, False, candidate_ignored
+            )
+            # Both chains stay held across the full capture; only now compare
+            # each held identity against what its held parent currently
+            # shows, and re-verify every ignored entry's identity and safety.
+            _recheck_ignored_entries(current_snapshot, current_ignored)
+            _recheck_ignored_entries(candidate_snapshot, candidate_ignored)
+            current_snapshot.recheck()
+            candidate_snapshot.recheck()
+            current_identity = _product_identity(current_records)
+            candidate_identity = _product_identity(candidate_records)
+            if (
+                expected_candidate_product_id is not None
+                and candidate_identity["product_id"]
+                != expected_candidate_product_id
+            ):
+                raise _Unsupported("expected-product-id-mismatch")
+            changed_paths, changed_components = _compare_product_states(
+                current_records, candidate_records
+            )
+            status = (
+                PRODUCT_STATUS_NO_UPDATE
+                if not changed_paths
+                else PRODUCT_STATUS_UPDATE_AVAILABLE
+            )
+            return _build_product_result(
+                status,
+                current_identity,
+                candidate_identity,
+                changed_paths,
+                changed_components,
+            )
+        finally:
+            for snapshot in snapshots:
+                snapshot.close()
+    except _Unsupported as blocked:
+        return _build_product_result(
+            f"unsupported:{blocked.token}",
+            current_identity,
+            candidate_identity,
+            [],
+            [],
+        )
+    except Exception:
+        # Unknown failure: emit nothing observed under the unknown state.
+        return _build_product_result(
+            "unsupported:internal-error", None, None, [], []
+        )
+
+
+def product_exit_code(result: dict) -> int:
+    return PRODUCT_EXIT_CODES.get(str(result.get("status")), 2)
+
+
 class _PlanArgumentParser(argparse.ArgumentParser):
     """Rejected command lines must yield the deterministic unsupported JSON
     contract on stdout, never argparse usage text on stderr.  Help output is
@@ -1953,6 +2999,19 @@ def _emit_governed(result: dict) -> int:
     return governed_exit_code(result)
 
 
+def _emit_product(result: dict) -> int:
+    # The rendered result line is itself bounded; an overrun collapses to a
+    # fixed product-shaped refusal rather than unbounded output.
+    line = render_plan(result)
+    if len(line.encode("utf-8")) > MAX_PRODUCT_RESULT_BYTES:
+        result = _build_product_result(
+            "unsupported:output-oversize", None, None, [], []
+        )
+        line = render_plan(result)
+    sys.stdout.write(line + "\n")
+    return product_exit_code(result)
+
+
 def main(argv: list[str] | None = None) -> int:
     # Argparse rejections happen before flags are parsed, so the output shape
     # for an invalid command line is chosen by a literal scan for the gate
@@ -1961,8 +3020,10 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:]) if argv is None else list(argv)
     gate_requested = "--preservation-gate" in raw_argv
     governed_requested = "--governed-update-plan" in raw_argv
+    product_requested = "--product-release-plan" in raw_argv
     parser = _PlanArgumentParser(
         prog="release_update_plan",
+        allow_abbrev=False,
         description=(
             "Read-only release update planner: classifies the trusted-manifest "
             "source delta between two local roots without applying anything."
@@ -1999,6 +3060,19 @@ def main(argv: list[str] | None = None) -> int:
             "one held snapshot per root; still read-only and plan-only."
         ),
     )
+    parser.add_argument(
+        "--product-release-plan",
+        action="store_true",
+        help=(
+            "Run the read-only whole-product inventory comparison instead "
+            "of the trusted-manifest source plan."
+        ),
+    )
+    parser.add_argument(
+        "--expected-candidate-product-id",
+        default=None,
+        help="Optional expected candidate product id (product-<64 hex>).",
+    )
     try:
         args = parser.parse_args(argv)
     except _CliArgumentError:
@@ -2019,6 +3093,12 @@ def main(argv: list[str] | None = None) -> int:
                     _required_surface_ids(),
                 )
             )
+        if product_requested:
+            return _emit_product(
+                _build_product_result(
+                    "unsupported:invalid-arguments", None, None, [], []
+                )
+            )
         return _emit(
             _build_plan(
                 CLASSIFICATION_UNSUPPORTED,
@@ -2029,7 +3109,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     if args.governed_update_plan:
-        if args.preservation_gate:
+        if (
+            args.preservation_gate
+            or args.product_release_plan
+            or args.expected_candidate_product_id is not None
+        ):
             return _emit_governed(
                 _build_governed_result(
                     GOVERNED_STATUS_UNSUPPORTED, None, None
@@ -2047,7 +3131,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.preservation_gate:
         # The expected-build-id contract belongs to the source plan; mixing
         # the two modes is rejected rather than silently ignored.
-        if args.expected_candidate_build_id is not None:
+        if (
+            args.expected_candidate_build_id is not None
+            or args.product_release_plan
+            or args.expected_candidate_product_id is not None
+        ):
             return _emit_gate(
                 _build_gate_result(
                     "unsupported:invalid-arguments",
@@ -2072,6 +3160,36 @@ def main(argv: list[str] | None = None) -> int:
                 _required_surface_ids(),
             )
         return _emit_gate(result)
+    if args.product_release_plan:
+        # The expected-build-id contract belongs to the source plan; mixing
+        # it with the product inventory is rejected rather than ignored.
+        if args.expected_candidate_build_id is not None:
+            return _emit_product(
+                _build_product_result(
+                    "unsupported:invalid-arguments", None, None, [], []
+                )
+            )
+        try:
+            result = plan_product_release(
+                Path(args.current_root),
+                Path(args.candidate_root),
+                args.expected_candidate_product_id,
+            )
+        except Exception:
+            result = _build_product_result(
+                "unsupported:internal-error", None, None, [], []
+            )
+        return _emit_product(result)
+    if args.expected_candidate_product_id is not None:
+        return _emit(
+            _build_plan(
+                CLASSIFICATION_UNSUPPORTED,
+                "unsupported:invalid-arguments",
+                None,
+                None,
+                [],
+            )
+        )
     try:
         plan = plan_release_update(
             Path(args.current_root),
