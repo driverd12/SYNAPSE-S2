@@ -2213,17 +2213,19 @@ HISTORY_CHANGED_PATHS = [
     "web/index.html",
 ]
 # The identical release-foundation overlay applied to both historical
-# templates: the closed 195-entry inventory binds these files, so both
+# templates: the closed 197-entry inventory binds these files, so both
 # trees carry the same current copies and the factual delta between the
 # templates stays exactly HISTORY_CHANGED_PATHS.  Product identities can
 # no longer be pinned as hex constants here: this very file is part of
 # the overlay, so any pinned digest would feed its own input.
 HISTORY_FOUNDATION_OVERLAY = (
     "pyproject.toml",
+    "scripts/installed_layout.py",
     "scripts/release_provenance.py",
     "scripts/release_stage.py",
     "scripts/release_update_plan.py",
     "scripts/sign_release_provenance.py",
+    "tests/test_installed_layout.py",
     "tests/test_release_provenance.py",
     "tests/test_release_stage.py",
     "tests/test_release_update_plan.py",
@@ -2232,9 +2234,11 @@ HISTORY_FOUNDATION_OVERLAY = (
 
 # Inventory paths introduced on top of the tracked HISTORY_NEW_COMMIT tree.
 FOUNDATION_NEW_PATHS = (
+    "scripts/installed_layout.py",
     "scripts/release_provenance.py",
     "scripts/release_stage.py",
     "scripts/sign_release_provenance.py",
+    "tests/test_installed_layout.py",
     "tests/test_release_provenance.py",
     "tests/test_release_stage.py",
 )
@@ -2393,7 +2397,7 @@ class ProductReleasePlanTests(unittest.TestCase):
         inventory_paths = sorted(
             path for _, _, path in planner.PRODUCT_INVENTORY
         )
-        self.assertEqual(len(inventory_paths), 195)
+        self.assertEqual(len(inventory_paths), 197)
         tracked = sorted(
             subprocess.run(
                 [
@@ -2411,7 +2415,7 @@ class ProductReleasePlanTests(unittest.TestCase):
             ).stdout.splitlines()
         )
         # Exact parity with the tracked tree at the release base plus the
-        # five release-foundation additions: no path is derived at runtime,
+        # seven release-foundation additions: no path is derived at runtime,
         # nothing tracked is uninventoried, and nothing inventoried is
         # neither tracked nor a declared addition.
         self.assertEqual(len(tracked), 190)
@@ -2427,6 +2431,39 @@ class ProductReleasePlanTests(unittest.TestCase):
         # Every trusted-manifest source file must also be product-inventoried.
         for name in planner.TRUSTED_MANIFEST:
             self.assertIn(name, inventory_paths)
+
+    def test_product_inventory_disk_mode_census_is_closed(self) -> None:
+        # The working tree the closed 197-entry inventory binds carries an
+        # equally closed permission census: exactly 185 regular 0644 files
+        # and exactly 12 executable 0755 operator entry points.  Any new
+        # executable (or a lost executable bit) must be reviewed here.
+        census: dict[int, int] = {}
+        executables = []
+        for _, _, path in planner.PRODUCT_INVENTORY:
+            observed = (ROOT / path).lstat()
+            self.assertTrue(stat.S_ISREG(observed.st_mode), path)
+            mode = stat.S_IMODE(observed.st_mode)
+            census[mode] = census.get(mode, 0) + 1
+            if mode == 0o755:
+                executables.append(path)
+        self.assertEqual(census, {0o644: 185, 0o755: 12})
+        self.assertEqual(
+            sorted(executables),
+            [
+                "scripts/capture_frontmost_selection.sh",
+                "scripts/core_agent_installer.py",
+                "scripts/core_cutover_preflight.py",
+                "scripts/core_cutover_preflight.sh",
+                "scripts/install_capture_daemon.sh",
+                "scripts/install_client_configs.py",
+                "scripts/install_core_agent.sh",
+                "scripts/install_dashboard_agent.sh",
+                "scripts/install_local_launcher.sh",
+                "scripts/open_dashboard.py",
+                "scripts/prep_tomorrow.sh",
+                "scripts/purge_namespaces.py",
+            ],
+        )
 
     def test_inventory_policy_id_binds_the_closed_policy(self) -> None:
         # Independent recomputation from the documented construction: the
@@ -2553,9 +2590,12 @@ class ProductReleasePlanTests(unittest.TestCase):
             ("operator-manual", "manual-asset",
              "output/pdf/SYNAPSE-S2_Visual_User_Manual.pdf"),
             ("operator-scripts", "operator-script",
+             "scripts/installed_layout.py"),
+            ("operator-scripts", "operator-script",
              "scripts/release_stage.py"),
             ("operator-scripts", "operator-script",
              "scripts/release_update_plan.py"),
+            ("tests", "test", "tests/test_installed_layout.py"),
             ("tests", "test", "tests/test_release_stage.py"),
             ("support-tools", "support-tool", "scripts/measure_retrieval_v2.py"),
             ("dependencies", "dependency-lock", "uv.lock"),
@@ -2607,9 +2647,9 @@ class ProductReleasePlanTests(unittest.TestCase):
                 caught.exception.token, "product-inventory-invalid"
             )
         # Inventory count bound, exercised at the exact edge.
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 195):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 197):
             planner._validate_product_inventory()
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 194):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 196):
             result = planner.plan_product_release(
                 self.template, self.template
             )
