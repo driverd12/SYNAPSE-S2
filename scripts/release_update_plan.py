@@ -66,6 +66,17 @@ missing, duplicated, rebound, dynamically mutated, syntactically ambiguous,
 over-budget, unsafe, or raced contract sources all fail closed to
 ``unsupported`` and provenance is still never claimed or verified.
 
+The plan-only governed mode (``--governed-update-plan``) combines those two
+analyses without combining their authority.  It captures source and selected
+contract bytes through one held snapshot per root, reuses the exact payloads
+for both decisions, and rechecks both roots after the complete capture.  It
+can therefore report ``no-update``, ``review-required``, or
+``blocked-contract-change`` without the mixed-snapshot race created by two
+independent planner calls.  It remains advisory: the emitted workflow is a
+non-executable sequence, and evidence validation, provenance, staging,
+cutover, rollback, live-store safety, and memory equivalence remain explicit
+nonclaims.
+
 Import hardening: before any non-builtin import, ``sys.path`` is rebuilt
 using builtins only — PYTHONPATH, cwd, and other untrusted entries are
 dropped, and only interpreter-owned entries are retained for stdlib loading.
@@ -292,6 +303,82 @@ GATE_STATUS_BLOCKED = "blocked-contract-change"
 GATE_EXIT_CODES = {
     GATE_STATUS_PROVEN_EQUAL: 0,
     GATE_STATUS_BLOCKED: 3,
+}
+
+GOVERNED_SCHEMA = "synapse-s2.governed-update-plan.v1"
+GOVERNED_MODE = "plan-only"
+
+GOVERNED_STATUS_NO_UPDATE = "no-update"
+GOVERNED_STATUS_REVIEW_REQUIRED = "review-required"
+GOVERNED_STATUS_BLOCKED = "blocked-contract-change"
+GOVERNED_STATUS_UNSUPPORTED = "unsupported"
+
+GOVERNED_EXIT_CODES = {
+    GOVERNED_STATUS_NO_UPDATE: 0,
+    GOVERNED_STATUS_REVIEW_REQUIRED: 3,
+    GOVERNED_STATUS_BLOCKED: 3,
+    GOVERNED_STATUS_UNSUPPORTED: 2,
+}
+
+# The governed mode observes the same two bounded read envelopes that its
+# former source-plan + preservation-gate composition used, but shares exact
+# file payloads between both analyses.  It remains bounded even if the two
+# selected source sets diverge in a future reviewed release.
+MAX_GOVERNED_TOTAL_BYTES = 2 * MAX_TOTAL_MANIFEST_BYTES
+
+GOVERNED_WORKFLOW_STEPS = (
+    "source-review",
+    "delivery-audit",
+    "writer-quiescence",
+    "replacement-stage",
+    "readiness-certification",
+    "cutover-preflight",
+    "explicit-install",
+    "post-update-memory-equivalence",
+    "client-config-convergence",
+)
+
+GOVERNED_STOP_CONDITIONS = (
+    "stale",
+    "drifted",
+    "expired",
+    "unsigned",
+    "mismatched",
+    "outcome_unknown",
+    "nonquiescent",
+    "memory-equivalence-failure",
+)
+
+GOVERNED_NONCLAIMS = (
+    "no-evidence-validation",
+    "no-staging",
+    "no-cutover",
+    "no-rollback",
+    "no-memory-equivalence-verification",
+    "no-live-store-safety",
+    "no-provenance-proof",
+)
+
+_GOVERNED_BLOCKERS = {
+    GOVERNED_STATUS_NO_UPDATE: (),
+    GOVERNED_STATUS_REVIEW_REQUIRED: ("source-delta-unclassified",),
+    GOVERNED_STATUS_BLOCKED: ("contract-change",),
+    GOVERNED_STATUS_UNSUPPORTED: ("unsupported-input-or-result",),
+}
+
+_GOVERNED_REQUIREMENTS = {
+    GOVERNED_STATUS_NO_UPDATE: (),
+    GOVERNED_STATUS_REVIEW_REQUIRED: (
+        "contract-classification",
+        "operator-review",
+        "source-delta-review",
+    ),
+    GOVERNED_STATUS_BLOCKED: (
+        "contract-review",
+        "operator-review",
+        "source-delta-review",
+    ),
+    GOVERNED_STATUS_UNSUPPORTED: ("operator-review",),
 }
 
 # Bounds on per-file contract-source analysis, with generous headroom over the
@@ -937,15 +1024,34 @@ def _extract_manifest(source: bytes) -> tuple[str, tuple[str, ...] | None]:
     return ("ok", tuple(entries))
 
 
+def _snapshot_payload(
+    snapshot: _RootSnapshot,
+    name: str,
+    budget: dict[str, int],
+    payload_cache: dict[str, bytes] | None,
+) -> bytes:
+    if payload_cache is not None and name in payload_cache:
+        return payload_cache[name]
+    payload = snapshot.read_file(name, budget)
+    if payload_cache is not None:
+        payload_cache[name] = payload
+    return payload
+
+
 def _capture_root_state(
-    snapshot: _RootSnapshot, budget: dict[str, int]
+    snapshot: _RootSnapshot,
+    budget: dict[str, int],
+    *,
+    open_root: bool = True,
+    payload_cache: dict[str, bytes] | None = None,
 ) -> tuple[str, dict[str, str]]:
-    snapshot.open_root()
+    if open_root:
+        snapshot.open_root()
     build_digest = hashlib.sha256()
     file_digests: dict[str, str] = {}
     core_service_source: bytes | None = None
     for name in TRUSTED_MANIFEST:
-        payload = snapshot.read_file(name, budget)
+        payload = _snapshot_payload(snapshot, name, budget, payload_cache)
         encoded_name = name.encode("utf-8")
         build_digest.update(len(encoded_name).to_bytes(4, "big"))
         build_digest.update(encoded_name)
@@ -996,6 +1102,34 @@ def _build_plan(
     }
 
 
+def _compare_source_states(
+    current_build_id: str,
+    current_digests: dict[str, str],
+    candidate_build_id: str,
+    candidate_digests: dict[str, str],
+) -> dict:
+    changes = sorted(
+        name
+        for name in TRUSTED_MANIFEST
+        if current_digests[name] != candidate_digests[name]
+    )
+    if not changes and current_build_id == candidate_build_id:
+        return _build_plan(
+            CLASSIFICATION_NO_OP,
+            "no-op",
+            current_build_id,
+            candidate_build_id,
+            [],
+        )
+    return _build_plan(
+        CLASSIFICATION_CHANGED,
+        "blocked-changed-unclassified",
+        current_build_id,
+        candidate_build_id,
+        changes,
+    )
+
+
 def plan_release_update(
     current_root: Path,
     candidate_root: Path,
@@ -1036,25 +1170,11 @@ def plan_release_update(
                 and candidate_build_id != expected_candidate_build_id
             ):
                 raise _Unsupported("expected-build-id-mismatch")
-            changes = sorted(
-                name
-                for name in TRUSTED_MANIFEST
-                if current_digests[name] != candidate_digests[name]
-            )
-            if not changes and current_build_id == candidate_build_id:
-                return _build_plan(
-                    CLASSIFICATION_NO_OP,
-                    "no-op",
-                    current_build_id,
-                    candidate_build_id,
-                    [],
-                )
-            return _build_plan(
-                CLASSIFICATION_CHANGED,
-                "blocked-changed-unclassified",
+            return _compare_source_states(
                 current_build_id,
+                current_digests,
                 candidate_build_id,
-                changes,
+                candidate_digests,
             )
         finally:
             for snapshot in snapshots:
@@ -1416,12 +1536,18 @@ def _capture_contract_state(
     snapshot: _RootSnapshot,
     file_items: dict[str, frozenset[str]],
     budget: dict[str, int],
+    *,
+    open_root: bool = True,
+    payload_cache: dict[str, bytes] | None = None,
 ) -> dict[str, object]:
-    snapshot.open_root()
+    if open_root:
+        snapshot.open_root()
     analyses: dict[str, object] = {}
     for name in sorted(file_items):
         try:
-            payload = snapshot.read_file(name, budget)
+            payload = _snapshot_payload(
+                snapshot, name, budget, payload_cache
+            )
         except _Unsupported as blocked:
             # A wholly absent contract source is a *missing* contract, which
             # the comparison reports per surface; every other snapshot
@@ -1609,6 +1735,196 @@ def run_preservation_gate(current_root: Path, candidate_root: Path) -> dict:
         )
 
 
+def _compose_governed_status(source_plan: dict, gate: dict) -> str:
+    classification = source_plan.get("classification")
+    gate_status = gate.get("status")
+    if classification == CLASSIFICATION_UNSUPPORTED:
+        return GOVERNED_STATUS_UNSUPPORTED
+    if isinstance(gate_status, str) and gate_status.startswith("unsupported:"):
+        return GOVERNED_STATUS_UNSUPPORTED
+    if gate_status == GATE_STATUS_BLOCKED:
+        return GOVERNED_STATUS_BLOCKED
+    if gate_status == GATE_STATUS_PROVEN_EQUAL:
+        if classification == CLASSIFICATION_NO_OP:
+            return GOVERNED_STATUS_NO_UPDATE
+        if classification == CLASSIFICATION_CHANGED:
+            return GOVERNED_STATUS_REVIEW_REQUIRED
+    return GOVERNED_STATUS_UNSUPPORTED
+
+
+def _build_governed_result(
+    status: str,
+    source_plan: dict | None,
+    preservation_gate: dict | None,
+) -> dict:
+    current_id = None
+    candidate_id = None
+    if source_plan is not None:
+        current_id = source_plan["current"]["source_build_id"]
+        candidate_id = source_plan["candidate"]["source_build_id"]
+    return {
+        "schema": GOVERNED_SCHEMA,
+        "mode": GOVERNED_MODE,
+        "status": status,
+        "apply_supported": False,
+        "apply_performed": False,
+        "provenance_verified": False,
+        "current": {"source_build_id": current_id},
+        "candidate": {"source_build_id": candidate_id},
+        "source_plan": source_plan,
+        "preservation_gate": preservation_gate,
+        "blockers": sorted(_GOVERNED_BLOCKERS[status]),
+        "requirements": sorted(_GOVERNED_REQUIREMENTS[status]),
+        "workflow": [
+            {"step": step, "execution_supported": False}
+            for step in GOVERNED_WORKFLOW_STEPS
+        ],
+        "stop_conditions": list(GOVERNED_STOP_CONDITIONS),
+        "nonclaims": list(GOVERNED_NONCLAIMS),
+    }
+
+
+def _governed_unsupported_result(token: str) -> dict:
+    source_plan = _build_plan(
+        CLASSIFICATION_UNSUPPORTED,
+        f"unsupported:{token}",
+        None,
+        None,
+        [],
+    )
+    gate = _build_gate_result(
+        f"unsupported:{token}",
+        None,
+        None,
+        [],
+        [],
+        _required_surface_ids(),
+    )
+    return _build_governed_result(
+        GOVERNED_STATUS_UNSUPPORTED, source_plan, gate
+    )
+
+
+def _capture_governed_root_state(
+    snapshot: _RootSnapshot,
+    file_items: dict[str, frozenset[str]],
+    budget: dict[str, int],
+) -> tuple[str, dict[str, str], dict[str, object]]:
+    """Capture source and contract state from one held root and exact bytes."""
+    snapshot.open_root()
+    payload_cache: dict[str, bytes] = {}
+    build_id, file_digests = _capture_root_state(
+        snapshot,
+        budget,
+        open_root=False,
+        payload_cache=payload_cache,
+    )
+    analyses = _capture_contract_state(
+        snapshot,
+        file_items,
+        budget,
+        open_root=False,
+        payload_cache=payload_cache,
+    )
+    return build_id, file_digests, analyses
+
+
+def plan_governed_update(
+    current_root: Path,
+    candidate_root: Path,
+    expected_candidate_build_id: str | None = None,
+) -> dict:
+    """Produce one atomic, read-only source + preservation verdict.
+
+    Each root is opened once through the descriptor-anchored snapshot reader.
+    The source and semantic-contract analyses reuse the exact same payloads,
+    and both roots are rechecked only after every selected byte is captured.
+    Any unsafe input, mutation, ambiguity, or failure returns the fixed
+    unsupported contract; this function never stages or applies an update.
+    """
+    snapshots: list[_RootSnapshot] = []
+    try:
+        if expected_candidate_build_id is not None and (
+            not isinstance(expected_candidate_build_id, str)
+            or _BUILD_ID_RE.fullmatch(expected_candidate_build_id) is None
+        ):
+            raise _Unsupported("invalid-arguments")
+        if not _PLATFORM_SUPPORTED:
+            raise _Unsupported("platform-unsupported")
+        _validate_trusted_manifest()
+        _validate_semantic_surfaces()
+        current_root = _validate_root_argument(current_root)
+        candidate_root = _validate_root_argument(candidate_root)
+        file_items = _surface_file_items()
+        budget = {"remaining": MAX_GOVERNED_TOTAL_BYTES}
+
+        current_snapshot = _RootSnapshot(current_root)
+        snapshots.append(current_snapshot)
+        (
+            current_build_id,
+            current_digests,
+            current_analyses,
+        ) = _capture_governed_root_state(
+            current_snapshot, file_items, budget
+        )
+
+        candidate_snapshot = _RootSnapshot(candidate_root)
+        snapshots.append(candidate_snapshot)
+        (
+            candidate_build_id,
+            candidate_digests,
+            candidate_analyses,
+        ) = _capture_governed_root_state(
+            candidate_snapshot, file_items, budget
+        )
+
+        current_snapshot.recheck()
+        candidate_snapshot.recheck()
+
+        source_plan = _compare_source_states(
+            current_build_id,
+            current_digests,
+            candidate_build_id,
+            candidate_digests,
+        )
+        gate = _compare_contract_states(
+            current_analyses, candidate_analyses
+        )
+        if (
+            expected_candidate_build_id is not None
+            and candidate_build_id != expected_candidate_build_id
+        ):
+            source_plan = _build_plan(
+                CLASSIFICATION_UNSUPPORTED,
+                "unsupported:expected-build-id-mismatch",
+                current_build_id,
+                candidate_build_id,
+                [],
+            )
+        status = _compose_governed_status(source_plan, gate)
+        return _build_governed_result(status, source_plan, gate)
+    except _Unsupported as blocked:
+        return _governed_unsupported_result(blocked.token)
+    except Exception:
+        return _governed_unsupported_result("internal-error")
+    finally:
+        for snapshot in snapshots:
+            snapshot.close()
+
+
+def governed_exit_code(result: object) -> int:
+    if not isinstance(result, dict):
+        return GOVERNED_EXIT_CODES[GOVERNED_STATUS_UNSUPPORTED]
+    return GOVERNED_EXIT_CODES.get(
+        result.get("status"),
+        GOVERNED_EXIT_CODES[GOVERNED_STATUS_UNSUPPORTED],
+    )
+
+
+def render_governed_plan(result: dict) -> str:
+    return json.dumps(result, sort_keys=True, separators=(",", ":"))
+
+
 def preservation_exit_code(result: dict) -> int:
     return GATE_EXIT_CODES.get(str(result.get("status")), 2)
 
@@ -1632,6 +1948,11 @@ def _emit_gate(result: dict) -> int:
     return preservation_exit_code(result)
 
 
+def _emit_governed(result: dict) -> int:
+    sys.stdout.write(render_governed_plan(result) + "\n")
+    return governed_exit_code(result)
+
+
 def main(argv: list[str] | None = None) -> int:
     # Argparse rejections happen before flags are parsed, so the output shape
     # for an invalid command line is chosen by a literal scan for the gate
@@ -1639,6 +1960,7 @@ def main(argv: list[str] | None = None) -> int:
     # keep their exact v1 bytes.
     raw_argv = list(sys.argv[1:]) if argv is None else list(argv)
     gate_requested = "--preservation-gate" in raw_argv
+    governed_requested = "--governed-update-plan" in raw_argv
     parser = _PlanArgumentParser(
         prog="release_update_plan",
         description=(
@@ -1669,9 +1991,23 @@ def main(argv: list[str] | None = None) -> int:
             "of the source-delta plan."
         ),
     )
+    parser.add_argument(
+        "--governed-update-plan",
+        action="store_true",
+        help=(
+            "Atomically compose the source plan and preservation gate from "
+            "one held snapshot per root; still read-only and plan-only."
+        ),
+    )
     try:
         args = parser.parse_args(argv)
     except _CliArgumentError:
+        if governed_requested:
+            return _emit_governed(
+                _build_governed_result(
+                    GOVERNED_STATUS_UNSUPPORTED, None, None
+                )
+            )
         if gate_requested:
             return _emit_gate(
                 _build_gate_result(
@@ -1692,6 +2028,22 @@ def main(argv: list[str] | None = None) -> int:
                 [],
             )
         )
+    if args.governed_update_plan:
+        if args.preservation_gate:
+            return _emit_governed(
+                _build_governed_result(
+                    GOVERNED_STATUS_UNSUPPORTED, None, None
+                )
+            )
+        try:
+            result = plan_governed_update(
+                Path(args.current_root),
+                Path(args.candidate_root),
+                args.expected_candidate_build_id,
+            )
+        except Exception:
+            result = _governed_unsupported_result("internal-error")
+        return _emit_governed(result)
     if args.preservation_gate:
         # The expected-build-id contract belongs to the source plan; mixing
         # the two modes is rejected rather than silently ignored.
