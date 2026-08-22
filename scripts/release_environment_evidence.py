@@ -50,7 +50,7 @@ PHASE5A_CONTRACT_ID = (
     "fec40398c01456d33b1bf5980b737987d1825fea8194d102af7d0afd939cfe3e"
 )
 PHASE5B1_SOURCE_SHA256 = (
-    "6a7fb7bfa2f0a0d321a424a535d3310d2f37d1f4c7a2b16017d1b12fc5e3f206"
+    "3aa1fbc1042ddc05b3482ad657d8e41d8f62e02debcc2c897e4ca3ba20574bb0"
 )
 PHASE5B1_CONTRACT_ID = (
     "environment-storage-contract-"

@@ -62,7 +62,7 @@ PINNED_STORAGE_CONTRACT_ID = (
     "9d10496d94003ad2d46905f19155de31c48a3834914c60469a739a73298c20aa"
 )
 PINNED_STORAGE_SOURCE_SHA256 = (
-    "6a7fb7bfa2f0a0d321a424a535d3310d2f37d1f4c7a2b16017d1b12fc5e3f206"
+    "3aa1fbc1042ddc05b3482ad657d8e41d8f62e02debcc2c897e4ca3ba20574bb0"
 )
 PINNED_PHASE5A_SOURCE_SHA256 = (
     "42da38a8710ebdeaaabf11741859f4822a943df3d6b9d8deff2236fa64672308"
@@ -795,6 +795,18 @@ class StorageFixture:
             environment_request=self.request,
             layout_plan=self.layout_plan,
             stage_result=self.stage_result,
+        )
+
+    def inspect_held(self, observer):
+        return rs._inspect_with_held_snapshot(
+            self.authority_root,
+            self.state_root,
+            self.journal_root,
+            environment_request=self.request,
+            layout_plan=self.layout_plan,
+            stage_result=self.stage_result,
+            tracker=rs._MutationTracker(write_supported=False),
+            snapshot_observer=observer,
         )
 
     def close(self):
@@ -1870,6 +1882,225 @@ class TestStorageLifecycle(unittest.TestCase):
             self.fixture._snapshot(self.fixture.sentinel_path),
             self.fixture.sentinel_before,
         )
+
+    def _lock_probe_exit_code(self):
+        script = (
+            "import fcntl,os,sys\n"
+            "fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)\n"
+            "try:\n"
+            "  fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+            "except BlockingIOError:\n"
+            "  raise SystemExit(7)\n"
+            "raise SystemExit(0)\n"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                self.fixture.state_root + "/" + rs.STATE_LOCK_NAME,
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return completed.returncode
+
+    def test_private_held_snapshot_observer_is_bracketed_by_shared_lock(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+        captured = {}
+
+        def observer(context):
+            self.assertEqual(
+                tuple(context), rs._HELD_SNAPSHOT_CONTEXT_KEYS
+            )
+            self.assertEqual(self._lock_probe_exit_code(), 7)
+            manifest = json.loads(
+                context["storage_manifest_json"].decode("ascii")
+            )
+            self.assertEqual(
+                context["storage_manifest_sha256"],
+                dsha(TREE_MANIFEST_DOMAIN, manifest),
+            )
+            file_fd = os.open(
+                "pyvenv.cfg",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=context["environment_root_fd"],
+            )
+            try:
+                captured["pyvenv"] = os.read(file_fd, 1024)
+            finally:
+                os.close(file_fd)
+            return {
+                "storage_digest": context["storage_digest"],
+                "manifest_entry_count": manifest["entry_count"],
+            }
+
+        result, snapshot = self.fixture.inspect_held(observer)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["storage_digest"], snapshot["storage_digest"])
+        self.assertGreater(snapshot["manifest_entry_count"], 0)
+        self.assertEqual(captured["pyvenv"], b"home = /synthetic\n")
+        self.assertEqual(self._lock_probe_exit_code(), 0)
+
+    def test_private_held_snapshot_preproof_precedes_observer(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+        self.fixture._write(
+            self.fixture.state_root + "/" + rs.STATE_REQUEST_DOC_NAME,
+            b"{}",
+            0o600,
+        )
+        called = []
+
+        with self.assertRaises(rs._StorageFailure):
+            self.fixture.inspect_held(lambda _context: called.append(True))
+        self.assertEqual(called, [])
+        self.assertEqual(self._lock_probe_exit_code(), 0)
+
+    def test_private_held_snapshot_postproof_rejects_observer_tree_drift(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+
+        def mutate_tree(context):
+            file_fd = os.open(
+                "pyvenv.cfg",
+                os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=context["environment_root_fd"],
+            )
+            try:
+                os.write(file_fd, b"changed\n")
+            finally:
+                os.close(file_fd)
+            return "must-not-escape"
+
+        with self.assertRaises(rs._StorageFailure):
+            self.fixture.inspect_held(mutate_tree)
+        self.assertEqual(self._lock_probe_exit_code(), 0)
+
+    def test_private_held_snapshot_observer_exception_releases_lock(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+        handed_fds = []
+
+        def interrupt(context):
+            handed_fds.append(context["environment_root_fd"])
+            raise KeyboardInterrupt("synthetic-observer-interrupt")
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.fixture.inspect_held(interrupt)
+        with self.assertRaises(OSError):
+            os.fstat(handed_fds[0])
+        self.assertEqual(self._lock_probe_exit_code(), 0)
+
+    def test_private_observer_duplicate_is_noninheritable_and_revoked(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+
+        def retain_context(context):
+            self.assertIs(
+                os.get_inheritable(context["environment_root_fd"]), False
+            )
+            return context
+
+        result, snapshot = self.fixture.inspect_held(retain_context)
+        self.assertEqual(result["status"], "success")
+        with self.assertRaises(OSError):
+            os.fstat(snapshot["environment_root_fd"])
+        self.assertEqual(self._lock_probe_exit_code(), 0)
+
+    def test_public_inspect_does_not_require_private_duplicate_capability(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+        with mock.patch.object(
+            rs.os, "dup", side_effect=AssertionError("unexpected-dup")
+        ):
+            result = self.fixture.inspect()
+        self.assertEqual(result["status"], "success")
+
+    def test_private_observer_duplicate_close_failure_blocks_value(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+        handed_fds = []
+        failed = []
+        real_close = os.close
+
+        def observer(context):
+            handed_fds.append(context["environment_root_fd"])
+            return "must-not-escape"
+
+        def fail_duplicate_close(fd):
+            if handed_fds and fd == handed_fds[0] and not failed:
+                failed.append(True)
+                raise OSError(errno.EIO, "synthetic-duplicate-close")
+            return real_close(fd)
+
+        try:
+            with mock.patch.object(rs.os, "close", fail_duplicate_close):
+                with self.assertRaises(rs._StorageFailure):
+                    self.fixture.inspect_held(observer)
+            self.assertEqual(failed, [True])
+            os.fstat(handed_fds[0])
+        finally:
+            if handed_fds:
+                try:
+                    real_close(handed_fds[0])
+                except OSError:
+                    pass
+        self.assertEqual(self._lock_probe_exit_code(), 0)
+
+    def test_private_observer_closing_duplicate_blocks_but_retains_proof(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+        scanned_root_fds = []
+        original_scan = rs._scan_tree
+
+        def capture_scan(root_fd, *args, **kwargs):
+            scanned_root_fds.append(root_fd)
+            return original_scan(root_fd, *args, **kwargs)
+
+        def close_observer_duplicate(context):
+            proof_fd = scanned_root_fds[0]
+            observer_fd = context["environment_root_fd"]
+            self.assertNotEqual(observer_fd, proof_fd)
+            proof_before = os.fstat(proof_fd)
+            observer_view = os.fstat(observer_fd)
+            self.assertEqual(
+                (observer_view.st_dev, observer_view.st_ino),
+                (proof_before.st_dev, proof_before.st_ino),
+            )
+            os.close(observer_fd)
+            proof_after = os.fstat(proof_fd)
+            self.assertEqual(
+                (proof_after.st_dev, proof_after.st_ino),
+                (proof_before.st_dev, proof_before.st_ino),
+            )
+            self.assertEqual(self._lock_probe_exit_code(), 7)
+            return "observer-duplicate-closed"
+
+        with mock.patch.object(rs, "_scan_tree", capture_scan):
+            with self.assertRaises(rs._StorageFailure):
+                self.fixture.inspect_held(close_observer_duplicate)
+        self.assertEqual(self._lock_probe_exit_code(), 0)
+
+    def test_private_observer_close_and_fd_reuse_never_closes_replacement(self):
+        self.assertEqual(self.fixture.finalize()["status"], "success")
+        replacement_fds = []
+
+        def close_and_reuse(context):
+            observer_fd = context["environment_root_fd"]
+            os.close(observer_fd)
+            replacement_fd = os.open(
+                "/dev/null", os.O_RDONLY | os.O_CLOEXEC
+            )
+            self.assertEqual(replacement_fd, observer_fd)
+            replacement_fds.append(replacement_fd)
+            return "must-not-escape"
+
+        try:
+            with self.assertRaises(rs._StorageFailure):
+                self.fixture.inspect_held(close_and_reuse)
+            os.fstat(replacement_fds[0])
+        finally:
+            for fd in replacement_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.assertEqual(self._lock_probe_exit_code(), 0)
 
     def test_symlink_and_hardlink_trees_refuse_before_swap(self):
         outside = self.fixture.base + "/outside"

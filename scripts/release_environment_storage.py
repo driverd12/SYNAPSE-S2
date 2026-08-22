@@ -3220,6 +3220,33 @@ _STATE_DOC_NAMES = (
     STATE_PREPARE_DOC_NAME,
 )
 
+# Private, source-hash-bound handoff shape for the next static-evidence slice.
+# The callback receiving this context runs while the shared storage lock and
+# every descriptor opened by the inspector remain held.  It receives an
+# observer-scoped duplicate of the published environment root descriptor plus
+# immutable documentary bytes and digests, but never the proof or lock
+# descriptors.  The inspector retains its original root descriptor and owns
+# revocation of the duplicate; the observer must not close, retain, or replace
+# that descriptor.  A directory descriptor is not a sandbox: the observer
+# must itself be exact-source-pinned and read-only, and the post-observer
+# reproof rejects persistent drift.  This is deliberately not a public
+# storage-contract surface.  A future consumer must pin this module's exact
+# source bytes and return before the common final reproof and descriptor close
+# below.
+_HELD_SNAPSHOT_CONTEXT_KEYS = (
+    "environment_root_fd",
+    "environment_request_json",
+    "environment_request_sha256",
+    "storage_request_record_json",
+    "storage_request_record_sha256",
+    "storage_manifest_json",
+    "storage_manifest_sha256",
+    "storage_prepare_record_json",
+    "storage_prepare_sha256",
+    "storage_digest",
+    "operation_id",
+)
+
 
 def _require_state_dir_names(state_fd: int, *, require_all: bool) -> None:
     """Exact state-directory name validation under the held descriptor.
@@ -3968,6 +3995,43 @@ def _inspect_impl(
     stage_result: Any,
     tracker: _MutationTracker,
 ) -> dict[str, Any]:
+    result, _snapshot = _inspect_with_held_snapshot(
+        environment_authority_root,
+        environment_state_root,
+        stage_journal_root,
+        environment_request=environment_request,
+        layout_plan=layout_plan,
+        stage_result=stage_result,
+        tracker=tracker,
+        snapshot_observer=None,
+    )
+    return result
+
+
+def _inspect_with_held_snapshot(
+    environment_authority_root: Any,
+    environment_state_root: Any,
+    stage_journal_root: Any,
+    *,
+    environment_request: Any,
+    layout_plan: Any,
+    stage_result: Any,
+    tracker: _MutationTracker,
+    snapshot_observer: Any,
+) -> tuple[dict[str, Any], Any]:
+    """Run one private trusted observer inside the complete inspect proof.
+
+    When supplied, the observer is invoked exactly once after the initial full
+    tree scan, immutable state-document derivation, and one complete reproof,
+    while the shared lock and all root descriptors remain held.  Its return
+    value is retained in memory only.  The normal final
+    state/tree/journal/lock reproof runs after it returns and before either the
+    storage result or observer value can escape.  With no observer, the public
+    inspector retains its original single-final-reproof path.  This private
+    seam confers no authenticity or read-only enforcement on an arbitrary
+    callback; consumers must bind this exact source and their own observer
+    implementation.
+    """
     # Bound the three public path strings before replaying any caller document.
     _validate_abs_path(environment_authority_root, "authority-root")
     _validate_abs_path(environment_state_root, "state-root")
@@ -4048,6 +4112,86 @@ def _inspect_impl(
             preimage_fingerprint,
             operation_fingerprint,
         )
+        snapshot_value = None
+        if snapshot_observer is not None:
+            # Establish the complete ordinary inspect proof immediately
+            # before the observer reads through the held environment
+            # descriptor.  The same proof is repeated below after it returns,
+            # so neither a stale pre-observer state nor observer-window drift
+            # can escape.  Ordinary public inspect supplies no observer and
+            # retains its original single-final-reproof cost.
+            _final_state_reproof(
+                journal_root=journal_root,
+                journal_fingerprint=journal_fingerprint,
+                journal_fd=journal_fd,
+                state_name=state_name,
+                state_fd=state_fd,
+                lock_fd=lock_fd,
+                lock_fingerprint=lock_fingerprint,
+                request_payload=request_payload,
+                manifest_payload=manifest_payload,
+                prepare_payload=prepare_payload,
+                request=request,
+                request_sha256=request_sha256,
+                operation_name=operation_name,
+                environment_parent=environment_parent,
+                environment_name=environment_name,
+                operation_fingerprint=operation_fingerprint,
+                preimage_fingerprint=preimage_fingerprint,
+            )
+            try:
+                observer_environment_fd = os.dup(environment_fd)
+            except OSError:
+                raise _blocked("held-snapshot-observer-fd-dup-failed")
+            try:
+                try:
+                    os.set_inheritable(observer_environment_fd, False)
+                    observer_inheritable = os.get_inheritable(
+                        observer_environment_fd
+                    )
+                except OSError:
+                    raise _blocked("held-snapshot-observer-fd-flags-failed")
+                if observer_inheritable is not False:
+                    raise _blocked("held-snapshot-observer-fd-inheritable")
+                _directory_fingerprint(
+                    observer_environment_fd, operation_fingerprint
+                )
+                snapshot_context = {
+                    "environment_root_fd": observer_environment_fd,
+                    "environment_request_json": _canonical_json_bytes(request),
+                    "environment_request_sha256": request_sha256,
+                    "storage_request_record_json": request_payload,
+                    "storage_request_record_sha256": request_record_sha256,
+                    "storage_manifest_json": manifest_payload,
+                    "storage_manifest_sha256": manifest_sha256,
+                    "storage_prepare_record_json": prepare_payload,
+                    "storage_prepare_sha256": prepare_sha256,
+                    "storage_digest": _storage_digest(
+                        request_sha256, manifest_sha256, prepare_sha256
+                    ),
+                    "operation_id": operation_name,
+                }
+                if tuple(snapshot_context) != _HELD_SNAPSHOT_CONTEXT_KEYS:
+                    raise _blocked("held-snapshot-context-keyset")
+                if not callable(snapshot_observer):
+                    raise _blocked("held-snapshot-observer")
+                snapshot_value = snapshot_observer(snapshot_context)
+            finally:
+                try:
+                    _directory_fingerprint(
+                        observer_environment_fd, operation_fingerprint
+                    )
+                except _StorageFailure:
+                    # Do not close an integer that the observer may have
+                    # closed and allowed another open to reuse.  The original
+                    # proof descriptor remains held by the outer scope.
+                    raise _blocked("held-snapshot-observer-fd-lost")
+                try:
+                    os.close(observer_environment_fd)
+                except OSError:
+                    # Close may have taken effect despite reporting failure;
+                    # never retry an ambiguous descriptor close.
+                    raise _blocked("held-snapshot-observer-fd-close-failed")
         _final_state_reproof(
             journal_root=journal_root,
             journal_fingerprint=journal_fingerprint,
@@ -4069,17 +4213,20 @@ def _inspect_impl(
         )
 
         # Inspect success truthfully claims no write support at all.
-        return _success_result(
-            COMMAND_INSPECT,
-            SUCCESS_REASONS[3],
-            request,
-            request_sha256,
-            manifest_sha256,
-            prepare_sha256,
-            operation_name,
-            write_supported=False,
-            wrote=False,
-            reconciled=False,
+        return (
+            _success_result(
+                COMMAND_INSPECT,
+                SUCCESS_REASONS[3],
+                request,
+                request_sha256,
+                manifest_sha256,
+                prepare_sha256,
+                operation_name,
+                write_supported=False,
+                wrote=False,
+                reconciled=False,
+            ),
+            snapshot_value,
         )
     finally:
         _close_quietly(fds)
