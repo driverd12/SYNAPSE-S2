@@ -39,47 +39,47 @@ PINNED_PHASE5B1_CONTRACT_ID = (
 )
 PINNED_POLICY_ID = (
     "environment-policy-"
-    "7bfb75f7dfc87e171010696f77f0297155da33cec1193f30fb6101ca4ce7ab6e"
+    "d739e429e1be375f2cf762312acf5a0b8d84b7854baad2436c0c6f1be279b5db"
 )
 PINNED_CONTRACT_ID = (
     "environment-evidence-contract-"
-    "b8cce1d2f4c6ebc5b56f1c56b34627b6722571d77e8e58406c626a33c3a61375"
+    "924123716d28c35acfe78fc833cfc9c2ac1703e9c01fd7eba265332a6312b3e2"
 )
 PINNED_MODEL_PLAN_SHA256 = (
-    "45cec1e5a993dbaf3332aaafde1a4cec4e23f281e689c0072f9507116f7ef985"
+    "387e1005f35ed547d1210584d895092b76461e1f969aadb3ec785fdaca39f8dd"
 )
 PINNED_REQUEST_SHA256 = (
-    "5446c6bef4f12178b7081787b6083535c885d9aec8233590372af046815300ac"
+    "5627ed53a530f296678f6136a7ccdf2063ad8f5fd2026a658b3e5b28014af359"
 )
 PINNED_REQUEST_RECORD_SHA256 = (
-    "3a6686ed8aeeae8a86d6dbea6477d2e1685f6b3ab7006cd369d0e86f8a7faca2"
+    "6dad49a631a6b9d68ec207e6190f81c129de71b464d07a6cf68a071989be4cc2"
 )
 PINNED_TREE_MANIFEST_SHA256 = (
-    "52e4d140715fbcec6eda823cc8a2fe6ba8e11667c37a266ea299edf7b347a465"
+    "e10777da10a877174048cde3803bee10bfc063bb0ed38aadcfff5a3366c15e51"
 )
 PINNED_PREPARE_SHA256 = (
-    "9d34783a4e2586a9f57ac81d34e21e5eda3dcce8d31fb4c98fd97c7a678b4bd2"
+    "425a299845d404e521ad057b75dcbcb9e93e78ac44cf982f58774c1a6cf21049"
 )
 PINNED_STORAGE_DIGEST = (
-    "bddfa22356c98754bcfca1a9d22aedc8c83a8ad8699695a389e3c3201bb72538"
+    "42e807fc2995313a05ae0a5edd92186bb6226c692cf0dcae2d372fd02c152b69"
 )
 PINNED_INSTALLED_MANIFEST_SHA256 = (
-    "c65f81427722d94a6b648d6e0ecf05943edfa686d6e7263977fd4433067b933d"
+    "b2db71448b036773089f7fa61d7c83fc8300a1dfbcaeac697de3320954673cac"
 )
 PINNED_NATIVE_MANIFEST_SHA256 = (
-    "b73528528cdd074293a0d89ea7043ad11612c327411bdf44742a5acfcd968610"
+    "8e45e12cf0fa17c5b97ca3d4267f1dd7942870354207855c5b7c83b812e7d65d"
 )
 PINNED_MODEL_MANIFEST_SHA256 = (
-    "0eb5ed9cdf2fa93fb23f703f0d7b6d6e844a08a446102c38f38a6683b89008b8"
+    "426ab242392bcf7181d1099103482ce746ff6307eb7592f118b432362dd59a24"
 )
 PINNED_EVIDENCE_SET_SHA256 = (
-    "4c4a923b526c7051c097b2b1a92ba6f835852f3ba01d5ed9542ed8937f2a6cca"
+    "e26258faa4f605c5564af1ba151ff8993b088ed15786b60e0f29496cb7f43fd3"
 )
 PINNED_MODEL_RESULT_SHA256 = (
-    "b97813f5c17399e3d0b365928119b96ef1bb4dd1a06c409e68dba9d311282c8d"
+    "319aab543d92b0cc85b3b3e77b5f400577567f99e7a0dca96ac17e4e98f5a9f4"
 )
 PINNED_EVIDENCE_RESULT_SHA256 = (
-    "93025ef24ac43e95b9f66656f7b2bf044da1affc3de0c2b9770bf1716204a10c"
+    "6e75ce25204b0afd5bbe6a37f4dc7242ce6eb3216d2e7c21061b27fbdfc21e5a"
 )
 
 DOMAINS = {
@@ -485,7 +485,7 @@ def _tree_dfs_order(entries):
     return ordered
 
 
-def rehash_storage_fixture(document, *, sync_operation_nlink=True):
+def rehash_storage_fixture(document):
     request_record = document["storage_request_record"]
     manifest = document["storage_manifest"]
     manifest["entries"] = _tree_dfs_order(manifest["entries"])
@@ -494,12 +494,6 @@ def rehash_storage_fixture(document, *, sync_operation_nlink=True):
         entry["size"] for entry in manifest["entries"]
         if entry["kind"] == "file"
     )
-    if sync_operation_nlink:
-        direct_directories = sum(
-            1 for entry in manifest["entries"]
-            if entry["kind"] == "directory" and "/" not in entry["path"]
-        )
-        request_record["operation_fingerprint"]["nlink"] = 2 + direct_directories
     request_body = {
         key: request_record[key]
         for key in evidence.STORAGE_REQUEST_KEYS
@@ -890,6 +884,30 @@ class EnvironmentEvidenceTests(unittest.TestCase):
                 for binding in evidence.DOCUMENT_VALUE_RELATION_BINDINGS
             ],
         )
+        self.assertEqual(
+            projection["document_relation_fields"]["storage_fingerprints"],
+            [
+                ["preimage", "environment_preimage_fingerprint"],
+                ["operation", "operation_fingerprint"],
+            ],
+        )
+        self.assertNotIn(
+            "storage_operation_nlink_relation",
+            projection["document_binding_tables"],
+        )
+        self.assertNotIn(
+            "storage-operation-nlink-equality",
+            {
+                binding[0]
+                for binding in projection["document_value_relation_bindings"]
+            },
+        )
+        for removed in (
+            "storage_top_level_directory_binding_fields",
+            "storage_top_level_directory_binding",
+            "storage_nlink_combine_method",
+        ):
+            self.assertNotIn(removed, projection)
         self.assertEqual(
             projection["collection_relation_bindings"],
             [list(binding) for binding in evidence.COLLECTION_RELATION_BINDINGS],
@@ -1939,11 +1957,54 @@ class EnvironmentEvidenceTests(unittest.TestCase):
         for mutate in mutations:
             _plan, request, document = valid_evidence_fixture()
             mutate(document["storage_request_record"])
-            rehash_storage_fixture(document, sync_operation_nlink=False)
+            rehash_storage_fixture(document)
             result = evidence.validate_environment_evidence_set_document(
                 request, document
             )
             self.assertEqual(result["status"], evidence.STATUS_UNSUPPORTED)
+
+    def test_operation_nlink_is_opaque_for_apfs_style_root_with_regular_file(self):
+        _plan, request, document = valid_evidence_fixture()
+        document["storage_manifest"]["entries"].append(
+            {
+                "path": "pyvenv.cfg",
+                "kind": "file",
+                "mode": "0600",
+                "size": 18,
+                "sha256": "91" * 32,
+            }
+        )
+        operation = document["storage_request_record"]["operation_fingerprint"]
+        direct_entries = sum(
+            1
+            for entry in document["storage_manifest"]["entries"]
+            if "/" not in entry["path"]
+        )
+        operation["nlink"] = (
+            evidence.PHASE5B1_PREIMAGE_NLINK + direct_entries
+        )
+        rehash_storage_fixture(document)
+        direct_directories = sum(
+            1
+            for entry in document["storage_manifest"]["entries"]
+            if entry["kind"] == "directory" and "/" not in entry["path"]
+        )
+        self.assertEqual(direct_directories, 3)
+        self.assertEqual(direct_entries, 4)
+        self.assertNotEqual(
+            operation["nlink"],
+            evidence.PHASE5B1_PREIMAGE_NLINK + direct_directories,
+        )
+        self.assertEqual(
+            document["storage_prepare_record"]["operation_fingerprint"],
+            operation,
+        )
+        self.assertEqual(
+            evidence.validate_environment_evidence_set_document(
+                request, document
+            )["status"],
+            evidence.STATUS_DOCUMENT_VALID,
+        )
 
     def test_tree_replays_phase5b1_paths_bounds_and_dfs_order(self):
         _plan, request, document = valid_evidence_fixture()
@@ -3211,6 +3272,7 @@ class EnvironmentEvidenceTests(unittest.TestCase):
             ("CROSS_MANIFEST_TREE_FILE_FIELDS", evidence.CROSS_MANIFEST_TREE_FILE_FIELDS[:-1]),
             ("CROSS_MANIFEST_MODEL_FILE_FIELDS", evidence.CROSS_MANIFEST_MODEL_FILE_FIELDS[:-1]),
             ("DOCUMENT_RELATION_FIELDS", {**evidence.DOCUMENT_RELATION_FIELDS, "native_manifest": evidence.DOCUMENT_RELATION_FIELDS["native_manifest"][:-1]}),
+            ("DOCUMENT_RELATION_FIELDS", {**evidence.DOCUMENT_RELATION_FIELDS, "storage_fingerprints": evidence.DOCUMENT_RELATION_FIELDS["storage_fingerprints"][::-1]}),
             ("DOCUMENT_AGGREGATION_OPERATIONS", evidence.DOCUMENT_AGGREGATION_OPERATIONS[::-1]),
             ("DOCUMENT_AGGREGATION_COMPARATOR_METHOD", "__ne__"),
             ("DOCUMENT_AGGREGATION_BINDINGS", {**evidence.DOCUMENT_AGGREGATION_BINDINGS, "model_snapshot_plan": evidence.DOCUMENT_AGGREGATION_BINDINGS["model_snapshot_plan"][::-1]}),
@@ -3224,8 +3286,7 @@ class EnvironmentEvidenceTests(unittest.TestCase):
             ("OPTIONAL_PATH_ALLOWED_ACTIONS", evidence.OPTIONAL_PATH_ALLOWED_ACTIONS[::-1]),
             ("EXECUTABLE_MODE_CLASSIFICATION_METHOD", "__ne__"),
             ("EXECUTABLE_PATH_MEMBERSHIP_METHOD", "__eq__"),
-            ("STORAGE_TOP_LEVEL_DIRECTORY_BINDING", ("entry_kind", "file", "__eq__", "entry_path", "__contains__", False)),
-            ("STORAGE_NLINK_COMBINE_METHOD", "__sub__"),
+            ("PHASE5B1_PREIMAGE_NLINK", evidence.PHASE5B1_PREIMAGE_NLINK + 1),
             ("TREE_FILE_MODE_BINDING", ("path", "executable_modes", "path", "get")),
             ("TREE_FILE_MODE_BINDING_FIELDS", evidence.TREE_FILE_MODE_BINDING_FIELDS[:-1]),
             ("ENTRY_KIND_VALIDATOR_BINDINGS", evidence.ENTRY_KIND_VALIDATOR_BINDINGS[::-1]),

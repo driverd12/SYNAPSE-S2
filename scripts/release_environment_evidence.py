@@ -1089,10 +1089,6 @@ DOCUMENT_BINDING_TABLES = {
         ("left", "preimage:inode"),
         ("right", "operation:inode"),
     ),
-    "storage_operation_nlink_relation": (
-        ("left", "operation:nlink"),
-        ("right", "derived:expected_nlink"),
-    ),
     "fingerprint_mode_relation": (
         ("left", "fingerprint:mode"),
         ("right", "derived:expected_mode"),
@@ -1273,9 +1269,6 @@ DOCUMENT_RELATION_FIELDS = {
     "storage_fingerprints": (
         ("preimage", "environment_preimage_fingerprint"),
         ("operation", "operation_fingerprint"),
-        ("entries", "entries"),
-        ("entry_kind", "kind"),
-        ("entry_path", "path"),
     ),
     "fingerprint": (
         ("device", "device"),
@@ -1452,10 +1445,6 @@ DOCUMENT_VALUE_RELATION_BINDINGS = (
         "storage-inode-distinctness", "storage_inode_relation", "__eq__", False,
     ),
     (
-        "storage-operation-nlink-equality",
-        "storage_operation_nlink_relation", "__eq__", True,
-    ),
-    (
         "installed-record-owner-equality",
         "installed_record_relation", "__eq__", True,
     ),
@@ -1569,15 +1558,6 @@ OPTIONAL_PATH_ALLOWED_ACTIONS = (
 )
 EXECUTABLE_MODE_CLASSIFICATION_METHOD = "__eq__"
 EXECUTABLE_PATH_MEMBERSHIP_METHOD = "__contains__"
-STORAGE_TOP_LEVEL_DIRECTORY_BINDING_FIELDS = (
-    "kind_role", "kind_value", "kind_comparator_method",
-    "path_role", "path_membership_method", "separator_expected",
-)
-STORAGE_TOP_LEVEL_DIRECTORY_BINDING = (
-    "entry_kind", TREE_ENTRY_KINDS[0], "__eq__",
-    "entry_path", "__contains__", False,
-)
-STORAGE_NLINK_COMBINE_METHOD = "__add__"
 ENTRY_KIND_VALIDATOR_BINDING_FIELDS = (
     "document_role", "entry_kind", "validator_function", "fixed_rule",
 )
@@ -3499,13 +3479,6 @@ def _policy_body():
         "executable_path_membership_method": (
             EXECUTABLE_PATH_MEMBERSHIP_METHOD
         ),
-        "storage_top_level_directory_binding_fields": list(
-            STORAGE_TOP_LEVEL_DIRECTORY_BINDING_FIELDS
-        ),
-        "storage_top_level_directory_binding": list(
-            STORAGE_TOP_LEVEL_DIRECTORY_BINDING
-        ),
-        "storage_nlink_combine_method": STORAGE_NLINK_COMBINE_METHOD,
         "tree_file_mode_binding_fields": list(
             TREE_FILE_MODE_BINDING_FIELDS
         ),
@@ -3900,10 +3873,6 @@ def _contract_body():
             "executable_path_membership_method": (
                 EXECUTABLE_PATH_MEMBERSHIP_METHOD
             ),
-            "storage_top_level_directory_binding": list(
-                STORAGE_TOP_LEVEL_DIRECTORY_BINDING
-            ),
-            "storage_nlink_combine_method": STORAGE_NLINK_COMBINE_METHOD,
             "tree_file_mode_binding": list(TREE_FILE_MODE_BINDING),
             "entry_kind_validator_bindings": [
                 list(binding) for binding in ENTRY_KIND_VALIDATOR_BINDINGS
@@ -4010,7 +3979,8 @@ def _contract_body():
                 "devices_equal": True,
                 "inodes_distinct": True,
                 "operation_nlink": (
-                    "preimage-nlink-plus-top-level-directory-count"
+                    "opaque-bounded-phase5b1-observation-exact-across-"
+                    "request-prepare-and-held-root-reproof"
                 ),
             },
             "storage_operation_id": "operation-prefix-plus-phase5a-request-sha256",
@@ -4165,7 +4135,8 @@ def _contract_body():
                     "request-layout-stage-result-and-stage-journal-bind-phase5a-request",
                     "operation-id-is-operation-prefix-plus-request-digest",
                     "layout-plan-digest-is-lowercase-sha256",
-                    "preimage-and-operation-fingerprints-obey-projected-policy",
+                    "preimage-fingerprint-is-exact-and-operation-fingerprint-"
+                    "is-a-bounded-opaque-phase5b1-observation",
                     "self-hash-excludes-only-request-record-sha256",
                 ],
                 "storage_prepare_record": [
@@ -4698,9 +4669,8 @@ def _storage_digest(components):
     return hashlib.sha256(preimage).hexdigest()
 
 
-def _crosscheck_storage_fingerprints(request_record, manifest):
+def _crosscheck_storage_fingerprints(request_record, _manifest):
     relations = _relation_fields("storage_fingerprints")
-    fingerprint_relations = _relation_fields("fingerprint")
     preimage = request_record[relations["preimage"]]
     operation = request_record[relations["operation"]]
     _require_document_value_relation(
@@ -4713,51 +4683,11 @@ def _crosscheck_storage_fingerprints(request_record, manifest):
         {"preimage": preimage, "operation": operation},
         "storage-fingerprint-inode",
     )
-    separator = _path_syntax()["separator"]
-    if (
-        type(STORAGE_TOP_LEVEL_DIRECTORY_BINDING) is not tuple
-        or not _exact_value_equal(
-            len(STORAGE_TOP_LEVEL_DIRECTORY_BINDING),
-            len(STORAGE_TOP_LEVEL_DIRECTORY_BINDING_FIELDS),
-        )
-    ):
-        raise _Reject("storage-nlink-policy")
-    (
-        kind_role, kind_value, kind_comparator_method,
-        path_role, path_membership_method, separator_expected,
-    ) = STORAGE_TOP_LEVEL_DIRECTORY_BINDING
-    if (
-        type(kind_role) is not str
-        or kind_role not in relations
-        or type(kind_value) is not str
-        or type(kind_comparator_method) is not str
-        or type(path_role) is not str
-        or path_role not in relations
-        or type(path_membership_method) is not str
-        or type(separator_expected) is not bool
-        or type(STORAGE_NLINK_COMBINE_METHOD) is not str
-    ):
-        raise _Reject("storage-nlink-policy")
-    direct_directories = sum(
-        1 for entry in manifest[relations["entries"]]
-        if getattr(
-            entry[relations[kind_role]], kind_comparator_method
-        )(kind_value) is True
-        and getattr(
-            entry[relations[path_role]], path_membership_method
-        )(separator) is separator_expected
-    )
-    expected_nlink = getattr(
-        PHASE5B1_PREIMAGE_NLINK, STORAGE_NLINK_COMBINE_METHOD
-    )(direct_directories)
-    _require_document_value_relation(
-        "storage-operation-nlink-equality",
-        {
-            "operation": operation,
-            "derived": {"expected_nlink": expected_nlink},
-        },
-        "storage-operation-nlink",
-    )
+    # Directory link-count conventions are filesystem-specific.  B1 owns the
+    # observation and its held-root reproof; B2 only bounds the value and binds
+    # the exact fingerprint through the request and prepare records.  Keep the
+    # two-argument private seam stable for exact-source-pinned downstream code;
+    # the independently replayed manifest no longer predicts ``st_nlink``.
 
 
 def _installed_manifest(document, request, request_sha256, storage_digest):

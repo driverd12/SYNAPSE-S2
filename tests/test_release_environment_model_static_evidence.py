@@ -45,11 +45,11 @@ storage_support = _load_storage_test_support()
 
 
 PINNED_SOURCE_SHA256 = (
-    "3c7f88fbd6bcd00a997ac2d2011d861594db2bc162dfa5ee1fea68eec865acfb"
+    "01102b6feb296013b07cdffe484d6f83d97a621062d7a1d3a5332c66e890f09e"
 )
 PINNED_CONTRACT_ID = (
     "environment-model-static-contract-"
-    "6a072d2e57be12fae80bb9dfcbb07e4c061df812353274ac8788e668cca8e160"
+    "a7e5668083829acde97890fcbc554db59478fdf989b127db2fa03735d111bc37"
 )
 CONTRACT_DOMAIN = (
     b"SYNAPSE-S2\0RELEASE-ENVIRONMENT-MODEL-STATIC-CONTRACT\0v1\0"
@@ -216,15 +216,6 @@ class ModelStaticFixture:
             raise AssertionError(configured_cache)
         self.core = core_config_fixture(configured_environment_root)
         self.runtime = runtime_config_fixture(self.core)
-        # B2's frozen fingerprint crosscheck uses the traditional root nlink
-        # formula.  Keep this bridge fixture intentionally minimal: B1 only
-        # requires bin/python, and the model subtree is the B3a subject.
-        operation = self.storage.operation_root
-        os.unlink(operation + "/lib/__pycache__/module.cpython-314.pyc")
-        os.rmdir(operation + "/lib/__pycache__")
-        os.unlink(operation + "/lib/__init__.py")
-        os.rmdir(operation + "/lib")
-        os.unlink(operation + "/pyvenv.cfg")
         root = self.storage.operation_root
         for segment in (
             "share",
@@ -421,6 +412,15 @@ class TestHeldRootProduction(unittest.TestCase):
         environment = fragment["environment"]
         self.assertEqual(environment["layout_plan"], self.fixture.storage.layout_plan)
         self.assertEqual(environment["stage_result"], self.fixture.storage.stage_result)
+        manifest_paths = {
+            entry["path"] for entry in environment["storage_manifest"]["entries"]
+        }
+        self.assertIn("pyvenv.cfg", manifest_paths)
+        self.assertIn("lib/__pycache__/module.cpython-314.pyc", manifest_paths)
+        self.assertEqual(
+            environment["storage_request_record"]["operation_fingerprint"],
+            environment["storage_prepare_record"]["operation_fingerprint"],
+        )
         expected_cache = (
             environment["layout_plan"]["environment_root"]
             + "/"
