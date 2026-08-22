@@ -83,12 +83,18 @@ EXPECTED_SURFACE_FILES = {
     ),
     "installed-layout": (
         "scripts/installed_layout.py", "scripts/release_activation_journal.py",
+        "scripts/release_environment.py",
+        "scripts/release_environment_evidence.py",
+        "scripts/release_environment_storage.py",
         "scripts/release_stage.py",
         "scripts/release_update_plan.py", "core_client_binding.py",
         "client_config.py", "scripts/core_agent_installer.py",
     ),
     "platform-runtime": (
-        "core_protocol.py", "core_runtime_paths.py", "scripts/release_stage.py",
+        "core_protocol.py", "core_runtime_paths.py",
+        "scripts/release_environment.py",
+        "scripts/release_environment_evidence.py",
+        "scripts/release_environment_storage.py", "scripts/release_stage.py",
         "pyproject.toml", "uv.lock",
     ),
     "readiness-quiescence": (
@@ -113,7 +119,7 @@ EXPECTED_SURFACE_FILES = {
 
 
 class CompatibilityFixture(unittest.TestCase):
-    """A small synthetic tree still exercises all 201 closed paths."""
+    """A small synthetic tree still exercises all 207 closed paths."""
 
     maxDiff = None
 
@@ -448,10 +454,10 @@ class ExactBuildVerificationTests(CompatibilityFixture):
         )
         self.assertEqual(self.floor_path.stat().st_mode & 0o777, 0o600)
 
-    def test_profile_v1_ticket_is_intentionally_retired_before_root_scan(
+    def test_profile_v2_ticket_is_intentionally_retired_before_root_scan(
         self,
     ) -> None:
-        self._install_chain(ticket_overrides={"profile_version": 1})
+        self._install_chain(ticket_overrides={"profile_version": 2})
         with mock.patch.object(
             compatibility,
             "_capture_root_observation",
@@ -466,14 +472,14 @@ class ExactBuildVerificationTests(CompatibilityFixture):
         planner._validate_product_inventory()
         self.assertEqual(compatibility.TRUSTED_MANIFEST, planner.TRUSTED_MANIFEST)
         self.assertEqual(compatibility.PRODUCT_INVENTORY, planner.PRODUCT_INVENTORY)
-        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 201)
+        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 207)
         self.assertEqual(
             compatibility._inventory_policy_id(), planner._inventory_policy_id()
         )
         self.assertEqual(
             compatibility._inventory_policy_id(),
             "inventory-policy-"
-            "67ff0e34c1335dfc8f07d2253f5f0eef168726296633460a0cdd34ab92f29e2d",
+            "a9af3d870c3fde4c2201cd97489543f33fd86a8c0ff127ca04709f1c7f4bdcd8",
         )
         self.assertEqual(compatibility.MAX_TOTAL_MANIFEST_BYTES, 64 * 1024 * 1024)
         self.assertEqual(
@@ -565,6 +571,20 @@ class ExactBuildVerificationTests(CompatibilityFixture):
             ),
             ("installed-layout", "recovery"),
         )
+        for path in (
+            "scripts/release_environment.py",
+            "scripts/release_environment_evidence.py",
+            "scripts/release_environment_storage.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    tuple(
+                        surface
+                        for surface in compatibility.COMPATIBILITY_SURFACES
+                        if path in compatibility.SURFACE_FILES[surface]
+                    ),
+                    ("installed-layout", "platform-runtime"),
+                )
         current = compatibility._surface_digests(self.current_observation)
         candidate = compatibility._surface_digests(self.candidate_observation)
         self.assertEqual(tuple(sorted(current)), compatibility.COMPATIBILITY_SURFACES)
@@ -1039,7 +1059,7 @@ class CompatibilitySignerTests(CompatibilityFixture):
                 "synapse-s2.host-evidence-receipt.v1"
             ),
             "SURFACE_MODE": "exact-build-only",
-            "PROFILE_VERSION": 2,
+            "PROFILE_VERSION": 3,
             "HOST_EVIDENCE_POLICY": "required-later",
             "MIGRATION_POLICY": "blocked",
             "DOWNGRADE_POLICY": "blocked",
@@ -1108,7 +1128,7 @@ class CompatibilitySignerTests(CompatibilityFixture):
         self._assert_signer_status(api_result, signer.STATUS_SIGNED)
         self.ticket_path = api_output
         self.assert_status(self.verify(), "verified", 0)
-        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 201)
+        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 207)
 
         cli_output = self.signing_root / "ticket-cli.json"
         cli_input = self._write_document(
@@ -1183,9 +1203,9 @@ class CompatibilitySignerTests(CompatibilityFixture):
                 "unsupported:invalid-arguments",
             )
 
-    def test_signer_refuses_retired_profile_v1_ticket(self) -> None:
+    def test_signer_refuses_retired_profile_v2_ticket(self) -> None:
         result, output = self._sign_ticket(
-            overrides={"profile_version": 1}
+            overrides={"profile_version": 2}
         )
         self._assert_signer_status(result, "unsupported:ticket-invalid")
         self.assertFalse(output.exists())

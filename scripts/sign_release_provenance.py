@@ -238,7 +238,7 @@ _BUNDLE_ROLES_BY_SCHEMA = {
 # lane, migration and downgrade blocked outright.  This profile-version
 # namespace is independent of the dormant activation-contract profile.
 SURFACE_MODE = "exact-build-only"
-PROFILE_VERSION = 2
+PROFILE_VERSION = 3
 HOST_EVIDENCE_POLICY = "required-later"
 MIGRATION_POLICY = "blocked"
 DOWNGRADE_POLICY = "blocked"

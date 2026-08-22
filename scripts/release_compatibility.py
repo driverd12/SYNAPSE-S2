@@ -355,6 +355,9 @@ SURFACE_FILES = {
     "installed-layout": (
         "scripts/installed_layout.py",
         "scripts/release_activation_journal.py",
+        "scripts/release_environment.py",
+        "scripts/release_environment_evidence.py",
+        "scripts/release_environment_storage.py",
         "scripts/release_stage.py",
         "scripts/release_update_plan.py",
         "core_client_binding.py",
@@ -364,6 +367,9 @@ SURFACE_FILES = {
     "platform-runtime": (
         "core_protocol.py",
         "core_runtime_paths.py",
+        "scripts/release_environment.py",
+        "scripts/release_environment_evidence.py",
+        "scripts/release_environment_storage.py",
         "scripts/release_stage.py",
         "pyproject.toml",
         "uv.lock",
@@ -407,7 +413,7 @@ DOWNGRADE_POLICY = "blocked"
 # profile; any semantic change to what a surface digest or the global digest
 # covers is a new version.  This namespace is independent of the separately
 # versioned dormant activation-contract profile.
-PROFILE_VERSION = 2
+PROFILE_VERSION = 3
 
 # Closed schema of the per-root compatibility observation whose records
 # the surface digests bind; hashed into the global digest.
@@ -727,6 +733,17 @@ PRODUCT_INVENTORY = (
         "operator-script",
         "scripts/release_compatibility.py",
     ),
+    ("operator-scripts", "operator-script", "scripts/release_environment.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/release_environment_evidence.py",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/release_environment_storage.py",
+    ),
     ("operator-scripts", "operator-script", "scripts/release_provenance.py"),
     ("operator-scripts", "operator-script", "scripts/release_stage.py"),
     ("operator-scripts", "operator-script", "scripts/release_update_plan.py"),
@@ -813,6 +830,9 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_redaction.py"),
     ("tests", "test", "tests/test_release_activation_journal.py"),
     ("tests", "test", "tests/test_release_compatibility.py"),
+    ("tests", "test", "tests/test_release_environment.py"),
+    ("tests", "test", "tests/test_release_environment_evidence.py"),
+    ("tests", "test", "tests/test_release_environment_storage.py"),
     ("tests", "test", "tests/test_release_provenance.py"),
     ("tests", "test", "tests/test_release_stage.py"),
     ("tests", "test", "tests/test_release_update_orchestrator.py"),
