@@ -2296,6 +2296,11 @@ PRODUCT_INVENTORY = (
     (
         "operator-scripts",
         "operator-script",
+        "scripts/release_activation_journal.py",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
         "scripts/release_compatibility.py",
     ),
     ("operator-scripts", "operator-script", "scripts/release_provenance.py"),
@@ -2382,6 +2387,7 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_purge_namespaces.py"),
     ("tests", "test", "tests/test_recovery_route_surfaces.py"),
     ("tests", "test", "tests/test_redaction.py"),
+    ("tests", "test", "tests/test_release_activation_journal.py"),
     ("tests", "test", "tests/test_release_compatibility.py"),
     ("tests", "test", "tests/test_release_provenance.py"),
     ("tests", "test", "tests/test_release_stage.py"),

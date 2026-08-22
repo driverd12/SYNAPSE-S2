@@ -233,11 +233,12 @@ _BUNDLE_ROLES_BY_SCHEMA = {
     ),
 }
 
-# Pinned ticket policy claims restated from the verifier: exact-build-only
-# profile, host evidence deferred to a later lane, migration and downgrade
-# blocked outright.
+# Pinned ticket policy claims restated from the verifier: the compatibility
+# ticket's exact-build-only surface profile, host evidence deferred to a later
+# lane, migration and downgrade blocked outright.  This profile-version
+# namespace is independent of the dormant activation-contract profile.
 SURFACE_MODE = "exact-build-only"
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 HOST_EVIDENCE_POLICY = "required-later"
 MIGRATION_POLICY = "blocked"
 DOWNGRADE_POLICY = "blocked"

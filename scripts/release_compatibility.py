@@ -354,6 +354,7 @@ SURFACE_FILES = {
     ),
     "installed-layout": (
         "scripts/installed_layout.py",
+        "scripts/release_activation_journal.py",
         "scripts/release_stage.py",
         "scripts/release_update_plan.py",
         "core_client_binding.py",
@@ -378,6 +379,7 @@ SURFACE_FILES = {
         "memory_store.py",
         "core_request_journal.py",
         "capture_daemon.py",
+        "scripts/release_activation_journal.py",
         "scripts/repair_torn_core_adoption.py",
         "scripts/core_agent_installer.py",
         "scripts/core_cutover_preflight.py",
@@ -401,9 +403,11 @@ HOST_EVIDENCE_POLICY = "required-later"
 MIGRATION_POLICY = "blocked"
 DOWNGRADE_POLICY = "blocked"
 
-# Integer version of the exact-build-only profile; any semantic change to
-# what a surface digest or the global digest covers is a new version.
-PROFILE_VERSION = 1
+# Integer version of the compatibility ticket's exact-build-only surface
+# profile; any semantic change to what a surface digest or the global digest
+# covers is a new version.  This namespace is independent of the separately
+# versioned dormant activation-contract profile.
+PROFILE_VERSION = 2
 
 # Closed schema of the per-root compatibility observation whose records
 # the surface digests bind; hashed into the global digest.
@@ -716,6 +720,11 @@ PRODUCT_INVENTORY = (
     (
         "operator-scripts",
         "operator-script",
+        "scripts/release_activation_journal.py",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
         "scripts/release_compatibility.py",
     ),
     ("operator-scripts", "operator-script", "scripts/release_provenance.py"),
@@ -802,6 +811,7 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_purge_namespaces.py"),
     ("tests", "test", "tests/test_recovery_route_surfaces.py"),
     ("tests", "test", "tests/test_redaction.py"),
+    ("tests", "test", "tests/test_release_activation_journal.py"),
     ("tests", "test", "tests/test_release_compatibility.py"),
     ("tests", "test", "tests/test_release_provenance.py"),
     ("tests", "test", "tests/test_release_stage.py"),
