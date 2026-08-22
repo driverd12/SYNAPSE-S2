@@ -29,27 +29,47 @@ is ever claimed for an ambiguous publish.
 
 Commands:
 
-- ``keygen root|release`` — generate a fresh Ed25519 keypair.  Both output
+- ``keygen root|release|compatibility-review`` — generate a fresh Ed25519
+  keypair.  Both output
   names must be absent beforehand; the public document is published first
   and rolled back if the private key cannot then be published, so a failed
   keygen never leaves an orphaned secret.  The private key is written raw
   (32 bytes, 0600, exclusive, owner-only parent).  For the root role the
   public side is a canonical ``synapse-s2.release-root.v1`` document; for
-  the release role a canonical ``synapse-s2.release-key.v1`` document.
+  the release and compatibility-review roles a canonical
+  ``synapse-s2.release-key.v1`` document carrying that role.
 - ``sign-trust-bundle`` — sign an unsigned canonical trust-bundle document
   with the root key.  The signer refuses unless the document schema is
-  ``synapse-s2.release-trust-bundle.v1``, the document carries no
+  ``synapse-s2.release-trust-bundle.v1`` or
+  ``synapse-s2.release-trust-bundle.v2`` (each signed over its own exact
+  schema-selected domain), the document carries no
   signature yet, the complete unsigned schema (fields, vocabularies,
   bounds, delegation windows and inclusive sequence bounds, sorted
   revocations) validates, the signing key is exactly the root key named by
   both the document and the out-of-band root document, and its own
-  freshly produced signature verifies.
+  freshly produced signature verifies.  A v2 bundle must additionally
+  carry both the release and compatibility-review role sets, each
+  nonempty on distinct non-root, nonrevoked key ids; v1 bundles are
+  unchanged.
 - ``sign-release`` — sign an unsigned canonical release-envelope document
   with a delegated release key.  The signer refuses unless the document
   schema is ``synapse-s2.release-envelope.v1``, it carries no signature
   yet, the complete unsigned schema validates, the envelope's ``key_id``
   matches the signing key, and the signing key is *not* the root key (the
   root signs bundles only), and its own signature verifies.
+- ``sign-compatibility-ticket`` — sign an unsigned canonical
+  build-compatibility ticket with a delegated compatibility-review key.
+  The signer refuses unless the root document validates, the supplied v2
+  trust bundle is canonical, syntax-valid, and root-signed over the v2
+  domain, the ticket names that exact bundle hash and generation plus the
+  signing key's own id, the bundle grants that key a nonrevoked
+  compatibility-review delegation whose channel, inclusive sequence
+  bounds, and validity window contain the ticket's, the complete unsigned
+  ticket schema (pinned profile, schemas, policies, exactly the thirteen
+  surface digests, equal dependency component ids) validates, and its own
+  freshly produced signature over the ticket domain verifies.  Offline
+  signing never consults the wall clock; current-time validity is the
+  verifier's judgment alone.
 
 Canonical documents are exact canonical JSON bytes with no trailing
 newline: what is signed is exactly what is stored.
@@ -192,12 +212,63 @@ RESULT_MODE = "offline-release-signer"
 ROOT_SCHEMA = "synapse-s2.release-root.v1"
 KEY_SCHEMA = "synapse-s2.release-key.v1"
 BUNDLE_SCHEMA = "synapse-s2.release-trust-bundle.v1"
+BUNDLE_SCHEMA_V2 = "synapse-s2.release-trust-bundle.v2"
 ENVELOPE_SCHEMA = "synapse-s2.release-envelope.v1"
 PRODUCT_SCHEMA = "synapse-s2.product-release-plan.v1"
+TICKET_SCHEMA = "synapse-s2.build-compatibility-ticket.v1"
+
+# Ticket vocabulary restated byte-for-byte from the verifier
+# (scripts/release_compatibility.py); this tool never imports it.
+COMPATIBILITY_OBSERVATION_SCHEMA = "synapse-s2.compatibility-observation.v1"
+LAYOUT_SCHEMA = "synapse-s2.installed-layout-contract.v1"
+HOST_EVIDENCE_RECEIPT_SCHEMA = "synapse-s2.host-evidence-receipt.v1"
+
+DELEGATION_ROLE_RELEASE = "release"
+DELEGATION_ROLE_COMPATIBILITY = "compatibility-review"
+_BUNDLE_ROLES_BY_SCHEMA = {
+    BUNDLE_SCHEMA: (DELEGATION_ROLE_RELEASE,),
+    BUNDLE_SCHEMA_V2: (
+        DELEGATION_ROLE_COMPATIBILITY,
+        DELEGATION_ROLE_RELEASE,
+    ),
+}
+
+# Pinned ticket policy claims restated from the verifier: exact-build-only
+# profile, host evidence deferred to a later lane, migration and downgrade
+# blocked outright.
+SURFACE_MODE = "exact-build-only"
+PROFILE_VERSION = 1
+HOST_EVIDENCE_POLICY = "required-later"
+MIGRATION_POLICY = "blocked"
+DOWNGRADE_POLICY = "blocked"
+EXPECTED_LAYOUT_CONTRACT_MODE = "inactive-versioned-v1"
+EXPECTED_LAYOUT_CONTRACT_ID = (
+    "layout-contract-"
+    "027363aa3a7a97a6dda522d869ef09a25471ce60161a56d063f0c1164b385ada"
+)
+
+# The closed compatibility surface vocabulary: exactly these thirteen
+# sorted names, restated from the verifier.
+COMPATIBILITY_SURFACES = (
+    "authority-runtime",
+    "capture",
+    "context-delivery",
+    "core-config",
+    "disk-safety",
+    "embedding-space",
+    "installed-layout",
+    "platform-runtime",
+    "readiness-quiescence",
+    "recovery",
+    "replication",
+    "request-journal",
+    "store-schema",
+)
 
 COMMAND_KEYGEN = "keygen"
 COMMAND_SIGN_BUNDLE = "sign-trust-bundle"
 COMMAND_SIGN_RELEASE = "sign-release"
+COMMAND_SIGN_TICKET = "sign-compatibility-ticket"
 
 STATUS_GENERATED = "generated"
 STATUS_SIGNED = "signed"
@@ -214,7 +285,14 @@ RESULT_NONCLAIMS = (
 
 _KEY_ID_DOMAIN = b"SYNAPSE-S2\x00ED25519-PUBLIC-KEY\x00v1\x00"
 _BUNDLE_SIGNING_DOMAIN = b"SYNAPSE-S2\x00RELEASE-TRUST-BUNDLE\x00v1\x00"
+_BUNDLE_SIGNING_DOMAIN_V2 = b"SYNAPSE-S2\x00RELEASE-TRUST-BUNDLE\x00v2\x00"
 _ENVELOPE_SIGNING_DOMAIN = b"SYNAPSE-S2\x00RELEASE-ENVELOPE\x00v1\x00"
+_TICKET_SIGNING_DOMAIN = b"SYNAPSE-S2\x00BUILD-COMPATIBILITY-TICKET\x00v1\x00"
+
+_BUNDLE_DOMAINS_BY_SCHEMA = {
+    BUNDLE_SCHEMA: _BUNDLE_SIGNING_DOMAIN,
+    BUNDLE_SCHEMA_V2: _BUNDLE_SIGNING_DOMAIN_V2,
+}
 
 MAX_DOCUMENT_BYTES = 64 * 1024
 MAX_RESULT_BYTES = 4096
@@ -228,11 +306,15 @@ MAX_INT = 2**53
 _KEY_ID_RE = re.compile(r"ed25519-[0-9a-f]{64}")
 _PUBLIC_KEY_RE = re.compile(r"[0-9a-f]{64}")
 _SIGNATURE_RE = re.compile(r"[0-9a-f]{128}")
+_HEX_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SOURCE_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_BUILD_ID_RE = re.compile(r"source-[0-9a-f]{24}")
 _PRODUCT_ID_RE = re.compile(r"product-[0-9a-f]{64}")
+_COMPONENT_ID_RE = re.compile(r"component-[0-9a-f]{64}")
 _POLICY_ID_RE = re.compile(r"inventory-policy-[0-9a-f]{64}")
 _CHANNEL_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,63}")
+_LAYOUT_CONTRACT_ID_RE = re.compile(r"layout-contract-[0-9a-f]{64}")
 
 # Compared case-insensitively so hostile paths on case-insensitive
 # filesystems cannot slip past.
@@ -421,10 +503,17 @@ def _validate_unsigned_bundle(document: dict) -> None:
     """The complete unsigned trust-bundle schema — the same closed fields,
     vocabularies, and bounds the verifier enforces, minus the signature —
     validated before anything is signed.  The signer never signs a
-    document the verifier would refuse to parse."""
+    document the verifier would refuse to parse.  The allowed delegation
+    roles are selected by the exact bundle schema: v1 carries release
+    only; v2 must carry both the release and compatibility-review role
+    sets, each nonempty on distinct non-root, nonrevoked key ids."""
     token = "bundle-invalid"
     _require_exact_fields(document, _UNSIGNED_BUNDLE_FIELDS, token)
-    if document["schema"] != BUNDLE_SCHEMA:
+    schema = document["schema"]
+    allowed_roles = (
+        _BUNDLE_ROLES_BY_SCHEMA.get(schema) if type(schema) is str else None
+    )
+    if allowed_roles is None:
         raise _Refusal(token)
     bundle_root_key_id = _string(document["root_key_id"], token, _KEY_ID_RE)
     _integer(document["generation"], token, minimum=1)
@@ -444,6 +533,7 @@ def _validate_unsigned_bundle(document: dict) -> None:
     if not isinstance(delegations, list) or len(delegations) > MAX_DELEGATIONS:
         raise _Refusal(token)
     seen_key_ids: set[str] = set()
+    delegated_roles: list[tuple[str, object]] = []
     for delegation in delegations:
         if not isinstance(delegation, dict):
             raise _Refusal(token)
@@ -452,13 +542,14 @@ def _validate_unsigned_bundle(document: dict) -> None:
         key_id = _string(delegation["key_id"], token, _KEY_ID_RE)
         if key_id != key_id_for_public_key(public_key):
             raise _Refusal(token)
-        if delegation["role"] != "release":
+        if delegation["role"] not in allowed_roles:
             raise _Refusal(token)
         if key_id == bundle_root_key_id:
             raise _Refusal("bundle-root-delegated")
         if key_id in seen_key_ids:
             raise _Refusal(token)
         seen_key_ids.add(key_id)
+        delegated_roles.append((key_id, delegation["role"]))
         channels = delegation["channels"]
         if not isinstance(channels, list) or not (
             1 <= len(channels) <= MAX_BUNDLE_CHANNELS
@@ -491,6 +582,25 @@ def _validate_unsigned_bundle(document: dict) -> None:
         _string(key_id, token, _KEY_ID_RE)
         if key_id == bundle_root_key_id:
             raise _Refusal("bundle-root-revoked")
+    if schema == BUNDLE_SCHEMA_V2:
+        # A v2 bundle exists to carry the two-role vocabulary: both role
+        # sets must remain nonempty after revocations (each role on a
+        # distinct key id, enforced by the duplicate-key check above).
+        revoked_set = set(revoked)
+        if seen_key_ids & revoked_set:
+            # A v2 role grant and revocation are mutually exclusive.
+            # Refuse the contradictory bundle outright rather than
+            # signing a document whose authority depends on which list a
+            # later consumer happens to consult first.  v1 remains
+            # byte-for-byte and behaviorally unchanged.
+            raise _Refusal(token)
+        live_roles = {
+            role
+            for delegated_key_id, role in delegated_roles
+            if delegated_key_id not in revoked_set
+        }
+        if live_roles != set(_BUNDLE_ROLES_BY_SCHEMA[BUNDLE_SCHEMA_V2]):
+            raise _Refusal(token)
 
 
 def _validate_unsigned_envelope(document: dict) -> None:
@@ -509,6 +619,128 @@ def _validate_unsigned_envelope(document: dict) -> None:
     _string(document["inventory_policy_id"], token, _POLICY_ID_RE)
     _string(document["product_id"], token, _PRODUCT_ID_RE)
     _integer(document["trust_generation"], token, minimum=1)
+    issued_at = _integer(document["issued_at"], token)
+    expires_at = _integer(document["expires_at"], token)
+    if expires_at <= issued_at:
+        raise _Refusal(token)
+    _string(document["key_id"], token, _KEY_ID_RE)
+
+
+_UNSIGNED_TICKET_FIELDS = (
+    "schema",
+    "profile",
+    "profile_version",
+    "compatibility_observation_schema",
+    "product_schema",
+    "channel",
+    "version",
+    "sequence",
+    "source_sha",
+    "current_source_build_id",
+    "candidate_source_build_id",
+    "current_product_id",
+    "candidate_product_id",
+    "inventory_policy_id",
+    "current_dependency_component_id",
+    "candidate_dependency_component_id",
+    "surface_digests",
+    "surfaces_digest",
+    "layout_schema",
+    "layout_mode",
+    "layout_contract_id",
+    "trust_generation",
+    "trust_bundle_sha256",
+    "envelope_sha256",
+    "host_evidence_receipt_schema",
+    "host_evidence_policy",
+    "migration",
+    "downgrade",
+    "issued_at",
+    "expires_at",
+    "key_id",
+)
+
+
+def _validate_unsigned_ticket(document: dict) -> None:
+    """The complete unsigned build-compatibility-ticket schema — the same
+    closed fields, pinned vocabularies, and bounds the verifier enforces,
+    minus the signature — validated before anything is signed: pinned
+    exact-build-only profile, pinned schemas and policies, exactly the
+    thirteen surface digests, and equal dependency component ids."""
+    token = "ticket-invalid"
+    _require_exact_fields(document, _UNSIGNED_TICKET_FIELDS, token)
+    if document["schema"] != TICKET_SCHEMA:
+        raise _Refusal(token)
+    if document["profile"] != SURFACE_MODE:
+        raise _Refusal(token)
+    if (
+        _integer(document["profile_version"], token, minimum=1)
+        != PROFILE_VERSION
+    ):
+        raise _Refusal(token)
+    if (
+        document["compatibility_observation_schema"]
+        != COMPATIBILITY_OBSERVATION_SCHEMA
+    ):
+        raise _Refusal(token)
+    if document["product_schema"] != PRODUCT_SCHEMA:
+        raise _Refusal(token)
+    _string(document["channel"], token, _CHANNEL_RE)
+    _string(document["version"], token, _VERSION_RE)
+    _integer(document["sequence"], token, minimum=1)
+    _string(document["source_sha"], token, _SOURCE_SHA_RE)
+    _string(document["current_source_build_id"], token, _BUILD_ID_RE)
+    _string(document["candidate_source_build_id"], token, _BUILD_ID_RE)
+    _string(document["current_product_id"], token, _PRODUCT_ID_RE)
+    _string(document["candidate_product_id"], token, _PRODUCT_ID_RE)
+    _string(document["inventory_policy_id"], token, _POLICY_ID_RE)
+    _string(
+        document["current_dependency_component_id"], token, _COMPONENT_ID_RE
+    )
+    _string(
+        document["candidate_dependency_component_id"], token, _COMPONENT_ID_RE
+    )
+    if (
+        document["current_dependency_component_id"]
+        != document["candidate_dependency_component_id"]
+    ):
+        # Exact-build-only tickets claim one unchanged dependency
+        # component; a ticket claiming a dependency change is never signed.
+        raise _Refusal(token)
+    surface_digests = document["surface_digests"]
+    if type(surface_digests) is not dict:
+        raise _Refusal(token)
+    if set(surface_digests) != set(COMPATIBILITY_SURFACES):
+        raise _Refusal(token)
+    for digest in surface_digests.values():
+        _string(digest, token, _HEX_SHA256_RE)
+    _string(document["surfaces_digest"], token, _HEX_SHA256_RE)
+    if document["layout_schema"] != LAYOUT_SCHEMA:
+        raise _Refusal(token)
+    if document["layout_mode"] != EXPECTED_LAYOUT_CONTRACT_MODE:
+        raise _Refusal(token)
+    if (
+        _string(document["layout_contract_id"], token, _LAYOUT_CONTRACT_ID_RE)
+        != EXPECTED_LAYOUT_CONTRACT_ID
+    ):
+        # The verifier pins one reviewed host-independent contract.  The
+        # signer must never mint a well-shaped ticket that Phase A will
+        # reject as a different layout contract.
+        raise _Refusal(token)
+    _integer(document["trust_generation"], token, minimum=1)
+    _string(document["trust_bundle_sha256"], token, _HEX_SHA256_RE)
+    _string(document["envelope_sha256"], token, _HEX_SHA256_RE)
+    if (
+        document["host_evidence_receipt_schema"]
+        != HOST_EVIDENCE_RECEIPT_SCHEMA
+    ):
+        raise _Refusal(token)
+    if document["host_evidence_policy"] != HOST_EVIDENCE_POLICY:
+        raise _Refusal(token)
+    if document["migration"] != MIGRATION_POLICY:
+        raise _Refusal(token)
+    if document["downgrade"] != DOWNGRADE_POLICY:
+        raise _Refusal(token)
     issued_at = _integer(document["issued_at"], token)
     expires_at = _integer(document["expires_at"], token)
     if expires_at <= issued_at:
@@ -1053,7 +1285,7 @@ def _public_key_hex(private_key) -> str:
     return private_key.public_key().public_bytes_raw().hex()
 
 
-def _load_root_key_id(root_path: str) -> str:
+def _load_root_document(root_path: str) -> tuple[str, str]:
     document = parse_canonical_document(
         _read_exact_file(root_path, private_key=False)
     )
@@ -1072,7 +1304,78 @@ def _load_root_key_id(root_path: str) -> str:
         raise _Refusal(token)
     if key_id != key_id_for_public_key(public_key):
         raise _Refusal(token)
-    return key_id
+    return key_id, public_key
+
+
+def _load_root_key_id(root_path: str) -> str:
+    return _load_root_document(root_path)[0]
+
+
+def _load_signed_bundle_v2(
+    bundle_path: str, root_key_id: str, root_public_key: str
+) -> tuple[dict, str]:
+    """Load, canonically parse, syntax-validate, and root-verify a signed
+    v2 trust bundle over the v2 signing domain only.  No wall-clock
+    checks: the offline signer proves the chain of custody; the verifier
+    alone judges current time.  Returns the bundle document and the
+    sha256 of its exact canonical bytes."""
+    data = _read_exact_file(bundle_path, private_key=False)
+    document = parse_canonical_document(data)
+    if document.get("schema") != BUNDLE_SCHEMA_V2:
+        raise _Refusal("document-type-mismatch")
+    token = "bundle-invalid"
+    if "signature" not in document:
+        raise _Refusal(token)
+    signature = _string(document["signature"], token, _SIGNATURE_RE)
+    unsigned = {
+        key: value for key, value in document.items() if key != "signature"
+    }
+    _validate_unsigned_bundle(unsigned)
+    if document["root_key_id"] != root_key_id:
+        raise _Refusal("bundle-root-mismatch")
+    payload = _BUNDLE_SIGNING_DOMAIN_V2 + canonical_bytes(unsigned)
+    try:
+        public = _ED25519.Ed25519PublicKey.from_public_bytes(
+            bytes.fromhex(root_public_key)
+        )
+        public.verify(bytes.fromhex(signature), payload)
+    except Exception:
+        raise _Refusal("bundle-signature-invalid")
+    return document, hashlib.sha256(data).hexdigest()
+
+
+def _check_delegation_grant_offline(
+    delegation: dict,
+    bundle: dict,
+    channel: str,
+    sequence: int,
+    issued_at: int,
+    expires_at: int,
+) -> None:
+    """The verifier's delegation-grant checks minus its wall-clock checks:
+    channel grant, validity-window containment, channel minimum, and
+    inclusive sequence bounds."""
+    if channel not in delegation["channels"]:
+        raise _Refusal("channel-not-delegated")
+    if not (
+        delegation["not_before"] <= issued_at < delegation["not_after"]
+    ):
+        raise _Refusal("delegation-window")
+    if expires_at > delegation["not_after"]:
+        # The document's whole validity must be contained in the
+        # delegation's: a delegate cannot mint trust outliving its grant.
+        raise _Refusal("delegation-window")
+    minimum = bundle["channel_minimum_sequences"].get(channel)
+    if minimum is None:
+        raise _Refusal("channel-unknown")
+    if sequence < minimum:
+        raise _Refusal("sequence-below-minimum")
+    if not (
+        delegation["sequence_minimum"]
+        <= sequence
+        <= delegation["sequence_maximum"]
+    ):
+        raise _Refusal("sequence-outside-delegation")
 
 
 def _verify_own_signature(
@@ -1090,7 +1393,11 @@ def _verify_own_signature(
 def keygen(role, private_key_out, public_out, signing_root) -> dict:
     def work() -> dict:
         _require_supported()
-        if role not in ("root", "release"):
+        if role not in (
+            "root",
+            DELEGATION_ROLE_RELEASE,
+            DELEGATION_ROLE_COMPATIBILITY,
+        ):
             raise _Refusal("invalid-arguments")
         root = _require_signing_root(signing_root)
         private_path = _require_within_signing_root(
@@ -1125,7 +1432,7 @@ def keygen(role, private_key_out, public_out, signing_root) -> dict:
                 "schema": KEY_SCHEMA,
                 "key_id": key_id,
                 "public_key": public_hex,
-                "role": "release",
+                "role": role,
             }
         public_bytes = canonical_bytes(public_document)
         # The public document lands first; if the private key then fails
@@ -1184,14 +1491,17 @@ def sign_trust_bundle(
         )
         # Product type check: refuse to sign anything but a complete,
         # bound-checked unsigned trust bundle naming this exact root key.
-        if unsigned.get("schema") != BUNDLE_SCHEMA:
+        # The signing domain is selected by the exact bundle schema, so a
+        # v1 signature can never verify a v2 bundle or vice versa.
+        schema = unsigned.get("schema")
+        if type(schema) is not str or schema not in _BUNDLE_DOMAINS_BY_SCHEMA:
             raise _Refusal("document-type-mismatch")
         if "signature" in unsigned:
             raise _Refusal("document-already-signed")
         _validate_unsigned_bundle(unsigned)
         if unsigned["root_key_id"] != root_key_id:
             raise _Refusal("bundle-root-mismatch")
-        payload = _BUNDLE_SIGNING_DOMAIN + canonical_bytes(unsigned)
+        payload = _BUNDLE_DOMAINS_BY_SCHEMA[schema] + canonical_bytes(unsigned)
         signature_hex = private_key.sign(payload).hex()
         if not _SIGNATURE_RE.fullmatch(signature_hex):
             raise _Refusal("signing-failed")
@@ -1209,7 +1519,7 @@ def sign_trust_bundle(
             STATUS_SIGNED,
             key_role="root",
             key_id=key_id,
-            document_schema=BUNDLE_SCHEMA,
+            document_schema=schema,
             document_sha256=hashlib.sha256(signed_bytes).hexdigest(),
         )
 
@@ -1273,6 +1583,104 @@ def sign_release(
     return _guard(COMMAND_SIGN_RELEASE, work)
 
 
+def sign_compatibility_ticket(
+    private_key_path,
+    root_path,
+    trust_bundle_path,
+    unsigned_path,
+    output_path,
+    signing_root,
+) -> dict:
+    def work() -> dict:
+        _require_supported()
+        root = _require_signing_root(signing_root)
+        key_file = _require_within_signing_root(
+            _validate_path_argument(private_key_path), root
+        )
+        root_file = _validate_path_argument(root_path)
+        bundle_file = _validate_path_argument(trust_bundle_path)
+        unsigned_file = _validate_path_argument(unsigned_path)
+        output_file = _require_within_signing_root(
+            _validate_path_argument(output_path), root
+        )
+        private_key = _load_private_key(key_file)
+        public_hex = _public_key_hex(private_key)
+        key_id = key_id_for_public_key(public_hex)
+        root_key_id, root_public_key = _load_root_document(root_file)
+        # Key role check: the root key never signs tickets.
+        if key_id == root_key_id:
+            raise _Refusal("key-role-mismatch")
+        bundle, bundle_sha256 = _load_signed_bundle_v2(
+            bundle_file, root_key_id, root_public_key
+        )
+        unsigned = parse_canonical_document(
+            _read_exact_file(unsigned_file, private_key=False)
+        )
+        if unsigned.get("schema") != TICKET_SCHEMA:
+            raise _Refusal("document-type-mismatch")
+        if "signature" in unsigned:
+            raise _Refusal("document-already-signed")
+        _validate_unsigned_ticket(unsigned)
+        # The ticket must name the key actually signing it.
+        if unsigned["key_id"] != key_id:
+            raise _Refusal("ticket-key-mismatch")
+        if key_id in bundle["revoked_key_ids"]:
+            raise _Refusal("key-revoked")
+        delegation = None
+        for candidate in bundle["delegations"]:
+            if candidate["key_id"] == key_id:
+                delegation = candidate
+                break
+        if delegation is None:
+            raise _Refusal("delegation-unknown")
+        # Role check: a release (or any other) delegation never signs
+        # tickets — role confusion is exactly the cross-lane forgery the
+        # compatibility lane exists to prevent.
+        if delegation["role"] != DELEGATION_ROLE_COMPATIBILITY:
+            raise _Refusal("delegation-role-mismatch")
+        if unsigned["trust_generation"] != bundle["generation"]:
+            raise _Refusal("trust-generation-mismatch")
+        if unsigned["trust_bundle_sha256"] != bundle_sha256:
+            raise _Refusal("ticket-bundle-mismatch")
+        _check_delegation_grant_offline(
+            delegation,
+            bundle,
+            unsigned["channel"],
+            unsigned["sequence"],
+            unsigned["issued_at"],
+            unsigned["expires_at"],
+        )
+        # The ticket's whole validity window must fit inside the bundle's.
+        if (
+            unsigned["issued_at"] < bundle["issued_at"]
+            or unsigned["expires_at"] > bundle["expires_at"]
+        ):
+            raise _Refusal("lifetime-outside-trust")
+        payload = _TICKET_SIGNING_DOMAIN + canonical_bytes(unsigned)
+        signature_hex = private_key.sign(payload).hex()
+        if not _SIGNATURE_RE.fullmatch(signature_hex):
+            raise _Refusal("signing-failed")
+        _verify_own_signature(public_hex, signature_hex, payload)
+        signed = dict(unsigned)
+        signed["signature"] = signature_hex
+        signed_bytes = canonical_bytes(signed)
+        if len(signed_bytes) > MAX_DOCUMENT_BYTES:
+            raise _Refusal("document-oversize")
+        _publish_exclusive(
+            output_file, signed_bytes, 0o644, parent_owner_only=False
+        )
+        return _build_result(
+            COMMAND_SIGN_TICKET,
+            STATUS_SIGNED,
+            key_role=DELEGATION_ROLE_COMPATIBILITY,
+            key_id=key_id,
+            document_schema=TICKET_SCHEMA,
+            document_sha256=hashlib.sha256(signed_bytes).hexdigest(),
+        )
+
+    return _guard(COMMAND_SIGN_TICKET, work)
+
+
 class _SignerArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
         raise _CliArgumentError()
@@ -1290,6 +1698,7 @@ def main(argv: list[str] | None = None) -> int:
         COMMAND_KEYGEN,
         COMMAND_SIGN_BUNDLE,
         COMMAND_SIGN_RELEASE,
+        COMMAND_SIGN_TICKET,
     ):
         command = COMMAND_KEYGEN
     parser = _SignerArgumentParser(
@@ -1321,8 +1730,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     keygen_parser.add_argument(
         "role",
-        choices=("root", "release"),
-        help="Key role: root signs trust bundles, release signs envelopes.",
+        choices=("root", "release", "compatibility-review"),
+        help=(
+            "Key role: root signs trust bundles, release signs envelopes, "
+            "compatibility-review signs build-compatibility tickets."
+        ),
     )
     keygen_parser.add_argument(
         "--private-key-out",
@@ -1371,6 +1783,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_sign_arguments(release_parser)
 
+    ticket_parser = subparsers.add_parser(
+        COMMAND_SIGN_TICKET,
+        allow_abbrev=False,
+        help=(
+            "Sign an unsigned build-compatibility ticket with a delegated "
+            "compatibility-review key."
+        ),
+    )
+    ticket_parser.add_argument(
+        "--trust-bundle",
+        required=True,
+        help=(
+            "Absolute path of the root-signed canonical v2 trust bundle "
+            "the ticket binds by exact hash and generation."
+        ),
+    )
+    _add_sign_arguments(ticket_parser)
+
     try:
         args = parser.parse_args(raw_argv)
     except _CliArgumentError:
@@ -1388,6 +1818,15 @@ def main(argv: list[str] | None = None) -> int:
         result = sign_trust_bundle(
             args.private_key,
             args.root_file,
+            args.input,
+            args.output,
+            args.signing_root,
+        )
+    elif args.command == COMMAND_SIGN_TICKET:
+        result = sign_compatibility_ticket(
+            args.private_key,
+            args.root_file,
+            args.trust_bundle,
             args.input,
             args.output,
             args.signing_root,

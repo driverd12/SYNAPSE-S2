@@ -29,6 +29,15 @@ non-canonical encodings, and out-of-bounds values all rejected:
   ``sequence_minimum``/``sequence_maximum`` bounds), a bounded revocation
   list, and the root signature over the domain-separated canonical
   unsigned document.
+- ``synapse-s2.release-trust-bundle.v2`` — identical fields and bounds,
+  signed over its own ``v2`` domain (a v1 signature can never verify a v2
+  bundle or vice versa), with a closed two-role delegation vocabulary:
+  ``release`` (signs envelopes) and ``compatibility-review`` (signs
+  build-compatibility tickets, verified by the separate dormant
+  ``release_compatibility`` tool).  A key id may appear in at most one
+  delegation, so no key can hold both roles; envelopes signed by a
+  non-release delegation are blocked (``delegation-role-mismatch``).
+  Every v1 document, signature, and behavior is unchanged.
 - ``synapse-s2.release-envelope.v1`` — signed by a delegated release key:
   channel, version, monotonic sequence, source SHA (40 hex), product
   schema, inventory policy id, product id, the trust generation it was
@@ -215,9 +224,23 @@ RESULT_MODE = "incumbent-release-provenance"
 
 ROOT_SCHEMA = "synapse-s2.release-root.v1"
 BUNDLE_SCHEMA = "synapse-s2.release-trust-bundle.v1"
+BUNDLE_SCHEMA_V2 = "synapse-s2.release-trust-bundle.v2"
 ENVELOPE_SCHEMA = "synapse-s2.release-envelope.v1"
 FLOOR_SCHEMA = "synapse-s2.release-floor.v1"
 PRODUCT_SCHEMA = "synapse-s2.product-release-plan.v1"
+
+# Closed per-schema delegation role vocabularies.  The v1 vocabulary is
+# frozen forever; v2 adds exactly one further role.  A key id may appear
+# in at most one delegation, so no single key can ever hold both roles.
+DELEGATION_ROLE_RELEASE = "release"
+DELEGATION_ROLE_COMPATIBILITY = "compatibility-review"
+_BUNDLE_ROLES_BY_SCHEMA = {
+    BUNDLE_SCHEMA: (DELEGATION_ROLE_RELEASE,),
+    BUNDLE_SCHEMA_V2: (
+        DELEGATION_ROLE_COMPATIBILITY,
+        DELEGATION_ROLE_RELEASE,
+    ),
+}
 
 COMMAND_VERIFY = "verify-release"
 COMMAND_ACCEPT = "accept-trust-bundle"
@@ -243,7 +266,13 @@ RESULT_NONCLAIMS = (
 # never verify for another.
 _KEY_ID_DOMAIN = b"SYNAPSE-S2\x00ED25519-PUBLIC-KEY\x00v1\x00"
 _BUNDLE_SIGNING_DOMAIN = b"SYNAPSE-S2\x00RELEASE-TRUST-BUNDLE\x00v1\x00"
+_BUNDLE_SIGNING_DOMAIN_V2 = b"SYNAPSE-S2\x00RELEASE-TRUST-BUNDLE\x00v2\x00"
 _ENVELOPE_SIGNING_DOMAIN = b"SYNAPSE-S2\x00RELEASE-ENVELOPE\x00v1\x00"
+
+_BUNDLE_DOMAINS_BY_SCHEMA = {
+    BUNDLE_SCHEMA: _BUNDLE_SIGNING_DOMAIN,
+    BUNDLE_SCHEMA_V2: _BUNDLE_SIGNING_DOMAIN_V2,
+}
 
 # Hard bounds, enforced before the offending byte or entry is consumed.
 MAX_DOCUMENT_BYTES = 64 * 1024
@@ -495,7 +524,11 @@ def _validate_bundle_syntax(document: dict) -> None:
     happen in _verify_bundle."""
     token = "bundle-invalid"
     _require_exact_fields(document, _BUNDLE_FIELDS, token)
-    if document["schema"] != BUNDLE_SCHEMA:
+    schema = document["schema"]
+    allowed_roles = (
+        _BUNDLE_ROLES_BY_SCHEMA.get(schema) if type(schema) is str else None
+    )
+    if allowed_roles is None:
         raise _Refusal(token)
     bundle_root_key_id = _string(document["root_key_id"], token, _KEY_ID_RE)
     _integer(document["generation"], token, minimum=1)
@@ -515,6 +548,7 @@ def _validate_bundle_syntax(document: dict) -> None:
     if not isinstance(delegations, list) or len(delegations) > MAX_DELEGATIONS:
         raise _Refusal(token)
     seen_key_ids: set[str] = set()
+    seen_roles: set[str] = set()
     for delegation in delegations:
         if not isinstance(delegation, dict):
             raise _Refusal(token)
@@ -523,8 +557,9 @@ def _validate_bundle_syntax(document: dict) -> None:
         key_id = _string(delegation["key_id"], token, _KEY_ID_RE)
         if key_id != key_id_for_public_key(public_key):
             raise _Refusal(token)
-        if delegation["role"] != "release":
+        if delegation["role"] not in allowed_roles:
             raise _Refusal(token)
+        seen_roles.add(delegation["role"])
         # The root key signs bundles only; a bundle delegating its own
         # root key as a release key is malformed on its face.
         if key_id == bundle_root_key_id:
@@ -555,6 +590,13 @@ def _validate_bundle_syntax(document: dict) -> None:
         )
         if sequence_maximum < sequence_minimum:
             raise _Refusal(token)
+    if document["schema"] == BUNDLE_SCHEMA_V2 and seen_roles != set(
+        _BUNDLE_ROLES_BY_SCHEMA[BUNDLE_SCHEMA_V2]
+    ):
+        # A v2 bundle exists to carry the two-role vocabulary: both role
+        # sets must be nonempty (each on a distinct key id, enforced by the
+        # duplicate-key check above).  v1 bundles are unchanged.
+        raise _Refusal(token)
     revoked = document["revoked_key_ids"]
     if not isinstance(revoked, list) or len(revoked) > MAX_REVOCATIONS:
         raise _Refusal(token)
@@ -570,13 +612,17 @@ def _validate_bundle_syntax(document: dict) -> None:
 def _verify_bundle(
     document: dict, root_key_id: str, root_public_key: str, now: int
 ) -> None:
-    """Cross-document verification of an already syntax-valid bundle."""
+    """Cross-document verification of an already syntax-valid bundle.
+    The signing domain is selected by the bundle schema, so a v1
+    signature can never verify a v2 bundle or vice versa."""
     if document["root_key_id"] != root_key_id:
         raise _Blocked("bundle-root-mismatch")
     if not _signature_valid(
         root_public_key,
         document["signature"],
-        _unsigned_signing_payload(document, _BUNDLE_SIGNING_DOMAIN),
+        _unsigned_signing_payload(
+            document, _BUNDLE_DOMAINS_BY_SCHEMA[document["schema"]]
+        ),
     ):
         raise _Blocked("bundle-signature-invalid")
     if now < document["issued_at"]:
@@ -642,6 +688,10 @@ def _verify_envelope(
             break
     if delegation is None:
         raise _Blocked("delegation-unknown")
+    if delegation["role"] != DELEGATION_ROLE_RELEASE:
+        # Role confusion: only a release-role delegation signs envelopes.
+        # Every v1 delegation is release-role, so v1 behavior is unchanged.
+        raise _Blocked("delegation-role-mismatch")
     if envelope["channel"] not in delegation["channels"]:
         raise _Blocked("channel-not-delegated")
     if not (

@@ -251,6 +251,10 @@ _DYNAMIC_NAMESPACE_BUILTINS = frozenset(
     )
 )
 
+_PYTHON_ENCODING_COOKIE_RE = re.compile(
+    br"^[ \t\f]*#.*?coding[:=][ \t]*[-_.a-zA-Z0-9]+"
+)
+
 # Flag lookups use getattr so importing this module can never fail on a
 # platform that lacks one; the deterministic gate below refuses to plan
 # instead.
@@ -931,9 +935,23 @@ def _extract_manifest(source: bytes) -> tuple[str, tuple[str, ...] | None]:
     # streams via tokenize and aborts early, so no huge AST is ever built.
     if len(source) > MAX_MANIFEST_SOURCE_BYTES:
         return ("complexity", None)
-    token_count = 0
+    if source.startswith(b"\xef\xbb\xbf"):
+        return ("missing", None)
+    if any(
+        _PYTHON_ENCODING_COOKIE_RE.match(line)
+        for line in source.split(b"\n", 2)[:2]
+    ):
+        return ("missing", None)
     try:
-        for _ in tokenize.tokenize(io.BytesIO(source).readline):
+        text = source.decode("utf-8")
+    except UnicodeDecodeError:
+        return ("missing", None)
+    # The bytes tokenizer emitted one ENCODING token.  Seed the count at
+    # one so the reviewed ceiling is unchanged while generate_tokens keeps
+    # candidate encoding cookies away from process-global codec hooks.
+    token_count = 1
+    try:
+        for _ in tokenize.generate_tokens(io.StringIO(text).readline):
             token_count += 1
             if token_count > MAX_MANIFEST_SOURCE_TOKENS:
                 return ("complexity", None)
@@ -946,7 +964,7 @@ def _extract_manifest(source: bytes) -> tuple[str, tuple[str, ...] | None]:
     ):
         return ("missing", None)
     try:
-        tree = ast.parse(source.decode("utf-8"))
+        tree = ast.parse(text)
     except (SyntaxError, ValueError, UnicodeDecodeError):
         return ("missing", None)
     def _touches_manifest(node: ast.AST) -> bool:
@@ -1346,9 +1364,22 @@ def _analyze_contract_source(
     """
     if len(source) > MAX_CONTRACT_SOURCE_BYTES:
         return None
-    token_count = 0
+    if source.startswith(b"\xef\xbb\xbf"):
+        return None
+    if any(
+        _PYTHON_ENCODING_COOKIE_RE.match(line)
+        for line in source.split(b"\n", 2)[:2]
+    ):
+        return None
     try:
-        for _ in tokenize.tokenize(io.BytesIO(source).readline):
+        text = source.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    # Preserve the old ENCODING-inclusive token ceiling without giving a
+    # candidate PEP 263 cookie access to the process-global codec registry.
+    token_count = 1
+    try:
+        for _ in tokenize.generate_tokens(io.StringIO(text).readline):
             token_count += 1
             if token_count > MAX_CONTRACT_SOURCE_TOKENS:
                 return None
@@ -1361,7 +1392,7 @@ def _analyze_contract_source(
     ):
         return None
     try:
-        tree = ast.parse(source.decode("utf-8"))
+        tree = ast.parse(text)
     except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
@@ -2262,6 +2293,11 @@ PRODUCT_INVENTORY = (
     ),
     ("operator-scripts", "operator-script", "scripts/prep_tomorrow.sh"),
     ("operator-scripts", "operator-script", "scripts/purge_namespaces.py"),
+    (
+        "operator-scripts",
+        "operator-script",
+        "scripts/release_compatibility.py",
+    ),
     ("operator-scripts", "operator-script", "scripts/release_provenance.py"),
     ("operator-scripts", "operator-script", "scripts/release_stage.py"),
     ("operator-scripts", "operator-script", "scripts/release_update_plan.py"),
@@ -2346,6 +2382,7 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_purge_namespaces.py"),
     ("tests", "test", "tests/test_recovery_route_surfaces.py"),
     ("tests", "test", "tests/test_redaction.py"),
+    ("tests", "test", "tests/test_release_compatibility.py"),
     ("tests", "test", "tests/test_release_provenance.py"),
     ("tests", "test", "tests/test_release_stage.py"),
     ("tests", "test", "tests/test_release_update_orchestrator.py"),

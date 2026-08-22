@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import codecs
 import contextlib
 import hashlib
 import io
@@ -1234,6 +1235,78 @@ class ReleaseUpdatePlanTests(unittest.TestCase):
         self.assertFalse(modules & forbidden)
 
 
+class AnalyzerCodecIsolationTests(unittest.TestCase):
+    def test_encoding_cookies_and_bom_fail_without_codec_lookup(self) -> None:
+        manifest = (
+            "BUILD_SOURCE_MANIFEST = " + repr(planner.TRUSTED_MANIFEST) + "\n"
+        ).encode("utf-8")
+        contract = b"SELECTED = 1\n"
+        codec_lookups = []
+
+        def codec_hook(name):
+            codec_lookups.append(name)
+            return None
+
+        prefixes = (
+            b"# coding: s2_planner_attacker_codec\n",
+            b"#!/usr/bin/env python\n# coding=s2_planner_attacker_codec\n",
+            b"\xef\xbb\xbf# coding: s2_planner_attacker_codec\n",
+            b"\xef\xbb\xbf",
+        )
+        codecs.register(codec_hook)
+        try:
+            for prefix in prefixes:
+                self.assertEqual(
+                    planner._extract_manifest(prefix + manifest),
+                    ("missing", None),
+                )
+                self.assertIsNone(
+                    planner._analyze_contract_source(
+                        prefix + contract, frozenset(("SELECTED",))
+                    )
+                )
+        finally:
+            codecs.unregister(codec_hook)
+        self.assertEqual(codec_lookups, [])
+
+    def test_string_tokenizer_preserves_encoding_inclusive_limits(self) -> None:
+        manifest = (
+            "BUILD_SOURCE_MANIFEST = " + repr(planner.TRUSTED_MANIFEST) + "\n"
+        ).encode("utf-8")
+        manifest_tokens = sum(
+            1 for _ in tokenize.tokenize(io.BytesIO(manifest).readline)
+        )
+        with mock.patch.object(
+            planner, "MAX_MANIFEST_SOURCE_TOKENS", manifest_tokens - 1
+        ):
+            self.assertEqual(
+                planner._extract_manifest(manifest), ("complexity", None)
+            )
+        with mock.patch.object(
+            planner, "MAX_MANIFEST_SOURCE_TOKENS", manifest_tokens
+        ):
+            self.assertEqual(
+                planner._extract_manifest(manifest),
+                ("ok", planner.TRUSTED_MANIFEST),
+            )
+
+        contract = b"SELECTED = 1\n"
+        contract_tokens = sum(
+            1 for _ in tokenize.tokenize(io.BytesIO(contract).readline)
+        )
+        names = frozenset(("SELECTED",))
+        with mock.patch.object(
+            planner, "MAX_CONTRACT_SOURCE_TOKENS", contract_tokens - 1
+        ):
+            self.assertIsNone(planner._analyze_contract_source(contract, names))
+        with mock.patch.object(
+            planner, "MAX_CONTRACT_SOURCE_TOKENS", contract_tokens
+        ):
+            self.assertIn(
+                "SELECTED", planner._analyze_contract_source(contract, names)
+            )
+
+
 GATE_KEYS = {
     "schema",
     "mode",
@@ -2213,7 +2286,7 @@ HISTORY_CHANGED_PATHS = [
     "web/index.html",
 ]
 # The identical release-foundation overlay applied to both historical
-# templates: the closed 197-entry inventory binds these files, so both
+# templates: the closed 199-entry inventory binds these files, so both
 # trees carry the same current copies and the factual delta between the
 # templates stays exactly HISTORY_CHANGED_PATHS.  Product identities can
 # no longer be pinned as hex constants here: this very file is part of
@@ -2221,11 +2294,13 @@ HISTORY_CHANGED_PATHS = [
 HISTORY_FOUNDATION_OVERLAY = (
     "pyproject.toml",
     "scripts/installed_layout.py",
+    "scripts/release_compatibility.py",
     "scripts/release_provenance.py",
     "scripts/release_stage.py",
     "scripts/release_update_plan.py",
     "scripts/sign_release_provenance.py",
     "tests/test_installed_layout.py",
+    "tests/test_release_compatibility.py",
     "tests/test_release_provenance.py",
     "tests/test_release_stage.py",
     "tests/test_release_update_plan.py",
@@ -2235,10 +2310,12 @@ HISTORY_FOUNDATION_OVERLAY = (
 # Inventory paths introduced on top of the tracked HISTORY_NEW_COMMIT tree.
 FOUNDATION_NEW_PATHS = (
     "scripts/installed_layout.py",
+    "scripts/release_compatibility.py",
     "scripts/release_provenance.py",
     "scripts/release_stage.py",
     "scripts/sign_release_provenance.py",
     "tests/test_installed_layout.py",
+    "tests/test_release_compatibility.py",
     "tests/test_release_provenance.py",
     "tests/test_release_stage.py",
 )
@@ -2397,7 +2474,7 @@ class ProductReleasePlanTests(unittest.TestCase):
         inventory_paths = sorted(
             path for _, _, path in planner.PRODUCT_INVENTORY
         )
-        self.assertEqual(len(inventory_paths), 197)
+        self.assertEqual(len(inventory_paths), 199)
         tracked = sorted(
             subprocess.run(
                 [
@@ -2415,7 +2492,7 @@ class ProductReleasePlanTests(unittest.TestCase):
             ).stdout.splitlines()
         )
         # Exact parity with the tracked tree at the release base plus the
-        # seven release-foundation additions: no path is derived at runtime,
+        # nine release-foundation additions: no path is derived at runtime,
         # nothing tracked is uninventoried, and nothing inventoried is
         # neither tracked nor a declared addition.
         self.assertEqual(len(tracked), 190)
@@ -2433,8 +2510,8 @@ class ProductReleasePlanTests(unittest.TestCase):
             self.assertIn(name, inventory_paths)
 
     def test_product_inventory_disk_mode_census_is_closed(self) -> None:
-        # The working tree the closed 197-entry inventory binds carries an
-        # equally closed permission census: exactly 185 regular 0644 files
+        # The working tree the closed 199-entry inventory binds carries an
+        # equally closed permission census: exactly 187 regular 0644 files
         # and exactly 12 executable 0755 operator entry points.  Any new
         # executable (or a lost executable bit) must be reviewed here.
         census: dict[int, int] = {}
@@ -2446,7 +2523,7 @@ class ProductReleasePlanTests(unittest.TestCase):
             census[mode] = census.get(mode, 0) + 1
             if mode == 0o755:
                 executables.append(path)
-        self.assertEqual(census, {0o644: 185, 0o755: 12})
+        self.assertEqual(census, {0o644: 187, 0o755: 12})
         self.assertEqual(
             sorted(executables),
             [
@@ -2592,10 +2669,13 @@ class ProductReleasePlanTests(unittest.TestCase):
             ("operator-scripts", "operator-script",
              "scripts/installed_layout.py"),
             ("operator-scripts", "operator-script",
+             "scripts/release_compatibility.py"),
+            ("operator-scripts", "operator-script",
              "scripts/release_stage.py"),
             ("operator-scripts", "operator-script",
              "scripts/release_update_plan.py"),
             ("tests", "test", "tests/test_installed_layout.py"),
+            ("tests", "test", "tests/test_release_compatibility.py"),
             ("tests", "test", "tests/test_release_stage.py"),
             ("support-tools", "support-tool", "scripts/measure_retrieval_v2.py"),
             ("dependencies", "dependency-lock", "uv.lock"),
@@ -2647,9 +2727,9 @@ class ProductReleasePlanTests(unittest.TestCase):
                 caught.exception.token, "product-inventory-invalid"
             )
         # Inventory count bound, exercised at the exact edge.
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 197):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 199):
             planner._validate_product_inventory()
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 196):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 198):
             result = planner.plan_product_release(
                 self.template, self.template
             )

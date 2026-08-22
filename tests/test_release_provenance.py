@@ -506,6 +506,16 @@ class ChainVerificationTests(ProvenanceFixture):
             "bundle-signature-invalid",
         )
 
+    def test_non_string_bundle_schema_preserves_bundle_invalid_taxonomy(self):
+        for schema in ([], {}):
+            with self.subTest(schema=schema):
+                bundle_path, envelope_path = self.write_chain(
+                    bundle=self.bundle_doc(schema=schema)
+                )
+                self.assert_refused(
+                    self.verify(bundle_path, envelope_path), "bundle-invalid"
+                )
+
     def test_every_signed_envelope_field_tamper_is_caught(self):
         signed = self.sign_envelope(self.envelope_doc())
         expectations = {
@@ -2967,6 +2977,125 @@ class GoldenVectorTests(ProvenanceFixture):
         self.floor_path = self.dir / "golden-floor.json"
         result = self.verify(bundle_path, envelope_path)
         self.assert_success(result, "verified")
+
+
+class V2DelegationTests(ProvenanceFixture):
+    """Compact role/domain checks added without changing the v1 contract."""
+
+    @classmethod
+    def compatibility_delegation(cls, *, key_id=None, public_key=None) -> dict:
+        return {
+            "key_id": key_id or cls.other_key_id,
+            "public_key": public_key or cls.other_public_hex,
+            "role": provenance.DELEGATION_ROLE_COMPATIBILITY,
+            "channels": ["stable"],
+            "not_before": ISSUED,
+            "not_after": EXPIRES,
+            "sequence_minimum": 1,
+            "sequence_maximum": 1_000_000,
+        }
+
+    @classmethod
+    def v2_bundle(cls, **overrides) -> dict:
+        document = cls.bundle_doc(
+            schema=provenance.BUNDLE_SCHEMA_V2,
+            delegations=[
+                cls.bundle_doc()["delegations"][0],
+                cls.compatibility_delegation(),
+            ],
+        )
+        document.update(overrides)
+        return document
+
+    @classmethod
+    def sign_v2(cls, unsigned: dict, domain=None) -> dict:
+        signed = dict(unsigned)
+        signed["signature"] = cls.root_private.sign(
+            (domain or provenance._BUNDLE_SIGNING_DOMAIN_V2)
+            + provenance.canonical_bytes(unsigned)
+        ).hex()
+        return signed
+
+    def verify_bundle(self, bundle: dict, envelope=None) -> dict:
+        envelope = envelope or self.sign_envelope(self.envelope_doc())
+        bundle_path = self.write("bundle-v2.json", canonical(bundle))
+        envelope_path = self.write("envelope-v2.json", canonical(envelope))
+        return self.verify(bundle_path, envelope_path)
+
+    def test_v1_v2_domains_are_separate_and_v1_golden_is_unchanged(self):
+        self.assertEqual(
+            provenance._BUNDLE_SIGNING_DOMAIN,
+            b"SYNAPSE-S2\x00RELEASE-TRUST-BUNDLE\x00v1\x00",
+        )
+        self.assertEqual(
+            provenance._BUNDLE_SIGNING_DOMAIN_V2,
+            b"SYNAPSE-S2\x00RELEASE-TRUST-BUNDLE\x00v2\x00",
+        )
+        self.assertNotEqual(
+            provenance._BUNDLE_SIGNING_DOMAIN,
+            provenance._BUNDLE_SIGNING_DOMAIN_V2,
+        )
+        root_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+            GOLDEN_ROOT_SEED
+        )
+        golden_payload = (
+            provenance._BUNDLE_SIGNING_DOMAIN
+            + provenance.canonical_bytes(GoldenVectorTests.golden_bundle_doc())
+        )
+        self.assertEqual(
+            root_key.sign(golden_payload).hex(), GOLDEN_BUNDLE_SIGNATURE
+        )
+
+        v2_wrong_domain = self.sign_v2(
+            self.v2_bundle(), provenance._BUNDLE_SIGNING_DOMAIN
+        )
+        self.assert_blocked(
+            self.verify_bundle(v2_wrong_domain), "bundle-signature-invalid"
+        )
+        v1 = self.bundle_doc()
+        v1_wrong_domain = dict(v1)
+        v1_wrong_domain["signature"] = self.root_private.sign(
+            provenance._BUNDLE_SIGNING_DOMAIN_V2 + canonical(v1)
+        ).hex()
+        self.assert_blocked(
+            self.verify_bundle(v1_wrong_domain), "bundle-signature-invalid"
+        )
+        self.assert_success(
+            self.verify_bundle(self.sign_v2(self.v2_bundle())), "verified"
+        )
+
+    def test_v2_requires_both_roles_and_rejects_duplicate_role_keys(self):
+        release = self.bundle_doc()["delegations"][0]
+        compatibility_role = self.compatibility_delegation()
+        invalid_delegations = (
+            [release],
+            [compatibility_role],
+            [release, release, compatibility_role],
+            [
+                release,
+                self.compatibility_delegation(
+                    key_id=self.release_key_id,
+                    public_key=self.release_public_hex,
+                ),
+            ],
+        )
+        for delegations in invalid_delegations:
+            with self.subTest(delegations=delegations):
+                bundle = self.sign_v2(
+                    self.v2_bundle(delegations=delegations)
+                )
+                self.assert_refused(
+                    self.verify_bundle(bundle), "bundle-invalid"
+                )
+
+    def test_release_envelope_rejects_compatibility_role(self):
+        bundle = self.sign_v2(self.v2_bundle())
+        envelope = self.envelope_doc(key_id=self.other_key_id)
+        envelope = self.sign_envelope(envelope, key=self.other_private)
+        self.assert_blocked(
+            self.verify_bundle(bundle, envelope),
+            "delegation-role-mismatch",
+        )
 
 
 class ModuleHygieneTests(unittest.TestCase):
