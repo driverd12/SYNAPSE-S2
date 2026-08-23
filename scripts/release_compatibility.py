@@ -357,6 +357,7 @@ SURFACE_FILES = {
         "scripts/release_activation_journal.py",
         "scripts/release_environment.py",
         "scripts/release_environment_evidence.py",
+        "scripts/release_environment_model_static_evidence.py",
         "scripts/release_environment_storage.py",
         "scripts/release_stage.py",
         "scripts/release_update_plan.py",
@@ -369,6 +370,7 @@ SURFACE_FILES = {
         "core_runtime_paths.py",
         "scripts/release_environment.py",
         "scripts/release_environment_evidence.py",
+        "scripts/release_environment_model_static_evidence.py",
         "scripts/release_environment_storage.py",
         "scripts/release_stage.py",
         "pyproject.toml",
@@ -413,7 +415,7 @@ DOWNGRADE_POLICY = "blocked"
 # profile; any semantic change to what a surface digest or the global digest
 # covers is a new version.  This namespace is independent of the separately
 # versioned dormant activation-contract profile.
-PROFILE_VERSION = 3
+PROFILE_VERSION = 4
 
 # Closed schema of the per-root compatibility observation whose records
 # the surface digests bind; hashed into the global digest.
@@ -742,6 +744,11 @@ PRODUCT_INVENTORY = (
     (
         "operator-scripts",
         "operator-script",
+        "scripts/release_environment_model_static_evidence.py",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
         "scripts/release_environment_storage.py",
     ),
     ("operator-scripts", "operator-script", "scripts/release_provenance.py"),
@@ -832,6 +839,11 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_release_compatibility.py"),
     ("tests", "test", "tests/test_release_environment.py"),
     ("tests", "test", "tests/test_release_environment_evidence.py"),
+    (
+        "tests",
+        "test",
+        "tests/test_release_environment_model_static_evidence.py",
+    ),
     ("tests", "test", "tests/test_release_environment_storage.py"),
     ("tests", "test", "tests/test_release_provenance.py"),
     ("tests", "test", "tests/test_release_stage.py"),

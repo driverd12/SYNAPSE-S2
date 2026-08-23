@@ -2312,6 +2312,11 @@ PRODUCT_INVENTORY = (
     (
         "operator-scripts",
         "operator-script",
+        "scripts/release_environment_model_static_evidence.py",
+    ),
+    (
+        "operator-scripts",
+        "operator-script",
         "scripts/release_environment_storage.py",
     ),
     ("operator-scripts", "operator-script", "scripts/release_provenance.py"),
@@ -2402,6 +2407,11 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_release_compatibility.py"),
     ("tests", "test", "tests/test_release_environment.py"),
     ("tests", "test", "tests/test_release_environment_evidence.py"),
+    (
+        "tests",
+        "test",
+        "tests/test_release_environment_model_static_evidence.py",
+    ),
     ("tests", "test", "tests/test_release_environment_storage.py"),
     ("tests", "test", "tests/test_release_provenance.py"),
     ("tests", "test", "tests/test_release_stage.py"),
