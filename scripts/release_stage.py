@@ -117,7 +117,7 @@ HELP_SCHEMA = "synapse-s2.release-stage-help.v1"
 # does.  A deliberate planner update therefore requires a reviewed stager
 # update in the same release.
 TRUSTED_PLANNER_SHA256 = (
-    "2ad36ef1ff0c302d89592c563a95a0f98f8144f73f205af4bde1eeafc01b83b6"
+    "1b870065a13f76ee7c3fc409a9a771996943e81d449d821e612a10aed58aa902"
 )
 
 STATUS_STAGED = "staged"

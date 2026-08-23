@@ -2286,7 +2286,7 @@ HISTORY_CHANGED_PATHS = [
     "web/index.html",
 ]
 # The identical release-foundation overlay applied to both historical
-# templates: the closed 207-entry inventory binds these files, so both
+# templates: the closed 209-entry inventory binds these files, so both
 # trees carry the same current copies and the factual delta between the
 # templates stays exactly HISTORY_CHANGED_PATHS.  Product identities can
 # no longer be pinned as hex constants here: this very file is part of
@@ -2298,6 +2298,7 @@ HISTORY_FOUNDATION_OVERLAY = (
     "scripts/release_compatibility.py",
     "scripts/release_environment.py",
     "scripts/release_environment_evidence.py",
+    "scripts/release_environment_model_static_evidence.py",
     "scripts/release_environment_storage.py",
     "scripts/release_provenance.py",
     "scripts/release_stage.py",
@@ -2308,6 +2309,7 @@ HISTORY_FOUNDATION_OVERLAY = (
     "tests/test_release_compatibility.py",
     "tests/test_release_environment.py",
     "tests/test_release_environment_evidence.py",
+    "tests/test_release_environment_model_static_evidence.py",
     "tests/test_release_environment_storage.py",
     "tests/test_release_provenance.py",
     "tests/test_release_stage.py",
@@ -2322,6 +2324,7 @@ FOUNDATION_NEW_PATHS = (
     "scripts/release_compatibility.py",
     "scripts/release_environment.py",
     "scripts/release_environment_evidence.py",
+    "scripts/release_environment_model_static_evidence.py",
     "scripts/release_environment_storage.py",
     "scripts/release_provenance.py",
     "scripts/release_stage.py",
@@ -2331,6 +2334,7 @@ FOUNDATION_NEW_PATHS = (
     "tests/test_release_compatibility.py",
     "tests/test_release_environment.py",
     "tests/test_release_environment_evidence.py",
+    "tests/test_release_environment_model_static_evidence.py",
     "tests/test_release_environment_storage.py",
     "tests/test_release_provenance.py",
     "tests/test_release_stage.py",
@@ -2490,7 +2494,7 @@ class ProductReleasePlanTests(unittest.TestCase):
         inventory_paths = sorted(
             path for _, _, path in planner.PRODUCT_INVENTORY
         )
-        self.assertEqual(len(inventory_paths), 207)
+        self.assertEqual(len(inventory_paths), 209)
         tracked = sorted(
             subprocess.run(
                 [
@@ -2526,8 +2530,8 @@ class ProductReleasePlanTests(unittest.TestCase):
             self.assertIn(name, inventory_paths)
 
     def test_product_inventory_disk_mode_census_is_closed(self) -> None:
-        # The working tree the closed 207-entry inventory binds carries an
-        # equally closed permission census: exactly 195 regular 0644 files
+        # The working tree the closed 209-entry inventory binds carries an
+        # equally closed permission census: exactly 197 regular 0644 files
         # and exactly 12 executable 0755 operator entry points.  Any new
         # executable (or a lost executable bit) must be reviewed here.
         census: dict[int, int] = {}
@@ -2539,7 +2543,7 @@ class ProductReleasePlanTests(unittest.TestCase):
             census[mode] = census.get(mode, 0) + 1
             if mode == 0o755:
                 executables.append(path)
-        self.assertEqual(census, {0o644: 195, 0o755: 12})
+        self.assertEqual(census, {0o644: 197, 0o755: 12})
         self.assertEqual(
             sorted(executables),
             [
@@ -2590,7 +2594,7 @@ class ProductReleasePlanTests(unittest.TestCase):
         self.assertEqual(
             expected,
             "inventory-policy-"
-            "a9af3d870c3fde4c2201cd97489543f33fd86a8c0ff127ca04709f1c7f4bdcd8",
+            "7e32522dc7bd9485c50a2992d7a35acfa0f2ece16e4dcdc14b78b8e82a095df4",
         )
         self.assertEqual(planner._inventory_policy_id(), expected)
         # A verified result and an unsupported refusal both carry the exact
@@ -2760,9 +2764,9 @@ class ProductReleasePlanTests(unittest.TestCase):
                 caught.exception.token, "product-inventory-invalid"
             )
         # Inventory count bound, exercised at the exact edge.
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 207):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 209):
             planner._validate_product_inventory()
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 206):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 208):
             result = planner.plan_product_release(
                 self.template, self.template
             )
