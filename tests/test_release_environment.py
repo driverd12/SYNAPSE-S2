@@ -472,7 +472,7 @@ class TestPins(unittest.TestCase):
         self.assertEqual(tuple(re_mod.FALSE_FLAGS), FALSE_FLAGS)
         self.assertEqual(list(re_mod.NONCLAIMS), NONCLAIMS)
 
-    def test_profile_disposition_matches_current_ticket_siblings(self):
+    def test_profile_disposition_is_independent_of_current_ticket_siblings(self):
         for path in (_COMPATIBILITY, _SIGNER):
             with self.subTest(path=path):
                 with open(path, "r", encoding="utf-8") as handle:
@@ -480,7 +480,7 @@ class TestPins(unittest.TestCase):
                 matches = re.findall(
                     r"(?m)^PROFILE_VERSION = ([0-9]+)$", text
                 )
-                self.assertEqual(matches, ["3"])
+                self.assertEqual(matches, ["4"])
         self.assertEqual(re_mod.COMPATIBILITY_PROFILE_VERSION, 3)
         self.assertEqual(
             re_mod.COMPATIBILITY_PROFILE_DISPOSITION,
