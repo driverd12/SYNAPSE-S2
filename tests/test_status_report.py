@@ -13,11 +13,15 @@ from core_client_binding import (
 from core_service import CoreConfig, write_core_config
 from scripts.synapse_status_report import (
     ROOT,
+    generate_visual_documentation,
     main,
     render_status_markdown,
+    render_visual_manual_markdown,
     sorted_context_rows,
     status_subprocess_environment,
     validate_status_output_path,
+    visual_artifact_relative_paths,
+    visual_manual_pages,
     write_private_status_report,
 )
 
@@ -249,11 +253,78 @@ class SynapseStatusReportTests(unittest.TestCase):
         self.assertIn("Start Work", markdown)
         self.assertIn("Cross-process Cortex closure", markdown)
         self.assertIn("App Connect preview", markdown)
+        self.assertIn("Retrieval associations", markdown)
+        self.assertIn("Private image and media memory", markdown)
+        self.assertIn("Impact scorecard", markdown)
+        self.assertIn("Governed Memora lifecycle", markdown)
+        self.assertIn("Exactly-once capture and delivery", markdown)
+        self.assertIn("Verified recovery and replication", markdown)
+        self.assertIn("Release safety substrate", markdown)
         self.assertIn("Known Non-Claims", markdown)
         self.assertIn("App Connect is not guaranteed internal app scraping", markdown)
         self.assertIn("Memory hygiene backlog", markdown)
         self.assertIn("Source checkout at generation", markdown)
         self.assertIn("final commit position", markdown)
+
+    def test_visual_manual_source_is_complete_current_and_ascii(self):
+        pages = visual_manual_pages()
+        markdown = render_visual_manual_markdown("abc1234", "2026-08-24")
+
+        self.assertEqual(len(pages), 13)
+        self.assertTrue(all(len(page.sections) == 4 for page in pages))
+        self.assertTrue(markdown.isascii())
+        self.assertIn("Source baseline abc1234 | Generated 2026-08-24", markdown)
+        self.assertIn("uv run --isolated --no-project", markdown)
+        self.assertIn("reportlab==4.4.9", markdown)
+        self.assertIn("Poppler 26.05.0", markdown)
+        self.assertNotIn(".venv/bin/python scripts/synapse_status_report.py", markdown)
+        for phrase in (
+            "Daily Operator Trust Loop",
+            "Retrieval associations",
+            "Private image and media memory",
+            "Memora governance",
+            "Impact and evaluation",
+            "Exactly-once posture",
+            "Offline replication",
+            "Safe release lane",
+            "No signed and notarized macOS app or package is published",
+        ):
+            self.assertIn(phrase, markdown)
+
+        paths = visual_artifact_relative_paths()
+        self.assertEqual(len(paths), 17)
+        self.assertEqual(len(set(paths)), 17)
+        self.assertEqual(
+            [path for path in paths if path.startswith("output/manual/plates/")],
+            [f"output/manual/plates/manual-{page:02d}.png" for page in range(1, 14)],
+        )
+
+    def test_visual_docs_mode_bypasses_live_collection(self):
+        with (
+            mock.patch(
+                "scripts.synapse_status_report.generate_visual_documentation",
+                return_value=(),
+            ) as generate,
+            mock.patch("scripts.synapse_status_report.collect_live_report") as collect,
+        ):
+            result = main(
+                [
+                    "--visual-docs",
+                    "--visual-revision",
+                    "abc1234",
+                    "--visual-source-date",
+                    "2026-08-24",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        generate.assert_called_once_with(
+            output_root=ROOT,
+            revision="abc1234",
+            source_date="2026-08-24",
+            pdftoppm=None,
+        )
+        collect.assert_not_called()
 
 
 if __name__ == "__main__":

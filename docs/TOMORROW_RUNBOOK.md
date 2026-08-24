@@ -8,6 +8,17 @@ core, database, capture transport, client binding, and remote refs before
 classifying any installation as legacy v5 or authoritative v6; this runbook
 does not make that live claim by itself.
 
+This runbook is for an already checked-out installation. The newer release
+planner, provenance, profile 4 compatibility, inactive staging, environment,
+and activation-journal modules are not an alternative install command: their
+activation/apply authority remains false, the environment chain is still
+profile 3 and incomplete, and no package or composed updater exists. Continue
+to use the guarded authoritative-core procedure below. See
+`docs/PRODUCTION_GAP_AUDIT.md` for the exact productization boundary.
+
+`docs/CURRENT_STATUS.md` contains a prominently labeled historical runtime
+snapshot. Regenerate it before relying on host counts, health, or readiness.
+
 ## Monday operator-trust certification
 
 On an already bound installation, run this first when the question is "can we
@@ -417,7 +428,6 @@ This creates event nodes in the relationship visualizer and publishes a durable 
 Always-on capture inbox:
 
 ```bash
-scripts/install_capture_daemon.sh
 .venv/bin/python synapse_cli.py --json capture-inbox-drop \
   --context default \
   --tag codex-session \
@@ -427,7 +437,17 @@ scripts/install_capture_daemon.sh
 .venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
 ```
 
-The sidecar watches `.synapse_s2/capture_inbox`, redacts common secret patterns, ingests pending payloads into real temporal event memories, then moves files to `.synapse_s2/capture_processed`. This is the production-hardened "magic" layer: clients and hooks still opt in by writing payloads, but no running dashboard or terminal session has to stay open for ingestion. Manual one-shot processing remains explicit: the CLI uses `--confirm`, MCP uses `confirm=true`, and the dashboard preflights the exact pending files before committing.
+On authoritative v6, the core's embedded capture worker watches the bound
+capture inbox, applies the capture redaction boundary, ingests private payloads
+into real temporal event memories, and moves completed files to the bound
+processed directory.
+This is the production-hardened "magic" layer: clients and hooks still opt in
+by writing payloads, but no running dashboard or terminal session has to stay
+open. Manual one-shot processing remains explicit: the CLI uses `--confirm`,
+MCP uses `confirm=true`, and the dashboard preflights the exact pending files
+before committing. `scripts/install_capture_daemon.sh` is a pre-cutover
+local-v5 maintenance path only and refuses an installed core or governed v6
+store.
 
 App Connect:
 
@@ -741,7 +761,7 @@ Useful tool calls:
 | `query_spiking_attention_text` | Deprecated stateful compatibility query; it may mutate recurrent runtime state and must not be used as read-only recall. |
 | `ingest_spiking_memory_text` | Segments a long briefing into event memories and relationship edges. |
 | `capture_spiking_conversation` | Captures real operator/agent session notes into event memory. |
-| `drop_spiking_capture_inbox` | Drops opt-in session notes for the always-on local sidecar. |
+| `drop_spiking_capture_inbox` | Drops opt-in session notes into the bound inbox for the authoritative embedded capture worker (or reviewed legacy-v5 worker). |
 | `get_spiking_capture_inbox_status` | Shows pending and processed capture inbox counts. |
 | `process_spiking_capture_inbox` | Manually processes pending capture inbox files; requires `confirm=true`. |
 | `preflight_spiking_capture_error_resolution` | Returns content-free terminal, historical, unsafe, and unresolved error counts plus a revision-bound confirmation token. |
@@ -789,11 +809,11 @@ The matrix maps each proposal requirement to implementation evidence and separat
 | :--- | :--- |
 | `.synapse_s2/memory.sqlite3` | Durable memory store. |
 | `.synapse_s2/runtime_state.json` | Toggle/runtime state. |
-| `.synapse_s2/capture_inbox` | Pending opt-in session payloads and client-session boundary notes for the sidecar. |
-| `.synapse_s2/capture_processed` | Sidecar-processed payloads. |
+| `.synapse_s2/capture_inbox` | Legacy-layout spelling for pending opt-in session payloads and client-session boundary notes; authoritative paths come from the owner-only binding. |
+| `.synapse_s2/capture_processed` | Legacy-layout spelling for processed capture payloads; authoritative paths come from the owner-only binding. |
 | `.synapse_s2/capture_error_archive` | Private governed archive of reviewed terminal or sanitized historical error evidence. |
 | `.synapse_s2/capture_error_resolutions` | Private crash-recoverable manifests for capture-error archival operations. |
-| `.synapse_s2/capture-daemon.log` | Capture sidecar stderr/stdout log. |
+| `.synapse_s2/capture-daemon.log` | Legacy-v5 standalone capture-sidecar log; authoritative v6 capture is embedded in the core. |
 | `.synapse_s2/backups/verified` | Signed paired recovery bundles eligible for verification and isolated restore proof. |
 | `.synapse_s2/backups/database-only` | SQLite-only diagnostic snapshots; never substitute these for paired recovery. |
 | `.synapse_s2/backups/retired` | Reversible per-plan quarantine; no automatic purge or disk reclamation. |

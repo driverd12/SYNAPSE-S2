@@ -81,23 +81,34 @@ const WIZARD_FLOWS = {
   {
     selector: "#wizardToggleButton",
     title: "Start or stop the guide",
-    body: "Use this top-right control whenever you want the live first-use guide. The wizard walks real dashboard controls and can be stopped at any time.",
-    capability: "Guided onboarding: a live overlay for real local state, not a demo walkthrough.",
+    body: "Use this top-right control whenever you want the live first-use guide. It walks real controls on an already-installed dashboard and can be stopped at any time.",
+    capability: "Guided operation: a live overlay for real local state, not a demo, installer, updater, restore tool, or host-adoption workflow.",
     items: [
       "Start Wizard opens the guide; Stop Wizard closes it.",
       "Use Next, Back, Escape, or the close button while walking the page.",
-      "Each step points at a functioning SYNAPSE-S2 capability.",
+      "The guide never clicks a control or mutates memory for you.",
+    ],
+  },
+  {
+    selector: "#runtimeBuildIdentity",
+    title: "Read the running Core identity honestly",
+    body: "When available, Runtime build is the exact build identity authenticated on the authoritative Core response. It identifies the running Core only.",
+    capability: "Build provenance: exact runtime identity with explicit nonclaims about checkout parity, release compatibility, and certification profile.",
+    items: [
+      "Unavailable means the dashboard did not receive authoritative build provenance.",
+      "A visible build id does not prove this checkout or a candidate release matches it.",
+      "Use governed release audit and replacement tooling for updates; this wizard cannot install, restore, or adopt a release.",
     ],
   },
   {
     selector: "#modelUri",
     title: "Confirm the local memory target",
     body: "Start real work by checking the top readouts. They show the runtime, active memory URI, embedding provider, platform, and core state.",
-    capability: "Setup: LaunchAgent dashboard, local SQLite memory, Codex/Claude MCP clients, and durable pull context bus.",
+    capability: "Installed runtime: loopback dashboard, local SQLite memory, configured MCP clients, and durable pull context bus when those components are present.",
     items: [
-      "Use the dashboard at 127.0.0.1:8765 for local operation.",
+      "The installed default is 127.0.0.1:8765; rely on the address of the page you actually opened.",
       "Check the Memory URI before relying on stored context.",
-      "Use the Memory Context field when you need to isolate work.",
+      "Top readouts report runtime state; they do not certify a release profile.",
     ],
   },
   {
@@ -145,6 +156,17 @@ const WIZARD_FLOWS = {
     ],
   },
   {
+    selector: "#goalsPanel",
+    title: "Use the Goal Ledger as durable work state",
+    body: "Start Work loads active goals, blockers, and next actions for the selected namespace so work can resume across clients and operators.",
+    capability: "Goal continuity: explicit objectives, blockers, next actions, and completion state alongside remembered evidence.",
+    items: [
+      "Treat a goal as durable coordination state, not permission to perform a risky action.",
+      "Keep blockers and next actions concrete enough for the next operator to resume.",
+      "Use Cortex and normal human gates even when a goal already exists.",
+    ],
+  },
+  {
     selector: "#coreActionGroup",
     title: "Control the core deliberately",
     body: "There is one runtime enable/disable path. Unlock gives you a short window to change state, then it relocks.",
@@ -167,6 +189,17 @@ const WIZARD_FLOWS = {
     ],
   },
   {
+    selector: "#imageCaptureForm",
+    title: "Capture bounded image memory",
+    body: "Image memory keeps a small local thumbnail, bounded numeric descriptors, and your searchable description; it does not upload or retain the full-resolution source file.",
+    capability: "Media memory: local derivatives, optional on-device Apple Vision enrichment, consent-gated redacted OCR, and deterministic similarity lookup.",
+    items: [
+      "Describe why the image matters before capture; the source file remains untouched.",
+      "OCR text is stored only when explicitly selected and consented; feature vectors remain node-local.",
+      "Similar-image scores are uncalibrated distance signals, not identity or truth probabilities.",
+    ],
+  },
+  {
     selector: "#queryForm",
     title: "Recall what has been captured",
     body: "Retrieval v2 embeds your prompt locally, reads durable spike and semantic indexes, and returns deterministic bounded results without recurrent spiking or memory mutation.",
@@ -175,6 +208,28 @@ const WIZARD_FLOWS = {
       "Ask for decisions, incidents, project state, or prior validation.",
       "If results are thin, capture better traces rather than broad filler.",
       "MCP clients use the same read-only contract through retrieve_spiking_memory_v2.",
+    ],
+  },
+  {
+    selector: "#memoraShadowToggleButton",
+    title: "Govern Retrieval associations",
+    body: "Retrieval associations help queries find existing memory. Shadow clusters never promote themselves; reviewed lifecycle actions run against one exact authoritative binding revision.",
+    capability: "Memora governance: inspect, propose, separately review, promote, reject, revoke, and audit retrieval-routing evidence.",
+    items: [
+      "Associations are not tasks, approvals, follow-ups, or execution authority.",
+      "Review the source-valid binding and receipt chain before unlocking one confirmed action.",
+      "Outcome-unknown responses retain the request id for reconciliation instead of blind replay.",
+    ],
+  },
+  {
+    selector: "#impactToggleButton",
+    title: "Read Impact without turning estimates into claims",
+    body: "Observed shows content-free telemetry for dashboard recalls. The editable cost calculator is a hypothetical model-input equivalent, separate from measured impact.",
+    capability: "Impact: recall yield, approved bridge paths, backend latency, response-size estimates, and explicit productization doctrine.",
+    items: [
+      "Coverage is dashboard recall across all namespaces, not MCP, CLI, or agent hydration.",
+      "Observed activity does not prove relevance, correctness, time saved, money saved, or avoided work.",
+      "Human approval remains for destructive, credential-sensitive, cross-namespace, and authority changes.",
     ],
   },
   {
@@ -191,12 +246,23 @@ const WIZARD_FLOWS = {
   {
     selector: "#captureInboxButton",
     title: "Process client session drops",
-    body: "Magic Capture processes local inbox payloads dropped by MCP clients and the session bridge.",
-    capability: "Capture daemon: sanitized local drops, startup hydration traces, and session-boundary notes.",
+    body: "Magic Capture preflights and processes sanitized local inbox payloads dropped by MCP clients and the session bridge under the exactly-once capture ledger.",
+    capability: "Exactly-once capture: sanitized drops, confirmation-bound processing, durable receipts, startup hydration traces, and session-boundary notes.",
     items: [
       "Use this after client sessions have produced inbox files.",
-      "The preflight confirmation names what will be processed.",
-      "Errors stay visible until processed or repaired.",
+      "The preflight token binds the exact safe transport target before processing.",
+      "Do not copy loose inbox files or a database snapshot as a substitute for paired recovery.",
+    ],
+  },
+  {
+    selector: "#backupButton",
+    title: "Create a paired recovery point",
+    body: "Create Recovery Point binds the SQLite memory snapshot to exactly-once capture state and immediately verifies the signed pair.",
+    capability: "Recovery safety: verified paired database and capture-ledger evidence suitable for later isolated restore proof.",
+    items: [
+      "Create a fresh verified pair before host handoff or governed replacement.",
+      "A recovery point preserves state; it does not install, restore, adopt, or promote another host.",
+      "Use the dedicated governed recovery workflow to verify and stage any later restore.",
     ],
   },
   {
@@ -262,6 +328,17 @@ const WIZARD_FLOWS = {
     description: "Walk through the required fields for a real governed work session.",
     steps: [
       {
+        selector: "#runtimeBuildIdentity",
+        title: "Confirm what runtime you are operating",
+        body: "Use the authoritative Runtime build value as the identity of the running Core, not as proof that a checkout, release candidate, or compatibility profile matches it.",
+        capability: "Release-safety boundary: exact runtime provenance without an unsupported update-readiness claim.",
+        items: [
+          "Stop if the runtime identity is unavailable when your task depends on exact build provenance.",
+          "Use governed audit, staging, certification, and replacement flows for release work.",
+          "This dashboard wizard cannot install, update, restore, or adopt memory on another host.",
+        ],
+      },
+      {
         selector: "#operatorActionBanner",
         title: "Start with the required action",
         body: "Use the front banner as the current instruction. If it says Cortex is idle, that means you should start a governed session before risky work.",
@@ -292,6 +369,17 @@ const WIZARD_FLOWS = {
           "Click Start Work and wait for the output panel.",
           "Resolve Doctor or Context Health blockers before continuing.",
           "Use the recipe list as the live workflow checklist.",
+        ],
+      },
+      {
+        selector: "#goalsPanel",
+        title: "Reconcile the Goal Ledger",
+        body: "Review active goals, blockers, and next actions from Start Work before choosing the current Cortex task.",
+        capability: "Required continuity check: durable goal state aligned with the present operator objective.",
+        items: [
+          "Resume an existing goal only when its evidence and next action still match reality.",
+          "Record a concrete blocker instead of treating stale goal text as current truth.",
+          "A goal coordinates work; it never bypasses Cortex or a human approval gate.",
         ],
       },
       {
@@ -391,6 +479,17 @@ const WIZARD_FLOWS = {
           "Choose a trace type that matches the fact: decision, validation, risk, correction, or evidence.",
           "Write the exact outcome and validation evidence.",
           "Commit only facts you want future agents to reuse.",
+        ],
+      },
+      {
+        selector: "#backupButton",
+        title: "Protect state before a host handoff",
+        body: "For host handoff or replacement work, create a fresh verified paired recovery point after the capture ledger is healthy.",
+        capability: "Handoff protection: signed database and exactly-once capture state, verified together before external media handling.",
+        items: [
+          "Ordinary session wrap does not require a new recovery point; host handoff and replacement do.",
+          "Keep recovery media protected because it may contain sensitive remembered context.",
+          "The resulting bundle requires governed verification and isolated restore before signed acknowledgement; any future live adoption needs a separately governed procedure.",
         ],
       },
       {
@@ -809,6 +908,8 @@ const elements = collectElements([
   "runtimeGraphMode",
   "runtimeMaintenance",
   "runtimeMaintenanceDetail",
+  "runtimeBuildClaim",
+  "runtimeBuildIdentity",
   "sidebarStatus",
   "selfTestButton",
   "selfTestGrid",
@@ -827,6 +928,7 @@ const elements = collectElements([
   "wizardArrowTip",
   "wizardBackButton",
   "wizardBody",
+  "wizardBoundary",
   "wizardCapability",
   "wizardChecklist",
   "wizardCloseButton",
@@ -1248,6 +1350,12 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   elements.chipLabel.textContent = system.chip || system.machine || "unknown";
   elements.uptimeLabel.textContent = formatDuration(system.uptime_seconds);
   elements.coreVersion.textContent = system.project_version ? `v${system.project_version}` : "local";
+  const runtimeBuildId = String(system.runtime_build_id || "").trim();
+  elements.runtimeBuildIdentity.textContent = runtimeBuildId || "unavailable";
+  elements.runtimeBuildIdentity.title = runtimeBuildId || "No authoritative runtime build identity was returned";
+  elements.runtimeBuildClaim.textContent = runtimeBuildId
+    ? "Authoritative Core identity; source/profile match not asserted"
+    : "Runtime identity unavailable; source/profile match not asserted";
   elements.sidebarStatus.textContent = runtimeReady ? "OPERATIONAL" : "DISABLED";
   if (state.coreHealth.latest) renderCoreHealth(state.coreHealth.latest);
   elements.memoryDbLabel.textContent = compactPath(status.memory_db_path || graph.memory_db_path || "pending");
@@ -6722,7 +6830,7 @@ function renderWizardChoice() {
   updateWizardTarget(target);
   elements.wizardEyebrow.textContent = "Choose wizard flow";
   elements.wizardTitle.textContent = "How do you want to start?";
-  elements.wizardBody.textContent = "Use the orientation guide for first-time learning, or skip directly into the operator workflow when you are ready to enter fields and run SYNAPSE-S2.";
+  elements.wizardBody.textContent = "Use the orientation guide for first-time learning, or skip directly into the operator workflow when you are ready to enter fields on this already-installed SYNAPSE-S2 dashboard.";
   elements.wizardFlowPicker.hidden = false;
   elements.wizardChecklist.replaceChildren();
   elements.wizardChecklist.hidden = true;

@@ -468,6 +468,11 @@
                 <small id="runtimeMaintenanceDetail">quick-prune window pending</small>
               </div>
             </div>
+            <div class="runtime-identity-readout" aria-label="Authoritative runtime build provenance">
+              <span>Runtime build</span>
+              <strong id="runtimeBuildIdentity">unavailable</strong>
+              <small id="runtimeBuildClaim">Authoritative identity only; source/profile match not asserted</small>
+            </div>
             <div class="runtime-footer">
               <span id="runtimeDetail">MLX pending</span>
               <span id="lastTick">Last tick: --</span>
@@ -1368,6 +1373,7 @@
             </button>
           </div>
           <p id="wizardBody" class="wizard-body">Walk through the local memory workflow.</p>
+          <p id="wizardBoundary" class="wizard-boundary">Installed-dashboard tour only. This wizard does not install dependencies, update or replace a release, restore a backup, or adopt memory on another host.</p>
           <div id="wizardFlowPicker" class="wizard-flow-picker" aria-label="Choose wizard flow">
             <button id="wizardIntroFlowButton" class="wizard-flow-card" type="button" data-wizard-flow="intro">
               <span>First-time orientation</span>

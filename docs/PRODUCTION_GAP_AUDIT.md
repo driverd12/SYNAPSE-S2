@@ -2,10 +2,41 @@
 
 This file is intentionally blunt. It catalogs prototype-risk gaps, shorthand fixes, and current disposition so operators do not mistake demo scaffolding or research extensions for production guarantees.
 
+Source disposition reviewed: `2026-08-24`, implementation baseline
+`910d9a7a46b1d79b6887f6c0714df1816be2e9e4`. This is a source-capability
+audit, not live Dans-MBP evidence. Documentation-only commits after the named
+baseline do not imply deployment.
+
 Deployment status is also intentionally separate from code disposition. No row
 below claims remote publication, live cutover, bridge governance, or multi-Mac
 replication; determine those states through their explicit runtime, Git, and
 replication evidence contracts.
+
+## Release Productization State
+
+SYNAPSE-S2 has a production-usable governed local runtime, but it is not yet a
+conventional downloadable product. The current installer is still rooted in a
+trusted checkout and repository-local `.venv`; no tracked `.pkg`, `.app`, DMG,
+wheel, offline install bundle, code-signing/notarization pipeline, or release CI
+workflow exists.
+
+The release work added after the local runtime hardening is implemented source,
+not stubbed placeholders. Each primitive is intentionally narrower than an
+updater:
+
+| Primitive | What exists | What it cannot authorize or prove |
+| :--- | :--- | :--- |
+| Product inventory and update planning | `release_update_plan.py` inventories the closed product surface, compares exact incumbent/candidate bytes and selected durable-contract AST, runs the preservation gate, and emits an atomic governed plan. | No staging, apply, provenance authentication, compatibility authority, or live-state mutation. |
+| Provenance | `release_provenance.py` and `sign_release_provenance.py` implement closed Ed25519 root/delegated-role documents, release envelopes, revocation, validity windows, monotonic sequence/generation floors, and exact source/product identity. | No operational key ceremony, online publication service, package signing, notarization, or activation. |
+| Compatibility profile 4 | `release_compatibility.py` verifies a separately signed exact-build-only ticket across the closed compatibility surfaces and the inactive installed-layout contract. | Host evidence is `required-later`; migration and downgrade are `blocked`; apply, activation, candidate execution, and host-evidence verification are false. |
+| Inactive source staging and layout | `release_stage.py` publishes a real owner-only inactive source tree with exact re-verification and a crash-aware journal; `installed_layout.py` models separate release, environment, retained-data, state, and selector roles. | No environment build, selector, candidate execution, service control, activation, migration, live-data access, or post-stage immutability claim. The currently installed shape remains checkout plus `.venv` and bound `.synapse_s2` data. |
+| Environment chain | Phase 5A defines dormant documents; Phase 5B1 validates/publishes a prebuilt inactive environment; Phase 5B2 defines evidence semantics; Phase 5B3 produces held-root static fragments for the environment, installed distribution, and model. | The chain remains bound to compatibility profile 3 while the signer/verifier siblings are profile 4. Native-file evidence is pending; dynamic dependency/interpreter/toolchain/model probes are null; `static_evidence_complete`, `evidence_verified`, `receipt_issuable`, `candidate_executed`, and `activation_performed` remain false. |
+| Activation journal | `release_activation_journal.py` defines the transition graph and can persist only immutable dormant journal documents below an explicit owner-only root. It models pre-pivot abort, ambiguous cutover reconciliation, post-pivot equivalence/convergence/floor states, and recovery-required outcomes. | No cross-root active-transaction exclusion, gate observation, host-evidence authentication, quiescence, service/selector/config control, live-state access, memory equivalence, rollback execution, provenance-floor mutation, or activation. |
+
+A successful output from one row never acquires the authority missing from the
+next row. In particular, profile 4 compatibility cannot be composed with the
+profile 3 environment receipt chain, and an activation journal document is not
+an activation executor.
 
 ## Closed In Latest Hardening Pass
 
@@ -95,7 +126,12 @@ replication evidence contracts.
 
 | Gap | Risk | Shorthand solution | Current disposition |
 | :--- | :--- | :--- | :--- |
-| Multi-Mac replication is an offline whole-checkpoint recovery protocol, not live merge or federated recall | Operators could expect a PTZPLZ namespace created on one Mac to automatically discover or bridge a CASP namespace that exists only on another Mac | Co-locate reviewed context before governed bridging today; design a signed remote catalog plus governed transfer or read-only federated retrieval before claiming live cross-Mac memory | Explicitly not claimed. Pairing, checkpoint creation, staged receive, and promotion preserve one authoritative store for recovery; they do not merge two live databases or automatically create cross-host namespace links. |
+| No downloadable, signed, notarized release artifact | A repository clone and local `.venv` can be mistaken for a reproducible end-user installation, and different hosts can resolve or cache different bytes | Build one immutable, offline-capable macOS package with a private versioned runtime, exact dependencies/model policy, retained data outside the replaceable release, checksums, signing, and notarization | Not implemented. Existing launchers and LaunchAgents derive their code/runtime paths from the checkout. |
+| Release compatibility and environment evidence are on different profiles | A valid profile 4 ticket could be incorrectly treated as authority for the still-profile-3 environment documents | Advance the complete environment/evidence/static chain under a reviewed profile 4 contract, add native-file and dynamic probes, then require one signed receipt | Deliberately fail-closed. No current document composes these lanes and no environment receipt is issuable. |
+| No composed release transaction or activation executor | Individually valid provenance, plan, stage, and journal artifacts could be mistaken for a safe live cutover | Implement one incumbent-controlled transaction: provenance → compatibility → environment → stage → global exclusion → quiescence → cutover → equivalence → client convergence → floor commit, with crash reconciliation | Not implemented. The current modules explicitly keep activation/apply and live-state flags false. |
+| No governed release migration, downgrade, or executed rollback/equivalence | A new build could change durable schemas or fail after the first candidate write without a proven recovery path | Add versioned forward migrations, explicit downgrade policy, pre-pivot rollback, post-pivot forward recovery, and memory/namespace/neuron/media/capture equivalence producers | Not implemented for product releases. Existing restored-target recovery is real but is not a general release rollback executor. |
+| No release CI, offline install gate, or multi-host canary | Local source tests can pass while packaging, Gatekeeper, cold install, offline dependency/model availability, or host-specific behavior fails | Build CI artifacts, verify signatures/checksums, test offline install/upgrade/rollback, then canary on the supported Mac fleet | Not implemented. Remote Git publication is not artifact publication or canary evidence. |
+| Multi-Mac replication is an offline whole-checkpoint recovery protocol, not live merge or federated recall | Operators could expect a PTZPLZ namespace created on one Mac to automatically discover or bridge a CASP namespace that exists only on another Mac | Co-locate reviewed context before governed bridging today; design a signed remote catalog plus governed transfer or read-only federated retrieval before claiming live cross-Mac memory | Explicitly not claimed. Pairing, checkpoint creation, isolated staged receive, and signed acknowledgement preserve recovery evidence only; `promotion_supported: false`, so the replication protocol does not promote the staged copy, merge two live databases, or automatically create cross-host namespace links. |
 | No guaranteed invisible interception of arbitrary private transcript stores | Running clients must still call a capture tool, write a local inbox payload, expose a transcript/log file, provide selected text, or be attached through App Connect for full chat text to enter memory | Use the MCP startup/session-boundary bridge for process boundaries, App Connect for visible running apps, transcript sources for local logs, and selected-text capture for apps that block snapshots | Documented limitation; bridge, inbox, App Connect, transcript deltas, selected-text capture, durable capture, and pull/ack work now |
 | Bayesian surprise is deterministic provider-distance segmentation, not online probabilistic token-stream inference | Event cuts are semantically provider-backed and auditable, but they are not a full Bayesian posterior over live token probabilities | Add optional online probabilistic calibration if future clients expose token-level streams | Research extension, not needed for current MCP stdio reliability |
 | Resource envelope certification is MLX/topology evidence, not Instruments counters | Hardware-level memory certification is not yet captured from Apple Instruments traces | Add Instruments/Metal counter harness across target Apple Silicon SKUs | Research extension, not claimed complete |
@@ -108,9 +144,9 @@ replication evidence contracts.
 | Future-dated S2-Net/SDA/SGTN citations were presented as implementation inspiration | Readers could infer that SYNAPSE-S2 implements or validates published biological synchronization algorithms | Treat the citations as unverified proposal context and describe only the algorithms actually present in code | Explicit non-claim: no S2-Net phase-delay engine, SDA spike-train attention operator, or SGTN model is implemented or validated. Namespace links, galaxy styling, and Retrieval v2 are deterministic operator-governed product mechanisms. |
 | Strict native mode requires explicit enablement | Default developer mode still permits fallback so non-native hosts can run tests and local tooling | Set `SYNAPSE_S2_REQUIRE_NATIVE=1`, CLI `--require-native-backend`, preflight `--require-native`, or run certification with `strict_native=true` | Hard-fail and certification path implemented |
 
-## Current Production Bar
+## Local Runtime Production Bar
 
-The current bar for calling a local build presentable is:
+The current bar for calling a checkout-backed local build presentable is:
 
 1. A clean source revision passes `scripts/prep_tomorrow.sh --verify-only`; a production apply additionally uses a fresh readiness manifest plus reviewed binding and passes `scripts/prep_tomorrow.sh --apply --install-core /absolute/path/to/manifest.json`.
 2. `get_spiking_attention_status` reports runtime ready, enabled, and shared `.synapse_s2` paths.
@@ -120,7 +156,7 @@ The current bar for calling a local build presentable is:
 6. No-memory recall returns a transparent raw activation summary, never a fake historical tag.
 7. Conversation capture creates visible event nodes in the graph and a durable context-bus deployment.
 8. Confirmed pruning can remove a single node, edge, deployment event, temporal edge set, or associative edge set.
-9. The capture inbox sidecar is installed or confirmed `capture-inbox-process --confirm` / `process_spiking_capture_inbox(confirm=true)` proves pending drops become graph events with secret redaction.
+9. On authoritative v6, status reports the embedded capture worker ready; on reviewed local-v5 maintenance, the legacy sidecar may be installed. A confirmed `capture-inbox-process --confirm` / `process_spiking_capture_inbox(confirm=true)` probe proves pending drops become graph events through the redaction boundary.
 10. Redaction regression tests prove raw secret shapes do not survive pending inbox files, direct capture memory, context-bus deployments, or returned MCP/API payloads.
 11. Exactly-once capture replay, receipt-write failure, concurrent duplicate, and restart reconciliation tests pass; capture status reports no unresolved or unsafe artifact.
 12. MCP prune calls fail without `confirm=true`, CLI prune calls require `--confirm`, dashboard destructive graph actions require explicit confirmation, Cortex trace prune follows the same confirm contract on all surfaces, and dashboard App Connect/Magic Capture writes require preflight confirmation tokens.
@@ -150,3 +186,12 @@ The current bar for calling a local build presentable is:
 36. CLI `retrieve-v2`, MCP `retrieve_spiking_memory_v2`, the dashboard query route, and internal hydration recall return the same structured read-only Retrieval v2 semantics: deterministic hybrid ranking, explicit scope/link/source provenance, uncalibrated scores, and no recurrent/STDP/pruning/runtime-state mutation.
 37. Compact/full memory list, memory graph, and Cortex state pages report exact totals and `authenticated-keyset-v2` continuation metadata; the next page fails closed if its cursor is altered, expired, stale, used with different bindings, moved across origins, or—in Cortex—if the frozen active-session view changes.
 38. `scripts/measure_retrieval_v2.py` must pass its fixed synthetic acceptance fixture without namespace leakage, duplicate IDs/content, provenance/score violations, output nondeterminism, or read-state mutation. The result remains explicitly synthetic and is not reported as live relevance or latency proof.
+39. The image-memory path keeps full-resolution originals outside SYNAPSE-S2, stores only bounded typed derivatives/cues, fails closed on referenced-media drift, and includes referenced derivatives in verified recovery plus capability-negotiated replication.
+40. `scripts/measure_memory_confidence.py` and `scripts/measure_longmem_v2.py` pass their deterministic disposable gates, including namespace isolation, updates, temporal ordering, abstention, image evidence, and the documented deletion-residue probes. Neither result is represented as an official LongMemEval score or live relevance proof.
+41. Memora shadow plans remain read-only; only an integrity-valid, explicitly reviewed, promoted cue binding may affect bounded Retrieval v2 routing, and recovery/replication/readiness evidence cross-binds the governance aggregate.
+42. The dashboard calls bounded graph/bridge retrieval-evidence contributions **Retrieval associations** and never presents them as user actions or approvals. Impact remains content-free local dashboard telemetry, not billing, guaranteed savings, or coverage of MCP/CLI/agent hydration.
+43. The README inventory matches all 70 decorated MCP tools, including image similarity, request reconciliation, capture-error preflight/apply, lease release, and context-delivery integrity inspection.
+
+Meeting this local runtime bar does not meet the separate release-productization
+bar above. A source checkout can be ready while packaging, environment
+evidence, activation, rollback, and multi-host artifact delivery remain open.

@@ -33,6 +33,21 @@ with `install_core_agent.sh status` and require `healthy`, `runtime_healthy`,
 `production_ready`, `capture_ready`, and `client_binding.ready` to be true,
 `provisional` to be false, and `deployment_mode` to be `authoritative`.
 
+### Release-productization boundary
+
+The profile 4 compatibility verifier, provenance documents, release planner,
+inactive source stager, installed-layout model, environment/static-evidence
+modules, and activation journal do not replace this live-core procedure. They
+are fail-closed release primitives whose public results explicitly deny
+activation/apply authority. In particular, the environment chain is still
+profile 3 and incomplete, and the activation module can persist dormant
+journal documents but cannot quiesce writers, control launchd, change a
+selector/binding, verify memory equivalence, execute rollback, or commit a
+provenance floor. Until a composed release executor exists, only the guarded
+audit → certification → final preflight → installer flow in this document may
+replace the authoritative core. See [PRODUCTION_GAP_AUDIT.md](PRODUCTION_GAP_AUDIT.md)
+for the primitive-by-primitive status.
+
 ## Adapter and browser boundary
 
 The MCP launcher and installed MCP client definitions route through the

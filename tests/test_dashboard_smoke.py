@@ -108,6 +108,7 @@ class DashboardSmokeTests(unittest.TestCase):
         }
         graph = {"entries": [], "relationships": [], "entry_count": 0}
         namespace_map = {"nodes": [], "links": [], "node_count": 0}
+        stdout = io.StringIO()
         with (
             mock.patch.object(smoke_dashboard.sys, "argv", ["smoke_dashboard.py"]),
             mock.patch.object(smoke_dashboard.time, "monotonic", return_value=100.0),
@@ -134,11 +135,16 @@ class DashboardSmokeTests(unittest.TestCase):
                 side_effect=[snapshot, graph, namespace_map],
             ) as fetch_json,
             mock.patch.object(smoke_dashboard.shutil, "which", return_value=None),
-            mock.patch("sys.stdout", new=io.StringIO()),
+            mock.patch("sys.stdout", new=stdout),
         ):
             status = smoke_dashboard.main()
 
         self.assertEqual(status, 0)
+        result = json.loads(stdout.getvalue())
+        self.assertTrue(result["index_loaded"])
+        self.assertTrue(result["app_js_loaded"])
+        self.assertTrue(result["styles_loaded"])
+        self.assertIsNone(result["js_syntax_ok"])
         self.assertEqual(
             [call.kwargs["timeout"] for call in fetch_text.call_args_list],
             [5.0, 5.0, 5.0],

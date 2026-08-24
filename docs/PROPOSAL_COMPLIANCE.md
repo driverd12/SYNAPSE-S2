@@ -2,6 +2,12 @@
 
 This matrix maps the supplied proposal documents to the current implementation. It is intentionally strict: implemented items point to working files and tests; research-grade extensions are called out separately instead of being implied.
 
+Source review refreshed `2026-08-24` against implementation baseline
+`910d9a7a46b1d79b6887f6c0714df1816be2e9e4`. The proposal matrix covers the
+original product requirements; post-proposal capabilities and the incomplete
+release-productization substrate are listed separately below. This review did
+not inspect or mutate a live host.
+
 Implementation status is not deployment status. Determine live status through
 the authoritative installer status contract and remote publication through Git;
 this matrix makes neither claim.
@@ -48,11 +54,11 @@ this matrix makes neither claim.
 | Bayesian Surprise Event Segmenter for local text streams | Implemented as deterministic provider-backed semantic surprise with lexical fallback | `event_segmenter.py`, `ingest_spiking_memory_text`, `synapse_cli.py ingest-text`, `mlx_backend.py`, `tests/test_event_segmenter.py`, `tests/test_backend.py` |
 | Dual graph memory protocol for episodic-semantic relationships | Implemented | `memory_relationships` table in `memory_store.py`, `list_spiking_memory_graph`, graph-expanded recall, deep-sleep relationship extraction |
 | Agent/operator conversation capture into event memory | Implemented | `capture_spiking_conversation`, `synapse_cli.py capture-session`, `/api/capture-conversation`, GUI capture form |
-| Always-on local session capture sidecar | Implemented as opt-in capture inbox | `capture_daemon.py`, `drop_spiking_capture_inbox`, confirmed `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, `/api/capture-inbox`, dashboard capture preflight tokens, `scripts/install_capture_daemon.sh` |
+| Always-on local session capture | Implemented as an opt-in capture inbox owned by the authoritative core's embedded worker | `capture_daemon.py`, `core_service.py`, `drop_spiking_capture_inbox`, confirmed `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, `/api/capture-inbox`, and dashboard capture preflight tokens. `scripts/install_capture_daemon.sh` is pre-cutover local-v5 maintenance only and refuses governed v6. |
 | Local app attachment and transcript capture lane | Implemented | `transcript_capture.py`, CLI `app-list` / `app-connect` / `app-snapshot` / `capture-clipboard` / `transcript-source-*`, MCP App Connect and transcript tools, dashboard App Connect preflight-token panel, `scripts/capture_frontmost_selection.sh`, tests |
 | App Connect preview receipts before memory writes | Implemented | `app-snapshot-preview`, dashboard `/api/app-snapshot-preview`, quality/capability badges, no-write blocked receipts, `tests/test_transcript_capture.py`, `tests/test_dashboard_server.py` |
 | Saved memory namespace selector | Implemented | Dashboard Memory Context control lists `status.memory_contexts`, keeps `default` first, updates the URL/input/current memory URI when selected, preserves manual entry, and is covered by `tests/test_dashboard_server.py` |
-| Current status report generator | Implemented | `scripts/synapse_status_report.py` writes `docs/CURRENT_STATUS.md` from live status/profile/Doctor/context-health/hygiene/Cortex state, with docs drift coverage in `tests/test_status_report.py` and `tests/test_documentation.py` |
+| Current status report generator (point-in-time) | Implemented | `scripts/synapse_status_report.py` writes `docs/CURRENT_STATUS.md` from live status/profile/Doctor/context-health/hygiene/Cortex state; the artifact carries a freshness warning and must be regenerated before a handoff/readiness claim. Drift coverage lives in `tests/test_status_report.py` and `tests/test_documentation.py`. |
 | Operator graph pruning for bad or sensitive graph data | Implemented | `prune_spiking_memory`, `synapse_cli.py prune-memory --confirm`, `/api/prune-memory`, GUI graph prune controls |
 | Hardened capture, pruning, and high-confidence memory safety envelope | Implemented | `redaction.py`, pre-write capture inbox redaction, private local file modes, symlink rejection, direct capture/context-bus response redaction, MCP `confirm=true` pruning and capture-inbox processing, CLI `--confirm`, dashboard confirmation/preflight tokens, Cortex prune confirmation, `test-validated` evidence enforcement, and tests |
 | Governed capture-error resolution | Implemented | Terminal/historical/unsafe classification, content-free preflight, confirmed fenced archival, private crash-recoverable resolution manifests, CLI/MCP controls, and Doctor distinction between active failures and retained evidence |
@@ -89,6 +95,18 @@ this matrix makes neither claim.
 | Readiness preflight | Implemented | `synapse_cli.py preflight`, `scripts/prep_tomorrow.sh`, `tests/test_cli.py` |
 | Single-pack operator readiness certification | Implemented | `scripts/operator_readiness_certify.py`, `docs/OPERATOR_READINESS_CERTIFICATION.md`, `tests/test_operator_readiness_certifier.py`; proves client config, MCP connect, native neural embedding, Doctor, Start Work, memory write, read-only Retrieval v2 recall, App Connect no-write preview, Wrap Session persistence, and dashboard smoke in one evidence pack |
 
+## Post-Proposal Shipped Capabilities
+
+| Capability | Status | Evidence and boundary |
+| :--- | :--- | :--- |
+| Local image memory and similarity | Implemented | Typed image memories retain an explicit description, bounded deterministic descriptors, an owner-only thumbnail, and optional Apple Vision feature print/OCR. Stored and transient similarity are scope-filtered and content-free; full-resolution originals and feature bytes are never returned. See `docs/FRONTIER_ENHANCEMENTS.md`, `image_capture.py`, `media_similarity.py`, and `tests/test_media_similarity.py`. |
+| Media-complete recovery and replication | Implemented with negotiated capability | Recovery bundle v3 seals referenced media derivatives and fails closed on missing/corrupt references. Offline replication carries the media archive only when both paired descriptors advertise `media-artifact-v1`. This is not live sync or promotion. |
+| Harmonic memory and Memora governance | Implemented conservative baseline | Source-backed primary abstractions and cue anchors remain attributable to immutable source rows. Memora shadow is read-only; only a two-actor, exact-revision, integrity-valid promoted binding may influence bounded Retrieval v2 routing. See `docs/HARMONIC_MEMORY.md` and `docs/MEMORA_SHADOW.md`. |
+| Long-horizon confidence gates | Implemented deterministic local gates | The memory-confidence fixture and SYNAPSE-derived LongMemEval-V2 lane cover updates, temporal order, abstention, namespace isolation, image evidence, and deletion residue in disposable roots. They do not claim an official LongMemEval score, live-corpus relevance, or an SLO. |
+| Governed offline multi-Mac checkpoint handoff | Implemented | Explicit pairing, target-bound signed checkpoints, isolated staged restore, and signed ACK exist. There is no automatic promotion, merge, live federation, or conflict resolution. See `docs/MULTI_MAC_REPLICATION.md`. |
+| Impact and Retrieval associations | Implemented with narrow scope | The dashboard exposes content-free local recall/resource telemetry under **Impact** and calls graph/bridge evidence contributions **Retrieval associations**. Associations are not actions or approvals; Impact is not billing or proven savings and excludes MCP/CLI/agent hydration. |
+| Release safety substrate | Implemented as non-authoritative primitives | Closed update planning/preservation, Ed25519 provenance, compatibility profile 4, inactive source staging, installed-layout modeling, partial environment/static evidence, and dormant activation-journal documents exist. They do not form an updater: environment evidence remains profile 3/incomplete, and packaging, activation, migration, rollback/equivalence, signing/notarization, CI, and canary delivery remain open. See `docs/PRODUCTION_GAP_AUDIT.md`. |
+
 ## Operator-Visible Controls
 
 | Control | Surface |
@@ -97,13 +115,16 @@ this matrix makes neither claim.
 | Store real local memory | `remember_spiking_context`, `synapse_cli.py remember-text/remember-vector` |
 | Segment long text into event memory graph | `ingest_spiking_memory_text`, `synapse_cli.py ingest-text` |
 | Capture real session conversation notes | `capture_spiking_conversation`, `synapse_cli.py capture-session`, dashboard Conversation capture |
-| Drop and process sidecar session payloads | `drop_spiking_capture_inbox`, `get_spiking_capture_inbox_status`, confirmed `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, dashboard Magic Capture preflight |
+| Drop and process capture-inbox session payloads | `drop_spiking_capture_inbox`, `get_spiking_capture_inbox_status`, confirmed `process_spiking_capture_inbox`, `synapse_cli.py capture-inbox-*`, the authoritative embedded worker, and dashboard Magic Capture preflight |
 | Attach a running local app and capture a redacted snapshot or selected text | `list_spiking_running_apps`, `connect_spiking_app`, `capture_spiking_app_snapshot`, `capture_spiking_clipboard`, CLI `app-list` / `app-connect` / `app-snapshot` / `capture-clipboard`, dashboard App Connect preflight, `scripts/capture_frontmost_selection.sh` |
 | Preview App Connect capture quality before writing memory | CLI `app-snapshot-preview`, dashboard App Preview quality badge, no-write receipt, and selected-text fallback guidance |
 | Choose an existing memory namespace from the dashboard | Dashboard saved Memory Context selector populated from live `memory_contexts`, plus manual namespace entry for new contexts |
-| Regenerate the committed live status artifact | `scripts/synapse_status_report.py --context default --embedding-provider mlx-neural`, writing `docs/CURRENT_STATUS.md` |
+| Regenerate the committed point-in-time status artifact | `scripts/synapse_status_report.py --context default --embedding-provider mlx-neural`, writing `docs/CURRENT_STATUS.md` |
 | Register local transcript/log deltas | `register_spiking_transcript_source`, `list_spiking_transcript_sources`, `poll_spiking_transcript_sources`, CLI `transcript-source-*` |
 | Read-only text recall | `retrieve_spiking_memory_v2`, `synapse_cli.py retrieve-v2`, and the dashboard query route. Legacy `query_spiking_attention*` / `query-*` surfaces remain deprecated stateful compatibility paths, not read-only recall. |
+| Find similar stored images | `query_spiking_media_similarity`, CLI `image-similar`, and dashboard Image Memory **Find similar**; the transient CLI lane does not create a durable query artifact. |
+| Inspect retrieval contribution evidence | Dashboard **Retrieval associations**; this is read-only explanatory evidence, not an operator action or approval. |
+| Inspect bounded local value telemetry | Dashboard **Impact**; content-free local dashboard telemetry only, not billing or guaranteed savings. |
 | Select bounded agent response detail | MCP `response_mode=compact|full` plus `max_response_bytes`; CLI `--response-mode compact|full` plus `--max-response-bytes`, with `legacy` reserved for known CLI compatibility consumers. For MCP, `structuredContent` is authoritative and the separately bounded safety `TextContent` is only a decision aid. |
 | Inspect status and dependency state | `get_spiking_attention_status`, `synapse_cli.py doctor/status/preflight` |
 | Start the daily work loop | `synapse_cli.py start-work`, dashboard Start Work brief, health score, recipes, and receipt |
@@ -155,10 +176,18 @@ These items are present in the architecture document as longer-horizon research 
 - The proposal's citations to S2-Net, Spike Dice Attention (SDA), and Spiking Graph Transformer Networks (SGTN) as May-July 2026 publications were future-dated relative to the supplied design evidence and have not been independently verified as implementation evidence. SYNAPSE-S2 does not claim or implement an S2-Net phase-delay engine, SDA spike-train attention operator, or SGTN model; its namespace links and retrieval ranker are deterministic, operator-governed product mechanisms.
 - Retrieval v2 relevance calibration on the live operator corpus. The fixed synthetic benchmark is an offline regression gate and does not establish live relevance quality, workload capacity, concurrency behavior, provider parity, or a service-level latency objective.
 
-## Current Verification Command
+## Verification Command
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Current result: run `scripts/prep_tomorrow.sh` before the presentation. The readiness script runs the full unit suite, compile check, CLI graph/profile/preflight gates, MCP smoke calls, consolidation lifecycle smoke, an authoritative capture-ledger audit, and a signed paired recovery-point gate with reverification plus isolated restore proof. Operator certification additionally requires `mcp_contract_probe`, which independently validates the installed 12,288-byte authoritative structured response and separate 4,096-byte compact safety text; outer transport framing is excluded.
+Run `scripts/prep_tomorrow.sh` when fresh runtime evidence is required. The
+readiness script runs the full unit suite, compile check, CLI
+graph/profile/preflight gates, MCP smoke calls, consolidation lifecycle smoke,
+an authoritative capture-ledger audit, and a signed paired recovery-point gate
+with reverification plus isolated restore proof. Operator certification
+additionally requires `mcp_contract_probe`, which independently validates the
+installed 12,288-byte authoritative structured response and separate
+4,096-byte compact safety text; outer transport framing is excluded. No stored
+result in this document substitutes for a new run.

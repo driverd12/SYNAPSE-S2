@@ -332,6 +332,30 @@ dd {
   white-space: nowrap;
 }
 
+.runtime-identity-readout {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 10px 12px;
+}
+
+.runtime-identity-readout span,
+.runtime-identity-readout small {
+  color: var(--muted);
+  font-family: var(--terminal-font);
+  font-size: 11px;
+}
+
+.runtime-identity-readout strong {
+  color: var(--green);
+  font-family: var(--terminal-font);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .status-dot {
   display: inline-block;
   flex: 0 0 9px;
@@ -538,6 +562,16 @@ svg {
 .wizard-body {
   color: var(--text);
   font-size: 14px;
+}
+
+.wizard-boundary {
+  border-left: 3px solid var(--amber);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: color-mix(in srgb, var(--amber) 10%, var(--panel-soft));
+  color: var(--muted);
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .wizard-flow-picker {

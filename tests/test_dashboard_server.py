@@ -3,6 +3,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 import unittest
 from contextlib import closing
+from html.parser import HTMLParser
 from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -630,11 +632,42 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["system"]["substrate_label"], "SNN Memory Context")
         self.assertEqual(payload["system"]["mode"], "LOCAL ONLY")
         self.assertIn("project_version", payload["system"])
+        self.assertIsNone(payload["system"]["runtime_build_id"])
+        self.assertEqual(payload["system"]["runtime_build_provenance"], "unavailable")
+        self.assertFalse(payload["system"]["source_match_asserted"])
+        self.assertFalse(payload["system"]["release_profile_asserted"])
         self.assertIn("uptime_seconds", payload["system"])
         self.assertIn("timings_ms", payload)
         self.assertGreaterEqual(payload["timings_ms"]["total"], 0)
         for stage in ("status", "profile", "graph", "system"):
             self.assertIn(stage, payload["timings_ms"])
+
+    def test_system_info_projects_exact_authoritative_build_with_release_nonclaims(self):
+        with TemporaryDirectory() as tmp:
+            core = CoreClient(
+                socket_path=Path(tmp) / "core" / "service.sock",
+                state_path=Path(tmp) / "runtime_state.json",
+            )
+            build_id = "source-" + ("ab" * 12)
+            core._last_identity = {"build_id": build_id}
+            core.embedding_provider_info = mock.Mock(
+                return_value={
+                    "provider": "mlx-neural-v1",
+                    "model_id": "local-test-model",
+                }
+            )
+            runtime = DashboardRuntime(core)
+
+            payload = runtime._system_info(context_id="demo")
+
+        self.assertEqual(payload["runtime_build_id"], build_id)
+        self.assertEqual(
+            payload["runtime_build_provenance"],
+            "authoritative-core-response",
+        )
+        self.assertFalse(payload["source_match_asserted"])
+        self.assertFalse(payload["release_profile_asserted"])
+        core.embedding_provider_info.assert_called_once_with()
 
     def test_query_records_content_free_impact_and_projects_honest_cost_range(self):
         with TemporaryDirectory() as tmp:
@@ -2146,6 +2179,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("themeButton", index)
         self.assertIn("brand-copy", index)
         self.assertIn("runtime-build-line", index)
+        self.assertIn("runtimeBuildIdentity", index)
+        self.assertIn("runtimeBuildClaim", index)
         self.assertNotIn('<span>S2 Core</span>\n            <strong id="coreVersion">', index)
         self.assertIn("hydrateLabel", index)
         self.assertIn("runtimeHealthGrid", index)
@@ -2172,6 +2207,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("wizardIntroFlowButton", index)
         self.assertIn("wizardOperatorFlowButton", index)
         self.assertIn("wizardChecklist", index)
+        self.assertIn("wizardBoundary", index)
         self.assertIn("First-time orientation", index)
         self.assertIn("Operator use", index)
         self.assertIn("Skip the tour and walk through the required fields", index)
@@ -2327,6 +2363,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("startWizardFlow", app)
         self.assertIn("renderWizardChoice", app)
         self.assertIn("currentWizardSteps", app)
+        self.assertIn("system.runtime_build_id", app)
         self.assertIn("Choose a flow", app)
         self.assertIn("Start orientation", app)
         self.assertIn('progressLabel: "Operator"', app)
@@ -2486,6 +2523,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("wizard-panel", styles)
         self.assertIn("wizard-arrow", styles)
         self.assertIn("wizard-highlight-target", styles)
+        self.assertIn("wizard-boundary", styles)
+        self.assertIn("runtime-identity-readout", styles)
         self.assertIn("operator-loop-panel", styles)
         self.assertIn("operator-action-banner", styles)
         self.assertIn("operator-run-order", styles)
@@ -2511,6 +2550,89 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertNotIn("board-demo", app)
         self.assertNotIn("durable real memory local SQLite substrate", index)
         self.assertNotIn('dispatchEvent(new Event("submit"', app)
+
+    def test_dashboard_wizard_targets_current_surfaces_and_wires_safe_navigation(self):
+        index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+        class DashboardMarkup(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.ids: set[str] = set()
+                self.id_counts: dict[str, int] = {}
+                self.classes: set[str] = set()
+
+            def handle_starttag(self, _tag, attrs):
+                attributes = dict(attrs)
+                if attributes.get("id"):
+                    element_id = attributes["id"]
+                    self.ids.add(element_id)
+                    self.id_counts[element_id] = self.id_counts.get(element_id, 0) + 1
+                self.classes.update((attributes.get("class") or "").split())
+
+        markup = DashboardMarkup()
+        markup.feed(index)
+        self.assertEqual(
+            {element_id: count for element_id, count in markup.id_counts.items() if count > 1},
+            {},
+        )
+        selectors = re.findall(r'\bselector:\s*"([^"]+)"', app)
+        self.assertEqual(len(selectors), 39)
+        self.assertEqual(len(set(selectors)), 33)
+        for selector in selectors:
+            if selector.startswith("#"):
+                self.assertIn(selector[1:], markup.ids, selector)
+            elif selector.startswith("."):
+                self.assertIn(selector[1:], markup.classes, selector)
+            else:
+                self.fail(f"wizard selector is not a simple local target: {selector}")
+
+        self.assertTrue(
+            {
+                "#runtimeBuildIdentity",
+                "#goalsPanel",
+                "#imageCaptureForm",
+                "#queryForm",
+                "#memoraShadowToggleButton",
+                "#impactToggleButton",
+                "#captureInboxButton",
+                "#backupButton",
+                "#evidencePackButton",
+            }.issubset(selectors)
+        )
+        self.assertIn("Installed-dashboard tour only", index)
+        self.assertIn("does not install dependencies", index)
+        self.assertIn("source/profile match not asserted", index)
+        self.assertIn("not a demo, installer, updater, restore tool", app)
+        self.assertIn(
+            "Associations are not tasks, approvals, follow-ups, or execution authority",
+            app,
+        )
+        self.assertIn(
+            "does not prove relevance, correctness, time saved, money saved",
+            app,
+        )
+        self.assertIn("exactly-once capture state", app)
+
+        wizard_logic = app[
+            app.index("function initializeWizard()") : app.index("function cssEscape")
+        ]
+        for interaction in (
+            'elements.wizardToggleButton.addEventListener("click"',
+            'elements.wizardFlowPicker.addEventListener("click"',
+            'elements.wizardCloseButton.addEventListener("click", stopWizard)',
+            'elements.wizardBackButton.addEventListener("click", previousWizardStep)',
+            'elements.wizardNextButton.addEventListener("click", nextWizardStep)',
+            'event.key === "Escape"',
+            'event.key === "ArrowRight"',
+            'event.key === "ArrowLeft"',
+            "state.wizard.index >= steps.length - 1",
+            "renderWizardChoice()",
+        ):
+            self.assertIn(interaction, wizard_logic)
+        self.assertNotIn("requestJson(", wizard_logic)
+        self.assertNotIn("dispatchEvent(", wizard_logic)
+        self.assertNotIn(".submit(", wizard_logic)
 
     def test_dashboard_exposes_honest_observed_scorecard_and_association_doctrine(self):
         index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")

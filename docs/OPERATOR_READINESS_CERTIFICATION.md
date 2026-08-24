@@ -1,6 +1,12 @@
 # SYNAPSE-S2 Operator Readiness Certification
 
-This runbook is the Monday trust gate. It is not a demo seeder and it does not use example datasets. It derives the exact candidate core configuration through the same installer path used for cutover, runs real local SYNAPSE-S2 commands against the selected context, verifies the installed compact MCP contract through both output channels, writes and recalls one factual readiness trace, previews a real running app, wraps the session, proves processed capture authority, creates and re-verifies a signed paired recovery point, proves an isolated restore, and packages the evidence into one local artifact.
+This runbook is the Monday trust gate. It is not a demo seeder and it does not use example datasets. It derives the exact candidate core configuration through the same installer path used for cutover, runs real local SYNAPSE-S2 commands against the selected context, verifies the installed compact MCP contract through both output channels, writes and recalls one factual readiness trace, previews a real running app, wraps the session, proves processed capture authority, creates and re-verifies a signed paired recovery point (including referenced media when present), proves an isolated restore, and packages the evidence into one local artifact.
+
+Source disposition reviewed `2026-08-24` against implementation baseline
+`910d9a7a46b1d79b6887f6c0714df1816be2e9e4`. A successful pack certifies the
+named checkout-backed local runtime at the recorded time. It does not certify a
+downloadable package, the dormant release-productization chain, an official
+LongMemEval score, live-corpus retrieval quality, or Impact savings.
 
 Certification is evidence, not deployment. Determine live status only through
 the authoritative installer status contract; this document makes no
@@ -83,9 +89,9 @@ be treated as operator-ready or used for cutover.
 | App Connect preview | A real running app is attached and previewed without writing memory. Quality and capability badges must be present even if Accessibility is blocked. |
 | Wrap Session | A factual handoff is persisted as durable session memory. |
 | Capture ledger audit | Every processed `capture.v2` record has an exact authoritative SQLite ledger binding; missing, ambiguous, or mismatched evidence blocks backup. |
-| Paired recovery backup | SQLite and exactly-once capture transport are bound by signed receipts with no replay debt; recovery bundle v3 also signs the bounded content-free Memora catalog/projection/event aggregate. |
-| Recovery verification | The database, schema contract, capture archive, provenance, reconciliation, canonical processed-request ledger binding, and exact Memora aggregate reverify from durable artifacts. Every promoted binding must remain effective with zero provider/source drift. |
-| Isolated recovery drill | A paired restore materializes outside live state and independently reproduces both content-free capture-ledger and Memora integrity proofs. Cue terms, source text, and vectors are absent from readiness evidence. |
+| Paired recovery backup | SQLite and exactly-once capture transport are bound by signed receipts with no replay debt; recovery bundle v3 also signs the bounded content-free Memora catalog/projection/event aggregate and a digest-bound sealed media archive whenever the database references media. A referenced-but-missing or corrupt derivative blocks publication. |
+| Recovery verification | The database, schema contract, capture archive, optional media archive, provenance, reconciliation, canonical processed-request ledger binding, and exact Memora aggregate reverify from durable artifacts. Every promoted binding must remain effective with zero provider/source drift, and every referenced media derivative must match its sealed manifest. |
+| Isolated recovery drill | A paired restore materializes outside live state and independently reproduces capture-ledger, Memora, and referenced-media integrity proofs. Memora cue terms, source text, vectors, full-resolution image originals, and private feature bytes are absent from readiness evidence. |
 | Dashboard smoke | Page/assets and the protected snapshot API load through the same rotating bootstrap, port-specific cookie, and `X-Synapse-Dashboard-Session` contract used by the installer; no bare URL or unauthenticated API success qualifies. |
 
 ## Interpreting Results
@@ -100,6 +106,14 @@ Open `summary.md` first. The top section shows:
 - A repair plan
 
 Only `Operator trustworthy: true` is acceptable for "ready to use with coworkers." A degraded pack is still useful as a repair report, but it is not a success certificate.
+
+The certificate is intentionally narrower than the complete feature surface.
+It does not turn a Memora shadow plan into retrieval authority, prove
+cross-device image-feature compatibility, validate the dashboard's **Impact**
+what-if as billing/savings, convert **Retrieval associations** into actions or
+approvals, promote a staged replication checkpoint, or authorize any profile 4
+release transition. Those remain governed by their own contracts and
+nonclaims.
 
 The compact contract probe does not add its two channels together into one
 budget. `response_contract.serialized_bytes` measures only authoritative
@@ -156,9 +170,9 @@ post-header I/O, and uses bounded shutdown.
 | `app_preview` | Open a visible app, grant macOS Accessibility/Automation where appropriate, or use selected-text capture when preview reports low signal. |
 | `wrap_session` | Run `wrap-session --preview`, confirm text is non-empty, then rerun certification. |
 | `capture_ledger_audit` | Review `finding_samples` and `audit_revision`. Only when `repairable: true`, run `capture-ledger-integrity --repair --confirm --expected-revision '<audit_revision>'`, then rerun the read-only audit and certification. Never replay captures or synthesize receipts. |
-| `recovery_backup` | Resolve disk space, SQLite integrity, capture errors, signing-key permissions, replay-required transport files, or Memora integrity/effectiveness drift. On the authoritative lane, omit capture-root and noncanonical-root overrides; the service owns those paths. |
-| `recovery_verify` | Inspect the complete bundle and signed receipt, including the exact content-free Memora revision/count/drift aggregate; never substitute a database-only copy. |
-| `recovery_restore` | Inspect the isolated restore proof, capture-ledger reconciliation, and exact restored Memora aggregate before any cutover planning. |
+| `recovery_backup` | Resolve disk space, SQLite integrity, capture errors, signing-key permissions, replay-required transport files, Memora integrity/effectiveness drift, or missing/corrupt referenced media. On the authoritative lane, omit capture-root and noncanonical-root overrides; the service owns those paths. |
+| `recovery_verify` | Inspect the complete bundle and signed receipt, including the exact content-free Memora revision/count/drift aggregate and referenced-media manifest; never substitute a database-only copy. |
+| `recovery_restore` | Inspect the isolated restore proof, capture-ledger reconciliation, restored Memora aggregate, and referenced-media inventory before any cutover planning. |
 | `dashboard` | Run `.venv/bin/python scripts/smoke_dashboard.py default`. For operator review, install/refresh with `scripts/install_dashboard_agent.sh` and use `.venv/bin/python scripts/open_dashboard.py`; never open a bare loopback URL. Verify the auth file is `0600` inside its `0700` directory. |
 
 ## Why This Exists

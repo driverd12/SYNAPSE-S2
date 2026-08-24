@@ -6,6 +6,20 @@ creates a signed, target-bound checkpoint; the paired receiver verifies it,
 materializes an isolated restore proof, and signs an acknowledgement. No step
 overwrites either Mac's live memory database.
 
+```mermaid
+flowchart LR
+  Source["Authoritative source core"] -->|"signed target-bound checkpoint"| Bundle["Database + capture +<br/>runtime/journal + referenced media"]
+  Bundle -->|"operator-provided encrypted transport"| Inbox["Paired target inbox"]
+  Inbox --> Stage["Isolated stage +<br/>full restore verification"]
+  Stage --> Ack["Target-signed acknowledgement"]
+  Stage -. "no protocol authority" .-> Live["Target live store"]
+  Source -. "no live sync or merge" .-> Live
+```
+
+Encryption is deliberately outside the replication document protocol: the
+artifacts are signed and digest-bound, but not encrypted by SYNAPSE-S2. Use an
+encrypted removable disk or equivalently reviewed encrypted transport.
+
 ## Safety boundary
 
 - Only the authoritative core may pair or revoke peers, create checkpoints,

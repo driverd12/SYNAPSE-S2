@@ -191,6 +191,10 @@ The single-pack readiness certification runbook is in `docs/OPERATOR_READINESS_C
 The strict proposal coverage matrix is in `docs/PROPOSAL_COMPLIANCE.md`.
 The production gap audit is in `docs/PRODUCTION_GAP_AUDIT.md`.
 The point-in-time live status report is in `docs/CURRENT_STATUS.md`.
+The current human-readable field guide is in
+[`output/manual/SYNAPSE-S2_Visual_User_Manual.md`](output/manual/SYNAPSE-S2_Visual_User_Manual.md),
+with a [13-page PDF](output/pdf/SYNAPSE-S2_Visual_User_Manual.pdf) and a
+[one-page operator reference](output/pdf/SYNAPSE-S2_Quick_Reference.pdf).
 The bounded source-backed primary-abstraction and cue-anchor contract is in
 `docs/HARMONIC_MEMORY.md`.
 The durable idempotency, crash-recovery, and rollout contract for capture
@@ -210,6 +214,42 @@ connected recall are in `docs/BRIDGE_GOVERNANCE.md`.
 The authoritative-core-only, offline multi-Mac checkpoint protocol, anti-TOFU
 pairing flow, private replication inbox, isolated restore proof, and signed ACK
 procedure are in `docs/MULTI_MAC_REPLICATION.md`.
+
+### Release productization status
+
+The installed production runtime and the release-productization substrate are
+separate. Today, the supported local installation still runs from a trusted
+checkout and its repository-local `.venv`, with governed data under the bound
+data root. The newer release modules are real, fail-closed primitives, but they
+do **not** yet compose into a downloadable or activating updater. This
+substrate is not an installer.
+
+```mermaid
+flowchart LR
+  Current["Verified incumbent source"] --> Plan["Closed inventory +<br/>preservation plan"]
+  Plan --> Trust["Signed provenance +<br/>profile 4 compatibility"]
+  Trust --> Stage["Owner-only inactive<br/>source stage"]
+  Stage --> Evidence["Environment/static evidence<br/>profile 3, incomplete"]
+  Evidence -. "blocked until complete evidence" .-> Activate["Activation journal<br/>contract only"]
+  Activate -. "no executor" .-> Live["Selector, service cutover,<br/>equivalence, floor commit"]
+```
+
+| Primitive | Implemented behavior | Deliberate boundary |
+| :--- | :--- | :--- |
+| `scripts/release_update_plan.py` | Inventories the closed product surface, classifies source changes, runs preservation inspection, and emits a governed read-only plan. | Never stages, applies, authenticates provenance, or authorizes a transition. |
+| `scripts/release_provenance.py` and `scripts/sign_release_provenance.py` | Verify/sign closed Ed25519 trust bundles, delegated roles, revocation, validity, sequence, generation floor, and exact source/product identities. | Operational key ceremony, secure key distribution, and a real release publication service remain external. |
+| `scripts/release_compatibility.py` | Verifies exact-build-only compatibility tickets under compatibility profile 4 across the closed source surfaces and inactive-layout identity. | Host evidence is `required-later`; migration and downgrade are blocked; a valid ticket cannot activate anything. |
+| `scripts/release_stage.py` and `scripts/installed_layout.py` | Stage source into an owner-only inactive versioned layout with exact re-verification and an immutable journal, and model separate code/environment/data roots. | No environment build, current/latest selector, candidate execution, activation, migration, live-data access, or post-stage immutability claim. |
+| `scripts/release_environment.py`, `scripts/release_environment_evidence.py`, `scripts/release_environment_storage.py`, and `scripts/release_environment_model_static_evidence.py` | Define dormant candidate-environment contracts, held-root storage/evidence semantics, and a static fragment for environment, installed distribution, and model roles. | This chain still binds compatibility profile 3; native-file evidence and every dynamic probe remain pending, so evidence is incomplete and no receipt is issuable. |
+| `scripts/release_activation_journal.py` | Defines a closed transition graph and can persist immutable dormant journal documents for quiescence, pivot, equivalence, convergence, floor, rollback intent, and recovery-required states. | It does not provide an operational executor or cross-root transaction exclusion, observe gates, control services/selectors, execute rollback, verify memory equivalence, or activate a release. |
+
+Consequently, a valid planner result, signature, compatibility ticket, staged
+tree, environment fragment, or activation plan is evidence for only that
+primitive. None is deployment authority, and none means a `.pkg`, `.app`, DMG,
+notarized executable, migration, rollback executor, CI release, or unattended
+multi-host rollout exists. The current gap ledger is in
+`docs/PRODUCTION_GAP_AUDIT.md`.
+
 The sanitized Phase 6 acceptance artifact is
 `docs/evidence/phase6-token-contract-acceptance.json`: it passed all 11
 correctness gates against a verified isolated recovery restore, with an
@@ -686,7 +726,7 @@ SESSION_ID=$(.venv/bin/python synapse_cli.py --json enter-cortex \
   --response-mode compact --max-response-bytes 12288
 ```
 
-The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goals, assumptions, contradictions, suggested next move, and capture queue in Cortex state. Use `goal.create`, `goal.update`, and `goal.list` to track lightweight operational goals with owner, state, evidence, and next action; MCP clients use `create_spiking_goal`, `update_spiking_goal`, and `list_spiking_goals` for the same ledger. Close the session after verified traces or Wrap Session handoff are captured so the dashboard returns to an explicit idle state instead of leaving stale active sessions. Runtime state persistence now merges cross-process Cortex session closures, so a long-running dashboard or capture daemon cannot resurrect a session that a fresh CLI/MCP process already closed.
+The Cortex Governor state is also included in `agent-brief`, MCP hydration, and the dashboard snapshot. It is intentionally typed: `goal`, `objective`, `decision`, `constraint`, `implementation`, `validation`, `risk`, `correction`, and `follow_up` traces carry truth posture, confidence, evidence, agent id, and session id. Each governor tick can also declare intended files and tools; SYNAPSE-S2 persists that scope, warns on undeclared mutations, sensitive paths, and high-impact tool use, and surfaces active goals, assumptions, contradictions, suggested next move, and capture queue in Cortex state. Use `goal.create`, `goal.update`, and `goal.list` to track lightweight operational goals with owner, state, evidence, and next action; MCP clients use `create_spiking_goal`, `update_spiking_goal`, and `list_spiking_goals` for the same ledger. Close the session after verified traces or Wrap Session handoff are captured so the dashboard returns to an explicit idle state instead of leaving stale active sessions. Runtime state persistence now merges cross-process Cortex session closures, so a long-running dashboard or pre-cutover capture daemon cannot resurrect a session that a fresh CLI/MCP process already closed.
 
 Capture real operator/Codex conversation notes into the event graph:
 
@@ -700,10 +740,16 @@ Capture real operator/Codex conversation notes into the event graph:
 
 Conversation capture automatically builds a local context namespace for the active topic or feature. Prefixes such as `Thread:`, `Feature:`, `Topic:`, `Goal:`, `Objective:`, and `Event:` become typed graph nodes, while the original conversation events receive the same `context_namespace` metadata and are linked back to the namespace anchor with `namespace_contains` edges. This is what makes new topics, current features, objectives, and temporal session details visibly grow in the relationship visualizer.
 
-For the always-on "magic" capture lane, run the launchd sidecar and drop session payloads into the local inbox. This is still opt-in and local: clients, hooks, or operators write a payload, then the sidecar redacts common secret shapes and ingests it into the same real graph used by MCP, CLI, and the dashboard.
+For the always-on "magic" capture lane on authoritative v6, drop session
+payloads into the local inbox; the authoritative core's embedded capture worker
+drains it only after `capture_ready` is true. This is still opt-in and local:
+clients, hooks, or operators write a payload, then the capture path redacts
+common secret shapes and ingests it into the same real graph used by MCP, CLI,
+and the dashboard. Do not install the legacy standalone capture LaunchAgent on
+v6; its installer refuses a governed store or installed core. That sidecar is a
+pre-cutover local-v5 maintenance option only.
 
 ```bash
-scripts/install_capture_daemon.sh
 .venv/bin/python synapse_cli.py --json capture-inbox-drop \
   --context default \
   --tag codex-session \
@@ -715,14 +761,19 @@ scripts/install_capture_daemon.sh
   --response-mode compact --max-response-bytes 12288
 ```
 
-Manual inbox processing is confirmation-gated. The launchd sidecar can process its own local queue continuously, but CLI and MCP one-shot processing require `--confirm` / `confirm=true`, and the dashboard Magic Capture button performs a preflight with a short-lived confirmation token before committing pending files.
+Manual inbox processing is confirmation-gated. The authoritative core's
+embedded worker processes its bound queue continuously; CLI and MCP one-shot
+processing require `--confirm` / `confirm=true`, and the dashboard Magic
+Capture button performs a preflight with a short-lived confirmation token
+before committing pending files. A legacy-v5 sidecar, if deliberately
+installed before adoption, follows the same inbox contract.
 
 Every new producer should use capture protocol `capture.v2`: create one
 `s2cap_<32 lowercase hex>` ID before its first attempt and reuse that ID only
 when retrying the exact same redacted request. The SQLite capture ledger is the
 source of truth; filenames, paths, timestamps, and raw-input hashes are never
 capture identity. See `docs/EXACTLY_ONCE_CAPTURE.md` before deploying or rolling
-back capture producers and the sidecar.
+back capture producers or changing the embedded/legacy worker.
 
 App Connect gives operators a local attach path for already-running apps. It detects attachable local apps through a fast filtered process-list scan, records a confirmed attachment, and can capture either intentionally selected text or a redacted Accessibility snapshot into the same temporal event graph and context bus. Dashboard app attach and snapshot actions use preflight confirmation tokens bound to the selected app/connection so a stale click cannot silently retarget capture. This is a hardened local connector, not a remote control plane.
 
@@ -825,17 +876,21 @@ The MCP server exposes these tools:
 | Tool | Purpose |
 | :--- | :--- |
 | `retrieve_spiking_memory_v2` | Deterministic, structured, read-only text retrieval through the configured local provider, with explicit namespace scope, provenance, completeness, and uncalibrated score semantics. This is the recall tool for new integrations. |
+| `query_spiking_media_similarity` | Rank authoritative, scope-filtered stored-image references by compatible private Apple Vision feature prints; returns content-free media IDs, descriptors, and uncalibrated distances, never feature bytes or OCR text. |
 | `query_spiking_attention` | Deprecated stateful dense-vector query. It may update recurrent runtime state; do not use it for read-only recall. |
 | `query_spiking_attention_text` | Deprecated stateful text query. It may update recurrent runtime state; use `retrieve_spiking_memory_v2` instead. |
 | `remember_spiking_context` | Persist a named context trace from text and/or an embedding. |
 | `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
+| `get_core_request_status` | Reconcile one ambiguous authoritative-core mutation by caller/request handle without replaying it. |
 | `list_spiking_memory` | List persisted SQLite memory through the compact contract by default; `full` is explicit and compact mode rejects vector/index arrays. |
 | `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
 | `capture_spiking_conversation` | Capture real operator/agent conversation notes as temporal event memories. |
-| `drop_spiking_capture_inbox` | Drop opt-in session text into the local capture inbox sidecar. |
+| `drop_spiking_capture_inbox` | Drop opt-in session text into the bound local capture inbox for the authoritative embedded worker (or reviewed legacy-v5 worker). |
 | `get_spiking_capture_inbox_status` | Show pending, processed, and failed inbox file counts. |
 | `process_spiking_capture_inbox` | Process pending inbox drops into the real memory graph; requires `confirm=true`. |
+| `preflight_spiking_capture_error_resolution` | Return a content-free, revision-bound token for one reviewed capture-error archival scope. |
+| `resolve_spiking_capture_errors` | Archive only the exact preflighted terminal/historical capture-error evidence after explicit confirmation. |
 | `register_spiking_transcript_source` | Register a confirmed local transcript/log file for bounded delta capture. |
 | `list_spiking_transcript_sources` | List registered local transcript sources. |
 | `poll_spiking_transcript_sources` | Poll registered transcript deltas into temporal event memory. |
@@ -861,8 +916,10 @@ The MCP server exposes these tools:
 | `prune_spiking_memory` | Remove one memory node, relationship edge, context deployment event, or relationship mode. |
 | `pull_spiking_context_deployments` | Pull durable context-bus events published by GUI and MCP write actions. |
 | `ack_spiking_context_deployments` | Atomically acknowledge exact receipt ids after their deployments were consumed. |
+| `release_spiking_context_deployments` | Release exact unconsumed leases so a later attempt can retry immediately without acknowledging delivery. |
 | `dead_letter_spiking_context_delivery` | Quarantine a retry-exhausted delivery with a reason, explicit confirmation, and durable governance audit. |
 | `list_spiking_context_cursors` | List per-agent delivery cursors and pending deployment counts. |
+| `inspect_spiking_context_delivery_health` | Read-only integrity audit of normalized delivery routes, rows, receipts, and foreign-key bindings. |
 | `hydrate_spiking_agent_context` | Lease a bounded agent-ready contract with one visible event per receipt, prompt recall, and graph highlights; acknowledge returned receipts separately after use. |
 | `enter_spiking_cortex` | Start a governed agent session with policy, recall, and a context-bus deployment. |
 | `tick_spiking_cortex` | Evaluate the current observation, proposed action, intended files, and intended tools against governed memory before proceeding. |

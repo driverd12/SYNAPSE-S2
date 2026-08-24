@@ -4426,7 +4426,18 @@ class DashboardRuntime:
         info = dict(self._system_info_cache)
         uptime_seconds = max(0.0, time.time() - self.started_at)
         memory_uri = f"s2://local/{mlx_backend.sanitize_context_id(context_id)}"
-        provider = self.backend.embedding_provider_info()
+        backend = self.backend
+        provider = backend.embedding_provider_info()
+        authority_identity = (
+            backend.authority_identity
+            if isinstance(backend, CoreClient)
+            else None
+        )
+        runtime_build_id = (
+            str(authority_identity.get("build_id") or "").strip()
+            if isinstance(authority_identity, dict)
+            else ""
+        )
         provider_id = str(provider.get("provider") or "embedding-provider")
         model_id = str(provider.get("model_id") or provider_id)
         info.update(
@@ -4438,6 +4449,18 @@ class DashboardRuntime:
                 "embedding_model_id": model_id,
                 "substrate_label": "SNN Memory Context",
                 "mode": "LOCAL ONLY",
+                # This is the exact build identity authenticated on the latest
+                # authoritative-Core response.  It deliberately does not claim
+                # that a checkout, candidate release, or compatibility profile
+                # matches the running process.
+                "runtime_build_id": runtime_build_id or None,
+                "runtime_build_provenance": (
+                    "authoritative-core-response"
+                    if runtime_build_id
+                    else "unavailable"
+                ),
+                "source_match_asserted": False,
+                "release_profile_asserted": False,
             }
         )
         return info
