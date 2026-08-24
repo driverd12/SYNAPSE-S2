@@ -5635,23 +5635,139 @@ function renderDoctorReport(payload) {
 function renderMemoryHygiene(payload) {
   if (!payload) return;
   const items = payload.review_items || [];
-  elements.memoryHygieneQueue.innerHTML = items.length
-    ? items.slice(0, 6).map((item) => `
+  const scope = `${formatNumber(payload.backlog_count || 0)} actionable item${Number(payload.backlog_count) === 1 ? "" : "s"} in ${formatNumber(payload.scanned_entry_count || 0)} recently scanned records`;
+  elements.memoryHygieneQueue.innerHTML = `
+    <div class="hygiene-scope">
+      <strong>${escapeHtml(scope)}</strong>
+      <small>Open the full record before cleanup. “Log review” records an audit event only; it does not delete the memory or improve health.</small>
+    </div>
+    ${items.length
+    ? items.slice(0, 12).map((item) => {
+      const label = item.display_title || item.tag || compactMemoryId(item.memory_id);
+      const duplicateLabel = item.duplicate_of_memory_id
+        ? `Recommended survivor: ${item.duplicate_of_tag || compactMemoryId(item.duplicate_of_memory_id)}`
+        : "";
+      return `
         <article class="hygiene-item ${escapeHtml(item.severity || "low")}">
-          <div>
-            <strong>${escapeHtml(item.tag || compactMemoryId(item.memory_id))}</strong>
+          <div class="hygiene-item-summary">
+            <strong>${escapeHtml(label)}</strong>
             <small>${escapeHtml((item.categories || []).join(" / "))}</small>
-            <p>${escapeHtml(item.reason || item.source_excerpt || "")}</p>
+            <p>${escapeHtml(item.display_summary || item.reason || item.source_excerpt || "")}</p>
+            <p>${escapeHtml(item.work_topic || "")}</p>
+            ${duplicateLabel ? `<small class="duplicate-reference">${escapeHtml(duplicateLabel)}</small>` : ""}
           </div>
           <button type="button"
             data-hygiene-action="acknowledge"
             data-memory-id="${escapeHtml(item.memory_id)}"
-            data-hygiene-label="${escapeHtml(item.tag || item.memory_id)}">
-            Ack
+            data-memory-context="${escapeHtml(item.context_id || state.context)}"
+            data-hygiene-label="${escapeHtml(label)}">
+            Log review only
           </button>
+          ${renderMemoryReviewDetails({
+            memoryId: item.memory_id,
+            memoryContext: item.context_id || state.context,
+            label,
+            actionKind: "hygiene",
+            duplicateOfMemoryId: item.duplicate_of_memory_id || "",
+            duplicateOfTag: item.duplicate_of_tag || "",
+          })}
+          ${item.duplicate_of_memory_id ? renderMemoryReviewDetails({
+            memoryId: item.duplicate_of_memory_id,
+            memoryContext: item.context_id || state.context,
+            label: item.duplicate_of_tag || compactMemoryId(item.duplicate_of_memory_id),
+            actionKind: "compare",
+          }) : ""}
         </article>
-      `).join("")
-    : '<div class="memory-ledger-empty">No memory hygiene review items</div>';
+      `;
+    }).join("")
+    : '<div class="memory-ledger-empty">No actionable memory hygiene items in the bounded recent scan.</div>'}
+  `;
+}
+
+function renderMemoryReviewDetails({
+  memoryId,
+  memoryContext = state.context,
+  label,
+  actionKind,
+  duplicateOfMemoryId = "",
+  duplicateOfTag = "",
+}) {
+  if (!memoryId) return "";
+  const isComparison = actionKind === "compare";
+  const duplicateNote = duplicateOfMemoryId
+    ? `This is the cleanup candidate. Keep ${duplicateOfTag || compactMemoryId(duplicateOfMemoryId)} unless your comparison shows otherwise.`
+    : "Review the complete record before deciding whether it should remain.";
+  const actionAttribute = actionKind === "hygiene"
+    ? 'data-hygiene-action="prune"'
+    : 'data-cortex-action="prune"';
+  return `
+    <details class="memory-review-details"
+      data-memory-detail-id="${escapeHtml(memoryId)}"
+      data-memory-context="${escapeHtml(memoryContext)}"
+      data-memory-detail-label="${escapeHtml(label)}">
+      <summary>${isComparison ? "View recommended survivor for comparison" : "View full record before cleanup"}</summary>
+      <div class="memory-review-panel">
+        <div class="memory-detail-content" data-memory-detail-content>
+          <p>Open to load the complete stored text without vectors.</p>
+        </div>
+        ${isComparison ? '<p class="memory-review-guidance">Compare this survivor with the cleanup candidate above. This panel has no delete control.</p>' : `
+        <p class="memory-review-guidance">${escapeHtml(duplicateNote)}</p>
+        <label class="memory-review-confirm">
+          <input type="checkbox" data-memory-review-confirm disabled>
+          I reviewed the full record and intend to prune only this copy.
+        </label>
+        <button type="button" ${actionAttribute}
+          data-reviewed-prune
+          data-memory-id="${escapeHtml(memoryId)}"
+          data-memory-context="${escapeHtml(memoryContext)}"
+          data-hygiene-label="${escapeHtml(label)}"
+          data-cortex-label="${escapeHtml(label)}"
+          disabled>
+          ${duplicateOfMemoryId ? "Prune this duplicate copy" : "Prune this memory"}
+        </button>
+        `}
+      </div>
+    </details>
+  `;
+}
+
+async function loadMemoryReviewDetails(details) {
+  if (!details?.open || details.dataset.memoryDetailState === "loaded" || details.dataset.memoryDetailState === "loading") return;
+  const memoryId = details.dataset.memoryDetailId || "";
+  const memoryContext = details.dataset.memoryContext || state.context;
+  const content = details.querySelector("[data-memory-detail-content]");
+  const checkbox = details.querySelector("[data-memory-review-confirm]");
+  if (!memoryId || !content) return;
+  details.dataset.memoryDetailState = "loading";
+  content.textContent = "Loading the complete stored record...";
+  try {
+    const payload = await requestJson("/api/memory-detail", {
+      params: { context_id: memoryContext, memory_id: memoryId },
+    });
+    const memory = payload.memory || {};
+    const provenance = memory.metadata || {};
+    const facts = [
+      ["Recorded", formatNamespaceUpdatedAt(memory.updated_at || memory.created_at)],
+      ["Context", memory.context_id || memoryContext],
+      ["Agent", memory.agent_id || provenance.agent_id || "Not captured"],
+      ["Session", memory.session_id || provenance.cortex_session_id || "Not captured"],
+      ["Record type", memory.record_kind || "memory-trace"],
+    ];
+    content.innerHTML = `
+      <strong>${escapeHtml(memory.display_title || memory.tag || compactMemoryId(memory.memory_id))}</strong>
+      <p>${escapeHtml(memory.display_summary || "No summary was captured.")}</p>
+      <p class="memory-work-topic">${escapeHtml(memory.work_topic || "No separate work topic was captured for this record.")}</p>
+      <dl>${facts.map(([name, value]) => `<div><dt>${escapeHtml(name)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
+      <small>Exact tag: ${escapeHtml(memory.tag || "none")} · ID: ${escapeHtml(memory.memory_id || memoryId)}</small>
+      <pre>${escapeHtml(memory.source_text || "(empty stored text)")}</pre>
+      ${memory.source_text_truncated ? '<small>Display is truncated at the dashboard safety limit, so cleanup remains disabled for this record.</small>' : ""}
+    `;
+    if (checkbox) checkbox.disabled = Boolean(memory.source_text_truncated);
+    details.dataset.memoryDetailState = "loaded";
+  } catch (error) {
+    details.dataset.memoryDetailState = "failed";
+    content.textContent = `Could not load this record: ${error.message}`;
+  }
 }
 
 function renderOperatorRecipes(recipes) {
@@ -5980,22 +6096,31 @@ function renderCortexMemoryList(items, emptyLabel) {
       Number.isFinite(confidence) ? `${formatNumber(confidence, 2)} confidence` : "",
     ].filter(Boolean).join(" / ");
     const memoryId = String(item.memory_id || "");
-    const label = item.tag || compactMemoryId(memoryId) || "cortex-trace";
+    const isSessionBoundary = String(item.excerpt || "").startsWith("SYNAPSE-S2 MCP client session ended.");
+    const label = isSessionBoundary
+      ? `${item.agent_id || "MCP client"} session ended`
+      : item.tag || compactMemoryId(memoryId) || "cortex-trace";
+    const memoryContext = item.context_id || state.context;
     const actions = memoryId ? `
         <div class="cortex-memory-actions" aria-label="Cortex trace moderation">
-          <button type="button" data-cortex-action="promote" data-memory-id="${escapeHtml(memoryId)}" data-cortex-label="${escapeHtml(label)}">Promote</button>
-          <button type="button" data-cortex-action="demote" data-memory-id="${escapeHtml(memoryId)}" data-cortex-label="${escapeHtml(label)}">Demote</button>
-          <button type="button" data-cortex-action="prune" data-memory-id="${escapeHtml(memoryId)}" data-cortex-label="${escapeHtml(label)}">Prune</button>
+          <button type="button" data-cortex-action="promote" data-memory-id="${escapeHtml(memoryId)}" data-memory-context="${escapeHtml(memoryContext)}" data-cortex-label="${escapeHtml(label)}">Promote</button>
+          <button type="button" data-cortex-action="demote" data-memory-id="${escapeHtml(memoryId)}" data-memory-context="${escapeHtml(memoryContext)}" data-cortex-label="${escapeHtml(label)}">Demote</button>
         </div>
       ` : "";
     return `
       <article class="cortex-memory-row">
         <div>
           <strong>${escapeHtml(label)}</strong>
-          <small>${escapeHtml(meta)}</small>
+          <small>${escapeHtml(`${formatNamespaceUpdatedAt(item.updated_at)} · ${meta}`)}</small>
         </div>
         <p>${escapeHtml(item.excerpt || "")}</p>
         ${actions}
+        ${renderMemoryReviewDetails({
+          memoryId,
+          memoryContext,
+          label,
+          actionKind: "cortex",
+        })}
       </article>
     `;
   }).join("");
@@ -8614,9 +8739,14 @@ async function commitCorticalTrace(button) {
 
 async function moderateCortexTrace(button) {
   const memoryId = button.dataset.memoryId || "";
+  const memoryContext = button.dataset.memoryContext || state.context;
   const action = button.dataset.cortexAction || "";
   const label = button.dataset.cortexLabel || compactMemoryId(memoryId);
   if (!memoryId || !action) return null;
+  if (action === "prune" && button.dataset.reviewed !== "true") {
+    logOperation("Cortex prune held", "Open and review the full record before pruning this copy.");
+    return null;
+  }
   if (action === "prune" && !confirmPrune(label)) {
     logOperation("Cortex prune cancelled", label);
     return null;
@@ -8625,7 +8755,7 @@ async function moderateCortexTrace(button) {
     const payload = await requestJson("/api/cortex/moderate", {
       method: "POST",
       body: {
-        context_id: state.context,
+        context_id: memoryContext,
         memory_id: memoryId,
         action,
         reason: `dashboard ${action} from Cortex Governor panel`,
@@ -8639,7 +8769,9 @@ async function moderateCortexTrace(button) {
 }
 
 function confirmPrune(label) {
-  return window.confirm(`Permanently prune ${label || "this graph item"} from SYNAPSE-S2 memory?`);
+  return window.confirm(
+    `Permanently prune ${label || "this graph item"} from SYNAPSE-S2 memory?\n\nThis deletes one stored memory node. Other stored records are unchanged.`,
+  );
 }
 
 async function pruneGraphItem(payload, button, label = "selected graph data") {
@@ -8976,19 +9108,50 @@ elements.memoryHygieneQueue.addEventListener("click", (event) => {
   const button = event.target.closest?.("[data-hygiene-action]");
   if (!button) return;
   event.preventDefault();
+  const action = button.dataset.hygieneAction || "acknowledge";
+  const label = button.dataset.hygieneLabel || compactMemoryId(button.dataset.memoryId || "");
+  const memoryContext = button.dataset.memoryContext || state.context;
+  if (action === "prune" && button.dataset.reviewed !== "true") {
+    logOperation("Memory hygiene prune held", "Open and review the full record before pruning this copy.");
+    return;
+  }
+  if (action === "prune" && !confirmPrune(label)) {
+    logOperation("Memory hygiene prune cancelled", label);
+    return;
+  }
   withBusy(button, "Memory hygiene action", async () => {
     const payload = await requestJson("/api/memory-hygiene/action", {
       method: "POST",
       body: {
-        context_id: state.context,
-        action: button.dataset.hygieneAction || "acknowledge",
+        context_id: memoryContext,
+        action,
         memory_id: button.dataset.memoryId || "",
-        reason: `dashboard acknowledged ${button.dataset.hygieneLabel || "memory item"}`,
+        reason: action === "prune"
+          ? `dashboard pruned reviewed memory item ${label}`
+          : `dashboard logged review of ${label}; memory unchanged`,
+        confirm: action === "prune",
       },
     });
     await runMemoryHygiene(elements.memoryHygieneButton);
+    if (action === "prune") await refreshSnapshot();
     return payload;
   }, { refresh: false });
+});
+
+document.addEventListener("toggle", (event) => {
+  const details = event.target.closest?.("details[data-memory-detail-id]");
+  if (!details?.open) return;
+  void loadMemoryReviewDetails(details);
+}, true);
+
+document.addEventListener("change", (event) => {
+  const checkbox = event.target.closest?.("[data-memory-review-confirm]");
+  if (!checkbox) return;
+  const details = checkbox.closest("details[data-memory-detail-id]");
+  const prune = details?.querySelector("[data-reviewed-prune]");
+  if (!prune || details.dataset.memoryDetailState !== "loaded") return;
+  prune.disabled = !checkbox.checked;
+  prune.dataset.reviewed = checkbox.checked ? "true" : "false";
 });
 
 elements.mondayReadinessButton.addEventListener("click", () => {

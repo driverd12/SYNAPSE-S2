@@ -996,6 +996,11 @@ class DashboardRuntimeTests(unittest.TestCase):
             runtime = DashboardRuntime(MutationGuard())
             capture_root = Path(tmp)
             runtime_state = Path(backend.state_path)
+            detail_memory_id = backend.memory_store.list_entries(
+                context_id="demo",
+                limit=1,
+                include_global=True,
+            )[0]["memory_id"]
             before_state = runtime_state.read_bytes()
             before_identity = runtime_state.lstat().st_ino
             routes = (
@@ -1016,6 +1021,7 @@ class DashboardRuntimeTests(unittest.TestCase):
                 "/api/self-test?context_id=demo&include_apps=false",
                 "/api/context-health?context_id=demo",
                 "/api/memory-hygiene?context_id=demo&limit=5",
+                f"/api/memory-detail?context_id=demo&memory_id={detail_memory_id}",
                 "/api/doctor?context_id=demo&include_apps=false&repair_plan=false",
                 "/api/cortex/state?context_id=demo&limit=5",
                 "/api/snapshot?context_id=demo&limit=5&include_graph=false",
@@ -1167,6 +1173,233 @@ class DashboardRuntimeTests(unittest.TestCase):
             self.assertFalse(call.kwargs["include_vectors"])
             self.assertEqual(call.kwargs["recall_scope"], "local")
         backend.list_memory_graph.assert_not_called()
+
+    def test_memory_hygiene_groups_session_copy_and_ignores_observed_follow_up(self):
+        backend = mock.Mock()
+        session_text = (
+            "SYNAPSE-S2 MCP client session ended. Agent: codex-desktop "
+            "Context: demo Session ID: session-123 Reason: signal-sigterm "
+            "Duration seconds: 3665.5 Startup new deployments: 0"
+        )
+        entries = [
+            {
+                "memory_id": "event-copy",
+                "tag": "client-session-boundary-event-001-canonical",
+                "context_id": "demo",
+                "source_text": session_text.replace(". Agent", ".\nAgent"),
+                "metadata": {
+                    "client_session_bridge": True,
+                    "cortex_governor": True,
+                    "trace_type": "follow_up",
+                    "truth_posture": "observed",
+                    "confidence": 0.76,
+                    "agent_id": "codex-desktop",
+                    "task": "Hydrate SYNAPSE-S2 context for codex-desktop local MCP client startup.",
+                },
+                "created_at": 1.0,
+                "updated_at": 1.0,
+            },
+            {
+                "memory_id": "cortex-copy",
+                "tag": "cortex-codex-desktop-follow_up-copy",
+                "context_id": "demo",
+                "source_text": session_text,
+                "metadata": {
+                    "cortex_governor": True,
+                    "trace_type": "follow_up",
+                    "truth_posture": "observed",
+                    "confidence": 0.76,
+                    "agent_id": "codex-desktop",
+                    "task": "Hydrate SYNAPSE-S2 context for codex-desktop local MCP client startup.",
+                },
+                "created_at": 2.0,
+                "updated_at": 2.0,
+            },
+            {
+                "memory_id": "useful-follow-up",
+                "tag": "follow-up-with-evidence",
+                "context_id": "demo",
+                "source_text": "Follow up after the vendor validates the observed signal path.",
+                "metadata": {
+                    "trace_type": "follow_up",
+                    "truth_posture": "observed",
+                    "confidence": 0.76,
+                    "task": "Vendor signal-path validation",
+                },
+                "created_at": 3.0,
+                "updated_at": 3.0,
+            },
+            {
+                "memory_id": "actual-assumption",
+                "tag": "unverified-assumption",
+                "context_id": "demo",
+                "source_text": "Assume the vendor signal path is complete.",
+                "metadata": {
+                    "trace_type": "assumption",
+                    "truth_posture": "inferred",
+                    "confidence": 0.7,
+                },
+                "created_at": 4.0,
+                "updated_at": 4.0,
+            },
+        ]
+        backend.list_memory.return_value = {
+            "entries": entries,
+            "_retrieval_page": {
+                "surface": "memory-list",
+                "response_mode": "compact",
+                "snapshot_revision": "stable-revision",
+                "total": {"entries": len(entries)},
+                "returned": {"entries": len(entries)},
+                "has_more": False,
+                "next_cursor": None,
+            },
+        }
+        runtime = DashboardRuntime(backend)
+
+        hygiene = runtime.memory_hygiene(context_id="demo", limit=10)
+
+        self.assertEqual(hygiene["backlog_count"], 3)
+        by_id = {item["memory_id"]: item for item in hygiene["review_items"]}
+        self.assertEqual(
+            set(by_id),
+            {"cortex-copy", "useful-follow-up", "actual-assumption"},
+        )
+        self.assertEqual(by_id["cortex-copy"]["duplicate_of_memory_id"], "event-copy")
+        self.assertEqual(
+            by_id["cortex-copy"]["duplicate_match"],
+            "same-session-normalized-full-text",
+        )
+        self.assertEqual(by_id["cortex-copy"]["context_id"], "demo")
+        self.assertEqual(by_id["cortex-copy"]["display_title"], "codex-desktop session ended")
+        self.assertIn("1h 1m", by_id["cortex-copy"]["display_summary"])
+        self.assertFalse(by_id["cortex-copy"]["work_topic_captured"])
+        self.assertIn("assumption_or_follow_up", by_id["useful-follow-up"]["categories"])
+
+    def test_memory_hygiene_does_not_group_matching_prefixes(self):
+        runtime = DashboardRuntime(mock.Mock())
+        entries = [
+            {
+                "memory_id": "prefix-a",
+                "tag": "prefix-a",
+                "source_text": ("same-prefix " * 30) + "ending-a",
+                "metadata": {},
+                "created_at": 1.0,
+            },
+            {
+                "memory_id": "prefix-b",
+                "tag": "prefix-b",
+                "source_text": ("same-prefix " * 30) + "ending-b",
+                "metadata": {},
+                "created_at": 2.0,
+            },
+        ]
+
+        self.assertEqual(runtime._memory_hygiene_duplicate_map(entries), {})
+
+        cross_context = [dict(entries[0]), dict(entries[0])]
+        cross_context[0].update(memory_id="context-a", context_id="demo")
+        cross_context[1].update(memory_id="context-b", context_id="global")
+        self.assertEqual(runtime._memory_hygiene_duplicate_map(cross_context), {})
+
+    def test_memory_hygiene_prune_requires_exact_context_and_real_deletion(self):
+        backend = mock.Mock()
+        backend.get_memory_entry.return_value = {
+            "memory_id": "global-memory",
+            "context_id": "global",
+            "tag": "global-memory",
+        }
+        runtime = DashboardRuntime(backend)
+        wrong_status, wrong_payload = self.decode(
+            runtime.handle(
+                "POST",
+                "/api/memory-hygiene/action",
+                json.dumps(
+                    {
+                        "context_id": "demo",
+                        "memory_id": "global-memory",
+                        "action": "prune",
+                        "confirm": True,
+                    }
+                ).encode(),
+            )
+        )
+        backend.prune_memory.return_value = {"result": {"deleted": False}}
+        raced_status, raced_payload = self.decode(
+            runtime.handle(
+                "POST",
+                "/api/memory-hygiene/action",
+                json.dumps(
+                    {
+                        "context_id": "global",
+                        "memory_id": "global-memory",
+                        "action": "prune",
+                        "confirm": True,
+                    }
+                ).encode(),
+            )
+        )
+        backend.prune_memory.return_value = {"result": {"deleted": True}}
+        deleted_status, deleted_payload = self.decode(
+            runtime.handle(
+                "POST",
+                "/api/memory-hygiene/action",
+                json.dumps(
+                    {
+                        "context_id": "global",
+                        "memory_id": "global-memory",
+                        "action": "prune",
+                        "confirm": True,
+                    }
+                ).encode(),
+            )
+        )
+
+        self.assertEqual(wrong_status, 404)
+        self.assertIn("selected context", wrong_payload["error"])
+        self.assertEqual(raced_status, 409)
+        self.assertIn("changed before pruning", raced_payload["error"])
+        self.assertEqual(deleted_status, 200)
+        self.assertEqual(deleted_payload["receipt"]["title"], "Memory item pruned")
+
+    def test_memory_detail_is_bounded_vector_free_and_context_scoped(self):
+        with TemporaryDirectory() as tmp:
+            runtime = self.make_runtime(tmp)
+            registration = runtime.backend.register_text_trace(
+                tag="human-review-detail",
+                context_id="demo",
+                text="<script>not executable</script> Full human-readable trace.",
+                metadata={
+                    "trace_type": "evidence",
+                    "truth_posture": "observed",
+                    "confidence": 0.88,
+                    "task": "Explain a memory before cleanup",
+                    "private_path": "/should/not/be/projected",
+                },
+            )
+            route = (
+                "/api/memory-detail?context_id=demo&memory_id="
+                + registration["memory_id"]
+            )
+            status, payload = self.decode(runtime.handle("GET", route))
+            wrong_status, wrong_payload = self.decode(
+                runtime.handle(
+                    "GET",
+                    "/api/memory-detail?context_id=other&memory_id="
+                    + registration["memory_id"],
+                )
+            )
+
+        self.assertEqual(status, 200)
+        memory = payload["memory"]
+        self.assertEqual(memory["memory_id"], registration["memory_id"])
+        self.assertEqual(memory["work_topic"], "Explain a memory before cleanup")
+        self.assertIn("<script>not executable</script>", memory["source_text"])
+        self.assertNotIn("spike_indices", memory)
+        self.assertNotIn("neuron_indices", memory)
+        self.assertNotIn("private_path", memory["metadata"])
+        self.assertEqual(wrong_status, 404)
+        self.assertEqual(wrong_payload["error"], "memory was not found in the selected context")
 
     def test_memory_hygiene_rejects_nonadvancing_pages(self):
         backend = mock.Mock()
@@ -2401,6 +2634,14 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("runDoctorReport", app)
         self.assertIn("runContextHealth", app)
         self.assertIn("runMemoryHygiene", app)
+        self.assertIn("/api/memory-detail", app)
+        self.assertIn("View full record before cleanup", app)
+        self.assertIn("I reviewed the full record and intend to prune only this copy", app)
+        self.assertIn("Log review only", app)
+        self.assertIn("data-reviewed-prune", app)
+        self.assertIn('button.dataset.reviewed !== "true"', app)
+        self.assertIn("memory-review-details", styles)
+        self.assertIn("white-space: pre-wrap", styles)
         self.assertIn("renderOperationReceipt", app)
         self.assertIn("renderGoalLedger", app)
         self.assertIn("renderRecipeDrawer", app)

@@ -1282,6 +1282,31 @@ textarea {
   align-items: center;
 }
 
+.hygiene-scope {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--row);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 8px;
+  color: var(--muted);
+}
+
+.hygiene-scope strong {
+  color: var(--text);
+}
+
+.hygiene-item-summary {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.duplicate-reference,
+.memory-work-topic {
+  color: var(--amber);
+}
+
 .hygiene-item.high {
   border-color: color-mix(in srgb, var(--red) 46%, var(--border));
 }
@@ -1299,6 +1324,97 @@ textarea {
   padding: 0 10px;
   font-size: 11px;
   font-weight: 800;
+}
+
+.memory-review-details {
+  grid-column: 1 / -1;
+  min-width: 0;
+  border-top: 1px solid var(--row);
+  padding-top: 6px;
+}
+
+.memory-review-details summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--teal-strong);
+  font-size: 11px;
+  font-weight: 820;
+}
+
+.memory-review-panel,
+.memory-detail-content {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.memory-review-panel {
+  margin-top: 7px;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  background: var(--input);
+  padding: 9px;
+}
+
+.memory-detail-content dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 5px;
+  margin: 0;
+}
+
+.memory-detail-content dl div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.memory-detail-content dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.memory-detail-content dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.memory-detail-content pre {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--row);
+  border-radius: 6px;
+  margin: 0;
+  background: var(--panel);
+  padding: 9px;
+  color: var(--text);
+  font-family: var(--terminal-font);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.memory-review-guidance,
+.memory-review-confirm {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.memory-review-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.memory-review-panel button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .brief-meta,
@@ -1616,12 +1732,16 @@ textarea {
   min-width: 0;
 }
 
-.cortex-memory-row strong,
-.cortex-memory-row small,
-.cortex-memory-row p {
+.cortex-memory-row small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.cortex-memory-row strong,
+.cortex-memory-row p {
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .cortex-memory-row strong {

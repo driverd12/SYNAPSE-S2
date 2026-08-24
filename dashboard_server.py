@@ -92,6 +92,7 @@ ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 MAX_JSON_BODY_BYTES = 128 * 1024
 MAX_TEXT_BYTES = 64 * 1024
+MAX_MEMORY_DETAIL_BYTES = 64 * 1024
 MAX_IMAGE_THUMBNAIL_BYTES = 72 * 1024
 DASHBOARD_SESSION_COOKIE_NAME = "synapse_s2_dashboard_session"
 DASHBOARD_SESSION_HEADER_NAME = "X-Synapse-Dashboard-Session"
@@ -887,6 +888,12 @@ class DashboardRuntime:
             context = self._context_from_params(params)
             limit = self._int_param(params, "limit", 25, minimum=1, maximum=100)
             return self._json_response(self.memory_hygiene(context_id=context, limit=limit))
+        if method == "GET" and path == "/api/memory-detail":
+            context = self._context_from_params(params)
+            memory_id = str(params.get("memory_id", [""])[0] or "").strip()
+            return self._json_response(
+                self.memory_detail(context_id=context, memory_id=memory_id)
+            )
         if method == "GET" and path == "/api/doctor":
             context = self._context_from_params(params)
             include_apps = self._bool_param(params, "include_apps", True)
@@ -2530,12 +2537,16 @@ class DashboardRuntime:
     def memory_hygiene(self, *, context_id: str, limit: int = 25) -> dict[str, Any]:
         context = mlx_backend.sanitize_context_id(context_id)
         entries, scan = self._memory_hygiene_entries(context_id=context)
-        duplicate_seen: dict[str, str] = {}
+        duplicates = self._memory_hygiene_duplicate_map(entries)
         review_items: list[dict[str, Any]] = []
         queue_summary: dict[str, int] = {}
 
         for entry in entries:
-            item = self._memory_hygiene_item(entry, duplicate_seen=duplicate_seen)
+            memory_id = str(entry.get("memory_id") or "")
+            item = self._memory_hygiene_item(
+                entry,
+                duplicate_info=duplicates.get(memory_id),
+            )
             if item is None:
                 continue
             review_items.append(item)
@@ -2574,11 +2585,88 @@ class DashboardRuntime:
             "generated_at": time.time(),
         }
 
+    def memory_detail(self, *, context_id: str, memory_id: str) -> dict[str, Any]:
+        """Return one bounded, vector-free record for deliberate local review."""
+
+        context = mlx_backend.sanitize_context_id(context_id)
+        try:
+            clean_memory_id = reject_sensitive_identifier(
+                str(memory_id or ""),
+                field="memory_id",
+            ).strip()
+        except ValueError as exc:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        if not clean_memory_id:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, "memory_id is required")
+        entry = self.backend.get_memory_entry(clean_memory_id, include_vectors=False)
+        if entry is None:
+            raise DashboardError(HTTPStatus.NOT_FOUND, "memory was not found")
+        entry_context = str(entry.get("context_id") or "")
+        if entry_context not in {context, "global"}:
+            raise DashboardError(
+                HTTPStatus.NOT_FOUND,
+                "memory was not found in the selected context",
+            )
+
+        source_text, source_text_truncated = self._bounded_utf8_text(
+            str(entry.get("source_text") or ""),
+            MAX_MEMORY_DETAIL_BYTES,
+        )
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        display = self._memory_review_display(entry)
+        safe_metadata_keys = (
+            "source",
+            "speaker",
+            "agent_id",
+            "cortex_session_id",
+            "trace_type",
+            "truth_posture",
+            "confidence",
+            "task",
+            "client_session_bridge",
+            "cortex_governor",
+            "event_type",
+        )
+        return {
+            "action": "memory-detail",
+            "context_id": context,
+            "memory": {
+                "memory_id": clean_memory_id,
+                "tag": str(entry.get("tag") or ""),
+                "context_id": entry_context,
+                "created_at": float(entry.get("created_at") or 0.0),
+                "updated_at": float(entry.get("updated_at") or 0.0),
+                "source_text": source_text,
+                "source_text_truncated": source_text_truncated,
+                "source_text_bytes": len(str(entry.get("source_text") or "").encode("utf-8")),
+                "metadata": {
+                    key: metadata[key]
+                    for key in safe_metadata_keys
+                    if key in metadata
+                    and isinstance(metadata[key], (str, int, float, bool, type(None)))
+                },
+                **display,
+            },
+        }
+
     def memory_hygiene_action(self, payload: dict[str, Any]) -> dict[str, Any]:
         context = self._context_from_payload(payload)
         action = str(payload.get("action", "acknowledge") or "acknowledge").strip().lower()
         memory_id = str(payload.get("memory_id", "") or "").strip()
         reason = str(payload.get("reason", "") or "").strip()
+        if action not in {"acknowledge", "prune"}:
+            raise DashboardError(
+                HTTPStatus.BAD_REQUEST,
+                "memory hygiene action must be acknowledge or prune",
+            )
+        if not memory_id:
+            raise DashboardError(HTTPStatus.BAD_REQUEST, "memory_id is required")
+        entry = self.backend.get_memory_entry(memory_id, include_vectors=False)
+        if entry is None or str(entry.get("context_id") or "") != context:
+            raise DashboardError(
+                HTTPStatus.NOT_FOUND,
+                "memory was not found in the selected context",
+            )
         if action == "prune":
             if payload.get("confirm") is not True:
                 raise DashboardError(
@@ -2593,6 +2681,12 @@ class DashboardRuntime:
                 source_surface="dashboard-memory-hygiene",
                 confirm=True,
             )
+            prune_result = result.get("result") if isinstance(result, dict) else None
+            if not isinstance(prune_result, dict) or prune_result.get("deleted") is not True:
+                raise DashboardError(
+                    HTTPStatus.CONFLICT,
+                    "memory changed before pruning; refresh Memory Hygiene and review it again",
+                )
             return {
                 "action": "memory-hygiene-action",
                 "context_id": context,
@@ -4863,11 +4957,77 @@ class DashboardRuntime:
             ],
         }
 
+    def _memory_hygiene_duplicate_map(
+        self,
+        entries: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Group only whole-record matches or the two copies of one session close."""
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for entry in entries:
+            source_text = str(entry.get("source_text") or "")
+            normalized = " ".join(source_text.casefold().split())
+            normalized = re.sub(r"\s+([,.;:])", r"\1", normalized)
+            if not normalized:
+                continue
+            context_id = str(entry.get("context_id") or "")
+            key = (
+                f"context:{context_id}:source:"
+                f"{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
+            )
+            groups.setdefault(key, []).append(entry)
+
+        duplicates: dict[str, dict[str, Any]] = {}
+        for key, members in groups.items():
+            if len(members) < 2:
+                continue
+
+            def survivor_order(item: dict[str, Any]) -> tuple[int, int, float, str]:
+                metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                tag = str(item.get("tag") or "")
+                return (
+                    0 if tag.startswith("client-session-boundary-event-") else 1,
+                    0 if metadata.get("client_session_bridge") is True else 1,
+                    float(item.get("created_at") or item.get("updated_at") or 0.0),
+                    str(item.get("memory_id") or ""),
+                )
+
+            survivor = min(members, key=survivor_order)
+            survivor_id = str(survivor.get("memory_id") or "")
+            # The normalized source digest is an internal grouping aid only.  A
+            # public group identifier must not become a raw-content equality
+            # oracle, so derive it solely from the already-public random IDs.
+            public_member_ids = sorted(
+                str(item.get("memory_id") or "") for item in members
+            )
+            group_id = hashlib.sha256(
+                ("memory-ids:" + "\0".join(public_member_ids)).encode("utf-8")
+            ).hexdigest()[:12]
+            is_session_lifecycle = " ".join(
+                str(survivor.get("source_text") or "").casefold().split()
+            ).startswith("synapse-s2 mcp client session ended.")
+            for member in members:
+                memory_id = str(member.get("memory_id") or "")
+                if not memory_id or memory_id == survivor_id:
+                    continue
+                duplicates[memory_id] = {
+                    "duplicate_group_id": group_id,
+                    "duplicate_group_count": len(members),
+                    "duplicate_of_memory_id": survivor_id,
+                    "duplicate_of_tag": str(survivor.get("tag") or ""),
+                    "duplicate_match": (
+                        "same-session-normalized-full-text"
+                        if is_session_lifecycle
+                        else "same-normalized-full-text"
+                    ),
+                }
+        return duplicates
+
     def _memory_hygiene_item(
         self,
         entry: dict[str, Any],
         *,
-        duplicate_seen: dict[str, str],
+        duplicate_info: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
         source_text = str(entry.get("source_text") or "")
@@ -4890,25 +5050,44 @@ class DashboardRuntime:
             confidence = None
         truth_posture = str(metadata.get("truth_posture") or "").lower()
         trace_type = str(metadata.get("trace_type") or "").lower()
+        tag = str(entry.get("tag") or "")
+        routine_session_boundary = bool(
+            trace_type == "follow_up"
+            and truth_posture == "observed"
+            and confidence is not None
+            and confidence >= 0.6
+            and " ".join(source_text.casefold().split()).startswith(
+                "synapse-s2 mcp client session ended."
+            )
+            and (
+                tag.startswith("client-session-boundary-event-")
+                or tag.startswith("cortex-")
+            )
+            and (
+                metadata.get("client_session_bridge") is True
+                or metadata.get("cortex_governor") is True
+            )
+        )
         if confidence is not None and confidence < 0.6:
             categories.append("low_confidence_trace")
             reasons.append(f"Confidence is {confidence:.2f}.")
             recommended_actions.append("Promote with evidence, demote, or prune after review.")
             severity = "medium"
-        if truth_posture in {"inferred", "stale"} or trace_type in {"assumption", "follow_up"}:
+        if (
+            truth_posture in {"inferred", "stale"}
+            or trace_type == "assumption"
+            or (trace_type == "follow_up" and not routine_session_boundary)
+        ):
             categories.append("assumption_or_follow_up")
-            reasons.append("Trace is an assumption, follow-up, inferred, or stale.")
+            reasons.append("Trace is an unresolved follow-up, assumption, inferred, or stale.")
             recommended_actions.append("Resolve or convert to observed/test-validated memory.")
             if severity == "low":
                 severity = "medium"
 
-        normalized = " ".join(source_text.lower().split())[:220]
-        if normalized and normalized in duplicate_seen:
+        if duplicate_info:
             categories.append("duplicate_candidate")
-            reasons.append("Source text resembles another memory entry.")
-            recommended_actions.append("Prune or merge duplicate memory if it is redundant.")
-        elif normalized:
-            duplicate_seen[normalized] = str(entry.get("memory_id") or "")
+            reasons.append("This record duplicates another stored copy; compare both before pruning.")
+            recommended_actions.append("Keep the recommended survivor and prune only this duplicate copy after review.")
 
         sensitive_markers = (
             "[redacted_secret]",
@@ -4929,10 +5108,12 @@ class DashboardRuntime:
         if not categories:
             return None
 
+        display = self._memory_review_display(entry)
         return {
             "item_id": f"hygiene_{hashlib.sha256(str(entry.get('memory_id', '')).encode('utf-8')).hexdigest()[:10]}",
             "memory_id": str(entry.get("memory_id") or ""),
             "tag": str(entry.get("tag") or ""),
+            "context_id": str(entry.get("context_id") or ""),
             "categories": self._unique_strings(categories),
             "category": categories[0],
             "severity": severity,
@@ -4940,6 +5121,8 @@ class DashboardRuntime:
             "recommended_action": recommended_actions[0],
             "recommended_actions": self._unique_strings(recommended_actions),
             "source_excerpt": self._compact_text(source_text, 220),
+            **display,
+            **(duplicate_info or {}),
             "updated_at": float(entry.get("updated_at") or 0.0),
             "metadata": {
                 "trace_type": trace_type,
@@ -4948,6 +5131,79 @@ class DashboardRuntime:
                 "adapter_kind": metadata.get("adapter_kind"),
                 "snapshot_quality": snapshot_quality if isinstance(snapshot_quality, dict) else {},
             },
+        }
+
+    def _memory_review_display(self, entry: dict[str, Any]) -> dict[str, Any]:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        source_text = str(entry.get("source_text") or "")
+        normalized = " ".join(source_text.split())
+
+        def field(pattern: str) -> str:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            return str(match.group(1) if match else "").strip()
+
+        is_session_boundary = normalized.casefold().startswith(
+            "synapse-s2 mcp client session ended."
+        )
+        agent = str(metadata.get("agent_id") or "").strip() or field(
+            r"\bAgent:\s*([A-Za-z0-9._-]+)"
+        )
+        session_id = str(metadata.get("cortex_session_id") or "").strip() or field(
+            r"\bSession ID:\s*([A-Za-z0-9._-]+)"
+        )
+        reason = field(r"\bReason:\s*([A-Za-z0-9._-]+)")
+        duration_raw = field(r"\bDuration seconds:\s*([0-9]+(?:\.[0-9]+)?)")
+        duration_seconds = float(duration_raw) if duration_raw else None
+        task = str(metadata.get("task") or "").strip()
+        task_is_bootstrap = bool(
+            re.fullmatch(
+                r"Hydrate SYNAPSE-S2 context for [A-Za-z0-9._-]+ local MCP client startup\.",
+                task,
+                flags=re.IGNORECASE,
+            )
+        )
+        captured_work_topic = task if task and not task_is_bootstrap else ""
+
+        if is_session_boundary:
+            display_title = f"{agent or 'MCP client'} session ended"
+            summary_parts = []
+            if session_id:
+                summary_parts.append(f"session {session_id[:12]}")
+            if duration_seconds is not None:
+                total_seconds = max(0, int(round(duration_seconds)))
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                if hours:
+                    duration_label = f"{hours}h {minutes}m"
+                elif minutes:
+                    duration_label = f"{minutes}m {seconds}s"
+                else:
+                    duration_label = f"{seconds}s"
+                summary_parts.append(f"ran {duration_label}")
+            if reason:
+                summary_parts.append(f"ended by {reason}")
+            display_summary = "; ".join(summary_parts) or "Recorded MCP client session closure."
+            purpose = captured_work_topic or "No work topic was captured in this lifecycle record."
+            record_kind = "client-session-lifecycle"
+        else:
+            display_title = str(metadata.get("display_summary") or "").strip()
+            if not display_title:
+                display_title = str(entry.get("tag") or "Memory record").replace("-", " ")
+            display_title = self._compact_text(display_title, 120)
+            display_summary = self._compact_text(normalized, 240)
+            purpose = captured_work_topic or "No separate work topic was captured for this record."
+            record_kind = "memory-trace"
+
+        return {
+            "display_title": display_title,
+            "display_summary": display_summary,
+            "work_topic": purpose,
+            "work_topic_captured": bool(captured_work_topic),
+            "record_kind": record_kind,
+            "agent_id": agent,
+            "session_id": session_id,
+            "session_end_reason": reason,
+            "duration_seconds": duration_seconds,
         }
 
     def _memory_hygiene_recommendations(self, queue_summary: dict[str, int]) -> list[str]:
@@ -5089,6 +5345,12 @@ class DashboardRuntime:
         if len(text) <= limit:
             return text
         return text[: max(0, limit - 1)].rstrip() + "..."
+
+    def _bounded_utf8_text(self, value: str, limit_bytes: int) -> tuple[str, bool]:
+        encoded = str(value or "").encode("utf-8")
+        if len(encoded) <= limit_bytes:
+            return encoded.decode("utf-8"), False
+        return encoded[:limit_bytes].decode("utf-8", errors="ignore"), True
 
     def _render_wrap_session_text(
         self,
