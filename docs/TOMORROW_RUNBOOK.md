@@ -174,6 +174,7 @@ Restart Codex, Claude Desktop, and Claude Code after the client-config installer
 - Compact/full memory-list, memory-graph, and Cortex-state reads expose exact authoritative totals and authenticated keyset continuation. A cursor is bound to contract version, response mode, context, scope, filters, ordering, snapshot revision, expiry, and origin node. Cortex cursors additionally bind the frozen live active-session view. A stale, expired, altered, wrong-context, wrong-mode, wrong-filter, or cross-origin cursor fails closed instead of restarting at page one.
 - Compact hydration preserves a one-to-one mapping from every leased `receipt_id` to a visible deployment event. Projection failure releases acquired leases; only a later exact-receipt acknowledgement advances durable delivery state.
 - A deterministic no-effect ACK, release, or dead-letter request becomes a terminal `failed` / `invalid_request` journal row; a genuinely uncertain commit remains `outcome_unknown` and is never replayed. Credential-shaped delivery identifiers fail before journal admission. Terminal rows retain dedup evidence until age-based pruning, so total retained-row throughput remains finite even though deterministic rejects do not consume accepted-row capacity.
+- Evidence-only request-journal reconciliation applies only to an exact explicit `ambiguous` row. It leaves the schema-v3 source row unchanged, appends a signed maintenance receipt, never authorizes replay, and never recovers journal capacity. `accepted` rows are inventory-only and cannot be terminally adjudicated through this surface.
 - Raw `register_trace` and `query` vectors must match the configured dimension before journal admission. The exact steady float32 dense topology must fit 384 MiB before MLX loading, materialization, or resize; this is not peak-residency, target-hardware, or execution-time proof.
 - Critical/high, action-required, and protected contract warnings survive compact projection. Noncritical warnings may be omitted only as complete items with a truthful omission count. MCP consumers must treat `structuredContent` as authoritative; safety text is a bounded decision aid.
 - The loopback dashboard stays on its rich local API. The MCP compact profile does not reduce Namespace Galaxy, ganglion, neuron, or graph inspection payloads in the browser.
@@ -202,6 +203,133 @@ If `ready` is false, inspect `failed_checks` first. The common checks are:
 | `native_certification_ready` | Strict MLX/mlxsnn certification failed. | Run `synapse_cli.py --json certify-runtime --strict-native --benchmark-quick-prune --require-resource-envelope` and inspect `failed_checks`. |
 | `effective_enabled` | The selected context is disabled. | Run `synapse_cli.py --json enable --context default`. |
 | `query_returned_context` | Recall did not return a registered context. | Seed or remember a matching trace, then query again. |
+
+## Request-journal evidence reconciliation
+
+This runbook section is source-only until a governed update is separately
+approved and installed. Do not treat the repository commands or tests as proof
+that the current LaunchAgents expose this feature. Before any live
+reconciliation, re-run authoritative status, prove installed build/source
+identity, require the normal capture/ledger/integrity gates, and create and
+verify a fresh paired recovery point. Do not restart, replace, or update the
+core merely because this source section exists.
+
+### 1. Inventory without changing the journal
+
+Use a bounded content-free inventory. A filtered view can make review easier:
+
+```bash
+.venv/bin/python synapse_cli.py --json request-journal-inventory \
+  --state ambiguous \
+  --limit 100
+```
+
+The response contains two revision domains:
+
+- `snapshot_revision` binds the exact state/filter selection shown on that
+  page. Use it with `--expected-snapshot-revision` for keyset continuation.
+- `reconciliation_guard.snapshot_revision` always binds the complete,
+  unfiltered `accepted` plus `ambiguous` candidate set, excluding the
+  reconciliation RPC's own rows. Use only this guard token for the mutation.
+
+If `has_more` is true, preserve the page revision and both continuation keys:
+
+```bash
+.venv/bin/python synapse_cli.py --json request-journal-inventory \
+  --state ambiguous \
+  --limit 100 \
+  --after-caller '<next_after_caller>' \
+  --after-request-id '<next_after_request_id>' \
+  --expected-snapshot-revision '<page_snapshot_revision>'
+```
+
+Only an item with `state: "ambiguous"`,
+`reconciliation_eligible: true`, `replay_safe: false`, and an unresolved
+reconciliation status can proceed. Do not use `accepted` as a synonym for
+failed or no-effect. Do not infer an outcome from age, missing response cache,
+capacity pressure, or an empty search result.
+
+### 2. Review authoritative evidence
+
+Require independent readback that binds the exact caller, request ID,
+operation, authority epoch, journal/store identity, and relevant durable
+effect. Retain the evidence outside the receipt and calculate only its
+content-free lowercase SHA-256 for submission. The closed matrix is:
+
+| Disposition | Permitted evidence kind |
+| :--- | :--- |
+| `confirmed_completed` | `authoritative_effect_readback`, `event_ledger_readback`, `signed_artifact_verification`, or `signed_operation_receipt` |
+| `confirmed_no_effect` | `authoritative_no_effect_readback` |
+| `superseded` | `authoritative_effect_readback`, `event_ledger_readback`, or `signed_operation_receipt` |
+
+Stop if evidence is indirect, contradictory, incomplete, cross-store, or cannot
+prove the requested disposition. `confirmed_no_effect` requires positive
+no-effect evidence. `superseded` requires a separately governed surviving
+effect; it is not a generic stale/dismissed category.
+
+### 3. Append one exact signed classification
+
+Process one target per confirmed mutation. Copy every compare-and-swap value
+from the reviewed inventory item, use the global reconciliation guard token,
+and predeclare the outer request ID:
+
+```bash
+.venv/bin/python synapse_cli.py --json request-journal-reconcile \
+  --caller '<target_caller>' \
+  --request-id '<target_request_id>' \
+  --expected-operation '<target_operation>' \
+  --expected-authority-epoch '<target_authority_epoch>' \
+  --expected-entry-revision '<target_entry_revision>' \
+  --expected-journal-id '<journal_id>' \
+  --inventory-snapshot-revision '<reconciliation_guard.snapshot_revision>' \
+  --disposition '<confirmed_completed|confirmed_no_effect|superseded>' \
+  --evidence-kind '<permitted_kind_for_the_disposition>' \
+  --evidence-sha256 '<reviewed_evidence_sha256>' \
+  --core-request-id '<predeclared_reconciliation_request_id>' \
+  --confirm
+```
+
+The core re-reads the complete guard snapshot and exact target before it writes.
+A changed snapshot, entry, state, journal/store binding, operation, authority
+epoch, or evidence pair returns a conflict; restart review instead of weakening
+the CAS. Exact semantic resubmission is idempotent and returns the same signed
+receipt. A different classification for the same target conflicts.
+
+If the command times out or loses its response, preserve the outer
+caller/request handle and use `request-status`. Never generate another logical
+request ID to force a retry. The target request remains non-replayable before
+and after reconciliation.
+
+### 4. Validate raw and adjudicated state
+
+Re-run status and inventory after every classification. Require:
+
+- the original v3 row still exists as `ambiguous` and remains
+  `replay_safe: false`;
+- the item reports one verified signed reconciliation receipt with the reviewed
+  disposition and evidence digest;
+- `explicit_ambiguous_count = reconciled_explicit_ambiguous_count +
+  unresolved_explicit_ambiguous_count`;
+- `reconciliation_record_count` includes the receipt and
+  `reconciliation_signatures_verified` is true;
+- the broader cache-sensitive `ambiguous_count` is not treated as the explicit
+  source-row count or used in the reconciliation arithmetic;
+- `used_rows` and `accepted_capacity_remaining` did not improve merely because
+  a row was reconciled; and
+- ordinary core, capture, ledger, database-integrity, recovery, and recall gates
+  remain healthy.
+
+The receipt lives in the existing recoverable maintenance ledger and is signed
+by the established local recovery authority. The journal remains v3; no
+request row is rewritten, pruned, dismissed, or moved to a terminal state.
+
+The source exposes the same contract through MCP
+`list_core_request_journal` / `reconcile_core_request_journal` and authenticated
+dashboard backend `POST /api/request-journal/inventory` /
+`POST /api/request-journal/reconcile`. The dashboard mutation accepts one exact
+target only and requires `reviewed=true`, `confirm=true`, and a predeclared
+`core_request_id`. These backend routes do not prove that an installed browser
+review panel exists.
 
 ## Daily Operator Trust Loop
 
@@ -698,8 +826,11 @@ ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune
 controls, memory graph edges, context deployments, guarded graph pruning,
 recall results, quick-pruning, deep-sleep, and backup controls. Its loopback HTTP
 API intentionally keeps the rich graph and visualization payloads; installed
-MCP compact budgets do not reduce browser data. The installer health check and
-the fixed-port-free smoke below authenticate through the same cookie-plus-header
+MCP compact budgets do not reduce browser data. The source backend additionally
+has authenticated POST-only request-journal inventory and exact single-target
+reconciliation routes; availability of those routes does not claim a deployed
+browser reconciliation panel. The installer health check and the
+fixed-port-free smoke below authenticate through the same cookie-plus-header
 contract:
 
 ```bash

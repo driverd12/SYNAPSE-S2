@@ -287,6 +287,173 @@ Installers walk existing path components without following application-owned
 symlinks, reject foreign or hard-linked targets, and never repair safety by
 changing permissions on an existing caller-owned directory.
 
+## Evidence-only request-journal reconciliation
+
+This section documents source capability, not installed authority. Until a
+separately approved build replacement installs the source, verifies the live
+build/store identity, and creates and proves a fresh paired recovery point, do
+not invoke these surfaces against the authoritative store. Source validation
+does not reconcile any live request.
+
+The reconciliation feature does not migrate or rewrite
+`.synapse_s2/core/requests.sqlite3`. The request journal remains schema v3 and
+every source row is unchanged by reconciliation. Reconciliation is a distinct signed
+classification receipt in the authoritative memory database's existing
+`store_maintenance_receipts` ledger. Because it does not alter the journal, it
+cannot recover row capacity, dismiss an ambiguity, or make an old request safe
+to replay.
+
+### Eligibility and evidence contract
+
+Only an original row whose exact durable state is `ambiguous` is eligible.
+`accepted` can still represent in-flight or outcome-unknown work and cannot be
+terminally adjudicated here. `completed` and `failed` already have terminal
+journal semantics and are also ineligible. Reconciliation operations are
+excluded from candidate inventories so admission of the governance mutation
+cannot invalidate its own snapshot.
+
+The disposition/evidence pair is a closed matrix:
+
+| Disposition | Permitted evidence kind |
+| --- | --- |
+| `confirmed_completed` | `authoritative_effect_readback`, `event_ledger_readback`, `signed_artifact_verification`, or `signed_operation_receipt` |
+| `confirmed_no_effect` | `authoritative_no_effect_readback` |
+| `superseded` | `authoritative_effect_readback`, `event_ledger_readback`, or `signed_operation_receipt` |
+
+The evidence digest is a lowercase SHA-256 of separately retained,
+authoritative evidence. It is not a digest of untrusted raw request text and it
+does not place private request arguments, response content, or memory text in
+the receipt. `confirmed_no_effect` requires affirmative authoritative no-effect
+readback; absence of a convenient result is not sufficient. `superseded`
+means a later, independently governed result now carries the intended effect;
+it does not imply that the original request was harmless or replayable.
+
+### Snapshot and exact-target gate
+
+An inventory may be filtered for review, but it returns two revisions with
+different purposes. `snapshot_revision` binds the selected states and filters;
+use it only for keyset continuation. The separate
+`reconciliation_guard.snapshot_revision` always binds the complete unfiltered
+`accepted` plus `ambiguous` candidate set and is the only token accepted by the
+reconciliation mutation:
+
+```bash
+.venv/bin/python synapse_cli.py --json request-journal-inventory \
+  --limit 100
+
+.venv/bin/python synapse_cli.py --json request-journal-inventory \
+  --limit 100 \
+  --after-caller '<next_after_caller>' \
+  --after-request-id '<next_after_request_id>' \
+  --expected-snapshot-revision '<page_snapshot_revision>'
+```
+
+The inventory is read-only, content-free, bounded to 100 rows per page, and
+ordered by `(caller, request_id)`. Every continuation must carry the first
+page's `snapshot_revision`. Restart review if that revision conflicts. The
+mutation must instead carry `reconciliation_guard.snapshot_revision`; this
+prevents an unrelated accepted or ambiguous row from changing unnoticed even
+when the reviewed page used narrower filters.
+
+For one reviewed explicit-ambiguous row, bind every immutable value returned by
+the inventory and predeclare a request ID for the reconciliation mutation:
+
+```bash
+.venv/bin/python synapse_cli.py --json request-journal-reconcile \
+  --caller '<target_caller>' \
+  --request-id '<target_request_id>' \
+  --expected-operation '<target_operation>' \
+  --expected-authority-epoch '<target_authority_epoch>' \
+  --expected-entry-revision '<target_entry_revision>' \
+  --expected-journal-id '<journal_id>' \
+  --inventory-snapshot-revision '<reconciliation_guard.snapshot_revision>' \
+  --disposition '<confirmed_completed|confirmed_no_effect|superseded>' \
+  --evidence-kind '<permitted_kind_for_the_disposition>' \
+  --evidence-sha256 '<reviewed_evidence_sha256>' \
+  --core-request-id '<predeclared_reconciliation_request_id>' \
+  --confirm
+```
+
+The core rechecks the complete inventory revision, journal ID, store identity,
+caller, target request ID, operation, authority epoch, entry revision, and
+original `ambiguous` state before appending one receipt. It injects the
+authenticated local principal instead of accepting a caller-supplied actor.
+Any changed binding, malformed evidence, unsupported pair, non-ambiguous row,
+or missing `--confirm` fails closed. Exact semantic resubmission is idempotent;
+a different classification for an already reconciled target conflicts.
+
+The signed receipt schema is
+`synapse-s2.request-journal-reconciliation-receipt.v1`. Each receipt binds its
+resolution ID, journal and store identities, exact target values, inventory
+revision, disposition, evidence kind and digest, authenticated actor,
+timestamp, `replay_safe: false`, public verification key, receipt digest, and
+Ed25519 signature. Post-commit readback verifies that exact record. The signing
+authority for a new local receipt is the existing audited recovery-receipt
+authority; this feature does not create a second key or a second
+request-journal database.
+
+Embedded receipts are trusted for live health and recovery eligibility only
+when their signature verifies and the signing key is one of three explicit
+authorities: the local recovery-receipt key, a key ID deliberately configured
+through the existing reviewed `SYNAPSE_S2_TRUSTED_BACKUP_KEY_IDS` contract, or
+the signing key of an active, non-revoked `receive` peer in the verified
+replication ledger. A cryptographically valid self-signed receipt from any
+other key is untrusted. So is any receipt whose journal ID or store identity
+does not match the live authority binding.
+
+The replication manager supplies active receive-peer key IDs through a dynamic
+provider. Each validation reads current verified ledger state, so an approved
+peer addition can authorize its already-signed carried receipts and revocation
+removes that authority from subsequent health, backup, and recovery checks.
+This does not copy, share, or replace either Mac's recovery private key. A
+`send` peer, revoked peer, stale descriptor, or ledger row that fails integrity
+does not enter the trust set.
+
+If the reconciliation response is lost, preserve its outer caller/request
+handle and use `request-status`. Do not send a new logical reconciliation and
+do not replay the target request. A receipt classifies evidence only; it never
+authorizes generic retry.
+
+### Health and supported adapters
+
+Request-journal health retains the raw source count and adds a distinct signed
+receipt projection:
+
+- `explicit_ambiguous_count` is the number of immutable source rows whose state
+  remains `ambiguous`.
+- `reconciled_explicit_ambiguous_count` is the number of those rows with a valid
+  locally trusted signed receipt.
+- `unresolved_explicit_ambiguous_count` is raw minus reconciled.
+- `reconciliation_record_count` is the number of bound reconciliation receipts.
+- `reconciliation_signatures_verified` is true only when the complete receipt
+  inventory verifies.
+
+The existing `ambiguous_count` has different semantics: it is a broader,
+cache-sensitive outcome-unknown projection that can include accepted rows and
+terminal rows whose process-local response is no longer present. Never use it
+as the explicit source-row count or subtract reconciliations from it.
+
+The invariant is `explicit_ambiguous_count =
+reconciled_explicit_ambiguous_count +
+unresolved_explicit_ambiguous_count`. Neither `used_rows` nor
+`accepted_capacity_remaining` changes because of reconciliation. Receipt
+verification, signer-authorization, or target-binding failure makes
+request-journal health fail closed.
+
+Supported source adapters are:
+
+- CLI: `request-journal-inventory` and `request-journal-reconcile`.
+- MCP: read-only `list_core_request_journal` and confirmed
+  `reconcile_core_request_journal`.
+- Authenticated dashboard backend: `POST /api/request-journal/inventory` and
+  `POST /api/request-journal/reconcile`.
+
+The dashboard reconciliation route accepts one exact field set only and
+requires `reviewed=true`, `confirm=true`, and a predeclared `core_request_id`.
+The backend route does not claim a deployed browser review panel. No adapter
+may offer bulk reconciliation, a generic dismiss/reclassify operation, direct
+journal mutation, or a replay button.
+
 ## First cutover or replacement
 
 1. For a first cutover from local-v5, publish the exact installer-derived
@@ -948,6 +1115,28 @@ through isolated materialization. A changed receipt or artifact fails before
 the output root is created. With all required pins supplied, a foreign governed
 bundle can complete isolated restore and reverify its bound journal and runtime;
 partial pinning is not accepted.
+
+Before a governed database is eligible for backup, verification, or recovery,
+its complete request-journal reconciliation receipt set is also scanned. Every
+receipt must have a valid digest/signature, match the exact live
+request-journal/store binding, and be signed by the local recovery key, an
+explicitly configured trusted backup key ID, or a current active non-revoked
+`receive` peer key from the verified replication ledger. An unrelated
+self-signed receipt or foreign journal/store binding fails eligibility instead
+of being sealed into a new trusted recovery point. Do not delete or rewrite the
+receipt to bypass this gate; repair the trust/binding evidence or use a
+separately reviewed recovery decision.
+
+Receive-peer trust is evaluated dynamically. The running replication manager
+supplies it during normal operation; offline audit, core-maintenance, readiness,
+and recovery paths reopen the existing signed replication ledger through a
+strictly read-only verifier. They never create or repair a ledger, and pending,
+incomplete, rolled-back, or invalid anchor/witness state fails closed. Peer
+add/revoke therefore affects the next health and recovery eligibility check
+without exporting or copying recovery private keys. Revoking a peer can make
+its previously carried receipts untrusted and intentionally block new backup or
+recovery evidence until the resulting authority condition is governed. Merely
+having a valid foreign public key or transport signature is insufficient.
 
 Path authorization currently pins the reviewed root, parent, and target with
 no-follow descriptors, validates ownership/link count/mode and containment, and

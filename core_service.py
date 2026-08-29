@@ -82,7 +82,12 @@ from cortex_contract import (
     canonicalize_validation_evidence,
     has_concrete_validation_evidence,
 )
-from memory_store import ContextDeliveryRejected, LOGICAL_SNAPSHOT_DIGEST_SCHEMA
+from memory_store import (
+    ContextDeliveryRejected,
+    LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
+    REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX,
+    RequestJournalReconciliationRejected,
+)
 from redaction import (
     SECRET_SAFE_LOG_FORMAT,
     SecretRedactingFormatter,
@@ -430,6 +435,24 @@ _CONTRACT_LIST = (
         "caller request_id",
         "caller request_id",
         retry_safe=True,
+    ),
+    _contract(
+        "request_journal_inventory",
+        "states caller operation limit after_caller after_request_id "
+        "expected_snapshot_revision",
+        retry_safe=True,
+    ),
+    _contract(
+        "reconcile_request_journal",
+        "target_caller target_request_id expected_operation "
+        "expected_authority_epoch expected_entry_revision "
+        "expected_journal_id inventory_snapshot_revision disposition "
+        "evidence_kind evidence_sha256 confirm",
+        "target_caller target_request_id expected_operation "
+        "expected_authority_epoch expected_entry_revision "
+        "expected_journal_id inventory_snapshot_revision disposition "
+        "evidence_kind evidence_sha256 confirm",
+        mutation=True,
     ),
     _contract("status", "context_id", retry_safe=True),
     _contract("is_enabled", "context_id", retry_safe=True),
@@ -869,7 +892,14 @@ CORE_OPERATION_CONTRACTS: Mapping[str, OperationContract] = MappingProxyType(
 SAFE_READ_OPERATIONS = frozenset(
     name for name, contract in CORE_OPERATION_CONTRACTS.items() if contract.retry_safe
 )
-SERVICE_CONTROL_OPERATIONS = frozenset({"health", "request_status"})
+SERVICE_CONTROL_OPERATIONS = frozenset(
+    {
+        "health",
+        "request_status",
+        "request_journal_inventory",
+        "reconcile_request_journal",
+    }
+)
 REPLICATION_OPERATIONS = frozenset(
     {
         "replication_identity",
@@ -1201,6 +1231,19 @@ def _schema(**rules: _ArgumentRule) -> Mapping[str, _ArgumentRule]:
 # is a startup error instead of an unvalidated path into the durable journal.
 MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingProxyType(
     {
+        "reconcile_request_journal": _schema(
+            target_caller=_IDENTIFIER,
+            target_request_id=_IDENTIFIER,
+            expected_operation=_IDENTIFIER,
+            expected_authority_epoch=_IDENTIFIER,
+            expected_entry_revision=_DIGEST,
+            expected_journal_id=_IDENTIFIER,
+            inventory_snapshot_revision=_DIGEST,
+            disposition=_SHORT_STRING,
+            evidence_kind=_SHORT_STRING,
+            evidence_sha256=_DIGEST,
+            confirm=_TRUE,
+        ),
         "set_enabled": _schema(enabled=_BOOL, context_id=_OPTIONAL_IDENTIFIER),
         "register_text_trace": _schema(
             tag=_SHORT_STRING,
@@ -1889,6 +1932,17 @@ def _validate_mutation_arguments(
             "reject",
         }:
             raise CoreProtocolError()
+    if operation == "reconcile_request_journal":
+        disposition = str(arguments.get("disposition") or "")
+        evidence_kind = str(arguments.get("evidence_kind") or "")
+        if (
+            evidence_kind
+            not in REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX.get(
+                disposition,
+                frozenset(),
+            )
+        ):
+            raise CoreProtocolError()
     if operation in {"benchmark_resource_profile", "certify_runtime"}:
         minimum = arguments.get("target_min_mb")
         maximum = arguments.get("target_max_mb")
@@ -1908,6 +1962,7 @@ _GOVERNANCE_ACTOR_FIELDS: Mapping[str, str] = MappingProxyType(
         "promote_memora_binding": "reviewed_by",
         "reject_memora_binding": "reviewed_by",
         "revoke_memora_binding": "revoked_by",
+        "reconcile_request_journal": "reconciled_by",
     }
 )
 _MEMORA_GOVERNANCE_ACTOR_OPERATIONS = frozenset(
@@ -5113,6 +5168,157 @@ class AuthoritativeCoreService:
             safe_error_code=None if error is None else error["code"],
         )
 
+    def _request_journal_inventory_result(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        journal = self._request_journal
+        store = getattr(self._backend, "memory_store", None)
+        receipt_inventory = getattr(
+            store,
+            "request_journal_reconciliation_inventory",
+            None,
+        )
+        if journal is None or not callable(receipt_inventory):
+            raise CoreRequestJournalError()
+        result = journal.inventory(**dict(arguments))
+        journal_id = result.get("journal_id")
+        store_identity = result.get("store_identity")
+        if not isinstance(journal_id, str) or not isinstance(store_identity, str):
+            raise CoreRequestJournalError()
+        reconciliations = receipt_inventory(
+            request_journal_id=journal_id,
+            store_identity=store_identity,
+        )
+        journal.review_reconciliation_targets(
+            reconciliations["items"],
+            expected_journal_id=journal_id,
+        )
+        indexed = {
+            (item["target_caller"], item["target_request_id"]): item
+            for item in reconciliations["items"]
+        }
+        reconciled_in_page = 0
+        for item in result["items"]:
+            receipt = indexed.get((item["caller"], item["request_id"]))
+            if receipt is None:
+                item["reconciliation"] = {
+                    "status": "unresolved",
+                    "resolution_id": None,
+                    "disposition": None,
+                    "evidence_kind": None,
+                    "evidence_sha256": None,
+                    "reconciled_by": None,
+                    "reconciled_at_unix_ms": None,
+                    "receipt_digest": None,
+                    "signature_verified": False,
+                    "replay_safe": False,
+                }
+            else:
+                reconciled_in_page += 1
+                item["reconciliation_eligible"] = False
+                item["reconciliation"] = {
+                    "status": "reconciled",
+                    "resolution_id": receipt["resolution_id"],
+                    "disposition": receipt["disposition"],
+                    "evidence_kind": receipt["evidence_kind"],
+                    "evidence_sha256": receipt["evidence_sha256"],
+                    "reconciled_by": receipt["reconciled_by"],
+                    "reconciled_at_unix_ms": receipt[
+                        "reconciled_at_unix_ms"
+                    ],
+                    "receipt_digest": receipt["receipt_digest"],
+                    "signature_verified": receipt["signature_verified"],
+                    "replay_safe": False,
+                }
+        result["reconciliation_summary"] = {
+            "record_count": int(reconciliations["count"]),
+            "reconciled_in_page": reconciled_in_page,
+            "all_signatures_verified": bool(
+                reconciliations["all_signatures_verified"]
+            ),
+            "original_journal_rows_preserved": True,
+            "generic_replay_authorized": False,
+        }
+        result["reconciliation_contract"] = {
+            "eligible_original_state": "ambiguous",
+            "dispositions": {
+                disposition: sorted(evidence_kinds)
+                for disposition, evidence_kinds in sorted(
+                    REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX.items()
+                )
+            },
+            "inventory_snapshot_source": (
+                "reconciliation_guard.snapshot_revision"
+            ),
+            "exact_confirmation_required": True,
+            "original_journal_rows_preserved": True,
+            "generic_replay_authorized": False,
+        }
+        return result
+
+    def _reconcile_request_journal_result(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        journal = self._request_journal
+        store = getattr(self._backend, "memory_store", None)
+        reconcile = getattr(store, "reconcile_request_journal", None)
+        if journal is None or not callable(reconcile):
+            raise CoreRequestJournalError()
+        try:
+            # Reconciliation-RPC rows are intentionally excluded from this
+            # candidate snapshot, so admitting this exact governance mutation
+            # cannot invalidate its own reviewed CAS token.
+            journal.inventory(
+                states=("accepted", "ambiguous"),
+                limit=1,
+                expected_snapshot_revision=str(
+                    arguments["inventory_snapshot_revision"]
+                ),
+            )
+            target = journal.review_reconciliation_target(
+                caller=str(arguments["target_caller"]),
+                request_id=str(arguments["target_request_id"]),
+                expected_operation=str(arguments["expected_operation"]),
+                expected_authority_epoch=str(
+                    arguments["expected_authority_epoch"]
+                ),
+                expected_entry_revision=str(
+                    arguments["expected_entry_revision"]
+                ),
+                expected_journal_id=str(arguments["expected_journal_id"]),
+            )
+        except CoreRequestJournalError as exc:
+            raise RequestJournalReconciliationRejected(
+                "request reconciliation review changed"
+            ) from exc
+        if (
+            target.get("store_identity") is None
+            or target.get("store_identity") != self._identity["store_identity"]
+        ):
+            raise RequestJournalReconciliationRejected(
+                "request reconciliation store binding changed"
+            )
+        return reconcile(
+            request_journal_id=str(target["journal_id"]),
+            store_identity=str(target["store_identity"]),
+            target_caller=str(target["caller"]),
+            target_request_id=str(target["request_id"]),
+            target_operation=str(target["operation"]),
+            target_authority_epoch=str(target["authority_epoch"]),
+            target_original_state="ambiguous",
+            target_entry_revision=str(target["entry_revision"]),
+            inventory_snapshot_revision=str(
+                arguments["inventory_snapshot_revision"]
+            ),
+            disposition=str(arguments["disposition"]),
+            evidence_kind=str(arguments["evidence_kind"]),
+            evidence_sha256=str(arguments["evidence_sha256"]),
+            reconciled_by=str(arguments["reconciled_by"]),
+            confirm=bool(arguments["confirm"]),
+        )
+
     def _execute_request(
         self,
         request: dict[str, Any],
@@ -5202,7 +5408,7 @@ class AuthoritativeCoreService:
             except CoreProtocolError:
                 return self._response(request, error=safe_error("operation_failed"))
             return response
-        if contract.name == "request_status":
+        if contract.name in {"request_status", "request_journal_inventory"}:
             for token in path_tokens:
                 token.close()
             journal = self._request_journal
@@ -5212,17 +5418,39 @@ class AuthoritativeCoreService:
                     error=safe_error("service_unavailable", retryable=True),
                 )
             try:
-                result = journal.request_status(**request["arguments"])
+                result = (
+                    journal.request_status(**request["arguments"])
+                    if contract.name == "request_status"
+                    else self._request_journal_inventory_result(
+                        request["arguments"]
+                    )
+                )
                 response = self._response(request, result=result)
                 self._bounded_response_bytes(response)
-            except (CoreRequestJournalError, OSError, sqlite3.Error):
-                LOGGER.error("mutation request reconciliation unavailable")
+            except CoreRequestJournalError as exc:
+                if exc.code in {"invalid_request", "request_conflict"}:
+                    return self._response(
+                        request,
+                        error=safe_error(exc.code, retryable=True),
+                    )
+                LOGGER.error("request-journal inventory unavailable")
+                return self._response(
+                    request,
+                    error=safe_error("service_unavailable", retryable=True),
+                )
+            except (
+                RequestJournalReconciliationRejected,
+                OSError,
+                RuntimeError,
+                sqlite3.Error,
+            ):
+                LOGGER.error("request-journal inventory unavailable")
                 return self._response(
                     request,
                     error=safe_error("service_unavailable", retryable=True),
                 )
             except CoreProtocolError:
-                LOGGER.error("mutation request reconciliation response invalid")
+                LOGGER.error("request-journal inventory response invalid")
                 return self._response(request, error=safe_error("operation_failed"))
             return response
 
@@ -5336,7 +5564,15 @@ class AuthoritativeCoreService:
                         token.assert_stable()
                     self._assert_live_authority()
                     with self._backend_execution_context():
-                        result = self._handlers[contract.name](**authorized_arguments)
+                        result = (
+                            self._reconcile_request_journal_result(
+                                authorized_arguments
+                            )
+                            if contract.name == "reconcile_request_journal"
+                            else self._handlers[contract.name](
+                                **authorized_arguments
+                            )
+                        )
                     self._assert_live_authority()
                     response = self._response(request, result=result)
                     self._bounded_response_bytes(response)
@@ -5393,6 +5629,18 @@ class AuthoritativeCoreService:
                     except (CoreRequestJournalError, OSError, sqlite3.Error):
                         LOGGER.error(
                             "governance rejection could not be finalized"
+                        )
+                    return self._cache_mutation_response(request, response)
+                except RequestJournalReconciliationRejected:
+                    response = self._response(
+                        request,
+                        error=safe_error("request_conflict"),
+                    )
+                    try:
+                        self._journal_finish(request, response)
+                    except (CoreRequestJournalError, OSError, sqlite3.Error):
+                        LOGGER.error(
+                            "request-journal reconciliation conflict could not be finalized"
                         )
                     return self._cache_mutation_response(request, response)
                 except ContextDeliveryRejected:
@@ -5544,6 +5792,10 @@ class AuthoritativeCoreService:
             "failed_count": 0,
             "explicit_ambiguous_count": 0,
             "ambiguous_count": 0,
+            "reconciliation_record_count": 0,
+            "reconciled_explicit_ambiguous_count": 0,
+            "unresolved_explicit_ambiguous_count": 0,
+            "reconciliation_signatures_verified": False,
             "last_prune_age_ms": None,
             "max_rows": 0,
             "used_rows": 0,
@@ -5558,8 +5810,72 @@ class AuthoritativeCoreService:
                 journal_health = self._request_journal.health(
                     exact_response_keys=self._cached_request_keys()
                 )
+                journal_health.update(
+                    {
+                        "reconciliation_record_count": 0,
+                        "reconciled_explicit_ambiguous_count": 0,
+                        "unresolved_explicit_ambiguous_count": int(
+                            journal_health["explicit_ambiguous_count"]
+                        ),
+                        "reconciliation_signatures_verified": False,
+                    }
+                )
+                store = getattr(self._backend, "memory_store", None)
+                receipt_inventory = getattr(
+                    store,
+                    "request_journal_reconciliation_inventory",
+                    None,
+                )
+                binding = self._request_journal.binding()
+                if (
+                    callable(receipt_inventory)
+                    and isinstance(binding.get("journal_id"), str)
+                    and isinstance(binding.get("store_identity"), str)
+                ):
+                    reconciliations = receipt_inventory(
+                        request_journal_id=binding["journal_id"],
+                        store_identity=binding["store_identity"],
+                    )
+                    self._request_journal.review_reconciliation_targets(
+                        reconciliations["items"],
+                        expected_journal_id=binding["journal_id"],
+                    )
+                    reconciled_count = int(reconciliations["count"])
+                    raw_count = int(
+                        journal_health["explicit_ambiguous_count"]
+                    )
+                    if reconciled_count > raw_count:
+                        raise CoreRequestJournalError()
+                    journal_health.update(
+                        {
+                            "reconciliation_record_count": reconciled_count,
+                            "reconciled_explicit_ambiguous_count": (
+                                reconciled_count
+                            ),
+                            "unresolved_explicit_ambiguous_count": (
+                                raw_count - reconciled_count
+                            ),
+                            "reconciliation_signatures_verified": bool(
+                                reconciliations[
+                                    "all_signatures_verified"
+                                ]
+                            ),
+                        }
+                    )
             except (CoreRequestJournalError, OSError, sqlite3.Error):
                 LOGGER.error("mutation request journal health failed")
+                journal_health["ready"] = False
+                journal_health["blocker"] = (
+                    "request_journal_reconciliation_invalid"
+                )
+            except Exception:
+                LOGGER.error(
+                    "request-journal reconciliation health failed"
+                )
+                journal_health["ready"] = False
+                journal_health["blocker"] = (
+                    "request_journal_reconciliation_invalid"
+                )
         ready = (
             self._started_event.is_set()
             and not self._stop_event.is_set()

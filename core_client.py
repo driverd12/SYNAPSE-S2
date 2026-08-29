@@ -433,6 +433,72 @@ class CoreClient:
             {"caller": caller, "request_id": request_id},
         )
 
+    def request_journal_inventory(
+        self,
+        *,
+        states: list[str] | tuple[str, ...] | None = None,
+        caller: str | None = None,
+        operation: str | None = None,
+        limit: int = 25,
+        after_caller: str | None = None,
+        after_request_id: str | None = None,
+        expected_snapshot_revision: str | None = None,
+    ) -> dict[str, Any]:
+        return self.call(
+            "request_journal_inventory",
+            {
+                "states": states,
+                "caller": caller,
+                "operation": operation,
+                "limit": limit,
+                "after_caller": after_caller,
+                "after_request_id": after_request_id,
+                "expected_snapshot_revision": expected_snapshot_revision,
+            },
+        )
+
+    def reconcile_request_journal(
+        self,
+        *,
+        target_caller: str,
+        target_request_id: str,
+        expected_operation: str,
+        expected_authority_epoch: str,
+        expected_entry_revision: str,
+        expected_journal_id: str,
+        inventory_snapshot_revision: str,
+        disposition: str,
+        evidence_kind: str,
+        evidence_sha256: str,
+        request_id: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or request_id != request_id.strip()
+        ):
+            raise ValueError(
+                "request-journal reconciliation requires a predeclared request_id"
+            )
+        return self.call(
+            "reconcile_request_journal",
+            {
+                "target_caller": target_caller,
+                "target_request_id": target_request_id,
+                "expected_operation": expected_operation,
+                "expected_authority_epoch": expected_authority_epoch,
+                "expected_entry_revision": expected_entry_revision,
+                "expected_journal_id": expected_journal_id,
+                "inventory_snapshot_revision": inventory_snapshot_revision,
+                "disposition": disposition,
+                "evidence_kind": evidence_kind,
+                "evidence_sha256": evidence_sha256,
+                "confirm": confirm,
+            },
+            request_id=request_id,
+        )
+
     def status(self, *, context_id: str = "default") -> dict[str, Any]:
         return self.call("status", {"context_id": context_id})
 

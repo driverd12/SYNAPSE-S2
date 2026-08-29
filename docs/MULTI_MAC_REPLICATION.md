@@ -169,6 +169,67 @@ Those legacy receipts are also cutover-ineligible when immutable database
 inspection finds any Memora governance state, because they cannot have signed
 its aggregate.
 
+### Request-journal reconciliation receipt carriage
+
+This subsection describes source capability only. It does not prove that either
+installed Mac has received the request-journal reconciliation feature; require
+a separately governed build replacement and live identity proof before relying
+on it.
+
+The feature deliberately leaves the request journal at schema v3 and does not
+mutate any original request row. One evidence classification is stored instead as
+an individually signed
+`synapse-s2.request-journal-reconciliation-receipt.v1` record in the existing
+authoritative memory database maintenance ledger. Consequently a normal paired
+recovery bundle and replication checkpoint carry the receipt inside the signed
+database artifact while the optional governed request-journal artifact carries
+the unchanged source row. There is no new replication artifact, journal schema,
+or merge protocol.
+
+Both halves are required to preserve meaning: the receipt binds the exact
+journal ID, store identity, caller/request target, operation, authority epoch,
+entry revision, and global accepted-plus-ambiguous snapshot revision. A
+database-only backup may contain the receipt but is insufficient because it
+does not preserve and prove the bound request journal. Conversely, copying a
+v3 journal without the database loses the signed classification. Use the
+complete paired recovery contract.
+
+Checkpoint creation, transfer, and isolated staging do not create, discard,
+merge, or reinterpret reconciliation receipts. The signed database artifact
+preserves their bytes and the request-journal artifact preserves the original
+ambiguities. A later separately governed adoption must verify the restored
+store/journal binding and every reconciliation receipt before health can
+project reconciled versus unresolved counts or a new backup/recovery point can
+be eligible.
+
+A receipt signer is authorized only when it is the destination's local recovery
+key, an explicitly configured trusted backup key ID, or the signing key of an
+active, non-revoked `receive` peer in the verified replication ledger. The
+running replication manager installs this receive-peer trust as a dynamic
+provider. Offline audit, core-maintenance, readiness, and recovery paths resolve
+the same keys by opening the existing ledger through a strictly read-only
+signed-anchor and high-water-witness verifier; they do not create, recover, or
+modify ledger state. Peer add authorizes the reviewed peer key for subsequent
+checks, and peer revoke removes it from subsequent checks. Pending or invalid
+ledger state fails closed. No recovery private key is copied between Macs.
+`send` peers, revoked peers, invalid ledger entries, and unrelated self-signed
+public keys confer no receipt authority.
+
+Signature validity alone is insufficient. An otherwise valid receipt with a
+foreign request-journal ID or store identity fails live health and
+backup/recovery eligibility, as does an untrusted signer. A replication
+transport signature or successful stage does not override this binding gate.
+Revoking a receive peer may therefore make its previously carried receipts
+ineligible until a separately governed trust or recovery decision resolves the
+condition; do not delete the receipts or copy recovery keys to make the check
+green.
+
+Reconciliation is never propagation authority. It does not make a request
+replay-safe, reduce journal capacity, or change the source row's raw
+`ambiguous` state on either Mac. Replication must not convert
+`confirmed_completed`, `confirmed_no_effect`, or `superseded` into a retry,
+request-journal deletion, or receiver-side mutation.
+
 Copy the entire returned `checkpoint_directory`, without changing its internal
 names or modes, into the receiver's replication inbox. Then stage its manifest:
 
@@ -277,6 +338,13 @@ fingerprint, lineage, manifest, or ACK inputs to retrieve the manager's
 idempotent result. Do not blind-retry a request reported as `accepted`,
 `ambiguous`, `failed`, or `not_found`; preserve the artifacts and investigate
 or reconcile first.
+
+An evidence-only reconciliation receipt does not change this rule.
+`request-status` continues to reflect the immutable v3 source row, and an
+explicit-ambiguous target remains non-replayable even after its signed evidence
+classification is visible in request-journal inventory. The receipt helps an
+operator distinguish raw, reconciled, and unresolved ambiguity; it is not a
+terminal journal transition or an idempotent-result cache.
 
 Health and request-status remain available while the lane is active. Health
 reports `operational_state` as `maintenance`, marks the backend lane

@@ -417,6 +417,58 @@ def command_request_status(args: argparse.Namespace) -> dict[str, Any]:
     return request_status(caller=args.caller, request_id=args.request_id)
 
 
+def command_request_journal_inventory(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    backend = build_backend(args)
+    inventory = getattr(backend, "request_journal_inventory", None)
+    if not callable(inventory):
+        raise RuntimeError("authoritative request-journal inventory is unavailable")
+    return inventory(
+        states=args.journal_states,
+        caller=args.caller,
+        operation=args.operation,
+        limit=args.limit,
+        after_caller=args.after_caller,
+        after_request_id=args.after_request_id,
+        expected_snapshot_revision=args.expected_snapshot_revision,
+    )
+
+
+def command_request_journal_reconcile(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    core_request_id = getattr(args, "core_request_id", None)
+    if (
+        not isinstance(core_request_id, str)
+        or not core_request_id
+        or core_request_id != core_request_id.strip()
+    ):
+        raise ValueError(
+            "request-journal reconciliation requires a predeclared --core-request-id"
+        )
+    backend = build_backend(args)
+    reconcile = getattr(backend, "reconcile_request_journal", None)
+    if not callable(reconcile):
+        raise RuntimeError(
+            "authoritative request-journal reconciliation is unavailable"
+        )
+    return reconcile(
+        target_caller=args.caller,
+        target_request_id=args.request_id,
+        expected_operation=args.expected_operation,
+        expected_authority_epoch=args.expected_authority_epoch,
+        expected_entry_revision=args.expected_entry_revision,
+        expected_journal_id=args.expected_journal_id,
+        inventory_snapshot_revision=args.inventory_snapshot_revision,
+        disposition=args.disposition,
+        evidence_kind=args.evidence_kind,
+        evidence_sha256=args.evidence_sha256,
+        confirm=args.confirm,
+        request_id=core_request_id,
+    )
+
+
 def command_enable(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.set_enabled(True, context_id=args.context)
@@ -2447,6 +2499,88 @@ def build_parser() -> argparse.ArgumentParser:
     request_status.add_argument("--caller", required=True)
     request_status.add_argument("--request-id", required=True)
     request_status.set_defaults(func=command_request_status)
+
+    request_inventory = subparsers.add_parser(
+        "request-journal-inventory",
+        help=(
+            "List one bounded, content-free request-journal snapshot without replay."
+        ),
+    )
+    request_inventory.add_argument(
+        "--state",
+        dest="journal_states",
+        action="append",
+        choices=("accepted", "ambiguous", "completed", "failed"),
+        default=None,
+        help=(
+            "Journal state to include; repeat as needed. Defaults to accepted and ambiguous."
+        ),
+    )
+    request_inventory.add_argument("--caller", default=None)
+    request_inventory.add_argument("--operation", default=None)
+    request_inventory.add_argument("--limit", type=int, default=25)
+    request_inventory.add_argument("--after-caller", default=None)
+    request_inventory.add_argument("--after-request-id", default=None)
+    request_inventory.add_argument(
+        "--expected-snapshot-revision",
+        default=None,
+        help="Require the exact revision returned by the preceding page.",
+    )
+    request_inventory.set_defaults(func=command_request_journal_inventory)
+
+    request_reconcile = subparsers.add_parser(
+        "request-journal-reconcile",
+        help=(
+            "Append one signed evidence classification; never replay or rewrite the request."
+        ),
+    )
+    request_reconcile.add_argument("--caller", required=True)
+    request_reconcile.add_argument("--request-id", required=True)
+    request_reconcile.add_argument("--expected-operation", required=True)
+    request_reconcile.add_argument(
+        "--expected-authority-epoch",
+        required=True,
+    )
+    request_reconcile.add_argument(
+        "--expected-entry-revision",
+        required=True,
+    )
+    request_reconcile.add_argument("--expected-journal-id", required=True)
+    request_reconcile.add_argument(
+        "--inventory-snapshot-revision",
+        required=True,
+    )
+    request_reconcile.add_argument(
+        "--disposition",
+        required=True,
+        choices=(
+            "confirmed_completed",
+            "confirmed_no_effect",
+            "superseded",
+        ),
+    )
+    request_reconcile.add_argument(
+        "--evidence-kind",
+        required=True,
+        choices=(
+            "authoritative_effect_readback",
+            "authoritative_no_effect_readback",
+            "event_ledger_readback",
+            "signed_artifact_verification",
+            "signed_operation_receipt",
+        ),
+    )
+    request_reconcile.add_argument("--evidence-sha256", required=True)
+    request_reconcile.add_argument(
+        "--core-request-id",
+        required=True,
+        help=(
+            "Required predeclared outer request handle. Preserve it for "
+            "request-status if the response is uncertain; never generate a replacement."
+        ),
+    )
+    request_reconcile.add_argument("--confirm", action="store_true")
+    request_reconcile.set_defaults(func=command_request_journal_reconcile)
 
     enable = subparsers.add_parser("enable")
     add_context(enable)

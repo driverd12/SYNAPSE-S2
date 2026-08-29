@@ -15,6 +15,7 @@ import stat
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
@@ -62,6 +63,10 @@ LOGGER.propagate = False
 
 class ContextDeliveryRejected(ValueError):
     """A deterministic delivery request rejection with no committed effects."""
+
+
+class RequestJournalReconciliationRejected(ValueError):
+    """A deterministic request-journal reconciliation conflict."""
 
 
 class RetrievalSnapshotStaleError(ValueError):
@@ -136,6 +141,65 @@ CORE_STORE_IDENTITY_RE = re.compile(r"^store-[0-9a-f]{24}$")
 CORE_REQUEST_JOURNAL_ID_RE = re.compile(r"^journal-[0-9a-f]{24}$")
 CORE_ROOT_GENERATION_ID_RE = re.compile(r"^generation-[0-9a-f]{24}$")
 BACKUP_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA = (
+    "synapse-s2.request-journal-reconciliation-receipt.v1"
+)
+REQUEST_JOURNAL_RECONCILIATION_OPERATION_TYPE = (
+    "request-journal-reconciliation"
+)
+REQUEST_JOURNAL_RECONCILIATION_MAX_RECEIPTS = 4096
+REQUEST_JOURNAL_RECONCILIATION_DISPOSITIONS = frozenset(
+    {"confirmed_completed", "confirmed_no_effect", "superseded"}
+)
+REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX = {
+    "confirmed_completed": frozenset(
+        {
+            "authoritative_effect_readback",
+            "event_ledger_readback",
+            "signed_artifact_verification",
+            "signed_operation_receipt",
+        }
+    ),
+    "confirmed_no_effect": frozenset(
+        {"authoritative_no_effect_readback"}
+    ),
+    "superseded": frozenset(
+        {
+            "authoritative_effect_readback",
+            "event_ledger_readback",
+            "signed_operation_receipt",
+        }
+    ),
+}
+REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS = frozenset(
+    {
+        "schema",
+        "resolution_id",
+        "request_journal_id",
+        "store_identity",
+        "target_caller",
+        "target_request_id",
+        "target_operation",
+        "target_authority_epoch",
+        "target_original_state",
+        "target_entry_revision",
+        "inventory_snapshot_revision",
+        "disposition",
+        "evidence_kind",
+        "evidence_sha256",
+        "reconciled_by",
+        "replay_safe",
+        "reconciled_at_unix_ms",
+        "auth_algorithm",
+        "auth_key_id",
+        "signing_public_key",
+        "receipt_digest",
+        "receipt_signature",
+    }
+)
+_REQUEST_JOURNAL_CORRELATION_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+)
 
 # Non-content lifecycle witness for governed memora cue bindings.  The
 # witness stores only store-owned lifecycle facts (row identity, version
@@ -1531,6 +1595,11 @@ class DurableMemoryStore:
         self._database_created_for_initialization = False
         self._claimed_core_authority_marker_sha256: str | None = None
         self._immutable_read_only = False
+        self._request_journal_reconciliation_trusted_key_provider: (
+            Callable[[], Iterable[str]] | None
+        ) = self._active_receive_peer_reconciliation_trust
+        self._receipt_signature_cache: dict[str, None] = {}
+        self._receipt_signature_cache_lock = threading.Lock()
         self._ensure_directory(self.db_path.parent, owned=False)
         self._owns_authority_lease = authority_lease is None
         self._authority_lease = authority_lease or CoreAuthorityLease.acquire_local(
@@ -1564,6 +1633,11 @@ class DurableMemoryStore:
         store._database_created_for_initialization = False
         store._claimed_core_authority_marker_sha256 = None
         store._immutable_read_only = bool(immutable)
+        store._request_journal_reconciliation_trusted_key_provider = (
+            store._active_receive_peer_reconciliation_trust
+        )
+        store._receipt_signature_cache = {}
+        store._receipt_signature_cache_lock = threading.Lock()
         store._authority_lease = None
         store._owns_authority_lease = False
         if not store.db_path.is_file():
@@ -1605,6 +1679,11 @@ class DurableMemoryStore:
         store._database_created_for_initialization = False
         store._claimed_core_authority_marker_sha256 = None
         store._immutable_read_only = False
+        store._request_journal_reconciliation_trusted_key_provider = (
+            store._active_receive_peer_reconciliation_trust
+        )
+        store._receipt_signature_cache = {}
+        store._receipt_signature_cache_lock = threading.Lock()
         store._authority_lease = authority_lease
         store._owns_authority_lease = False
         if not store.db_path.is_file():
@@ -1629,6 +1708,28 @@ class DurableMemoryStore:
             ) from exc
         authority_lease.assert_core_for(store.db_path)
         return store
+
+    def set_request_journal_reconciliation_trusted_key_provider(
+        self,
+        provider: Callable[[], Iterable[str]] | None,
+    ) -> None:
+        """Install the authoritative provider for active receive-peer keys."""
+
+        if provider is not None and not callable(provider):
+            raise TypeError("trusted reconciliation key provider must be callable")
+        self._request_journal_reconciliation_trusted_key_provider = provider
+
+    def _active_receive_peer_reconciliation_trust(self) -> tuple[str, ...]:
+        """Resolve verified receive-peer signer trust without ledger mutation."""
+
+        # Local import avoids a module cycle: replication_store depends on the
+        # memory-store type, while the trust provider is needed only when an
+        # otherwise nonlocal reconciliation signer is actually encountered.
+        from replication_store import ReplicationLedger
+
+        return ReplicationLedger.active_receive_peer_signing_key_ids_for_store(
+            self
+        )
 
     def close(self) -> None:
         if self._owns_authority_lease and self._authority_lease is not None:
@@ -8134,6 +8235,73 @@ class DurableMemoryStore:
             safe_text, redaction_count = redact_capture_text(raw_text)
             safe_text, digest_removals = strip_untrusted_raw_digest_text(safe_text)
             return safe_text, int(redaction_count) + int(digest_removals)
+        if (
+            isinstance(decoded, dict)
+            and decoded.get("schema")
+            == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA
+            and set(decoded) == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS
+        ):
+            try:
+                public_key = base64.b64decode(
+                    str(decoded["signing_public_key"]),
+                    validate=True,
+                )
+                signature = base64.b64decode(
+                    str(decoded["receipt_signature"]),
+                    validate=True,
+                )
+            except (TypeError, ValueError):
+                public_key = b""
+                signature = b""
+            structural_digests = (
+                "target_entry_revision",
+                "inventory_snapshot_revision",
+                "evidence_sha256",
+                "auth_key_id",
+                "receipt_digest",
+            )
+            structurally_safe = (
+                decoded.get("auth_algorithm") == "ed25519"
+                and len(public_key) == 32
+                and len(signature) == 64
+                and all(
+                    BACKUP_DIGEST_RE.fullmatch(
+                        str(decoded.get(field) or "")
+                    )
+                    is not None
+                    for field in structural_digests
+                )
+            )
+            if structurally_safe:
+                inspection = {
+                    key: value
+                    for key, value in decoded.items()
+                    if key
+                    not in {
+                        "auth_algorithm",
+                        "auth_key_id",
+                        "signing_public_key",
+                        "receipt_digest",
+                        "receipt_signature",
+                        "target_entry_revision",
+                        "inventory_snapshot_revision",
+                        "evidence_sha256",
+                    }
+                }
+                safe_inspection, redaction_count = redact_sensitive_value(
+                    inspection
+                )
+                safe_inspection, digest_removals = (
+                    strip_untrusted_raw_digest_fields(safe_inspection)
+                )
+                if (
+                    int(redaction_count) + int(digest_removals) == 0
+                    and safe_inspection == inspection
+                ):
+                    # These are public verification values in an exact signed
+                    # receipt contract, not credentials. Keeping the raw JSON
+                    # is required so recovery can re-verify its signature.
+                    return raw_text, 0
         safe_value, redaction_count = redact_sensitive_value(decoded)
         safe_value, digest_removals = strip_untrusted_raw_digest_fields(safe_value)
         mutation_count = int(redaction_count) + int(digest_removals)
@@ -17561,7 +17729,12 @@ class DurableMemoryStore:
             private_key.sign(_json_dumps(signed_payload).encode("utf-8"))
         ).decode("ascii")
 
-    def _verify_receipt_authenticator(self, payload: dict[str, Any]) -> bool:
+    def _verify_receipt_authenticator(
+        self,
+        payload: dict[str, Any],
+        *,
+        trusted_signing_key_ids: Iterable[str] | None = None,
+    ) -> bool:
         if payload.get("auth_algorithm") != "ed25519":
             raise ValueError("backup receipt authentication algorithm is not supported")
         try:
@@ -17581,13 +17754,37 @@ class DurableMemoryStore:
         signed_payload = {
             key: value for key, value in payload.items() if key != "receipt_signature"
         }
-        try:
-            Ed25519PublicKey.from_public_bytes(public_bytes).verify(
-                signature,
-                _json_dumps(signed_payload).encode("utf-8"),
+        signed_bytes = _json_dumps(signed_payload).encode("utf-8")
+        signature_cache_key = hashlib.sha256(
+            signature + signed_bytes
+        ).hexdigest()
+        with self._receipt_signature_cache_lock:
+            signature_cached = (
+                signature_cache_key in self._receipt_signature_cache
             )
-        except InvalidSignature as exc:
-            raise ValueError("backup receipt signature verification failed") from exc
+        if not signature_cached:
+            try:
+                Ed25519PublicKey.from_public_bytes(public_bytes).verify(
+                    signature,
+                    signed_bytes,
+                )
+            except InvalidSignature as exc:
+                raise ValueError(
+                    "backup receipt signature verification failed"
+                ) from exc
+            with self._receipt_signature_cache_lock:
+                if len(self._receipt_signature_cache) >= 8192:
+                    self._receipt_signature_cache.pop(
+                        next(iter(self._receipt_signature_cache))
+                    )
+                self._receipt_signature_cache[signature_cache_key] = None
+        if trusted_signing_key_ids is not None:
+            reviewed_ids = {
+                str(value).strip().lower()
+                for value in trusted_signing_key_ids
+                if BACKUP_DIGEST_RE.fullmatch(str(value).strip().lower())
+            }
+            return key_id in reviewed_ids
         _private, local_public, local_key_id = self._backup_receipt_signing_key(
             create=False
         )
@@ -17602,6 +17799,603 @@ class DurableMemoryStore:
             if BACKUP_DIGEST_RE.fullmatch(value.strip().lower())
         }
         return locally_trusted or key_id in configured_ids
+
+    @staticmethod
+    def _request_journal_reconciliation_identifier(
+        value: Any,
+        *,
+        field: str,
+    ) -> str:
+        try:
+            cleaned = reject_sensitive_identifier(value, field=field).strip()
+        except ValueError as exc:
+            raise RequestJournalReconciliationRejected(
+                "request reconciliation identifier is invalid"
+            ) from exc
+        if _REQUEST_JOURNAL_CORRELATION_RE.fullmatch(cleaned) is None:
+            raise RequestJournalReconciliationRejected(
+                "request reconciliation identifier is invalid"
+            )
+        return cleaned
+
+    @staticmethod
+    def _request_journal_reconciliation_receipt_fields() -> set[str]:
+        return set(REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS)
+
+    def _validate_request_journal_reconciliation_receipt(
+        self,
+        payload: Any,
+        *,
+        require_local_trust: bool = True,
+        trusted_signing_key_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(payload, dict)
+            or set(payload)
+            != self._request_journal_reconciliation_receipt_fields()
+            or payload.get("schema")
+            != REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA
+            or re.fullmatch(
+                r"reqrec-[0-9a-f]{24}",
+                str(payload.get("resolution_id") or ""),
+            )
+            is None
+            or CORE_REQUEST_JOURNAL_ID_RE.fullmatch(
+                str(payload.get("request_journal_id") or "")
+            )
+            is None
+            or CORE_STORE_IDENTITY_RE.fullmatch(
+                str(payload.get("store_identity") or "")
+            )
+            is None
+            or payload.get("target_original_state") != "ambiguous"
+            or payload.get("disposition")
+            not in REQUEST_JOURNAL_RECONCILIATION_DISPOSITIONS
+            or payload.get("evidence_kind")
+            not in REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX.get(
+                str(payload.get("disposition") or ""),
+                frozenset(),
+            )
+            or payload.get("replay_safe") is not False
+            or type(payload.get("reconciled_at_unix_ms")) is not int
+            or int(payload["reconciled_at_unix_ms"]) <= 0
+            or any(
+                BACKUP_DIGEST_RE.fullmatch(str(payload.get(field) or ""))
+                is None
+                for field in (
+                    "target_entry_revision",
+                    "inventory_snapshot_revision",
+                    "evidence_sha256",
+                    "auth_key_id",
+                    "receipt_digest",
+                )
+            )
+        ):
+            raise RuntimeError(
+                "request-journal reconciliation receipt contract is invalid"
+            )
+        for field in (
+            "target_caller",
+            "target_request_id",
+            "target_operation",
+            "target_authority_epoch",
+            "reconciled_by",
+        ):
+            self._request_journal_reconciliation_identifier(
+                payload.get(field),
+                field=field,
+            )
+        expected_digest = self._canonical_payload_digest(payload)
+        if not secrets.compare_digest(
+            str(payload["receipt_digest"]),
+            expected_digest,
+        ):
+            raise RuntimeError(
+                "request-journal reconciliation receipt digest is invalid"
+            )
+        trusted = self._verify_receipt_authenticator(
+            payload,
+            trusted_signing_key_ids=trusted_signing_key_ids,
+        )
+        provider_key_ids: Iterable[str] = ()
+        if not trusted and trusted_signing_key_ids is None:
+            provider = getattr(
+                self,
+                "_request_journal_reconciliation_trusted_key_provider",
+                None,
+            )
+            provider_key_ids = () if provider is None else provider()
+        reviewed_key_ids = {
+            str(value).strip().lower()
+            for value in (
+                *(trusted_signing_key_ids or ()),
+                *provider_key_ids,
+            )
+            if BACKUP_DIGEST_RE.fullmatch(str(value).strip().lower())
+        }
+        if str(payload["auth_key_id"]) in reviewed_key_ids:
+            trusted = True
+        if require_local_trust and not trusted:
+            raise RuntimeError(
+                "request-journal reconciliation receipt signer is untrusted"
+            )
+        return dict(payload)
+
+    @staticmethod
+    def _request_journal_reconciliation_target_key(
+        *,
+        request_journal_id: str,
+        target_caller: str,
+        target_request_id: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            _json_dumps(
+                {
+                    "schema": "synapse-s2.request-journal-reconciliation-target.v1",
+                    "request_journal_id": request_journal_id,
+                    "target_caller": target_caller,
+                    "target_request_id": target_request_id,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"reqrec:{digest[:32]}"
+
+    def _request_journal_reconciliation_rows(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        request_journal_id: str,
+        store_identity: str,
+        require_local_trust: bool = True,
+        trusted_signing_key_ids: Iterable[str] | None = None,
+        operation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        maximum_rows = REQUEST_JOURNAL_RECONCILIATION_MAX_RECEIPTS
+        if operation_id is None:
+            rows = conn.execute(
+                "SELECT operation_id, context_id, before_revision, after_revision, "
+                "payload_json, created_at FROM store_maintenance_receipts "
+                "WHERE operation_type = ? ORDER BY created_at, operation_id "
+                "LIMIT ?",
+                (
+                    REQUEST_JOURNAL_RECONCILIATION_OPERATION_TYPE,
+                    maximum_rows + 1,
+                ),
+            ).fetchall()
+        else:
+            if re.fullmatch(r"reqrec-[0-9a-f]{24}", operation_id) is None:
+                raise RuntimeError(
+                    "request-journal reconciliation receipt identifier is invalid"
+                )
+            rows = conn.execute(
+                "SELECT operation_id, context_id, before_revision, after_revision, "
+                "payload_json, created_at FROM store_maintenance_receipts "
+                "WHERE operation_type = ? AND operation_id = ? "
+                "ORDER BY created_at, operation_id LIMIT 2",
+                (
+                    REQUEST_JOURNAL_RECONCILIATION_OPERATION_TYPE,
+                    operation_id,
+                ),
+            ).fetchall()
+        if len(rows) > maximum_rows:
+            raise RuntimeError(
+                "request-journal reconciliation receipt limit exceeded"
+            )
+        decoded_rows: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                raw_payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "request-journal reconciliation receipt JSON is invalid"
+                ) from exc
+            if not isinstance(raw_payload, dict):
+                raise RuntimeError(
+                    "request-journal reconciliation receipt JSON is invalid"
+                )
+            decoded_rows.append((row, raw_payload))
+        if not decoded_rows:
+            return []
+
+        # Freeze peer trust once for the whole inventory.  This keeps one
+        # consistent ledger view and avoids an O(receipts * peer-ledger-scan)
+        # path on adopted stores.  Local/configured signers never consult the
+        # dynamic provider, and an explicit trusted set remains authoritative.
+        _private, _public, local_key_id = self._backup_receipt_signing_key(
+            create=False
+        )
+        statically_trusted = {
+            value.strip().lower()
+            for value in os.getenv(
+                "SYNAPSE_S2_TRUSTED_BACKUP_KEY_IDS", ""
+            ).split(",")
+            if BACKUP_DIGEST_RE.fullmatch(value.strip().lower())
+        }
+        if local_key_id is not None:
+            statically_trusted.add(local_key_id)
+        if trusted_signing_key_ids is not None:
+            frozen_trusted_key_ids = tuple(
+                sorted(
+                    statically_trusted
+                    | {
+                        str(value).strip().lower()
+                        for value in trusted_signing_key_ids
+                        if BACKUP_DIGEST_RE.fullmatch(
+                            str(value).strip().lower()
+                        )
+                    }
+                )
+            )
+        else:
+            needs_dynamic_trust = bool(
+                require_local_trust
+                and any(
+                    str(payload.get("auth_key_id") or "").strip().lower()
+                    not in statically_trusted
+                    for _row, payload in decoded_rows
+                )
+            )
+            provider = getattr(
+                self,
+                "_request_journal_reconciliation_trusted_key_provider",
+                None,
+            )
+            frozen_trusted_key_ids = tuple(
+                sorted(
+                    statically_trusted
+                    | {
+                        str(value).strip().lower()
+                        for value in (
+                            ()
+                            if not needs_dynamic_trust or provider is None
+                            else provider()
+                        )
+                        if BACKUP_DIGEST_RE.fullmatch(
+                            str(value).strip().lower()
+                        )
+                    }
+                )
+            )
+        receipts: list[dict[str, Any]] = []
+        seen_targets: set[tuple[str, str]] = set()
+        for row, raw_payload in decoded_rows:
+            payload = self._validate_request_journal_reconciliation_receipt(
+                raw_payload,
+                require_local_trust=require_local_trust,
+                trusted_signing_key_ids=frozen_trusted_key_ids,
+            )
+            if (
+                str(row["operation_id"]) != payload["resolution_id"]
+                or str(row["before_revision"])
+                != payload["target_entry_revision"]
+                or str(row["after_revision"]) != payload["receipt_digest"]
+                or abs(
+                    int(round(float(row["created_at"]) * 1000))
+                    - int(payload["reconciled_at_unix_ms"])
+                )
+                > 1
+                or str(row["context_id"])
+                != self._request_journal_reconciliation_target_key(
+                    request_journal_id=str(payload["request_journal_id"]),
+                    target_caller=str(payload["target_caller"]),
+                    target_request_id=str(payload["target_request_id"]),
+                )
+            ):
+                raise RuntimeError(
+                    "request-journal reconciliation receipt binding is invalid"
+                )
+            if (
+                payload["request_journal_id"] != request_journal_id
+                or payload["store_identity"] != store_identity
+            ):
+                raise RuntimeError(
+                    "request-journal reconciliation receipt authority binding is invalid"
+                )
+            target = (
+                str(payload["target_caller"]),
+                str(payload["target_request_id"]),
+            )
+            if target in seen_targets:
+                raise RuntimeError(
+                    "request-journal target has multiple reconciliation receipts"
+                )
+            seen_targets.add(target)
+            receipts.append(payload)
+        return receipts
+
+    def request_journal_reconciliation_inventory(
+        self,
+        *,
+        request_journal_id: str,
+        store_identity: str,
+        trusted_signing_key_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Read and verify content-free reconciliation receipts."""
+
+        journal_id = self._request_journal_reconciliation_identifier(
+            request_journal_id,
+            field="request_journal_id",
+        )
+        store_id = self._request_journal_reconciliation_identifier(
+            store_identity,
+            field="store_identity",
+        )
+        if (
+            CORE_REQUEST_JOURNAL_ID_RE.fullmatch(journal_id) is None
+            or CORE_STORE_IDENTITY_RE.fullmatch(store_id) is None
+        ):
+            raise RequestJournalReconciliationRejected(
+                "request reconciliation binding is invalid"
+            )
+        with closing(self._connect_read_only()) as conn:
+            receipts = self._request_journal_reconciliation_rows(
+                conn,
+                request_journal_id=journal_id,
+                store_identity=store_id,
+                trusted_signing_key_ids=trusted_signing_key_ids,
+            )
+        items = [
+            {
+                "resolution_id": str(receipt["resolution_id"]),
+                "target_caller": str(receipt["target_caller"]),
+                "target_request_id": str(receipt["target_request_id"]),
+                "target_operation": str(receipt["target_operation"]),
+                "target_authority_epoch": str(
+                    receipt["target_authority_epoch"]
+                ),
+                "target_original_state": "ambiguous",
+                "target_entry_revision": str(
+                    receipt["target_entry_revision"]
+                ),
+                "inventory_snapshot_revision": str(
+                    receipt["inventory_snapshot_revision"]
+                ),
+                "disposition": str(receipt["disposition"]),
+                "evidence_kind": str(receipt["evidence_kind"]),
+                "evidence_sha256": str(receipt["evidence_sha256"]),
+                "reconciled_by": str(receipt["reconciled_by"]),
+                "reconciled_at_unix_ms": int(
+                    receipt["reconciled_at_unix_ms"]
+                ),
+                "receipt_digest": str(receipt["receipt_digest"]),
+                "auth_key_id": str(receipt["auth_key_id"]),
+                "signature_verified": True,
+                "replay_safe": False,
+            }
+            for receipt in receipts
+        ]
+        items.sort(key=lambda item: (item["target_caller"], item["target_request_id"]))
+        return {
+            "schema": "synapse-s2.request-journal-reconciliation-inventory.v1",
+            "read_only": True,
+            "request_journal_id": journal_id,
+            "store_identity": store_id,
+            "count": len(items),
+            "items": items,
+            "all_signatures_verified": True,
+            "generic_replay_authorized": False,
+        }
+
+    def reconcile_request_journal(
+        self,
+        *,
+        request_journal_id: str,
+        store_identity: str,
+        target_caller: str,
+        target_request_id: str,
+        target_operation: str,
+        target_authority_epoch: str,
+        target_original_state: str,
+        target_entry_revision: str,
+        inventory_snapshot_revision: str,
+        disposition: str,
+        evidence_kind: str,
+        evidence_sha256: str,
+        reconciled_by: str,
+        confirm: bool = False,
+        trusted_signing_key_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Append one signed classification without changing request history."""
+
+        if confirm is not True or target_original_state != "ambiguous":
+            raise RequestJournalReconciliationRejected(
+                "request reconciliation requires an exact ambiguous target"
+            )
+        journal_id = self._request_journal_reconciliation_identifier(
+            request_journal_id,
+            field="request_journal_id",
+        )
+        store_id = self._request_journal_reconciliation_identifier(
+            store_identity,
+            field="store_identity",
+        )
+        caller = self._request_journal_reconciliation_identifier(
+            target_caller,
+            field="target_caller",
+        )
+        request_id = self._request_journal_reconciliation_identifier(
+            target_request_id,
+            field="target_request_id",
+        )
+        operation = self._request_journal_reconciliation_identifier(
+            target_operation,
+            field="target_operation",
+        )
+        authority_epoch = self._request_journal_reconciliation_identifier(
+            target_authority_epoch,
+            field="target_authority_epoch",
+        )
+        actor = self._request_journal_reconciliation_identifier(
+            reconciled_by,
+            field="reconciled_by",
+        )
+        entry_revision = str(target_entry_revision or "").strip().lower()
+        snapshot_revision = str(
+            inventory_snapshot_revision or ""
+        ).strip().lower()
+        evidence_digest = str(evidence_sha256 or "").strip().lower()
+        if (
+            CORE_REQUEST_JOURNAL_ID_RE.fullmatch(journal_id) is None
+            or CORE_STORE_IDENTITY_RE.fullmatch(store_id) is None
+            or any(
+                BACKUP_DIGEST_RE.fullmatch(value) is None
+                for value in (
+                    entry_revision,
+                    snapshot_revision,
+                    evidence_digest,
+                )
+            )
+            or disposition not in REQUEST_JOURNAL_RECONCILIATION_DISPOSITIONS
+            or evidence_kind
+            not in REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX.get(
+                disposition,
+                frozenset(),
+            )
+        ):
+            raise RequestJournalReconciliationRejected(
+                "request reconciliation evidence contract is invalid"
+            )
+        target_key = self._request_journal_reconciliation_target_key(
+            request_journal_id=journal_id,
+            target_caller=caller,
+            target_request_id=request_id,
+        )
+        semantic = {
+            "request_journal_id": journal_id,
+            "store_identity": store_id,
+            "target_caller": caller,
+            "target_request_id": request_id,
+            "target_operation": operation,
+            "target_authority_epoch": authority_epoch,
+            "target_original_state": "ambiguous",
+            "target_entry_revision": entry_revision,
+            "inventory_snapshot_revision": snapshot_revision,
+            "disposition": disposition,
+            "evidence_kind": evidence_kind,
+            "evidence_sha256": evidence_digest,
+            "reconciled_by": actor,
+            "replay_safe": False,
+        }
+        with closing(self._connect()) as conn:
+            with self._transaction(conn, immediate=True):
+                existing_receipts = self._request_journal_reconciliation_rows(
+                    conn,
+                    request_journal_id=journal_id,
+                    store_identity=store_id,
+                    trusted_signing_key_ids=trusted_signing_key_ids,
+                )
+                existing = next(
+                    (
+                        receipt
+                        for receipt in existing_receipts
+                        if receipt["target_caller"] == caller
+                        and receipt["target_request_id"] == request_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if any(existing.get(key) != value for key, value in semantic.items()):
+                        raise RequestJournalReconciliationRejected(
+                            "request reconciliation conflicts with existing receipt"
+                        )
+                    result = dict(existing)
+                    idempotent = True
+                else:
+                    if (
+                        len(existing_receipts)
+                        >= REQUEST_JOURNAL_RECONCILIATION_MAX_RECEIPTS
+                    ):
+                        raise RequestJournalReconciliationRejected(
+                            "request reconciliation receipt capacity is exhausted"
+                        )
+                    reconciled_at_unix_ms = int(time.time() * 1000)
+                    resolution_digest = hashlib.sha256(
+                        _json_dumps(
+                            {
+                                "schema": (
+                                    "synapse-s2.request-journal-reconciliation-id.v1"
+                                ),
+                                **semantic,
+                                "reconciled_at_unix_ms": reconciled_at_unix_ms,
+                            }
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    result = {
+                        "schema": (
+                            REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA
+                        ),
+                        "resolution_id": f"reqrec-{resolution_digest[:24]}",
+                        **semantic,
+                        "reconciled_at_unix_ms": reconciled_at_unix_ms,
+                    }
+                    self._authenticate_receipt(result)
+                    self._validate_request_journal_reconciliation_receipt(
+                        result
+                    )
+                    conn.execute(
+                        "INSERT INTO store_maintenance_receipts ("
+                        "operation_id, operation_type, context_id, "
+                        "before_revision, after_revision, payload_json, created_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            result["resolution_id"],
+                            REQUEST_JOURNAL_RECONCILIATION_OPERATION_TYPE,
+                            target_key,
+                            entry_revision,
+                            result["receipt_digest"],
+                            json.dumps(
+                                result,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            reconciled_at_unix_ms / 1000.0,
+                        ),
+                    )
+                    idempotent = False
+        with closing(self._connect_read_only()) as verification_conn:
+            matches = self._request_journal_reconciliation_rows(
+                verification_conn,
+                request_journal_id=journal_id,
+                store_identity=store_id,
+                trusted_signing_key_ids=trusted_signing_key_ids,
+                operation_id=str(result["resolution_id"]),
+            )
+        matches = [
+            item
+            for item in matches
+            if item["target_caller"] == caller
+            and item["target_request_id"] == request_id
+            and item["receipt_digest"] == result["receipt_digest"]
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "request-journal reconciliation commit could not be verified"
+            )
+        return {
+            "schema": "synapse-s2.request-journal-reconciliation-result.v1",
+            "status": "reconciled",
+            "idempotent": idempotent,
+            "resolution_id": str(result["resolution_id"]),
+            "request_journal_id": journal_id,
+            "store_identity": store_id,
+            "target_caller": caller,
+            "target_request_id": request_id,
+            "target_operation": operation,
+            "target_original_state": "ambiguous",
+            "target_entry_revision": entry_revision,
+            "disposition": disposition,
+            "evidence_kind": evidence_kind,
+            "evidence_sha256": evidence_digest,
+            "reconciled_by": actor,
+            "reconciled_at_unix_ms": int(result["reconciled_at_unix_ms"]),
+            "receipt_digest": str(result["receipt_digest"]),
+            "auth_key_id": str(result["auth_key_id"]),
+            "signature_verified": True,
+            "survivor_history_preserved": True,
+            "original_journal_state_preserved": True,
+            "replay_safe": False,
+        }
 
     @staticmethod
     def _regular_file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -19520,6 +20314,32 @@ class DurableMemoryStore:
                         f"v{int(schema_contract['user_version'])}"
                     ),
                 }
+            if authority_binding["governance_mode"] == "authoritative-v6":
+                reconciliation_receipts = self._request_journal_reconciliation_rows(
+                    conn,
+                    request_journal_id=str(
+                        authority_binding["request_journal_id"]
+                    ),
+                    store_identity=str(authority_binding["store_identity"]),
+                    # Backup and recovery eligibility require both signature
+                    # integrity and an authorized signer: the local recovery
+                    # authority, a configured key, or an active receive peer
+                    # anchored by the verified replication ledger.
+                    require_local_trust=True,
+                )
+            else:
+                legacy_reconciliation_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM store_maintenance_receipts "
+                        "WHERE operation_type = ?",
+                        (REQUEST_JOURNAL_RECONCILIATION_OPERATION_TYPE,),
+                    ).fetchone()[0]
+                )
+                if legacy_reconciliation_count:
+                    raise RuntimeError(
+                        "journal-less backup contains request reconciliation evidence"
+                    )
+                reconciliation_receipts = []
             canonical_contract = self._canonical_backup_contract()
             matching_contract_versions = _matching_backup_schema_contract_versions(
                 schema_contract
@@ -19666,6 +20486,10 @@ class DurableMemoryStore:
             + target_error_count
             + event_error_count
             + highwater_error_count,
+            "request_journal_reconciliation_receipt_count": len(
+                reconciliation_receipts
+            ),
+            "request_journal_reconciliation_signatures_verified": True,
             "canonical_json_error_count": json_error_count,
             "canonical_json_scanned_bytes": json_scanned_bytes,
             "secret_audit": secret_audit,
@@ -19847,6 +20671,16 @@ class DurableMemoryStore:
                 ),
                 "delivery_integrity_error_count": int(
                     inspection["delivery_integrity_error_count"]
+                ),
+                "request_journal_reconciliation_receipt_count": int(
+                    inspection[
+                        "request_journal_reconciliation_receipt_count"
+                    ]
+                ),
+                "request_journal_reconciliation_signatures_verified": bool(
+                    inspection[
+                        "request_journal_reconciliation_signatures_verified"
+                    ]
                 ),
                 "secret_audit": inspection["secret_audit"],
                 "restore_eligible": True,

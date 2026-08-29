@@ -1868,6 +1868,184 @@ class DashboardRuntime:
             return self._json_response(
                 request_status(caller=caller, request_id=request_id)
             )
+        if method == "POST" and path == "/api/request-journal/inventory":
+            payload = self._parse_json_body(body)
+            allowed = {
+                "states",
+                "caller",
+                "operation",
+                "limit",
+                "after_caller",
+                "after_request_id",
+                "expected_snapshot_revision",
+            }
+            if set(payload) - allowed:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "request-journal inventory body contains unsupported fields",
+                )
+            states = payload.get("states")
+            if states is not None and (
+                not isinstance(states, list)
+                or not states
+                or len(states) > 4
+                or len(set(states)) != len(states)
+                or any(
+                    state
+                    not in {"accepted", "ambiguous", "completed", "failed"}
+                    for state in states
+                )
+            ):
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "states must be a unique bounded journal-state list",
+                )
+            limit = payload.get("limit", 25)
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "limit must be between 1 and 100",
+                )
+            values: dict[str, str | None] = {}
+            for field in (
+                "caller",
+                "operation",
+                "after_caller",
+                "after_request_id",
+                "expected_snapshot_revision",
+            ):
+                value = payload.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise DashboardError(
+                        HTTPStatus.BAD_REQUEST,
+                        f"{field} must be a string",
+                    )
+                values[field] = None if not value else value.strip()
+            inventory = getattr(
+                self.backend,
+                "request_journal_inventory",
+                None,
+            )
+            if not callable(inventory):
+                raise DashboardError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "authoritative request-journal inventory unavailable",
+                )
+            try:
+                result = inventory(
+                    states=states,
+                    caller=values["caller"],
+                    operation=values["operation"],
+                    limit=limit,
+                    after_caller=values["after_caller"],
+                    after_request_id=values["after_request_id"],
+                    expected_snapshot_revision=values[
+                        "expected_snapshot_revision"
+                    ],
+                )
+            except CoreRemoteError as exc:
+                if exc.code in {"invalid_request", "request_conflict"}:
+                    raise DashboardError(
+                        HTTPStatus.CONFLICT,
+                        "request-journal snapshot changed; restart the inventory",
+                    ) from exc
+                if exc.code in {"service_unavailable", "operation_failed"}:
+                    raise DashboardError(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "authoritative request-journal inventory unavailable",
+                    ) from exc
+                raise
+            return self._json_response(result)
+        if method == "POST" and path == "/api/request-journal/reconcile":
+            payload = self._parse_json_body(body)
+            allowed = {
+                "caller",
+                "request_id",
+                "expected_operation",
+                "expected_authority_epoch",
+                "expected_entry_revision",
+                "expected_journal_id",
+                "inventory_snapshot_revision",
+                "disposition",
+                "evidence_kind",
+                "evidence_sha256",
+                "reviewed",
+                "confirm",
+                "core_request_id",
+            }
+            if set(payload) != allowed:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "request-journal reconciliation requires one exact reviewed target",
+                )
+            if payload.get("reviewed") is not True or payload.get("confirm") is not True:
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "reviewed=true and confirm=true are required",
+                )
+            text_fields = allowed - {"reviewed", "confirm"}
+            if any(
+                not isinstance(payload.get(field), str)
+                or not str(payload[field]).strip()
+                for field in text_fields
+            ):
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "every reconciliation handle and evidence field is required",
+                )
+            if payload["core_request_id"] != payload["core_request_id"].strip():
+                raise DashboardError(
+                    HTTPStatus.BAD_REQUEST,
+                    "core_request_id must be preserved exactly",
+                )
+            reconcile = getattr(
+                self.backend,
+                "reconcile_request_journal",
+                None,
+            )
+            if not callable(reconcile):
+                raise DashboardError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "authoritative request-journal reconciliation unavailable",
+                )
+            try:
+                result = reconcile(
+                    target_caller=str(payload["caller"]).strip(),
+                    target_request_id=str(payload["request_id"]).strip(),
+                    expected_operation=str(
+                        payload["expected_operation"]
+                    ).strip(),
+                    expected_authority_epoch=str(
+                        payload["expected_authority_epoch"]
+                    ).strip(),
+                    expected_entry_revision=str(
+                        payload["expected_entry_revision"]
+                    ).strip(),
+                    expected_journal_id=str(
+                        payload["expected_journal_id"]
+                    ).strip(),
+                    inventory_snapshot_revision=str(
+                        payload["inventory_snapshot_revision"]
+                    ).strip(),
+                    disposition=str(payload["disposition"]).strip(),
+                    evidence_kind=str(payload["evidence_kind"]).strip(),
+                    evidence_sha256=str(payload["evidence_sha256"]).strip(),
+                    confirm=True,
+                    request_id=payload["core_request_id"],
+                )
+            except CoreRemoteError as exc:
+                if exc.code in {"invalid_request", "request_conflict"}:
+                    raise DashboardError(
+                        HTTPStatus.CONFLICT,
+                        "request-journal reconciliation conflicted; refresh and review again",
+                    ) from exc
+                if exc.code in {"service_unavailable", "operation_failed"}:
+                    raise DashboardError(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "authoritative request-journal reconciliation unavailable",
+                    ) from exc
+                raise
+            return self._json_response(result)
         if method == "POST" and path == "/api/quick-prune":
             return self._json_response(self.backend.run_quick_pruning(trigger="dashboard"))
         if method == "POST" and path == "/api/certify-runtime":

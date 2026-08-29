@@ -1892,6 +1892,122 @@ def get_core_request_status(caller: str, request_id: str) -> str:
 
 
 @mcp.tool(
+    annotations={
+        "title": "List Authoritative Core Request Journal",
+        "readOnlyHint": True,
+    }
+)
+def list_core_request_journal(
+    states: list[str] | None = None,
+    caller: str = "",
+    operation: str = "",
+    limit: int = 25,
+    after_caller: str = "",
+    after_request_id: str = "",
+    expected_snapshot_revision: str = "",
+) -> str:
+    """List one bounded content-free snapshot; never replay requests."""
+
+    try:
+        payload = CoreClient.from_environment().request_journal_inventory(
+            states=states,
+            caller=caller.strip() or None,
+            operation=operation.strip() or None,
+            limit=limit,
+            after_caller=after_caller.strip() or None,
+            after_request_id=after_request_id.strip() or None,
+            expected_snapshot_revision=(
+                expected_snapshot_revision.strip() or None
+            ),
+        )
+        return json.dumps(payload, sort_keys=True)
+    except Exception as exc:
+        LOGGER.exception("core request-journal inventory failed")
+        return json.dumps(
+            {
+                "error": _public_error(
+                    "core request-journal inventory failed",
+                    exc,
+                )
+            },
+            sort_keys=True,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Reconcile Exact Authoritative Core Request",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+    }
+)
+def reconcile_core_request_journal(
+    caller: str,
+    request_id: str,
+    expected_operation: str,
+    expected_authority_epoch: str,
+    expected_entry_revision: str,
+    expected_journal_id: str,
+    inventory_snapshot_revision: str,
+    disposition: str,
+    evidence_kind: str,
+    evidence_sha256: str,
+    core_request_id: str,
+    confirm: bool = False,
+) -> str:
+    """Append one signed classification using a predeclared outer request ID.
+
+    Preserve that exact ID for request-status if the response is uncertain;
+    never blindly retry or generate a replacement request.
+    """
+
+    try:
+        if (
+            not isinstance(core_request_id, str)
+            or not core_request_id
+            or core_request_id != core_request_id.strip()
+        ):
+            raise ValueError(
+                "request-journal reconciliation requires core_request_id"
+            )
+        payload = CoreClient.from_environment().reconcile_request_journal(
+            target_caller=caller,
+            target_request_id=request_id,
+            expected_operation=expected_operation,
+            expected_authority_epoch=expected_authority_epoch,
+            expected_entry_revision=expected_entry_revision,
+            expected_journal_id=expected_journal_id,
+            inventory_snapshot_revision=inventory_snapshot_revision,
+            disposition=disposition,
+            evidence_kind=evidence_kind,
+            evidence_sha256=evidence_sha256,
+            confirm=confirm,
+            request_id=core_request_id,
+        )
+        return json.dumps(payload, sort_keys=True)
+    except CoreOutcomeUnknown as exc:
+        return json.dumps(
+            {
+                "error": "outcome_unknown",
+                "reconciliation": outcome_unknown_projection(exc),
+            },
+            sort_keys=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("core request-journal reconciliation failed")
+        return json.dumps(
+            {
+                "error": _public_error(
+                    "core request-journal reconciliation failed",
+                    exc,
+                )
+            },
+            sort_keys=True,
+        )
+
+
+@mcp.tool(
     output_schema=TOKEN_CONTRACT_OUTPUT_SCHEMA,
     annotations={
         "title": "List Persisted SYNAPSE-S2 Memory",

@@ -172,6 +172,7 @@ class ReplicationLedger:
 
     def __init__(self, store: DurableMemoryStore) -> None:
         self.store = store
+        self._audit_only = False
         self.root = store.db_path.parent.absolute() / "replication"
         if self.root.exists() or self.root.is_symlink():
             validate_private_directory(self.root)
@@ -199,6 +200,88 @@ class ReplicationLedger:
         validate_private_directory(self.anchor_history_root)
         self._ensure_lock_file()
         self._initialize_or_validate()
+
+    @classmethod
+    def open_existing_for_audit(
+        cls,
+        store: DurableMemoryStore,
+    ) -> "ReplicationLedger":
+        """Open an existing ledger through a strictly read-only audit lane."""
+
+        ledger = cls.__new__(cls)
+        ledger.store = store
+        ledger._audit_only = True
+        ledger.root = store.db_path.parent.absolute() / "replication"
+        validate_private_directory(ledger.root)
+        ledger.path = ledger.root / "replication.sqlite3"
+        ledger.lock_path = ledger.root / "manager.lock"
+        ledger.anchor_path = ledger.root / "ledger-state.receipt.json"
+        ledger.pending_anchor_path = (
+            ledger.root / ".ledger-state.pending.receipt.json"
+        )
+        ledger.anchor_history_root = ledger.root / "anchor-history"
+        ledger.witness_root = store.db_path.parent.absolute() / "core"
+        ledger.witness_path = (
+            ledger.witness_root
+            / "replication-ledger-high-water.receipt.json"
+        )
+        validate_private_directory(ledger.witness_root)
+        validate_private_directory(ledger.anchor_history_root)
+        ledger._validate_private_regular(ledger.lock_path, allow_empty=True)
+        ledger._validate_private_regular(ledger.path)
+        if (
+            ledger.pending_anchor_path.exists()
+            or ledger.pending_anchor_path.is_symlink()
+        ):
+            raise RuntimeError(
+                "replication ledger has unresolved pending anchor state"
+            )
+        return ledger
+
+    @classmethod
+    def active_receive_peer_signing_key_ids_for_store(
+        cls,
+        store: DurableMemoryStore,
+    ) -> tuple[str, ...]:
+        """Return verified active receive-peer keys without changing state."""
+
+        root = store.db_path.parent.absolute() / "replication"
+        if not root.exists() and not root.is_symlink():
+            return ()
+        ledger_path = root / "replication.sqlite3"
+        if not ledger_path.exists() and not ledger_path.is_symlink():
+            return ()
+        ledger = cls.open_existing_for_audit(store)
+        keys: set[str] = set()
+        for peer in ledger.peers_for_integrity():
+            if peer.get("direction") != "receive" or peer.get("revoked") != 0:
+                continue
+            key_id = str(peer.get("signing_key_id") or "")
+            if DIGEST_RE.fullmatch(key_id) is None:
+                raise ReplicationProtocolError(
+                    "peer signing key identifier is invalid"
+                )
+            try:
+                public_bytes = base64.b64decode(
+                    str(peer.get("signing_public_key") or ""),
+                    validate=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ReplicationProtocolError(
+                    "peer signing key encoding is invalid"
+                ) from exc
+            if (
+                len(public_bytes) != 32
+                or not secrets.compare_digest(
+                    hashlib.sha256(public_bytes).hexdigest(),
+                    key_id,
+                )
+            ):
+                raise ReplicationProtocolError(
+                    "peer signing key binding is invalid"
+                )
+            keys.add(key_id)
+        return tuple(sorted(keys))
 
     @staticmethod
     def _validate_private_regular(path: Path, *, allow_empty: bool = False) -> os.stat_result:
@@ -257,6 +340,14 @@ class ReplicationLedger:
     def _open(self, *, create: bool = False) -> sqlite3.Connection:
         if create:
             conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        elif self._audit_only:
+            self._validate_private_regular(self.path)
+            conn = sqlite3.connect(
+                self.path.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=30.0,
+                isolation_level=None,
+            )
         else:
             self._validate_private_regular(self.path)
             conn = sqlite3.connect(
@@ -269,6 +360,8 @@ class ReplicationLedger:
         conn.execute("PRAGMA busy_timeout = 30000")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA trusted_schema = OFF")
+        if self._audit_only:
+            conn.execute("PRAGMA query_only = ON")
         return conn
 
     def _initialize_or_validate(self) -> None:
@@ -357,7 +450,7 @@ class ReplicationLedger:
 
     def _local_signing_identity(self) -> tuple[str, str, str]:
         _private, public_bytes, key_id = self.store._backup_receipt_signing_key(
-            create=True
+            create=not self._audit_only
         )
         if public_bytes is None or key_id is None:
             raise RuntimeError("replication ledger signing authority is unavailable")
@@ -622,6 +715,10 @@ class ReplicationLedger:
         with closing(self.store._connect_read_only()) as witness_conn:
             revision = self._read_neutral_high_water_conn(witness_conn)
         if revision is None:
+            if self._audit_only:
+                raise RuntimeError(
+                    "replication neutral high-water revision is missing"
+                )
             if int(anchor["revision"]) != 0 or not self._ledger_is_empty(conn):
                 raise RuntimeError(
                     "replication neutral high-water revision is missing"
@@ -703,6 +800,10 @@ class ReplicationLedger:
         with closing(self.store._connect_read_only()) as witness_conn:
             witness = self._read_high_water_witness_conn(witness_conn)
         if witness is None:
+            if self._audit_only:
+                raise RuntimeError(
+                    "replication high-water witness is missing"
+                )
             if int(anchor["revision"]) != 0 or not self._ledger_is_empty(conn):
                 raise RuntimeError("replication high-water witness is missing")
             witness = self._advance_high_water_witness(
@@ -1110,7 +1211,16 @@ class ReplicationLedger:
     def _read_transaction(self) -> Iterator[sqlite3.Connection]:
         with closing(self._open()) as conn:
             self._validate_schema(conn)
-            self._initialize_or_recover_anchor(conn)
+            if self._audit_only:
+                if (
+                    self.pending_anchor_path.exists()
+                    or self.pending_anchor_path.is_symlink()
+                ):
+                    raise RuntimeError(
+                        "replication ledger has unresolved pending anchor state"
+                    )
+            else:
+                self._initialize_or_recover_anchor(conn)
             conn.execute("BEGIN")
             try:
                 self._validate_schema(conn)

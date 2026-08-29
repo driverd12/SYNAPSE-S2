@@ -37,6 +37,7 @@ from core_request_journal import (
     JOURNAL_SCHEMA_IDENTITY,
     JOURNAL_SCHEMA_VERSION,
     SAFE_ERROR_CODES as REQUEST_JOURNAL_SAFE_ERROR_CODES,
+    request_journal_entry_revision,
 )
 from image_capture import (
     IMAGE_ARTIFACT_ENRICHED_SCHEMA,
@@ -954,6 +955,7 @@ class VerifiedRecoveryManager:
         path: Path,
         *,
         maximum_authority_epoch: int,
+        reconciliation_targets: Iterable[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         """Inspect one sealed standalone journal without SQLite side effects.
 
@@ -964,6 +966,64 @@ class VerifiedRecoveryManager:
 
         if maximum_authority_epoch <= 0:
             raise ValueError("request-journal binding requires a governed store epoch")
+        reviewed_targets = tuple(reconciliation_targets)
+        if len(reviewed_targets) > 4096:
+            raise RuntimeError(
+                "request-journal reconciliation receipt limit exceeded"
+            )
+        normalized_targets: list[dict[str, str]] = []
+        target_keys: set[tuple[str, str]] = set()
+        for target in reviewed_targets:
+            if not isinstance(target, Mapping):
+                raise RuntimeError(
+                    "request-journal reconciliation target is invalid"
+                )
+            normalized = {
+                field: str(target.get(field) or "")
+                for field in (
+                    "request_journal_id",
+                    "store_identity",
+                    "target_caller",
+                    "target_request_id",
+                    "target_operation",
+                    "target_authority_epoch",
+                    "target_original_state",
+                    "target_entry_revision",
+                )
+            }
+            key = (
+                normalized["target_caller"],
+                normalized["target_request_id"],
+            )
+            if (
+                REQUEST_JOURNAL_ID_RE.fullmatch(
+                    normalized["request_journal_id"]
+                )
+                is None
+                or STORE_IDENTITY_RE.fullmatch(normalized["store_identity"])
+                is None
+                or any(
+                    REQUEST_JOURNAL_IDENTIFIER_RE.fullmatch(normalized[field])
+                    is None
+                    for field in (
+                        "target_caller",
+                        "target_request_id",
+                        "target_operation",
+                        "target_authority_epoch",
+                    )
+                )
+                or normalized["target_original_state"] != "ambiguous"
+                or BACKUP_DIGEST_RE.fullmatch(
+                    normalized["target_entry_revision"]
+                )
+                is None
+                or key in target_keys
+            ):
+                raise RuntimeError(
+                    "request-journal reconciliation target is invalid"
+                )
+            target_keys.add(key)
+            normalized_targets.append(normalized)
         source = Path(path).expanduser().absolute()
         reject_sensitive_identifier(source, field="request journal path")
         observed = os.lstat(source)
@@ -1155,6 +1215,9 @@ class VerifiedRecoveryManager:
                 "accepted_at_unix_ms, finished_at_unix_ms FROM request_journal"
             )
             streamed_row_count = 0
+            matched_reconciliation_rows: dict[
+                tuple[str, str], tuple[Any, ...]
+            ] = {}
             while True:
                 batch = cursor.fetchmany(512)
                 if not batch:
@@ -1238,8 +1301,41 @@ class VerifiedRecoveryManager:
                             "request journal row state is inconsistent"
                         )
                     state_counts[state] += 1
+                    row_key = (caller, request_id)
+                    if row_key in target_keys:
+                        matched_reconciliation_rows[row_key] = tuple(row)
             if streamed_row_count != row_count:
                 raise RuntimeError("request journal changed during bounded inspection")
+            for target in normalized_targets:
+                key = (
+                    target["target_caller"],
+                    target["target_request_id"],
+                )
+                row = matched_reconciliation_rows.get(key)
+                if row is None:
+                    raise RuntimeError(
+                        "request-journal reconciliation source row is missing"
+                    )
+                entry_revision = request_journal_entry_revision(
+                    journal_id=metadata["journal_id"],
+                    store_identity=metadata["store_identity"],
+                    row=row,
+                )
+                if (
+                    target["request_journal_id"] != metadata["journal_id"]
+                    or target["store_identity"] != metadata["store_identity"]
+                    or str(row[2]) != target["target_operation"]
+                    or str(row[4]) != target["target_authority_epoch"]
+                    or str(row[5]) != "ambiguous"
+                    or str(row[2]) == "reconcile_request_journal"
+                    or not secrets.compare_digest(
+                        entry_revision,
+                        target["target_entry_revision"],
+                    )
+                ):
+                    raise RuntimeError(
+                        "request-journal reconciliation source binding is invalid"
+                    )
         visible = os.lstat(source)
         if (
             self.store._regular_file_identity(visible)
@@ -1270,6 +1366,12 @@ class VerifiedRecoveryManager:
             "store_identity": metadata["store_identity"],
             "quick_check": quick_check,
             "integrity_check": integrity_check,
+            "reconciliation_receipts": {
+                "count": len(normalized_targets),
+                "source_row_bindings_verified": True,
+                "original_ambiguous_rows_preserved": True,
+                "generic_replay_authorized": False,
+            },
             "verified": True,
         }
 
@@ -1525,6 +1627,7 @@ class VerifiedRecoveryManager:
         *,
         expected_sha256: str,
         maximum_authority_epoch: int,
+        reconciliation_targets: Iterable[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         if BACKUP_DIGEST_RE.fullmatch(expected_sha256) is None:
             raise ValueError("request-journal digest is invalid")
@@ -1548,6 +1651,7 @@ class VerifiedRecoveryManager:
             inspection = self.inspect_request_journal_snapshot(
                 temporary,
                 maximum_authority_epoch=maximum_authority_epoch,
+                reconciliation_targets=reconciliation_targets,
             )
             return {
                 **inspection,
@@ -1558,6 +1662,36 @@ class VerifiedRecoveryManager:
         finally:
             temporary.unlink(missing_ok=True)
             self.store._fsync_directory(staging_dir)
+
+    def _request_journal_reconciliation_receipts_from_database(
+        self,
+        path: Path,
+        *,
+        request_journal_id: str,
+        store_identity: str,
+        live_store_target: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Verify and return signed receipt bindings from one exact database.
+
+        The returned payloads remain content-free.  Recovery uses them only to
+        prove that every receipt still binds to the exact ambiguous row in the
+        separately verified request-journal artifact.
+        """
+
+        if live_store_target:
+            connection = self.store._connect_read_only()
+        else:
+            uri = Path(path).resolve().as_uri() + "?mode=ro&immutable=1"
+            connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+        with closing(connection) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA trusted_schema = OFF")
+            return self.store._request_journal_reconciliation_rows(
+                conn,
+                request_journal_id=request_journal_id,
+                store_identity=store_identity,
+            )
 
     @contextmanager
     def _runtime_state_lock(self, *, read_only: bool = False) -> Iterable[None]:
@@ -2509,10 +2643,22 @@ class VerifiedRecoveryManager:
                 raise RuntimeError(
                     "live restored memory changed during binding verification"
                 )
+        memory_binding = memory["authority_binding"]
+        reconciliation_receipts = (
+            self._request_journal_reconciliation_receipts_from_database(
+                memory_path,
+                request_journal_id=str(
+                    memory_binding["request_journal_id"]
+                ),
+                store_identity=str(memory_binding["store_identity"]),
+                live_store_target=live_memory_target,
+            )
+        )
         journal = self._verify_request_journal_artifact(
             journal_path,
             expected_sha256=str(payload["request_journal_sha256"]),
             maximum_authority_epoch=int(payload["authority_epoch_number"]),
+            reconciliation_targets=reconciliation_receipts,
         )
         runtime_state = self._verify_runtime_state_artifact(
             runtime_state_path,
@@ -2528,7 +2674,6 @@ class VerifiedRecoveryManager:
             ),
         )
         runtime_payload = json.loads(runtime_data.decode("utf-8"))
-        memory_binding = memory["authority_binding"]
         mismatches = (
             not secrets.compare_digest(memory_digest, str(payload["memory_sha256"])),
             int(memory_size) != int(payload["memory_size_bytes"]),
@@ -2627,6 +2772,17 @@ class VerifiedRecoveryManager:
             "request_journal_schema_identity": str(
                 payload["request_journal_schema_identity"]
             ),
+            "request_journal_reconciliation": {
+                "receipt_count": len(reconciliation_receipts),
+                "signatures_verified": True,
+                "source_row_bindings_verified": bool(
+                    journal["reconciliation_receipts"][
+                        "source_row_bindings_verified"
+                    ]
+                ),
+                "original_ambiguous_rows_preserved": True,
+                "generic_replay_authorized": False,
+            },
             "source_request_journal_binding_receipt_digest": str(
                 payload["source_request_journal_binding_receipt_digest"]
             ),
@@ -7960,6 +8116,7 @@ class VerifiedRecoveryManager:
         request_journal: dict[str, Any] | None = None
         request_journal_binding: dict[str, Any] | None = None
         request_journal_binding_path: Path | None = None
+        request_journal_reconciliation_receipts: list[dict[str, Any]] = []
         runtime_state: dict[str, Any] | None = None
         runtime_state_path: Path | None = None
         if (
@@ -8030,10 +8187,29 @@ class VerifiedRecoveryManager:
                     raise RuntimeError(
                         "request-journal binding signer is not trusted locally"
                     )
+                request_journal_reconciliation_receipts = (
+                    self._request_journal_reconciliation_receipts_from_database(
+                        database_path,
+                        request_journal_id=str(database["request_journal_id"]),
+                        store_identity=str(database["store_identity"]),
+                    )
+                )
+                if len(request_journal_reconciliation_receipts) != int(
+                    database.get(
+                        "request_journal_reconciliation_receipt_count",
+                        0,
+                    )
+                ):
+                    raise RuntimeError(
+                        "request-journal reconciliation inventory changed during recovery verification"
+                    )
                 request_journal = self._verify_request_journal_artifact(
                     request_journal_path,
                     expected_sha256=str(receipt["request_journal_sha256"]),
                     maximum_authority_epoch=int(authority_epoch_number),
+                    reconciliation_targets=(
+                        request_journal_reconciliation_receipts
+                    ),
                 )
                 if (
                     str(request_journal["store_identity"])
@@ -8342,6 +8518,11 @@ class VerifiedRecoveryManager:
                     request_journal is not None
                     and request_journal_binding is not None
                     and runtime_state is not None
+                    and bool(
+                        request_journal["reconciliation_receipts"][
+                            "source_row_bindings_verified"
+                        ]
+                    )
                 )
             )
         )
@@ -8419,6 +8600,22 @@ class VerifiedRecoveryManager:
             "logical_snapshot_schema": str(database["logical_snapshot_schema"]),
             "logical_snapshot_sha256": str(database["logical_snapshot_sha256"]),
             "request_journal": request_journal,
+            "request_journal_reconciliation": {
+                "receipt_count": len(
+                    request_journal_reconciliation_receipts
+                ),
+                "signatures_verified": True,
+                "source_row_bindings_verified": (
+                    request_journal is None
+                    or bool(
+                        request_journal["reconciliation_receipts"][
+                            "source_row_bindings_verified"
+                        ]
+                    )
+                ),
+                "original_ambiguous_rows_preserved": True,
+                "generic_replay_authorized": False,
+            },
             "request_journal_binding": (
                 None
                 if request_journal_binding is None

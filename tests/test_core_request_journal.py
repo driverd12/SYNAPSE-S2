@@ -445,6 +445,132 @@ class CoreRequestJournalTests(unittest.TestCase):
         self.assertEqual(contract.allowed_arguments, {"caller", "request_id"})
         self.assertEqual(contract.required_arguments, {"caller", "request_id"})
 
+    def test_inventory_is_bounded_content_free_and_snapshot_bound(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = self.private_root(temporary)
+            journal = CoreRequestJournal(
+                root / "requests.sqlite3",
+                authority_epoch="epoch-inventory",
+            )
+            self.addCleanup(journal.close)
+            self.accept(journal, "req-z")
+            self.accept(journal, "req-a")
+            self.finish(journal, "req-a", error="outcome_unknown")
+            self.accept(journal, "req-completed")
+            self.finish(journal, "req-completed", result={"enabled": True})
+
+            first = journal.inventory(limit=1)
+            self.assertEqual(first["schema"], "synapse-s2.request-journal-inventory.v1")
+            self.assertTrue(first["read_only"])
+            self.assertEqual(first["filters"]["states"], ["accepted", "ambiguous"])
+            self.assertEqual(first["pagination"]["total"], 2)
+            self.assertTrue(first["pagination"]["has_more"])
+            self.assertEqual(first["items"][0]["request_id"], "req-a")
+            self.assertEqual(first["items"][0]["state"], "ambiguous")
+            self.assertTrue(first["items"][0]["reconciliation_eligible"])
+            forbidden = {
+                "request_fingerprint",
+                "arguments",
+                "response",
+                "response_bytes",
+                "response_sha256",
+                "text",
+                "embedding",
+                "path",
+            }
+            self.assertTrue(forbidden.isdisjoint(first["items"][0]))
+            self.assertFalse(first["safety"]["contains_arguments"])
+            self.assertFalse(
+                first["safety"]["contains_request_fingerprints"]
+            )
+            self.assertFalse(first["safety"]["contains_results"])
+            self.assertEqual(
+                first["reconciliation_guard"]["snapshot_revision"],
+                first["snapshot_revision"],
+            )
+
+            with self.assertRaises(CoreRequestJournalError) as unbound_page:
+                journal.inventory(
+                    limit=1,
+                    after_caller=first["pagination"]["next_after_caller"],
+                    after_request_id=first["pagination"][
+                        "next_after_request_id"
+                    ],
+                )
+            self.assertEqual(unbound_page.exception.code, "invalid_request")
+
+            second = journal.inventory(
+                limit=1,
+                after_caller=first["pagination"]["next_after_caller"],
+                after_request_id=first["pagination"]["next_after_request_id"],
+                expected_snapshot_revision=first["snapshot_revision"],
+            )
+            self.assertEqual(second["items"][0]["request_id"], "req-z")
+            self.assertFalse(second["pagination"]["has_more"])
+
+            self.accept(journal, "req-new")
+            with self.assertRaises(CoreRequestJournalError) as raised:
+                journal.inventory(
+                    limit=1,
+                    after_caller=first["pagination"]["next_after_caller"],
+                    after_request_id=first["pagination"]["next_after_request_id"],
+                    expected_snapshot_revision=first["snapshot_revision"],
+                )
+            self.assertEqual(raised.exception.code, "request_conflict")
+
+            filtered = journal.inventory(states=("ambiguous",))
+            self.assertNotEqual(
+                filtered["reconciliation_guard"]["snapshot_revision"],
+                filtered["snapshot_revision"],
+            )
+            self.assertEqual(
+                filtered["reconciliation_guard"]["states"],
+                ["accepted", "ambiguous"],
+            )
+
+    def test_reconciliation_review_requires_exact_immutable_ambiguous_row(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = self.private_root(temporary)
+            journal = CoreRequestJournal(
+                root / "requests.sqlite3",
+                authority_epoch="epoch-review",
+                store_identity="store-" + ("1" * 24),
+            )
+            self.addCleanup(journal.close)
+            self.accept(journal, "req-review")
+            self.finish(journal, "req-review", error="outcome_unknown")
+            inventory = journal.inventory(states=("ambiguous",))
+            item = inventory["items"][0]
+            before = journal._db.execute(
+                "SELECT * FROM request_journal WHERE caller = ? AND request_id = ?",
+                (item["caller"], item["request_id"]),
+            ).fetchone()
+            reviewed = journal.review_reconciliation_target(
+                caller=item["caller"],
+                request_id=item["request_id"],
+                expected_operation=item["operation"],
+                expected_authority_epoch=item["authority_epoch"],
+                expected_entry_revision=item["entry_revision"],
+                expected_journal_id=inventory["journal_id"],
+            )
+            after = journal._db.execute(
+                "SELECT * FROM request_journal WHERE caller = ? AND request_id = ?",
+                (item["caller"], item["request_id"]),
+            ).fetchone()
+            self.assertEqual(before, after)
+            self.assertEqual(reviewed["original_state"], "ambiguous")
+            self.assertFalse(reviewed["replay_safe"])
+            with self.assertRaises(CoreRequestJournalError) as raised:
+                journal.review_reconciliation_target(
+                    caller=item["caller"],
+                    request_id=item["request_id"],
+                    expected_operation=item["operation"],
+                    expected_authority_epoch=item["authority_epoch"],
+                    expected_entry_revision="f" * 64,
+                    expected_journal_id=inventory["journal_id"],
+                )
+            self.assertEqual(raised.exception.code, "request_conflict")
+
     def test_refuses_unsafe_parent_symlink_hardlink_and_replacement(self) -> None:
         with TemporaryDirectory() as temporary:
             base = Path(temporary)

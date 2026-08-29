@@ -15,6 +15,7 @@ from memory_store import (
     LEGACY_SECRET_IDENTIFIER_COLUMNS,
     SQLITE_APPLICATION_ID,
     DurableMemoryStore,
+    RequestJournalReconciliationRejected,
 )
 
 
@@ -2765,6 +2766,167 @@ class DurableMemoryStoreTests(unittest.TestCase):
             ) as raised:
                 DurableMemoryStore(db_path)
             self.assertNotIn(marker, str(raised.exception))
+
+    def test_request_journal_reconciliation_is_signed_idempotent_and_recoverable(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DurableMemoryStore(root / "memory.sqlite3")
+            arguments = {
+                "request_journal_id": "journal-" + ("1" * 24),
+                "store_identity": "store-" + ("2" * 24),
+                "target_caller": "core-client-test",
+                "target_request_id": "req-ambiguous-test",
+                "target_operation": "cortex_tick",
+                "target_authority_epoch": "epoch-1",
+                "target_original_state": "ambiguous",
+                "target_entry_revision": "3" * 64,
+                "inventory_snapshot_revision": "4" * 64,
+                "disposition": "confirmed_no_effect",
+                "evidence_kind": "authoritative_no_effect_readback",
+                "evidence_sha256": "5" * 64,
+                "reconciled_by": "core:local-owner:" + ("6" * 24),
+                "confirm": True,
+            }
+            first = store.reconcile_request_journal(**arguments)
+            second = store.reconcile_request_journal(**arguments)
+            inventory = store.request_journal_reconciliation_inventory(
+                request_journal_id=arguments["request_journal_id"],
+                store_identity=arguments["store_identity"],
+            )
+            self.assertFalse(first["idempotent"])
+            self.assertTrue(second["idempotent"])
+            self.assertEqual(first["receipt_digest"], second["receipt_digest"])
+            self.assertEqual(inventory["count"], 1)
+            self.assertTrue(inventory["all_signatures_verified"])
+            self.assertFalse(inventory["generic_replay_authorized"])
+            self.assertFalse(first["replay_safe"])
+            self.assertTrue(first["original_journal_state_preserved"])
+
+            # A journal-less v5 store cannot prove the receipt's source-row
+            # binding, so backup correctly refuses it. Paired v6 recoverability
+            # is covered by the authoritative-core integration test.
+            with self.assertRaises(RuntimeError):
+                store.backup(root / "backup.sqlite3")
+
+            conflicting = dict(arguments)
+            conflicting["evidence_sha256"] = "7" * 64
+            with self.assertRaises(RequestJournalReconciliationRejected):
+                store.reconcile_request_journal(**conflicting)
+            self.assertEqual(
+                store.request_journal_reconciliation_inventory(
+                    request_journal_id=arguments["request_journal_id"],
+                    store_identity=arguments["store_identity"],
+                )["count"],
+                1,
+            )
+
+    def test_request_journal_reconciliation_rejects_invalid_proof_and_tamper(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "memory.sqlite3"
+            store = DurableMemoryStore(db_path)
+            arguments = {
+                "request_journal_id": "journal-" + ("8" * 24),
+                "store_identity": "store-" + ("9" * 24),
+                "target_caller": "core-client-test",
+                "target_request_id": "req-tamper-test",
+                "target_operation": "commit_cortical_trace",
+                "target_authority_epoch": "epoch-2",
+                "target_original_state": "ambiguous",
+                "target_entry_revision": "a" * 64,
+                "inventory_snapshot_revision": "b" * 64,
+                "disposition": "confirmed_no_effect",
+                "evidence_kind": "authoritative_effect_readback",
+                "evidence_sha256": "c" * 64,
+                "reconciled_by": "core:local-owner:" + ("d" * 24),
+                "confirm": True,
+            }
+            with self.assertRaises(RequestJournalReconciliationRejected):
+                store.reconcile_request_journal(**arguments)
+
+            arguments["evidence_kind"] = "authoritative_no_effect_readback"
+            store.reconcile_request_journal(**arguments)
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT operation_id, payload_json FROM store_maintenance_receipts "
+                    "WHERE operation_type = 'request-journal-reconciliation'"
+                ).fetchone()
+                payload = json.loads(row[1])
+                payload["disposition"] = "confirmed_completed"
+                conn.execute(
+                    "UPDATE store_maintenance_receipts SET payload_json = ? "
+                    "WHERE operation_id = ?",
+                    (json.dumps(payload, sort_keys=True), row[0]),
+                )
+                conn.commit()
+            with self.assertRaises(RuntimeError):
+                store.request_journal_reconciliation_inventory(
+                    request_journal_id=arguments["request_journal_id"],
+                    store_identity=arguments["store_identity"],
+                )
+
+    def test_request_journal_reconciliation_accepts_reviewed_peer_signer(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = DurableMemoryStore(root / "source" / "memory.sqlite3")
+            arguments = {
+                "request_journal_id": "journal-" + ("1" * 24),
+                "store_identity": "store-" + ("2" * 24),
+                "target_caller": "core-client-peer",
+                "target_request_id": "req-peer-test",
+                "target_operation": "cortex_tick",
+                "target_authority_epoch": "epoch-peer",
+                "target_original_state": "ambiguous",
+                "target_entry_revision": "3" * 64,
+                "inventory_snapshot_revision": "4" * 64,
+                "disposition": "confirmed_no_effect",
+                "evidence_kind": "authoritative_no_effect_readback",
+                "evidence_sha256": "5" * 64,
+                "reconciled_by": "core:local-owner:" + ("6" * 24),
+                "confirm": True,
+            }
+            receipt = source.reconcile_request_journal(**arguments)
+            with closing(sqlite3.connect(source.db_path)) as conn:
+                source_row = conn.execute(
+                    "SELECT operation_id, operation_type, context_id, "
+                    "before_revision, after_revision, payload_json, created_at "
+                    "FROM store_maintenance_receipts WHERE operation_id = ?",
+                    (receipt["resolution_id"],),
+                ).fetchone()
+
+            destination = DurableMemoryStore(
+                root / "destination" / "memory.sqlite3"
+            )
+            with closing(sqlite3.connect(destination.db_path)) as conn:
+                conn.execute(
+                    "INSERT INTO store_maintenance_receipts ("
+                    "operation_id, operation_type, context_id, before_revision, "
+                    "after_revision, payload_json, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    source_row,
+                )
+                conn.commit()
+            with self.assertRaises(RuntimeError):
+                destination.request_journal_reconciliation_inventory(
+                    request_journal_id=arguments["request_journal_id"],
+                    store_identity=arguments["store_identity"],
+                )
+            destination.set_request_journal_reconciliation_trusted_key_provider(
+                lambda: (receipt["auth_key_id"],)
+            )
+            provider_trusted = (
+                destination.request_journal_reconciliation_inventory(
+                    request_journal_id=arguments["request_journal_id"],
+                    store_identity=arguments["store_identity"],
+                )
+            )
+            self.assertEqual(provider_trusted["count"], 1)
+            trusted = destination.request_journal_reconciliation_inventory(
+                request_journal_id=arguments["request_journal_id"],
+                store_identity=arguments["store_identity"],
+                trusted_signing_key_ids=(receipt["auth_key_id"],),
+            )
+            self.assertEqual(trusted["count"], 1)
+            self.assertTrue(trusted["all_signatures_verified"])
 
 
 if __name__ == "__main__":

@@ -336,7 +336,109 @@ Use `wrap-session --confirm` only after the preview receipt matches the facts yo
 - The private socket admits at most 32 active request workers behind a backlog of 64 and gives a connection one second to present its peer identity, authenticated request, and complete bounded frame; authenticated socket I/O then has a five-second timeout. The dashboard separately admits at most eight active handlers behind backlog 32, enforces an absolute one-second deadline for complete request headers, switches to five-second post-header I/O, and bounds shutdown. Both services close admission before bounded drains.
 - Neural embedding, retrieval, trace, capture, Cortex, and consolidation operations share a 120-second client/service deadline floor derived from measured native execution, while ordinary control-plane RPCs retain the 30-second stall fence. Core worker and capture threads enter an MLX thread-local stream context before touching arrays. Dashboard Memory Hygiene reads stable 50-entry cursor pages without serializing relationship edges, scans at most the latest 250 entries per request, and reports exact scan coverage instead of implying a complete-store audit.
 - Deterministic acknowledgement, release, or dead-letter requests that provably commit no delivery change finish as terminal journal rows with `invalid_request`; credential-shaped delivery identifiers are rejected before journal admission. Failures whose commit state is genuinely uncertain remain `outcome_unknown` and are never replayed. Terminal rows age out, so accepted-row capacity is not consumed by deterministic rejects, but the total retained-row ceiling still makes sustained throughput finite until retention pruning runs.
+- Request-journal reconciliation is evidence classification, not journal repair. It applies only to an explicit v3 `ambiguous` row, preserves that source row unchanged, appends a separately signed maintenance receipt to the authoritative memory store, and always reports `replay_safe: false`. It does not dismiss, retry, reclassify, delete, or recover request-journal capacity.
 - Raw `register_trace` and `query` embeddings must have exactly the configured dimension before journal admission. The exact steady float32 dense topology—sensory matrix, lateral matrix, membrane, spike, and active-trace arrays—must fit 384 MiB before MLX model loading, array materialization, or sensory resize. This is an admission calculation, not proof of peak process residency, target hardware behavior, or execution time.
+
+### Request-journal evidence reconciliation
+
+> **Source-only availability:** these commands, MCP tools, health fields, and
+> authenticated dashboard API routes describe the current source tree. They do
+> not prove that an installed core or dashboard has been updated. Do not use
+> them against a live store until a separately governed deployment verifies the
+> installed build identity and its fresh paired recovery point.
+
+The request journal remains schema v3, and this feature does not mutate any
+source row; an explicit-ambiguous target remains unchanged and nonprunable.
+`request-journal-inventory` returns a bounded, content-free, keyset-paginated
+snapshot. Only a row whose original state is exactly `ambiguous` is eligible
+for reconciliation; `accepted`, `completed`, and `failed` rows can be inspected
+but cannot be adjudicated through this surface. The operation never reads or
+publishes the original request arguments or response body.
+
+One reconciliation appends an individually Ed25519-signed
+`synapse-s2.request-journal-reconciliation-receipt.v1` record to the existing
+recoverable `store_maintenance_receipts` ledger. The receipt binds the journal
+ID, store identity, caller, request ID, operation, authority epoch, immutable
+entry revision, inventory snapshot revision, disposition, content-free evidence
+SHA-256, authenticated local principal, and receipt timestamp. The original v3
+row is neither updated nor removed.
+
+The closed disposition/evidence contract is:
+
+| Disposition | Permitted evidence kind |
+| :--- | :--- |
+| `confirmed_completed` | `authoritative_effect_readback`, `event_ledger_readback`, `signed_artifact_verification`, or `signed_operation_receipt` |
+| `confirmed_no_effect` | `authoritative_no_effect_readback` |
+| `superseded` | `authoritative_effect_readback`, `event_ledger_readback`, or `signed_operation_receipt` |
+
+Every inventory returns two distinct revisions. `snapshot_revision` binds that
+page's selected states and filters and must be used for keyset continuation.
+`reconciliation_guard.snapshot_revision` always binds the complete unfiltered
+`accepted` plus `ambiguous` candidate set and is the only revision accepted by
+the reconciliation mutation. A filtered `--state ambiguous`, caller, or
+operation inventory is therefore safe for review without weakening the global
+change guard:
+
+```bash
+.venv/bin/python synapse_cli.py --json request-journal-inventory \
+  --limit 100
+
+# Continue only when the page is bound to the same snapshot revision.
+.venv/bin/python synapse_cli.py --json request-journal-inventory \
+  --limit 100 \
+  --after-caller '<next_after_caller>' \
+  --after-request-id '<next_after_request_id>' \
+  --expected-snapshot-revision '<page_snapshot_revision>'
+```
+
+After independently reviewing authoritative, content-free evidence, submit one
+exact candidate with every compare-and-swap binding copied from that snapshot.
+Predeclare the reconciliation mutation's own request ID so an interrupted
+response can be checked with `request-status` without submitting a new logical
+mutation:
+
+```bash
+.venv/bin/python synapse_cli.py --json request-journal-reconcile \
+  --caller '<target_caller>' \
+  --request-id '<target_request_id>' \
+  --expected-operation '<target_operation>' \
+  --expected-authority-epoch '<target_authority_epoch>' \
+  --expected-entry-revision '<target_entry_revision>' \
+  --expected-journal-id '<journal_id>' \
+  --inventory-snapshot-revision '<reconciliation_guard.snapshot_revision>' \
+  --disposition confirmed_no_effect \
+  --evidence-kind authoritative_no_effect_readback \
+  --evidence-sha256 '<sha256_of_separately_retained_evidence>' \
+  --core-request-id '<predeclared_reconciliation_request_id>' \
+  --confirm
+```
+
+Any changed snapshot, row, journal/store binding, operation, authority epoch,
+or evidence matrix fails closed. Submitting the same semantics again is
+idempotent and returns the same verified receipt; attempting a different
+classification for the same target conflicts. An uncertain reconciliation
+response is itself handled only through `request-status` and is never blindly
+retried.
+
+Health deliberately keeps raw and adjudicated counts separate:
+`explicit_ambiguous_count` is the immutable source-row count,
+`reconciled_explicit_ambiguous_count` is the number of valid signed receipts,
+and `unresolved_explicit_ambiguous_count` is their difference.
+`reconciliation_record_count` reports bound receipts, while
+`reconciliation_signatures_verified` confirms that the receipt set verified.
+The older `ambiguous_count` is a broader cache-sensitive outcome-unknown
+projection and must not be substituted for `explicit_ambiguous_count`.
+Reconciliation does not reduce `used_rows`, increase
+`accepted_capacity_remaining`, or make any target replay-safe.
+
+The same contract is exposed as the read-only MCP tool
+`list_core_request_journal`, the confirmed mutation tool
+`reconcile_core_request_journal`, and authenticated dashboard backend routes
+`POST /api/request-journal/inventory` and
+`POST /api/request-journal/reconcile`. The reconciliation dashboard route
+requires the exact field set plus `reviewed=true`, `confirm=true`, and a
+predeclared `core_request_id`; these backend routes do not by themselves claim
+that a browser review panel has been installed.
 
 ### 3. Write and Query Persistent Memory
 
@@ -883,6 +985,8 @@ The MCP server exposes these tools:
 | `set_spiking_attention_enabled` | Enable or disable SYNAPSE-S2 globally or per context id. |
 | `get_spiking_attention_status` | Report health, dependency state, memory counts, and toggle state. |
 | `get_core_request_status` | Reconcile one ambiguous authoritative-core mutation by caller/request handle without replaying it. |
+| `list_core_request_journal` | List a bounded content-free request-journal snapshot, including signed reconciliation status; this read never replays or mutates a request. |
+| `reconcile_core_request_journal` | Append one signed evidence classification for an exact explicit-ambiguous row after full snapshot/entry CAS and `confirm=true`; it never changes the source row or authorizes replay. |
 | `list_spiking_memory` | List persisted SQLite memory through the compact contract by default; `full` is explicit and compact mode rejects vector/index arrays. |
 | `ingest_spiking_memory_text` | Segment long text into event memories and persist graph relationships. |
 | `capture_spiking_conversation` | Capture real operator/agent conversation notes as temporal event memories. |
@@ -995,7 +1099,7 @@ Deep sleep returns all seven proposal lifecycle phases: connection weight decay,
 
 ### 7. Local Control Dashboard
 
-The dashboard is a loopback-only, bounded threaded adapter for the same authoritative core used by MCP and the CLI. It admits at most eight active handlers behind backlog 32, requires complete request headers inside an absolute one-second pre-authentication deadline, uses five-second post-header I/O timeouts, and performs bounded shutdown. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation and image capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and signed paired recovery points. A hidden far-right Impact control opens content-free recall/yield/bridge/graph/latency/resource analytics plus an editable `$0`-to-upper-bound cost what-if; it is explicitly not provider billing or proven savings. Current coverage is one all-namespace local aggregate of dashboard `/api/query` only—not MCP, CLI, or agent hydration—and approximate tokens are response UTF-8 bytes divided by four. Reported recall latency covers backend retrieval, not full HTTP delivery. Its rich local HTTP payloads are intentionally separate from the installed MCP compact-response projector, so the 12,288-byte agent budget does not remove graph or drill-down evidence from the browser.
+The dashboard is a loopback-only, bounded threaded adapter for the same authoritative core used by MCP and the CLI. It admits at most eight active handlers behind backlog 32, requires complete request headers inside an absolute one-second pre-authentication deadline, uses five-second post-header I/O timeouts, and performs bounded shutdown. It exposes live status, a saved memory namespace selector populated from live contexts, one core enable switch, the Daily Operator Trust Loop, Start Work briefs, Context Health, Memory Quality, Goal Ledger, Doctor/Repair reports, Memory Hygiene actions, operation receipts, Wrap Session preview/commit, Recipes, resource envelope profiling, native certification, durable trace capture, conversation and image capture, App Connect capability badges plus tokenized preview/snapshot capture, tokenized magic capture inbox processing, event ingestion, Cortex Governor enter/tick/commit/close plus promote/demote/prune controls, Recall evidence actions and Recall Pin, graph memory inspection, surgical graph pruning, recall, quick-pruning, deep-sleep, and signed paired recovery points. The source backend also exposes authenticated, POST-only request-journal inventory and exact single-record reconciliation routes; they preserve the immutable journal and do not imply that the installed browser UI includes a reconciliation panel. A hidden far-right Impact control opens content-free recall/yield/bridge/graph/latency/resource analytics plus an editable `$0`-to-upper-bound cost what-if; it is explicitly not provider billing or proven savings. Current coverage is one all-namespace local aggregate of dashboard `/api/query` only—not MCP, CLI, or agent hydration—and approximate tokens are response UTF-8 bytes divided by four. Reported recall latency covers backend retrieval, not full HTTP delivery. Its rich local HTTP payloads are intentionally separate from the installed MCP compact-response projector, so the 12,288-byte agent budget does not remove graph or drill-down evidence from the browser.
 
 ### Connected namespace recall and neural galaxy
 

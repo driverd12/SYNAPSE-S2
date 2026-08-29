@@ -378,6 +378,57 @@ class ReplicationManagerTests(unittest.TestCase):
         receiver_status = receiver.status()
         self.assertEqual(source_status["checkpoint_counts"]["outgoing:acknowledged"], 1)
         self.assertEqual(receiver_status["checkpoint_counts"]["incoming:staged"], 1)
+
+    def test_receive_peer_trust_verifies_reconciliation_receipt_in_checkpoint(self):
+        source = self.manager("source-reconciliation")
+        receiver = self.manager("receiver-reconciliation")
+        self.pair(source, receiver)
+        journal = self.journals[0]
+        fingerprint = hashlib.sha256(b"replicated-ambiguous-request").hexdigest()
+        journal.accept(
+            caller="replication-source-client",
+            request_id="replication-source-request",
+            operation="cortex_tick",
+            request_fingerprint=fingerprint,
+        )
+        journal.finish(
+            caller="replication-source-client",
+            request_id="replication-source-request",
+            operation="cortex_tick",
+            request_fingerprint=fingerprint,
+            result=None,
+            safe_error_code="outcome_unknown",
+        )
+        inventory = journal.inventory(states=("ambiguous",))
+        candidate = inventory["items"][0]
+        receipt = source.store.reconcile_request_journal(
+            request_journal_id=inventory["journal_id"],
+            store_identity=inventory["store_identity"],
+            target_caller=candidate["caller"],
+            target_request_id=candidate["request_id"],
+            target_operation=candidate["operation"],
+            target_authority_epoch=candidate["authority_epoch"],
+            target_original_state="ambiguous",
+            target_entry_revision=candidate["entry_revision"],
+            inventory_snapshot_revision=inventory["reconciliation_guard"][
+                "snapshot_revision"
+            ],
+            disposition="confirmed_no_effect",
+            evidence_kind="authoritative_no_effect_readback",
+            evidence_sha256=hashlib.sha256(
+                b"replication-no-effect-evidence"
+            ).hexdigest(),
+            reconciled_by="core:local-owner:" + ("a" * 24),
+            confirm=True,
+        )
+        self.assertTrue(receipt["signature_verified"])
+
+        exported = source.create_checkpoint(receiver.node_id)
+        staged = receiver.stage_checkpoint(exported["manifest_path"])
+        self.assertTrue(staged["verified"])
+        self.assertTrue(staged["memory_recovery_cutover_ready"])
+        source_status = source.status()
+        receiver_status = receiver.status()
         self.assertEqual(receiver_status["acknowledgement_count"], 1)
         self.assertEqual(source_status["integrity"]["state"], "ready")
         self.assertEqual(receiver_status["integrity"]["state"], "ready")
@@ -392,6 +443,134 @@ class ReplicationManagerTests(unittest.TestCase):
                 status["ack_policy"],
                 "receiver-signs-after-memory-recovery-ready-proof",
             )
+
+    def test_offline_audit_resolves_and_revokes_receive_peer_receipt_trust(self):
+        source = self.manager("offline-trust-source")
+        receiver = self.manager("offline-trust-receiver")
+        self.pair(source, receiver)
+        receiver_journal = self.journals[-1]
+        fingerprint = hashlib.sha256(
+            b"offline-peer-trust-ambiguous-request"
+        ).hexdigest()
+        receiver_journal.accept(
+            caller="offline-peer-source-client",
+            request_id="offline-peer-source-request",
+            operation="cortex_tick",
+            request_fingerprint=fingerprint,
+        )
+        receiver_journal.finish(
+            caller="offline-peer-source-client",
+            request_id="offline-peer-source-request",
+            operation="cortex_tick",
+            request_fingerprint=fingerprint,
+            result=None,
+            safe_error_code="outcome_unknown",
+        )
+        inventory = receiver_journal.inventory(states=("ambiguous",))
+        candidate = inventory["items"][0]
+        signed = source.store.reconcile_request_journal(
+            request_journal_id=inventory["journal_id"],
+            store_identity=inventory["store_identity"],
+            target_caller=candidate["caller"],
+            target_request_id=candidate["request_id"],
+            target_operation=candidate["operation"],
+            target_authority_epoch=candidate["authority_epoch"],
+            target_original_state="ambiguous",
+            target_entry_revision=candidate["entry_revision"],
+            inventory_snapshot_revision=inventory["reconciliation_guard"][
+                "snapshot_revision"
+            ],
+            disposition="confirmed_no_effect",
+            evidence_kind="authoritative_no_effect_readback",
+            evidence_sha256=hashlib.sha256(
+                b"offline-peer-no-effect-evidence"
+            ).hexdigest(),
+            reconciled_by="core:peer-owner:" + ("b" * 24),
+            confirm=True,
+        )
+        with closing(sqlite3.connect(source.store.db_path)) as source_conn:
+            row = source_conn.execute(
+                "SELECT operation_id, operation_type, context_id, "
+                "before_revision, after_revision, payload_json, created_at "
+                "FROM store_maintenance_receipts WHERE operation_id = ?",
+                (signed["resolution_id"],),
+            ).fetchone()
+        with closing(sqlite3.connect(receiver.store.db_path)) as receiver_conn:
+            receiver_conn.execute(
+                "INSERT INTO store_maintenance_receipts ("
+                "operation_id, operation_type, context_id, before_revision, "
+                "after_revision, payload_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+            receiver_conn.commit()
+
+        live = receiver.store.request_journal_reconciliation_inventory(
+            request_journal_id=inventory["journal_id"],
+            store_identity=inventory["store_identity"],
+        )
+        self.assertEqual(live["count"], 1)
+        offline = DurableMemoryStore.open_existing_for_audit(
+            receiver.store.db_path
+        )
+        recovery_root = (
+            receiver.store.db_path.parent / "backups" / "offline-peer-trust"
+        )
+        recovery_root.mkdir(parents=True, mode=0o700)
+        os.chmod(recovery_root, 0o700)
+        bundle = receiver.recovery.create_bundle(
+            recovery_root / "offline-peer-trust.sqlite3",
+            purpose="offline-peer-reconciliation-trust-test",
+            pinned=True,
+        )
+        try:
+            verified = offline.request_journal_reconciliation_inventory(
+                request_journal_id=inventory["journal_id"],
+                store_identity=inventory["store_identity"],
+            )
+            offline_recovery = VerifiedRecoveryManager(
+                offline,
+                capture_root=receiver.store.db_path.parent,
+            )
+            verified_bundle = offline_recovery.verify_bundle(
+                bundle["bundle_receipt_path"]
+            )
+        finally:
+            offline.close()
+        self.assertEqual(verified["count"], 1)
+        self.assertTrue(verified_bundle["verified"])
+        self.assertTrue(
+            verified_bundle["request_journal_reconciliation"][
+                "source_row_bindings_verified"
+            ]
+        )
+        self.assertEqual(
+            verified["items"][0]["auth_key_id"],
+            source.node_descriptor()["auth_key_id"],
+        )
+
+        receiver.revoke_peer(
+            source.node_id,
+            reason="offline trust revocation test",
+            confirm=True,
+        )
+        revoked = DurableMemoryStore.open_existing_for_audit(
+            receiver.store.db_path
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "signer is untrusted"):
+                revoked.request_journal_reconciliation_inventory(
+                    request_journal_id=inventory["journal_id"],
+                    store_identity=inventory["store_identity"],
+                )
+            revoked_recovery = VerifiedRecoveryManager(
+                revoked,
+                capture_root=receiver.store.db_path.parent,
+            )
+            with self.assertRaisesRegex(RuntimeError, "signer is untrusted"):
+                revoked_recovery.verify_bundle(bundle["bundle_receipt_path"])
+        finally:
+            revoked.close()
 
     def test_memora_governance_survives_stage_and_is_revalidated_on_replay(self):
         identity = self._memora_identity()

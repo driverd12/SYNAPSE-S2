@@ -95,6 +95,9 @@ class ReplicationManager:
         if self.recovery.store is not store:
             raise ValueError("replication and recovery managers must share one memory store")
         self.ledger = ReplicationLedger(store)
+        self.store.set_request_journal_reconciliation_trusted_key_provider(
+            self._active_receive_peer_signing_key_ids
+        )
         self.root = self.ledger.root
         self.outgoing_root = self.root / "outgoing"
         self.incoming_root = self.root / "incoming"
@@ -114,6 +117,19 @@ class ReplicationManager:
         self.descriptor_path = self.root / "node-descriptor.json"
         self._descriptor = self._load_or_create_descriptor()
         self.node_id = str(self._descriptor["node_id"])
+
+    def _active_receive_peer_signing_key_ids(self) -> tuple[str, ...]:
+        keys: set[str] = set()
+        for peer in self.ledger.peers_for_integrity():
+            if peer.get("direction") != "receive" or peer.get("revoked") != 0:
+                continue
+            keys.add(
+                validate_digest(
+                    peer.get("signing_key_id"),
+                    "peer signing key",
+                )
+            )
+        return tuple(sorted(keys))
 
     def _ensure_private_directory(self, path: Path) -> None:
         if path.exists() or path.is_symlink():

@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Collection, Literal
+from typing import Any, Callable, Collection, Literal, Mapping
 
 from core_authority import CoreAuthorityError, CoreAuthorityLease
 
@@ -24,6 +24,7 @@ JOURNAL_SCHEMA_IDENTITY = (
     f"sqlite-{JOURNAL_APPLICATION_ID:x}-v{JOURNAL_SCHEMA_VERSION}"
 )
 JOURNAL_BINDING_SCHEMA = "synapse-s2.request-journal-binding.v1"
+JOURNAL_INVENTORY_SCHEMA = "synapse-s2.request-journal-inventory.v1"
 DEFAULT_MAX_ROWS = 16_384
 DEFAULT_MAX_ACCEPTED_ROWS = 4_096
 DEFAULT_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -58,6 +59,8 @@ _SECRET_PATTERNS = (
     re.compile(r"\bBearer[A-Za-z0-9._~+:/=-]{12,}\b", re.IGNORECASE),
 )
 _TERMINAL_STATES = ("completed", "failed")
+_INVENTORY_STATES = ("accepted", "ambiguous", "completed", "failed")
+_RECONCILIATION_OPERATION = "reconcile_request_journal"
 SAFE_ERROR_CODES = frozenset(
     {
         "authentication_failed",
@@ -338,6 +341,60 @@ def _bounded_age_ms(now_unix_ms: int, timestamp_unix_ms: int | None) -> int | No
     if timestamp_unix_ms is None:
         return None
     return min(MAX_STATUS_AGE_MS, max(0, now_unix_ms - int(timestamp_unix_ms)))
+
+
+def _revision_digest(*records: Any) -> str:
+    digest = hashlib.sha256()
+    for record in records:
+        try:
+            encoded = json.dumps(
+                record,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CoreRequestJournalError() from exc
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def request_journal_entry_revision(
+    *,
+    journal_id: str,
+    store_identity: str | None,
+    row: Collection[Any],
+) -> str:
+    """Bind one exact journal row to its immutable journal/store identity.
+
+    Recovery verification uses the same content-free revision calculation as
+    the live review path so a signed reconciliation receipt cannot be paired
+    with a different, missing, or changed source row.
+    """
+
+    if (
+        not isinstance(journal_id, str)
+        or _JOURNAL_ID_RE.fullmatch(journal_id) is None
+        or (
+            store_identity is not None
+            and (
+                not isinstance(store_identity, str)
+                or _STORE_IDENTITY_RE.fullmatch(store_identity) is None
+            )
+        )
+        or len(row) != 10
+    ):
+        raise CoreRequestJournalError()
+    return _revision_digest(
+        {
+            "schema": "synapse-s2.request-journal-entry-revision.v1",
+            "journal_id": journal_id,
+            "store_identity": store_identity,
+        },
+        list(row),
+    )
 
 
 class CoreRequestJournal:
@@ -861,6 +918,366 @@ class CoreRequestJournal:
             self._health_cache = None
             self._secure_sidecars()
             self.prune()
+
+    def _entry_revision(self, row: Collection[Any]) -> str:
+        if self.journal_id is None:
+            raise CoreRequestJournalError()
+        return request_journal_entry_revision(
+            journal_id=self.journal_id,
+            store_identity=self.store_identity,
+            row=row,
+        )
+
+    def inventory(
+        self,
+        *,
+        states: Collection[str] | None = None,
+        caller: str | None = None,
+        operation: str | None = None,
+        limit: int = 25,
+        after_caller: str | None = None,
+        after_request_id: str | None = None,
+        expected_snapshot_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one deterministic, content-free request-journal page.
+
+        This surface never prunes, replays, or mutates request evidence.  A
+        continuation must present the prior snapshot revision so pages from
+        different journal states cannot be spliced together silently.
+        """
+
+        requested_states = (
+            ("accepted", "ambiguous") if states is None else tuple(states)
+        )
+        if (
+            not requested_states
+            or len(requested_states) > len(_INVENTORY_STATES)
+            or len(set(requested_states)) != len(requested_states)
+            or any(state not in _INVENTORY_STATES for state in requested_states)
+        ):
+            raise CoreRequestJournalError("invalid_request")
+        ordered_states = tuple(
+            state for state in _INVENTORY_STATES if state in requested_states
+        )
+        clean_caller = None if caller is None else _validate_identifier(caller)
+        clean_operation = (
+            None if operation is None else _validate_identifier(operation)
+        )
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CoreRequestJournalError("invalid_request")
+        if (after_caller is None) != (after_request_id is None):
+            raise CoreRequestJournalError("invalid_request")
+        if after_caller is not None and expected_snapshot_revision is None:
+            raise CoreRequestJournalError("invalid_request")
+        clean_after_caller = (
+            None
+            if after_caller is None
+            else _validate_identifier(after_caller)
+        )
+        clean_after_request_id = (
+            None
+            if after_request_id is None
+            else _validate_identifier(after_request_id)
+        )
+        expected_revision = (
+            None
+            if expected_snapshot_revision is None
+            else _validate_fingerprint(expected_snapshot_revision)
+        )
+        now_ms = int(time.time() * 1000)
+        with self._mutex:
+            db = self._db
+            db.execute("BEGIN")
+            try:
+                clauses = [
+                    "state IN ("
+                    + ",".join("?" for _state in ordered_states)
+                    + ")",
+                    "operation <> ?",
+                ]
+                parameters: list[Any] = [
+                    *ordered_states,
+                    _RECONCILIATION_OPERATION,
+                ]
+                if clean_caller is not None:
+                    clauses.append("caller = ?")
+                    parameters.append(clean_caller)
+                if clean_operation is not None:
+                    clauses.append("operation = ?")
+                    parameters.append(clean_operation)
+                rows = db.execute(
+                    "SELECT caller, request_id, operation, request_fingerprint, "
+                    "authority_epoch, state, result_kind, safe_error_code, "
+                    "accepted_at_unix_ms, finished_at_unix_ms "
+                    "FROM request_journal WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY caller, request_id",
+                    tuple(parameters),
+                ).fetchall()
+                snapshot_header = {
+                    "schema": JOURNAL_INVENTORY_SCHEMA,
+                    "journal_id": self.journal_id,
+                    "store_identity": self.store_identity,
+                    "states": ordered_states,
+                    "caller": clean_caller,
+                    "operation": clean_operation,
+                }
+                snapshot_revision = _revision_digest(
+                    snapshot_header,
+                    *[list(row) for row in rows],
+                )
+                reconciliation_rows = (
+                    rows
+                    if ordered_states == ("accepted", "ambiguous")
+                    and clean_caller is None
+                    and clean_operation is None
+                    else db.execute(
+                        "SELECT caller, request_id, operation, request_fingerprint, "
+                        "authority_epoch, state, result_kind, safe_error_code, "
+                        "accepted_at_unix_ms, finished_at_unix_ms "
+                        "FROM request_journal WHERE state IN (?, ?) "
+                        "AND operation <> ? ORDER BY caller, request_id",
+                        ("accepted", "ambiguous", _RECONCILIATION_OPERATION),
+                    ).fetchall()
+                )
+                reconciliation_snapshot_revision = _revision_digest(
+                    {
+                        "schema": JOURNAL_INVENTORY_SCHEMA,
+                        "journal_id": self.journal_id,
+                        "store_identity": self.store_identity,
+                        "states": ("accepted", "ambiguous"),
+                        "caller": None,
+                        "operation": None,
+                    },
+                    *[list(row) for row in reconciliation_rows],
+                )
+                if expected_revision is not None and not secrets.compare_digest(
+                    expected_revision,
+                    snapshot_revision,
+                ):
+                    raise CoreRequestJournalError("request_conflict")
+                after_key = (
+                    None
+                    if clean_after_caller is None
+                    else (clean_after_caller, clean_after_request_id)
+                )
+                eligible_rows = [
+                    row
+                    for row in rows
+                    if after_key is None
+                    or (str(row[0]), str(row[1])) > after_key
+                ]
+                selected = eligible_rows[: limit + 1]
+                has_more = len(selected) > limit
+                page_rows = selected[:limit]
+                items = [
+                    {
+                        "caller": str(row[0]),
+                        "request_id": str(row[1]),
+                        "operation": str(row[2]),
+                        "state": str(row[5]),
+                        "result_kind": (
+                            None if row[6] is None else str(row[6])
+                        ),
+                        "safe_error_code": (
+                            None if row[7] is None else str(row[7])
+                        ),
+                        "authority_epoch": str(row[4]),
+                        "accepted_age_ms": _bounded_age_ms(now_ms, row[8]),
+                        "finished_age_ms": _bounded_age_ms(now_ms, row[9]),
+                        "entry_revision": self._entry_revision(row),
+                        "reconciliation_eligible": (
+                            str(row[5]) == "ambiguous"
+                            and str(row[2]) != _RECONCILIATION_OPERATION
+                        ),
+                        "replay_safe": False,
+                        "retention_expiry_possible": str(row[5])
+                        in _TERMINAL_STATES,
+                    }
+                    for row in page_rows
+                ]
+                next_after_caller = (
+                    str(page_rows[-1][0]) if has_more and page_rows else None
+                )
+                next_after_request_id = (
+                    str(page_rows[-1][1]) if has_more and page_rows else None
+                )
+            finally:
+                db.execute("ROLLBACK")
+        return {
+            "schema": JOURNAL_INVENTORY_SCHEMA,
+            "read_only": True,
+            "journal_id": self.journal_id,
+            "store_identity": self.store_identity,
+            "snapshot_revision": snapshot_revision,
+            "filters": {
+                "states": list(ordered_states),
+                "caller": clean_caller,
+                "operation": clean_operation,
+            },
+            "items": items,
+            "pagination": {
+                "ordering": "caller-asc,request-id-asc",
+                "limit": limit,
+                "returned": len(items),
+                "total": len(rows),
+                "has_more": has_more,
+                "next_after_caller": next_after_caller,
+                "next_after_request_id": next_after_request_id,
+                "snapshot_revision": snapshot_revision,
+            },
+            "reconciliation_guard": {
+                "states": ["accepted", "ambiguous"],
+                "caller": None,
+                "operation": None,
+                "snapshot_revision": reconciliation_snapshot_revision,
+            },
+            "safety": {
+                "contains_arguments": False,
+                "contains_request_fingerprints": False,
+                "contains_results": False,
+                "generic_replay_authorized": False,
+            },
+        }
+
+    def review_reconciliation_target(
+        self,
+        *,
+        caller: str,
+        request_id: str,
+        expected_operation: str,
+        expected_authority_epoch: str,
+        expected_entry_revision: str,
+        expected_journal_id: str,
+    ) -> dict[str, Any]:
+        """Re-read one exact ambiguous row without altering its evidence."""
+
+        caller = _validate_identifier(caller)
+        request_id = _validate_identifier(request_id)
+        expected_operation = _validate_identifier(expected_operation)
+        expected_authority_epoch = _validate_identifier(
+            expected_authority_epoch
+        )
+        expected_entry_revision = _validate_fingerprint(
+            expected_entry_revision
+        )
+        expected_journal_id = _validate_identifier(expected_journal_id)
+        with self._mutex:
+            if self.journal_id != expected_journal_id:
+                raise CoreRequestJournalError("request_conflict")
+            row = self._db.execute(
+                "SELECT caller, request_id, operation, request_fingerprint, "
+                "authority_epoch, state, result_kind, safe_error_code, "
+                "accepted_at_unix_ms, finished_at_unix_ms "
+                "FROM request_journal WHERE caller = ? AND request_id = ?",
+                (caller, request_id),
+            ).fetchone()
+            if row is None:
+                raise CoreRequestJournalError("request_conflict")
+            entry_revision = self._entry_revision(row)
+            if (
+                str(row[2]) != expected_operation
+                or str(row[4]) != expected_authority_epoch
+                or str(row[5]) != "ambiguous"
+                or str(row[2]) == _RECONCILIATION_OPERATION
+                or not secrets.compare_digest(
+                    entry_revision,
+                    expected_entry_revision,
+                )
+            ):
+                raise CoreRequestJournalError("request_conflict")
+            return {
+                "caller": caller,
+                "request_id": request_id,
+                "operation": str(row[2]),
+                "original_state": str(row[5]),
+                "authority_epoch": str(row[4]),
+                "entry_revision": entry_revision,
+                "journal_id": self.journal_id,
+                "store_identity": self.store_identity,
+                "replay_safe": False,
+            }
+
+    def review_reconciliation_targets(
+        self,
+        targets: Collection[Mapping[str, Any]],
+        *,
+        expected_journal_id: str,
+    ) -> list[dict[str, Any]]:
+        """Bulk-verify signed receipt bindings against immutable source rows."""
+
+        expected_journal_id = _validate_identifier(expected_journal_id)
+        if (
+            self.journal_id != expected_journal_id
+            or len(targets) > self.max_accepted_rows
+        ):
+            raise CoreRequestJournalError("request_conflict")
+        reviewed_inputs: list[tuple[str, str, str, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for target in targets:
+            if not isinstance(target, Mapping):
+                raise CoreRequestJournalError("invalid_request")
+            caller = _validate_identifier(str(target.get("target_caller") or ""))
+            request_id = _validate_identifier(
+                str(target.get("target_request_id") or "")
+            )
+            key = (caller, request_id)
+            if key in seen:
+                raise CoreRequestJournalError("request_conflict")
+            seen.add(key)
+            reviewed_inputs.append(
+                (
+                    caller,
+                    request_id,
+                    _validate_identifier(
+                        str(target.get("target_operation") or "")
+                    ),
+                    _validate_identifier(
+                        str(target.get("target_authority_epoch") or "")
+                    ),
+                    _validate_fingerprint(
+                        str(target.get("target_entry_revision") or "")
+                    ),
+                )
+            )
+        with self._mutex:
+            rows = self._db.execute(
+                "SELECT caller, request_id, operation, request_fingerprint, "
+                "authority_epoch, state, result_kind, safe_error_code, "
+                "accepted_at_unix_ms, finished_at_unix_ms "
+                "FROM request_journal WHERE state = 'ambiguous' "
+                "AND operation <> ? ORDER BY caller, request_id",
+                (_RECONCILIATION_OPERATION,),
+            ).fetchall()
+            indexed = {(str(row[0]), str(row[1])): row for row in rows}
+            reviewed: list[dict[str, Any]] = []
+            for caller, request_id, operation, authority_epoch, revision in (
+                reviewed_inputs
+            ):
+                row = indexed.get((caller, request_id))
+                if row is None:
+                    raise CoreRequestJournalError("request_conflict")
+                entry_revision = self._entry_revision(row)
+                if (
+                    str(row[2]) != operation
+                    or str(row[4]) != authority_epoch
+                    or not secrets.compare_digest(entry_revision, revision)
+                ):
+                    raise CoreRequestJournalError("request_conflict")
+                reviewed.append(
+                    {
+                        "caller": caller,
+                        "request_id": request_id,
+                        "operation": operation,
+                        "authority_epoch": authority_epoch,
+                        "entry_revision": entry_revision,
+                        "journal_id": self.journal_id,
+                        "store_identity": self.store_identity,
+                        "original_state": "ambiguous",
+                        "replay_safe": False,
+                    }
+                )
+        return reviewed
 
     def request_status(self, *, caller: str, request_id: str) -> dict[str, Any]:
         """Return a fixed, content-free reconciliation projection for one request."""
