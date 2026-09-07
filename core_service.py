@@ -86,6 +86,8 @@ from memory_store import (
     ContextDeliveryRejected,
     LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
     REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX,
+    STRANDED_ACCEPTED_PRUNE_DISPOSITION,
+    STRANDED_ACCEPTED_PRUNE_EVIDENCE_KIND,
     RequestJournalReconciliationRejected,
 )
 from redaction import (
@@ -452,6 +454,26 @@ _CONTRACT_LIST = (
         "expected_authority_epoch expected_entry_revision "
         "expected_journal_id inventory_snapshot_revision disposition "
         "evidence_kind evidence_sha256 confirm",
+        mutation=True,
+    ),
+    _contract(
+        "reconcile_stranded_accepted_prune",
+        "target_caller target_request_id expected_authority_epoch "
+        "expected_entry_revision expected_journal_id expected_store_identity "
+        "inventory_snapshot_revision expected_reconciling_authority_epoch "
+        "expected_reconciling_root_generation_id "
+        "expected_reconciling_build_id "
+        "expected_reconciling_config_fingerprint observed_context_id "
+        "observed_candidate_memory_id observed_survivor_memory_id "
+        "evidence_sha256 confirm",
+        "target_caller target_request_id expected_authority_epoch "
+        "expected_entry_revision expected_journal_id expected_store_identity "
+        "inventory_snapshot_revision expected_reconciling_authority_epoch "
+        "expected_reconciling_root_generation_id "
+        "expected_reconciling_build_id "
+        "expected_reconciling_config_fingerprint observed_context_id "
+        "observed_candidate_memory_id observed_survivor_memory_id "
+        "evidence_sha256 confirm",
         mutation=True,
     ),
     _contract("status", "context_id", retry_safe=True),
@@ -898,6 +920,7 @@ SERVICE_CONTROL_OPERATIONS = frozenset(
         "request_status",
         "request_journal_inventory",
         "reconcile_request_journal",
+        "reconcile_stranded_accepted_prune",
     }
 )
 REPLICATION_OPERATIONS = frozenset(
@@ -1080,6 +1103,30 @@ _OPTIONAL_DIGEST = _rule(
     max_bytes=64,
     pattern=re.compile(r"[0-9a-f]{64}"),
 )
+_AUTHORITY_EPOCH = _rule(
+    "string",
+    min_bytes=7,
+    max_bytes=32,
+    pattern=re.compile(r"epoch-[1-9][0-9]*"),
+)
+_ROOT_GENERATION_ID = _rule(
+    "string",
+    min_bytes=35,
+    max_bytes=35,
+    pattern=re.compile(r"generation-[0-9a-f]{24}"),
+)
+_STORE_IDENTITY = _rule(
+    "string",
+    min_bytes=30,
+    max_bytes=30,
+    pattern=re.compile(r"store-[0-9a-f]{24}"),
+)
+_PUBLIC_MEMORY_ID = _rule(
+    "string",
+    min_bytes=35,
+    max_bytes=35,
+    pattern=re.compile(r"s2_[0-9a-f]{32}"),
+)
 _MEMORA_BINDING_ID = _rule(
     "string",
     min_bytes=37,
@@ -1241,6 +1288,24 @@ MUTATION_ARGUMENT_SCHEMAS: Mapping[str, Mapping[str, _ArgumentRule]] = MappingPr
             inventory_snapshot_revision=_DIGEST,
             disposition=_SHORT_STRING,
             evidence_kind=_SHORT_STRING,
+            evidence_sha256=_DIGEST,
+            confirm=_TRUE,
+        ),
+        "reconcile_stranded_accepted_prune": _schema(
+            target_caller=_IDENTIFIER,
+            target_request_id=_IDENTIFIER,
+            expected_authority_epoch=_AUTHORITY_EPOCH,
+            expected_entry_revision=_DIGEST,
+            expected_journal_id=_IDENTIFIER,
+            expected_store_identity=_STORE_IDENTITY,
+            inventory_snapshot_revision=_DIGEST,
+            expected_reconciling_authority_epoch=_AUTHORITY_EPOCH,
+            expected_reconciling_root_generation_id=_ROOT_GENERATION_ID,
+            expected_reconciling_build_id=_IDENTIFIER,
+            expected_reconciling_config_fingerprint=_DIGEST,
+            observed_context_id=_NONEMPTY_IDENTIFIER,
+            observed_candidate_memory_id=_PUBLIC_MEMORY_ID,
+            observed_survivor_memory_id=_PUBLIC_MEMORY_ID,
             evidence_sha256=_DIGEST,
             confirm=_TRUE,
         ),
@@ -1943,6 +2008,12 @@ def _validate_mutation_arguments(
             )
         ):
             raise CoreProtocolError()
+    if operation == "reconcile_stranded_accepted_prune":
+        if (
+            arguments.get("observed_candidate_memory_id")
+            == arguments.get("observed_survivor_memory_id")
+        ):
+            raise CoreProtocolError()
     if operation in {"benchmark_resource_profile", "certify_runtime"}:
         minimum = arguments.get("target_min_mb")
         maximum = arguments.get("target_max_mb")
@@ -1963,6 +2034,7 @@ _GOVERNANCE_ACTOR_FIELDS: Mapping[str, str] = MappingProxyType(
         "reject_memora_binding": "reviewed_by",
         "revoke_memora_binding": "revoked_by",
         "reconcile_request_journal": "reconciled_by",
+        "reconcile_stranded_accepted_prune": "reconciled_by",
     }
 )
 _MEMORA_GOVERNANCE_ACTOR_OPERATIONS = frozenset(
@@ -2024,6 +2096,43 @@ def _bind_authenticated_governance_actor(
 _MUTATION_CONTRACT_NAMES = frozenset(
     name for name, contract in CORE_OPERATION_CONTRACTS.items() if contract.mutation
 )
+_RECEIPT_JOURNALED_MUTATION_OPERATIONS = frozenset(
+    {"reconcile_stranded_accepted_prune"}
+)
+_STRANDED_RECONCILIATION_PROJECTION_FIELDS = (
+    "target_argument_binding_confirmed",
+    "target_operation_completion_confirmed",
+    "target_operation_outcome",
+    "cause_attributed_to_target_request",
+    "observation_scope",
+    "observed_context_id",
+    "observed_candidate_memory_id",
+    "observed_candidate_present",
+    "observed_survivor_memory_id",
+    "observed_survivor_present",
+    "source_row_preserved",
+    "capacity_recovered",
+    "reconciling_authority_epoch",
+    "reconciling_root_generation_id",
+    "reconciling_build_id",
+    "reconciling_config_fingerprint",
+    "reconciliation_request_caller",
+    "reconciliation_request_id",
+    "reconciliation_request_operation",
+    "reconciliation_request_completion_confirmed",
+    "reconciliation_request_outcome",
+)
+_REQUEST_JOURNALED_MUTATION_OPERATIONS = (
+    _MUTATION_CONTRACT_NAMES - _RECEIPT_JOURNALED_MUTATION_OPERATIONS
+)
+if (
+    _REQUEST_JOURNALED_MUTATION_OPERATIONS
+    & _RECEIPT_JOURNALED_MUTATION_OPERATIONS
+    or _REQUEST_JOURNALED_MUTATION_OPERATIONS
+    | _RECEIPT_JOURNALED_MUTATION_OPERATIONS
+    != _MUTATION_CONTRACT_NAMES
+):
+    raise RuntimeError("closed mutation journal policy is incomplete")
 if frozenset(MUTATION_ARGUMENT_SCHEMAS) != _MUTATION_CONTRACT_NAMES:
     raise RuntimeError("closed mutation argument registry is incomplete")
 for _operation_name, _operation_schema in MUTATION_ARGUMENT_SCHEMAS.items():
@@ -2982,6 +3091,8 @@ class AuthoritativeCoreService:
             tuple[str, str], tuple[str, dict[str, Any], int]
         ] = OrderedDict()
         self._request_cache_bytes = 0
+        self._receipt_journal_in_flight_lock = threading.Lock()
+        self._receipt_journal_in_flight: set[tuple[str, str]] = set()
         self._request_journal: CoreRequestJournal | None = None
         self._path_policy: CorePathPolicy | None = None
         self._replication_manager: Any = None
@@ -5142,6 +5253,22 @@ class AuthoritativeCoreService:
         journal = self._request_journal
         if journal is None:
             raise CoreRequestJournalError()
+        # Any receipt/source/authority or cross-ledger inconsistency fences all
+        # mutations, not only a request that happens to reuse the bad key.
+        self._assert_reconciliation_ledger_integrity()
+        operation = str(request["operation"])
+        if operation in _RECEIPT_JOURNALED_MUTATION_OPERATIONS:
+            existing = journal.request_status(
+                caller=str(request["caller"]),
+                request_id=str(request["request_id"]),
+            )
+            return "conflict" if existing["known"] else "accepted"
+        receipt_status = self._receipt_journal_request_status(
+            caller=str(request["caller"]),
+            request_id=str(request["request_id"]),
+        )
+        if receipt_status["known"]:
+            return "conflict"
         decision = journal.accept(
             caller=request["caller"],
             request_id=request["request_id"],
@@ -5155,6 +5282,11 @@ class AuthoritativeCoreService:
         request: Mapping[str, Any],
         response: dict[str, Any],
     ) -> None:
+        if (
+            str(request["operation"])
+            in _RECEIPT_JOURNALED_MUTATION_OPERATIONS
+        ):
+            return
         journal = self._request_journal
         if journal is None:
             raise CoreRequestJournalError()
@@ -5167,6 +5299,121 @@ class AuthoritativeCoreService:
             result=response["result"],
             safe_error_code=None if error is None else error["code"],
         )
+
+    def _receipt_journal_request_status(
+        self,
+        *,
+        caller: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        journal = self._request_journal
+        store = getattr(self._backend, "memory_store", None)
+        lookup = getattr(
+            store,
+            "request_journal_reconciliation_request_status",
+            None,
+        )
+        if journal is None or not callable(lookup):
+            raise CoreRequestJournalError()
+        binding = journal.binding()
+        try:
+            status = lookup(
+                request_journal_id=str(binding["journal_id"]),
+                store_identity=str(binding["store_identity"]),
+                caller=caller,
+                request_id=request_id,
+            )
+            if status["known"]:
+                receipt_target = {
+                    key: status[key]
+                    for key in (
+                        "target_caller",
+                        "target_request_id",
+                        "target_operation",
+                        "target_authority_epoch",
+                        "target_original_state",
+                        "target_entry_revision",
+                        "reconciling_authority_epoch",
+                        "reconciling_root_generation_id",
+                        "reconciling_build_id",
+                        "reconciling_config_fingerprint",
+                    )
+                }
+                self._assert_reconciliation_receipt_authority(
+                    {"items": [receipt_target]}
+                )
+                journal.review_reconciliation_targets(
+                    [receipt_target],
+                    expected_journal_id=str(binding["journal_id"]),
+                )
+            return status
+        except (
+            RequestJournalReconciliationRejected,
+            CoreRequestJournalError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            sqlite3.Error,
+        ) as exc:
+            raise CoreRequestJournalError() from exc
+
+    def _assert_reconciliation_ledger_integrity(self) -> None:
+        journal = self._request_journal
+        store = getattr(self._backend, "memory_store", None)
+        inventory_reader = getattr(
+            store,
+            "request_journal_reconciliation_inventory",
+            None,
+        )
+        if journal is None or not callable(inventory_reader):
+            raise CoreRequestJournalError()
+        try:
+            binding = journal.binding()
+            reconciliations = inventory_reader(
+                request_journal_id=str(binding["journal_id"]),
+                store_identity=str(binding["store_identity"]),
+            )
+            self._assert_reconciliation_receipt_authority(reconciliations)
+            journal.review_reconciliation_targets(
+                reconciliations["items"],
+                expected_journal_id=str(binding["journal_id"]),
+            )
+            self._assert_reconciliation_outer_keys_unclaimed(
+                reconciliations
+            )
+        except (
+            RequestJournalReconciliationRejected,
+            CoreRequestJournalError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            sqlite3.Error,
+        ) as exc:
+            raise CoreRequestJournalError() from exc
+
+    def _request_status_result(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        journal = self._request_journal
+        if journal is None:
+            raise CoreRequestJournalError()
+        caller = str(arguments["caller"])
+        request_id = str(arguments["request_id"])
+        status = journal.request_status(caller=caller, request_id=request_id)
+        receipt_status = self._receipt_journal_request_status(
+            caller=caller,
+            request_id=request_id,
+        )
+        if status["known"] and receipt_status["known"]:
+            raise CoreRequestJournalError("request_conflict")
+        if status["known"]:
+            return status
+        if receipt_status["known"]:
+            return receipt_status
+        # A volatile worker cannot make an absent request durable.  Keep the
+        # established not-found projection until the signed receipt commits.
+        return status
 
     def _request_journal_inventory_result(
         self,
@@ -5190,16 +5437,44 @@ class AuthoritativeCoreService:
             request_journal_id=journal_id,
             store_identity=store_identity,
         )
+        self._assert_reconciliation_receipt_authority(reconciliations)
         journal.review_reconciliation_targets(
             reconciliations["items"],
             expected_journal_id=journal_id,
         )
+        self._assert_reconciliation_outer_keys_unclaimed(reconciliations)
         indexed = {
             (item["target_caller"], item["target_request_id"]): item
             for item in reconciliations["items"]
         }
+        current_epoch_match = re.fullmatch(
+            r"epoch-([1-9][0-9]*)",
+            str(self._identity["neural_epoch"]),
+        )
         reconciled_in_page = 0
         for item in result["items"]:
+            target_epoch_match = re.fullmatch(
+                r"epoch-([1-9][0-9]*)",
+                str(item.get("authority_epoch") or ""),
+            )
+            if (
+                item.get("state") == "accepted"
+                and item.get("operation") == "prune_memory"
+                and current_epoch_match is not None
+                and target_epoch_match is not None
+                and int(current_epoch_match.group(1))
+                > int(target_epoch_match.group(1))
+            ):
+                item["reconciliation_eligible"] = True
+                item["reconciliation_kind"] = (
+                    "stranded_accepted_prune"
+                )
+            else:
+                item["reconciliation_kind"] = (
+                    "explicit_ambiguous"
+                    if item.get("state") == "ambiguous"
+                    else None
+                )
             receipt = indexed.get((item["caller"], item["request_id"]))
             if receipt is None:
                 item["reconciliation"] = {
@@ -5212,13 +5487,21 @@ class AuthoritativeCoreService:
                     "reconciled_at_unix_ms": None,
                     "receipt_digest": None,
                     "signature_verified": False,
+                    **{
+                        field: None
+                        for field in _STRANDED_RECONCILIATION_PROJECTION_FIELDS
+                    },
                     "replay_safe": False,
                 }
             else:
                 reconciled_in_page += 1
                 item["reconciliation_eligible"] = False
                 item["reconciliation"] = {
-                    "status": "reconciled",
+                    "status": (
+                        "stranding_recorded"
+                        if receipt["target_original_state"] == "accepted"
+                        else "reconciled"
+                    ),
                     "resolution_id": receipt["resolution_id"],
                     "disposition": receipt["disposition"],
                     "evidence_kind": receipt["evidence_kind"],
@@ -5229,6 +5512,10 @@ class AuthoritativeCoreService:
                     ],
                     "receipt_digest": receipt["receipt_digest"],
                     "signature_verified": receipt["signature_verified"],
+                    **{
+                        field: receipt.get(field)
+                        for field in _STRANDED_RECONCILIATION_PROJECTION_FIELDS
+                    },
                     "replay_safe": False,
                 }
         result["reconciliation_summary"] = {
@@ -5242,6 +5529,7 @@ class AuthoritativeCoreService:
         }
         result["reconciliation_contract"] = {
             "eligible_original_state": "ambiguous",
+            "eligible_original_states": ["ambiguous", "accepted"],
             "dispositions": {
                 disposition: sorted(evidence_kinds)
                 for disposition, evidence_kinds in sorted(
@@ -5252,10 +5540,100 @@ class AuthoritativeCoreService:
                 "reconciliation_guard.snapshot_revision"
             ),
             "exact_confirmation_required": True,
+            "stranded_accepted_prune": {
+                "target_operation": "prune_memory",
+                "disposition": STRANDED_ACCEPTED_PRUNE_DISPOSITION,
+                "evidence_kind": STRANDED_ACCEPTED_PRUNE_EVIDENCE_KIND,
+                "successor_authority_epoch_required": True,
+                "target_argument_binding_confirmed": False,
+                "target_operation_completion_confirmed": False,
+                "target_operation_outcome": "unknown",
+                "cause_attributed_to_target_request": False,
+                "reconciliation_request_journal_policy": "signed_receipt",
+                "capacity_recovered": False,
+            },
             "original_journal_rows_preserved": True,
             "generic_replay_authorized": False,
         }
+        result["reconciling_authority"] = {
+            "authority_epoch": str(self._identity["neural_epoch"]),
+            "root_generation_id": str(self._root_generation_id or ""),
+            "build_id": str(self._build_id),
+            "config_fingerprint": str(
+                self._identity["config_fingerprint"]
+            ),
+            "store_identity": str(self._identity["store_identity"]),
+            "journal_id": str(journal_id),
+        }
         return result
+
+    def _assert_reconciliation_receipt_authority(
+        self,
+        inventory: Mapping[str, Any],
+    ) -> None:
+        """Fail closed on future or falsely current v2 authority claims."""
+
+        current_epoch_match = re.fullmatch(
+            r"epoch-([1-9][0-9]*)",
+            str(self._identity["neural_epoch"]),
+        )
+        if current_epoch_match is None:
+            raise CoreRequestJournalError()
+        current_epoch = int(current_epoch_match.group(1))
+        for item in inventory.get("items", ()):
+            if item.get("target_original_state") != "accepted":
+                continue
+            target_match = re.fullmatch(
+                r"epoch-([1-9][0-9]*)",
+                str(item.get("target_authority_epoch") or ""),
+            )
+            reconciling_match = re.fullmatch(
+                r"epoch-([1-9][0-9]*)",
+                str(item.get("reconciling_authority_epoch") or ""),
+            )
+            if (
+                target_match is None
+                or reconciling_match is None
+                or int(target_match.group(1))
+                >= int(reconciling_match.group(1))
+                or int(reconciling_match.group(1)) > current_epoch
+            ):
+                raise CoreRequestJournalError()
+            if int(reconciling_match.group(1)) == current_epoch and (
+                str(item.get("reconciling_root_generation_id") or "")
+                != str(self._root_generation_id or "")
+                or str(item.get("reconciling_build_id") or "")
+                != str(self._build_id)
+                or str(item.get("reconciling_config_fingerprint") or "")
+                != str(self._identity["config_fingerprint"])
+            ):
+                raise CoreRequestJournalError()
+
+    def _assert_reconciliation_outer_keys_unclaimed(
+        self,
+        inventory: Mapping[str, Any],
+    ) -> None:
+        """Reject a key claimed by both generic and signed receipt ledgers."""
+
+        journal = self._request_journal
+        if journal is None:
+            raise CoreRequestJournalError()
+        seen: set[tuple[str, str]] = set()
+        for item in inventory.get("items", ()):
+            if item.get("target_original_state") != "accepted":
+                continue
+            key = (
+                str(item.get("reconciliation_request_caller") or ""),
+                str(item.get("reconciliation_request_id") or ""),
+            )
+            if not key[0] or not key[1] or key in seen:
+                raise CoreRequestJournalError("request_conflict")
+            seen.add(key)
+            if journal.request_status(
+                caller=key[0],
+                request_id=key[1],
+            )["known"]:
+                raise CoreRequestJournalError("request_conflict")
 
     def _reconcile_request_journal_result(
         self,
@@ -5318,6 +5696,153 @@ class AuthoritativeCoreService:
             reconciled_by=str(arguments["reconciled_by"]),
             confirm=bool(arguments["confirm"]),
         )
+
+    def _reconcile_stranded_accepted_prune_result(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        outer_request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record a successor-generation readback without replaying a prune."""
+
+        journal = self._request_journal
+        store = getattr(self._backend, "memory_store", None)
+        reconcile = getattr(
+            store,
+            "reconcile_stranded_accepted_prune",
+            None,
+        )
+        if journal is None or not callable(reconcile):
+            raise CoreRequestJournalError()
+        current_epoch = str(self._identity["neural_epoch"])
+        current_root_generation = str(self._root_generation_id or "")
+        current_build = str(self._build_id)
+        current_config_fingerprint = str(
+            self._identity["config_fingerprint"]
+        )
+        if (
+            not secrets.compare_digest(
+                str(arguments["expected_reconciling_authority_epoch"]),
+                current_epoch,
+            )
+            or not secrets.compare_digest(
+                str(arguments["expected_reconciling_root_generation_id"]),
+                current_root_generation,
+            )
+            or not secrets.compare_digest(
+                str(arguments["expected_reconciling_build_id"]),
+                current_build,
+            )
+            or not secrets.compare_digest(
+                str(arguments["expected_reconciling_config_fingerprint"]),
+                current_config_fingerprint,
+            )
+        ):
+            raise RequestJournalReconciliationRejected(
+                "reconciling authority identity changed"
+            )
+        try:
+            # The reconciliation RPC itself is excluded from this guard, so
+            # admitting it cannot invalidate the reviewed candidate set.
+            journal.inventory(
+                states=("accepted", "ambiguous"),
+                limit=1,
+                expected_snapshot_revision=str(
+                    arguments["inventory_snapshot_revision"]
+                ),
+            )
+            target = journal.review_reconciliation_target(
+                caller=str(arguments["target_caller"]),
+                request_id=str(arguments["target_request_id"]),
+                expected_operation="prune_memory",
+                expected_authority_epoch=str(
+                    arguments["expected_authority_epoch"]
+                ),
+                expected_entry_revision=str(
+                    arguments["expected_entry_revision"]
+                ),
+                expected_journal_id=str(arguments["expected_journal_id"]),
+                expected_original_state="accepted",
+            )
+        except CoreRequestJournalError as exc:
+            raise RequestJournalReconciliationRejected(
+                "stranded accepted prune review changed"
+            ) from exc
+        target_epoch_match = re.fullmatch(
+            r"epoch-([1-9][0-9]*)",
+            str(target["authority_epoch"]),
+        )
+        current_epoch_match = re.fullmatch(
+            r"epoch-([1-9][0-9]*)",
+            current_epoch,
+        )
+        if (
+            target.get("store_identity") is None
+            or target.get("store_identity") != self._identity["store_identity"]
+            or not secrets.compare_digest(
+                str(arguments["expected_store_identity"]),
+                str(target.get("store_identity") or ""),
+            )
+            or target_epoch_match is None
+            or current_epoch_match is None
+            or int(current_epoch_match.group(1))
+            <= int(target_epoch_match.group(1))
+        ):
+            raise RequestJournalReconciliationRejected(
+                "accepted prune has no proven successor authority"
+            )
+        outer_key = (
+            str(outer_request["caller"]),
+            str(outer_request["request_id"]),
+        )
+        with self._receipt_journal_in_flight_lock:
+            if outer_key in self._receipt_journal_in_flight:
+                raise RequestJournalReconciliationRejected(
+                    "reconciliation request is already in flight"
+                )
+            self._receipt_journal_in_flight.add(outer_key)
+        try:
+            self._assert_live_authority()
+            result = reconcile(
+                request_journal_id=str(target["journal_id"]),
+                store_identity=str(target["store_identity"]),
+                target_caller=str(target["caller"]),
+                target_request_id=str(target["request_id"]),
+                target_authority_epoch=str(target["authority_epoch"]),
+                target_entry_revision=str(target["entry_revision"]),
+                inventory_snapshot_revision=str(
+                    arguments["inventory_snapshot_revision"]
+                ),
+                expected_reconciling_authority_epoch=current_epoch,
+                expected_reconciling_root_generation_id=(
+                    current_root_generation
+                ),
+                expected_reconciling_build_id=current_build,
+                expected_reconciling_config_fingerprint=(
+                    current_config_fingerprint
+                ),
+                observed_context_id=str(arguments["observed_context_id"]),
+                observed_candidate_memory_id=str(
+                    arguments["observed_candidate_memory_id"]
+                ),
+                observed_survivor_memory_id=str(
+                    arguments["observed_survivor_memory_id"]
+                ),
+                evidence_sha256=str(arguments["evidence_sha256"]),
+                reconciliation_request_caller=outer_key[0],
+                reconciliation_request_id=outer_key[1],
+                reconciliation_request_fingerprint=str(
+                    outer_request["request_fingerprint"]
+                ),
+                reconciled_by=str(arguments["reconciled_by"]),
+                confirm=bool(arguments["confirm"]),
+            )
+            self._assert_live_authority()
+            self._assert_reconciliation_ledger_integrity()
+            return result
+        finally:
+            with self._receipt_journal_in_flight_lock:
+                self._receipt_journal_in_flight.discard(outer_key)
 
     def _execute_request(
         self,
@@ -5419,7 +5944,7 @@ class AuthoritativeCoreService:
                 )
             try:
                 result = (
-                    journal.request_status(**request["arguments"])
+                    self._request_status_result(request["arguments"])
                     if contract.name == "request_status"
                     else self._request_journal_inventory_result(
                         request["arguments"]
@@ -5564,15 +6089,24 @@ class AuthoritativeCoreService:
                         token.assert_stable()
                     self._assert_live_authority()
                     with self._backend_execution_context():
-                        result = (
-                            self._reconcile_request_journal_result(
+                        if contract.name == "reconcile_request_journal":
+                            result = self._reconcile_request_journal_result(
                                 authorized_arguments
                             )
-                            if contract.name == "reconcile_request_journal"
-                            else self._handlers[contract.name](
+                        elif (
+                            contract.name
+                            == "reconcile_stranded_accepted_prune"
+                        ):
+                            result = (
+                                self._reconcile_stranded_accepted_prune_result(
+                                    authorized_arguments,
+                                    outer_request=request,
+                                )
+                            )
+                        else:
+                            result = self._handlers[contract.name](
                                 **authorized_arguments
                             )
-                        )
                     self._assert_live_authority()
                     response = self._response(request, result=result)
                     self._bounded_response_bytes(response)
@@ -5795,6 +6329,7 @@ class AuthoritativeCoreService:
             "reconciliation_record_count": 0,
             "reconciled_explicit_ambiguous_count": 0,
             "unresolved_explicit_ambiguous_count": 0,
+            "stranded_accepted_prune_record_count": 0,
             "reconciliation_signatures_verified": False,
             "last_prune_age_ms": None,
             "max_rows": 0,
@@ -5817,6 +6352,7 @@ class AuthoritativeCoreService:
                         "unresolved_explicit_ambiguous_count": int(
                             journal_health["explicit_ambiguous_count"]
                         ),
+                        "stranded_accepted_prune_record_count": 0,
                         "reconciliation_signatures_verified": False,
                     }
                 )
@@ -5836,24 +6372,46 @@ class AuthoritativeCoreService:
                         request_journal_id=binding["journal_id"],
                         store_identity=binding["store_identity"],
                     )
+                    self._assert_reconciliation_receipt_authority(
+                        reconciliations
+                    )
                     self._request_journal.review_reconciliation_targets(
                         reconciliations["items"],
                         expected_journal_id=binding["journal_id"],
                     )
+                    self._assert_reconciliation_outer_keys_unclaimed(
+                        reconciliations
+                    )
                     reconciled_count = int(reconciliations["count"])
+                    reconciled_ambiguous_count = int(
+                        reconciliations["ambiguous_count"]
+                    )
+                    stranded_accepted_prune_count = int(
+                        reconciliations[
+                            "stranded_accepted_prune_count"
+                        ]
+                    )
                     raw_count = int(
                         journal_health["explicit_ambiguous_count"]
                     )
-                    if reconciled_count > raw_count:
+                    if (
+                        reconciled_ambiguous_count > raw_count
+                        or reconciled_count
+                        != reconciled_ambiguous_count
+                        + stranded_accepted_prune_count
+                    ):
                         raise CoreRequestJournalError()
                     journal_health.update(
                         {
                             "reconciliation_record_count": reconciled_count,
                             "reconciled_explicit_ambiguous_count": (
-                                reconciled_count
+                                reconciled_ambiguous_count
                             ),
                             "unresolved_explicit_ambiguous_count": (
-                                raw_count - reconciled_count
+                                raw_count - reconciled_ambiguous_count
+                            ),
+                            "stranded_accepted_prune_record_count": (
+                                stranded_accepted_prune_count
                             ),
                             "reconciliation_signatures_verified": bool(
                                 reconciliations[

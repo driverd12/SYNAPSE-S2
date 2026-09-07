@@ -59,6 +59,8 @@ from memory_store import (
     LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
     RECOVERY_REQUEST_JOURNAL_BINDING_SCHEMA,
     SQLITE_USER_VERSION,
+    STRANDED_ACCEPTED_PRUNE_RECONCILIATION_OPERATION,
+    STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA,
     _json_dumps,
     _matching_backup_schema_contract_versions,
     capture_request_fingerprint,
@@ -971,8 +973,9 @@ class VerifiedRecoveryManager:
             raise RuntimeError(
                 "request-journal reconciliation receipt limit exceeded"
             )
-        normalized_targets: list[dict[str, str]] = []
+        normalized_targets: list[dict[str, Any]] = []
         target_keys: set[tuple[str, str]] = set()
+        outer_request_keys: set[tuple[str, str]] = set()
         for target in reviewed_targets:
             if not isinstance(target, Mapping):
                 raise RuntimeError(
@@ -991,9 +994,44 @@ class VerifiedRecoveryManager:
                     "target_entry_revision",
                 )
             }
+            if normalized["target_original_state"] == "accepted":
+                normalized.update(
+                    {
+                        field: str(target.get(field) or "")
+                        for field in (
+                            "schema",
+                            "reconciling_authority_epoch",
+                            "reconciling_root_generation_id",
+                            "reconciling_build_id",
+                            "reconciling_config_fingerprint",
+                            "reconciliation_request_caller",
+                            "reconciliation_request_id",
+                            "reconciliation_request_operation",
+                        )
+                    }
+                )
+                normalized.update(
+                    {
+                        field: target.get(field)
+                        for field in (
+                            "target_argument_binding_confirmed",
+                            "target_operation_completion_confirmed",
+                            "target_operation_outcome",
+                            "cause_attributed_to_target_request",
+                            "source_row_preserved",
+                            "capacity_recovered",
+                            "reconciliation_request_completion_confirmed",
+                            "reconciliation_request_outcome",
+                        )
+                    }
+                )
             key = (
                 normalized["target_caller"],
                 normalized["target_request_id"],
+            )
+            outer_key = (
+                normalized.get("reconciliation_request_caller", ""),
+                normalized.get("reconciliation_request_id", ""),
             )
             if (
                 REQUEST_JOURNAL_ID_RE.fullmatch(
@@ -1012,17 +1050,81 @@ class VerifiedRecoveryManager:
                         "target_authority_epoch",
                     )
                 )
-                or normalized["target_original_state"] != "ambiguous"
+                or normalized["target_original_state"]
+                not in {"ambiguous", "accepted"}
+                or (
+                    normalized["target_original_state"] == "accepted"
+                    and (
+                        normalized["target_operation"] != "prune_memory"
+                        or normalized["schema"]
+                        != STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA
+                        or re.fullmatch(
+                            r"epoch-([1-9][0-9]*)",
+                            normalized["reconciling_authority_epoch"],
+                        )
+                        is None
+                        or re.fullmatch(
+                            r"generation-[0-9a-f]{24}",
+                            normalized["reconciling_root_generation_id"],
+                        )
+                        is None
+                        or REQUEST_JOURNAL_IDENTIFIER_RE.fullmatch(
+                            normalized["reconciling_build_id"]
+                        )
+                        is None
+                        or BACKUP_DIGEST_RE.fullmatch(
+                            normalized["reconciling_config_fingerprint"]
+                        )
+                        is None
+                        or normalized["reconciliation_request_operation"]
+                        != STRANDED_ACCEPTED_PRUNE_RECONCILIATION_OPERATION
+                        or any(
+                            REQUEST_JOURNAL_IDENTIFIER_RE.fullmatch(
+                                normalized[field]
+                            )
+                            is None
+                            for field in (
+                                "reconciliation_request_caller",
+                                "reconciliation_request_id",
+                            )
+                        )
+                        or normalized["target_argument_binding_confirmed"]
+                        is not False
+                        or normalized[
+                            "target_operation_completion_confirmed"
+                        ]
+                        is not False
+                        or normalized["target_operation_outcome"] != "unknown"
+                        or normalized[
+                            "cause_attributed_to_target_request"
+                        ]
+                        is not False
+                        or normalized["source_row_preserved"] is not True
+                        or normalized["capacity_recovered"] is not False
+                        or normalized[
+                            "reconciliation_request_completion_confirmed"
+                        ]
+                        is not True
+                        or normalized["reconciliation_request_outcome"]
+                        != "receipt_committed"
+                    )
+                )
                 or BACKUP_DIGEST_RE.fullmatch(
                     normalized["target_entry_revision"]
                 )
                 is None
                 or key in target_keys
+                or (
+                    normalized["target_original_state"] == "accepted"
+                    and outer_key in outer_request_keys
+                )
             ):
                 raise RuntimeError(
                     "request-journal reconciliation target is invalid"
                 )
             target_keys.add(key)
+            if normalized["target_original_state"] == "accepted":
+                outer_request_keys.add(outer_key)
             normalized_targets.append(normalized)
         source = Path(path).expanduser().absolute()
         reject_sensitive_identifier(source, field="request journal path")
@@ -1302,6 +1404,10 @@ class VerifiedRecoveryManager:
                         )
                     state_counts[state] += 1
                     row_key = (caller, request_id)
+                    if row_key in outer_request_keys:
+                        raise RuntimeError(
+                            "receipt-journaled request collides with generic journal row"
+                        )
                     if row_key in target_keys:
                         matched_reconciliation_rows[row_key] = tuple(row)
             if streamed_row_count != row_count:
@@ -1321,13 +1427,40 @@ class VerifiedRecoveryManager:
                     store_identity=metadata["store_identity"],
                     row=row,
                 )
+                target_epoch_match = re.fullmatch(
+                    r"epoch-([1-9][0-9]*)",
+                    target["target_authority_epoch"],
+                )
+                reconciling_epoch_match = (
+                    None
+                    if target["target_original_state"] != "accepted"
+                    else re.fullmatch(
+                        r"epoch-([1-9][0-9]*)",
+                        target["reconciling_authority_epoch"],
+                    )
+                )
                 if (
                     target["request_journal_id"] != metadata["journal_id"]
                     or target["store_identity"] != metadata["store_identity"]
                     or str(row[2]) != target["target_operation"]
                     or str(row[4]) != target["target_authority_epoch"]
-                    or str(row[5]) != "ambiguous"
-                    or str(row[2]) == "reconcile_request_journal"
+                    or str(row[5]) != target["target_original_state"]
+                    or str(row[2])
+                    in {
+                        "reconcile_request_journal",
+                        "reconcile_stranded_accepted_prune",
+                    }
+                    or (
+                        target["target_original_state"] == "accepted"
+                        and (
+                            target_epoch_match is None
+                            or reconciling_epoch_match is None
+                            or int(target_epoch_match.group(1))
+                            >= int(reconciling_epoch_match.group(1))
+                            or int(reconciling_epoch_match.group(1))
+                            > maximum_authority_epoch
+                        )
+                    )
                     or not secrets.compare_digest(
                         entry_revision,
                         target["target_entry_revision"],
@@ -1368,8 +1501,17 @@ class VerifiedRecoveryManager:
             "integrity_check": integrity_check,
             "reconciliation_receipts": {
                 "count": len(normalized_targets),
+                "ambiguous_count": sum(
+                    target["target_original_state"] == "ambiguous"
+                    for target in normalized_targets
+                ),
+                "stranded_accepted_prune_count": sum(
+                    target["target_original_state"] == "accepted"
+                    for target in normalized_targets
+                ),
                 "source_row_bindings_verified": True,
                 "original_ambiguous_rows_preserved": True,
+                "original_accepted_rows_preserved": True,
                 "generic_replay_authorized": False,
             },
             "verified": True,
@@ -2774,6 +2916,14 @@ class VerifiedRecoveryManager:
             ),
             "request_journal_reconciliation": {
                 "receipt_count": len(reconciliation_receipts),
+                "ambiguous_count": int(
+                    journal["reconciliation_receipts"]["ambiguous_count"]
+                ),
+                "stranded_accepted_prune_count": int(
+                    journal["reconciliation_receipts"][
+                        "stranded_accepted_prune_count"
+                    ]
+                ),
                 "signatures_verified": True,
                 "source_row_bindings_verified": bool(
                     journal["reconciliation_receipts"][
@@ -2781,6 +2931,7 @@ class VerifiedRecoveryManager:
                     ]
                 ),
                 "original_ambiguous_rows_preserved": True,
+                "original_accepted_rows_preserved": True,
                 "generic_replay_authorized": False,
             },
             "source_request_journal_binding_receipt_digest": str(
@@ -8604,6 +8755,24 @@ class VerifiedRecoveryManager:
                 "receipt_count": len(
                     request_journal_reconciliation_receipts
                 ),
+                "ambiguous_count": (
+                    0
+                    if request_journal is None
+                    else int(
+                        request_journal["reconciliation_receipts"][
+                            "ambiguous_count"
+                        ]
+                    )
+                ),
+                "stranded_accepted_prune_count": (
+                    0
+                    if request_journal is None
+                    else int(
+                        request_journal["reconciliation_receipts"][
+                            "stranded_accepted_prune_count"
+                        ]
+                    )
+                ),
                 "signatures_verified": True,
                 "source_row_bindings_verified": (
                     request_journal is None
@@ -8614,6 +8783,7 @@ class VerifiedRecoveryManager:
                     )
                 ),
                 "original_ambiguous_rows_preserved": True,
+                "original_accepted_rows_preserved": True,
                 "generic_replay_authorized": False,
             },
             "request_journal_binding": (

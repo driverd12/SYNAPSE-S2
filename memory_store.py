@@ -144,6 +144,12 @@ BACKUP_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA = (
     "synapse-s2.request-journal-reconciliation-receipt.v1"
 )
+STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA = (
+    "synapse-s2.request-journal-reconciliation-receipt.v2"
+)
+# Both schemas deliberately share one operation type.  A v1-only binary sees
+# the v2 row, rejects its unknown exact schema, and fails closed instead of
+# silently dropping the successor-generation evidence during a downgrade.
 REQUEST_JOURNAL_RECONCILIATION_OPERATION_TYPE = (
     "request-journal-reconciliation"
 )
@@ -197,6 +203,45 @@ REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS = frozenset(
         "receipt_signature",
     }
 )
+STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_FIELDS = (
+    REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS
+    | frozenset(
+        {
+            "reconciling_authority_epoch",
+            "reconciling_root_generation_id",
+            "reconciling_build_id",
+            "observed_context_id",
+            "observed_candidate_memory_id",
+            "observed_candidate_present",
+            "observed_survivor_memory_id",
+            "observed_survivor_present",
+            "observation_scope",
+            "target_argument_binding_confirmed",
+            "target_operation_completion_confirmed",
+            "target_operation_outcome",
+            "cause_attributed_to_target_request",
+            "source_row_preserved",
+            "capacity_recovered",
+            "reconciling_config_fingerprint",
+            "reconciliation_request_caller",
+            "reconciliation_request_id",
+            "reconciliation_request_operation",
+            "reconciliation_request_fingerprint",
+            "reconciliation_request_completion_confirmed",
+            "reconciliation_request_outcome",
+        }
+    )
+)
+STRANDED_ACCEPTED_PRUNE_DISPOSITION = "stranded_outcome_unresolved"
+STRANDED_ACCEPTED_PRUNE_EVIDENCE_KIND = (
+    "successor_authority_and_candidate_readback"
+)
+STRANDED_ACCEPTED_PRUNE_OBSERVATION_SCOPE = "current_store_state_only"
+STRANDED_ACCEPTED_PRUNE_RECONCILIATION_OPERATION = (
+    "reconcile_stranded_accepted_prune"
+)
+_AUTHORITY_EPOCH_RE = re.compile(r"^epoch-([1-9][0-9]*)$")
+_PUBLIC_MEMORY_ID_RE = re.compile(r"^s2_[0-9a-f]{32}$")
 _REQUEST_JOURNAL_CORRELATION_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 )
@@ -8237,9 +8282,20 @@ class DurableMemoryStore:
             return safe_text, int(redaction_count) + int(digest_removals)
         if (
             isinstance(decoded, dict)
-            and decoded.get("schema")
-            == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA
-            and set(decoded) == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS
+            and (
+                (
+                    decoded.get("schema")
+                    == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA
+                    and set(decoded)
+                    == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS
+                )
+                or (
+                    decoded.get("schema")
+                    == STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA
+                    and set(decoded)
+                    == STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_FIELDS
+                )
+            )
         ):
             try:
                 public_key = base64.b64decode(
@@ -8259,6 +8315,11 @@ class DurableMemoryStore:
                 "evidence_sha256",
                 "auth_key_id",
                 "receipt_digest",
+            ) + (
+                ("reconciling_config_fingerprint",)
+                if decoded.get("schema")
+                == STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA
+                else ()
             )
             structurally_safe = (
                 decoded.get("auth_algorithm") == "ed25519"
@@ -8286,6 +8347,7 @@ class DurableMemoryStore:
                         "target_entry_revision",
                         "inventory_snapshot_revision",
                         "evidence_sha256",
+                        "reconciling_config_fingerprint",
                     }
                 }
                 safe_inspection, redaction_count = redact_sensitive_value(
@@ -17819,8 +17881,16 @@ class DurableMemoryStore:
         return cleaned
 
     @staticmethod
-    def _request_journal_reconciliation_receipt_fields() -> set[str]:
-        return set(REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS)
+    def _request_journal_reconciliation_receipt_fields(
+        schema: str = REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA,
+    ) -> set[str]:
+        if schema == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA:
+            return set(REQUEST_JOURNAL_RECONCILIATION_RECEIPT_FIELDS)
+        if schema == STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA:
+            return set(
+                STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_FIELDS
+            )
+        return set()
 
     def _validate_request_journal_reconciliation_receipt(
         self,
@@ -17829,12 +17899,76 @@ class DurableMemoryStore:
         require_local_trust: bool = True,
         trusted_signing_key_ids: Iterable[str] | None = None,
     ) -> dict[str, Any]:
+        schema = (
+            str(payload.get("schema") or "")
+            if isinstance(payload, dict)
+            else ""
+        )
+        is_ambiguous_v1 = (
+            schema == REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA
+        )
+        is_stranded_prune_v2 = (
+            schema
+            == STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA
+        )
+        state_contract_valid = bool(
+            (
+                is_ambiguous_v1
+                and payload.get("target_original_state") == "ambiguous"
+                and payload.get("disposition")
+                in REQUEST_JOURNAL_RECONCILIATION_DISPOSITIONS
+                and payload.get("evidence_kind")
+                in REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX.get(
+                    str(payload.get("disposition") or ""),
+                    frozenset(),
+                )
+            )
+            or (
+                is_stranded_prune_v2
+                and payload.get("target_original_state") == "accepted"
+                and payload.get("target_operation") == "prune_memory"
+                and payload.get("disposition")
+                == STRANDED_ACCEPTED_PRUNE_DISPOSITION
+                and payload.get("evidence_kind")
+                == STRANDED_ACCEPTED_PRUNE_EVIDENCE_KIND
+                and payload.get("observed_candidate_present") is False
+                and payload.get("observed_survivor_present") is True
+                and payload.get("observation_scope")
+                == STRANDED_ACCEPTED_PRUNE_OBSERVATION_SCOPE
+                and payload.get("target_argument_binding_confirmed") is False
+                and payload.get("target_operation_completion_confirmed")
+                is False
+                and payload.get("target_operation_outcome") == "unknown"
+                and payload.get("cause_attributed_to_target_request") is False
+                and payload.get("source_row_preserved") is True
+                and payload.get("capacity_recovered") is False
+                and payload.get("reconciliation_request_operation")
+                == STRANDED_ACCEPTED_PRUNE_RECONCILIATION_OPERATION
+                and payload.get("reconciliation_request_completion_confirmed")
+                is True
+                and payload.get("reconciliation_request_outcome")
+                == "receipt_committed"
+                and _PUBLIC_MEMORY_ID_RE.fullmatch(
+                    str(payload.get("observed_candidate_memory_id") or "")
+                )
+                is not None
+                and _PUBLIC_MEMORY_ID_RE.fullmatch(
+                    str(payload.get("observed_survivor_memory_id") or "")
+                )
+                is not None
+                and payload.get("observed_candidate_memory_id")
+                != payload.get("observed_survivor_memory_id")
+                and CORE_ROOT_GENERATION_ID_RE.fullmatch(
+                    str(payload.get("reconciling_root_generation_id") or "")
+                )
+                is not None
+            )
+        )
         if (
             not isinstance(payload, dict)
             or set(payload)
-            != self._request_journal_reconciliation_receipt_fields()
-            or payload.get("schema")
-            != REQUEST_JOURNAL_RECONCILIATION_RECEIPT_SCHEMA
+            != self._request_journal_reconciliation_receipt_fields(schema)
+            or not state_contract_valid
             or re.fullmatch(
                 r"reqrec-[0-9a-f]{24}",
                 str(payload.get("resolution_id") or ""),
@@ -17848,14 +17982,6 @@ class DurableMemoryStore:
                 str(payload.get("store_identity") or "")
             )
             is None
-            or payload.get("target_original_state") != "ambiguous"
-            or payload.get("disposition")
-            not in REQUEST_JOURNAL_RECONCILIATION_DISPOSITIONS
-            or payload.get("evidence_kind")
-            not in REQUEST_JOURNAL_RECONCILIATION_EVIDENCE_MATRIX.get(
-                str(payload.get("disposition") or ""),
-                frozenset(),
-            )
             or payload.get("replay_safe") is not False
             or type(payload.get("reconciled_at_unix_ms")) is not int
             or int(payload["reconciled_at_unix_ms"]) <= 0
@@ -17885,6 +18011,44 @@ class DurableMemoryStore:
                 payload.get(field),
                 field=field,
             )
+        if is_stranded_prune_v2:
+            for field in (
+                "reconciling_authority_epoch",
+                "reconciling_build_id",
+                "observed_context_id",
+                "observed_candidate_memory_id",
+                "observed_survivor_memory_id",
+                "reconciliation_request_caller",
+                "reconciliation_request_id",
+                "reconciliation_request_operation",
+            ):
+                self._request_journal_reconciliation_identifier(
+                    payload.get(field),
+                    field=field,
+                )
+            target_epoch_match = _AUTHORITY_EPOCH_RE.fullmatch(
+                str(payload["target_authority_epoch"])
+            )
+            reconciling_epoch_match = _AUTHORITY_EPOCH_RE.fullmatch(
+                str(payload["reconciling_authority_epoch"])
+            )
+            if (
+                target_epoch_match is None
+                or reconciling_epoch_match is None
+                or int(reconciling_epoch_match.group(1))
+                <= int(target_epoch_match.group(1))
+                or BACKUP_DIGEST_RE.fullmatch(
+                    str(payload.get("reconciling_config_fingerprint") or "")
+                )
+                is None
+                or BACKUP_DIGEST_RE.fullmatch(
+                    str(payload.get("reconciliation_request_fingerprint") or "")
+                )
+                is None
+            ):
+                raise RuntimeError(
+                    "stranded accepted reconciliation lacks a successor authority epoch"
+                )
         expected_digest = self._canonical_payload_digest(payload)
         if not secrets.compare_digest(
             str(payload["receipt_digest"]),
@@ -18058,6 +18222,7 @@ class DurableMemoryStore:
             )
         receipts: list[dict[str, Any]] = []
         seen_targets: set[tuple[str, str]] = set()
+        seen_outer_requests: set[tuple[str, str]] = set()
         for row, raw_payload in decoded_rows:
             payload = self._validate_request_journal_reconciliation_receipt(
                 raw_payload,
@@ -18100,6 +18265,16 @@ class DurableMemoryStore:
                     "request-journal target has multiple reconciliation receipts"
                 )
             seen_targets.add(target)
+            if payload["target_original_state"] == "accepted":
+                outer_request = (
+                    str(payload["reconciliation_request_caller"]),
+                    str(payload["reconciliation_request_id"]),
+                )
+                if outer_request in seen_outer_requests:
+                    raise RuntimeError(
+                        "reconciliation request has multiple signed receipts"
+                    )
+                seen_outer_requests.add(outer_request)
             receipts.append(payload)
         return receipts
 
@@ -18134,8 +18309,9 @@ class DurableMemoryStore:
                 store_identity=store_id,
                 trusted_signing_key_ids=trusted_signing_key_ids,
             )
-        items = [
-            {
+        items: list[dict[str, Any]] = []
+        for receipt in receipts:
+            item: dict[str, Any] = {
                 "resolution_id": str(receipt["resolution_id"]),
                 "target_caller": str(receipt["target_caller"]),
                 "target_request_id": str(receipt["target_request_id"]),
@@ -18143,7 +18319,9 @@ class DurableMemoryStore:
                 "target_authority_epoch": str(
                     receipt["target_authority_epoch"]
                 ),
-                "target_original_state": "ambiguous",
+                "target_original_state": str(
+                    receipt["target_original_state"]
+                ),
                 "target_entry_revision": str(
                     receipt["target_entry_revision"]
                 ),
@@ -18162,8 +18340,78 @@ class DurableMemoryStore:
                 "signature_verified": True,
                 "replay_safe": False,
             }
-            for receipt in receipts
-        ]
+            if receipt["target_original_state"] == "accepted":
+                item.update(
+                    {
+                        "receipt_schema": str(receipt["schema"]),
+                        "reconciling_authority_epoch": receipt.get(
+                            "reconciling_authority_epoch"
+                        ),
+                        "reconciling_root_generation_id": receipt.get(
+                            "reconciling_root_generation_id"
+                        ),
+                        "reconciling_build_id": receipt.get(
+                            "reconciling_build_id"
+                        ),
+                        "reconciling_config_fingerprint": receipt.get(
+                            "reconciling_config_fingerprint"
+                        ),
+                        "observed_context_id": receipt.get(
+                            "observed_context_id"
+                        ),
+                        "observed_candidate_memory_id": receipt.get(
+                            "observed_candidate_memory_id"
+                        ),
+                        "observed_candidate_present": receipt.get(
+                            "observed_candidate_present"
+                        ),
+                        "observed_survivor_memory_id": receipt.get(
+                            "observed_survivor_memory_id"
+                        ),
+                        "observed_survivor_present": receipt.get(
+                            "observed_survivor_present"
+                        ),
+                        "observation_scope": receipt.get(
+                            "observation_scope"
+                        ),
+                        "target_argument_binding_confirmed": receipt.get(
+                            "target_argument_binding_confirmed"
+                        ),
+                        "target_operation_completion_confirmed": receipt.get(
+                            "target_operation_completion_confirmed"
+                        ),
+                        "target_operation_outcome": receipt.get(
+                            "target_operation_outcome"
+                        ),
+                        "cause_attributed_to_target_request": receipt.get(
+                            "cause_attributed_to_target_request"
+                        ),
+                        "source_row_preserved": receipt.get(
+                            "source_row_preserved"
+                        ),
+                        "capacity_recovered": receipt.get(
+                            "capacity_recovered"
+                        ),
+                        "reconciliation_request_caller": receipt.get(
+                            "reconciliation_request_caller"
+                        ),
+                        "reconciliation_request_id": receipt.get(
+                            "reconciliation_request_id"
+                        ),
+                        "reconciliation_request_operation": receipt.get(
+                            "reconciliation_request_operation"
+                        ),
+                        "reconciliation_request_completion_confirmed": (
+                            receipt.get(
+                                "reconciliation_request_completion_confirmed"
+                            )
+                        ),
+                        "reconciliation_request_outcome": receipt.get(
+                            "reconciliation_request_outcome"
+                        ),
+                    }
+                )
+            items.append(item)
         items.sort(key=lambda item: (item["target_caller"], item["target_request_id"]))
         return {
             "schema": "synapse-s2.request-journal-reconciliation-inventory.v1",
@@ -18171,9 +18419,130 @@ class DurableMemoryStore:
             "request_journal_id": journal_id,
             "store_identity": store_id,
             "count": len(items),
+            "ambiguous_count": sum(
+                item["target_original_state"] == "ambiguous"
+                for item in items
+            ),
+            "stranded_accepted_prune_count": sum(
+                item["target_original_state"] == "accepted"
+                for item in items
+            ),
             "items": items,
             "all_signatures_verified": True,
             "generic_replay_authorized": False,
+        }
+
+    def request_journal_reconciliation_request_status(
+        self,
+        *,
+        request_journal_id: str,
+        store_identity: str,
+        caller: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Resolve one receipt-journaled request without exposing its HMAC."""
+
+        clean_caller = self._request_journal_reconciliation_identifier(
+            caller,
+            field="caller",
+        )
+        clean_request_id = self._request_journal_reconciliation_identifier(
+            request_id,
+            field="request_id",
+        )
+        inventory = self.request_journal_reconciliation_inventory(
+            request_journal_id=request_journal_id,
+            store_identity=store_identity,
+        )
+        matches = [
+            item
+            for item in inventory["items"]
+            if item.get("reconciliation_request_caller") == clean_caller
+            and item.get("reconciliation_request_id") == clean_request_id
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "reconciliation request has multiple signed receipts"
+            )
+        if not matches:
+            return {
+                "known": False,
+                "caller": clean_caller,
+                "request_id": clean_request_id,
+                "state": "not_found",
+                "operation": None,
+                "safe_error_code": None,
+                "result_kind": None,
+                "authority_epoch": None,
+                "accepted_age_ms": None,
+                "finished_age_ms": None,
+                "replay_safe": False,
+                "retention_expiry_possible": True,
+                "receipt_journaled": False,
+                "receipt_digest": None,
+            }
+        item = matches[0]
+        finished_age_ms = min(
+            (2**31) - 1,
+            max(
+                0,
+                int(time.time() * 1000)
+                - int(item["reconciled_at_unix_ms"]),
+            ),
+        )
+        return {
+            "known": True,
+            "caller": clean_caller,
+            "request_id": clean_request_id,
+            "state": "completed",
+            "operation": str(item["reconciliation_request_operation"]),
+            "safe_error_code": None,
+            "result_kind": "signed_receipt",
+            "authority_epoch": str(item["reconciling_authority_epoch"]),
+            # Receipt-journaled reconciliation has no generic acceptance row,
+            # so only its durable commit age is knowable.
+            "accepted_age_ms": None,
+            "finished_age_ms": finished_age_ms,
+            "replay_safe": False,
+            "retention_expiry_possible": False,
+            "receipt_journaled": True,
+            "receipt_digest": str(item["receipt_digest"]),
+            "resolution_id": str(item["resolution_id"]),
+            "signature_verified": True,
+            "reconciliation_request_completion_confirmed": True,
+            "reconciliation_request_outcome": "receipt_committed",
+            "target_caller": str(item["target_caller"]),
+            "target_request_id": str(item["target_request_id"]),
+            "target_operation": "prune_memory",
+            "target_original_state": "accepted",
+            "target_authority_epoch": str(item["target_authority_epoch"]),
+            "target_entry_revision": str(item["target_entry_revision"]),
+            "target_operation_outcome": "unknown",
+            "target_operation_completion_confirmed": False,
+            "target_argument_binding_confirmed": False,
+            "cause_attributed_to_target_request": False,
+            "observed_context_id": str(item["observed_context_id"]),
+            "observed_candidate_memory_id": str(
+                item["observed_candidate_memory_id"]
+            ),
+            "observed_candidate_present": False,
+            "observed_survivor_memory_id": str(
+                item["observed_survivor_memory_id"]
+            ),
+            "observed_survivor_present": True,
+            "observation_scope": str(item["observation_scope"]),
+            "reconciling_authority_epoch": str(
+                item["reconciling_authority_epoch"]
+            ),
+            "reconciling_root_generation_id": str(
+                item["reconciling_root_generation_id"]
+            ),
+            "reconciling_build_id": str(item["reconciling_build_id"]),
+            "reconciling_config_fingerprint": str(
+                item["reconciling_config_fingerprint"]
+            ),
+            "source_row_preserved": True,
+            "capacity_recovered": False,
         }
 
     def reconcile_request_journal(
@@ -18395,6 +18764,380 @@ class DurableMemoryStore:
             "survivor_history_preserved": True,
             "original_journal_state_preserved": True,
             "replay_safe": False,
+        }
+
+    def _stranded_accepted_prune_authority_marker(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any] | None:
+        """Return the durable marker used by the v2 receipt transaction.
+
+        This narrow wrapper keeps the receipt's authority assertion explicit
+        and gives disposable unit tests a seam that does not weaken the normal
+        transaction-level authority fence.
+        """
+
+        return self._core_authority_marker(conn)
+
+    def reconcile_stranded_accepted_prune(
+        self,
+        *,
+        request_journal_id: str,
+        store_identity: str,
+        target_caller: str,
+        target_request_id: str,
+        target_authority_epoch: str,
+        target_entry_revision: str,
+        inventory_snapshot_revision: str,
+        expected_reconciling_authority_epoch: str,
+        expected_reconciling_root_generation_id: str,
+        expected_reconciling_build_id: str,
+        expected_reconciling_config_fingerprint: str,
+        observed_context_id: str,
+        observed_candidate_memory_id: str,
+        observed_survivor_memory_id: str,
+        evidence_sha256: str,
+        reconciliation_request_caller: str,
+        reconciliation_request_id: str,
+        reconciliation_request_fingerprint: str,
+        reconciled_by: str,
+        confirm: bool = False,
+        trusted_signing_key_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Record a stranded accepted prune observation without replay.
+
+        This receipt deliberately does not claim that the accepted request
+        completed or that it caused the observed absence.  It binds a newer
+        authoritative generation to one transactionally consistent observation:
+        the reviewed candidate is absent and the separately reviewed survivor is
+        present in the supplied namespace.  The immutable request-journal row is
+        not changed and no capacity is recovered.
+        """
+
+        if confirm is not True:
+            raise RequestJournalReconciliationRejected(
+                "stranded accepted prune reconciliation requires confirmation"
+            )
+        journal_id = self._request_journal_reconciliation_identifier(
+            request_journal_id,
+            field="request_journal_id",
+        )
+        store_id = self._request_journal_reconciliation_identifier(
+            store_identity,
+            field="store_identity",
+        )
+        caller = self._request_journal_reconciliation_identifier(
+            target_caller,
+            field="target_caller",
+        )
+        request_id = self._request_journal_reconciliation_identifier(
+            target_request_id,
+            field="target_request_id",
+        )
+        target_epoch = self._request_journal_reconciliation_identifier(
+            target_authority_epoch,
+            field="target_authority_epoch",
+        )
+        current_epoch = self._request_journal_reconciliation_identifier(
+            expected_reconciling_authority_epoch,
+            field="expected_reconciling_authority_epoch",
+        )
+        root_generation_id = self._request_journal_reconciliation_identifier(
+            expected_reconciling_root_generation_id,
+            field="expected_reconciling_root_generation_id",
+        )
+        build_id = self._request_journal_reconciliation_identifier(
+            expected_reconciling_build_id,
+            field="expected_reconciling_build_id",
+        )
+        config_fingerprint = str(
+            expected_reconciling_config_fingerprint or ""
+        ).strip().lower()
+        context_id = self._request_journal_reconciliation_identifier(
+            observed_context_id,
+            field="observed_context_id",
+        )
+        candidate_memory_id = self._request_journal_reconciliation_identifier(
+            observed_candidate_memory_id,
+            field="observed_candidate_memory_id",
+        )
+        survivor_memory_id = self._request_journal_reconciliation_identifier(
+            observed_survivor_memory_id,
+            field="observed_survivor_memory_id",
+        )
+        actor = self._request_journal_reconciliation_identifier(
+            reconciled_by,
+            field="reconciled_by",
+        )
+        outer_caller = self._request_journal_reconciliation_identifier(
+            reconciliation_request_caller,
+            field="reconciliation_request_caller",
+        )
+        outer_request_id = self._request_journal_reconciliation_identifier(
+            reconciliation_request_id,
+            field="reconciliation_request_id",
+        )
+        outer_fingerprint = str(
+            reconciliation_request_fingerprint or ""
+        ).strip().lower()
+        target_epoch_match = _AUTHORITY_EPOCH_RE.fullmatch(target_epoch)
+        current_epoch_match = _AUTHORITY_EPOCH_RE.fullmatch(current_epoch)
+        entry_revision = str(target_entry_revision or "").strip().lower()
+        snapshot_revision = str(
+            inventory_snapshot_revision or ""
+        ).strip().lower()
+        evidence_digest = str(evidence_sha256 or "").strip().lower()
+        if (
+            CORE_REQUEST_JOURNAL_ID_RE.fullmatch(journal_id) is None
+            or CORE_STORE_IDENTITY_RE.fullmatch(store_id) is None
+            or target_epoch_match is None
+            or current_epoch_match is None
+            or int(current_epoch_match.group(1))
+            <= int(target_epoch_match.group(1))
+            or CORE_ROOT_GENERATION_ID_RE.fullmatch(root_generation_id) is None
+            or _PUBLIC_MEMORY_ID_RE.fullmatch(candidate_memory_id) is None
+            or _PUBLIC_MEMORY_ID_RE.fullmatch(survivor_memory_id) is None
+            or candidate_memory_id == survivor_memory_id
+            or any(
+                BACKUP_DIGEST_RE.fullmatch(value) is None
+                for value in (
+                    entry_revision,
+                    snapshot_revision,
+                    evidence_digest,
+                    config_fingerprint,
+                    outer_fingerprint,
+                )
+            )
+        ):
+            raise RequestJournalReconciliationRejected(
+                "stranded accepted prune evidence contract is invalid"
+            )
+        target_key = self._request_journal_reconciliation_target_key(
+            request_journal_id=journal_id,
+            target_caller=caller,
+            target_request_id=request_id,
+        )
+        semantic = {
+            "request_journal_id": journal_id,
+            "store_identity": store_id,
+            "target_caller": caller,
+            "target_request_id": request_id,
+            "target_operation": "prune_memory",
+            "target_authority_epoch": target_epoch,
+            "target_original_state": "accepted",
+            "target_entry_revision": entry_revision,
+            "inventory_snapshot_revision": snapshot_revision,
+            "disposition": STRANDED_ACCEPTED_PRUNE_DISPOSITION,
+            "evidence_kind": STRANDED_ACCEPTED_PRUNE_EVIDENCE_KIND,
+            "evidence_sha256": evidence_digest,
+            "reconciled_by": actor,
+            "replay_safe": False,
+            "reconciling_authority_epoch": current_epoch,
+            "reconciling_root_generation_id": root_generation_id,
+            "reconciling_build_id": build_id,
+            "reconciling_config_fingerprint": config_fingerprint,
+            "observed_context_id": context_id,
+            "observed_candidate_memory_id": candidate_memory_id,
+            "observed_candidate_present": False,
+            "observed_survivor_memory_id": survivor_memory_id,
+            "observed_survivor_present": True,
+            "observation_scope": STRANDED_ACCEPTED_PRUNE_OBSERVATION_SCOPE,
+            "target_argument_binding_confirmed": False,
+            "target_operation_completion_confirmed": False,
+            "target_operation_outcome": "unknown",
+            "cause_attributed_to_target_request": False,
+            "source_row_preserved": True,
+            "capacity_recovered": False,
+            "reconciliation_request_caller": outer_caller,
+            "reconciliation_request_id": outer_request_id,
+            "reconciliation_request_operation": (
+                STRANDED_ACCEPTED_PRUNE_RECONCILIATION_OPERATION
+            ),
+            "reconciliation_request_fingerprint": outer_fingerprint,
+            "reconciliation_request_completion_confirmed": True,
+            "reconciliation_request_outcome": "receipt_committed",
+        }
+        with closing(self._connect()) as conn:
+            with self._transaction(conn, immediate=True):
+                marker = self._stranded_accepted_prune_authority_marker(conn)
+                if (
+                    marker is None
+                    or int(marker["epoch"])
+                    != int(current_epoch_match.group(1))
+                    or str(marker["root_generation_id"])
+                    != root_generation_id
+                    or str(marker["build_id"]) != build_id
+                    or str(marker["config_fingerprint"])
+                    != config_fingerprint
+                    or str(marker["request_journal_id"]) != journal_id
+                    or str(marker["store_identity"]) != store_id
+                ):
+                    raise RequestJournalReconciliationRejected(
+                        "stranded accepted prune authority binding changed"
+                    )
+                existing_receipts = self._request_journal_reconciliation_rows(
+                    conn,
+                    request_journal_id=journal_id,
+                    store_identity=store_id,
+                    trusted_signing_key_ids=trusted_signing_key_ids,
+                )
+                existing = next(
+                    (
+                        receipt
+                        for receipt in existing_receipts
+                        if receipt["target_caller"] == caller
+                        and receipt["target_request_id"] == request_id
+                    ),
+                    None,
+                )
+                existing_outer = next(
+                    (
+                        receipt
+                        for receipt in existing_receipts
+                        if receipt.get("reconciliation_request_caller")
+                        == outer_caller
+                        and receipt.get("reconciliation_request_id")
+                        == outer_request_id
+                    ),
+                    None,
+                )
+                if (
+                    existing is not None
+                    and existing_outer is not None
+                    and existing["resolution_id"]
+                    != existing_outer["resolution_id"]
+                ):
+                    raise RequestJournalReconciliationRejected(
+                        "request reconciliation outer handle is not unique"
+                    )
+                if existing is None and existing_outer is not None:
+                    raise RequestJournalReconciliationRejected(
+                        "request reconciliation outer handle conflicts"
+                    )
+                if existing is not None:
+                    if any(
+                        existing.get(key) != value
+                        for key, value in semantic.items()
+                    ):
+                        raise RequestJournalReconciliationRejected(
+                            "request reconciliation conflicts with existing receipt"
+                        )
+                    result = dict(existing)
+                    idempotent = True
+                else:
+                    candidate_row = conn.execute(
+                        "SELECT context_id FROM memory_entries WHERE memory_id = ?",
+                        (candidate_memory_id,),
+                    ).fetchone()
+                    survivor_row = conn.execute(
+                        "SELECT context_id FROM memory_entries WHERE memory_id = ?",
+                        (survivor_memory_id,),
+                    ).fetchone()
+                    candidate_relationship_count = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM memory_relationships "
+                            "WHERE source_memory_id = ? OR target_memory_id = ?",
+                            (candidate_memory_id, candidate_memory_id),
+                        ).fetchone()[0]
+                    )
+                    if (
+                        candidate_row is not None
+                        or candidate_relationship_count != 0
+                        or survivor_row is None
+                        or str(survivor_row["context_id"]) != context_id
+                    ):
+                        raise RequestJournalReconciliationRejected(
+                            "stranded accepted prune readback changed"
+                        )
+                    if (
+                        len(existing_receipts)
+                        >= REQUEST_JOURNAL_RECONCILIATION_MAX_RECEIPTS
+                    ):
+                        raise RequestJournalReconciliationRejected(
+                            "request reconciliation receipt capacity is exhausted"
+                        )
+                    reconciled_at_unix_ms = int(time.time() * 1000)
+                    resolution_digest = hashlib.sha256(
+                        _json_dumps(
+                            {
+                                "schema": (
+                                    "synapse-s2.request-journal-reconciliation-id.v2"
+                                ),
+                                **semantic,
+                                "reconciled_at_unix_ms": reconciled_at_unix_ms,
+                            }
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    result = {
+                        "schema": (
+                            STRANDED_ACCEPTED_PRUNE_RECONCILIATION_RECEIPT_SCHEMA
+                        ),
+                        "resolution_id": f"reqrec-{resolution_digest[:24]}",
+                        **semantic,
+                        "reconciled_at_unix_ms": reconciled_at_unix_ms,
+                    }
+                    self._authenticate_receipt(result)
+                    self._validate_request_journal_reconciliation_receipt(
+                        result
+                    )
+                    conn.execute(
+                        "INSERT INTO store_maintenance_receipts ("
+                        "operation_id, operation_type, context_id, "
+                        "before_revision, after_revision, payload_json, created_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            result["resolution_id"],
+                            REQUEST_JOURNAL_RECONCILIATION_OPERATION_TYPE,
+                            target_key,
+                            entry_revision,
+                            result["receipt_digest"],
+                            json.dumps(
+                                result,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            reconciled_at_unix_ms / 1000.0,
+                        ),
+                    )
+                    idempotent = False
+        with closing(self._connect_read_only()) as verification_conn:
+            matches = self._request_journal_reconciliation_rows(
+                verification_conn,
+                request_journal_id=journal_id,
+                store_identity=store_id,
+                trusted_signing_key_ids=trusted_signing_key_ids,
+                operation_id=str(result["resolution_id"]),
+            )
+        matches = [
+            item
+            for item in matches
+            if item["target_caller"] == caller
+            and item["target_request_id"] == request_id
+            and item["receipt_digest"] == result["receipt_digest"]
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "stranded accepted prune reconciliation could not be verified"
+            )
+        public_semantic = {
+            key: value
+            for key, value in semantic.items()
+            if key != "reconciliation_request_fingerprint"
+        }
+        return {
+            "schema": (
+                "synapse-s2.stranded-accepted-prune-reconciliation-result.v1"
+            ),
+            "status": "stranding_recorded",
+            "idempotent": idempotent,
+            "resolution_id": str(result["resolution_id"]),
+            **public_semantic,
+            "reconciled_at_unix_ms": int(result["reconciled_at_unix_ms"]),
+            "receipt_digest": str(result["receipt_digest"]),
+            "auth_key_id": str(result["auth_key_id"]),
+            "signature_verified": True,
+            "original_journal_state_preserved": True,
         }
 
     @staticmethod

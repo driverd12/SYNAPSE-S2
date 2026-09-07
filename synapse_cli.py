@@ -469,6 +469,55 @@ def command_request_journal_reconcile(
     )
 
 
+def command_request_journal_reconcile_stranded_prune(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    core_request_id = getattr(args, "core_request_id", None)
+    if (
+        not isinstance(core_request_id, str)
+        or not core_request_id
+        or core_request_id != core_request_id.strip()
+    ):
+        raise ValueError(
+            "stranded prune reconciliation requires a predeclared --core-request-id"
+        )
+    backend = build_backend(args)
+    reconcile = getattr(
+        backend,
+        "reconcile_stranded_accepted_prune",
+        None,
+    )
+    if not callable(reconcile):
+        raise RuntimeError(
+            "authoritative stranded-prune reconciliation is unavailable"
+        )
+    return reconcile(
+        target_caller=args.caller,
+        target_request_id=args.request_id,
+        expected_authority_epoch=args.expected_authority_epoch,
+        expected_entry_revision=args.expected_entry_revision,
+        expected_journal_id=args.expected_journal_id,
+        expected_store_identity=args.expected_store_identity,
+        inventory_snapshot_revision=args.inventory_snapshot_revision,
+        expected_reconciling_authority_epoch=(
+            args.expected_reconciling_authority_epoch
+        ),
+        expected_reconciling_root_generation_id=(
+            args.expected_reconciling_root_generation_id
+        ),
+        expected_reconciling_build_id=args.expected_reconciling_build_id,
+        expected_reconciling_config_fingerprint=(
+            args.expected_reconciling_config_fingerprint
+        ),
+        observed_context_id=args.observed_context_id,
+        observed_candidate_memory_id=args.observed_candidate_memory_id,
+        observed_survivor_memory_id=args.observed_survivor_memory_id,
+        evidence_sha256=args.evidence_sha256,
+        confirm=args.confirm,
+        request_id=core_request_id,
+    )
+
+
 def command_enable(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_backend(args)
     return backend.set_enabled(True, context_id=args.context)
@@ -2581,6 +2630,80 @@ def build_parser() -> argparse.ArgumentParser:
     )
     request_reconcile.add_argument("--confirm", action="store_true")
     request_reconcile.set_defaults(func=command_request_journal_reconcile)
+
+    stranded_prune_reconcile = subparsers.add_parser(
+        "request-journal-reconcile-stranded-prune",
+        help=(
+            "Record one successor-generation accepted-prune observation; "
+            "never replay or mark the prune completed."
+        ),
+    )
+    stranded_prune_reconcile.add_argument("--caller", required=True)
+    stranded_prune_reconcile.add_argument("--request-id", required=True)
+    stranded_prune_reconcile.add_argument(
+        "--expected-authority-epoch",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--expected-entry-revision",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--expected-journal-id",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--expected-store-identity",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--inventory-snapshot-revision",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--expected-reconciling-authority-epoch",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--expected-reconciling-root-generation-id",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--expected-reconciling-build-id",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--expected-reconciling-config-fingerprint",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--observed-context-id",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--observed-candidate-memory-id",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--observed-survivor-memory-id",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--evidence-sha256",
+        required=True,
+    )
+    stranded_prune_reconcile.add_argument(
+        "--core-request-id",
+        required=True,
+        help=(
+            "Predeclared outer request handle. Preserve it for request-status "
+            "if the response is uncertain; never generate a replacement."
+        ),
+    )
+    stranded_prune_reconcile.add_argument("--confirm", action="store_true")
+    stranded_prune_reconcile.set_defaults(
+        func=command_request_journal_reconcile_stranded_prune
+    )
 
     enable = subparsers.add_parser("enable")
     add_context(enable)

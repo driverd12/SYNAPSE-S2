@@ -60,7 +60,10 @@ _SECRET_PATTERNS = (
 )
 _TERMINAL_STATES = ("completed", "failed")
 _INVENTORY_STATES = ("accepted", "ambiguous", "completed", "failed")
-_RECONCILIATION_OPERATION = "reconcile_request_journal"
+_RECONCILIATION_OPERATIONS = (
+    "reconcile_request_journal",
+    "reconcile_stranded_accepted_prune",
+)
 SAFE_ERROR_CODES = frozenset(
     {
         "authentication_failed",
@@ -993,11 +996,13 @@ class CoreRequestJournal:
                     "state IN ("
                     + ",".join("?" for _state in ordered_states)
                     + ")",
-                    "operation <> ?",
+                    "operation NOT IN ("
+                    + ",".join("?" for _operation in _RECONCILIATION_OPERATIONS)
+                    + ")",
                 ]
                 parameters: list[Any] = [
                     *ordered_states,
-                    _RECONCILIATION_OPERATION,
+                    *_RECONCILIATION_OPERATIONS,
                 ]
                 if clean_caller is not None:
                     clauses.append("caller = ?")
@@ -1036,8 +1041,8 @@ class CoreRequestJournal:
                         "authority_epoch, state, result_kind, safe_error_code, "
                         "accepted_at_unix_ms, finished_at_unix_ms "
                         "FROM request_journal WHERE state IN (?, ?) "
-                        "AND operation <> ? ORDER BY caller, request_id",
-                        ("accepted", "ambiguous", _RECONCILIATION_OPERATION),
+                        "AND operation NOT IN (?, ?) ORDER BY caller, request_id",
+                        ("accepted", "ambiguous", *_RECONCILIATION_OPERATIONS),
                     ).fetchall()
                 )
                 reconciliation_snapshot_revision = _revision_digest(
@@ -1088,7 +1093,7 @@ class CoreRequestJournal:
                         "entry_revision": self._entry_revision(row),
                         "reconciliation_eligible": (
                             str(row[5]) == "ambiguous"
-                            and str(row[2]) != _RECONCILIATION_OPERATION
+                            and str(row[2]) not in _RECONCILIATION_OPERATIONS
                         ),
                         "replay_safe": False,
                         "retention_expiry_possible": str(row[5])
@@ -1149,8 +1154,9 @@ class CoreRequestJournal:
         expected_authority_epoch: str,
         expected_entry_revision: str,
         expected_journal_id: str,
+        expected_original_state: str = "ambiguous",
     ) -> dict[str, Any]:
-        """Re-read one exact ambiguous row without altering its evidence."""
+        """Re-read one exact eligible row without altering its evidence."""
 
         caller = _validate_identifier(caller)
         request_id = _validate_identifier(request_id)
@@ -1162,6 +1168,9 @@ class CoreRequestJournal:
             expected_entry_revision
         )
         expected_journal_id = _validate_identifier(expected_journal_id)
+        expected_original_state = _validate_identifier(expected_original_state)
+        if expected_original_state not in {"ambiguous", "accepted"}:
+            raise CoreRequestJournalError("invalid_request")
         with self._mutex:
             if self.journal_id != expected_journal_id:
                 raise CoreRequestJournalError("request_conflict")
@@ -1178,8 +1187,17 @@ class CoreRequestJournal:
             if (
                 str(row[2]) != expected_operation
                 or str(row[4]) != expected_authority_epoch
-                or str(row[5]) != "ambiguous"
-                or str(row[2]) == _RECONCILIATION_OPERATION
+                or str(row[5]) != expected_original_state
+                or str(row[2]) in _RECONCILIATION_OPERATIONS
+                or (
+                    expected_original_state == "accepted"
+                    and (
+                        str(row[2]) != "prune_memory"
+                        or row[6] is not None
+                        or row[7] is not None
+                        or row[9] is not None
+                    )
+                )
                 or not secrets.compare_digest(
                     entry_revision,
                     expected_entry_revision,
@@ -1212,7 +1230,7 @@ class CoreRequestJournal:
             or len(targets) > self.max_accepted_rows
         ):
             raise CoreRequestJournalError("request_conflict")
-        reviewed_inputs: list[tuple[str, str, str, str, str]] = []
+        reviewed_inputs: list[tuple[str, str, str, str, str, str]] = []
         seen: set[tuple[str, str]] = set()
         for target in targets:
             if not isinstance(target, Mapping):
@@ -1238,6 +1256,9 @@ class CoreRequestJournal:
                     _validate_fingerprint(
                         str(target.get("target_entry_revision") or "")
                     ),
+                    _validate_identifier(
+                        str(target.get("target_original_state") or "")
+                    ),
                 )
             )
         with self._mutex:
@@ -1245,13 +1266,20 @@ class CoreRequestJournal:
                 "SELECT caller, request_id, operation, request_fingerprint, "
                 "authority_epoch, state, result_kind, safe_error_code, "
                 "accepted_at_unix_ms, finished_at_unix_ms "
-                "FROM request_journal WHERE state = 'ambiguous' "
-                "AND operation <> ? ORDER BY caller, request_id",
-                (_RECONCILIATION_OPERATION,),
+                "FROM request_journal WHERE state IN ('accepted', 'ambiguous') "
+                "AND operation NOT IN (?, ?) ORDER BY caller, request_id",
+                _RECONCILIATION_OPERATIONS,
             ).fetchall()
             indexed = {(str(row[0]), str(row[1])): row for row in rows}
             reviewed: list[dict[str, Any]] = []
-            for caller, request_id, operation, authority_epoch, revision in (
+            for (
+                caller,
+                request_id,
+                operation,
+                authority_epoch,
+                revision,
+                original_state,
+            ) in (
                 reviewed_inputs
             ):
                 row = indexed.get((caller, request_id))
@@ -1261,6 +1289,16 @@ class CoreRequestJournal:
                 if (
                     str(row[2]) != operation
                     or str(row[4]) != authority_epoch
+                    or str(row[5]) != original_state
+                    or (
+                        original_state == "accepted"
+                        and (
+                            operation != "prune_memory"
+                            or row[6] is not None
+                            or row[7] is not None
+                            or row[9] is not None
+                        )
+                    )
                     or not secrets.compare_digest(entry_revision, revision)
                 ):
                     raise CoreRequestJournalError("request_conflict")
@@ -1273,7 +1311,7 @@ class CoreRequestJournal:
                         "entry_revision": entry_revision,
                         "journal_id": self.journal_id,
                         "store_identity": self.store_identity,
-                        "original_state": "ambiguous",
+                        "original_state": original_state,
                         "replay_safe": False,
                     }
                 )

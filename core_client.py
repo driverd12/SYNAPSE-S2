@@ -499,6 +499,72 @@ class CoreClient:
             request_id=request_id,
         )
 
+    def reconcile_stranded_accepted_prune(
+        self,
+        *,
+        target_caller: str,
+        target_request_id: str,
+        expected_authority_epoch: str,
+        expected_entry_revision: str,
+        expected_journal_id: str,
+        expected_store_identity: str,
+        inventory_snapshot_revision: str,
+        expected_reconciling_authority_epoch: str,
+        expected_reconciling_root_generation_id: str,
+        expected_reconciling_build_id: str,
+        expected_reconciling_config_fingerprint: str,
+        observed_context_id: str,
+        observed_candidate_memory_id: str,
+        observed_survivor_memory_id: str,
+        evidence_sha256: str,
+        request_id: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Record a stranded accepted prune observation without replay."""
+
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or request_id != request_id.strip()
+        ):
+            raise ValueError(
+                "stranded accepted prune reconciliation requires a predeclared request_id"
+            )
+        return self.call(
+            "reconcile_stranded_accepted_prune",
+            {
+                "target_caller": target_caller,
+                "target_request_id": target_request_id,
+                "expected_authority_epoch": expected_authority_epoch,
+                "expected_entry_revision": expected_entry_revision,
+                "expected_journal_id": expected_journal_id,
+                "expected_store_identity": expected_store_identity,
+                "inventory_snapshot_revision": inventory_snapshot_revision,
+                "expected_reconciling_authority_epoch": (
+                    expected_reconciling_authority_epoch
+                ),
+                "expected_reconciling_root_generation_id": (
+                    expected_reconciling_root_generation_id
+                ),
+                "expected_reconciling_build_id": (
+                    expected_reconciling_build_id
+                ),
+                "expected_reconciling_config_fingerprint": (
+                    expected_reconciling_config_fingerprint
+                ),
+                "observed_context_id": observed_context_id,
+                "observed_candidate_memory_id": (
+                    observed_candidate_memory_id
+                ),
+                "observed_survivor_memory_id": (
+                    observed_survivor_memory_id
+                ),
+                "evidence_sha256": evidence_sha256,
+                "confirm": confirm,
+            },
+            request_id=request_id,
+        )
+
     def status(self, *, context_id: str = "default") -> dict[str, Any]:
         return self.call("status", {"context_id": context_id})
 
