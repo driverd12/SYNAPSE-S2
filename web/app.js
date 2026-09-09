@@ -529,6 +529,7 @@ const state = {
   snapshot: null,
   snapshotRequestGeneration: 0,
   imageGalleryRequestGeneration: 0,
+  snapshotBootstrapPending: false,
   coreHealth: {
     refreshPending: false,
     refreshTimer: null,
@@ -1182,6 +1183,15 @@ async function refreshCoreHealth({ background = false } = {}) {
     coreHealth.lastSuccessfulRefreshAt = Date.now();
     coreHealth.latest = health;
     renderCoreHealth(health);
+    if (
+      health.ready
+      && health.backend_lane?.accepting_ordinary_operations === true
+      && document.visibilityState === "visible"
+    ) {
+      void refreshMissingSnapshot().catch((error) => {
+        logOperation("Dashboard loading retry failed", error.message);
+      });
+    }
     return health;
   } catch (error) {
     if (isDashboardAuthorizationError(error)) {
@@ -1287,6 +1297,18 @@ function applyTheme(theme) {
   elements.themeButton.setAttribute("aria-label", dark ? "Use light mode" : "Use dark mode");
   elements.themeButton.setAttribute("title", dark ? "Use light mode" : "Use dark mode");
   requestNamespaceGalaxyDraw();
+}
+
+async function refreshMissingSnapshot() {
+  if (state.snapshot || state.snapshotBootstrapPending || state.dashboardAccessRequired) {
+    return null;
+  }
+  state.snapshotBootstrapPending = true;
+  try {
+    return await refreshSnapshot();
+  } finally {
+    state.snapshotBootstrapPending = false;
+  }
 }
 
 async function refreshSnapshot() {
@@ -1733,39 +1755,38 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
       params: {
         context_id: contextId,
         limit: 2000,
-        include_suggestions: background ? "false" : "true",
-        include_density_metrics: background ? "false" : "true",
+        // Routine loading must not scan the full indexes on the core's shared lane.
+        include_suggestions: "false",
+        include_density_metrics: "false",
       },
       timeoutMs: background ? 5000 : READ_REQUEST_TIMEOUT_MS,
     });
     if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
     const data = normalizeNamespaceMap(payload);
-    if (background) {
-      const priorNodes = new Map(
-        galaxy.data.nodes.map((node) => [node.contextId, node]),
-      );
-      data.nodes = data.nodes.map((node) => ({
-        ...node,
-        surfaceTermCount: node.surfaceTermCount
-          ?? priorNodes.get(node.contextId)?.surfaceTermCount
-          ?? null,
-      }));
-      data.nodes = applyNamespaceGalaxyMetrics(data.nodes, data.links);
-      const liveNodeIds = new Set(data.nodes.map((node) => node.contextId));
-      const governedPairs = new Set(
-        [...data.links, ...data.proposals].map((item) => (
-          [item.sourceContextId, item.targetContextId].sort().join("\u001f")
-        )),
-      );
-      data.suggestions = galaxy.data.suggestions.filter((item) => (
-        liveNodeIds.has(item.sourceContextId)
-        && liveNodeIds.has(item.targetContextId)
-        && !governedPairs.has(
-          [item.sourceContextId, item.targetContextId].sort().join("\u001f"),
-        )
-      ));
-      data.stats = { ...data.stats, suggestion_count: data.suggestions.length };
-    }
+    const priorNodes = new Map(
+      galaxy.data.nodes.map((node) => [node.contextId, node]),
+    );
+    data.nodes = data.nodes.map((node) => ({
+      ...node,
+      surfaceTermCount: node.surfaceTermCount
+        ?? priorNodes.get(node.contextId)?.surfaceTermCount
+        ?? null,
+    }));
+    data.nodes = applyNamespaceGalaxyMetrics(data.nodes, data.links);
+    const liveNodeIds = new Set(data.nodes.map((node) => node.contextId));
+    const governedPairs = new Set(
+      [...data.links, ...data.proposals].map((item) => (
+        [item.sourceContextId, item.targetContextId].sort().join("\u001f")
+      )),
+    );
+    data.suggestions = galaxy.data.suggestions.filter((item) => (
+      liveNodeIds.has(item.sourceContextId)
+      && liveNodeIds.has(item.targetContextId)
+      && !governedPairs.has(
+        [item.sourceContextId, item.targetContextId].sort().join("\u001f"),
+      )
+    ));
+    data.stats = { ...data.stats, suggestion_count: data.suggestions.length };
     renderNamespaceGalaxy(data);
     galaxy.lastSuccessfulRefreshAt = Date.now();
     elements.namespaceGalaxyCanvas.title = "Namespace map is current as of "
@@ -9682,7 +9703,7 @@ document.addEventListener("visibilitychange", () => {
   scheduleCoreHealthRefresh({ immediate: document.visibilityState !== "hidden" });
 });
 
-refreshSnapshot()
+refreshMissingSnapshot()
   .catch((error) => {
     logOperation("Initial load failed", error.message);
   })
