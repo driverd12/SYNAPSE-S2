@@ -22,9 +22,9 @@ const stateStart = source.indexOf('const state = {');
 const stateEnd = source.indexOf('\nconst elements = ', stateStart);
 assert.ok(stateStart >= 0 && stateEnd > stateStart);
 const production = source.slice(stateStart, stateEnd) + '\n'
-  + ['refreshSnapshot', 'refreshImageGallery', 'pullContextDeployments', 'withGraph', 'applySelectedContext']
+  + ['refreshMissingSnapshot', 'refreshCoreHealth', 'refreshSnapshot', 'refreshImageGallery', 'pullContextDeployments', 'withGraph', 'applySelectedContext']
     .map(functionSource).join('\n')
-  + '\nglobalThis.dashboard = { state, refreshSnapshot, refreshImageGallery, pullContextDeployments, applySelectedContext };';
+  + '\nglobalThis.dashboard = { state, refreshMissingSnapshot, refreshCoreHealth, refreshSnapshot, refreshImageGallery, pullContextDeployments, applySelectedContext };';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const shell = (context, version = context) => ({ context_id: context, version, graph: { deferred: true } });
@@ -37,12 +37,14 @@ function harness() {
   const logs = [];
   const elements = {
     headerRuntime: { textContent: '' },
+    sidebarStatus: { textContent: '' },
     contextApply: {},
     contextInput: { value: '' },
     contextSelect: { value: '', options: [] },
   };
   const sandbox = {
     URL, URLSearchParams,
+    document: { visibilityState: 'visible' },
     DEFAULT_CONTEXT: 'A',
     NAMESPACE_GALAXY_CONTEXT_PARAM: 'namespace',
     NAMESPACE_GALAXY_DEFAULT_ROTATION: {},
@@ -57,6 +59,9 @@ function harness() {
     }),
     renderSnapshot: (snapshot) => snapshots.push(structuredClone(snapshot)),
     renderImageGallery: (gallery) => galleries.push(structuredClone(gallery)),
+    renderCoreHealth() {},
+    isDashboardAuthorizationError: (error) => error.status === 401,
+    renderDashboardAccessRequired() { api.state.dashboardAccessRequired = true; },
     refreshNamespaceGalaxy: async () => null,
     operationLogIsIdle: () => false,
     logSnapshotResponse() {},
@@ -85,7 +90,61 @@ function harness() {
     take('/api/context-events', context).resolve({ context_id: context, version, events: [] });
     await flush();
   }
-  return { ...api, requests, snapshots, galleries, logs, elements, take, finish };
+  return { ...api, requests, snapshots, galleries, logs, elements, document: sandbox.document, take, finish };
+}
+
+test('failed initial loading releases the bootstrap guard and a later healthy poll recovers it', async () => {
+  const h = harness();
+  const failed = h.refreshMissingSnapshot();
+  const rejected = assert.rejects(failed, /initial shell unavailable/);
+  h.take('/api/snapshot', 'A').reject(new Error('initial shell unavailable'));
+  await rejected;
+  assert.equal(h.state.snapshotBootstrapPending, false);
+  assert.equal(h.state.snapshot, null);
+  const health = h.refreshCoreHealth({ background: true });
+  h.take('/api/core-health').resolve({ ready: true, backend_lane: { accepting_ordinary_operations: true } });
+  await health;
+  assert.equal(h.state.snapshotBootstrapPending, true);
+  await h.finish('A', 'recovered');
+  assert.equal(h.state.snapshotBootstrapPending, false);
+  assert.equal(h.state.snapshot.graph.version, 'recovered');
+});
+
+test('overlapping missing-snapshot retries share one in-flight bootstrap', async () => {
+  const h = harness();
+  const initial = h.refreshMissingSnapshot();
+  assert.equal(await h.refreshMissingSnapshot(), null);
+  assert.equal(h.requests.length, 1);
+  await h.finish('A');
+  await initial;
+  assert.equal(h.state.snapshotBootstrapPending, false);
+});
+
+test('loaded snapshots and authentication lockout suppress bootstrap requests', async () => {
+  const h = harness();
+  h.state.snapshot = shell('A');
+  assert.equal(await h.refreshMissingSnapshot(), null);
+  h.state.snapshot = null;
+  h.state.dashboardAccessRequired = true;
+  assert.equal(await h.refreshMissingSnapshot(), null);
+  assert.equal(h.requests.length, 0);
+});
+
+for (const scenario of [
+  { name: 'unavailable core', health: { ready: false, backend_lane: { accepting_ordinary_operations: true } } },
+  { name: 'maintenance', health: { ready: true, backend_lane: { accepting_ordinary_operations: false } } },
+  { name: 'missing lane evidence', health: { ready: true } },
+  { name: 'hidden page', health: { ready: true, backend_lane: { accepting_ordinary_operations: true } }, hidden: true },
+]) {
+  test(`${scenario.name} does not start an automatic snapshot retry`, async () => {
+    const h = harness();
+    if (scenario.hidden) h.document.visibilityState = 'hidden';
+    const health = h.refreshCoreHealth({ background: true });
+    h.take('/api/core-health').resolve(scenario.health);
+    await health;
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.state.snapshotBootstrapPending, false);
+  });
 }
 
 test('late shell response cannot overwrite a newly selected namespace or start follow-up reads', async () => {
