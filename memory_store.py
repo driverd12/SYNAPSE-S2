@@ -11501,23 +11501,37 @@ class DurableMemoryStore:
         candidates: list[dict[str, Any]] = []
         try:
             with self._read_connection_scope(_conn) as conn:
+                # Aggregate narrow index rows before loading entry payloads.
+                # The first entry join preserves timestamp ties and excludes
+                # orphan index rows before applying the existing source cap.
                 rows = conn.execute(
                     f"""
-                    SELECT
-                        e.*,
-                        COUNT(*) AS overlap_count
-                    FROM memory_spikes AS s
+                    WITH matched AS (
+                        SELECT s.memory_id, COUNT(*) AS overlap_count
+                        FROM memory_spikes AS s
+                        WHERE
+                            s.context_id IN ({context_placeholders})
+                            AND s.spike_index IN ({placeholders})
+                        GROUP BY s.memory_id
+                    ), bounded AS (
+                        SELECT matched.memory_id, matched.overlap_count
+                        FROM matched
+                        JOIN memory_entries AS e
+                            ON e.memory_id = matched.memory_id
+                        ORDER BY
+                            matched.overlap_count DESC,
+                            e.updated_at DESC,
+                            e.memory_id ASC
+                        LIMIT ?
+                    )
+                    SELECT e.*, bounded.overlap_count
+                    FROM bounded
                     JOIN memory_entries AS e
-                        ON e.memory_id = s.memory_id
-                    WHERE
-                        s.context_id IN ({context_placeholders})
-                        AND s.spike_index IN ({placeholders})
-                    GROUP BY e.memory_id
+                        ON e.memory_id = bounded.memory_id
                     ORDER BY
-                        overlap_count DESC,
+                        bounded.overlap_count DESC,
                         e.updated_at DESC,
                         e.memory_id ASC
-                    LIMIT ?
                     """,
                     tuple(params),
                 ).fetchall()
