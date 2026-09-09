@@ -527,6 +527,8 @@ const state = {
     || new URLSearchParams(window.location.search).get("context_id")
   )?.trim() || DEFAULT_CONTEXT,
   snapshot: null,
+  snapshotRequestGeneration: 0,
+  imageGalleryRequestGeneration: 0,
   coreHealth: {
     refreshPending: false,
     refreshTimer: null,
@@ -1288,17 +1290,25 @@ function applyTheme(theme) {
 }
 
 async function refreshSnapshot() {
+  const contextId = state.context;
+  const requestGeneration = ++state.snapshotRequestGeneration;
+  const isCurrent = () => (
+    requestGeneration === state.snapshotRequestGeneration
+    && contextId === state.context
+    && !state.dashboardAccessRequired
+  );
   const started = nowMs();
   elements.headerRuntime.textContent = "REFRESHING";
   const shellSnapshot = await requestJson("/api/snapshot", {
-    params: { context_id: state.context, limit: SNAPSHOT_LIMIT, include_graph: "false" },
+    params: { context_id: contextId, limit: SNAPSHOT_LIMIT, include_graph: "false" },
   });
+  if (!isCurrent()) return null;
   state.snapshot = withGraph(shellSnapshot, shellSnapshot.graph);
   const shellElapsedMs = elapsedMs(started);
   renderSnapshot(state.snapshot, shellElapsedMs);
   const namespaceMapPromise = refreshNamespaceGalaxy();
   const imageGalleryPromise = refreshImageGallery().catch((error) => {
-    logOperation("Image gallery refresh failed", error.message);
+    if (isCurrent()) logOperation("Image gallery refresh failed", error.message);
     return null;
   });
   if (operationLogIsIdle()) {
@@ -1307,19 +1317,28 @@ async function refreshSnapshot() {
 
   try {
     const graph = await requestJson("/api/graph", {
-      params: { context_id: state.context, limit: SNAPSHOT_LIMIT },
+      params: { context_id: contextId, limit: SNAPSHOT_LIMIT },
     });
-    const contextDeployments = await pullContextDeployments(0, 20);
-    state.snapshot = {
-      ...withGraph(shellSnapshot, graph),
-      context_deployments: contextDeployments,
-    };
+    if (!isCurrent()) return null;
+    state.snapshot = withGraph(shellSnapshot, graph);
     renderSnapshot(state.snapshot, elapsedMs(started));
+    // A separate deployment read must not hide an already loaded graph.
+    try {
+      const contextDeployments = await pullContextDeployments(0, 20, contextId);
+      if (!isCurrent()) return null;
+      state.snapshot = {
+        ...state.snapshot,
+        context_deployments: contextDeployments,
+      };
+      renderSnapshot(state.snapshot, elapsedMs(started));
+    } catch (error) {
+      if (isCurrent()) logOperation("Context deployment refresh failed", error.message);
+    }
   } catch (error) {
-    logOperation("Graph refresh failed", error.message);
+    if (isCurrent()) logOperation("Graph refresh failed", error.message);
   }
   await Promise.all([namespaceMapPromise, imageGalleryPromise]);
-  return state.snapshot;
+  return isCurrent() ? state.snapshot : null;
 }
 
 function renderSnapshot(snapshot, clientElapsedMs = null) {
@@ -1494,6 +1513,8 @@ async function applySelectedContext(context, busyElement = elements.contextApply
   }
   state.context = nextContext;
   if (contextChanged) {
+    state.snapshotRequestGeneration += 1;
+    state.imageGalleryRequestGeneration += 1;
     resetRecallResults({ contextId: nextContext });
   }
   const galaxyNode = state.namespaceGalaxy.data.nodes.find((item) => item.contextId === nextContext);
@@ -5080,9 +5101,16 @@ function renderImageGallery(payload = {}) {
 }
 
 async function refreshImageGallery() {
+  const contextId = state.context;
+  const requestGeneration = ++state.imageGalleryRequestGeneration;
   const payload = await requestJson("/api/media-cache", {
-    params: { context_id: state.context, limit: 12 },
+    params: { context_id: contextId, limit: 12 },
   });
+  if (
+    requestGeneration !== state.imageGalleryRequestGeneration
+    || contextId !== state.context
+    || state.dashboardAccessRequired
+  ) return null;
   renderImageGallery(payload);
   return payload;
 }
@@ -8311,10 +8339,10 @@ function logSnapshotResponse(snapshot, clientElapsedMs) {
   });
 }
 
-async function pullContextDeployments(sinceEventId = 0, limit = 10) {
+async function pullContextDeployments(sinceEventId = 0, limit = 10, contextId = state.context) {
   return requestJson("/api/context-events", {
     params: {
-      context_id: state.context,
+      context_id: contextId,
       since_event_id: Math.max(0, Math.trunc(Number(sinceEventId) || 0)),
       limit,
     },
