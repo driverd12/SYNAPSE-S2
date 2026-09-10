@@ -30,7 +30,7 @@ from scripts import release_update_plan as planner
 
 # Build id of the trusted manifest at the pinned working-tree revision.  This
 # test suite deliberately certifies the real repository root.
-REAL_ROOT_BUILD_ID = "source-66a8757ff0e964613fa09c13"
+REAL_ROOT_BUILD_ID = "source-efef025be8db9ac3de1b15fd"
 
 PLAN_KEYS = {
     "schema",
