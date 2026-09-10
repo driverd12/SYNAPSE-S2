@@ -30,7 +30,7 @@ from scripts import release_update_plan as planner
 
 # Build id of the trusted manifest at the pinned working-tree revision.  This
 # test suite deliberately certifies the real repository root.
-REAL_ROOT_BUILD_ID = "source-c91ed618a46b3bb9589ae445"
+REAL_ROOT_BUILD_ID = "source-66a8757ff0e964613fa09c13"
 
 PLAN_KEYS = {
     "schema",
@@ -2286,12 +2286,36 @@ HISTORY_CHANGED_PATHS = [
     "web/index.html",
 ]
 # The identical release-foundation overlay applied to both historical
-# templates: the closed 209-entry inventory binds these files, so both
+# templates: the closed 224-entry inventory binds these files, so both
 # trees carry the same current copies and the factual delta between the
 # templates stays exactly HISTORY_CHANGED_PATHS.  Product identities can
 # no longer be pinned as hex constants here: this very file is part of
 # the overlay, so any pinned digest would feed its own input.
+# Explicit additions since the historical release baseline. Keep them visible
+# in both historical fixtures so their original dashboard-only delta remains
+# independently testable under the current closed inventory.
+ENHANCEMENT_NEW_PATHS = (
+    "docs/ENHANCEMENT_RELEASE_20260910.md",
+    "hygiene_scan.py",
+    "namespace_enrichment.py",
+    "process_metrics.py",
+    "scripts/benchmark_recall.py",
+    "tests/test_benchmark_recall.py",
+    "tests/test_dashboard_analysis.py",
+    "tests/test_dashboard_refresh_behavior.cjs",
+    "tests/test_hygiene_scan.py",
+    "tests/test_image_memory_listing.py",
+    "tests/test_namespace_enrichment.py",
+    "tests/test_process_metrics.py",
+    "tests/test_recall_candidate_query.py",
+    "tests/test_request_journal_reconciliation_feature.py",
+    "tests/test_stranded_accepted_prune_reconciliation.py",
+)
+
 HISTORY_FOUNDATION_OVERLAY = (
+    # Both fixtures need the current literal manifest binding after its
+    # reviewed process_metrics addition; their historical delta stays intact.
+    "core_service.py",
     "pyproject.toml",
     "scripts/installed_layout.py",
     "scripts/release_activation_journal.py",
@@ -2315,7 +2339,7 @@ HISTORY_FOUNDATION_OVERLAY = (
     "tests/test_release_stage.py",
     "tests/test_release_update_plan.py",
     "uv.lock",
-)
+) + ENHANCEMENT_NEW_PATHS
 
 # Inventory paths introduced on top of the tracked HISTORY_NEW_COMMIT tree.
 FOUNDATION_NEW_PATHS = (
@@ -2338,7 +2362,7 @@ FOUNDATION_NEW_PATHS = (
     "tests/test_release_environment_storage.py",
     "tests/test_release_provenance.py",
     "tests/test_release_stage.py",
-)
+) + ENHANCEMENT_NEW_PATHS
 
 PRODUCT_ID_PATTERN = r"\Aproduct-[0-9a-f]{64}\Z"
 COMPONENT_ID_PATTERN = r"\Acomponent-[0-9a-f]{64}\Z"
@@ -2494,7 +2518,7 @@ class ProductReleasePlanTests(unittest.TestCase):
         inventory_paths = sorted(
             path for _, _, path in planner.PRODUCT_INVENTORY
         )
-        self.assertEqual(len(inventory_paths), 209)
+        self.assertEqual(len(inventory_paths), 224)
         tracked = sorted(
             subprocess.run(
                 [
@@ -2512,7 +2536,7 @@ class ProductReleasePlanTests(unittest.TestCase):
             ).stdout.splitlines()
         )
         # Exact parity with the tracked tree at the release base plus the
-        # seventeen release-foundation additions: no path is derived at runtime,
+        # reviewed foundation and enhancement additions: no path is derived at runtime,
         # nothing tracked is uninventoried, and nothing inventoried is
         # neither tracked nor a declared addition.
         self.assertEqual(len(tracked), 190)
@@ -2530,8 +2554,8 @@ class ProductReleasePlanTests(unittest.TestCase):
             self.assertIn(name, inventory_paths)
 
     def test_product_inventory_disk_mode_census_is_closed(self) -> None:
-        # The working tree the closed 209-entry inventory binds carries an
-        # equally closed permission census: exactly 197 regular 0644 files
+        # The working tree the closed 224-entry inventory binds carries an
+        # equally closed permission census: exactly 212 regular 0644 files
         # and exactly 12 executable 0755 operator entry points.  Any new
         # executable (or a lost executable bit) must be reviewed here.
         census: dict[int, int] = {}
@@ -2543,7 +2567,7 @@ class ProductReleasePlanTests(unittest.TestCase):
             census[mode] = census.get(mode, 0) + 1
             if mode == 0o755:
                 executables.append(path)
-        self.assertEqual(census, {0o644: 197, 0o755: 12})
+        self.assertEqual(census, {0o644: 212, 0o755: 12})
         self.assertEqual(
             sorted(executables),
             [
@@ -2594,7 +2618,7 @@ class ProductReleasePlanTests(unittest.TestCase):
         self.assertEqual(
             expected,
             "inventory-policy-"
-            "7e32522dc7bd9485c50a2992d7a35acfa0f2ece16e4dcdc14b78b8e82a095df4",
+            "d78f9a560ccb5011ce8ca122eef51c23e069d44ce045a40a78693009e8f9080a",
         )
         self.assertEqual(planner._inventory_policy_id(), expected)
         # A verified result and an unsupported refusal both carry the exact
@@ -2764,9 +2788,9 @@ class ProductReleasePlanTests(unittest.TestCase):
                 caught.exception.token, "product-inventory-invalid"
             )
         # Inventory count bound, exercised at the exact edge.
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 209):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 224):
             planner._validate_product_inventory()
-        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 208):
+        with mock.patch.object(planner, "MAX_PRODUCT_INVENTORY_ENTRIES", 223):
             result = planner.plan_product_release(
                 self.template, self.template
             )

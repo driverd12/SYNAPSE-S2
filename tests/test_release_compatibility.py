@@ -121,7 +121,7 @@ EXPECTED_SURFACE_FILES = {
 
 
 class CompatibilityFixture(unittest.TestCase):
-    """A small synthetic tree still exercises all 209 closed paths."""
+    """A small synthetic tree still exercises all 224 closed paths."""
 
     maxDiff = None
 
@@ -474,14 +474,14 @@ class ExactBuildVerificationTests(CompatibilityFixture):
         planner._validate_product_inventory()
         self.assertEqual(compatibility.TRUSTED_MANIFEST, planner.TRUSTED_MANIFEST)
         self.assertEqual(compatibility.PRODUCT_INVENTORY, planner.PRODUCT_INVENTORY)
-        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 209)
+        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 224)
         self.assertEqual(
             compatibility._inventory_policy_id(), planner._inventory_policy_id()
         )
         self.assertEqual(
             compatibility._inventory_policy_id(),
             "inventory-policy-"
-            "7e32522dc7bd9485c50a2992d7a35acfa0f2ece16e4dcdc14b78b8e82a095df4",
+            "d78f9a560ccb5011ce8ca122eef51c23e069d44ce045a40a78693009e8f9080a",
         )
         self.assertEqual(compatibility.MAX_TOTAL_MANIFEST_BYTES, 64 * 1024 * 1024)
         self.assertEqual(
@@ -1130,7 +1130,7 @@ class CompatibilitySignerTests(CompatibilityFixture):
         self._assert_signer_status(api_result, signer.STATUS_SIGNED)
         self.ticket_path = api_output
         self.assert_status(self.verify(), "verified", 0)
-        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 209)
+        self.assertEqual(len(compatibility.PRODUCT_INVENTORY), 224)
 
         cli_output = self.signing_root / "ticket-cli.json"
         cli_input = self._write_document(

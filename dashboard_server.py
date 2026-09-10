@@ -61,6 +61,16 @@ from image_capture import (  # noqa: E402
     validate_media_id,
 )
 from impact_metrics import ImpactMetricsError, ImpactMetricsStore  # noqa: E402
+from hygiene_scan import (  # noqa: E402
+    HygieneScanError,
+    HygieneScanManager,
+    default_survivor_sort_key,
+)
+from namespace_enrichment import (  # noqa: E402
+    NamespaceEnrichmentManager,
+    NamespaceRevisionObserver,
+    RevisionUnavailable,
+)
 from redaction import (  # noqa: E402
     SECRET_SAFE_LOG_FORMAT,
     SecretSafeArgumentParser,
@@ -241,6 +251,12 @@ class DashboardRuntime:
         self._binding = binding if binding is not None else BOUND_CORE_BINDING
         self._image_cache = image_cache
         self._impact_store = impact_store
+        self._execution_lock = threading.RLock()
+        self._analysis_init_lock = threading.Lock()
+        self._closed = False
+        self._hygiene_scanner: HygieneScanManager | None = None
+        self._namespace_enrichment: NamespaceEnrichmentManager | None = None
+        self._namespace_revision_observer: NamespaceRevisionObserver | None = None
         self.started_at = time.time()
         self._system_info_cache: dict[str, Any] | None = None
         self._confirmation_tokens: dict[str, dict[str, Any]] = {}
@@ -263,6 +279,102 @@ class DashboardRuntime:
             root=self._capture_root(),
             backend=self.backend,
         )
+
+    def close(self) -> None:
+        with self._analysis_init_lock:
+            self._closed = True
+            if self._namespace_enrichment is not None:
+                self._namespace_enrichment.close()
+
+    def _enrichment_manager(self) -> NamespaceEnrichmentManager:
+        with self._analysis_init_lock:
+            if self._closed:
+                raise DashboardError(HTTPStatus.SERVICE_UNAVAILABLE, "dashboard is closed")
+            if self._namespace_enrichment is None:
+                # Observe only the canonical bound store. A test/local-v5
+                # backend may explicitly supply its own memory_path.
+                memory_path = (
+                    self._binding.memory_path if self._binding is not None
+                    else getattr(self._backend, "memory_path", None)
+                )
+                if memory_path is None:
+                    raise DashboardError(HTTPStatus.SERVICE_UNAVAILABLE, "namespace revision is unavailable")
+                observer = NamespaceRevisionObserver(memory_path)
+
+                def calculate(**kwargs: Any) -> dict[str, Any]:
+                    # Preserve the dashboard/device execution lane for local
+                    # backends as well as the governed CoreClient RPC lane.
+                    with self._execution_lock:
+                        if self._closed:
+                            raise DashboardError(HTTPStatus.SERVICE_UNAVAILABLE, "dashboard is closed")
+                        return self.backend.list_namespace_map(**kwargs)
+
+                self._namespace_revision_observer = observer
+                self._namespace_enrichment = NamespaceEnrichmentManager(
+                    revision_source=observer.snapshot,
+                    calculate=calculate,
+                    close_revision_source=observer.close,
+                )
+            return self._namespace_enrichment
+
+    def _observe_namespace_revision(self) -> None:
+        if self._namespace_enrichment is None or self._namespace_revision_observer is None:
+            return
+        try:
+            self._namespace_enrichment.observe_revision(self._namespace_revision_observer.snapshot())
+        except RevisionUnavailable:
+            self._namespace_enrichment.invalidate_revision()
+
+    def _hygiene_scan_page(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = self._context_from_payload(payload)
+        scan_id = payload.get("scan_id")
+        if scan_id is not None and (not isinstance(scan_id, str) or not 1 <= len(scan_id) <= 128):
+            raise DashboardError(HTTPStatus.BAD_REQUEST, "scan_id is invalid")
+        with self._analysis_init_lock:
+            if self._closed:
+                raise DashboardError(HTTPStatus.SERVICE_UNAVAILABLE, "dashboard is closed")
+            if self._hygiene_scanner is None:
+                def classify(entry: dict[str, Any]) -> list[str]:
+                    item = self._memory_hygiene_item(entry, duplicate_info=None)
+                    return list(item["categories"]) if item else []
+
+                self._hygiene_scanner = HygieneScanManager(
+                    self.backend, page_limit=COMPACT_SOURCE_LIMITS["memory-list"],
+                    max_entries_per_scan=20_000, max_state_bytes=8 * 1024 * 1024,
+                    session_ttl_seconds=1800, max_sessions=4,
+                    classify_entry=classify,
+                )
+        scanner = self._hygiene_scanner
+        try:
+            if scan_id is None:
+                scan_id = scanner.start_scan(context_id=context)["scan_token"]
+            report = scanner.advance_scan(scan_token=scan_id, context_id=context)
+        except HygieneScanError as exc:
+            restart_required = exc.restart_required or exc.code in {
+                "invalid-token", "invalid-page", "callback-failed",
+                "state-budget-exceeded", "scan-not-running",
+            }
+            return {
+                "action": "memory-hygiene-scan", "context_id": context,
+                "status": "restart_required" if restart_required else "unavailable",
+                "error_code": exc.code, "scan_id": scan_id,
+                "scan_complete": False, "core_availability_assessed": False,
+            }
+        return {
+            **report,
+            "scan_id": report["scan_token"],
+            "status": (
+                "complete" if report["scan_complete"]
+                else "restart_required" if report["state"] == "truncated"
+                else "partial"
+            ),
+            "error_code": "scan-budget-reached" if report["state"] == "truncated" else None,
+            "coverage_fraction": report["scanned_fraction"],
+            "candidate_survivor_mapping": report["duplicate_candidates"],
+            "assessment_state": "review-required" if any(report["category_counts"].values()) else "no-findings-in-complete-scan" if report["scan_complete"] else "no-findings-in-partial-scan",
+            "core_availability_assessed": False,
+            "automatic_cleanup": False,
+        }
 
     def transcript_capture(self) -> TranscriptCaptureManager:
         return TranscriptCaptureManager(
@@ -732,11 +844,11 @@ class DashboardRuntime:
                 minimum=0,
                 maximum=500,
             )
-            include_suggestions = self._bool_param(params, "include_suggestions", True)
+            include_suggestions = self._bool_param(params, "include_suggestions", False)
             include_density_metrics = self._bool_param(
                 params,
                 "include_density_metrics",
-                True,
+                False,
             )
             min_suggestion_score = self._float_param(
                 params,
@@ -745,16 +857,19 @@ class DashboardRuntime:
                 minimum=0.0,
                 maximum=1.0,
             )
-            return self._json_response(
-                self.backend.list_namespace_map(
-                    context_id=context,
-                    limit=limit,
-                    include_suggestions=include_suggestions,
-                    include_density_metrics=include_density_metrics,
-                    suggestion_limit=suggestion_limit,
-                    min_suggestion_score=min_suggestion_score,
-                )
+            namespace_map = self.backend.list_namespace_map(
+                context_id=context,
+                limit=limit,
+                include_suggestions=include_suggestions,
+                include_density_metrics=include_density_metrics,
+                suggestion_limit=suggestion_limit,
+                min_suggestion_score=min_suggestion_score,
             )
+            self._observe_namespace_revision()
+            return self._json_response(namespace_map)
+        if method == "GET" and path == "/api/namespace-enrichment":
+            context = self._context_from_params(params)
+            return self._json_response(self._enrichment_manager().status(context_id=context))
         if method == "GET" and path == "/api/namespace-link-proposals":
             context = str(params.get("context_id", [""])[0] or "").strip()
             state = str(params.get("state", [""])[0] or "").strip().lower()
@@ -2111,6 +2226,12 @@ class DashboardRuntime:
         if method == "POST" and path == "/api/memory-hygiene/action":
             payload = self._parse_json_body(body)
             return self._json_response(self.memory_hygiene_action(payload))
+        if method == "POST" and path == "/api/memory-hygiene/scan":
+            return self._json_response(self._hygiene_scan_page(self._parse_json_body(body)))
+        if method == "POST" and path == "/api/namespace-enrichment":
+            payload = self._parse_json_body(body)
+            context = self._context_from_payload(payload)
+            return self._json_response(self._enrichment_manager().start(context_id=context))
         if method == "POST" and path == "/api/capture-inbox/process":
             payload = self._parse_json_body(body)
             max_files = self._max_files_from_payload(payload)
@@ -2707,6 +2828,7 @@ class DashboardRuntime:
             "assessment_scope": "recent-bounded-scan",
             "scanned_entry_count": len(entries),
             "total_entry_count": expected_total,
+            "coverage_fraction": len(entries) / expected_total if expected_total else 1.0,
             "scan_complete": len(entries) == expected_total,
             "scan_limit": bounded_scan_limit,
             "snapshot_revision": expected_revision,
@@ -2740,17 +2862,27 @@ class DashboardRuntime:
         )
         bounded_items = review_items[: max(1, min(int(limit), 100))]
         backlog_count = len(review_items)
-        status = "ready" if backlog_count == 0 else "degraded" if backlog_count < 8 else "blocked"
+        status = "ready" if backlog_count == 0 else "degraded"
         return {
             "action": "memory-hygiene",
             "context_id": context,
             "status": status,
             "backlog_count": backlog_count,
+            "assessment_state": (
+                "review-required" if backlog_count
+                else "no-findings-in-complete-scan" if scan["scan_complete"]
+                else "no-findings-in-sample"
+            ),
+            "core_availability_assessed": False,
             **scan,
             "review_items": bounded_items,
             "queue_summary": dict(sorted(queue_summary.items())),
             "memory_quality_score": max(0, 100 - min(60, backlog_count * 5)),
-            "recommended_actions": self._memory_hygiene_recommendations(queue_summary),
+            "recommended_actions": (
+                self._memory_hygiene_recommendations(queue_summary)
+                if backlog_count or scan["scan_complete"]
+                else ["Continue the full namespace scan; this recent sample cannot establish namespace cleanliness."]
+            ),
             "receipt": self._operation_receipt(
                 action="memory-hygiene",
                 status=status,
@@ -3884,50 +4016,10 @@ class DashboardRuntime:
         context_id: str,
         limit: int,
     ) -> dict[str, Any]:
-        listing = self.backend.list_memory(
+        return self.backend.list_image_memories(
             context_id=context_id,
-            limit=200,
-            include_global=False,
-            include_vectors=False,
-            recall_scope="local",
+            limit=limit,
         )
-        items: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for entry in listing.get("entries", []):
-            if not isinstance(entry, dict):
-                continue
-            metadata = entry.get("metadata")
-            if not isinstance(metadata, dict) or metadata.get("context_memory_type") != "image":
-                continue
-            try:
-                media_id = validate_media_id(metadata.get("media_id"))
-            except (TypeError, ValueError):
-                continue
-            if media_id in seen:
-                continue
-            seen.add(media_id)
-            dimensions = metadata.get("thumbnail_dimensions")
-            dimensions = dimensions if isinstance(dimensions, dict) else {}
-            items.append(
-                {
-                    "media_id": media_id,
-                    "display_label": str(metadata.get("display_label") or entry.get("tag") or "Image memory"),
-                    "thumbnail_width": int(dimensions.get("width") or 0),
-                    "thumbnail_height": int(dimensions.get("height") or 0),
-                    "created_at": float(entry.get("created_at") or 0.0),
-                    "cache_authoritative": False,
-                }
-            )
-            if len(items) >= limit:
-                break
-        return {
-            "schema": "synapse-s2.image-memory-gallery.v1",
-            "context_id": context_id,
-            "items": items,
-            "item_count": len(items),
-            "scan_limit": 200,
-            "thumbnail_cache_authoritative": False,
-        }
 
     def media_similarity_recall(
         self,
@@ -5160,17 +5252,7 @@ class DashboardRuntime:
             if len(members) < 2:
                 continue
 
-            def survivor_order(item: dict[str, Any]) -> tuple[int, int, float, str]:
-                metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-                tag = str(item.get("tag") or "")
-                return (
-                    0 if tag.startswith("client-session-boundary-event-") else 1,
-                    0 if metadata.get("client_session_bridge") is True else 1,
-                    float(item.get("created_at") or item.get("updated_at") or 0.0),
-                    str(item.get("memory_id") or ""),
-                )
-
-            survivor = min(members, key=survivor_order)
+            survivor = min(members, key=default_survivor_sort_key)
             survivor_id = str(survivor.get("memory_id") or "")
             # The normalized source digest is an internal grouping aid only.  A
             # public group identifier must not become a raw-content equality
@@ -6151,7 +6233,7 @@ class SynapseDashboardServer(ThreadingHTTPServer):
         auth_file: Path | None = None,
         default_context: str = DEFAULT_CONTEXT,
     ) -> None:
-        self._runtime_lock = threading.Lock()
+        self._runtime_lock = runtime._execution_lock
         self._handler_slots = threading.BoundedSemaphore(DASHBOARD_MAX_ACTIVE_HANDLERS)
         self._handler_condition = threading.Condition()
         self._active_handler_sockets: set[socket.socket] = set()
@@ -6213,11 +6295,15 @@ class SynapseDashboardServer(ThreadingHTTPServer):
         raw_body: bytes,
     ) -> tuple[int, dict[str, str], bytes]:
         parsed_path = urlparse(path).path
-        if method.upper() == "GET" and parsed_path == "/api/core-health":
+        if method.upper() == "GET" and parsed_path in {"/api/core-health", "/api/namespace-enrichment"}:
             # Core health bypasses the backend execution lane and performs no
             # dashboard mutation. Keep it outside the runtime lock so an
             # operator can see maintenance progress while a deep audit owns
             # the serialized lane.
+            return self.runtime.handle(method, path, raw_body)
+        if method.upper() == "POST" and parsed_path == "/api/namespace-enrichment":
+            # Starting only queues bounded work; the worker itself owns the
+            # execution lane. A second caller must see busy without waiting.
             return self.runtime.handle(method, path, raw_body)
         # Network parsing and authentication may run concurrently, but other
         # MLX-backed runtime work remains serialized to preserve device affinity.
@@ -6325,6 +6411,7 @@ class SynapseDashboardServer(ThreadingHTTPServer):
             except OSError:
                 pass
         self._remove_dashboard_auth()
+        self.runtime.close()
         super().server_close()
         deadline = time.monotonic() + DASHBOARD_HANDLER_SHUTDOWN_SECONDS
         with self._handler_condition:

@@ -1,5 +1,7 @@
 """Behavioral parity for narrowing spike matches before loading entry payloads."""
 
+import json
+import random
 import sqlite3
 import unittest
 from contextlib import closing
@@ -63,17 +65,16 @@ class RecallCandidateQueryTests(unittest.TestCase):
             jaccard = int(row["overlap_count"]) / max(1, len(set(spikes) | trace))
             if jaccard <= 0.0:
                 continue
-            activity = sum(
-                float(firing_values[int(index)])
-                for index in entry["neuron_indices"]
-                if 0 <= int(index) < len(firing_values)
-            )
+            activity = 0.0
+            for index in entry["neuron_indices"]:
+                if 0 <= int(index) < len(firing_values):
+                    activity += float(firing_values[int(index)])
             bonus = min(activity / max(1, len(entry["neuron_indices"])), 1.0)
             entry["score"] = round(float(jaccard + 0.05 * bonus), 6)
             entry.update(scope.get(str(entry["context_id"]), {}))
             candidates.append(entry)
         candidates.sort(
-            key=lambda item: (-item["score"], -item["updated_at"], item["memory_id"])
+            key=lambda item: (-float(item["score"]), -float(item["updated_at"]), str(item["memory_id"]))
         )
         return candidates[:bounded_limit]
 
@@ -164,7 +165,7 @@ class RecallCandidateQueryTests(unittest.TestCase):
         records = self.store.resolve_recall_contexts(context_id="alpha", scope="local")
         with patch.object(self.store, "_row_to_entry", wraps=self.store._row_to_entry) as decode:
             actual = self.store.recall_candidates(**arguments, context_id="alpha")
-        self.assertEqual(decode.call_count, 128)
+        self.assertEqual(decode.call_count, 1)
         self.assertEqual(actual, self.legacy_candidates(**arguments, records=records))
         self.assertEqual([item["memory_id"] for item in actual], [winner["memory_id"]])
         # A larger source window admits the stronger activity candidate.
@@ -190,6 +191,91 @@ class RecallCandidateQueryTests(unittest.TestCase):
         actual = self.store.recall_candidates(**arguments, context_id="alpha")
         self.assertEqual(actual, self.legacy_candidates(**arguments, records=records))
         self.assertEqual([item["memory_id"] for item in actual], [valid["memory_id"]])
+
+    def test_selected_payloads_remain_redacted_fresh_and_deletions_take_effect(self):
+        for index in range(12):
+            self.entry(f"payload-{index:02d}", at=100.0 + index)
+        arguments = dict(query_spikes={1, 2, 3}, firing_values=[0.0], limit=3)
+        records = self.store.resolve_recall_contexts(context_id="alpha", scope="local")
+        target = self.store.stable_memory_id(context_id="alpha", tag="payload-11")
+        # Simulate historical unredacted storage only in this disposable fixture.
+        with closing(sqlite3.connect(self.store.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_entries SET source_text=?, metadata_json=? WHERE memory_id=?",
+                ("Retained evidence api_key=sk-test-secret123", json.dumps({
+                    "nested": {"api_key": "sk-test-secret123", "retained": "first"}
+                }), target),
+            )
+            conn.commit()
+        expected = self.legacy_candidates(**arguments, records=records)
+        with patch.object(self.store, "_row_to_entry", wraps=self.store._row_to_entry) as decode:
+            actual = self.store.recall_candidates(**arguments, context_id="alpha")
+        self.assertEqual(actual, expected)
+        self.assertEqual(decode.call_count, 3)
+        self.assertNotIn("sk-test-secret123", json.dumps(actual))
+        self.assertEqual(actual[0]["metadata"]["nested"]["retained"], "first")
+
+        with closing(sqlite3.connect(self.store.db_path)) as conn:
+            conn.execute("UPDATE memory_entries SET metadata_json=? WHERE memory_id=?",
+                         (json.dumps({"retained": "changed"}), target))
+            conn.commit()
+        refreshed = self.store.recall_candidates(**arguments, context_id="alpha")
+        self.assertEqual(refreshed, self.legacy_candidates(**arguments, records=records))
+        self.assertEqual(refreshed[0]["metadata"], {"retained": "changed"})
+        self.store.delete_entry(context_id="alpha", memory_id=target)
+        after_delete = self.store.recall_candidates(**arguments, context_id="alpha")
+        self.assertEqual(after_delete, self.legacy_candidates(**arguments, records=records))
+        self.assertNotIn(target, {entry["memory_id"] for entry in after_delete})
+
+    def test_numeric_row_coercions_and_scope_overrides_match_oracle(self):
+        first = self.entry("numeric-alpha")
+        self.entry("numeric-beta", context="beta", at=120.0)
+        with closing(sqlite3.connect(self.store.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_entries SET spike_indices_json=?, neuron_indices_json=? WHERE memory_id=?",
+                ('["1", 2.0, 3, 3]', '["0", 1.0, -1, 99]', first["memory_id"]),
+            )
+            conn.commit()
+        records = [
+            {"context_id": "alpha", "score": "0.5", "updated_at": "200", "memory_id": "scope-override"},
+            {"context_id": "beta", "score": "0.5", "updated_at": "100"},
+        ]
+        arguments = dict(query_spikes={1, 2, 3}, firing_values=[0.2, 0.9], limit=2)
+        actual = self.store.recall_candidates(**arguments, context_id="alpha", recall_contexts=records)
+        self.assertEqual(actual, self.legacy_candidates(**arguments, records=records))
+        self.assertEqual(actual[0]["memory_id"], "scope-override")
+        self.assertEqual(actual[0]["spike_indices"], [1, 2, 3, 3])
+        self.assertEqual(actual[0]["neuron_indices"], [0, 1, -1, 99])
+
+    def test_randomized_jaccard_rankings_match_union_oracle(self):
+        random_source = random.Random(938125)
+        for index in range(40):
+            spikes = random_source.sample(range(32), random_source.randrange(1, 33))
+            self.entry(f"random-{index}", spikes=spikes, neurons=(index % 4,), at=float(index % 7))
+        records = self.store.resolve_recall_contexts(context_id="alpha", scope="local")
+        queries = [set(), {0}, set(range(32)), {100}]
+        queries.extend(set(random_source.sample(range(40), random_source.randrange(1, 41)))
+                       for _ in range(24))
+        for query in queries:
+            arguments = dict(query_spikes=query, firing_values=[0.0, 0.1, 0.7, 1.1], limit=13)
+            with self.subTest(query=query):
+                actual = self.store.recall_candidates(**arguments, context_id="alpha")
+                self.assertEqual(actual, self.legacy_candidates(**arguments, records=records))
+
+    def test_jaccard_denominator_preserves_trace_when_derived_index_disagrees(self):
+        entry = self.entry("damaged-derived-index", spikes=(1, 2, 3))
+        # Preserve the historical numerator from memory_spikes but change the
+        # trace projection in this isolated damaged fixture. SQL overlap=3;
+        # actual trace overlap=1 and actual union=5, so the score stays 0.6.
+        with closing(sqlite3.connect(self.store.db_path)) as conn:
+            conn.execute("UPDATE memory_entries SET spike_indices_json=? WHERE memory_id=?",
+                         ('["3", 4.0, 5, 5]', entry["memory_id"]))
+            conn.commit()
+        arguments = dict(query_spikes={1, 2, 3}, firing_values=[0.0], limit=1)
+        records = self.store.resolve_recall_contexts(context_id="alpha", scope="local")
+        actual = self.store.recall_candidates(**arguments, context_id="alpha")
+        self.assertEqual(actual, self.legacy_candidates(**arguments, records=records))
+        self.assertEqual(actual[0]["score"], 0.6)
 
     def test_executed_candidate_query_uses_spike_index(self):
         self.entry("indexed")

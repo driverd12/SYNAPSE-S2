@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -124,7 +125,29 @@ class RetrievalV2Tests(unittest.TestCase):
             for nested in value:
                 self._assert_finite_json(nested)
 
-    def test_repeated_and_fresh_backend_are_byte_deterministic(self) -> None:
+    def test_spike_signal_exact_set_boundaries_and_randomized_union_parity(self) -> None:
+        backend = SpikingAttentionBackend.__new__(SpikingAttentionBackend)
+        cases = [(set(), []), ({1, 2}, []), (set(), [1, 2]),
+                 ({1, 2}, [1, 2]), ({1, 2}, [3, 4]), ({1, 2}, ["1", 2.0, 2]),
+                 ({1, 2, 3}, [2, 3, 4]), ({-1, 0, 10**20}, [-1, 0, 10**20])]
+        random_source = random.Random(739551)
+        for _ in range(1000):
+            query = set(random_source.sample(range(-100, 101), random_source.randrange(101)))
+            candidate = random_source.choices(range(-100, 101), k=random_source.randrange(101))
+            cases.append((query, candidate))
+        for query, values in cases:
+            candidate = {int(value) for value in values}
+            overlap = len(query.intersection(candidate))
+            expected = overlap / max(1, len(query.union(candidate)))
+            signal, reason = backend._retrieval_v2_spike_signal({"spike_indices": values}, query)
+            self.assertEqual(signal, expected)
+            self.assertEqual(reason, {
+                "type": "spike-index-overlap", "overlap_count": overlap,
+                "query_spike_count": len(query), "candidate_spike_count": len(candidate),
+                "jaccard": round(expected, 8),
+            })
+
+    def test_repeated_and_fresh_backend_semantics_are_byte_deterministic(self) -> None:
         backend = self._backend()
         prompt = "deterministic camera control room retrieval"
         for suffix in ("alpha", "bravo", "charlie"):
@@ -149,7 +172,8 @@ class RetrievalV2Tests(unittest.TestCase):
             result_limit=3,
             candidate_limit=16,
         )
-        self.assertEqual(first, repeated)
+        self.assertEqual({k: v for k, v in first.items() if k != "timings_ms"},
+                         {k: v for k, v in repeated.items() if k != "timings_ms"})
         state_path = backend.state_path
         self._close_backend(backend)
 
@@ -160,9 +184,60 @@ class RetrievalV2Tests(unittest.TestCase):
             result_limit=3,
             candidate_limit=16,
         )
-        self.assertEqual(first, replay)
+        self.assertEqual({k: v for k, v in first.items() if k != "timings_ms"},
+                         {k: v for k, v in replay.items() if k != "timings_ms"})
         self.assertEqual(first["ranker"]["version"], "2.1.0")
         self.assertFalse(first["query"]["raw_input_stored"])
+
+    def test_phase_timings_are_content_free_and_do_not_change_identity(self) -> None:
+        backend = self._backend()
+        prompt = "camera control room timing evidence"
+        self._register_with_query_embedding(
+            backend, prompt=prompt, context_id="ops", tag="timing-evidence",
+            text="Camera control room timing evidence.",
+        )
+        clock = [1.0]
+        original_embedding = backend.embed_text_payload
+        original_sources = backend.memory_store.retrieval_v2_candidate_sources
+        original_graph = backend._retrieval_v2_graph_edges
+        original_score = backend._retrieval_v2_score_candidate
+        def embedding(*args, **kwargs):
+            clock[0] += 0.050
+            return original_embedding(*args, **kwargs)
+        def sources(*args, **kwargs):
+            clock[0] += 0.030
+            return original_sources(*args, **kwargs)
+        def graph(*args, **kwargs):
+            clock[0] += 0.010
+            return original_graph(*args, **kwargs)
+        def score(*args, **kwargs):
+            clock[0] += 0.002
+            return original_score(*args, **kwargs)
+        expected = backend.retrieve_text_v2(prompt, context_id="ops", result_limit=1)
+        with (
+            patch.object(mlx_backend.time, "perf_counter", side_effect=lambda: clock[0]),
+            patch.object(backend, "embed_text_payload", side_effect=embedding),
+            patch.object(backend.memory_store, "retrieval_v2_candidate_sources", side_effect=sources),
+            patch.object(backend, "_retrieval_v2_graph_edges", side_effect=graph),
+            patch.object(backend, "_retrieval_v2_score_candidate", side_effect=score),
+        ):
+            observed = backend.retrieve_text_v2(prompt, context_id="ops", result_limit=1)
+        self.assertEqual({k:v for k,v in observed.items() if k != "timings_ms"},
+                         {k:v for k,v in expected.items() if k != "timings_ms"})
+        timings = observed["timings_ms"]
+        self.assertIsNone(timings["queue_wait_ms"])
+        self.assertAlmostEqual(timings["embedding_ms"], 50.0)
+        self.assertAlmostEqual(timings["index_lookup_ms"], 30.0)
+        self.assertAlmostEqual(timings["graph_expansion_ms"], 20.0)
+        self.assertGreater(timings["ranking_ms"], 0.0)
+        self.assertEqual(set(timings), {
+            "queue_wait_ms", "preparation_ms", "embedding_ms", "scope_lookup_ms",
+            "revision_validation_ms", "cue_lookup_ms", "index_lookup_ms",
+            "graph_expansion_ms", "ranking_ms", "serialization_ms", "backend_total_ms",
+        })
+        self.assertTrue(all(v is None or (type(v) is float and math.isfinite(v) and v >= 0.0)
+                            for v in timings.values()))
+        self.assertNotIn(prompt, json.dumps(timings))
 
     def test_randomized_insertion_order_and_exact_ties_use_memory_id_tiebreak(self) -> None:
         prompt = "shared deterministic ranking tie"
@@ -740,7 +815,10 @@ class RetrievalV2Tests(unittest.TestCase):
         self.assertEqual(list(call["recall_contexts"]), scope_records)
 
         self.assertEqual(collected, expected)
-        self.assertEqual(public, expected_public)
+        self.assertEqual(
+            {k: v for k, v in public.items() if k != "timings_ms"},
+            {k: v for k, v in expected_public.items() if k != "timings_ms"},
+        )
         self.assertTrue(collected["items"])
         self.assertEqual(
             {item["context_id"] for item in collected["items"]},

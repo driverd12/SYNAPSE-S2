@@ -94,6 +94,7 @@ DOCTOR_TIMEOUT_SECONDS = 60
 NEURAL_DOCTOR_TIMEOUT_SECONDS = 300
 CAPTURE_DRAIN_BATCH_SIZE = 250
 CAPTURE_DRAIN_MAX_PASSES = 12
+CAPTURE_DRAIN_POLL_SECONDS = 2.0
 AUTHORITY_GUARD_TIMEOUT_SECONDS = 30.0
 CHILD_ENV_ALLOWLIST = frozenset(
     {
@@ -3369,8 +3370,9 @@ class OperatorReadinessCertifier:
         }
 
     def _check_capture_inbox(self) -> CheckResult:
-        """Drain Phase-A capture debt, then publish one exact required verdict."""
+        """Observe core-owned capture, or drain local-v5, before final evidence."""
 
+        embedded_worker = self.runtime_authority_mode != "candidate-local-v5"
         observed: dict[str, Any] = {}
         total_processed = 0
         drain_passes = 0
@@ -3407,12 +3409,15 @@ class OperatorReadinessCertifier:
             observed = dict(initial.parsed)
 
         while (
-            type(observed.get("pending_file_count")) is int
-            and int(observed["pending_file_count"]) > 0
+            any(
+                type(observed.get(field)) is int and observed[field] > 0
+                for field in ("pending_file_count", "processing_file_count")
+            )
             and drain_passes < CAPTURE_DRAIN_MAX_PASSES
         ):
-            before_pending = int(observed["pending_file_count"])
+            before_pending = observed.get("pending_file_count")
             drain_passes += 1
+            processed_count = 0
 
             def drain_evaluator(
                 returncode: int,
@@ -3453,25 +3458,31 @@ class OperatorReadinessCertifier:
                     },
                 )
 
-            processed = self._run_command(
-                f"capture_inbox_drain_{drain_passes:02d}",
-                label=f"Capture inbox drain pass {drain_passes}",
-                command=self._cli_command(
-                    "capture-inbox-process",
-                    "--max-files",
-                    str(CAPTURE_DRAIN_BATCH_SIZE),
-                    "--confirm",
-                ),
-                required=False,
-                timeout=300,
-                evaluator=drain_evaluator,
-            )
-            processed_count = (
-                int(processed.parsed.get("processed_file_count") or 0)
-                if isinstance(processed.parsed, dict)
-                else 0
-            )
-            total_processed += processed_count
+            if embedded_worker:
+                # The authoritative worker owns the backend lane before its
+                # capture lock. A CLI drain would hold that lock while waiting
+                # for the same lane; only observe the existing worker here.
+                time.sleep(CAPTURE_DRAIN_POLL_SECONDS)
+            else:
+                processed = self._run_command(
+                    f"capture_inbox_drain_{drain_passes:02d}",
+                    label=f"Capture inbox drain pass {drain_passes}",
+                    command=self._cli_command(
+                        "capture-inbox-process",
+                        "--max-files",
+                        str(CAPTURE_DRAIN_BATCH_SIZE),
+                        "--confirm",
+                    ),
+                    required=False,
+                    timeout=300,
+                    evaluator=drain_evaluator,
+                )
+                processed_count = (
+                    int(processed.parsed.get("processed_file_count") or 0)
+                    if isinstance(processed.parsed, dict)
+                    else 0
+                )
+                total_processed += processed_count
             observed_result = self._run_command(
                 f"capture_inbox_observe_{drain_passes:02d}",
                 label=f"Capture inbox observation {drain_passes}",
@@ -3486,7 +3497,9 @@ class OperatorReadinessCertifier:
             observed = dict(observed_result.parsed)
             after_pending = observed.get("pending_file_count")
             if (
-                type(after_pending) is int
+                not embedded_worker
+                and type(before_pending) is int
+                and type(after_pending) is int
                 and int(after_pending) >= before_pending
                 and processed_count == 0
             ):
@@ -3497,9 +3510,15 @@ class OperatorReadinessCertifier:
             metrics.update(
                 {
                     "drain_passes": drain_passes,
-                    "processed_file_count": total_processed,
+                    "drain_mode": (
+                        "embedded-worker-observation"
+                        if embedded_worker
+                        else "local-v5-processing"
+                    ),
+                    "processed_file_count": None if embedded_worker else total_processed,
                     "maximum_drain_passes": CAPTURE_DRAIN_MAX_PASSES,
-                    "batch_size": CAPTURE_DRAIN_BATCH_SIZE,
+                    "batch_size": None if embedded_worker else CAPTURE_DRAIN_BATCH_SIZE,
+                    "poll_delay_seconds": CAPTURE_DRAIN_POLL_SECONDS if embedded_worker else 0,
                 }
             )
             if returncode != 0 or not isinstance(parsed, dict):
@@ -3517,7 +3536,7 @@ class OperatorReadinessCertifier:
                     else "Capture transport is not quiescent after its bounded drain."
                 ),
                 (
-                    "Keep respawners paused; process replay-required files through the governed inbox and rerun certification."
+                    "Keep respawners paused; inspect capture health and preserved error evidence, then rerun certification after the owning worker drains."
                     if not ready
                     else ""
                 ),

@@ -24,6 +24,9 @@ const NAMESPACE_DETAIL_REQUEST_TIMEOUT_MS = 30000;
 const DOCTOR_REQUEST_TIMEOUT_MS = 20000;
 const NAMESPACE_GALAXY_VISIBLE_REFRESH_MS = 30000;
 const NAMESPACE_GALAXY_HIDDEN_REFRESH_MS = 120000;
+const CORE_HEALTH_FRESH_MS = 15000;
+const DASHBOARD_PANEL_FRESH_MS = 60000;
+const DASHBOARD_PANEL_RETRY_MS = 5000;
 const CORE_HEALTH_VISIBLE_REFRESH_MS = 5000;
 const CORE_HEALTH_HIDDEN_REFRESH_MS = 30000;
 const IMPACT_RATE_STORAGE_KEY = "synapse-s2-impact-rate-v1";
@@ -245,12 +248,12 @@ const WIZARD_FLOWS = {
   },
   {
     selector: "#captureInboxButton",
-    title: "Process client session drops",
-    body: "Magic Capture preflights and processes sanitized local inbox payloads dropped by MCP clients and the session bridge under the exactly-once capture ledger.",
-    capability: "Exactly-once capture: sanitized drops, confirmation-bound processing, durable receipts, startup hydration traces, and session-boundary notes.",
+    title: "Inspect client session drops",
+    body: "The authoritative worker processes sanitized local inbox payloads. This control checks its queue without starting a competing processor.",
+    capability: "Exactly-once capture: sanitized drops, authoritative worker processing, durable receipts, startup hydration traces, and session-boundary notes.",
     items: [
       "Use this after client sessions have produced inbox files.",
-      "The preflight token binds the exact safe transport target before processing.",
+      "A queued drop is not a completed capture; verify the exact receipt after the worker finishes.",
       "Do not copy loose inbox files or a database snapshot as a substitute for paired recovery.",
     ],
   },
@@ -529,12 +532,21 @@ const state = {
   snapshot: null,
   snapshotRequestGeneration: 0,
   imageGalleryRequestGeneration: 0,
+  imageGalleryRenderGeneration: 0,
   snapshotBootstrapPending: false,
+  captureInboxRefreshPending: false,
+  captureInboxObservation: { latest: null, lastSuccessfulRefreshAt: 0, error: null },
+  dashboardContextGeneration: 0,
+  panels: {},
+  hygieneScan: { scanId: null, payload: null, pending: false, error: null },
+  namespaceEnrichment: { payload: null, pending: false, polling: false, timer: null, generation: 0, polls: 0, lastSuccessfulRefreshAt: 0, error: null },
   coreHealth: {
     refreshPending: false,
     refreshTimer: null,
     lastSuccessfulRefreshAt: 0,
     latest: null,
+    error: null,
+    ageTimer: null,
   },
   lastQueryPayload: null,
   recallRequestGeneration: 0,
@@ -605,6 +617,8 @@ const state = {
     galleryObjectUrls: [],
     similarObjectUrls: [],
     similarOpen: false,
+    similarGeneration: 0,
+    similarMediaId: "",
     similarReturnFocus: null,
   },
   impact: {
@@ -751,6 +765,21 @@ const elements = collectElements([
   "headroomMb",
   "headroomState",
   "headerRuntime",
+  "healthConfirmedAt",
+  "footerHealthConfirmedAt",
+  "runtimeLoadState",
+  "hygieneScanButton",
+  "hygieneScanStatus",
+  "hygieneScanDetails",
+  "namespaceEnrichmentButton",
+  "namespaceEnrichmentStop",
+  "namespaceEnrichmentStatus",
+  "namespaceEnrichmentOutput",
+  "graphLoadState",
+  "namespaceMapLoadState",
+  "imageGalleryLoadState",
+  "processMemory",
+  "processMemoryDetail",
   "hydrateLabel",
   "imageCaptureButton",
   "imageCaptureDescription",
@@ -1021,6 +1050,7 @@ async function requestJson(
       headers,
       body: body ? JSON.stringify(body) : undefined,
       signal: controller?.signal,
+      cache: readOnly ? "no-store" : "default",
     });
     try {
       payload = await response.json();
@@ -1089,6 +1119,9 @@ async function requestBlob(path, { params = {}, timeoutMs = READ_REQUEST_TIMEOUT
       }
       const error = new Error(message);
       error.status = response.status;
+      error.dashboardAuthorizationRequired = response.status === 403
+        && String(message).trim().toLowerCase() === "dashboard authorization required";
+      if (error.dashboardAuthorizationRequired) renderDashboardAccessRequired(error);
       throw error;
     }
     return response.blob();
@@ -1107,6 +1140,9 @@ function isDashboardAuthorizationError(error) {
 function renderDashboardAccessRequired(error) {
   if (state.dashboardAccessRequired) return;
   state.dashboardAccessRequired = true;
+  closeImageSimilar({ restoreFocus: false });
+  stopNamespaceEnrichmentPolling();
+  renderCoreHealth();
   elements.dashboardAccessBanner.hidden = false;
   document.documentElement.classList.add("dashboard-auth-required");
   elements.connectionStatusCard.classList.add("authorization-required");
@@ -1136,87 +1172,97 @@ function renderDashboardAccessRequired(error) {
   });
 }
 
-function renderCoreHealth(health) {
-  const operationalState = String(health?.operational_state || "unavailable").toLowerCase();
-  const lane = health?.backend_lane && typeof health.backend_lane === "object"
-    ? health.backend_lane
-    : {};
-  const maintenance = operationalState === "maintenance" || Boolean(lane.maintenance);
-  const ready = Boolean(health?.ready);
-  const label = maintenance ? "MAINTENANCE" : ready ? "READY" : "OFFLINE";
-  const owner = String(lane.owner || "").trim();
-  const ageSeconds = Number.isFinite(Number(lane.active_age_ms))
-    ? Math.max(0, Math.round(Number(lane.active_age_ms) / 1000))
-    : null;
-  const deadlineSeconds = Number.isFinite(Number(lane.deadline_remaining_ms))
-    ? Math.max(0, Math.round(Number(lane.deadline_remaining_ms) / 1000))
-    : null;
-  const blocker = String(lane.blocker || health?.authority?.blocker || "").trim();
-  const detail = owner
-    ? [
-        owner,
-        ageSeconds === null ? "" : `${ageSeconds}s elapsed`,
-        deadlineSeconds === null ? "" : `${deadlineSeconds}s remaining`,
-        blocker,
-      ].filter(Boolean).join(" · ")
-    : ready
-      ? "Authoritative core is accepting work"
-      : blocker || "Authoritative core is unavailable";
+function dashboardHealthModel(now = Date.now()) {
+  const current = state.coreHealth;
+  const health = current.latest;
+  const ageMs = current.lastSuccessfulRefreshAt ? Math.max(0, now - current.lastSuccessfulRefreshAt) : null;
+  const lane = health?.backend_lane || {};
+  const captureAge = health?.capture?.last_success_age_ms;
+  const captureFresh = typeof captureAge === "number" && Number.isFinite(captureAge)
+    && captureAge >= 0 && captureAge + (ageMs || 0) <= CORE_HEALTH_FRESH_MS;
+  let status;
+  if (state.dashboardAccessRequired) status = "authentication-required";
+  else if (!health) status = current.error ? "unavailable" : "initializing";
+  else if (current.error || ageMs === null || ageMs > CORE_HEALTH_FRESH_MS) status = "stale";
+  else if (health.authority?.ready !== true || health.ready !== true) status = "unavailable";
+  else if (lane.maintenance === true || lane.active === true || health.operational_state === "maintenance") status = "busy";
+  else if (health.capture?.ready !== true) status = "unavailable";
+  else if (!captureFresh) status = "stale";
+  else if (lane.ready !== true || lane.accepting_ordinary_operations !== true) status = "unavailable";
+  else status = "ready";
+  const label = status === "authentication-required" ? "AUTH REQUIRED" : status.toUpperCase();
+  const confirmed = ageMs === null ? "Not yet confirmed" : `Last confirmed ${Math.floor(ageMs / 1000)}s ago`;
+  const reason = current.error || health?.authority?.blocker || lane.blocker
+    || (status === "busy" ? `Core busy${lane.owner ? `: ${lane.owner}` : ""}`
+      : status === "ready" ? "Fresh authority and capture evidence; accepting work"
+        : status === "stale" ? "Fresh authoritative evidence is required"
+          : status === "authentication-required" ? "Reopen the dashboard securely"
+            : "Waiting for authoritative core and capture evidence");
+  return { status, label, confirmed, ageMs, detail: `${reason}; ${confirmed.toLowerCase()}` };
+}
 
-  elements.headerRuntime.textContent = label;
-  elements.headerRuntime.title = detail;
-  if (maintenance) {
-    elements.sidebarStatus.textContent = "MAINTENANCE";
-  } else if (ready) {
-    elements.sidebarStatus.textContent = "OPERATIONAL";
-  } else if (!ready) {
-    elements.sidebarStatus.textContent = "OFFLINE";
+function renderCoreHealth() {
+  const model = dashboardHealthModel();
+  document.documentElement.dataset.coreHealth = model.status;
+  for (const name of ["headerRuntime", "sidebarStatus", "footerHealth", "engineState", "routerState", "memoryState", "apiState"]) {
+    const element = elements[name];
+    element.textContent = model.label;
+    element.title = model.detail;
+    element.dataset.health = model.status;
+    element.classList.toggle("good", model.status === "ready");
+    element.classList.toggle("warn", model.status !== "ready");
   }
+  elements.healthConfirmedAt.textContent = model.confirmed;
+  elements.footerHealthConfirmedAt.textContent = model.confirmed;
+  renderProcessMemory();
+  renderCaptureInbox();
+  renderDashboardPanelStates();
+  renderAnalysisControls();
+  renderNamespaceEnrichment();
+  return model;
+}
+
+function renderProcessMemory() {
+  const memory = state.coreHealth.latest?.process_memory;
+  const footprint = memory?.footprint_bytes;
+  const resident = memory?.resident_bytes;
+  const bytes = typeof footprint === "number" && Number.isFinite(footprint) && footprint >= 0 ? footprint
+    : typeof resident === "number" && Number.isFinite(resident) && resident >= 0 ? resident : null;
+  const model = dashboardHealthModel();
+  elements.processMemory.textContent = bytes === null ? "Unavailable" : `${formatNumber(bytes / 1048576, 1)} MiB`;
+  elements.processMemoryDetail.textContent = bytes === null
+    ? "Core process measurement unavailable; topology estimate is separate"
+    : `${bytes === footprint ? "Process footprint" : "Process resident memory"} · ${model.confirmed.toLowerCase()}${model.status === "stale" ? " · stale" : ""}`;
 }
 
 async function refreshCoreHealth({ background = false } = {}) {
   const coreHealth = state.coreHealth;
-  if (background && coreHealth.refreshPending) return null;
-  if (background) coreHealth.refreshPending = true;
+  if (coreHealth.refreshPending || state.dashboardAccessRequired) return null;
+  coreHealth.refreshPending = true;
+  const requestedAt = Date.now();
   try {
     const health = await requestJson("/api/core-health", { timeoutMs: 3000 });
-    coreHealth.lastSuccessfulRefreshAt = Date.now();
+    if (state.dashboardAccessRequired) return null;
+    // Count transport time against freshness instead of extending an old proof.
+    coreHealth.lastSuccessfulRefreshAt = requestedAt;
     coreHealth.latest = health;
-    renderCoreHealth(health);
-    if (
-      health.ready
-      && health.backend_lane?.accepting_ordinary_operations === true
-      && document.visibilityState === "visible"
-    ) {
-      void refreshMissingSnapshot().catch((error) => {
-        logOperation("Dashboard loading retry failed", error.message);
-      });
+    coreHealth.error = null;
+    const model = renderCoreHealth();
+    if (model.status === "ready" && document.visibilityState === "visible") {
+      void refreshMissingSnapshot().catch((error) => logOperation("Dashboard loading retry failed", error.message));
+      const queue = state.captureInboxObservation.latest;
+      if (Number(queue?.pending_file_count || 0) > 0 || Number(queue?.processing_file_count || 0) > 0) {
+        void refreshCaptureInboxStatus().catch((error) => logOperation("Capture queue check failed", error.message));
+      }
     }
     return health;
   } catch (error) {
-    if (isDashboardAuthorizationError(error)) {
-      renderDashboardAccessRequired(error);
-      return null;
-    }
-    const hasLastGood = Boolean(
-      coreHealth.latest && coreHealth.lastSuccessfulRefreshAt
-    );
-    const ageSeconds = hasLastGood
-      ? Math.max(
-          0,
-          Math.round((Date.now() - coreHealth.lastSuccessfulRefreshAt) / 1000),
-        )
-      : null;
-    elements.headerRuntime.textContent = hasLastGood ? "STALE" : "OFFLINE";
-    elements.sidebarStatus.textContent = hasLastGood ? "STALE" : "OFFLINE";
-    elements.headerRuntime.title = [
-      error.message || "Core health check failed",
-      ageSeconds === null ? "no live health response" : `last confirmed ${ageSeconds}s ago`,
-      "last dashboard data retained",
-    ].join("; ");
+    if (isDashboardAuthorizationError(error)) renderDashboardAccessRequired(error);
+    else coreHealth.error = error.message || "Core health check failed";
+    renderCoreHealth();
     return null;
   } finally {
-    if (background) coreHealth.refreshPending = false;
+    coreHealth.refreshPending = false;
   }
 }
 
@@ -1299,68 +1345,146 @@ function applyTheme(theme) {
   requestNamespaceGalaxyDraw();
 }
 
-async function refreshMissingSnapshot() {
-  if (state.snapshot || state.snapshotBootstrapPending || state.dashboardAccessRequired) {
-    return null;
-  }
-  state.snapshotBootstrapPending = true;
-  try {
-    return await refreshSnapshot();
-  } finally {
-    state.snapshotBootstrapPending = false;
+function dashboardPanel(name) {
+  if (!state.panels[name]) state.panels[name] = {
+    pending: false, lastSuccessfulRefreshAt: 0, error: null, failures: 0, retryAt: 0,
+  };
+  return state.panels[name];
+}
+
+function dashboardPanelNeedsRefresh(name, force = false) {
+  const panel = dashboardPanel(name);
+  return !panel.pending && (force || Date.now() >= panel.retryAt)
+    && (force || panel.error || !panel.lastSuccessfulRefreshAt
+      || Date.now() - panel.lastSuccessfulRefreshAt >= DASHBOARD_PANEL_FRESH_MS);
+}
+
+function renderDashboardPanelStates() {
+  const health = dashboardHealthModel();
+  const names = { runtime: "runtimeLoadState", graph: "graphLoadState", namespaceMap: "namespaceMapLoadState", gallery: "imageGalleryLoadState" };
+  for (const [name, elementName] of Object.entries(names)) {
+    const panel = dashboardPanel(name);
+    const age = panel.lastSuccessfulRefreshAt ? Math.max(0, Date.now() - panel.lastSuccessfulRefreshAt) : null;
+    const status = state.dashboardAccessRequired ? "authentication-required"
+      : panel.pending ? "loading"
+        : panel.error || (age !== null && age >= DASHBOARD_PANEL_FRESH_MS) ? "stale"
+          : age === null ? "initializing" : "ready";
+    const retained = age === null ? "no successful load" : `last loaded ${Math.floor(age / 1000)}s ago`;
+    const waiting = health.status === "busy" ? " · waiting for core" : "";
+    elements[elementName].textContent = `${status === "authentication-required" ? "Authentication required" : status} · ${retained}${waiting}`;
+    elements[elementName].dataset.loadState = status;
+    elements[elementName].title = panel.error || `${state.context}: ${retained}`;
   }
 }
 
-async function refreshSnapshot() {
+async function runDashboardPanel(name, task) {
+  const panel = dashboardPanel(name);
+  if (panel.pending || state.dashboardAccessRequired) return null;
   const contextId = state.context;
-  const requestGeneration = ++state.snapshotRequestGeneration;
-  const isCurrent = () => (
-    requestGeneration === state.snapshotRequestGeneration
-    && contextId === state.context
-    && !state.dashboardAccessRequired
-  );
-  const started = nowMs();
-  elements.headerRuntime.textContent = "REFRESHING";
-  const shellSnapshot = await requestJson("/api/snapshot", {
-    params: { context_id: contextId, limit: SNAPSHOT_LIMIT, include_graph: "false" },
-  });
-  if (!isCurrent()) return null;
-  state.snapshot = withGraph(shellSnapshot, shellSnapshot.graph);
-  const shellElapsedMs = elapsedMs(started);
-  renderSnapshot(state.snapshot, shellElapsedMs);
-  const namespaceMapPromise = refreshNamespaceGalaxy();
-  const imageGalleryPromise = refreshImageGallery().catch((error) => {
-    if (isCurrent()) logOperation("Image gallery refresh failed", error.message);
-    return null;
-  });
-  if (operationLogIsIdle()) {
-    logSnapshotResponse(state.snapshot, shellElapsedMs);
-  }
-
+  const generation = state.dashboardContextGeneration;
+  const isCurrent = () => generation === state.dashboardContextGeneration
+    && contextId === state.context && !state.dashboardAccessRequired;
+  panel.pending = true;
+  renderDashboardPanelStates();
   try {
-    const graph = await requestJson("/api/graph", {
-      params: { context_id: contextId, limit: SNAPSHOT_LIMIT },
+    const result = await task(isCurrent, contextId);
+    if (!isCurrent() || result === null) return null;
+    panel.lastSuccessfulRefreshAt = Date.now();
+    panel.error = null;
+    panel.failures = 0;
+    panel.retryAt = 0;
+    return result;
+  } catch (error) {
+    if (!isCurrent()) return null;
+    panel.error = error.message || "Panel load failed";
+    panel.failures += 1;
+    panel.retryAt = Date.now() + Math.min(30000, DASHBOARD_PANEL_RETRY_MS * 2 ** (panel.failures - 1));
+    if (isDashboardAuthorizationError(error)) renderDashboardAccessRequired(error);
+    throw error;
+  } finally {
+    panel.pending = false;
+    if (isCurrent()) renderDashboardPanelStates();
+  }
+}
+
+async function refreshMissingSnapshot() {
+  if (state.snapshotBootstrapPending || state.dashboardAccessRequired) return null;
+  if (state.coreHealth.latest && dashboardHealthModel().status !== "ready") return null;
+  state.snapshotBootstrapPending = true;
+  const generation = state.dashboardContextGeneration;
+  try {
+    return await refreshSnapshot({ retryOnly: true });
+  } finally {
+    if (generation === state.dashboardContextGeneration) state.snapshotBootstrapPending = false;
+  }
+}
+
+async function refreshRuntimePanel() {
+  return runDashboardPanel("runtime", async (isCurrent, contextId) => {
+    const started = nowMs();
+    const shell = await requestJson("/api/snapshot", {
+      params: { context_id: contextId, limit: SNAPSHOT_LIMIT, include_graph: "false" },
     });
     if (!isCurrent()) return null;
-    state.snapshot = withGraph(shellSnapshot, graph);
+    const retainedGraph = state.snapshot?.context_id === contextId && !state.snapshot.graph?.deferred
+      ? state.snapshot.graph : shell.graph;
+    state.snapshot = withGraph(shell, retainedGraph);
+    recordCaptureInboxStatus(shell.capture_inbox || null);
     renderSnapshot(state.snapshot, elapsedMs(started));
-    // A separate deployment read must not hide an already loaded graph.
+    if (operationLogIsIdle()) logSnapshotResponse(state.snapshot, elapsedMs(started));
+    return state.snapshot;
+  });
+}
+
+async function refreshGraphPanel() {
+  return runDashboardPanel("graph", async (isCurrent, contextId) => {
+    const graph = await requestJson("/api/graph", { params: { context_id: contextId, limit: SNAPSHOT_LIMIT } });
+    if (!isCurrent() || !state.snapshot) return null;
+    state.snapshot = withGraph(state.snapshot, graph);
+    renderSnapshot(state.snapshot);
+    // Deployment availability is independent of graph loading success.
     try {
-      const contextDeployments = await pullContextDeployments(0, 20, contextId);
+      const deployments = await pullContextDeployments(0, 20, contextId);
       if (!isCurrent()) return null;
-      state.snapshot = {
-        ...state.snapshot,
-        context_deployments: contextDeployments,
-      };
-      renderSnapshot(state.snapshot, elapsedMs(started));
+      state.snapshot = { ...state.snapshot, context_deployments: deployments };
+      renderSnapshot(state.snapshot);
     } catch (error) {
       if (isCurrent()) logOperation("Context deployment refresh failed", error.message);
     }
-  } catch (error) {
-    if (isCurrent()) logOperation("Graph refresh failed", error.message);
+    return graph;
+  });
+}
+
+async function refreshSnapshot({ retryOnly = false } = {}) {
+  if (state.dashboardAccessRequired) return null;
+  const generation = state.dashboardContextGeneration;
+  if (state.coreHealth.latest && dashboardHealthModel().status !== "ready") {
+    renderDashboardPanelStates();
+    return null;
   }
-  await Promise.all([namespaceMapPromise, imageGalleryPromise]);
-  return isCurrent() ? state.snapshot : null;
+  let runtimeError = null;
+  if (dashboardPanelNeedsRefresh("runtime", !retryOnly)) {
+    try { await refreshRuntimePanel(); }
+    catch (error) {
+      if (!state.snapshot) throw error;
+      runtimeError = error;
+    }
+  }
+  if (generation !== state.dashboardContextGeneration || !state.snapshot || state.dashboardAccessRequired) return null;
+  const tasks = [
+    ["graph", refreshGraphPanel, "Graph refresh failed"],
+    ["namespaceMap", refreshNamespaceGalaxy, "Namespace Galaxy refresh failed"],
+    ["gallery", refreshImageGallery, "Image gallery refresh failed"],
+  ].filter(([name]) => dashboardPanelNeedsRefresh(name, !retryOnly));
+  await Promise.all(tasks.map(async ([name, refresh, label]) => {
+    try { return await refresh(); }
+    catch (error) {
+      if (generation === state.dashboardContextGeneration && !state.dashboardAccessRequired) logOperation(label, error.message);
+      return null;
+    }
+  }));
+  if (runtimeError && generation === state.dashboardContextGeneration && !state.dashboardAccessRequired) throw runtimeError;
+  return generation === state.dashboardContextGeneration && !state.dashboardAccessRequired ? state.snapshot : null;
 }
 
 function renderSnapshot(snapshot, clientElapsedMs = null) {
@@ -1369,7 +1493,6 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   const graph = snapshot.graph || {};
   const system = snapshot.system || {};
   const enabled = Boolean(status.effective_enabled);
-  const runtimeReady = enabled && String(status.runtime || "").toLowerCase() === "ready";
   const memoryUri = system.memory_uri || system.model_uri || `s2://local/${snapshot.context_id || state.context}`;
   const entryTotal = Number(status.memory_context_entry_count ?? graph.entry_count ?? 0);
   const relationshipTotal = Number(status.memory_context_relationship_count ?? graph.relationship_count ?? 0);
@@ -1385,7 +1508,6 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   elements.modelUri.textContent = memoryUri;
   elements.embeddingModelLabel.textContent = formatEmbeddingProvider(status.embedding_provider || {});
   elements.embeddingModelLabel.title = embeddingProviderTitle(status.embedding_provider || {});
-  elements.headerRuntime.textContent = runtimeReady ? "READY" : String(status.runtime || "PENDING").toUpperCase();
   elements.modeLabel.textContent = system.mode || "LOCAL ONLY";
   elements.platformLabel.textContent = platformLabel(system);
   elements.chipLabel.textContent = system.chip || system.machine || "unknown";
@@ -1397,18 +1519,9 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   elements.runtimeBuildClaim.textContent = runtimeBuildId
     ? "Authoritative Core identity; source/profile match not asserted"
     : "Runtime identity unavailable; source/profile match not asserted";
-  elements.sidebarStatus.textContent = runtimeReady ? "OPERATIONAL" : "DISABLED";
-  if (state.coreHealth.latest) renderCoreHealth(state.coreHealth.latest);
+  renderCoreHealth();
   elements.memoryDbLabel.textContent = compactPath(status.memory_db_path || graph.memory_db_path || "pending");
 
-  elements.engineState.textContent = status.mlx_available ? "ACTIVE" : "UNAVAILABLE";
-  elements.engineState.className = status.mlx_available ? "good" : "warn";
-  elements.routerState.textContent = enabled ? "ACTIVE" : "PAUSED";
-  elements.routerState.className = enabled ? "good" : "warn";
-  elements.memoryState.textContent = "ACTIVE";
-  elements.memoryState.className = "good";
-  elements.apiState.textContent = "LISTENING";
-  elements.apiState.className = "good";
   elements.runtimeDetail.textContent = `MLX ${status.mlx_available ? "ready" : "missing"} / mlxsnn ${status.mlxsnn_available ? "ready" : "missing"} / ${profile.mlxsnn_lif_execution_path ? "native LIF" : "fallback LIF"}`;
   elements.lastTick.textContent = `Last tick: ${formatGeneratedAt(snapshot.generated_at)}`;
   renderRuntimeHealth(status, profile, graph, {
@@ -1449,7 +1562,7 @@ function renderSnapshot(snapshot, clientElapsedMs = null) {
   renderContextEventLedger(snapshot.context_deployments || {});
   renderMemoryLedger(graph);
   renderContextBus(status);
-  renderCaptureInbox(snapshot.capture_inbox || null);
+  renderCaptureInbox();
   renderCortexState(snapshot.cortex_state || {});
   renderFooter(snapshot, status, profile, contextCount);
   renderHydrationTiming(snapshot, clientElapsedMs);
@@ -1536,7 +1649,24 @@ async function applySelectedContext(context, busyElement = elements.contextApply
   state.context = nextContext;
   if (contextChanged) {
     state.snapshotRequestGeneration += 1;
+    closeImageSimilar({ restoreFocus: false });
     state.imageGalleryRequestGeneration += 1;
+    state.dashboardContextGeneration += 1;
+    state.panels = {};
+    state.hygieneScan = { scanId: null, payload: null, pending: false, error: null };
+    stopNamespaceEnrichmentPolling();
+    state.namespaceEnrichment.payload = null;
+    state.namespaceEnrichment.lastSuccessfulRefreshAt = 0;
+    state.namespaceEnrichment.error = null;
+    renderHygieneScan();
+    renderNamespaceEnrichment();
+    state.snapshot = null;
+    state.snapshotBootstrapPending = false;
+    galaxy.requestToken += 1;
+    galaxy.requestPending = false;
+    galaxy.backgroundRefreshPending = false;
+    renderImageGallery({ items: [] });
+    renderDashboardPanelStates();
     resetRecallResults({ contextId: nextContext });
   }
   const galaxyNode = state.namespaceGalaxy.data.nodes.find((item) => item.contextId === nextContext);
@@ -1722,6 +1852,12 @@ function initializeNamespaceGalaxy() {
 }
 
 async function refreshNamespaceGalaxy({ background = false } = {}) {
+  if (state.dashboardAccessRequired) return null;
+  if (state.coreHealth.latest && dashboardHealthModel().status !== "ready") return null;
+  return runDashboardPanel("namespaceMap", () => refreshNamespaceGalaxyRequest({ background }));
+}
+
+async function refreshNamespaceGalaxyRequest({ background = false } = {}) {
   const galaxy = state.namespaceGalaxy;
   if (background && (galaxy.backgroundRefreshPending || galaxy.requestPending)) {
     return null;
@@ -1761,33 +1897,17 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
       },
       timeoutMs: background ? 5000 : READ_REQUEST_TIMEOUT_MS,
     });
-    if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
+    if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context || state.dashboardAccessRequired) return null;
     const data = normalizeNamespaceMap(payload);
-    const priorNodes = new Map(
-      galaxy.data.nodes.map((node) => [node.contextId, node]),
-    );
-    data.nodes = data.nodes.map((node) => ({
-      ...node,
-      surfaceTermCount: node.surfaceTermCount
-        ?? priorNodes.get(node.contextId)?.surfaceTermCount
-        ?? null,
-    }));
+    // Rich calculations belong to their revision-bound, timestamped details view.
+    // Never carry density or suggestions from an older map into this fresh base.
     data.nodes = applyNamespaceGalaxyMetrics(data.nodes, data.links);
-    const liveNodeIds = new Set(data.nodes.map((node) => node.contextId));
-    const governedPairs = new Set(
-      [...data.links, ...data.proposals].map((item) => (
-        [item.sourceContextId, item.targetContextId].sort().join("\u001f")
-      )),
-    );
-    data.suggestions = galaxy.data.suggestions.filter((item) => (
-      liveNodeIds.has(item.sourceContextId)
-      && liveNodeIds.has(item.targetContextId)
-      && !governedPairs.has(
-        [item.sourceContextId, item.targetContextId].sort().join("\u001f"),
-      )
-    ));
-    data.stats = { ...data.stats, suggestion_count: data.suggestions.length };
     renderNamespaceGalaxy(data);
+    const enrichment = state.namespaceEnrichment;
+    if (enrichment.payload && !enrichment.pending && !enrichment.polling && document.visibilityState === "visible") {
+      // Recheck only an explicitly requested calculation; this GET never starts work.
+      void refreshNamespaceEnrichment();
+    }
     galaxy.lastSuccessfulRefreshAt = Date.now();
     elements.namespaceGalaxyCanvas.title = "Namespace map is current as of "
       + new Date(galaxy.lastSuccessfulRefreshAt).toLocaleTimeString();
@@ -1802,7 +1922,7 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
     }
     return data;
   } catch (error) {
-    if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context) return null;
+    if (requestToken !== state.namespaceGalaxy.requestToken || contextId !== state.context || state.dashboardAccessRequired) return null;
     if (isDashboardAuthorizationError(error)) {
       setNamespaceGalaxyState(
         "warning",
@@ -1810,7 +1930,8 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
         "Reopen securely with .venv/bin/python scripts/open_dashboard.py; the core may still be healthy.",
       );
       elements.namespaceGalaxyCanvas.title = "Dashboard authentication required; reopen securely from the SYNAPSE-S2 checkout.";
-      return null;
+      renderDashboardAccessRequired(error);
+      throw error;
     }
     if (background && galaxy.data.nodes.length) {
       const ageSeconds = galaxy.lastSuccessfulRefreshAt
@@ -1824,7 +1945,7 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
           : `Automatic refresh failed; showing the last good map from ${ageSeconds}s ago.`,
       );
       elements.namespaceGalaxyCanvas.title = error.message || "Automatic namespace refresh failed";
-      return null;
+      throw error;
     }
     const fallback = namespaceMapFallbackFromSnapshot();
     if (fallback.nodes.length) {
@@ -1840,8 +1961,7 @@ async function refreshNamespaceGalaxy({ background = false } = {}) {
       renderNamespaceGalaxy({ nodes: [], links: [], proposals: [], suggestions: [], stats: {} });
       setNamespaceGalaxyState("error", "Namespace Galaxy unavailable", error.message || "The namespace map could not be loaded.");
     }
-    logOperation("Namespace Galaxy refresh failed", error.message);
-    return fallback;
+    throw error;
   } finally {
     if (background) galaxy.backgroundRefreshPending = false;
     if (requestToken === galaxy.requestToken) galaxy.requestPending = false;
@@ -1861,7 +1981,8 @@ function scheduleNamespaceGalaxyRefresh({ immediate = false } = {}) {
   galaxy.backgroundRefreshTimer = window.setTimeout(async () => {
     galaxy.backgroundRefreshTimer = null;
     if (document.visibilityState !== "hidden") {
-      await refreshNamespaceGalaxy({ background: true });
+      try { await refreshNamespaceGalaxy({ background: true }); }
+      catch (error) { if (!state.dashboardAccessRequired) logOperation("Namespace Galaxy refresh failed", error.message); }
     }
     scheduleNamespaceGalaxyRefresh();
   }, delay);
@@ -4841,35 +4962,61 @@ function renderContextBus(status, deployment = null) {
   `;
 }
 
-function renderCaptureInbox(captureInbox) {
-  if (!captureInbox) {
+function recordCaptureInboxStatus(payload) {
+  state.captureInboxObservation = {
+    latest: payload, lastSuccessfulRefreshAt: payload ? Date.now() : 0, error: null,
+  };
+}
+
+async function refreshCaptureInboxStatus() {
+  if (state.captureInboxRefreshPending || state.dashboardAccessRequired) return null;
+  state.captureInboxRefreshPending = true;
+  try {
+    const payload = await requestJson("/api/capture-inbox");
+    if (state.dashboardAccessRequired) return null;
+    recordCaptureInboxStatus(payload);
+    if (state.snapshot) state.snapshot = { ...state.snapshot, capture_inbox: payload };
+    renderCaptureInbox();
+    return payload;
+  } catch (error) {
+    state.captureInboxObservation.error = error.message || "Queue check failed";
+    renderCaptureInbox();
+    throw error;
+  } finally {
+    state.captureInboxRefreshPending = false;
+  }
+}
+
+function renderCaptureInbox() {
+  const observed = state.captureInboxObservation;
+  const captureInbox = observed.latest;
+  const model = dashboardHealthModel();
+  const age = observed.lastSuccessfulRefreshAt ? Math.max(0, Date.now() - observed.lastSuccessfulRefreshAt) : null;
+  const counts = [captureInbox?.pending_file_count, captureInbox?.processing_file_count, captureInbox?.error_file_count];
+  const validCounts = counts.every(value => typeof value === "number" && Number.isFinite(value) && value >= 0);
+  if (!captureInbox || !validCounts) {
     elements.captureInboxState.className = "capture-inbox-state";
-    elements.captureInboxState.innerHTML = `
-      <strong>Capture inbox unknown</strong>
-      <small>Status has not been loaded yet.</small>
-    `;
+    elements.captureInboxState.innerHTML = "<strong>Capture queue unknown</strong><small>Complete queue counts have not been loaded.</small>";
     return;
   }
-  const pending = Number(captureInbox.pending_file_count ?? 0);
-  const processed = Number(captureInbox.processed_file_count ?? 0);
-  const errors = Number(captureInbox.error_file_count ?? 0);
-  const last = captureInbox.last_result || {};
-  const capturedEvents = Number(last.captured_event_count ?? 0);
-  const capturedPayloads = Number(last.captured_payload_count ?? 0);
-  const mode = errors > 0 ? "error" : pending > 0 ? "pending" : "ready";
+  const [pending, processing, errors] = counts;
+  const fresh = age !== null && age <= CORE_HEALTH_FRESH_MS && !observed.error;
+  const empty = pending === 0 && processing === 0 && errors === 0;
+  const ready = fresh && empty && model.status === "ready";
+  const mode = errors > 0 ? "error" : ready ? "ready" : "pending";
   const headline = errors > 0
-    ? `${formatNumber(errors)} capture error${errors === 1 ? "" : "s"}`
-    : pending > 0
-      ? `${formatNumber(pending)} pending capture file${pending === 1 ? "" : "s"}`
-      : "Capture inbox armed";
-  const detail = pending > 0
-    ? `${formatNumber(processed)} processed. Press Process to ingest pending local session drops.`
-    : `Processed ${formatNumber(processed)} files; last run captured ${formatNumber(capturedEvents)} events from ${formatNumber(capturedPayloads)} payloads.`;
+    ? `${formatNumber(errors)} observed capture error${errors === 1 ? "" : "s"}`
+    : !empty ? `${formatNumber(pending)} queued · ${formatNumber(processing)} processing`
+      : ready ? "Capture queue empty" : "Capture queue last observed empty";
+  const ageText = age === null ? "Not yet confirmed" : `Queue last checked ${Math.floor(age / 1000)}s ago`;
+  const detail = [
+    observed.error || (fresh ? ageText : `${ageText} · stale`),
+    model.detail,
+    !empty ? "Queued for the authoritative worker; this page checks progress without starting another processor."
+      : "An empty queue does not establish an individual capture receipt.",
+  ].join(" · ");
   elements.captureInboxState.className = `capture-inbox-state ${mode}`;
-  elements.captureInboxState.innerHTML = `
-    <strong>${escapeHtml(headline)}</strong>
-    <small>${escapeHtml(detail)}</small>
-  `;
+  elements.captureInboxState.innerHTML = `<strong>${escapeHtml(headline)}</strong><small>${escapeHtml(detail)}</small>`;
 }
 
 function setImageCaptureState(headline, detail, mode = "") {
@@ -5073,8 +5220,10 @@ function clearImageGalleryObjectUrls() {
 }
 
 async function loadImageGalleryThumbnail(image, mediaId) {
+  const generation = state.imageGalleryRenderGeneration;
   try {
     const blob = await requestBlob("/api/media-thumbnail", { params: { media_id: mediaId } });
+    if (generation !== state.imageGalleryRenderGeneration || state.dashboardAccessRequired) return;
     const url = URL.createObjectURL(blob);
     state.imageCapture.galleryObjectUrls.push(url);
     image.src = url;
@@ -5084,6 +5233,7 @@ async function loadImageGalleryThumbnail(image, mediaId) {
 }
 
 function renderImageGallery(payload = {}) {
+  state.imageGalleryRenderGeneration += 1;
   clearImageGalleryObjectUrls();
   elements.imageGallery.replaceChildren();
   const items = Array.isArray(payload.items) ? payload.items.slice(0, 12) : [];
@@ -5122,18 +5272,12 @@ function renderImageGallery(payload = {}) {
 }
 
 async function refreshImageGallery() {
-  const contextId = state.context;
-  const requestGeneration = ++state.imageGalleryRequestGeneration;
-  const payload = await requestJson("/api/media-cache", {
-    params: { context_id: contextId, limit: 12 },
+  return runDashboardPanel("gallery", async (isCurrent, contextId) => {
+    const payload = await requestJson("/api/media-cache", { params: { context_id: contextId, limit: 12 } });
+    if (!isCurrent()) return null;
+    renderImageGallery(payload);
+    return payload;
   });
-  if (
-    requestGeneration !== state.imageGalleryRequestGeneration
-    || contextId !== state.context
-    || state.dashboardAccessRequired
-  ) return null;
-  renderImageGallery(payload);
-  return payload;
 }
 
 function clearImageSimilarObjectUrls() {
@@ -5149,13 +5293,23 @@ function setImageSimilarState(headline, detail, mode = "") {
   `;
 }
 
-async function loadImageSimilarThumbnail(image, mediaId) {
+function imageSimilarRequestIsCurrent(request) {
+  return state.imageCapture.similarOpen && !state.dashboardAccessRequired
+    && request.generation === state.imageCapture.similarGeneration
+    && request.contextGeneration === state.dashboardContextGeneration
+    && request.contextId === state.context
+    && request.mediaId === state.imageCapture.similarMediaId;
+}
+
+async function loadImageSimilarThumbnail(image, mediaId, request) {
   try {
     const blob = await requestBlob("/api/media-thumbnail", { params: { media_id: mediaId } });
+    if (!imageSimilarRequestIsCurrent(request)) return;
     const url = URL.createObjectURL(blob);
     state.imageCapture.similarObjectUrls.push(url);
     image.src = url;
   } catch (_error) {
+    if (!imageSimilarRequestIsCurrent(request)) return;
     image.alt = "Cached thumbnail unavailable";
   }
 }
@@ -5185,7 +5339,8 @@ function renderImageSimilarWarnings(payload) {
   });
 }
 
-function renderImageSimilarResults(payload) {
+function renderImageSimilarResults(payload, request) {
+  if (!imageSimilarRequestIsCurrent(request)) return;
   clearImageSimilarObjectUrls();
   elements.imageSimilarResults.replaceChildren();
   renderImageSimilarWarnings(payload);
@@ -5219,12 +5374,20 @@ function renderImageSimilarResults(payload) {
     text.append(label, detail);
     card.append(image, text);
     elements.imageSimilarResults.append(card);
-    void loadImageSimilarThumbnail(image, mediaId);
+    void loadImageSimilarThumbnail(image, mediaId, request);
   });
 }
 
 async function openImageSimilar(mediaId, displayLabel, returnFocus) {
+  if (state.dashboardAccessRequired) return;
+  const request = {
+    generation: ++state.imageCapture.similarGeneration,
+    contextGeneration: state.dashboardContextGeneration,
+    contextId: state.context,
+    mediaId,
+  };
   state.imageCapture.similarOpen = true;
+  state.imageCapture.similarMediaId = mediaId;
   state.imageCapture.similarReturnFocus = returnFocus || null;
   elements.imageSimilarPanel.hidden = false;
   elements.imageSimilarTitle.textContent = `Similar to “${displayLabel}”`;
@@ -5235,17 +5398,19 @@ async function openImageSimilar(mediaId, displayLabel, returnFocus) {
   elements.imageSimilarClose.focus({ preventScroll: true });
   try {
     const payload = await requestJson("/api/media-similar", {
-      params: { media_id: mediaId, context_id: state.context, limit: 8 },
+      params: { media_id: mediaId, context_id: request.contextId, limit: 8 },
     });
-    if (!state.imageCapture.similarOpen) return;
-    renderImageSimilarResults(payload);
+    if (!imageSimilarRequestIsCurrent(request)) return;
+    renderImageSimilarResults(payload, request);
   } catch (error) {
-    if (!state.imageCapture.similarOpen) return;
+    if (!imageSimilarRequestIsCurrent(request)) return;
     setImageSimilarState("Similarity search failed", error.message, "error");
   }
 }
 
-function closeImageSimilar() {
+function closeImageSimilar({ restoreFocus = true } = {}) {
+  state.imageCapture.similarGeneration += 1;
+  state.imageCapture.similarMediaId = "";
   if (!state.imageCapture.similarOpen && elements.imageSimilarPanel.hidden) return;
   state.imageCapture.similarOpen = false;
   clearImageSimilarObjectUrls();
@@ -5254,7 +5419,7 @@ function closeImageSimilar() {
   elements.imageSimilarWarnings.replaceChildren();
   const returnFocus = state.imageCapture.similarReturnFocus;
   state.imageCapture.similarReturnFocus = null;
-  if (returnFocus && typeof returnFocus.focus === "function" && returnFocus.isConnected) {
+  if (restoreFocus && returnFocus && typeof returnFocus.focus === "function" && returnFocus.isConnected) {
     returnFocus.focus({ preventScroll: true });
   }
 }
@@ -5679,6 +5844,191 @@ function renderDoctorReport(payload) {
     <small>${formatNumber(checks.length)} checks / ${formatNumber(failures.length)} need attention</small>
     <ul>${(payload.repair_plan || []).slice(0, 4).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
   `;
+}
+
+function formatCalculationTime(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return new Date(value > 1e12 ? value : value * 1000).toLocaleString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    const date = new Date(value);
+    if (Number.isFinite(date.getTime())) return date.toLocaleString();
+  }
+  return "not recorded";
+}
+
+function renderAnalysisControls() {
+  const ready = dashboardHealthModel().status === "ready";
+  elements.hygieneScanButton.disabled = !ready || state.hygieneScan.pending;
+  elements.namespaceEnrichmentButton.disabled = !ready || state.namespaceEnrichment.pending || state.namespaceEnrichment.polling;
+  elements.namespaceEnrichmentStop.disabled = state.dashboardAccessRequired || !state.namespaceEnrichment.polling;
+}
+
+function renderHygieneScan() {
+  const scan = state.hygieneScan;
+  const data = scan.payload;
+  const complete = data?.scan_complete === true && data?.status === "complete"
+    && Number.isFinite(data.scanned_entry_count) && Number.isFinite(data.total_entry_count)
+    && data.scanned_entry_count >= 0 && data.scanned_entry_count === data.total_entry_count
+    && data.coverage_fraction === 1;
+  const unavailable = data?.status === "unavailable";
+  const restart = data?.status === "restart_required";
+  elements.hygieneScanButton.textContent = scan.pending ? "Scanning one page…"
+    : restart ? "Restart scan" : unavailable ? "Retry scan page" : complete ? "Start a new scan" : scan.scanId ? "Continue scan" : "Scan full namespace";
+  if (!data) {
+    elements.hygieneScanStatus.textContent = scan.error || (scan.pending ? "Reading one bounded page…" : "Full coverage has not been checked.");
+    elements.hygieneScanDetails.textContent = "Each click reads one page. No cleanup is performed.";
+  } else {
+    const scanned = Number.isFinite(data.scanned_entry_count) && data.scanned_entry_count >= 0 ? data.scanned_entry_count : null;
+    const total = Number.isFinite(data.total_entry_count) && data.total_entry_count >= 0 ? data.total_entry_count : null;
+    const fraction = typeof data.coverage_fraction === "number" && Number.isFinite(data.coverage_fraction)
+      ? Math.max(0, Math.min(1, data.coverage_fraction)) : null;
+    const coverage = scanned === null || total === null ? "Coverage unavailable"
+      : `${formatNumber(scanned)} / ${formatNumber(total)} records${fraction === null ? "" : ` (${formatNumber(fraction * 100, 1)}%)`}`;
+    const status = restart ? "Scan cannot continue — restart required" : unavailable ? "Scan unavailable" : complete ? "Scan complete" : "Partial scan — namespace cleanliness not established";
+    elements.hygieneScanStatus.textContent = `${status} · ${coverage}${scan.error || data.error_code ? ` · ${scan.error || data.error_code}` : ""}`;
+    const categories = Object.entries(data.category_counts || {}).map(([name, count]) => `${name}: ${count}`).join(" · ");
+    const mappings = Array.isArray(data.candidate_survivor_mapping) ? data.candidate_survivor_mapping : [];
+    elements.hygieneScanDetails.textContent = [
+      `Calculated at ${formatCalculationTime(data.calculated_at)}`,
+      categories || "No categories reported in the scanned portion",
+      `${formatNumber(mappings.length)} candidate-to-survivor mappings${complete ? " for review" : " (provisional)"}${data.duplicate_candidates_truncated ? ` · showing a bounded subset of ${formatNumber(data.duplicate_candidate_count)} candidates` : ""}`,
+      "Review exact records before any cleanup; this scan deletes nothing.",
+    ].join(" · ");
+  }
+  renderAnalysisControls();
+}
+
+async function advanceHygieneScan() {
+  const scan = state.hygieneScan;
+  if (scan.pending || state.dashboardAccessRequired || dashboardHealthModel().status !== "ready") return null;
+  const generation = state.dashboardContextGeneration;
+  const contextId = state.context;
+  const isCurrent = () => generation === state.dashboardContextGeneration && contextId === state.context && !state.dashboardAccessRequired;
+  scan.pending = true;
+  scan.error = null;
+  renderHygieneScan();
+  try {
+    const body = { context_id: contextId };
+    if (scan.scanId && scan.payload?.scan_complete !== true && scan.payload?.status !== "restart_required") body.scan_id = scan.scanId;
+    const payload = await requestJson("/api/memory-hygiene/scan", { method: "POST", body });
+    if (!isCurrent()) return null;
+    if (payload.context_id && payload.context_id !== contextId) throw new Error("Scan returned a different namespace");
+    scan.payload = payload;
+    scan.scanId = payload.status === "restart_required" ? null : payload.scan_id || null;
+    return payload;
+  } catch (error) {
+    if (isCurrent()) {
+      scan.error = error.message || "Scan page unavailable";
+      if (isDashboardAuthorizationError(error)) renderDashboardAccessRequired(error);
+    }
+    return null;
+  } finally {
+    scan.pending = false;
+    if (isCurrent()) renderHygieneScan();
+  }
+}
+
+function stopNamespaceEnrichmentPolling() {
+  const job = state.namespaceEnrichment;
+  if (job.timer !== null) window.clearTimeout(job.timer);
+  job.timer = null;
+  job.polling = false;
+  // An in-flight status read still owns the request slot until it returns.
+  job.generation += 1;
+  renderAnalysisControls();
+}
+
+function renderNamespaceEnrichment() {
+  const job = state.namespaceEnrichment;
+  const payload = job.payload;
+  const status = String(payload?.state || payload?.status || "not calculated");
+  const observationAge = job.lastSuccessfulRefreshAt ? Math.max(0, Date.now() - job.lastSuccessfulRefreshAt) : null;
+  const displayStatus = status === "ready" && (observationAge === null || observationAge > CORE_HEALTH_FRESH_MS)
+    ? "stale calculation — awaiting fresh revision check" : status;
+  elements.namespaceEnrichmentStatus.textContent = [
+    job.error || displayStatus,
+    payload?.error_code ? String(payload.error_code).replaceAll("_", " ") : "",
+    payload?.deadline_exceeded ? "Calculation exceeded its deadline; no result is certified" : "",
+    payload?.calculated_at ? `Calculated at ${formatCalculationTime(payload.calculated_at)}` : "No completed calculation",
+    job.polling ? "Checking every 5s" : "",
+  ].filter(Boolean).join(" · ");
+  elements.namespaceEnrichmentButton.textContent = (["queued", "running"].includes(status) || (status === "busy" && payload?.job_id)) ? "Check calculation" : "Calculate details";
+  const data = payload?.data;
+  elements.namespaceEnrichmentOutput.replaceChildren();
+  if (data && typeof data === "object") {
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    const suggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+    const summary = document.createElement("p");
+    summary.textContent = `${nodes.length} calculated namespaces · ${suggestions.length} suggested bridges. These are calculated details; the live map remains lightweight.`;
+    elements.namespaceEnrichmentOutput.append(summary);
+    const list = document.createElement("ul");
+    for (const node of nodes.slice(0, 20)) {
+      const row = document.createElement("li");
+      row.textContent = `${String(node.context_id || node.id || "Namespace")}: ${node.entry_count ?? "unknown"} memories · ${node.surface_term_count ?? "unavailable"} indexed terms · ${node.relationship_count ?? "unavailable"} relationships`;
+      list.append(row);
+    }
+    for (const suggestion of suggestions.slice(0, 20)) {
+      const row = document.createElement("li");
+      row.textContent = `Suggested bridge: ${String(suggestion.source_context_id || suggestion.source || "unknown")} → ${String(suggestion.target_context_id || suggestion.target || "unknown")}. Separate governance approval is required.`;
+      list.append(row);
+    }
+    elements.namespaceEnrichmentOutput.append(list);
+  }
+  renderAnalysisControls();
+}
+
+async function refreshNamespaceEnrichment({ start = false } = {}) {
+  const job = state.namespaceEnrichment;
+  if (job.pending || state.dashboardAccessRequired) return null;
+  if (start && dashboardHealthModel().status !== "ready") return null;
+  const generation = job.generation;
+  const contextGeneration = state.dashboardContextGeneration;
+  const contextId = state.context;
+  const isCurrent = () => generation === job.generation && contextGeneration === state.dashboardContextGeneration && contextId === state.context && !state.dashboardAccessRequired;
+  job.pending = true;
+  job.error = null;
+  renderAnalysisControls();
+  try {
+    const payload = await requestJson("/api/namespace-enrichment", start
+      ? { method: "POST", body: { context_id: contextId } }
+      : { params: { context_id: contextId }, timeoutMs: 3000 });
+    if (!isCurrent()) return null;
+    if (payload.context_id && payload.context_id !== contextId) throw new Error("Calculation returned a different namespace");
+    job.payload = payload;
+    job.lastSuccessfulRefreshAt = Date.now();
+    const status = String(payload.state || payload.status || "failed");
+    job.polling = (["queued", "running"].includes(status) || (status === "busy" && Boolean(payload.job_id)))
+      && payload.deadline_exceeded !== true && job.polls < 24;
+    if (job.polling) {
+      job.timer = window.setTimeout(() => {
+        job.timer = null;
+        if (!isCurrent()) return;
+        job.polls += 1;
+        void refreshNamespaceEnrichment();
+      }, 5000);
+    }
+    return payload;
+  } catch (error) {
+    if (isCurrent()) {
+      job.error = error.message || "Calculation unavailable";
+      job.polling = false;
+      if (isDashboardAuthorizationError(error)) renderDashboardAccessRequired(error);
+    }
+    return null;
+  } finally {
+    job.pending = false;
+    if (isCurrent()) renderNamespaceEnrichment();
+    else renderAnalysisControls();
+  }
+}
+
+function requestNamespaceEnrichment() {
+  const job = state.namespaceEnrichment;
+  if (job.pending || job.polling) return null;
+  job.polls = 0;
+  const status = job.payload?.state || job.payload?.status;
+  return refreshNamespaceEnrichment({ start: !(["queued", "running"].includes(status) || (status === "busy" && job.payload?.job_id)) });
 }
 
 function renderMemoryHygiene(payload) {
@@ -7255,9 +7605,8 @@ function renderMemoryLedger(graph) {
 function renderFooter(snapshot, status, profile, contextCount) {
   const current = Number(profile.estimated_total_mb ?? 0);
   const max = Number(profile.target_envelope_mb?.max ?? 256);
-  const healthy = Boolean(status.effective_enabled) && Boolean(profile.within_target_envelope);
-  elements.footerHealth.textContent = healthy ? "GOOD" : "CHECK";
-  elements.footerMemory.textContent = `${formatNumber(current, 1)} MB / ${formatNumber(max, 0)} MB`;
+  renderCoreHealth();
+  elements.footerMemory.textContent = `${formatNumber(current, 1)} MB estimated / ${formatNumber(max, 0)} MB target`;
   elements.footerGpu.textContent = `MLX ${status.mlx_device || "default"}`;
   elements.footerContexts.textContent = formatNumber(contextCount);
   elements.footerTime.textContent = formatClock(snapshot.generated_at);
@@ -8885,7 +9234,7 @@ async function withBusy(button, label, task, options = { refresh: true }) {
     logOperation(`${label} failed`, error.message);
     throw error;
   } finally {
-    button.disabled = originalDisabled;
+    button.disabled = state.dashboardAccessRequired || originalDisabled;
   }
 }
 
@@ -8937,9 +9286,9 @@ function updateCoreToggleGuard() {
   const nextAction = enabled ? "Disable" : "Enable";
   const lockedHint = "Locked. Press Unlock before enabling or disabling SYNAPSE-S2 Core.";
   const unlockedHint = `Unlocked for one ${nextAction.toLowerCase()} action. Relocks after use or timeout.`;
-  elements.toggleActionButton.disabled = !unlocked;
+  elements.toggleActionButton.disabled = state.dashboardAccessRequired || !unlocked;
   elements.toggleActionState.textContent = nextAction;
-  elements.coreUnlockButton.disabled = unlocked;
+  elements.coreUnlockButton.disabled = state.dashboardAccessRequired || unlocked;
   elements.coreUnlockButton.textContent = unlocked ? "Unlocked" : "Unlock";
   elements.coreUnlockButton.setAttribute("aria-pressed", String(unlocked));
   elements.coreToggleGuardHint.textContent = unlocked ? unlockedHint : lockedHint;
@@ -9632,40 +9981,16 @@ elements.evidencePackButton.addEventListener("click", () => {
   ));
 });
 
+elements.hygieneScanButton.addEventListener("click", () => { void advanceHygieneScan(); });
+elements.namespaceEnrichmentButton.addEventListener("click", () => { void requestNamespaceEnrichment(); });
+elements.namespaceEnrichmentStop.addEventListener("click", () => {
+  stopNamespaceEnrichmentPolling();
+  state.namespaceEnrichment.error = "Checking paused; the server may still finish the calculation.";
+  renderNamespaceEnrichment();
+});
+
 elements.captureInboxButton.addEventListener("click", () => {
-  withBusy(elements.captureInboxButton, "Magic capture", async () => {
-    const maxFiles = 50;
-    const preflight = await requestJson("/api/capture-inbox/preflight", {
-      method: "POST",
-      body: { context_id: state.context, max_files: maxFiles },
-    });
-    if (Number(preflight.selected_file_count || 0) <= 0) {
-      logOperation("Magic capture idle", preflight);
-      return preflight;
-    }
-    if (!confirmPreflight("Process pending capture inbox files?", [
-      `Files: ${preflight.selected_file_count} of ${preflight.pending_file_count}`,
-      `Bytes: ${formatNumber(preflight.selected_total_bytes || 0)}`,
-      `Root: ${preflight.root}`,
-    ])) {
-      logOperation("Magic capture cancelled", preflight);
-      return preflight;
-    }
-    const payload = await requestJson("/api/capture-inbox/process", {
-      method: "POST",
-      body: {
-        context_id: state.context,
-        max_files: maxFiles,
-        confirmation_token: preflight.confirmation_token,
-      },
-    });
-    renderCaptureInbox({
-      ...(state.snapshot?.capture_inbox || {}),
-      last_result: payload,
-      pending_file_count: 0,
-    });
-    return payload;
-  });
+  withBusy(elements.captureInboxButton, "Capture queue", refreshCaptureInboxStatus, { refresh: false });
 });
 
 elements.appConnectButton.addEventListener("click", () => {
@@ -9699,10 +10024,14 @@ elements.appSelectionCaptureButton.addEventListener("click", () => {
 });
 
 document.addEventListener("visibilitychange", () => {
+  renderCoreHealth();
   scheduleNamespaceGalaxyRefresh({ immediate: document.visibilityState !== "hidden" });
   scheduleCoreHealthRefresh({ immediate: document.visibilityState !== "hidden" });
 });
 
+renderCoreHealth();
+state.coreHealth.ageTimer = window.setInterval(() => renderCoreHealth(), 1000);
+scheduleCoreHealthRefresh({ immediate: true });
 refreshMissingSnapshot()
   .catch((error) => {
     logOperation("Initial load failed", error.message);
@@ -9713,7 +10042,6 @@ refreshMissingSnapshot()
       renderImpactUnavailable(error);
     });
     scheduleNamespaceGalaxyRefresh();
-    scheduleCoreHealthRefresh({ immediate: true });
   });
 
 refreshAppConnect({ detect: false })

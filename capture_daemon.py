@@ -2980,9 +2980,15 @@ class CaptureInboxDaemon:
         return result
 
     def process_once(self, *, max_files: int = 50) -> dict[str, Any]:
+        self._require_in_process_capture_backend()
         paths = self.paths()
         self._ensure_transport_dirs(paths)
         while True:
+            # Initialize queued local-v5 work before taking any capture lock.
+            # The factory may itself discover an authoritative CoreClient.
+            if self._backend is None and self._capture_work_present(paths):
+                self.backend
+            self._require_in_process_capture_backend()
             initialize_backend = False
             with self._exclusive_lock(
                 paths["lock_dir"] / GLOBAL_CAPTURE_LOCK,
@@ -2994,13 +3000,7 @@ class CaptureInboxDaemon:
                 # the global capture lock. If work appeared since the previous
                 # observation, release capture, initialize authority, and then
                 # reacquire capture in the canonical order.
-                if self._backend is None and any(
-                    any(directory.iterdir())
-                    for directory in (
-                        paths["inbox_dir"],
-                        paths["processing_dir"],
-                    )
-                ):
+                if self._backend is None and self._capture_work_present(paths):
                     initialize_backend = True
                 else:
                     self._repair_legacy_state(paths["state_path"])
@@ -3010,6 +3010,33 @@ class CaptureInboxDaemon:
                     )
             if initialize_backend:
                 self.backend
+
+    def _require_in_process_capture_backend(self) -> None:
+        # Import locally: core_client imports the service contract, whose
+        # embedded worker uses this class with an in-process backend. Calling
+        # the service while holding GLOBAL_CAPTURE_LOCK reverses its lock
+        # order (backend lane, then capture lock) and can deadlock both workers.
+        from core_client import CoreClient
+
+        service_backed = isinstance(self._backend, CoreClient)
+        if self._backend is None:
+            from backend_router import resolve_backend_route
+
+            service_backed = (
+                resolve_backend_route(capture_root=self.root).mode == "service"
+            )
+        if service_backed:
+            raise RuntimeError(
+                "authoritative capture is owned by the embedded capture worker; "
+                "use capture-inbox-status to observe its drain"
+            )
+
+    @staticmethod
+    def _capture_work_present(paths: dict[str, Path]) -> bool:
+        return any(
+            any(paths[key].iterdir())
+            for key in ("inbox_dir", "processing_dir")
+        )
 
     def _process_once_locked(
         self,
@@ -3767,6 +3794,18 @@ class CaptureInboxDaemon:
                     ),
                     **self._committed_capture_audit(captures),
                 }
+                # Preserve only the validated public reconciliation handle.
+                # Never serialize an exception dictionary, request body, or
+                # transport credentials. Invalid handles remain unknown, with
+                # the payload quarantined and no automatic replay.
+                from core_client import CoreOutcomeUnknown, outcome_unknown_projection
+                from core_protocol import CoreProtocolError
+
+                if isinstance(exc, CoreOutcomeUnknown):
+                    try:
+                        error_payload["reconciliation"] = outcome_unknown_projection(exc)
+                    except CoreProtocolError:
+                        pass
                 staged_raw: Path | None = None
                 if not payload_document_prepared:
                     try:

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-core-health="initializing">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -33,7 +33,8 @@
         <div class="top-readouts" aria-label="Runtime summary">
           <div class="top-readout">
             <span>Runtime</span>
-            <strong><i class="status-dot" aria-hidden="true"></i><span id="headerRuntime">PENDING</span></strong>
+            <strong><i class="status-dot" aria-hidden="true"></i><span id="headerRuntime">INITIALIZING</span></strong>
+            <small id="healthConfirmedAt" class="health-confirmed">Not yet confirmed</small>
             <small class="runtime-build-line">S2 Core <b id="coreVersion">local</b></small>
           </div>
           <div class="top-readout">
@@ -269,6 +270,11 @@
                   </button>
                 </div>
                 <div id="doctorReportOutput" class="operator-mini-output">Doctor idle</div>
+                <div class="bounded-analysis-controls">
+                  <button id="hygieneScanButton" class="secondary-button" type="button" disabled>Scan full namespace</button>
+                  <small id="hygieneScanStatus" role="status">Full coverage has not been checked.</small>
+                  <small id="hygieneScanDetails">Each click reads one page. No cleanup is performed.</small>
+                </div>
                 <div id="memoryHygieneQueue" class="hygiene-queue">No hygiene queue loaded</div>
               </section>
 
@@ -316,6 +322,7 @@
             <div>
               <p class="section-label">Connected Memory</p>
               <h2 id="namespaceGalaxyTitle">Namespace Galaxy</h2>
+                <small id="namespaceMapLoadState" class="panel-load-state" role="status">initializing · no successful load</small>
               <p class="namespace-galaxy-subtitle">Every saved context remains isolated until an approved bridge deliberately connects it.</p>
             </div>
             <div class="namespace-galaxy-summary" aria-label="Namespace map summary">
@@ -325,6 +332,15 @@
             </div>
           </div>
 
+          <details class="bounded-analysis-controls namespace-enrichment">
+            <summary>Calculated density and bridge suggestions</summary>
+            <div class="analysis-actions">
+              <button id="namespaceEnrichmentButton" class="secondary-button" type="button" disabled>Calculate details</button>
+              <button id="namespaceEnrichmentStop" class="secondary-button" type="button" disabled>Stop checking</button>
+            </div>
+            <small id="namespaceEnrichmentStatus" role="status">Not calculated. Ordinary page loading uses the lightweight map.</small>
+            <div id="namespaceEnrichmentOutput"></div>
+          </details>
           <div class="namespace-galaxy-layout">
             <div class="namespace-galaxy-stage">
               <div id="namespaceGalaxyNavigation" class="namespace-galaxy-navigation">
@@ -432,19 +448,20 @@
           <article class="panel runtime-panel" id="runtime" aria-labelledby="runtimeTitle">
             <div class="panel-header">
               <div>
-                <p class="section-label">Runtime Ready</p>
+                <p class="section-label">Runtime status</p>
                 <h2 id="runtimeTitle">SYNAPSE-S2 Core</h2>
+                <small id="runtimeLoadState" class="panel-load-state" role="status">initializing · no successful load</small>
               </div>
-              <div id="coreStateIndicator" class="core-status-badge" role="status" aria-live="polite" title="SYNAPSE-S2 Core is currently enabled">
+              <div id="coreStateIndicator" class="core-status-badge" role="status" aria-live="polite" title="Core enabled state has not been confirmed">
                 <span class="core-status-dot" aria-hidden="true"></span>
-                <span id="toggleText">Core enabled</span>
+                <span id="toggleText">Checking core state</span>
               </div>
             </div>
             <div class="system-list">
-              <div><span>Spiking Engine</span><strong id="engineState">ACTIVE</strong></div>
-              <div><span>Attention Router</span><strong id="routerState">ACTIVE</strong></div>
-              <div><span>Memory Subsystem</span><strong id="memoryState">ACTIVE</strong></div>
-              <div><span>Dashboard API</span><strong id="apiState">LISTENING</strong></div>
+              <div><span>Spiking Engine</span><strong id="engineState">INITIALIZING</strong></div>
+              <div><span>Attention Router</span><strong id="routerState">INITIALIZING</strong></div>
+              <div><span>Memory Subsystem</span><strong id="memoryState">INITIALIZING</strong></div>
+              <div><span>Dashboard API</span><strong id="apiState">INITIALIZING</strong></div>
             </div>
             <div id="runtimeHealthGrid" class="runtime-health-grid" aria-label="Runtime health details">
               <div>
@@ -492,7 +509,7 @@
               </button>
             </div>
             <div class="envelope-heading">
-              <span>Current</span>
+              <span>Estimated topology arrays</span>
               <strong id="resourceMb">-- MB</strong>
             </div>
             <div class="envelope">
@@ -512,6 +529,11 @@
               <div><span>Headroom</span><strong id="headroomMb">-- MB</strong><small id="headroomState">remaining</small></div>
               <div><span>Trace Cache</span><strong id="traceCache">--</strong><small>registered</small></div>
               <div><span>Arrays</span><strong id="arrayCount">--</strong><small>tracked</small></div>
+            </div>
+            <div class="process-memory-readout">
+              <span>Core process memory</span><strong id="processMemory">Unavailable</strong>
+              <small id="processMemoryDetail">Waiting for a process measurement</small>
+              <small>Topology counts estimated arrays only. Process memory also includes the model, caches and runtime; the topology target does not certify total memory pressure.</small>
             </div>
             <div class="array-list-header" aria-hidden="true">
               <span>Substrate</span>
@@ -603,13 +625,13 @@
                   </button>
                   <button class="action-row" type="button" id="captureInboxButton">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
-                    <span><strong>Magic Capture</strong><small>Process local session inbox drops</small></span>
-                    <em>Process</em>
+                    <span><strong>Capture queue</strong><small>Check the authoritative worker’s progress</small></span>
+                    <em>Check</em>
                   </button>
                 </div>
                 <div id="captureInboxState" class="capture-inbox-state" aria-live="polite">
-                  <strong>Capture inbox pending</strong>
-                  <small>Waiting for local clients to drop session payloads.</small>
+                  <strong>Capture queue unknown</strong>
+                  <small>Waiting for fresh queue and worker evidence.</small>
                 </div>
               </section>
 
@@ -905,6 +927,7 @@
               <div>
                 <p class="section-label">Memory Graph</p>
                 <h2 id="graphTitle">Event relationships</h2>
+                <small id="graphLoadState" class="panel-load-state" role="status">initializing · no successful load</small>
               </div>
               <div class="graph-toolbar-actions" aria-label="Graph viewport controls">
                 <button id="graphZoomOut" class="icon-button compact" type="button" title="Zoom out" aria-label="Zoom out">
@@ -1190,6 +1213,7 @@
                     Capture image memory
                   </button>
                 </div>
+                <small id="imageGalleryLoadState" class="panel-load-state" role="status">initializing · no successful load</small>
                 <div id="imageGallery" class="image-gallery" aria-live="polite" aria-label="Cached image memory thumbnails"></div>
                 <section id="imageSimilarPanel" class="image-similar-panel" hidden role="region" aria-label="Similar image results">
                   <div class="image-similar-header">
@@ -1228,8 +1252,8 @@
             <span>5 Wrap + Pack</span>
           </small>
         </div>
-        <div class="footer-health-cell"><span class="status-dot" aria-hidden="true"></span><strong>Health</strong><small id="footerHealth">GOOD</small></div>
-        <div><strong>Memory</strong><small id="footerMemory">-- / 384 MB</small></div>
+        <div class="footer-health-cell"><span class="status-dot" aria-hidden="true"></span><strong>Health</strong><small id="footerHealth">INITIALIZING</small><small id="footerHealthConfirmedAt" class="health-confirmed">Not yet confirmed</small></div>
+        <div><strong>Topology estimate</strong><small id="footerMemory">Not measured</small></div>
         <div><strong>Compute</strong><small id="footerGpu">MLX --</small></div>
         <div><strong>Contexts</strong><small id="footerContexts">--</small></div>
         <div><strong>Time</strong><small id="footerTime">--</small></div>

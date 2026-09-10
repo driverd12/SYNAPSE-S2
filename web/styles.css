@@ -5074,3 +5074,46 @@ textarea {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* A neutral shell cannot imply authoritative readiness before the first proof. */
+html:not([data-core-health="ready"]) .status-dot,
+html:not([data-core-health="ready"]) .core-status-dot {
+  background: var(--muted);
+  box-shadow: none;
+}
+html[data-core-health="busy"] .status-dot,
+html[data-core-health="stale"] .status-dot,
+html[data-core-health="authentication-required"] .status-dot {
+  background: var(--amber);
+}
+.health-confirmed, .panel-load-state {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.panel-load-state[data-load-state="stale"],
+.panel-load-state[data-load-state="authentication-required"] { color: var(--amber); }
+.footer-health-cell { flex-wrap: wrap; }
+.footer-health-cell .health-confirmed { flex-basis: 100%; }
+.process-memory-readout {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px solid var(--row);
+  border-radius: 7px;
+  font-size: 12px;
+}
+.process-memory-readout small { grid-column: 1 / -1; color: var(--muted); }
+
+html:not([data-core-health="ready"]) .system-list strong { color: var(--muted); }
+html[data-core-health="busy"] .system-list strong,
+html[data-core-health="stale"] .system-list strong { color: var(--amber); }
+.bounded-analysis-controls { display: grid; gap: 8px; margin: 12px 0; padding: 10px; border: 1px solid var(--row); border-radius: 7px; }
+.bounded-analysis-controls small { color: var(--muted); line-height: 1.5; }
+.bounded-analysis-controls button { justify-self: start; }
+.analysis-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.namespace-enrichment summary { cursor: pointer; font-size: 12px; }
+#namespaceEnrichmentOutput { max-height: 280px; overflow: auto; font-size: 12px; }

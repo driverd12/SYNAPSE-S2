@@ -652,6 +652,9 @@ class CoreClient:
     def list_media_references(self, **arguments: Any) -> dict[str, Any]:
         return self.call("list_media_references", arguments)
 
+    def list_image_memories(self, **arguments: Any) -> dict[str, Any]:
+        return self.call("list_image_memories", arguments)
+
     def publish_context_event(self, **arguments: Any) -> dict[str, Any]:
         return self.call("publish_context_event", arguments)
 

@@ -479,14 +479,18 @@ journal mutation, or a replay button.
    also run, pass the exact memory and capture paths enumerated by that reviewed
    manifest through its `--memory-db` and `--capture-root` inventory arguments.
 2. Resolve capture/replay debt, then quiesce every persistent writer before
-   producing final evidence. First inspect and drain the governed inbox while
-   the legacy capture worker is still available:
+   producing final evidence. Inspect the inbox and let the authoritative
+   core's embedded worker drain it:
 
    ```bash
    .venv/bin/python synapse_cli.py --json capture-inbox-status
-   .venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
    .venv/bin/python synapse_cli.py --json capture-inbox-status
    ```
+
+   Repeat the read-only status check until pending and processing are zero and
+   capture health is fresh. Do not run manual `capture-inbox-process` against
+   an authoritative CoreClient: the central guard rejects it before taking
+   the capture lock. Manual processing is only for the explicit local-v5 lane.
 
    Reconcile every reported capture error, ambiguous request, or
    replay-required artifact; never delete or replay it to make the count zero.

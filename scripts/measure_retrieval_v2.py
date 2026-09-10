@@ -469,6 +469,11 @@ def _query_call(backend: SpikingAttentionBackend, query: dict[str, Any]) -> dict
     )
 
 
+def semantic_retrieval_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the complete retrieval contract except observational elapsed times."""
+    return {key: value for key, value in result.items() if key != "timings_ms"}
+
+
 def _run_query_set(
     backend: SpikingAttentionBackend,
     fixture: dict[str, Any],
@@ -479,7 +484,7 @@ def _run_query_set(
 ) -> dict[str, Any]:
     results: dict[str, dict[str, Any]] = {}
     latency: dict[str, list[float]] = {}
-    repeated_exact = True
+    repeated_semantic_equal = True
     with ExitStack() as guards:
         for method_name in (
             "_auto_quick_prune_if_due",
@@ -499,9 +504,9 @@ def _run_query_set(
         for query in fixture["queries"]:
             query_id = str(query["query_id"])
             # The untimed warm call provides the evidence object and is excluded
-            # from p50/p95. Timed calls must remain byte-identical to it.
+            # from p50/p95. Every semantic field must remain byte-identical.
             result = _query_call(backend, query)
-            reference_bytes = canonical_json_bytes(result)
+            reference_bytes = canonical_json_bytes(semantic_retrieval_payload(result))
             samples: list[float] = []
             if measure_latency:
                 for _sample in range(latency_samples):
@@ -509,15 +514,15 @@ def _run_query_set(
                     observed = _query_call(backend, query)
                     elapsed = max(0, timer() - started) / 1_000_000.0
                     samples.append(elapsed)
-                    if canonical_json_bytes(observed) != reference_bytes:
-                        repeated_exact = False
+                    if canonical_json_bytes(semantic_retrieval_payload(observed)) != reference_bytes:
+                        repeated_semantic_equal = False
             results[query_id] = result
             latency[query_id] = samples
     return {
         "results": results,
         "latency_ms": latency,
-        "repeated_exact": repeated_exact,
-        "raw_digest": _digest([results[str(query["query_id"])] for query in fixture["queries"]]),
+        "repeated_semantic_equal": repeated_semantic_equal,
+        "semantic_payload_digest": _digest([semantic_retrieval_payload(results[str(query["query_id"])]) for query in fixture["queries"]]),
     }
 
 
@@ -1007,8 +1012,8 @@ def acceptance_verdict(
             "id": "canonical-output-deterministic",
             "passed": bool(
                 determinism["canonical_digest_all_equal"]
-                and determinism["fresh_backend_raw_equal"]
-                and determinism["repeated_same_backend_raw_equal"]
+                and determinism["fresh_backend_semantic_payload_equal"]
+                and determinism["repeated_same_backend_semantic_payload_equal"]
             ),
         },
         {
@@ -1140,12 +1145,13 @@ def _aggregate_evidence(
             "fresh_backend_digest": canonical_digests["fresh_backend"],
             "randomized_insertion_digest": canonical_digests["randomized_insertion"],
             "canonical_digest_all_equal": len(set(canonical_digests.values())) == 1,
-            "baseline_raw_result_digest": baseline_run["raw_digest"],
-            "fresh_backend_raw_result_digest": fresh_run["raw_digest"],
-            "randomized_insertion_raw_result_digest": shuffled_run["raw_digest"],
-            "fresh_backend_raw_equal": baseline_run["raw_digest"] == fresh_run["raw_digest"],
-            "randomized_insertion_raw_equal": baseline_run["raw_digest"] == shuffled_run["raw_digest"],
-            "repeated_same_backend_raw_equal": bool(baseline_run["repeated_exact"]),
+            "baseline_semantic_payload_digest": baseline_run["semantic_payload_digest"],
+            "fresh_backend_semantic_payload_digest": fresh_run["semantic_payload_digest"],
+            "randomized_insertion_semantic_payload_digest": shuffled_run["semantic_payload_digest"],
+            "semantic_payload_excludes": ["timings_ms"],
+            "fresh_backend_semantic_payload_equal": baseline_run["semantic_payload_digest"] == fresh_run["semantic_payload_digest"],
+            "randomized_insertion_semantic_payload_equal": baseline_run["semantic_payload_digest"] == shuffled_run["semantic_payload_digest"],
+            "repeated_same_backend_semantic_payload_equal": bool(baseline_run["repeated_semantic_equal"]),
             "random_seed": random_seed,
             "randomized_document_order_sha256": shuffled_order_digest,
         },

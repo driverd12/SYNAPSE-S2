@@ -42,6 +42,67 @@ def _prepared_payload() -> dict:
     return prepared
 
 
+class LongMemSemanticComparisonTests(unittest.TestCase):
+    @staticmethod
+    def payload() -> dict:
+        return {
+            "schema": "synapse-retrieval.v2", "retrieval_id": "retrieval-a",
+            "snapshot_id": "snapshot-a", "entries_revision": {"revision": "revision-a"},
+            "items": [{"memory_id": "memory-a", "rank": 1, "score": 0.7,
+                       "content": {"text": "Evidence", "timings_ms": "semantic nested field"}}],
+            "query": {"context_id": "alpha"}, "timings_ms": {"embedding_ms": 1.0},
+        }
+
+    def run_query_set(self, responses: list[dict]) -> dict:
+        backend = mock.Mock(spec=measurement.FORBIDDEN_MUTATORS)
+        with mock.patch.object(measurement.evaluation, "query_call", side_effect=responses):
+            return measurement._run_query_set(
+                backend, object(), {"questions": [{"question_id": "q"}]},
+                latency_samples=len(responses) - 1, timer=_StepTimer(),
+            )
+
+    def test_timing_jitter_is_excluded_from_repeat_comparison_and_digest_only(self) -> None:
+        first = self.payload()
+        repeated = copy.deepcopy(first)
+        repeated["timings_ms"] = {"embedding_ms": 987.0, "queue_wait_ms": 12.0}
+        missing_timings = copy.deepcopy(first)
+        del missing_timings["timings_ms"]
+        result = self.run_query_set([first, repeated])
+        other = self.run_query_set([repeated, missing_timings])
+        self.assertEqual(result["semantic_payload_digest"], other["semantic_payload_digest"])
+        self.assertEqual(result["results"]["q"], first)
+        self.assertEqual(other["results"]["q"], repeated)
+        self.assertEqual(first["timings_ms"], {"embedding_ms": 1.0})
+
+    def test_semantic_nondeterminism_still_fails_for_every_contract_surface(self) -> None:
+        mutations = (
+            lambda p: p.update(retrieval_id="different"),
+            lambda p: p.update(snapshot_id="different"),
+            lambda p: p["entries_revision"].update(revision="different"),
+            lambda p: p["items"][0].update(memory_id="different"),
+            lambda p: p["items"][0].update(rank=2),
+            lambda p: p["items"][0].update(score=0.8),
+            lambda p: p["items"][0]["content"].update(text="different"),
+            lambda p: p["items"][0]["content"].update(timings_ms="different"),
+            lambda p: p["query"].update(context_id="different"),
+            lambda p: p.update(new_semantic_field=True),
+            lambda p: p.update(items={"malformed": True}),
+        )
+        for index, mutate in enumerate(mutations):
+            first = self.payload()
+            changed = copy.deepcopy(first)
+            mutate(changed)
+            with self.subTest(index=index), self.assertRaisesRegex(
+                measurement.MeasurementError, "not semantically byte-identical"
+            ):
+                self.run_query_set([first, changed])
+            # Separate fresh runs must also disagree even when each run is
+            # individually stable; this exercises the full-payload digest.
+            original = self.run_query_set([first, copy.deepcopy(first)])
+            altered = self.run_query_set([changed, copy.deepcopy(changed)])
+            self.assertNotEqual(original["semantic_payload_digest"], altered["semantic_payload_digest"])
+
+
 class LongMemV2MeasurementTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -151,9 +212,10 @@ class LongMemV2MeasurementTests(unittest.TestCase):
     def test_determinism_matrix_and_purity(self) -> None:
         determinism = self.report["aggregate"]["determinism"]
         self.assertTrue(determinism["canonical_digest_all_equal"])
-        self.assertTrue(determinism["fresh_backend_raw_equal"])
-        self.assertTrue(determinism["randomized_insertion_raw_equal"])
-        self.assertTrue(determinism["repeated_same_backend_raw_equal"])
+        self.assertTrue(determinism["fresh_backend_semantic_payload_equal"])
+        self.assertTrue(determinism["randomized_insertion_semantic_payload_equal"])
+        self.assertTrue(determinism["repeated_same_backend_semantic_payload_equal"])
+        self.assertEqual(determinism["semantic_payload_excludes"], ["timings_ms"])
         self.assertEqual(
             len(
                 {
@@ -376,6 +438,17 @@ class LongMemV2MeasurementTests(unittest.TestCase):
                 )
                 self.assertFalse(verdict["accepted"])
                 self.assertIn(expected_failure, verdict["failure_codes"])
+
+    def test_each_semantic_determinism_flag_is_enforced_by_acceptance(self) -> None:
+        for name in ("fresh_backend_semantic_payload_equal",
+                     "randomized_insertion_semantic_payload_equal",
+                     "repeated_same_backend_semantic_payload_equal"):
+            with self.subTest(name=name):
+                aggregate = copy.deepcopy(self.report["aggregate"])
+                aggregate["determinism"][name] = False
+                verdict = measurement.acceptance_verdict(aggregate, measurement.SAFE_THRESHOLDS)
+                self.assertFalse(verdict["accepted"])
+                self.assertIn("canonical-output-deterministic", verdict["failure_codes"])
 
     def test_thresholds_cannot_be_weakened_at_verdict_or_load(self) -> None:
         weakened = copy.deepcopy(self.report["thresholds"])

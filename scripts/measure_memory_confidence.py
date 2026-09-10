@@ -451,13 +451,18 @@ def run_confidence_benchmark(
 
             def timed_query(**kwargs: str) -> dict[str, Any]:
                 result: dict[str, Any] | None = None
+                reference_bytes: bytes | None = None
                 for _ in range(latency_samples):
                     started = timer()
                     observed = _retrieve(backend, **kwargs)
                     latencies.append(max(0, timer() - started) / 1_000_000.0)
+                    observed_bytes = _canonical_bytes(
+                        retrieval_measurement.semantic_retrieval_payload(observed)
+                    )
                     if result is None:
                         result = observed
-                    elif _canonical_bytes(result) != _canonical_bytes(observed):
+                        reference_bytes = observed_bytes
+                    elif reference_bytes != observed_bytes:
                         raise ConfidenceMeasurementError("repeated confidence query was not deterministic")
                 assert result is not None
                 return result
@@ -586,6 +591,7 @@ def run_confidence_benchmark(
                 },
                 "methodology": {
                     "mode": "deterministic-context-gathering-regression",
+                    "determinism_contract": "complete retrieval payload excluding only top-level timings_ms observations",
                     "evidence_qualification": "expected stable memory identity or exact fixture marker",
                     "answer_model": None,
                     "mutations": "disposable-store update, bridge approval, image derivative, and confirmed prune only",

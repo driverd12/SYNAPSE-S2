@@ -144,9 +144,10 @@ class RetrievalV2MeasurementTests(unittest.TestCase):
     def test_determinism_matrix_purity_and_over_cap_ties_are_proven(self) -> None:
         determinism = self.report["aggregate"]["determinism"]
         self.assertTrue(determinism["canonical_digest_all_equal"])
-        self.assertTrue(determinism["fresh_backend_raw_equal"])
-        self.assertTrue(determinism["randomized_insertion_raw_equal"])
-        self.assertTrue(determinism["repeated_same_backend_raw_equal"])
+        self.assertEqual(determinism["semantic_payload_excludes"], ["timings_ms"])
+        self.assertTrue(determinism["fresh_backend_semantic_payload_equal"])
+        self.assertTrue(determinism["randomized_insertion_semantic_payload_equal"])
+        self.assertTrue(determinism["repeated_same_backend_semantic_payload_equal"])
         self.assertEqual(
             len(
                 {

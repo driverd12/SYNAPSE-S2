@@ -11728,7 +11728,7 @@ class DurableMemoryStore:
             *clean_query_spikes,
             candidate_limit,
         ]
-        candidates: list[dict[str, Any]] = []
+        ranked_rows: list[tuple[dict[str, Any], sqlite3.Row, float]] = []
         try:
             with self._read_connection_scope(_conn) as conn:
                 # Aggregate narrow index rows before loading entry payloads.
@@ -11770,36 +11770,66 @@ class DurableMemoryStore:
             raise
         query_spike_set = set(clean_query_spikes)
         for row in rows:
-            entry = self._row_to_entry(row)
-            trace_spikes = set(int(idx) for idx in entry["spike_indices"])
+            # Rank using precisely the same scalar/index conversions as
+            # _row_to_entry. Source bodies and nested metadata do not affect
+            # this score, so redact/materialize them only for selected rows.
+            # Keep the original bounded source window and tie order intact.
+            memory_id = redact_capture_text(str(row["memory_id"]))[0]
+            context = redact_capture_text(str(row["context_id"]))[0]
+            updated_at = float(row["updated_at"])
+            int(row["embedding_dimensions"])
+            float(row["created_at"])
+            trace_spikes = {
+                int(idx)
+                for idx in _decode_json(str(row["spike_indices_json"]), [])
+            }
+            neuron_indices = [
+                int(idx)
+                for idx in _decode_json(str(row["neuron_indices_json"]), [])
+            ]
             if not trace_spikes:
                 continue
             overlap = int(row["overlap_count"])
-            union = len(query_spike_set | trace_spikes)
+            # Keep the denominator based on the stored trace itself: damaged
+            # derived index rows can disagree with the SQL overlap numerator.
+            trace_overlap = len(query_spike_set & trace_spikes)
+            union = len(query_spike_set) + len(trace_spikes) - trace_overlap
             jaccard = overlap / max(1, union)
             if jaccard <= 0.0:
                 continue
             neuron_activity = 0.0
-            for neuron_idx in entry["neuron_indices"]:
+            for neuron_idx in neuron_indices:
                 idx = int(neuron_idx)
                 if 0 <= idx < len(firing_values):
                     neuron_activity += float(firing_values[idx])
             activity_bonus = min(
-                neuron_activity / max(1, len(entry["neuron_indices"])),
+                neuron_activity / max(1, len(neuron_indices)),
                 1.0,
             )
-            candidate = dict(entry)
-            candidate["score"] = round(float(jaccard + 0.05 * activity_bonus), 6)
-            candidate.update(scope_by_context.get(str(entry["context_id"]), {}))
-            candidates.append(candidate)
-        candidates.sort(
+            score = round(float(jaccard + 0.05 * activity_bonus), 6)
+            ranking_fields = {
+                "score": score,
+                "updated_at": updated_at,
+                "memory_id": memory_id,
+            }
+            # Preserve explicit scope-record overrides, including their
+            # historical effect on ordering, before applying the final limit.
+            ranking_fields.update(scope_by_context.get(context, {}))
+            ranked_rows.append((ranking_fields, row, score))
+        ranked_rows.sort(
             key=lambda item: (
-                -float(item["score"]),
-                -float(item["updated_at"]),
-                str(item["memory_id"]),
+                -float(item[0]["score"]),
+                -float(item[0]["updated_at"]),
+                str(item[0]["memory_id"]),
             )
         )
-        return candidates[:bounded_limit]
+        candidates: list[dict[str, Any]] = []
+        for _ranking_fields, row, score in ranked_rows[:bounded_limit]:
+            entry = self._row_to_entry(row)
+            entry["score"] = score
+            entry.update(scope_by_context.get(str(entry["context_id"]), {}))
+            candidates.append(entry)
+        return candidates
 
     def surface_recall_candidates(
         self,
@@ -12559,6 +12589,110 @@ class DurableMemoryStore:
                 }
             )
         return records
+
+    def list_image_memories(
+        self,
+        *,
+        context_id: str = "default",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Project typed image memories from exactly one namespace.
+
+        Text memories never consume the image limit. SQL projects only bounded
+        scalar gallery fields, so source bodies, vectors and arbitrary metadata
+        never cross this reader. Malformed identities are skipped; malformed
+        optional display fields use safe defaults. No total/error count scan is
+        required. One extra distinct media ID establishes has_more.
+        """
+        context = self._canonical_retrieval_context_ids([context_id])[0]
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("image memory limit must be an integer between 1 and 200")
+        with closing(self._connect_read_only()) as conn:
+            rows = conn.execute(
+                """
+                WITH image_rows AS (
+                    SELECT memory_id, tag, created_at, updated_at,
+                        CASE WHEN json_valid(metadata_json)
+                            THEN metadata_json ELSE '{}' END AS image_json
+                    FROM memory_entries
+                    WHERE context_id = ?
+                ), fields AS (
+                    SELECT memory_id,
+                        json_extract(image_json, '$.media_id') AS media_id,
+                        CASE
+                            WHEN json_type(image_json, '$.display_label') = 'text'
+                                AND length(json_extract(image_json, '$.display_label')) BETWEEN 1 AND 512
+                            THEN json_extract(image_json, '$.display_label')
+                            WHEN json_type(image_json, '$.title') = 'text'
+                                AND length(json_extract(image_json, '$.title')) BETWEEN 1 AND 512
+                            THEN json_extract(image_json, '$.title')
+                            WHEN length(tag) BETWEEN 1 AND 512 THEN tag
+                            ELSE 'Image memory'
+                        END AS display_label,
+                        CASE WHEN typeof(created_at) IN ('integer', 'real')
+                            AND created_at BETWEEN 0 AND 253402300799
+                            THEN created_at ELSE 0.0 END AS created_at,
+                        CASE WHEN typeof(updated_at) IN ('integer', 'real')
+                            AND updated_at BETWEEN 0 AND 253402300799
+                            THEN updated_at ELSE 0.0 END AS updated_at,
+                        CASE WHEN json_type(image_json, '$.thumbnail_dimensions.width') = 'integer'
+                            AND json_extract(image_json, '$.thumbnail_dimensions.width') BETWEEN 1 AND 320
+                            THEN json_extract(image_json, '$.thumbnail_dimensions.width')
+                            ELSE 0 END AS thumbnail_width,
+                        CASE WHEN json_type(image_json, '$.thumbnail_dimensions.height') = 'integer'
+                            AND json_extract(image_json, '$.thumbnail_dimensions.height') BETWEEN 1 AND 320
+                            THEN json_extract(image_json, '$.thumbnail_dimensions.height')
+                            ELSE 0 END AS thumbnail_height
+                    FROM image_rows
+                    WHERE json_type(image_json) = 'object'
+                        AND json_extract(image_json, '$.context_memory_type') = 'image'
+                        AND json_type(image_json, '$.media_id') = 'text'
+                        AND length(memory_id) = 35
+                        AND substr(memory_id, 1, 3) = 's2_'
+                        AND substr(memory_id, 4) NOT GLOB '*[^0-9a-f]*'
+                ), ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY media_id ORDER BY updated_at DESC, memory_id DESC
+                    ) AS media_rank
+                    FROM fields
+                    WHERE length(media_id) = 38
+                        AND substr(media_id, 1, 6) = 's2img_'
+                        AND substr(media_id, 7) NOT GLOB '*[^0-9a-f]*'
+                )
+                SELECT memory_id, media_id, display_label, created_at,
+                    thumbnail_width, thumbnail_height
+                FROM ranked
+                WHERE media_rank = 1
+                ORDER BY updated_at DESC, memory_id DESC
+                LIMIT ?
+                """,
+                (context, limit + 1),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows[:limit]:
+            label = redact_capture_text(str(row["display_label"]))[0]
+            label = " ".join(label.split())
+            label = label.encode("utf-8")[:256].decode("utf-8", errors="ignore")
+            items.append({
+                "memory_id": str(row["memory_id"]),
+                "media_id": str(row["media_id"]),
+                "display_label": label or "Image memory",
+                "created_at": float(row["created_at"]),
+                "capture_kind": "image",
+                "thumbnail_width": int(row["thumbnail_width"]),
+                "thumbnail_height": int(row["thumbnail_height"]),
+                "cache_authoritative": False,
+            })
+        return {
+            "schema": "synapse-s2.image-memory-gallery.v2",
+            "context_id": context,
+            "items": items,
+            "item_count": len(items),
+            "limit": limit,
+            "has_more": len(rows) > limit,
+            "authoritative": True,
+            "thumbnail_cache_authoritative": False,
+        }
 
     def list_media_references(
         self,

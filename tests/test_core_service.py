@@ -1380,6 +1380,11 @@ class CoreServiceTests(unittest.TestCase):
         health = self.harness.client(caller="health-client").health(timeout_seconds=1.0)
         self.assertLess(time.monotonic() - started, 0.75)
         self.assertTrue(health["ready"])
+        self.assertEqual(health["process_memory"]["pid"], os.getpid())
+        self.assertEqual(health["evidence_max_age_ms"], 15_000)
+        self.assertLess(
+            abs(int(time.time() * 1000) - health["observed_at_unix_ms"]), 2_000
+        )
         self.assertEqual(self.harness.backend.maximum_active_handlers, 1)
         self.harness.backend.block_release.set()
         first.join(3.0)
@@ -3042,6 +3047,66 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=5.0)
 
+    def test_image_gallery_is_bounded_scoped_and_never_admitted_to_mutation_journal(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self.config(Path(temporary))
+            service = AuthoritativeCoreService(config)
+            failures: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    service.serve_forever()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not config.socket_path.exists():
+                if failures:
+                    break
+                time.sleep(0.02)
+            try:
+                self.assertEqual(failures, [])
+                client = CoreClient(socket_path=config.socket_path, caller="image-gallery-test")
+                media_id = "s2img_" + "a" * 32
+                for context in ("ops", "other", "global"):
+                    client.register_text_trace(
+                        tag="gallery-fixture", text="Private image source that must not leave the gallery API.",
+                        context_id=context, metadata={
+                            "context_memory_type": "image", "media_id": media_id,
+                            "display_label": "Control room diagram",
+                            "thumbnail_dimensions": {"width": 320, "height": 180},
+                        },
+                    )
+                with mock.patch.object(service, "_journal_accept", wraps=service._journal_accept) as journal_accept:
+                    result = client.call(
+                        "list_image_memories", {"context_id": "ops", "limit": 200},
+                        request_id="req-image-gallery-read-only",
+                    )
+                    request_status = client.request_status(
+                        caller=client.delivery_instance_id, request_id="req-image-gallery-read-only",
+                    )
+                journal_accept.assert_not_called()
+                self.assertFalse(request_status["known"])
+                self.assertEqual(result["schema"], "synapse-s2.image-memory-gallery.v2")
+                self.assertEqual(result["context_id"], "ops")
+                self.assertEqual(result["item_count"], 1)
+                self.assertEqual(result["items"][0]["media_id"], media_id)
+                self.assertEqual(result["items"][0]["display_label"], "Control room diagram")
+                self.assertEqual(result["items"][0]["thumbnail_width"], 320)
+                self.assertEqual(result["items"][0]["thumbnail_height"], 180)
+                self.assertNotIn("Private image source", json.dumps(result))
+                self.assertEqual(set(result["items"][0]), {
+                    "memory_id", "media_id", "display_label", "created_at", "capture_kind",
+                    "thumbnail_width", "thumbnail_height", "cache_authoritative",
+                })
+                self.assertLess(len(json.dumps(result).encode()), config.max_frame_bytes)
+                self.assertEqual(client.list_image_memories(context_id="missing")["item_count"], 0)
+            finally:
+                service.close()
+                thread.join(timeout=5.0)
+
     def test_retrieval_v2_is_structured_and_never_admitted_to_mutation_journal(
         self,
     ) -> None:
@@ -3100,11 +3165,19 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                     "candidate_limit": 8,
                     "include_graph_neighbors": False,
                 }
+                acquire_lane = service._acquire_backend_lane
+
+                def delayed_lane(**kwargs):
+                    time.sleep(0.02)
+                    return acquire_lane(**kwargs)
+
                 with mock.patch.object(
                     service,
                     "_journal_accept",
                     wraps=service._journal_accept,
-                ) as journal_accept:
+                ) as journal_accept, mock.patch.object(
+                    service, "_acquire_backend_lane", side_effect=delayed_lane
+                ):
                     result = client.call(
                         "retrieve_text_v2",
                         arguments,
@@ -3120,6 +3193,10 @@ class RealBackendCoreIntegrationTests(unittest.TestCase):
                 self.assertFalse(request_status["known"])
                 self.assertEqual(request_status["state"], "not_found")
                 handler.assert_called_once_with(**arguments)
+                self.assertIsInstance(result["timings_ms"]["queue_wait_ms"], float)
+                self.assertGreaterEqual(result["timings_ms"]["queue_wait_ms"], 20.0)
+                self.assertGreater(result["timings_ms"]["serialization_ms"], 0.0)
+                self.assertGreater(result["timings_ms"]["embedding_ms"], 0.0)
                 self.assertEqual(result["schema"], "synapse-retrieval.v2")
                 self.assertEqual(result["schema_version"], 2)
                 self.assertEqual(result["query"]["context_id"], "ops")

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 from scripts import measure_memory_confidence as measurement
 
@@ -174,6 +175,50 @@ class MemoryConfidenceMeasurementTests(unittest.TestCase):
             measurement._canonical_bytes(self.report),
             measurement._canonical_bytes(repeated),
         )
+
+    def test_timing_jitter_is_observational_and_never_changes_evidence(self) -> None:
+        retrieve = measurement._retrieve
+        observations = []
+
+        def observed(*args, **kwargs):
+            result = retrieve(*args, **kwargs)
+            result["timings_ms"] = {"embedding_ms": float(len(observations) * 17)}
+            observations.append(result)
+            return result
+
+        with mock.patch.object(measurement, "_retrieve", side_effect=observed):
+            result = measurement.run_confidence_benchmark(
+                latency_samples=2, timer=_StepTimer(), code_commit="deadbeef",
+            )
+        self.assertEqual(measurement._canonical_bytes(result), measurement._canonical_bytes(self.report))
+        self.assertGreater(len(observations), 2)
+        self.assertNotEqual(observations[0]["timings_ms"], observations[1]["timings_ms"])
+        self.assertIn("only top-level timings_ms", result["methodology"]["determinism_contract"])
+
+    def test_changed_semantics_still_fail_before_grading(self) -> None:
+        first = {
+            "retrieval_id": "a", "snapshot_id": "snapshot-a",
+            "query": {"context_id": "alpha"},
+            "items": [{"memory_id": "a", "score": 0.5, "content": {"timings_ms": "semantic"}}],
+            "timings_ms": {"embedding_ms": 1.0},
+        }
+        mutations = (
+            lambda p: p.update(retrieval_id="different"),
+            lambda p: p.update(snapshot_id="different"),
+            lambda p: p["query"].update(context_id="different"),
+            lambda p: p["items"][0].update(memory_id="different"),
+            lambda p: p["items"][0].update(score=0.9),
+            lambda p: p["items"][0]["content"].update(timings_ms="different"),
+            lambda p: p.update(new_semantic_field=True),
+            lambda p: p.update(items={"malformed": True}),
+        )
+        for index, mutate in enumerate(mutations):
+            changed = copy.deepcopy(first)
+            mutate(changed)
+            with self.subTest(index=index), mock.patch.object(
+                measurement, "_retrieve", side_effect=[copy.deepcopy(first), changed]
+            ), self.assertRaisesRegex(measurement.ConfidenceMeasurementError, "not deterministic"):
+                measurement.run_confidence_benchmark(latency_samples=2, timer=_StepTimer())
 
     def test_invalid_measurement_bounds_fail_before_execution(self) -> None:
         with self.assertRaises(measurement.ConfidenceMeasurementError):

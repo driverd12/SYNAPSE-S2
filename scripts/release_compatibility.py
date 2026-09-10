@@ -467,6 +467,7 @@ TRUSTED_MANIFEST = (
     "media_similarity.py",
     "memora_governance.py",
     "memora_shadow.py",
+    "process_metrics.py",
     "memory_store.py",
     "mlx_backend.py",
     "native/apple_vision_enrich.swift",
@@ -489,7 +490,7 @@ _MANIFEST_NAME = "BUILD_SOURCE_MANIFEST"
 # Bounds on candidate core_service.py analysis, with generous headroom
 # over the trusted source (restated from the planner).
 MAX_MANIFEST_SOURCE_BYTES = 2 * 1024 * 1024
-MAX_MANIFEST_SOURCE_TOKENS = 160_000
+MAX_MANIFEST_SOURCE_TOKENS = 164_000
 
 _DYNAMIC_NAMESPACE_BUILTINS = frozenset(
     (
@@ -554,6 +555,7 @@ PRODUCT_INVENTORY = (
     ("operator-docs", "policy-doc", "docs/AUTHORITATIVE_CORE_OPERATIONS.md"),
     ("operator-docs", "policy-doc", "docs/BRIDGE_GOVERNANCE.md"),
     ("operator-docs", "doc", "docs/CURRENT_STATUS.md"),
+    ("operator-docs", "doc", "docs/ENHANCEMENT_RELEASE_20260910.md"),
     ("operator-docs", "policy-doc", "docs/EXACTLY_ONCE_CAPTURE.md"),
     ("operator-docs", "doc", "docs/FRONTIER_ENHANCEMENTS.md"),
     ("operator-docs", "doc", "docs/HARMONIC_MEMORY.md"),
@@ -615,6 +617,7 @@ PRODUCT_INVENTORY = (
     ("core", "code", "embedding_providers.py"),
     ("core", "code", "event_segmenter.py"),
     ("core", "code", "harmonic_memory.py"),
+    ("dashboard", "code", "hygiene_scan.py"),
     ("core", "code", "image_capture.py"),
     ("core", "code", "impact_metrics.py"),
     ("support-tools", "support-tool", "longmem_eval.py"),
@@ -625,6 +628,7 @@ PRODUCT_INVENTORY = (
     ("core", "code", "memora_shadow.py"),
     ("core", "code", "memory_store.py"),
     ("core", "code", "mlx_backend.py"),
+    ("dashboard", "code", "namespace_enrichment.py"),
     ("native", "native-source", "native/apple_vision_enrich.swift"),
     ("official-longmem", "eval-adapter", "official_longmem/__init__.py"),
     ("official-longmem", "eval-adapter", "official_longmem/bootstrap.py"),
@@ -634,6 +638,7 @@ PRODUCT_INVENTORY = (
         "official_longmem/synapse_s2_memory.py",
     ),
     ("core", "code", "operator_readiness_contract.py"),
+    ("core", "code", "process_metrics.py"),
     (
         "operator-manual",
         "manual-asset",
@@ -716,6 +721,7 @@ PRODUCT_INVENTORY = (
     ("support-tools", "support-tool", "scripts/measure_longmem_v2.py"),
     ("support-tools", "support-tool", "scripts/measure_memory_confidence.py"),
     ("support-tools", "support-tool", "scripts/measure_retrieval_v2.py"),
+    ("support-tools", "support-tool", "scripts/benchmark_recall.py"),
     ("support-tools", "support-tool", "scripts/measure_token_contracts.py"),
     ("operator-scripts", "operator-script", "scripts/open_dashboard.py"),
     (
@@ -784,6 +790,7 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_argparse_security.py"),
     ("tests", "test", "tests/test_backend.py"),
     ("tests", "test", "tests/test_backend_routing.py"),
+    ("tests", "test", "tests/test_benchmark_recall.py"),
     ("tests", "test", "tests/test_backup_recovery.py"),
     ("tests", "test", "tests/test_bridge_governance.py"),
     ("tests", "test", "tests/test_capture_daemon.py"),
@@ -804,6 +811,8 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_core_request_journal.py"),
     ("tests", "test", "tests/test_core_service.py"),
     ("tests", "test", "tests/test_dashboard_memora.py"),
+    ("tests", "test", "tests/test_dashboard_analysis.py"),
+    ("tests", "test", "tests/test_dashboard_refresh_behavior.cjs"),
     ("tests", "test", "tests/test_dashboard_open.py"),
     ("tests", "test", "tests/test_dashboard_server.py"),
     ("tests", "test", "tests/test_dashboard_smoke.py"),
@@ -811,7 +820,9 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_embedding_providers.py"),
     ("tests", "test", "tests/test_event_segmenter.py"),
     ("tests", "test", "tests/test_harmonic_memory.py"),
+    ("tests", "test", "tests/test_hygiene_scan.py"),
     ("tests", "test", "tests/test_image_capture.py"),
+    ("tests", "test", "tests/test_image_memory_listing.py"),
     ("tests", "test", "tests/test_impact_metrics.py"),
     ("tests", "test", "tests/test_installed_layout.py"),
     ("tests", "test", "tests/test_launch_agent_installers.py"),
@@ -828,11 +839,14 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_memory_confidence_measurement.py"),
     ("tests", "test", "tests/test_memory_store.py"),
     ("tests", "test", "tests/test_memory_store_atomicity.py"),
+    ("tests", "test", "tests/test_namespace_enrichment.py"),
     ("tests", "test", "tests/test_official_longmem_adapter.py"),
     ("tests", "test", "tests/test_official_longmem_runner_stage1a.py"),
     ("tests", "test", "tests/test_operational_scripts.py"),
     ("tests", "test", "tests/test_operator_readiness_certifier.py"),
+    ("tests", "test", "tests/test_process_metrics.py"),
     ("tests", "test", "tests/test_purge_namespaces.py"),
+    ("tests", "test", "tests/test_recall_candidate_query.py"),
     ("tests", "test", "tests/test_recovery_route_surfaces.py"),
     ("tests", "test", "tests/test_redaction.py"),
     ("tests", "test", "tests/test_release_activation_journal.py"),
@@ -850,6 +864,8 @@ PRODUCT_INVENTORY = (
     ("tests", "test", "tests/test_release_update_orchestrator.py"),
     ("tests", "test", "tests/test_release_update_plan.py"),
     ("tests", "test", "tests/test_replacement_admission.py"),
+    ("tests", "test", "tests/test_request_journal_reconciliation_feature.py"),
+    ("tests", "test", "tests/test_stranded_accepted_prune_reconciliation.py"),
     ("tests", "test", "tests/test_replication.py"),
     ("tests", "test", "tests/test_response_contract.py"),
     ("tests", "test", "tests/test_retrieval_cursor.py"),

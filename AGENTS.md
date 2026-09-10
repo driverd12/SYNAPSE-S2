@@ -38,10 +38,15 @@ When a session produces useful project memory, capture a concise factual session
   --tag codex-session \
   --speaker codex \
   --text "<factual decisions, implementation details, validation evidence, and follow-up constraints>"
-.venv/bin/python synapse_cli.py --json capture-inbox-process
+.venv/bin/python synapse_cli.py --json capture-inbox-status
 ```
 
-If the capture sidecar is not running or you need immediate synchronous capture, use the direct path:
+On authoritative v6, the core's embedded worker owns inbox processing. Observe
+its drain with `capture-inbox-status`; do not run a competing
+`capture-inbox-process`, MCP one-shot, or dashboard manual drain. Manual inbox
+processing is only available to a local-v5 backend, with explicit confirmation.
+
+If you need immediate synchronous capture through the current backend, use the direct path:
 
 ```bash
 .venv/bin/python synapse_cli.py --json capture-session \
@@ -50,6 +55,11 @@ If the capture sidecar is not running or you need immediate synchronous capture,
   --speaker codex \
   --text "<factual decisions, implementation details, validation evidence, and follow-up constraints>"
 ```
+
+If capture returns `outcome_unknown`, preserve the payload and its validated
+`reconciliation` handle (`caller`, `request_id`, `operation`, `replay_safe`).
+Use that exact identity for request-status inspection; never infer success or
+retry solely from a timeout or a missing transport receipt.
 
 For new topics, threads, or feature work, make the namespace explicit in the capture text when possible. Use short prefixes such as `Thread:`, `Feature:`, `Goal:`, `Objective:`, and `Event:` so SYNAPSE-S2 creates typed namespace nodes and temporal event relationships automatically.
 

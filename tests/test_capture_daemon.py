@@ -7,6 +7,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import capture_daemon
@@ -20,7 +21,7 @@ from capture_daemon import (
     release_capture_replacement_freeze,
     write_capture_drop,
 )
-from core_client import CoreOutcomeUnknown, CoreUnavailable
+from core_client import CoreClient, CoreOutcomeUnknown, CoreUnavailable
 from mlx_backend import SpikingAttentionBackend
 
 
@@ -134,6 +135,95 @@ class FailProcessedMoveOnceDaemon(CaptureInboxDaemon):
 
 
 class CaptureInboxDaemonTests(unittest.TestCase):
+    def test_core_client_processing_is_rejected_before_transport_or_rpc(self):
+        for queued in (False, True):
+            with self.subTest(queued=queued), TemporaryDirectory() as tmp:
+                root = Path(tmp) / "capture"
+                client = CoreClient(
+                    socket_path=Path(tmp) / "core" / "service.sock",
+                    state_path=Path(tmp) / "runtime_state.json",
+                )
+                daemon = CaptureInboxDaemon(root=root, backend=client)
+                drop = (
+                    write_capture_drop(root=root, text="Preserve this queued capture.")
+                    if queued else None
+                )
+                before = drop.read_bytes() if drop else None
+                with (
+                    patch.object(daemon, "_ensure_transport_dirs") as ensure,
+                    patch.object(daemon, "_exclusive_lock") as lock,
+                    patch.object(daemon, "_claim_inbox_file") as claim,
+                    patch.object(client, "call") as rpc,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "embedded capture worker"):
+                        daemon.process_once()
+                ensure.assert_not_called()
+                lock.assert_not_called()
+                claim.assert_not_called()
+                rpc.assert_not_called()
+                if drop:
+                    self.assertEqual(drop.read_bytes(), before)
+                    self.assertFalse((root / "capture_processing").exists())
+                    self.assertFalse((root / "capture_errors").exists())
+                else:
+                    self.assertFalse(root.exists())
+
+    def test_lazy_service_route_is_rejected_without_constructing_backend(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "capture"
+            daemon = CaptureInboxDaemon(root=root)
+            with (
+                patch("backend_router.resolve_backend_route", return_value=SimpleNamespace(mode="service")) as route,
+                patch.object(capture_daemon.mlx_backend, "get_backend") as backend,
+                patch.object(daemon, "_ensure_transport_dirs") as ensure,
+                patch.object(daemon, "_exclusive_lock") as lock,
+                patch.object(daemon, "_claim_inbox_file") as claim,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "embedded capture worker"):
+                    daemon.process_once()
+            route.assert_called_once_with(capture_root=root.resolve())
+            backend.assert_not_called()
+            ensure.assert_not_called()
+            lock.assert_not_called()
+            claim.assert_not_called()
+            self.assertFalse(root.exists())
+
+    def test_lazy_factory_core_client_is_rejected_before_lock_or_claim(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = CoreClient(socket_path=root / "core" / "service.sock")
+            drop = write_capture_drop(root=root, text="A newly discovered core owns this drop.")
+            before = drop.read_bytes()
+            daemon = CaptureInboxDaemon(root=root)
+            with (
+                patch("backend_router.resolve_backend_route", return_value=SimpleNamespace(mode="local")),
+                patch.object(capture_daemon.mlx_backend, "get_backend", return_value=client) as backend,
+                patch.object(daemon, "_exclusive_lock") as lock,
+                patch.object(daemon, "_claim_inbox_file") as claim,
+                patch.object(client, "call") as rpc,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "embedded capture worker"):
+                    daemon.process_once()
+            backend.assert_called_once_with()
+            lock.assert_not_called()
+            claim.assert_not_called()
+            rpc.assert_not_called()
+            self.assertEqual(drop.read_bytes(), before)
+            self.assertEqual(list((root / "capture_processing").iterdir()), [])
+            self.assertEqual(list((root / "capture_errors").iterdir()), [])
+
+    def test_empty_local_v5_processing_keeps_backend_lazy(self):
+        with TemporaryDirectory() as tmp:
+            daemon = CaptureInboxDaemon(root=Path(tmp))
+            with (
+                patch("backend_router.resolve_backend_route", return_value=SimpleNamespace(mode="local")),
+                patch.object(capture_daemon.mlx_backend, "get_backend") as backend,
+            ):
+                result = daemon.process_once()
+            backend.assert_not_called()
+            self.assertEqual(result["processed_file_count"], 0)
+            self.assertEqual(result["error_file_count"], 0)
+
     def test_first_use_backend_initialization_occurs_outside_capture_lock(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1838,6 +1928,8 @@ class CaptureInboxDaemonTests(unittest.TestCase):
                 )
             )
             daemon = CaptureInboxDaemon(root=root, backend=backend)
+            backend.error.request_body = "MUST_NOT_SERIALIZE_BODY"
+            backend.error.token = "MUST_NOT_SERIALIZE_TOKEN"
             write_capture_drop(
                 root=root,
                 text="An ambiguous submission must not be blindly replayed.",
@@ -1845,17 +1937,69 @@ class CaptureInboxDaemonTests(unittest.TestCase):
 
             result = daemon.process_once()
             status = daemon.status()
+            evidence = json.loads(next((root / "capture_errors").glob("capture-error-*.json")).read_text())
             retry = daemon.process_once()
 
         self.assertEqual(result["processed_file_count"], 0)
         self.assertEqual(result["error_file_count"], 1)
         self.assertEqual(result["deferred_file_count"], 0)
         self.assertEqual(result["errors"][0]["error"], "outcome_unknown")
+        expected_reconciliation = {
+            "code": "outcome_unknown",
+            "caller": "capture-test",
+            "request_id": "req-capture-ambiguous",
+            "operation": "capture_conversation",
+            "replay_safe": False,
+        }
+        self.assertEqual(result["errors"][0]["reconciliation"], expected_reconciliation)
+        self.assertEqual(evidence["reconciliation"], expected_reconciliation)
+        self.assertNotIn("MUST_NOT_SERIALIZE", json.dumps(evidence))
         self.assertGreater(status["unresolved_error_count"], 0)
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(len(backend.effects), 0)
         self.assertEqual(retry["processed_file_count"], 0)
         self.assertEqual(retry["error_file_count"], 0)
+
+    def test_unknown_capture_rejects_malformed_or_forged_reconciliation(self):
+        for failure_kind in ("invalid_caller", "extra_fields", "wrong_exception"):
+            with self.subTest(failure_kind=failure_kind), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                error = CoreOutcomeUnknown(
+                    caller="capture-test",
+                    request_id="req-capture-ambiguous",
+                    operation="capture_conversation",
+                )
+                secret = "sk-" + "SYNTHETICSECRET" * 3
+                if failure_kind == "invalid_caller":
+                    error.caller = secret
+                elif failure_kind == "extra_fields":
+                    class ExtraFieldsError(CoreOutcomeUnknown):
+                        @property
+                        def reconciliation(self):
+                            return {**super().reconciliation, "request_body": secret}
+                    error = ExtraFieldsError(
+                        caller="capture-test", request_id="req-extra-fields",
+                        operation="capture_conversation",
+                    )
+                else:
+                    error = RuntimeError("outcome_unknown")
+                    error.reconciliation = {
+                        "code": "outcome_unknown", "caller": "capture-test",
+                        "request_id": "req-forged", "operation": "capture_conversation",
+                        "replay_safe": False,
+                    }
+                backend = RecordingBackend(error=error)
+                daemon = CaptureInboxDaemon(root=root, backend=backend)
+                write_capture_drop(root=root, text="Uncertainty must retain safe evidence.")
+                result = daemon.process_once()
+                evidence = json.loads(next((root / "capture_errors").glob("capture-error-*.json")).read_text())
+                retry = daemon.process_once()
+                self.assertEqual(result["error_file_count"], 1)
+                self.assertEqual(evidence["error"], "outcome_unknown")
+                self.assertNotIn("reconciliation", evidence)
+                self.assertNotIn(secret, json.dumps(evidence))
+                self.assertEqual(len(backend.calls), 1)
+                self.assertEqual(retry["processed_file_count"], 0)
 
     def test_legacy_jsonl_ids_are_unique_and_persisted_before_effect(self):
         with TemporaryDirectory() as tmp:

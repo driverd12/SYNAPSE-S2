@@ -133,6 +133,21 @@ class RetrievalPaginationIntegrationTests(unittest.TestCase):
             return projected["data"]["entries"]
         return projected["data"]["payload"]["entries"]
 
+    def test_excluding_global_inheritance_keeps_explicit_global_origin(self) -> None:
+        self._seed_memory_scope()
+        for mode in ("legacy", "compact", "full"):
+            for context in ("alpha", "global"):
+                with self.subTest(mode=mode, context=context):
+                    result = self.backend.list_memory(
+                        context_id=context, limit=50, include_global=False,
+                        include_vectors=False, recall_scope="local", response_mode=mode,
+                    )
+                    self.assertEqual({row["context_id"] for row in result["entries"]}, {context})
+                    self.assertEqual(len(result["entries"]), 3 if context == "alpha" else 2)
+                    if mode != "legacy":
+                        self.assertEqual(result["_retrieval_page"]["returned"]["entries"], len(result["entries"]))
+                        self.assertFalse(result["_retrieval_page"]["has_more"])
+
     def test_memory_cursor_traversal_has_no_duplicates_or_skips_in_compact_and_full_modes(
         self,
     ) -> None:

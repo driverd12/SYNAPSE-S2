@@ -171,8 +171,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(SynapseDashboardServer.request_queue_size, 16)
         self.assertTrue(SynapseDashboardServer.daemon_threads)
 
-        class RuntimeProbe:
+        class RuntimeProbe(DashboardRuntime):
             def __init__(self) -> None:
+                super().__init__(backend=object())
                 self.lock = threading.Lock()
                 self.active = 0
                 self.peak = 0
@@ -206,8 +207,9 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.peak, 1)
 
     def test_core_health_bypasses_dashboard_runtime_lock(self):
-        class RuntimeProbe:
+        class RuntimeProbe(DashboardRuntime):
             def __init__(self) -> None:
+                super().__init__(backend=object())
                 self.lock = threading.Lock()
                 self.active = 0
                 self.peak = 0
@@ -1164,6 +1166,8 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertFalse(hygiene["scan_complete"])
         self.assertEqual(hygiene["scan_limit"], 250)
         self.assertEqual(hygiene["backlog_count"], 250)
+        self.assertEqual(hygiene["status"], "degraded")
+        self.assertFalse(hygiene["core_availability_assessed"])
         self.assertEqual(len(hygiene["review_items"]), 8)
         self.assertEqual(backend.list_memory.call_count, 5)
         for call in backend.list_memory.call_args_list:
@@ -1620,12 +1624,14 @@ class DashboardRuntimeTests(unittest.TestCase):
                 )
             )
             linked_status, linked_payload = self.decode(
-                runtime.handle("GET", "/api/namespace-map?context_id=demo")
+                runtime.handle("GET", "/api/namespace-map?context_id=demo&include_density_metrics=true")
             )
 
         self.assertEqual(map_status, 200)
         self.assertEqual(map_payload["scope"], "all")
         self.assertEqual(map_payload["selected_context_id"], "demo")
+        self.assertFalse(map_payload["density_metrics_included"])
+        self.assertEqual(map_payload["suggestions"], [])
         self.assertEqual(
             {node["context_id"] for node in map_payload["nodes"]},
             {"camera-work", "demo"},
@@ -2491,7 +2497,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("Remember + publish", index)
         self.assertIn("Ingest + publish", index)
         self.assertIn("Capture conversation", index)
-        self.assertIn("Magic Capture", index)
+        self.assertIn("Capture queue", index)
         self.assertIn("captureInboxButton", index)
         self.assertIn("captureInboxState", index)
         self.assertIn("imageCaptureForm", index)
@@ -2726,7 +2732,7 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("/api/capture-conversation", app)
         self.assertIn("/api/prune-memory", app)
         self.assertIn("/api/capture-inbox", app)
-        self.assertIn("/api/capture-inbox/preflight", app)
+        self.assertNotIn("/api/capture-inbox/process", app)
         self.assertIn("/api/apps", app)
         self.assertIn("/api/app-connect", app)
         self.assertIn("/api/app-connect/preflight", app)
@@ -2952,9 +2958,6 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn('document.addEventListener("visibilitychange"', app)
         self.assertIn('"Namespace Galaxy stale"', app)
         self.assertIn('requestJson("/api/core-health", { timeoutMs: 3000 })', app)
-        self.assertIn('maintenance ? "MAINTENANCE" : ready ? "READY" : "OFFLINE"', app)
-        self.assertIn('elements.sidebarStatus.textContent = "OPERATIONAL"', app)
-        self.assertIn('hasLastGood ? "STALE" : "OFFLINE"', app)
         self.assertIn("CORE_HEALTH_VISIBLE_REFRESH_MS", app)
         self.assertIn("state.coreHealth.latest?.backend_lane?.accepting_ordinary_operations === false", app)
         self.assertIn('"Namespace Galaxy waiting"', app)
@@ -2967,7 +2970,6 @@ class DashboardRuntimeTests(unittest.TestCase):
         self.assertIn("galaxy.requestPending", app)
         self.assertIn("DOCTOR_REQUEST_TIMEOUT_MS = 20000", app)
         self.assertIn("timeoutMs: DOCTOR_REQUEST_TIMEOUT_MS", app)
-        self.assertIn("governedPairs", app)
         self.assertIn("Deep integrity scan started", app)
         self.assertIn('id="deepDoctorReportButton"', index)
         mutation_start = app.index("async function requestJson")

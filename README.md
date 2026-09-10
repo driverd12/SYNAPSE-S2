@@ -2,7 +2,9 @@
 
 SYNAPSE-S2 (Synaptic Plasticity & Spiking Encoding via S2) is an Apple Silicon-optimized Model Context Protocol (MCP) server. It provides local large language models (LLMs) with high-efficiency, associative memory capabilities using a persistent, biologically grounded Spiking Neural Network (SNN) substrate.
 
-Traditional transformer self-attention forms a dense token-token score matrix for every layer and attention head, so the attention logits and probabilities scale as `O(N^2)` in sequence length `N`. SYNAPSE-S2 does not materialize that per-request all-pairs attention matrix during recall. It projects local embeddings into sparse spike sets, runs bounded recurrent Leaky Integrate-and-Fire (LIF) dynamics, and stores learned co-activation structure in durable sparse spike, surface-term, relationship, and synaptic indexes. The practical scaling shift is from dense request-time self-attention memory to sparse spike propagation plus indexed local memory lookup. SYNAPSE-S2 still has a configurable topology resource envelope, so the precise claim is that it avoids the transformer attention-matrix memory wall rather than making every internal structure sub-quadratic in every parameter.
+Traditional self-attention has a logical token-token score matrix with `O(N^2)` elements in sequence length `N`; optimized attention kernels can avoid storing that entire matrix. SYNAPSE-S2 retrieves stored memories through bounded sparse spike, surface-term and relationship indexes instead of feeding the full memory corpus into one transformer context. Its local embedding model is still a transformer with its own attention costs. Sparse memory lookup does not eliminate those embedding costs or make every internal structure sub-quadratic.
+
+The [September recall and operator-trust enhancement](docs/ENHANCEMENT_RELEASE_20260910.md) documents exact retrieval optimizations, phase measurements, fresh dashboard health, bounded analysis, and host-specific activation requirements.
 
 ### Math Note: What Replaces the `O(N^2)` Attention Wall
 
@@ -18,9 +20,9 @@ Each token compares against every other token:
 S = \frac{QK^\top}{\sqrt{d_k}},\quad A = \mathrm{softmax}(S),\quad Y = AV
 ```
 
-Because `S` and `A` are both `N x N`, their memory footprint is `Theta(N^2)` per head before counting values, activations, caches, or batching. Doubling the usable context length roughly quadruples the attention-matrix storage. That is the self-attention memory wall.
+When `S` and `A` are explicitly materialized as `N x N` arrays, their memory footprint is `Theta(N^2)` per head before counting values, activations, caches, or batching. Doubling context length roughly quadruples this naive attention-matrix storage. This describes the materialized implementation, not a requirement that optimized kernels retain the full matrices.
 
-SYNAPSE-S2 uses a different runtime object. Text is embedded locally, converted to sparse sensory spikes, and propagated through a recurrent substrate:
+SYNAPSE-S2 also maintains a recurrent substrate for its learning/write and legacy SNN paths. Text is embedded locally, converted to sparse sensory spikes, and propagated through that substrate:
 
 ```math
 z = \mathrm{embed}(\text{text}),\quad s_0 = \mathrm{TopK}(\mathrm{zscore}(z), k)
@@ -36,7 +38,7 @@ s_{t+1} = H(\tilde{u}_{t+1} - V_{\text{thr}}),\quad
 u_{t+1} = \tilde{u}_{t+1} - s_{t+1}V_{\text{thr}}
 ```
 
-Temporal co-activation changes durable relationship strength through STDP:
+Temporal co-activation updates recurrent lateral weights through STDP when the activity guard admits the update; zero activity or activity above `stdp_active_limit` skips it:
 
 ```math
 \Delta W_{\text{lat}} =
@@ -49,7 +51,7 @@ A_-e^{-1/\tau_-}s_{t+1}s_t^{\top}
 W_{\text{lat}} \leftarrow \mathrm{clip}(W_{\text{lat}} + \Delta W_{\text{lat}}, -c, c)
 ```
 
-At inference time, active spike operations are dominated by additions, threshold comparisons, decay, and sparse/indexed retrieval rather than dense query-key matrix multiplication over all token pairs. The implementation still uses MLX arrays and scalar multiplications for decay, weighting, and setup where appropriate; "multiplication-free" should be read as the neuromorphic recall path avoiding dense per-token dot-product attention, not as a claim that no numeric multiplication exists anywhere in the codebase. The STDP equation above is the implemented one-step discrete update: previous spikes potentiate current spikes, current spikes depress the reverse direction, and lateral weights are clipped to a configured envelope.
+The STDP equation above is the implemented one-step discrete update: previous spikes potentiate current spikes, current spikes depress the reverse direction, and lateral weights are clipped to a configured envelope. Ordinary read-only Retrieval v2 does not execute that learning cycle or modify synaptic weights. It embeds the query, resolves a bounded candidate set, combines semantic/spike/surface signals, expands bounded graph neighbors, and ranks results. Neither the transformer embedding nor the hybrid ranking is multiplication-free. Benchmark this read-only entry point separately from legacy stateful query operations.
 
 ## **Operational Quickstart**
 
@@ -84,6 +86,7 @@ that exact candidate:
 
 ```bash
 .venv/bin/python synapse_cli.py --json capture-inbox-status
+# First-cutover local-v5 only; an adopted core drains its own inbox.
 .venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
 .venv/bin/python synapse_cli.py --json capture-inbox-status
 scripts/core_cutover_preflight.sh --inventory-only --require-quiescent
@@ -94,8 +97,9 @@ scripts/core_cutover_preflight.sh --inventory-only --require-quiescent
   --expect-embedding-provider mlx-neural
 ```
 
-The certifier runs every live functional probe first, performs a bounded inbox
-drain, then acquires exclusive core authority and the existing global capture
+The certifier runs every live functional probe first, observes the authoritative
+core's embedded inbox drain (or processes bounded batches on local-v5), then
+acquires exclusive core authority and the existing global capture
 lock. Backup, signed verification, isolated restore, and the final
 process/LaunchAgent inventory occur in-process under that one guard. The guard,
 temporary restore, store, and lease must unwind cleanly before the optional ZIP
@@ -858,17 +862,23 @@ pre-cutover local-v5 maintenance option only.
   --speaker codex \
   --text "Capture a concise factual session note here."
 .venv/bin/python synapse_cli.py --json capture-inbox-status
-.venv/bin/python synapse_cli.py --json capture-inbox-process --confirm
 .venv/bin/python synapse_cli.py --json graph --context default --limit 30 \
   --response-mode compact --max-response-bytes 12288
 ```
 
-Manual inbox processing is confirmation-gated. The authoritative core's
-embedded worker processes its bound queue continuously; CLI and MCP one-shot
-processing require `--confirm` / `confirm=true`, and the dashboard Magic
-Capture button performs a preflight with a short-lived confirmation token
-before committing pending files. A legacy-v5 sidecar, if deliberately
-installed before adoption, follows the same inbox contract.
+The authoritative core's embedded worker processes its bound queue continuously.
+Observe that worker with `capture-inbox-status`; manual CLI, MCP, and dashboard
+processing against a CoreClient is rejected before taking capture locks or
+claiming drops. A competing manual worker would hold the capture lock while
+waiting for the core's execution lane, reversing the embedded worker's lock
+order. Local-v5 manual processing remains confirmation-gated (`--confirm` /
+`confirm=true`); its dashboard button also requires a preflight token.
+
+An uncertain inbox capture keeps its redacted payload and diagnostic in the error
+directory. A valid `outcome_unknown` diagnostic also retains the fixed,
+content-free `reconciliation` handle: `code`, `caller`, `request_id`, `operation`,
+and `replay_safe: false`. Inspect request status using that exact identity.
+The handle authorizes no replay, and a missing receipt does not prove no effect.
 
 Every new producer should use capture protocol `capture.v2`: create one
 `s2cap_<32 lowercase hex>` ID before its first attempt and reuse that ID only

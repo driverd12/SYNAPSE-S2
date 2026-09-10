@@ -376,7 +376,8 @@ def _run_query_set(
     """Run every question with read-mutation tripwires armed.
 
     The warm untimed call provides the graded evidence object; every timed
-    repeat must be byte-identical or the run fails.
+    repeat must preserve every semantic byte or the run fails. Only the
+    observational top-level timings_ms field is excluded from comparisons.
     """
 
     results: dict[str, dict[str, Any]] = {}
@@ -391,25 +392,31 @@ def _run_query_set(
         for question in corpus["questions"]:
             question_id = str(question["question_id"])
             warm = evaluation.query_call(adapter, question)
-            warm_bytes = canonical_json_bytes(warm)
+            warm_bytes = canonical_json_bytes(
+                retrieval_measurement.semantic_retrieval_payload(warm)
+            )
             samples: list[float] = []
             for _ in range(latency_samples):
                 started = timer()
                 observed = evaluation.query_call(adapter, question)
                 samples.append(max(0, timer() - started) / 1_000_000.0)
-                if canonical_json_bytes(observed) != warm_bytes:
+                observed_bytes = canonical_json_bytes(
+                    retrieval_measurement.semantic_retrieval_payload(observed)
+                )
+                if observed_bytes != warm_bytes:
                     raise MeasurementError(
-                        f"repeated query {question_id} was not byte-identical"
+                        f"repeated query {question_id} was not semantically byte-identical"
                     )
             results[question_id] = warm
             latency_by_question[question_id] = samples
-    raw_digest = evaluation.digest_value(
-        {question_id: results[question_id] for question_id in sorted(results)}
+    semantic_payload_digest = evaluation.digest_value(
+        {question_id: retrieval_measurement.semantic_retrieval_payload(results[question_id])
+         for question_id in sorted(results)}
     )
     return {
         "results": results,
         "latency_by_question": latency_by_question,
-        "raw_digest": raw_digest,
+        "semantic_payload_digest": semantic_payload_digest,
     }
 
 
@@ -652,9 +659,9 @@ def acceptance_verdict(aggregate: dict[str, Any], thresholds: dict[str, Any]) ->
             "repeat, fresh-backend, and shuffled-insertion digests all equal",
             determinism,
             determinism["canonical_digest_all_equal"] is True
-            and determinism["fresh_backend_raw_equal"] is True
-            and determinism["randomized_insertion_raw_equal"] is True
-            and determinism["repeated_same_backend_raw_equal"] is True,
+            and determinism["fresh_backend_semantic_payload_equal"] is True
+            and determinism["randomized_insertion_semantic_payload_equal"] is True
+            and determinism["repeated_same_backend_semantic_payload_equal"] is True,
         ),
         (
             "zero-logical-deletion-residue",
@@ -895,7 +902,9 @@ def run_measurement(
             repeat_run = _run_query_set(
                 backend, adapter, corpus, latency_samples=1, timer=timer
             )
-            repeated_equal = repeat_run["raw_digest"] == baseline_run["raw_digest"]
+            repeated_equal = (
+                repeat_run["semantic_payload_digest"] == baseline_run["semantic_payload_digest"]
+            )
 
             db_path = Path(backend.memory_store.db_path)
             deleted_residue = []
@@ -1013,9 +1022,10 @@ def run_measurement(
             {baseline_projection_digest, fresh_projection_digest, random_projection_digest}
         )
         == 1,
-        "fresh_backend_raw_equal": fresh_run["raw_digest"] == baseline_run["raw_digest"],
-        "randomized_insertion_raw_equal": random_run["raw_digest"] == baseline_run["raw_digest"],
-        "repeated_same_backend_raw_equal": repeated_equal,
+        "fresh_backend_semantic_payload_equal": fresh_run["semantic_payload_digest"] == baseline_run["semantic_payload_digest"],
+        "randomized_insertion_semantic_payload_equal": random_run["semantic_payload_digest"] == baseline_run["semantic_payload_digest"],
+        "repeated_same_backend_semantic_payload_equal": repeated_equal,
+        "semantic_payload_excludes": ["timings_ms"],
         "trajectory_order_baseline": natural_order,
         "trajectory_order_randomized": shuffled_order,
         "random_seed": seed,
@@ -1132,6 +1142,7 @@ def run_measurement(
             "insert_contract": "trajectories inserted sequentially per session turn order",
             "query_contract": "compact text/image evidence via retrieve_text_v2",
             "grading": "deterministic fixture judgments; no reader or judge model",
+            "determinism_contract": "complete retrieval payload excluding only top-level timings_ms observations",
             "determinism_matrix": [
                 "repeated queries on the same backend",
                 "fresh backend over the same store",

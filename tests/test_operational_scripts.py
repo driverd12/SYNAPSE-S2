@@ -1,3 +1,7 @@
+import ast
+import math
+import re
+import time
 import json
 import os
 import plistlib
@@ -371,6 +375,78 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
                 payload = plistlib.load(stream)
         return result, payload, plist_path
 
+    @staticmethod
+    def _prep_capture_poll_fixture():
+        script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text(encoding="utf-8")
+        source = script.split("<<'PY_CAPTURE_SMOKE'\n", 1)[1].split("\nPY_CAPTURE_SMOKE", 1)[0]
+        tree = ast.parse(source)
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "wait_for_capture_receipt")
+        namespace = {"math": math, "re": re, "time": time}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "prep-capture-poll", "exec"), namespace)
+        capture_id = "s2cap_" + "a" * 32
+        drop = {"capture_id": capture_id, "context_id": "demo", "source_tag": "production-capture-inbox", "capture_protocol": "capture.v2"}
+        receipt = {"capture_id": capture_id, "request_fingerprint": "b" * 64, "committed_at": 101.0,
+                   "result": {"capture_id": capture_id, "context_id": "demo", "source_tag": "production-capture-inbox"}}
+        health = {"ready": True, "authority": {"ready": True}, "capture": {"ready": True, "last_success_age_ms": 1}}
+        clock = [0.0]
+        arguments = {"capture_id": capture_id, "context_id": "demo", "started_at": 100.0,
+                     "read_receipt": lambda: receipt, "read_health": lambda: health,
+                     "monotonic": lambda: clock[0], "sleep": lambda seconds: clock.__setitem__(0, clock[0] + seconds), "timeout": 3.0}
+        return namespace["wait_for_capture_receipt"], drop, receipt, health, arguments, clock
+
+    def test_prep_capture_observes_one_exact_receipt_without_processing(self):
+        poll, drop, receipt, _, arguments, clock = self._prep_capture_poll_fixture()
+        observations = iter((None, receipt))
+        arguments["read_receipt"] = lambda: next(observations)
+        result = poll(drop, **arguments)
+        self.assertEqual(result["capture_id"], drop["capture_id"])
+        self.assertEqual(result["status"], "exact-transport-receipt-observed")
+        self.assertFalse(result["ledger_independently_verified"])
+        self.assertEqual(clock[0], 1.0)
+        script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text()
+        smoke = script.split('echo "=== capture inbox smoke ==="', 1)[1].split('echo "=== cortex governor smoke ==="', 1)[0]
+        self.assertEqual(smoke.count("capture-inbox-drop"), 1)
+        self.assertNotIn("capture-inbox-process", smoke)
+        self.assertNotIn("process_once", smoke)
+
+    def test_prep_capture_rejects_wrong_or_old_receipt(self):
+        for kind in ("capture-id", "context", "old-commit", "bad-fingerprint"):
+            with self.subTest(kind=kind):
+                poll, drop, receipt, _, arguments, _ = self._prep_capture_poll_fixture()
+                if kind == "capture-id": receipt["capture_id"] = "s2cap_" + "c" * 32
+                elif kind == "context": receipt["result"]["context_id"] = "other"
+                elif kind == "old-commit": receipt["committed_at"] = 99.0
+                else: receipt["request_fingerprint"] = "invalid"
+                with self.assertRaisesRegex(ValueError, "receipt binding is invalid"):
+                    poll(drop, **arguments)
+
+    def test_prep_capture_requires_fresh_authority_even_after_receipt(self):
+        for kind in ("authority", "stale-capture", "missing-capture"):
+            with self.subTest(kind=kind):
+                poll, drop, _, health, arguments, clock = self._prep_capture_poll_fixture()
+                if kind == "authority": health["authority"]["ready"] = False
+                elif kind == "stale-capture": health["capture"]["last_success_age_ms"] = 16000
+                else: health["capture"]["last_success_age_ms"] = None
+                with self.assertRaisesRegex(TimeoutError, "without replay"):
+                    poll(drop, **arguments)
+                self.assertEqual(clock[0], 3.0)
+
+    def test_prep_capture_timeout_retains_exact_id_and_missing_receipt_is_unknown(self):
+        poll, drop, _, _, arguments, clock = self._prep_capture_poll_fixture()
+        arguments["read_receipt"] = lambda: None
+        with self.assertRaisesRegex(TimeoutError, drop["capture_id"]):
+            poll(drop, **arguments)
+        self.assertEqual(clock[0], 3.0)
+        drop["context_id"] = "other"
+        with self.assertRaisesRegex(ValueError, "drop binding is invalid"):
+            poll(drop, **arguments)
+
+    def test_prep_tomorrow_compiles_enhancement_modules(self):
+        script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text()
+        compile_section = script.split('echo "=== compile check ==="', 1)[1].split('echo "=== build identity ==="', 1)[0]
+        for relative in ("process_metrics.py", "hygiene_scan.py", "namespace_enrichment.py", "scripts/benchmark_recall.py"):
+            self.assertIn(relative, compile_section)
+
     def test_prep_tomorrow_does_not_seed_demo_memory_by_default(self):
         script = (ROOT / "scripts" / "prep_tomorrow.sh").read_text(encoding="utf-8")
 
@@ -457,11 +533,9 @@ printf '{"runtime":"ready","effective_enabled":true,"memory_db_path":"%s","memor
             apply_stage.index("scripts/install_dashboard_agent.sh"),
         )
         self.assertIn('binding.get("ready") is not True', apply_stage)
-        capture_process = apply_stage.split(
-            "synapse_cli.py --json capture-inbox-process",
-            1,
-        )[1].split("synapse_cli.py --json capture-inbox-status", 1)[0]
-        self.assertIn("--confirm", capture_process)
+        self.assertNotIn("synapse_cli.py --json capture-inbox-process", apply_stage)
+        self.assertIn("wait_for_capture_receipt", apply_stage)
+        self.assertIn('binding.authority_mode != "authoritative-core-v6"', apply_stage)
         cortex_commit = apply_stage.split(
             "synapse_cli.py --json commit-cortex",
             1,
@@ -1511,7 +1585,7 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
         )[0]
         ordered_markers = (
             "scripts/install_core_agent.sh publish-binding",
-            "capture-inbox-process --confirm",
+            "capture-inbox-status",
             "mcp_client_wrapper.py",
             "--inventory-only --require-quiescent",
             "scripts/operator_readiness_certify.py",
@@ -1524,6 +1598,7 @@ printf '%s\n' "$@" > "$SELECTION_ARGS_RECORD"
         self.assertIn("--json", cutover)
         self.assertIn("A momentarily empty process list is not durable quiescence", cutover)
         self.assertIn("post-backup quiescence proof", cutover)
+        self.assertNotIn("capture-inbox-process --confirm", cutover)
 
 
 if __name__ == "__main__":

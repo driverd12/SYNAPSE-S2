@@ -2336,6 +2336,19 @@ class SpikingAttentionBackend:
         one retry is allowed and a second moving snapshot fails closed.
         """
 
+        started = time.perf_counter()
+        timings_ms = {
+            "queue_wait_ms": None,
+            "preparation_ms": 0.0,
+            "embedding_ms": 0.0,
+            "scope_lookup_ms": 0.0,
+            "revision_validation_ms": 0.0,
+            "cue_lookup_ms": 0.0,
+            "index_lookup_ms": 0.0,
+            "graph_expansion_ms": 0.0,
+            "ranking_ms": 0.0,
+            "serialization_ms": 0.0,
+        }
         self._require_neural_substrate()
         context = sanitize_context_id(context_id)
         scope = sanitize_recall_scope(recall_scope)
@@ -2360,6 +2373,8 @@ class SpikingAttentionBackend:
             extracted_terms,
             limit=RETRIEVAL_V2_MAX_QUERY_TERMS,
         )
+        timings_ms["preparation_ms"] = (time.perf_counter() - started) * 1000.0
+        embedding_started = time.perf_counter()
         embedding_payload = self.embed_text_payload(
             prompt_text,
             dimensions=self.dimension,
@@ -2372,6 +2387,9 @@ class SpikingAttentionBackend:
         embedding_identity = self._retrieval_v2_embedding_identity(
             embedding_payload.get("provenance")
         )
+        timings_ms["embedding_ms"] = (
+            time.perf_counter() - embedding_started
+        ) * 1000.0
         query_fingerprint = hashlib.sha256(
             (
                 f"{RETRIEVAL_V2_SCHEMA}\x1f{context}\x1f{scope}\x1f"
@@ -2382,21 +2400,24 @@ class SpikingAttentionBackend:
         stable_read: dict[str, Any] | None = None
         attempts = 0
         for attempts in range(1, 3):
-            scope_before = self._retrieval_v2_scope_snapshot(
-                context=context,
-                recall_scope=scope,
-            )
+            with self._retrieval_v2_timed(timings_ms, "scope_lookup_ms"):
+                scope_before = self._retrieval_v2_scope_snapshot(
+                    context=context,
+                    recall_scope=scope,
+                )
             scope_context_ids = [
                 str(record["context_id"])
                 for record in scope_before["records"]
             ]
-            entries_before = self._retrieval_v2_entries_snapshot(
-                scope_context_ids
-            )
-            cue_phase = self._retrieval_v2_cue_phase(
-                scope_records=scope_before["records"],
-                query_terms=query_terms,
-            )
+            with self._retrieval_v2_timed(timings_ms, "revision_validation_ms"):
+                entries_before = self._retrieval_v2_entries_snapshot(
+                    scope_context_ids
+                )
+            with self._retrieval_v2_timed(timings_ms, "cue_lookup_ms"):
+                cue_phase = self._retrieval_v2_cue_phase(
+                    scope_records=scope_before["records"],
+                    query_terms=query_terms,
+                )
             collected = self._retrieval_v2_collect_candidates(
                 query_spikes=query_spikes,
                 query_terms=query_terms,
@@ -2405,21 +2426,26 @@ class SpikingAttentionBackend:
                 candidate_limit=bounded_candidate_limit,
                 include_graph_neighbors=include_graph_neighbors,
                 cue_routes=cue_phase["routes"],
+                timings_ms=timings_ms,
             )
-            graph_after = self._retrieval_v2_graph_edges(
-                collected["graph_anchors"],
-                enabled=include_graph_neighbors,
-            )
-            entries_after = self._retrieval_v2_entries_snapshot(
-                scope_context_ids
-            )
-            cue_revisions_after = self._retrieval_v2_cue_revisions(
-                cue_phase["contexts"]
-            )
-            scope_after = self._retrieval_v2_scope_snapshot(
-                context=context,
-                recall_scope=scope,
-            )
+            with self._retrieval_v2_timed(timings_ms, "graph_expansion_ms"):
+                graph_after = self._retrieval_v2_graph_edges(
+                    collected["graph_anchors"],
+                    enabled=include_graph_neighbors,
+                )
+            with self._retrieval_v2_timed(timings_ms, "revision_validation_ms"):
+                entries_after = self._retrieval_v2_entries_snapshot(
+                    scope_context_ids
+                )
+            with self._retrieval_v2_timed(timings_ms, "revision_validation_ms"):
+                cue_revisions_after = self._retrieval_v2_cue_revisions(
+                    cue_phase["contexts"]
+                )
+            with self._retrieval_v2_timed(timings_ms, "scope_lookup_ms"):
+                scope_after = self._retrieval_v2_scope_snapshot(
+                    context=context,
+                    recall_scope=scope,
+                )
             if (
                 entries_before.get("revision") == entries_after.get("revision")
                 and scope_before["revision"] == scope_after["revision"]
@@ -2617,10 +2643,32 @@ class SpikingAttentionBackend:
             "work": work,
             "raw_input_stored": False,
         }
+        response["timings_ms"] = timings_ms
+        response["timing_scope"] = {
+            "clock": "monotonic",
+            "queue": "authoritative backend lane; null for direct backend calls",
+            "serialization": "JSON validation passes; excludes socket send and client decoding",
+            "identity": "timings are observational and excluded from retrieval and snapshot identities",
+        }
         # Refuse to publish unsupported floats or non-JSON values.  This is a
         # validation pass only; it does not reparse or coerce the result.
-        json.dumps(response, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._retrieval_v2_timed(timings_ms, "serialization_ms"):
+            json.dumps(response, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        timings_ms["backend_total_ms"] = (time.perf_counter() - started) * 1000.0
         return response
+
+    @staticmethod
+    @contextmanager
+    def _retrieval_v2_timed(timings_ms: dict[str, Any], phase: str):
+        """Accumulate content-free durations, including a bounded retry."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            timings_ms[phase] = float(timings_ms.get(phase) or 0.0) + max(
+                0.0, (time.perf_counter() - started) * 1000.0
+            )
+
 
     def _retrieval_v2_entries_snapshot(
         self,
@@ -3263,7 +3311,9 @@ class SpikingAttentionBackend:
         candidate_limit: int,
         include_graph_neighbors: bool,
         cue_routes: dict[str, dict[str, Any]] | None = None,
+        timings_ms: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        timings_ms = timings_ms if timings_ms is not None else {}
         cue_routes = cue_routes or {}
         if not scope_records:
             empty_graph = self._retrieval_v2_graph_edges([], enabled=False)
@@ -3309,6 +3359,7 @@ class SpikingAttentionBackend:
         )
         # One shared read connection serves both candidate sources; the store
         # wrapper skips the surface lookup when the term list is empty.
+        phase_started = time.perf_counter()
         candidate_sources = self.memory_store.retrieval_v2_candidate_sources(
             context_id=origin_context,
             query_spikes=query_spikes,
@@ -3321,6 +3372,10 @@ class SpikingAttentionBackend:
         spike_rows = candidate_sources["spike"]
         surface_rows = candidate_sources["surface"]
 
+        timings_ms["index_lookup_ms"] = float(
+            timings_ms.get("index_lookup_ms") or 0.0
+        ) + (time.perf_counter() - phase_started) * 1000.0
+        phase_started = time.perf_counter()
         pool: dict[str, dict[str, Any]] = {}
         memory_id_deduplications = 0
 
@@ -3406,6 +3461,10 @@ class SpikingAttentionBackend:
             }
             for candidate in base_ranked[:RETRIEVAL_V2_MAX_GRAPH_ANCHORS]
         ]
+        timings_ms["ranking_ms"] = float(
+            timings_ms.get("ranking_ms") or 0.0
+        ) + (time.perf_counter() - phase_started) * 1000.0
+        phase_started = time.perf_counter()
         graph_snapshot = self._retrieval_v2_graph_edges(
             graph_anchors,
             enabled=include_graph_neighbors,
@@ -3472,6 +3531,10 @@ class SpikingAttentionBackend:
             }
             candidate["graph_provenance"].append(provenance)
 
+        timings_ms["graph_expansion_ms"] = float(
+            timings_ms.get("graph_expansion_ms") or 0.0
+        ) + (time.perf_counter() - phase_started) * 1000.0
+        phase_started = time.perf_counter()
         # Governed cue routes are admitted only after the graph anchors were
         # chosen from the base pool, so a cue-only candidate can never become
         # a graph anchor: cue routing stays strictly one hop, with no
@@ -3538,6 +3601,9 @@ class SpikingAttentionBackend:
             self._retrieval_v2_public_item(candidate, rank=rank)
             for rank, candidate in enumerate(selected, start=1)
         ]
+        timings_ms["ranking_ms"] = float(
+            timings_ms.get("ranking_ms") or 0.0
+        ) + (time.perf_counter() - phase_started) * 1000.0
         result_truncated = len(deduplicated) > len(selected)
         candidate_pool_truncated = bool(
             base_pool_truncated
@@ -3586,7 +3652,7 @@ class SpikingAttentionBackend:
             int(value) for value in entry.get("spike_indices", [])
         }
         overlap_count = len(query_spikes & candidate_spikes)
-        union_count = len(query_spikes | candidate_spikes)
+        union_count = len(query_spikes) + len(candidate_spikes) - overlap_count
         signal = overlap_count / max(1, union_count)
         return self._retrieval_v2_unit_float(signal), {
             "type": "spike-index-overlap",
@@ -5033,7 +5099,8 @@ class SpikingAttentionBackend:
             context_id=context,
             scope=recall_scope,
         )
-        if not include_global:
+        # include_global controls inheritance, not an explicitly selected origin.
+        if not include_global and context != "global":
             records = [
                 record
                 for record in records
@@ -5175,6 +5242,18 @@ class SpikingAttentionBackend:
             }
         )
         return entry_position, relationship_position
+
+    def list_image_memories(
+        self,
+        *,
+        context_id: str = "default",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List bounded image metadata without implicit global inheritance."""
+        return self.memory_store.list_image_memories(
+            context_id=context_id,
+            limit=limit,
+        )
 
     def list_media_references(
         self,
@@ -5354,7 +5433,7 @@ class SpikingAttentionBackend:
             context_id=context,
             scope=recall_scope,
         )
-        if not include_global:
+        if not include_global and context != "global":
             scope_records = [
                 record
                 for record in scope_records

@@ -30,6 +30,7 @@ from scripts import core_cutover_preflight as preflight
 from scripts.operator_readiness_certify import (
     CAPTURE_DRAIN_BATCH_SIZE,
     CAPTURE_DRAIN_MAX_PASSES,
+    CAPTURE_DRAIN_POLL_SECONDS,
     CheckResult,
     MCP_COMPACT_BUDGET,
     MCP_CONTRACT_SCHEMA,
@@ -2281,6 +2282,62 @@ class OperatorReadinessCertifierTests(unittest.TestCase):
                         ],
                     )
                     self.assertEqual(result["required_total"], len(REQUIRED_PROOFS))
+
+    def test_authoritative_capture_drain_observes_worker_without_manual_processing(self):
+        scenarios = {
+            "delayed_progress": [
+                self._capture_status(pending=1),
+                self._capture_status(pending=1),
+                self._capture_status(processing=1),
+                self._capture_status(),
+                self._capture_status(),
+            ],
+            "already_processing": [
+                self._capture_status(processing=1),
+                self._capture_status(),
+                self._capture_status(),
+            ],
+            "stalled": [self._capture_status(processing=1)] * (CAPTURE_DRAIN_MAX_PASSES + 2),
+            "unsafe_evidence": [
+                {**self._capture_status(), "unresolved_error_count": 1, "error_file_count": 1},
+            ] * 2,
+        }
+        for scenario, statuses in scenarios.items():
+            for authority_mode in ("authoritative-core-v6", "explicit-socket", "durable-marker"):
+                with self.subTest(scenario=scenario, authority_mode=authority_mode), TemporaryDirectory() as tmp:
+                    certifier, _, _ = self._bound_certifier(Path(tmp))
+                    certifier.runtime_authority_mode = authority_mode
+                    status_iter = iter(statuses)
+                    calls = []
+
+                    def run_command(check_id, *, label, command, required, timeout, evaluator, env=None):
+                        del timeout, env
+                        self.assertIn("capture-inbox-status", command)
+                        self.assertNotIn("capture-inbox-process", command)
+                        payload = next(status_iter)
+                        status, detail, repair, metrics = evaluator(0, payload, json.dumps(payload), "")
+                        result = CheckResult(
+                            check_id=check_id, label=label, status=status,
+                            required=required, detail=detail, repair=repair,
+                            command=command, returncode=0, parsed=payload, metrics=metrics,
+                        )
+                        certifier.results.append(result)
+                        calls.append(command)
+                        return result
+
+                    with (
+                        mock.patch.object(certifier, "_run_command", side_effect=run_command),
+                        mock.patch("scripts.operator_readiness_certify.time.sleep") as sleep,
+                    ):
+                        final = certifier._check_capture_inbox()
+                    self.assertEqual(final.status, "blocked" if scenario in {"stalled", "unsafe_evidence"} else "ready")
+                    self.assertEqual(final.metrics["drain_mode"], "embedded-worker-observation")
+                    self.assertIsNone(final.metrics["processed_file_count"])
+                    self.assertEqual(sleep.call_count, len(statuses) - 2)
+                    for call in sleep.call_args_list:
+                        self.assertEqual(call.args, (CAPTURE_DRAIN_POLL_SECONDS,))
+                    self.assertEqual(len(calls), len(statuses))
+                    self.assertEqual(sum(result.required for result in certifier.results), 1)
 
     def test_capture_drain_is_bounded_and_stops_on_no_progress(self):
         def run_scenario(

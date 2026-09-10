@@ -82,6 +82,8 @@ from cortex_contract import (
     canonicalize_validation_evidence,
     has_concrete_validation_evidence,
 )
+from process_metrics import observe_process_memory
+
 from memory_store import (
     ContextDeliveryRejected,
     LOGICAL_SNAPSHOT_DIGEST_SCHEMA,
@@ -194,6 +196,7 @@ BUILD_SOURCE_MANIFEST = (
     "media_similarity.py",
     "memora_governance.py",
     "memora_shadow.py",
+    "process_metrics.py",
     "memory_store.py",
     "mlx_backend.py",
     "native/apple_vision_enrich.swift",
@@ -568,6 +571,7 @@ _CONTRACT_LIST = (
         "context_id recall_scope limit",
         retry_safe=True,
     ),
+    _contract("list_image_memories", "context_id limit", retry_safe=True),
     _contract(
         "publish_context_event",
         "context_id source_surface event_type summary payload agent_targets",
@@ -5979,6 +5983,7 @@ class AuthoritativeCoreService:
                 return self._response(request, error=safe_error("operation_failed"))
             return response
 
+        lane_wait_started = time.perf_counter()
         remaining = (request["deadline_unix_ms"] / 1000.0) - time.time()
         lane_floor_seconds = self._backend_lane_timeout_floor(contract.name)
         lane_acquire_timeout = self._backend_lane_acquire_timeout(
@@ -6011,6 +6016,7 @@ class AuthoritativeCoreService:
                 request,
                 error=safe_error("deadline_exceeded", retryable=contract.retry_safe),
             )
+        queue_wait_ms = max(0.0, (time.perf_counter() - lane_wait_started) * 1000.0)
         try:
             if self._stop_event.is_set():
                 return self._response(
@@ -6239,9 +6245,27 @@ class AuthoritativeCoreService:
                     with self._backend_execution_context():
                         result = self._handlers[contract.name](**authorized_arguments)
                     self._assert_live_authority()
+                    if contract.name == "retrieve_text_v2" and isinstance(result, dict):
+                        # Never amend a backend-owned object or a cached semantic
+                        # projection. Queue observations belong to this request.
+                        result = {
+                            **result,
+                            "timings_ms": {
+                                **dict(result.get("timings_ms") or {}),
+                                "queue_wait_ms": queue_wait_ms,
+                            },
+                        }
                     response = self._response(request, result=result)
                     # Prove the complete envelope fits before publishing it.
+                    serialization_started = time.perf_counter()
                     self._bounded_response_bytes(response)
+                    if contract.name == "retrieve_text_v2" and isinstance(result, dict):
+                        timings = result["timings_ms"]
+                        timings["serialization_ms"] = float(
+                            timings.get("serialization_ms") or 0.0
+                        ) + max(0.0, (time.perf_counter() - serialization_started) * 1000.0)
+                        # Timing metadata must also remain inside the frame cap.
+                        self._bounded_response_bytes(response)
                 except CorePathPolicyError:
                     response = self._response(
                         request,
@@ -6442,6 +6466,9 @@ class AuthoritativeCoreService:
             and journal_health["ready"]
         )
         return {
+            "process_memory": observe_process_memory(),
+            "observed_at_unix_ms": int(time.time() * 1000),
+            "evidence_max_age_ms": 15_000,
             "ready": ready,
             "operational_state": (
                 "unavailable"
