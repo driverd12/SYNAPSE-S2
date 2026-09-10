@@ -41,6 +41,13 @@ separate: a checkout alone does not activate these changes.
   transport changes or capture-lock acquisition. Certification polls the
   embedded worker. Uncertain capture responses retain validated reconciliation
   handles when they are available.
+- Recovery may retry a journal inspection once from a new private copy when
+  only its change timestamp moved, a stable hash still matches the signed
+  expected bytes, and the original identity, permissions and sidecars remain
+  intact. The failed inspection is discarded. The second copy repeats every
+  integrity and reconciliation check; other changes or repeated drift still
+  stop recovery. Safe diagnostics identify which metadata changed without
+  exposing journal contents.
 
 ## Mathematical research decisions
 

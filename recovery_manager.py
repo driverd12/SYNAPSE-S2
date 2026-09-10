@@ -245,6 +245,57 @@ def _immutable_read_transaction(
             connection.execute("ROLLBACK")
 
 
+def _journal_file_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev), int(value.st_ino), int(value.st_size),
+        int(value.st_mtime_ns), int(value.st_ctime_ns), int(value.st_uid),
+        int(value.st_nlink), stat.S_IMODE(value.st_mode),
+    )
+
+
+class ImmutableJournalInspectionDrift(RuntimeError):
+    """A failed inspection; only field names are exposed in its error text."""
+
+    _fields = ("device", "inode", "size", "mtime_ns", "ctime_ns", "uid", "nlink", "mode")
+
+    def __init__(
+        self,
+        before: os.stat_result,
+        after: os.stat_result,
+        *,
+        sidecars_unchanged: Callable[[], bool],
+    ) -> None:
+        self._before_identity = _journal_file_identity(before)
+        self._after_identity = _journal_file_identity(after)
+        self._sidecars_unchanged = sidecars_unchanged
+        self.changed_fields = tuple(
+            name for name, original, final in zip(
+                self._fields, self._before_identity, self._after_identity,
+            ) if original != final
+        )
+        super().__init__(
+            "request journal changed during immutable inspection "
+            f"(changed fields: {', '.join(self.changed_fields)})"
+        )
+
+    def _retry_metadata_matches(self, metadata: os.stat_result) -> bool:
+        # A stable postfailure hash must observe the exact final identity,
+        # including ctime, and retain every original non-ctime field. This
+        # never turns the failed inspection into usable recovery evidence.
+        identity = _journal_file_identity(metadata)
+        return (
+            self.changed_fields == ("ctime_ns",)
+            and identity == self._after_identity
+            and all(
+                current == original
+                for name, current, original in zip(
+                    self._fields, identity, self._before_identity,
+                ) if name != "ctime_ns"
+            )
+            and self._sidecars_unchanged()
+        )
+
+
 MAINTENANCE_RECEIPT_COLUMN_SIGNATURE = (
     ("operation_id", "TEXT", 0, None, 1),
     ("operation_type", "TEXT", 1, None, 0),
@@ -1470,16 +1521,22 @@ class VerifiedRecoveryManager:
                         "request-journal reconciliation source binding is invalid"
                     )
         visible = os.lstat(source)
-        if (
+        changed = (
             self.store._regular_file_identity(visible)
             != self.store._regular_file_identity(observed)
             or visible.st_uid != observed.st_uid
             or int(visible.st_nlink) != int(observed.st_nlink)
             or stat.S_IMODE(visible.st_mode) != stat.S_IMODE(observed.st_mode)
-        ):
-            raise RuntimeError("request journal changed during immutable inspection")
+        )
+        # A metadata drift must not hide sidecar drift. The retryable error
+        # is constructed only after all logical and original sidecar checks.
         if clean_close_sidecars() != sidecars_before:
             raise RuntimeError("request journal sidecar changed during inspection")
+        if changed:
+            raise ImmutableJournalInspectionDrift(
+                observed, visible,
+                sidecars_unchanged=lambda: clean_close_sidecars() == sidecars_before,
+            )
         return {
             "application_id": application_id,
             "schema_version": user_version,
@@ -1779,31 +1836,60 @@ class VerifiedRecoveryManager:
                 str(512 * 1024**2),
             )
         )
-        if maximum_bytes <= 0 or int(os.lstat(path).st_size) > maximum_bytes:
+        source_observed = os.lstat(path)
+        if maximum_bytes <= 0 or int(source_observed.st_size) > maximum_bytes:
             raise RuntimeError("request-journal artifact exceeds its recovery limit")
-        staging_dir = self.store._backup_verification_staging_dir()
-        temporary = self.store._unique_private_temp_path(
-            staging_dir,
-            prefix=f".{path.name}.journal-verify.",
+        # Callers may supply a one-shot iterable. Every inspection must check
+        # the same complete receipt bindings, including on the sole retry.
+        reviewed_targets = tuple(
+            dict(target) if isinstance(target, Mapping) else target
+            for target in reconciliation_targets
         )
-        try:
-            copied = self.store._copy_stable_regular_file(path, temporary)
-            if not secrets.compare_digest(str(copied["sha256"]), expected_sha256):
-                raise RuntimeError("request-journal artifact digest verification failed")
-            inspection = self.inspect_request_journal_snapshot(
-                temporary,
-                maximum_authority_epoch=maximum_authority_epoch,
-                reconciliation_targets=reconciliation_targets,
+        staging_dir = self.store._backup_verification_staging_dir()
+        for attempt in range(2):
+            if attempt and _journal_file_identity(os.lstat(path)) != _journal_file_identity(source_observed):
+                raise RuntimeError("request-journal source changed before inspection retry")
+            temporary = self.store._unique_private_temp_path(
+                staging_dir,
+                prefix=f".{path.name}.journal-verify.",
             )
-            return {
-                **inspection,
-                "sha256": str(copied["sha256"]),
-                "size_bytes": int(copied["size_bytes"]),
-                "artifact_path": str(path),
-            }
-        finally:
-            temporary.unlink(missing_ok=True)
-            self.store._fsync_directory(staging_dir)
+            try:
+                copied = self.store._copy_stable_regular_file(path, temporary)
+                if attempt and _journal_file_identity(os.lstat(path)) != _journal_file_identity(source_observed):
+                    raise RuntimeError("request-journal source changed during inspection retry")
+                if not secrets.compare_digest(str(copied["sha256"]), expected_sha256):
+                    raise RuntimeError("request-journal artifact digest verification failed")
+                try:
+                    inspection = self.inspect_request_journal_snapshot(
+                        temporary,
+                        maximum_authority_epoch=maximum_authority_epoch,
+                        reconciliation_targets=reviewed_targets,
+                    )
+                except ImmutableJournalInspectionDrift as exc:
+                    if attempt or exc.changed_fields != ("ctime_ns",):
+                        raise
+                    digest, size_bytes, metadata = self.store._hash_stable_regular_file(temporary)
+                    if (
+                        not secrets.compare_digest(digest, expected_sha256)
+                        or int(size_bytes) != int(copied["size_bytes"])
+                        or not exc._retry_metadata_matches(metadata)
+                        or _journal_file_identity(os.lstat(temporary))
+                        != _journal_file_identity(metadata)
+                    ):
+                        raise
+                    # Discard every result and byte from the failed attempt.
+                    # finally removes this copy before another is created.
+                    continue
+                return {
+                    **inspection,
+                    "sha256": str(copied["sha256"]),
+                    "size_bytes": int(copied["size_bytes"]),
+                    "artifact_path": str(path),
+                }
+            finally:
+                temporary.unlink(missing_ok=True)
+                self.store._fsync_directory(staging_dir)
+        raise RuntimeError("request-journal inspection retry exhausted")
 
     def _request_journal_reconciliation_receipts_from_database(
         self,
